@@ -150,8 +150,7 @@ async fn rowid_disabled_by_default() -> DataFusionResult<()> {
     let err = ctx
         .sql("SELECT rowid FROM c.main.t")
         .await
-        .err()
-        .expect("should fail to plan rowid reference with lineage off");
+        .expect_err("should fail to plan rowid reference with lineage off");
     assert!(
         format!("{err}").to_lowercase().contains("rowid"),
         "expected error to mention rowid, got: {err}"
