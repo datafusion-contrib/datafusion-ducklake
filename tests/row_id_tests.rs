@@ -32,15 +32,9 @@ fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
 
     conn.execute("CREATE TABLE c.t(i INTEGER);", [])?;
     // First file: rows 0..3
-    conn.execute(
-        "INSERT INTO c.t SELECT i FROM range(0, 3) t(i);",
-        [],
-    )?;
+    conn.execute("INSERT INTO c.t SELECT i FROM range(0, 3) t(i);", [])?;
     // Second file: rows 10..15
-    conn.execute(
-        "INSERT INTO c.t SELECT i FROM range(10, 15) t(i);",
-        [],
-    )?;
+    conn.execute("INSERT INTO c.t SELECT i FROM range(10, 15) t(i);", [])?;
     Ok(())
 }
 
@@ -131,8 +125,8 @@ fn collect_rowid_i_sorted(batches: &[RecordBatch]) -> Vec<(i64, i32)> {
 
 #[tokio::test]
 async fn rowid_disabled_by_default() -> DataFusionResult<()> {
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_default.ducklake");
     create_catalog_rowid_two_files(&path).map_err(common::to_datafusion_error)?;
 
@@ -168,8 +162,8 @@ async fn rowid_disabled_by_default() -> DataFusionResult<()> {
 
 #[tokio::test]
 async fn rowid_sequential_across_files() -> DataFusionResult<()> {
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_two_files.ducklake");
     create_catalog_rowid_two_files(&path).map_err(common::to_datafusion_error)?;
 
@@ -194,16 +188,7 @@ async fn rowid_sequential_across_files() -> DataFusionResult<()> {
     let pairs = collect_rowid_i_sorted(&batches);
     assert_eq!(
         pairs,
-        vec![
-            (0, 0),
-            (1, 1),
-            (2, 2),
-            (3, 10),
-            (4, 11),
-            (5, 12),
-            (6, 13),
-            (7, 14),
-        ],
+        vec![(0, 0), (1, 1), (2, 2), (3, 10), (4, 11), (5, 12), (6, 13), (7, 14),],
         "rowids should be contiguous 0..8 across the two files",
     );
 
@@ -220,8 +205,8 @@ async fn rowid_sequential_across_files() -> DataFusionResult<()> {
 
 #[tokio::test]
 async fn rowid_preserved_under_deletes() -> DataFusionResult<()> {
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_with_deletes.ducklake");
     create_catalog_rowid_with_deletes(&path).map_err(common::to_datafusion_error)?;
 
@@ -250,8 +235,8 @@ async fn rowid_preserved_under_deletes() -> DataFusionResult<()> {
 async fn rowid_only_projection() -> DataFusionResult<()> {
     // Edge case: physical projection is empty (just rowid). Verifies that
     // RowIdExec works when ParquetExec emits zero-column count batches.
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_only.ducklake");
     create_catalog_rowid_two_files(&path).map_err(common::to_datafusion_error)?;
 
@@ -283,8 +268,8 @@ async fn rowid_preserved_across_update_rewrite() -> DataFusionResult<()> {
     // The critical test: UPDATE rewrites the file with embedded rowids.
     // Our scan must read those embedded values rather than compute
     // `row_id_start + position`, otherwise the rowids drift.
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_update.ducklake");
     create_catalog_rowid_with_update(&path).map_err(common::to_datafusion_error)?;
 
@@ -319,8 +304,8 @@ async fn rowid_preserved_across_update_rewrite() -> DataFusionResult<()> {
 #[tokio::test]
 async fn rowid_count_star_unaffected() -> DataFusionResult<()> {
     // COUNT(*) should not trigger the rowid path (it asks for zero columns).
-    let temp = TempDir::new()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let temp =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_count_star.ducklake");
     create_catalog_rowid_two_files(&path).map_err(common::to_datafusion_error)?;
 

@@ -263,8 +263,7 @@ mod tests {
         let b1 = small_batch(input_schema.clone(), &[10, 20, 30]);
         let b2 = small_batch(input_schema.clone(), &[40, 50]);
         let mem =
-            MemorySourceConfig::try_new_exec(&[vec![b1, b2]], input_schema.clone(), None)
-                .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![b1, b2]], input_schema.clone(), None).unwrap();
 
         let exec = Arc::new(RowIdExec::new(mem, Some(1000)));
         assert_eq!(exec.schema().field(1).name(), ROWID_COLUMN_NAME);
@@ -309,8 +308,7 @@ mod tests {
         )
         .unwrap();
         let mem =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None)
-                .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None).unwrap();
 
         // Insert rowid at position 1 → schema should be [a, rowid, b]
         let exec = Arc::new(RowIdExec::new_at(mem, Some(500), 1));
@@ -364,8 +362,7 @@ mod tests {
         )
         .unwrap();
         let mem =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None)
-                .unwrap();
+            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None).unwrap();
 
         let exec = Arc::new(RowIdExec::new(mem, Some(42)));
         assert_eq!(exec.schema().fields().len(), 1);
@@ -435,8 +432,7 @@ mod tests {
         // ends up appended at the end.
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let b = small_batch(input_schema.clone(), &[1, 2]);
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
+        let mem = MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
 
         let exec = Arc::new(RowIdExec::new_at(mem, Some(10), 99));
         assert_eq!(exec.schema().fields().len(), 2);
@@ -453,8 +449,7 @@ mod tests {
         // Distribution shape — just that it is SinglePartition for the
         // sole child.
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![]], input_schema, None).unwrap();
+        let mem = MemorySourceConfig::try_new_exec(&[vec![]], input_schema, None).unwrap();
         let exec = RowIdExec::new(mem, Some(0));
 
         let dists = exec.required_input_distribution();
@@ -476,8 +471,7 @@ mod tests {
     async fn emits_null_when_row_id_start_is_none() {
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let b = small_batch(input_schema.clone(), &[1, 2]);
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
+        let mem = MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
 
         let exec = Arc::new(RowIdExec::new(mem, None));
         let ctx = Arc::new(TaskContext::default());

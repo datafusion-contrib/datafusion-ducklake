@@ -11,9 +11,7 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
 };
 use crate::path_resolver::resolve_path;
-use crate::row_id::{
-    ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field,
-};
+use crate::row_id::{ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field};
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
@@ -259,7 +257,8 @@ impl DuckLakeTable {
 
     /// Index of the synthetic `rowid` column in `self.schema`, when enabled.
     fn rowid_index(&self) -> Option<usize> {
-        self.row_lineage.then(|| self.physical_schema.fields().len())
+        self.row_lineage
+            .then(|| self.physical_schema.fields().len())
     }
 
     /// Resolve a file path (data or delete file) to its absolute path
@@ -618,16 +617,14 @@ impl DuckLakeTable {
                 if !key.is_empty() {
                     let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
                     let decryption_props =
-                        parquet::encryption::decrypt::FileDecryptionProperties::builder(
-                            key_bytes,
-                        )
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create decryption properties: {}",
-                                e
-                            ))
-                        })?;
+                        parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
+                            .build()
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to create decryption properties: {}",
+                                    e
+                                ))
+                            })?;
                     ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
                 } else {
                     ArrowReaderOptions::new()
@@ -687,9 +684,7 @@ impl DuckLakeTable {
 
         {
             let mut cache = self.file_read_config_cache.lock().unwrap();
-            cache
-                .entry(resolved_path)
-                .or_insert_with(|| cfg.clone());
+            cache.entry(resolved_path).or_insert_with(|| cfg.clone());
         }
 
         Ok(cfg)
@@ -720,14 +715,15 @@ impl DuckLakeTable {
             .filter(|&&i| i != rowid_idx)
             .copied()
             .collect();
-        let rowid_insert_pos: usize = user_proj
-            .iter()
-            .position(|&i| i == rowid_idx)
-            .ok_or_else(|| {
-                DataFusionError::Internal(
-                    "build_exec_for_file_with_rowid called without rowid in projection".into(),
-                )
-            })?;
+        let rowid_insert_pos: usize =
+            user_proj
+                .iter()
+                .position(|&i| i == rowid_idx)
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "build_exec_for_file_with_rowid called without rowid in projection".into(),
+                    )
+                })?;
 
         // Match the C++ extension: if the file embeds no rowid column AND the
         // catalog didn't record a `row_id_start`, lineage cannot be

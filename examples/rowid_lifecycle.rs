@@ -138,9 +138,7 @@ async fn run_lifecycle(
     // Step 3: DELETE a single row → exercises DeleteFilterExec
     // -------------------------------------------------------------------
     header("Step 3: DELETE id=4");
-    duckdb_conn.execute_batch(&format!(
-        "DELETE FROM dl.main.{TABLE} WHERE id = 4;"
-    ))?;
+    duckdb_conn.execute_batch(&format!("DELETE FROM dl.main.{TABLE} WHERE id = 4;"))?;
     all_passed &= compare_step("After DELETE id=4", duckdb_conn, runtime, cfg).await?;
 
     // -------------------------------------------------------------------
@@ -263,7 +261,11 @@ fn duckdb_read(conn: &duckdb::Connection, sql: &str) -> Result<Vec<Row>, Box<dyn
             r.get::<_, Option<i64>>(1)?.unwrap_or(0)
         };
         let name: Option<String> = r.get(2)?;
-        out.push(Row { rowid, id, name });
+        out.push(Row {
+            rowid,
+            id,
+            name,
+        });
     }
     Ok(out)
 }
@@ -304,9 +306,17 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<Row>, Box<dyn Error>
 
             // id may come back as Int32 or Int64; coerce to i64.
             let id: i64 = if let Some(arr) = id_col.as_any().downcast_ref::<Int32Array>() {
-                if arr.is_null(i) { 0 } else { arr.value(i) as i64 }
+                if arr.is_null(i) {
+                    0
+                } else {
+                    arr.value(i) as i64
+                }
             } else if let Some(arr) = id_col.as_any().downcast_ref::<Int64Array>() {
-                if arr.is_null(i) { 0 } else { arr.value(i) }
+                if arr.is_null(i) {
+                    0
+                } else {
+                    arr.value(i)
+                }
             } else {
                 return Err(format!("unexpected id type {:?}", id_col.data_type()).into());
             };
@@ -321,7 +331,11 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<Row>, Box<dyn Error>
                 return Err(format!("unexpected name type {:?}", name_col.data_type()).into());
             };
 
-            out.push(Row { rowid, id, name });
+            out.push(Row {
+                rowid,
+                id,
+                name,
+            });
         }
     }
     Ok(out)

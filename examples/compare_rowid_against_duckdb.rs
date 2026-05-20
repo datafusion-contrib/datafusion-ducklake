@@ -161,10 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .with_region("auto")
             .build()?,
     );
-    runtime.register_object_store(
-        &Url::parse(&format!("s3://{}/", cfg.s3_bucket))?,
-        s3,
-    );
+    runtime.register_object_store(&Url::parse(&format!("s3://{}/", cfg.s3_bucket))?, s3);
 
     let catalog = DuckLakeCatalog::new(provider)?.with_row_lineage(true);
     let cfg = SessionConfig::new().with_default_catalog_and_schema("dl", "main");
@@ -175,7 +172,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // ----- 3. Compare table by table -----
     let mut overall_ok = true;
     for &(schema, table, key, key_type, limit) in TEST_TABLES {
-        print_header(&format!("Comparing {schema}.{table} (key={key}, limit={limit})"));
+        print_header(&format!(
+            "Comparing {schema}.{table} (key={key}, limit={limit})"
+        ));
         match compare_table(&duckdb_conn, &ctx, schema, table, key, key_type, limit).await {
             Ok(true) => println!("✅ rowid + {key} match between DuckDB and DataFusion"),
             Ok(false) => {
@@ -275,7 +274,10 @@ fn duckdb_query(
         } else {
             return Err("unsupported key type from DuckDB".into());
         };
-        out.push(Row { rowid, key });
+        out.push(Row {
+            rowid,
+            key,
+        });
     }
     Ok(out)
 }
@@ -331,7 +333,10 @@ fn extract_rows(
                 )
                 .into());
             };
-            out.push(Row { rowid, key });
+            out.push(Row {
+                rowid,
+                key,
+            });
         }
     }
     Ok(out)
