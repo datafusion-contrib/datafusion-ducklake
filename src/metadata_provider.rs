@@ -31,6 +31,8 @@ pub const SQL_GET_DATA_FILES: &str = "
         data.file_size_bytes AS data_file_size,
         data.footer_size AS data_footer_size,
         data.encryption_key AS data_encryption_key,
+        data.row_id_start AS data_row_id_start,
+        data.record_count AS data_record_count,
         del.delete_file_id,
         del.path AS delete_file_path,
         del.path_is_relative AS delete_path_is_relative,
@@ -482,11 +484,14 @@ pub struct DuckLakeTableFile {
     pub file: DuckLakeFileData,
     /// Optional associated delete file containing deleted row positions
     pub delete_file: Option<DuckLakeFileData>,
-    /// Starting row ID for this file (reserved for future use)
+    /// Starting row ID for this file. Combined with each row's position in the
+    /// file, this gives a globally unique `rowid` (DuckLake row lineage).
+    /// `None` for files where the metadata column is unset (e.g. older catalogs).
     pub row_id_start: Option<i64>,
     /// Snapshot ID when this file was created (reserved for future use)
     pub snapshot_id: Option<i64>,
-    /// Maximum number of rows in this file (reserved for future use)
+    /// Total rows in this file (`record_count` from the catalog), before any
+    /// delete files are applied. Used for synthetic `rowid` generation.
     pub max_row_count: Option<i64>,
 }
 

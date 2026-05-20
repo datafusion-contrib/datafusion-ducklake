@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     column_type VARCHAR NOT NULL,
     column_order INTEGER NOT NULL,
     nulls_allowed BOOLEAN DEFAULT 1,
+    -- Mirror the upstream DuckLake spec (ducklake_metadata_manager.cpp):
+    -- `parent_column` is projected by our reader's SQL_GET_TABLE_COLUMNS;
+    -- the four `*default*` columns are projected by DuckDB when it reads
+    -- catalogs we produce. We leave them NULL — no nested-type or
+    -- column-default writes yet.
+    initial_default VARCHAR,
+    default_value VARCHAR,
+    parent_column INTEGER,
+    default_value_type VARCHAR,
+    default_value_dialect VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
@@ -67,6 +77,19 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     mapping_id INTEGER,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
+);
+
+-- Per-table row-lineage counter (DuckLake spec). `next_row_id` is the
+-- monotonic rowid allocator: a new data file gets its `row_id_start` from
+-- the current value, then we advance by `record_count` in the same
+-- transaction. `record_count` and `file_size_bytes` mirror the currently-
+-- visible totals so DuckDB's `ducklake_table_info` aggregate sees correct
+-- numbers for tables we wrote.
+CREATE TABLE IF NOT EXISTS ducklake_table_stats (
+    table_id INTEGER PRIMARY KEY,
+    record_count INTEGER NOT NULL DEFAULT 0,
+    next_row_id INTEGER NOT NULL DEFAULT 0,
+    file_size_bytes INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_delete_file (
@@ -254,9 +277,34 @@ impl MetadataWriter for SqliteMetadataWriter {
         file: &DataFileInfo,
     ) -> Result<i64> {
         block_on(async {
-            let row = sqlx::query(
-                "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+            // Allocate row_id_start from the table's monotonic counter inside
+            // the same transaction so concurrent writers can't hand out
+            // overlapping ranges. Falls back to inserting a fresh stats row
+            // (next_row_id = 0) for tables created before this writer
+            // started maintaining the table_stats table.
+            let mut tx = self.pool.begin().await?;
+
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let stats_row =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let row_id_start: i64 = stats_row.try_get(0)?;
+
+            let data_file_row = sqlx::query(
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -264,24 +312,62 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
+            .bind(row_id_start)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-            Ok(row.try_get(0)?)
+            let data_file_id: i64 = data_file_row.try_get(0)?;
+
+            // Advance the counter and accumulate stats. `next_row_id`
+            // monotonically increases over the table's lifetime — rowids
+            // are never reused, even after end-snapshot.
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + ?,
+                     record_count    = record_count + ?,
+                     file_size_bytes = file_size_bytes + ?
+                 WHERE table_id = ?",
+            )
+            .bind(file.record_count)
+            .bind(file.record_count)
+            .bind(file.file_size_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(data_file_id)
         })
     }
 
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
+        // Used by WriteMode::Replace. End-snapshotting every visible file
+        // drops the table's currently-visible row count and byte total to
+        // zero (the new files written next will rebuild them). `next_row_id`
+        // is deliberately NOT reset: rowids must stay monotonic across the
+        // table's lifetime so historical snapshots still resolve uniquely.
         block_on(async {
+            let mut tx = self.pool.begin().await?;
+
             let result = sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = ?
                  WHERE table_id = ? AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
             .bind(table_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = 0, file_size_bytes = 0
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
             Ok(result.rows_affected())
         })
     }
@@ -497,6 +583,28 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(table_id)
                 .execute(&mut *tx)
                 .await?;
+
+                // Mirror end_table_files: drop visible row/byte totals to
+                // zero while keeping next_row_id monotonic. INSERT OR IGNORE
+                // first so we don't fall over if this is the first write
+                // (Replace on a brand-new table).
+                sqlx::query(
+                    "INSERT OR IGNORE INTO ducklake_table_stats
+                         (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES (?, 0, 0, 0)",
+                )
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = 0, file_size_bytes = 0
+                     WHERE table_id = ?",
+                )
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
             }
 
             tx.commit().await?;
@@ -619,6 +727,142 @@ mod tests {
             .register_data_file(table_id, snapshot_id, &file)
             .unwrap();
         assert_eq!(file_id, 1);
+    }
+
+    /// Helper for the row-lineage tests: read back what `register_data_file`
+    /// wrote into the catalog so we can assert on `row_id_start` and the
+    /// stats counter directly.
+    async fn read_row_id_start(writer: &SqliteMetadataWriter, file_id: i64) -> Option<i64> {
+        let row = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(file_id)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+        row.try_get(0).ok()
+    }
+
+    async fn read_table_stats(writer: &SqliteMetadataWriter, table_id: i64) -> (i64, i64, i64) {
+        let row = sqlx::query(
+            "SELECT record_count, next_row_id, file_size_bytes
+             FROM ducklake_table_stats WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        (
+            row.try_get(0).unwrap(),
+            row.try_get(1).unwrap(),
+            row.try_get(2).unwrap(),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_id_start_advances_across_inserts() {
+        // Two INSERTs against the same table should hand out non-overlapping
+        // [row_id_start, row_id_start + record_count) ranges. Counter is
+        // initialized lazily on first register_data_file.
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snapshot_id)
+            .unwrap();
+
+        let f1_id = writer
+            .register_data_file(
+                table_id,
+                snapshot_id,
+                &DataFileInfo::new("a.parquet", 100, 3),
+            )
+            .unwrap();
+        let f2_id = writer
+            .register_data_file(
+                table_id,
+                snapshot_id,
+                &DataFileInfo::new("b.parquet", 250, 7),
+            )
+            .unwrap();
+
+        assert_eq!(read_row_id_start(&writer, f1_id).await, Some(0));
+        assert_eq!(read_row_id_start(&writer, f2_id).await, Some(3));
+
+        let (records, next, bytes) = read_table_stats(&writer, table_id).await;
+        assert_eq!(records, 10, "record_count = 3 + 7");
+        assert_eq!(next, 10, "next_row_id advances by sum of record_counts");
+        assert_eq!(bytes, 350, "file_size_bytes accumulates");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_table_files_preserves_next_row_id() {
+        // Replace must reset record_count and file_size_bytes (those reflect
+        // currently-visible rows) but keep next_row_id monotonic so the next
+        // generation of files gets fresh, non-overlapping rowids.
+        let (writer, _temp) = create_test_writer().await;
+        let snap1 = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap1)
+            .unwrap();
+
+        writer
+            .register_data_file(table_id, snap1, &DataFileInfo::new("a.parquet", 100, 5))
+            .unwrap();
+
+        let snap2 = writer.create_snapshot().unwrap();
+        writer.end_table_files(table_id, snap2).unwrap();
+
+        let (records, next, bytes) = read_table_stats(&writer, table_id).await;
+        assert_eq!(records, 0, "record_count cleared after end_table_files");
+        assert_eq!(next, 5, "next_row_id preserved (monotonic across lifetime)");
+        assert_eq!(bytes, 0, "file_size_bytes cleared");
+
+        let f2_id = writer
+            .register_data_file(table_id, snap2, &DataFileInfo::new("b.parquet", 200, 2))
+            .unwrap();
+        assert_eq!(
+            read_row_id_start(&writer, f2_id).await,
+            Some(5),
+            "post-replace files must start at the preserved counter, not 0",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_id_start_works_when_stats_row_missing() {
+        // Defensive path: a table that existed before this writer started
+        // maintaining ducklake_table_stats. First register_data_file must
+        // self-initialize the stats row rather than fail.
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "legacy", None, snapshot_id)
+            .unwrap();
+
+        // Simulate a "legacy" table by deleting any stats row that
+        // get_or_create_table may have written (it doesn't today, but be
+        // explicit so the test stays meaningful if that changes).
+        sqlx::query("DELETE FROM ducklake_table_stats WHERE table_id = ?")
+            .bind(table_id)
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+
+        let file_id = writer
+            .register_data_file(
+                table_id,
+                snapshot_id,
+                &DataFileInfo::new("a.parquet", 50, 4),
+            )
+            .unwrap();
+        assert_eq!(read_row_id_start(&writer, file_id).await, Some(0));
+        let (records, next, _) = read_table_stats(&writer, table_id).await;
+        assert_eq!(records, 4);
+        assert_eq!(next, 4);
     }
 
     #[tokio::test(flavor = "multi_thread")]

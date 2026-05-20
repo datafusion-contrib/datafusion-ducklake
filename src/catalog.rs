@@ -37,6 +37,10 @@ pub struct DuckLakeCatalog {
     object_store_url: Arc<ObjectStoreUrl>,
     /// Catalog base path component for resolving relative schema paths (e.g., /prefix/)
     catalog_path: String,
+    /// When true, expose a virtual `rowid` BIGINT column on every table
+    /// (DuckLake row-lineage feature). Default: false, to preserve existing
+    /// `SELECT *` shape for callers that haven't opted in.
+    row_lineage: bool,
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
     write_config: Option<WriteConfig>,
@@ -58,6 +62,7 @@ impl DuckLakeCatalog {
             snapshot_id,
             object_store_url: Arc::new(object_store_url),
             catalog_path,
+            row_lineage: false,
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -77,6 +82,7 @@ impl DuckLakeCatalog {
             snapshot_id,
             object_store_url: Arc::new(object_store_url),
             catalog_path,
+            row_lineage: false,
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -119,10 +125,24 @@ impl DuckLakeCatalog {
             snapshot_id,
             object_store_url: Arc::new(object_store_url),
             catalog_path,
+            row_lineage: false,
             write_config: Some(WriteConfig {
                 writer,
             }),
         })
+    }
+
+    /// Enable the DuckLake row-lineage feature: every table will expose a
+    /// virtual `rowid` BIGINT column (assigned from each row's `row_id_start +
+    /// position_in_file`). Off by default to preserve existing `SELECT *`
+    /// shape.
+    ///
+    /// Note: DataFusion has no hidden-column concept, so the `rowid` column
+    /// IS included in `SELECT *` once enabled — this differs from the DuckDB
+    /// extension where `rowid` is hidden unless explicitly referenced.
+    pub fn with_row_lineage(mut self, enabled: bool) -> Self {
+        self.row_lineage = enabled;
+        self
     }
 
     /// Get the metadata provider for this catalog
@@ -199,7 +219,8 @@ impl CatalogProvider for DuckLakeCatalog {
                     self.snapshot_id, // Propagate pinned snapshot_id
                     self.object_store_url.clone(),
                     schema_path,
-                );
+                )
+                .with_row_lineage(self.row_lineage);
 
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]

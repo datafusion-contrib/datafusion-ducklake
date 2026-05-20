@@ -57,7 +57,7 @@ skip-tests-with-docker = []
 
 # Metadata provider backends
 metadata-duckdb = ["dep:duckdb"]
-metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono"]
+metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/tls-rustls-ring"]
 metadata-mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/chrono"]
 metadata-sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono"]
 
@@ -75,3 +75,13 @@ write-sqlite = ["write", "metadata-sqlite"]
 write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
 # Multicatalog read provider (independent of write support)
 multicatalog-postgres = ["metadata-postgres"]
+
+# Rowid verification examples need both the DuckDB extension (writes the
+# catalog + writes data) and the postgres provider (DataFusion-side reads).
+[[example]]
+name = "compare_rowid_against_duckdb"
+required-features = ["metadata-duckdb", "metadata-postgres"]
+
+[[example]]
+name = "rowid_lifecycle"
+required-features = ["metadata-duckdb", "metadata-postgres"]

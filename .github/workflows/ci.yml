@@ -83,11 +83,14 @@ jobs:
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
       - name: Run tests
+        # `write-sqlite` pulls in the writer and sqlite-provider tests,
+        # which are `#![cfg]`-gated; without it cargo compiles them to
+        # zero-test binaries.
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            cargo test --features skip-tests-with-docker
+            cargo test --features "skip-tests-with-docker write-sqlite"
           else
-            cargo test
+            cargo test --features "write-sqlite"
           fi
 
       - name: Check documentation

@@ -217,6 +217,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                     data.file_size_bytes AS data_file_size,
                     data.footer_size AS data_footer_size,
                     data.encryption_key AS data_encryption_key,
+                    data.row_id_start AS data_row_id_start,
+                    data.record_count AS data_record_count,
                     del.delete_file_id,
                     del.path AS delete_file_path,
                     del.path_is_relative AS delete_path_is_relative,
@@ -252,14 +254,16 @@ impl MetadataProvider for PostgresMetadataProvider {
                         footer_size: row.try_get(4)?,
                         encryption_key: row.try_get(5)?,
                     };
+                    let row_id_start: Option<i64> = row.try_get(6)?;
+                    let record_count: Option<i64> = row.try_get(7)?;
 
-                    let delete_file = if row.try_get::<Option<i64>, _>(6)?.is_some() {
+                    let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
                         Some(DuckLakeFileData {
-                            path: row.try_get(7)?,
-                            path_is_relative: row.try_get(8)?,
-                            file_size_bytes: row.try_get(9)?,
-                            footer_size: row.try_get(10)?,
-                            encryption_key: row.try_get(11)?,
+                            path: row.try_get(9)?,
+                            path_is_relative: row.try_get(10)?,
+                            file_size_bytes: row.try_get(11)?,
+                            footer_size: row.try_get(12)?,
+                            encryption_key: row.try_get(13)?,
                         })
                     } else {
                         None
@@ -268,9 +272,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                     Ok(DuckLakeTableFile {
                         file: data_file,
                         delete_file,
-                        row_id_start: None,
-                        snapshot_id: None,
-                        max_row_count: None,
+                        row_id_start,
+                        snapshot_id: Some(snapshot_id),
+                        max_row_count: record_count,
                     })
                 })
                 .collect()

@@ -25,6 +25,7 @@ To meet the [Hotdata](https://www.hotdata.dev) team, [Join the Hotdata Discord](
 - Dynamic metadata lookup (no upfront catalog caching)
 - SQL-queryable `information_schema` for catalog metadata (snapshots, schemas, tables, columns, files)
 - DuckDB-style table functions: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`
+- DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`. Writers always populate the lineage counter, matching DuckDB's default; the flag is read-only. Compatible with files produced by DuckDB's `UPDATE` / compaction (embedded `_ducklake_internal_row_id`).
 
 ---
 
@@ -34,6 +35,7 @@ To meet the [Hotdata](https://www.hotdata.dev) team, [Join the Hotdata Discord](
 - No partition-based file pruning
 - No time travel support
 - DuckDB-encrypted Parquet files (non-PME) are not supported
+- **Data inlining is not read.** DuckDB's ducklake extension inlines small INSERTs (≤ `ducklake_default_data_inlining_row_limit`, default 10 rows) into the catalog itself rather than parquet files. This crate only reads `ducklake_data_file` rows, so inlined data is invisible — `SELECT COUNT(*)` will silently undercount. If you write through DuckDB and read through this crate, either disable inlining at write time (`SET ducklake_default_data_inlining_row_limit = 0` on every writer connection) or run `COMPACT` before reading. Catalogs written entirely through this crate's `SqliteMetadataWriter` are unaffected — we never inline.
 
 ---
 
