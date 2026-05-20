@@ -68,10 +68,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    // The five non-`column_id`/`table_id`/etc. columns below mirror the
-    // upstream DuckLake spec. The reader's SQL_GET_TABLE_COLUMNS query
-    // projects `parent_column`, so this fixture has to provide it or the
-    // metadata provider errors with "no such column".
+    // Schema must match SQL_CREATE_SCHEMA in metadata_writer_sqlite.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
             column_id INTEGER PRIMARY KEY,
@@ -93,9 +90,6 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
-    // `row_id_start` and `record_count` are projected by SQL_GET_DATA_FILES
-    // since the row-lineage work in PR #115. The fixture must surface them
-    // so the provider can hydrate `DuckLakeTableFile`.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_data_file (
             data_file_id INTEGER PRIMARY KEY,

@@ -83,12 +83,9 @@ jobs:
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
       - name: Run tests
-        # `--features write-sqlite` is required to make the writer + sqlite-
-        # provider test suites visible to `cargo test`. Both test files are
-        # gated with `#![cfg(feature = "write-sqlite")]` /
-        # `#![cfg(feature = "metadata-sqlite")]`, so without these features
-        # cargo silently compiles them to zero-test binaries and any
-        # writer-schema regression slips through CI unnoticed.
+        # `write-sqlite` pulls in the writer and sqlite-provider tests,
+        # which are `#![cfg]`-gated; without it cargo compiles them to
+        # zero-test binaries.
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             cargo test --features "skip-tests-with-docker write-sqlite"
