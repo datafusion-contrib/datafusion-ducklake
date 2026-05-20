@@ -180,7 +180,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .query_map(
                 [table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
                 |row| {
-                    // Parse data file (columns 0-5)
+                    // Parse data file (columns 0-7)
                     let _data_file_id: i64 = row.get(0)?;
                     let data_file = DuckLakeFileData {
                         path: row.get(1)?,
@@ -189,28 +189,30 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         footer_size: row.get(4)?,
                         encryption_key: row.get(5)?,
                     };
+                    let row_id_start: Option<i64> = row.get(6)?;
+                    let record_count: Option<i64> = row.get(7)?;
 
-                    // Parse delete file (columns 6-12) if exists
-                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(6) {
+                    // Parse delete file (columns 8-14) if exists
+                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(8) {
                         Some(DuckLakeFileData {
-                            path: row.get(7)?,
-                            path_is_relative: row.get(8)?,
-                            file_size_bytes: row.get(9)?,
-                            footer_size: row.get(10)?,
-                            encryption_key: row.get(11)?,
+                            path: row.get(9)?,
+                            path_is_relative: row.get(10)?,
+                            file_size_bytes: row.get(11)?,
+                            footer_size: row.get(12)?,
+                            encryption_key: row.get(13)?,
                         })
                     } else {
                         None
                     };
 
-                    let _delete_count: Option<i64> = row.get(12)?;
+                    let _delete_count: Option<i64> = row.get(14)?;
 
                     Ok(DuckLakeTableFile {
                         file: data_file,
                         delete_file,
-                        row_id_start: None,
+                        row_id_start,
                         snapshot_id: Some(snapshot_id),
-                        max_row_count: None, // Set to None until we have actual row count from data file metadata
+                        max_row_count: record_count,
                     })
                 },
             )?
