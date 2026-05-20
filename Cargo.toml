@@ -57,7 +57,7 @@ skip-tests-with-docker = []
 
 # Metadata provider backends
 metadata-duckdb = ["dep:duckdb"]
-metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono"]
+metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/tls-rustls-ring"]
 metadata-mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/chrono"]
 metadata-sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono"]
 
