@@ -72,3 +72,6 @@ encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64
 # Write support
 write = ["dep:uuid"]
 write-sqlite = ["write", "metadata-sqlite"]
+write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
+# Multicatalog read provider (independent of write support)
+multicatalog-postgres = ["metadata-postgres"]
