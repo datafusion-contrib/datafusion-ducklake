@@ -68,6 +68,10 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // The five non-`column_id`/`table_id`/etc. columns below mirror the
+    // upstream DuckLake spec. The reader's SQL_GET_TABLE_COLUMNS query
+    // projects `parent_column`, so this fixture has to provide it or the
+    // metadata provider errors with "no such column".
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
             column_id INTEGER PRIMARY KEY,
@@ -76,6 +80,11 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             column_type TEXT NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed INTEGER,
+            initial_default TEXT,
+            default_value TEXT,
+            parent_column INTEGER,
+            default_value_type TEXT,
+            default_value_dialect TEXT,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
@@ -84,6 +93,9 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // `row_id_start` and `record_count` are projected by SQL_GET_DATA_FILES
+    // since the row-lineage work in PR #115. The fixture must surface them
+    // so the provider can hydrate `DuckLakeTableFile`.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_data_file (
             data_file_id INTEGER PRIMARY KEY,
@@ -93,6 +105,9 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             file_size_bytes INTEGER NOT NULL,
             footer_size INTEGER,
             encryption_key TEXT,
+            record_count INTEGER,
+            row_id_start INTEGER,
+            mapping_id INTEGER,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)

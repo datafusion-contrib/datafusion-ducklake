@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     column_type VARCHAR NOT NULL,
     column_order INTEGER NOT NULL,
     nulls_allowed BOOLEAN DEFAULT 1,
+    -- Columns below match the DuckLake spec (see
+    -- ducklake_metadata_manager.cpp upstream). We don't populate them
+    -- today (our writer doesn't support nested types or column defaults)
+    -- but their PRESENCE in the schema is required so the reader's
+    -- SQL_GET_TABLE_COLUMNS query — which projects `parent_column` —
+    -- doesn't fail on tables we wrote. Leaving the other four in for
+    -- compatibility with anything DuckDB or future reader code may
+    -- project from the same row.
+    initial_default VARCHAR,
+    default_value VARCHAR,
+    parent_column INTEGER,
+    default_value_type VARCHAR,
+    default_value_dialect VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
