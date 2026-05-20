@@ -11,6 +11,9 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
 };
 use crate::path_resolver::resolve_path;
+use crate::row_id::{
+    ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field,
+};
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
@@ -94,6 +97,27 @@ pub fn delete_file_schema() -> SchemaRef {
 /// Cached schema mapping for renamed columns
 type SchemaMappingCache = (SchemaRef, HashMap<String, String>);
 
+/// Per-file read configuration computed for the row-lineage scan path.
+///
+/// Encapsulates the decision made by `DuckLakeMultiFileReader::GetVirtualColumnExpression`
+/// in the C++ extension: either the parquet file embeds a row-id column
+/// (UPDATE/compaction case — surviving rowids preserved across file rewrite),
+/// or it doesn't (INSERT-only case — synthesize from `row_id_start + position`).
+#[derive(Debug, Clone)]
+struct FileReadConfig {
+    /// Schema we pass to `ParquetSource::new` for this file. When
+    /// `embedded_rowid_parquet_name` is `Some`, this schema has the embedded
+    /// rowid column appended at the end (under its parquet name).
+    read_schema: SchemaRef,
+    /// Parquet-name → user-facing-name renames. Includes the rowid rename
+    /// (parquet column → `"rowid"`) when the file has an embedded column with
+    /// a different name.
+    name_mapping: HashMap<String, String>,
+    /// `Some(parquet_column_name)` if the file embeds the rowid column
+    /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
+    embedded_rowid_parquet_name: Option<String>,
+}
+
 /// DuckLake table provider
 ///
 /// Represents a table within a DuckLake schema and provides access to data via Parquet files.
@@ -108,14 +132,25 @@ pub struct DuckLakeTable {
     object_store_url: Arc<ObjectStoreUrl>,
     /// Table path for resolving relative file paths
     table_path: String,
-    /// Current schema with potentially renamed column names
+    /// User-facing schema. Equals `physical_schema` when row lineage is off, or
+    /// `physical_schema` with a `rowid` BIGINT appended at the end when on.
     schema: SchemaRef,
+    /// Schema of the physical (parquet-backed) columns only — no rowid.
+    physical_schema: SchemaRef,
+    /// When true, `schema` includes a trailing `rowid` column and `scan()`
+    /// injects it per-file via [`RowIdExec`].
+    row_lineage: bool,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
     table_files: Vec<DuckLakeTableFile>,
     /// Cached schema mapping (read_schema, name_mapping) - computed once on first scan
     schema_mapping_cache: OnceCell<SchemaMappingCache>,
+    /// Per-file row-lineage read config, populated lazily on the rowid scan
+    /// path. Each file requires its own parquet metadata read to detect an
+    /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
+    /// scans don't re-fetch.
+    file_read_config_cache: std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>,
     /// Encryption factory for decrypting encrypted Parquet files (when encryption feature is enabled)
     #[cfg(feature = "encryption")]
     encryption_factory: Option<Arc<dyn EncryptionFactory>>,
@@ -152,7 +187,8 @@ impl DuckLakeTable {
     ) -> Result<Self> {
         // Load ALL metadata with this snapshot_id
         let columns = provider.get_table_structure(table_id)?;
-        let schema = Arc::new(build_arrow_schema(&columns)?);
+        let physical_schema = Arc::new(build_arrow_schema(&columns)?);
+        let schema = physical_schema.clone();
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
@@ -190,16 +226,40 @@ impl DuckLakeTable {
             object_store_url,
             table_path,
             schema,
+            physical_schema,
+            row_lineage: false,
             columns,
             table_files,
             #[cfg(feature = "encryption")]
             encryption_factory,
             schema_mapping_cache: OnceCell::new(),
+            file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "write")]
             schema_name: None,
             #[cfg(feature = "write")]
             writer: None,
         })
+    }
+
+    /// Enable / disable the row-lineage feature. When enabled, the table's
+    /// public schema includes a trailing `rowid` BIGINT column synthesized
+    /// from each row's catalog-recorded `row_id_start + position_in_file`.
+    pub fn with_row_lineage(mut self, enabled: bool) -> Self {
+        self.row_lineage = enabled;
+        self.schema = if enabled {
+            let mut fields: Vec<Arc<Field>> =
+                self.physical_schema.fields().iter().cloned().collect();
+            fields.push(Arc::new(rowid_field()));
+            Arc::new(Schema::new(fields))
+        } else {
+            self.physical_schema.clone()
+        };
+        self
+    }
+
+    /// Index of the synthetic `rowid` column in `self.schema`, when enabled.
+    fn rowid_index(&self) -> Option<usize> {
+        self.row_lineage.then(|| self.physical_schema.fields().len())
     }
 
     /// Resolve a file path (data or delete file) to its absolute path
@@ -525,6 +585,258 @@ impl DuckLakeTable {
             Ok(exec_after_delete)
         }
     }
+
+    /// Inspect a single file's parquet metadata for the row-lineage scan
+    /// path. Mirrors the per-file logic in `DuckLakeMultiFileReader::
+    /// GetVirtualColumnExpression` (ducklake C++): if the file embeds a
+    /// column tagged with [`ROW_ID_PARQUET_FIELD_ID`], project that column;
+    /// otherwise synthesize rowid from `row_id_start + position`.
+    async fn build_file_read_config(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<Arc<FileReadConfig>> {
+        let resolved_path = self.resolve_file_path(file)?;
+
+        {
+            let cache = self.file_read_config_cache.lock().unwrap();
+            if let Some(cfg) = cache.get(&resolved_path) {
+                return Ok(cfg.clone());
+            }
+        }
+
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url.as_ref())?;
+        let object_path = ObjectPath::from(resolved_path.as_str());
+        let reader = ParquetObjectReader::new(object_store, object_path);
+
+        #[cfg(feature = "encryption")]
+        let builder = {
+            use parquet::arrow::arrow_reader::ArrowReaderOptions;
+            let options = if let Some(ref key) = file.encryption_key {
+                if !key.is_empty() {
+                    let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+                    let decryption_props =
+                        parquet::encryption::decrypt::FileDecryptionProperties::builder(
+                            key_bytes,
+                        )
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create decryption properties: {}",
+                                e
+                            ))
+                        })?;
+                    ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
+                } else {
+                    ArrowReaderOptions::new()
+                }
+            } else {
+                ArrowReaderOptions::new()
+            };
+            ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
+
+        #[cfg(not(feature = "encryption"))]
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let field_id_map = extract_parquet_field_ids(builder.metadata());
+
+        // Standard read_schema + name_mapping for physical columns.
+        let (physical_read_schema, mut name_mapping) = if field_id_map.is_empty() {
+            (self.physical_schema.as_ref().clone(), HashMap::new())
+        } else {
+            let (s, m) = build_read_schema_with_field_id_mapping(&self.columns, &field_id_map)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            (s, m)
+        };
+
+        // Detect the embedded rowid column by reserved field-id.
+        let embedded_rowid_parquet_name = field_id_map.get(&ROW_ID_PARQUET_FIELD_ID).cloned();
+
+        let read_schema = if let Some(ref parquet_name) = embedded_rowid_parquet_name {
+            // Append the embedded rowid column to read_schema under its
+            // parquet name; ParquetExec will project it by name from the
+            // file. We add a `parquet_name → "rowid"` rename so the user
+            // sees the column as `rowid` (only needed if the names differ).
+            let mut fields: Vec<Arc<Field>> =
+                physical_read_schema.fields().iter().cloned().collect();
+            fields.push(Arc::new(Field::new(
+                parquet_name.clone(),
+                DataType::Int64,
+                true,
+            )));
+            if parquet_name != ROWID_COLUMN_NAME {
+                name_mapping.insert(parquet_name.clone(), ROWID_COLUMN_NAME.to_string());
+            }
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::new(physical_read_schema)
+        };
+
+        let cfg = Arc::new(FileReadConfig {
+            read_schema,
+            name_mapping,
+            embedded_rowid_parquet_name,
+        });
+
+        {
+            let mut cache = self.file_read_config_cache.lock().unwrap();
+            cache
+                .entry(resolved_path)
+                .or_insert_with(|| cfg.clone());
+        }
+
+        Ok(cfg)
+    }
+
+    /// Build a plan for a single file when the synthetic `rowid` column is in
+    /// the projection. Always uses per-file scans because each file may have a
+    /// different layout (embedded rowid vs. synthesized) and a distinct
+    /// `row_id_start`.
+    ///
+    /// Order: ParquetExec(physical_proj [+ rowid if embedded]) →
+    ///   RowIdExec(?) → DeleteFilterExec(?) → ColumnRenameExec(?).
+    async fn build_exec_for_file_with_rowid(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        user_proj: &[usize],
+        rowid_idx: usize,
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+        let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
+
+        // Decompose user projection: which physical columns to read, and where
+        // rowid should appear in the output.
+        let physical_proj: Vec<usize> = user_proj
+            .iter()
+            .filter(|&&i| i != rowid_idx)
+            .copied()
+            .collect();
+        let rowid_insert_pos: usize = user_proj
+            .iter()
+            .position(|&i| i == rowid_idx)
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "build_exec_for_file_with_rowid called without rowid in projection".into(),
+                )
+            })?;
+
+        // Match the C++ extension: if the file embeds no rowid column AND the
+        // catalog didn't record a `row_id_start`, lineage cannot be
+        // reconstructed. Hard-error rather than silently emit NULL/garbage.
+        if !has_embedded && table_file.row_id_start.is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
+                 `row_id_start` set in the catalog — row lineage cannot be reconstructed",
+                table_file.file.path
+            )));
+        }
+
+        // Build the ParquetExec projection. When the file embeds rowid we
+        // splice it into the projection at `rowid_insert_pos` directly, so
+        // the parquet emits batches already in the user's requested column
+        // order (no extra reorder pass needed).
+        let parquet_projection: Vec<usize> = if has_embedded {
+            let rowid_col_in_read_schema = file_cfg.read_schema.fields().len() - 1;
+            let mut p = physical_proj.clone();
+            p.insert(rowid_insert_pos, rowid_col_in_read_schema);
+            p
+        } else {
+            physical_proj.clone()
+        };
+
+        // Resolve and configure the data file
+        let resolved_path = self.resolve_file_path(&table_file.file)?;
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+        );
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+
+        let mut builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
+        )
+        .with_limit(limit)
+        .with_file_group(FileGroup::new(vec![pf]));
+        builder = builder.with_projection_indices(Some(parquet_projection))?;
+
+        let parquet_exec: Arc<dyn ExecutionPlan> =
+            DataSourceExec::from_data_source(builder.build());
+
+        // Synthesize rowid only when the file doesn't already supply it.
+        let after_rowid: Arc<dyn ExecutionPlan> = if has_embedded {
+            parquet_exec
+        } else {
+            Arc::new(RowIdExec::new_at(
+                parquet_exec,
+                table_file.row_id_start,
+                rowid_insert_pos,
+            ))
+        };
+
+        // Apply delete filter if needed. DeleteFilterExec tracks file
+        // position, which is preserved through both RowIdExec and an embedded
+        // rowid projection (both leave row order untouched).
+        let after_deletes: Arc<dyn ExecutionPlan> =
+            if let Some(ref delete_file) = table_file.delete_file {
+                let deleted_positions = self.read_delete_file_positions(state, delete_file).await?;
+                if !deleted_positions.is_empty() {
+                    Arc::new(DeleteFilterExec::new(
+                        after_rowid,
+                        table_file.file.path.clone(),
+                        Arc::new(deleted_positions),
+                    ))
+                } else {
+                    after_rowid
+                }
+            } else {
+                after_rowid
+            };
+
+        // Apply column rename. Required when a physical column was renamed in
+        // the catalog, or when the embedded rowid column's parquet name
+        // differs from `"rowid"` (the common case — it's
+        // `_ducklake_internal_row_id`).
+        if !file_cfg.name_mapping.is_empty() {
+            let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
+            Ok(Arc::new(ColumnRenameExec::new(
+                after_deletes,
+                output_schema,
+                file_cfg.name_mapping.clone(),
+            )))
+        } else {
+            Ok(after_deletes)
+        }
+    }
+
+    /// Output schema for the rowid-projected per-file plan: physical fields
+    /// (using their user-facing renamed names from `self.schema`) interleaved
+    /// with the synthetic `rowid` field at `rowid_idx`.
+    fn output_schema_for_projection(&self, user_proj: &[usize], rowid_idx: usize) -> SchemaRef {
+        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(user_proj.len());
+        for &i in user_proj {
+            if i == rowid_idx {
+                fields.push(Arc::new(rowid_field()));
+            } else {
+                fields.push(self.schema.fields()[i].clone());
+            }
+        }
+        Arc::new(Schema::new(fields))
+    }
 }
 
 #[async_trait]
@@ -608,8 +920,42 @@ impl TableProvider for DuckLakeTable {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Separate files into two groups: with deletes and without deletes
-        // This allows us to create a single efficient exec for files without deletes
+        // Row-lineage detour: when the synthetic `rowid` column is projected,
+        // every file needs its own scan because each has a distinct
+        // `row_id_start`. `projection == None` with row lineage on means "all
+        // columns including rowid", which also routes through this path.
+        let rowid_idx = self.rowid_index();
+        let rowid_in_proj = match (rowid_idx, projection) {
+            (Some(r), Some(p)) => p.contains(&r),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+
+        if rowid_in_proj {
+            let rowid_idx = rowid_idx.unwrap();
+            let user_proj: Vec<usize> = projection
+                .cloned()
+                .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+
+            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+            for tf in &self.table_files {
+                let exec = self
+                    .build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
+                    .await?;
+                execs.push(exec);
+            }
+
+            if execs.is_empty() {
+                use datafusion::physical_plan::empty::EmptyExec;
+                let projected_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
+                return Ok(Arc::new(EmptyExec::new(projected_schema)));
+            }
+
+            return combine_execution_plans(execs);
+        }
+
+        // Fast path: rowid not projected. All projection indices refer to
+        // physical columns, so the existing logic works untouched.
         let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
             .table_files
             .iter()
