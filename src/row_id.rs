@@ -351,6 +351,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rowid_only_projection_empty_input_columns() {
+        // The input has zero columns (count-rows-only mode). RowIdExec
+        // should still emit a single-column batch with the rowid values.
+        // This is the shape that flows from a parquet scan when only rowid
+        // is in the projection.
+        let input_schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let batch = RecordBatch::try_new_with_options(
+            input_schema.clone(),
+            vec![],
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(3)),
+        )
+        .unwrap();
+        let mem =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None)
+                .unwrap();
+
+        let exec = Arc::new(RowIdExec::new(mem, Some(42)));
+        assert_eq!(exec.schema().fields().len(), 1);
+        assert_eq!(exec.schema().field(0).name(), ROWID_COLUMN_NAME);
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        use futures::StreamExt;
+        let out = stream.next().await.unwrap().unwrap();
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(out.num_columns(), 1);
+        let rowids = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(rowids, vec![42, 43, 44]);
+    }
+
+    #[tokio::test]
+    async fn empty_batch_passes_through_with_empty_rowid_column() {
+        // A zero-row batch from the input should produce a zero-row batch
+        // out, with the rowid column present and the cursor unchanged so
+        // the next non-empty batch picks up at the right offset.
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let empty_batch = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef],
+        )
+        .unwrap();
+        let next_batch = small_batch(input_schema.clone(), &[7, 8]);
+        let mem = MemorySourceConfig::try_new_exec(
+            &[vec![empty_batch, next_batch]],
+            input_schema.clone(),
+            None,
+        )
+        .unwrap();
+
+        let exec = Arc::new(RowIdExec::new(mem, Some(100)));
+        let ctx = Arc::new(TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        use futures::StreamExt;
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.num_rows(), 0);
+        assert_eq!(first.num_columns(), 2);
+
+        let second = stream.next().await.unwrap().unwrap();
+        let rowids = second
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        // Cursor should NOT have advanced past the empty batch — second
+        // batch rows still start at row_id_start + 0.
+        assert_eq!(rowids, vec![100, 101]);
+    }
+
+    #[tokio::test]
+    async fn insert_at_out_of_range_clamps_to_end() {
+        // Caller asks to insert at position 99 when the input has only 1
+        // column. The constructor clamps to input.len() (= 1) so the rowid
+        // ends up appended at the end.
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let b = small_batch(input_schema.clone(), &[1, 2]);
+        let mem =
+            MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
+
+        let exec = Arc::new(RowIdExec::new_at(mem, Some(10), 99));
+        assert_eq!(exec.schema().fields().len(), 2);
+        assert_eq!(exec.schema().field(0).name(), "v");
+        assert_eq!(exec.schema().field(1).name(), ROWID_COLUMN_NAME);
+    }
+
+    #[test]
+    fn declares_single_partition_input_to_block_repartition() {
+        // Regression guard for the cursor-vs-RepartitionExec hazard: if
+        // either of these defaults reverts, DataFusion's optimizer could
+        // legally insert a RepartitionExec under RowIdExec and break
+        // rowid computation silently. We do not over-assert the exact
+        // Distribution shape — just that it is SinglePartition for the
+        // sole child.
+        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mem =
+            MemorySourceConfig::try_new_exec(&[vec![]], input_schema, None).unwrap();
+        let exec = RowIdExec::new(mem, Some(0));
+
+        let dists = exec.required_input_distribution();
+        assert_eq!(dists.len(), 1);
+        assert!(
+            matches!(dists[0], Distribution::SinglePartition),
+            "RowIdExec must require a single-partition input; got {:?}",
+            dists[0]
+        );
+        assert_eq!(
+            exec.maintains_input_order(),
+            vec![true],
+            "RowIdExec preserves row order — must declare it so DataFusion's \
+             order-aware optimizations can fire",
+        );
+    }
+
+    #[tokio::test]
     async fn emits_null_when_row_id_start_is_none() {
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let b = small_batch(input_schema.clone(), &[1, 2]);
