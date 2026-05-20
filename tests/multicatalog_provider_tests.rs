@@ -51,7 +51,9 @@ async fn seed_two_catalogs(pool: &PgPool) -> anyhow::Result<(i64, i64)> {
     let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_mysql).await?;
     wa.set_data_path("/data")?;
 
-    let reg = |w: &PostgresMetadataWriter, setup: datafusion_ducklake::metadata_writer::WriteSetupResult, fname: &str| {
+    let reg = |w: &PostgresMetadataWriter,
+               setup: datafusion_ducklake::metadata_writer::WriteSetupResult,
+               fname: &str| {
         w.register_data_file(
             setup.table_id,
             setup.snapshot_id,
@@ -66,8 +68,7 @@ async fn seed_two_catalogs(pool: &PgPool) -> anyhow::Result<(i64, i64)> {
     let s2 = wa.begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)?;
     reg(&wa, s2, "users-b.parquet");
     // mysql_prod: DDL
-    let s3 =
-        wb.begin_write_transaction("public", "orders", &orders_cols(), WriteMode::Replace)?;
+    let s3 = wb.begin_write_transaction("public", "orders", &orders_cols(), WriteMode::Replace)?;
     reg(&wb, s3, "orders-a.parquet");
     // pg_prod: column-add DDL
     let mut v2 = users_cols();
@@ -345,9 +346,7 @@ async fn get_table_files_for_select_returns_visible_files_at_snapshot() {
         .unwrap()
         .unwrap();
 
-    let files = pa
-        .get_table_files_for_select(table.table_id, sn)
-        .unwrap();
+    let files = pa.get_table_files_for_select(table.table_id, sn).unwrap();
     // At snapshot 4 only the latest data file is visible (older ones end_snapshot'd).
     assert_eq!(files.len(), 1);
 

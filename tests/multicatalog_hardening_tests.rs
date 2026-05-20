@@ -12,9 +12,7 @@
 
 use std::sync::Arc;
 
-use datafusion_ducklake::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode,
-};
+use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
     MulticatalogManager, PostgresMetadataWriter, initialize_multicatalog_schema,
 };
@@ -85,7 +83,10 @@ async fn concurrent_get_or_create_schema_no_duplicates() {
         "all callers must see the same schema_id, got {:?}",
         ids
     );
-    assert_eq!(created_count, 1, "exactly one writer should report was_created");
+    assert_eq!(
+        created_count, 1,
+        "exactly one writer should report was_created"
+    );
 
     // And the catalog only has one schema row.
     let n: i64 = sqlx::query(
@@ -114,7 +115,9 @@ async fn concurrent_get_or_create_table_no_duplicates() {
             .unwrap(),
     );
     let snapshot_id = writer.create_snapshot().unwrap();
-    let (schema_id, _) = writer.get_or_create_schema("public", None, snapshot_id).unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("public", None, snapshot_id)
+        .unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..10 {
@@ -199,8 +202,12 @@ async fn seed_two_catalogs(pool: &PgPool) -> (i64, i64, i64, i64) {
     let mgr = MulticatalogManager::new(pool.clone());
     let cat_a = mgr.create_catalog("cat_a").await.unwrap();
     let cat_b = mgr.create_catalog("cat_b").await.unwrap();
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a).await.unwrap();
-    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
     wa.set_data_path("/data").unwrap();
 
     let setup_a = wa
@@ -217,7 +224,9 @@ async fn seed_two_catalogs(pool: &PgPool) -> (i64, i64, i64, i64) {
 async fn register_data_file_rejects_cross_catalog_table_id() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let (cat_a, _cat_b, _table_a, table_b) = seed_two_catalogs(&pool).await;
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
     let snap = wa.create_snapshot().unwrap();
 
     let result = wa.register_data_file(
@@ -233,13 +242,12 @@ async fn register_data_file_rejects_cross_catalog_table_id() {
     );
 
     // And no row was inserted.
-    let n: i64 =
-        sqlx::query("SELECT COUNT(*) FROM ducklake_data_file WHERE path = 'evil.parquet'")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .try_get(0)
-            .unwrap();
+    let n: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_data_file WHERE path = 'evil.parquet'")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -248,7 +256,9 @@ async fn register_data_file_rejects_cross_catalog_table_id() {
 async fn end_table_files_rejects_cross_catalog_table_id() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let (cat_a, _cat_b, _table_a, table_b) = seed_two_catalogs(&pool).await;
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
     let snap = wa.create_snapshot().unwrap();
 
     let result = wa.end_table_files(table_b, snap);
@@ -265,7 +275,9 @@ async fn end_table_files_rejects_cross_catalog_table_id() {
 async fn set_columns_rejects_cross_catalog_table_id() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let (cat_a, _cat_b, _table_a, table_b) = seed_two_catalogs(&pool).await;
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
     let snap = wa.create_snapshot().unwrap();
 
     let result = wa.set_columns(table_b, &users_cols(), snap);
@@ -284,8 +296,12 @@ async fn get_or_create_table_rejects_cross_catalog_schema_id() {
     let mgr = MulticatalogManager::new(pool.clone());
     let cat_a = mgr.create_catalog("cat_a").await.unwrap();
     let cat_b = mgr.create_catalog("cat_b").await.unwrap();
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a).await.unwrap();
-    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
     wa.set_data_path("/data").unwrap();
 
     // Set up a schema in each catalog.
@@ -322,12 +338,10 @@ async fn set_data_path_rejects_silent_overwrite() {
     // Same value is idempotent.
     w.set_data_path("/data/a").unwrap();
     // Different value rejected.
-    let err = w.set_data_path("/data/b").expect_err("must reject overwrite");
-    assert!(
-        err.to_string().contains("already set"),
-        "got: {}",
-        err
-    );
+    let err = w
+        .set_data_path("/data/b")
+        .expect_err("must reject overwrite");
+    assert!(err.to_string().contains("already set"), "got: {}", err);
     // Original value is untouched.
     assert_eq!(w.get_data_path().unwrap(), "/data/a");
 }
@@ -368,15 +382,23 @@ async fn rollback_leaves_no_orphan_rows() {
         ColumnDef::new("name", "varchar", true).unwrap(),
     ];
     let snaps_before_fail: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
-        .fetch_one(&pool).await.unwrap().try_get(0).unwrap();
-    let err =
-        w.begin_write_transaction("public", "users", &bad_cols, WriteMode::Append)
-            .expect_err("incompatible type change must fail");
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    let err = w
+        .begin_write_transaction("public", "users", &bad_cols, WriteMode::Append)
+        .expect_err("incompatible type change must fail");
     assert!(err.to_string().contains("Schema evolution error"));
 
     // The failed call must not have left a snapshot behind.
     let snaps_after_fail: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
-        .fetch_one(&pool).await.unwrap().try_get(0).unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
     assert_eq!(
         snaps_after_fail, snaps_before_fail,
         "rollback should leave snapshot count unchanged"
@@ -458,15 +480,12 @@ async fn unknown_catalog_id_errors_clearly_on_lock() {
     // but the map insert will succeed because there's no FK to ducklake_catalog.
     // The lock-taking methods are the ones that must reject. begin_write_transaction
     // takes the lock first:
-    let result = bogus.begin_write_transaction(
-        "public",
-        "users",
-        &users_cols(),
-        WriteMode::Replace,
-    );
+    let result =
+        bogus.begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace);
     let err = result.expect_err("bogus catalog_id should error");
     assert!(
-        err.to_string().contains("999999") || err.to_string().contains("not found")
+        err.to_string().contains("999999")
+            || err.to_string().contains("not found")
             || err.to_string().to_lowercase().contains("catalog"),
         "expected catalog-related error, got: {}",
         err

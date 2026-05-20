@@ -66,10 +66,10 @@ pub mod metadata_provider_sqlite;
 pub mod insert_exec;
 #[cfg(feature = "write")]
 pub mod metadata_writer;
-#[cfg(feature = "write-sqlite")]
-pub mod metadata_writer_sqlite;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres;
+#[cfg(feature = "write-sqlite")]
+pub mod metadata_writer_sqlite;
 #[cfg(feature = "write-postgres")]
 pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
@@ -105,10 +105,10 @@ pub use insert_exec::DuckLakeInsertExec;
 pub use metadata_writer::{
     ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult, WriteSetupResult,
 };
-#[cfg(feature = "write-sqlite")]
-pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres::PostgresMetadataWriter;
+#[cfg(feature = "write-sqlite")]
+pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]
 pub use multicatalog::{MulticatalogManager, initialize_multicatalog_schema};
 #[cfg(feature = "multicatalog-postgres")]

@@ -10,10 +10,16 @@ use sqlx::postgres::PgPool;
 
 /// Bootstrap standard + multicatalog tables. Idempotent.
 pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
-    execute_ddl_statements(pool, crate::metadata_writer_postgres::SQL_CREATE_STANDARD_TABLES)
-        .await?;
-    execute_ddl_statements(pool, crate::metadata_writer_postgres::SQL_CREATE_MULTICATALOG_TABLES)
-        .await?;
+    execute_ddl_statements(
+        pool,
+        crate::metadata_writer_postgres::SQL_CREATE_STANDARD_TABLES,
+    )
+    .await?;
+    execute_ddl_statements(
+        pool,
+        crate::metadata_writer_postgres::SQL_CREATE_MULTICATALOG_TABLES,
+    )
+    .await?;
     Ok(())
 }
 

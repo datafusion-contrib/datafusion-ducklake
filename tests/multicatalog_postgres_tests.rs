@@ -63,13 +63,12 @@ async fn initialize_multicatalog_schema_is_idempotent() {
         "ducklake_catalog_schema_map",
         "ducklake_schema_versions",
     ] {
-        let row = sqlx::query(
-            "SELECT table_name FROM information_schema.tables WHERE table_name = $1",
-        )
-        .bind(table)
-        .fetch_optional(&pool)
-        .await
-        .unwrap();
+        let row =
+            sqlx::query("SELECT table_name FROM information_schema.tables WHERE table_name = $1")
+                .bind(table)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
         assert!(row.is_some(), "table {} should exist", table);
     }
 }
@@ -121,34 +120,38 @@ async fn single_catalog_ddl_then_dml_assigns_versions() {
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
 
-    let v1: i64 = sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
-        .bind(setup1.snapshot_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
-    let v2: i64 = sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
-        .bind(setup2.snapshot_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
+    let v1: i64 =
+        sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(setup1.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    let v2: i64 =
+        sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(setup2.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
     assert_eq!(v1, 1, "first DDL ⇒ v1");
     assert_eq!(v2, 1, "DML carries forward ⇒ still v1");
 
     // ducklake_schema_versions has exactly one row for the DDL commit.
-    let count: i64 = sqlx::query(
-        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE table_id = $1",
-    )
-    .bind(setup1.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap()
-    .try_get(0)
-    .unwrap();
-    assert_eq!(count, 1, "only the DDL commit records a schema_versions row");
+    let count: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_schema_versions WHERE table_id = $1")
+            .bind(setup1.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        count, 1,
+        "only the DDL commit records a schema_versions row"
+    );
 
     // Third commit: column added → DDL bump.
     let mut cols_v2 = cols();
@@ -156,13 +159,14 @@ async fn single_catalog_ddl_then_dml_assigns_versions() {
     let setup3 = writer
         .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
         .unwrap();
-    let v3: i64 = sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
-        .bind(setup3.snapshot_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
+    let v3: i64 =
+        sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(setup3.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
     assert_eq!(v3, 2, "column added ⇒ DDL ⇒ v2");
 }
 
@@ -194,41 +198,38 @@ async fn cross_catalog_isolation_same_schema_name() {
     assert_ne!(setup_a.schema_id, setup_b.schema_id);
 
     // Catalog A's mapping points only at A's schema.
-    let schema_ids_a: Vec<i64> = sqlx::query(
-        "SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1",
-    )
-    .bind(cat_a)
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|r| r.try_get(0).unwrap())
-    .collect();
+    let schema_ids_a: Vec<i64> =
+        sqlx::query("SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1")
+            .bind(cat_a)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get(0).unwrap())
+            .collect();
     assert_eq!(schema_ids_a, vec![setup_a.schema_id]);
 
-    let schema_ids_b: Vec<i64> = sqlx::query(
-        "SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1",
-    )
-    .bind(cat_b)
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|r| r.try_get(0).unwrap())
-    .collect();
+    let schema_ids_b: Vec<i64> =
+        sqlx::query("SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1")
+            .bind(cat_b)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get(0).unwrap())
+            .collect();
     assert_eq!(schema_ids_b, vec![setup_b.schema_id]);
 
     // Each catalog has exactly one snapshot mapping after one write.
     for cat in [cat_a, cat_b] {
-        let n: i64 = sqlx::query(
-            "SELECT COUNT(*) FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1",
-        )
-        .bind(cat)
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
+        let n: i64 =
+            sqlx::query("SELECT COUNT(*) FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1")
+                .bind(cat)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap();
         assert_eq!(n, 1, "catalog {} should have 1 snapshot mapping", cat);
     }
 }

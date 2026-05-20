@@ -60,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mgr = MulticatalogManager::new(pool.clone());
     let cat_pg = mgr.create_catalog("pg_prod").await?;
     let cat_mysql = mgr.create_catalog("mysql_prod").await?;
-    println!("✓ catalogs: pg_prod -> {}, mysql_prod -> {}", cat_pg, cat_mysql);
+    println!(
+        "✓ catalogs: pg_prod -> {}, mysql_prod -> {}",
+        cat_pg, cat_mysql
+    );
 
     // ── Step 3: write through each catalog ────────────────────────────────────
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
@@ -88,8 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // mysql_prod.public.orders
-    let writer_mysql =
-        Arc::new(PostgresMetadataWriter::with_pool(pool.clone(), cat_mysql).await?);
+    let writer_mysql = Arc::new(PostgresMetadataWriter::with_pool(pool.clone(), cat_mysql).await?);
     let orders_batch = build_orders_batch();
     let tw_mysql = DuckLakeTableWriter::new(writer_mysql.clone(), Arc::clone(&object_store))?;
     let orders_result = tw_mysql
@@ -219,7 +221,11 @@ async fn read_via_multicatalog(
                 continue;
             }
             let schema = cat.schema(&schema_name).unwrap();
-            println!("    schema {} -> tables {:?}", schema_name, schema.table_names());
+            println!(
+                "    schema {} -> tables {:?}",
+                schema_name,
+                schema.table_names()
+            );
         }
     }
 
@@ -317,11 +323,12 @@ async fn dump_query(
         .map(|c| sqlx::Column::name(c).to_string())
         .collect();
     println!("    {}", header.join(" | "));
-    println!("    {}", "-".repeat(header.iter().map(|s| s.len()).sum::<usize>() + header.len() * 3));
+    println!(
+        "    {}",
+        "-".repeat(header.iter().map(|s| s.len()).sum::<usize>() + header.len() * 3)
+    );
     for row in &rows {
-        let cols: Vec<String> = (0..row.len())
-            .map(|i| format_col(row, i))
-            .collect();
+        let cols: Vec<String> = (0..row.len()).map(|i| format_col(row, i)).collect();
         println!("    {}", cols.join(" | "));
     }
     Ok(())
