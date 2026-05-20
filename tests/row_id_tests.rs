@@ -69,18 +69,17 @@ fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
 /// new data file whose parquet stores `_ducklake_internal_row_id` (field-id
 /// 2147483540) so the original rowids survive the rewrite.
 ///
-/// Trajectory:
-///   INSERT (0..3)    → rowids 0..2, i values [0,1,2]
-///   INSERT (10..15)  → rowids 3..7, i values [10,11,12,13,14]
-///   DELETE WHERE i%2=1 → drops rowids {1,3,5}  (i=1,11,13)
-///   Surviving: (0,0) (2,2) (4,12) wait — let me recompute:
-///     rowid 0 -> i=0;  rowid 1 -> i=1 (del);  rowid 2 -> i=2;
-///     rowid 3 -> i=10; rowid 4 -> i=11 (del); rowid 5 -> i=12;
-///     rowid 6 -> i=13 (del); rowid 7 -> i=14
-///   So surviving = [(0,0),(2,2),(3,10),(5,12),(7,14)]
-///   UPDATE i = i+1000 WHERE i<3 OR i>10:
-///     matches i=0, i=2, i=12, i=14
-///     → [(0,1000),(2,1002),(3,10),(5,1012),(7,1014)]
+/// Trajectory (rowid in parentheses):
+///   INSERT range(0, 3)   → (0,0) (1,1) (2,2)
+///   INSERT range(10, 15) → (3,10) (4,11) (5,12) (6,13) (7,14)
+///   DELETE WHERE i % 2 = 1 → drops rowids {1, 4, 6}
+///     Surviving: (0,0) (2,2) (3,10) (5,12) (7,14)
+///   UPDATE i = i+1000 WHERE i<3 OR i>10 → touches rowids {0, 2, 5, 7}:
+///     → (0,1000) (2,1002) (3,10) (5,1012) (7,1014)
+///
+/// The expected result is only achievable if the rewrite file's embedded
+/// `_ducklake_internal_row_id` column is read; `row_id_start + position`
+/// for the rewrite file would yield a fresh sequential range, not {0,2,5,7}.
 fn create_catalog_rowid_with_update(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     conn.execute("INSTALL ducklake;", [])?;

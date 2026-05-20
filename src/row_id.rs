@@ -1,16 +1,17 @@
 //! Synthetic `rowid` column injection for DuckLake row lineage.
 //!
-//! DuckLake assigns each row a globally unique `rowid` BIGINT. For files written
-//! by INSERT, the catalog records the file's `row_id_start`, and per-row rowid
-//! is `row_id_start + position_in_file`. This module implements an execution
-//! plan that appends that synthetic column to each batch streaming out of a
-//! per-file Parquet scan, in file order.
+//! DuckLake assigns each row a globally unique `rowid` BIGINT. For files
+//! written by INSERT, the catalog records the file's `row_id_start`, and the
+//! per-row rowid is `row_id_start + position_in_file`. This module implements
+//! an execution plan ([`RowIdExec`]) that appends that synthetic column to
+//! each batch streaming out of a per-file Parquet scan, in file order.
 //!
-//! Limitations vs. the DuckDB extension:
-//! - Files written by UPDATE/compaction store rowids inline in the parquet
-//!   itself (as `_ducklake_internal_row_id`). This is not yet wired up here;
-//!   reads of compacted files will produce computed rowids that no longer
-//!   reflect the original lineage. Tracked as a follow-up.
+//! Files written by `UPDATE` / compaction store the original rowids inline in
+//! the parquet as a column tagged with [`ROW_ID_PARQUET_FIELD_ID`] (typically
+//! named `_ducklake_internal_row_id`). Those files do NOT use this exec —
+//! `DuckLakeTable` reads the embedded column directly via the parquet scan
+//! and renames it; `RowIdExec` is only used when no embedded column is
+//! present. See `table.rs::build_exec_for_file_with_rowid`.
 
 use std::any::Any;
 use std::pin::Pin;
@@ -22,7 +23,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::{Distribution, EquivalenceProperties};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -138,6 +139,23 @@ impl ExecutionPlan for RowIdExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// Rowid synthesis relies on rows arriving in file order on a single
+    /// stream — the cursor counts position-in-file. If DataFusion's
+    /// `EnforceDistribution` / `Repartition` rules inserted a `RepartitionExec`
+    /// below us, batches would arrive interleaved across partitions and
+    /// rowid = row_id_start + cursor would no longer correspond to the row's
+    /// real file offset. Pin the child to a single partition to prevent that.
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition]
+    }
+
+    /// Order-preserving wrapper: we do not reorder or drop rows, we only
+    /// append a column. Declaring this lets DataFusion's order-aware
+    /// optimizations (e.g. avoiding sorts after RowIdExec) fire.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
     }
 
     fn with_new_children(

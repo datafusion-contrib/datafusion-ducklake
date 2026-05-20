@@ -72,3 +72,13 @@ encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64
 # Write support
 write = ["dep:uuid"]
 write-sqlite = ["write", "metadata-sqlite"]
+
+# Rowid verification examples need both the DuckDB extension (writes the
+# catalog + writes data) and the postgres provider (DataFusion-side reads).
+[[example]]
+name = "compare_rowid_against_duckdb"
+required-features = ["metadata-duckdb", "metadata-postgres"]
+
+[[example]]
+name = "rowid_lifecycle"
+required-features = ["metadata-duckdb", "metadata-postgres"]
