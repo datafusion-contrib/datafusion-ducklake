@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     column_type VARCHAR NOT NULL,
     column_order INTEGER NOT NULL,
     nulls_allowed BOOLEAN DEFAULT 1,
+    -- Mirror the upstream DuckLake spec (ducklake_metadata_manager.cpp):
+    -- `parent_column` is projected by our reader's SQL_GET_TABLE_COLUMNS;
+    -- the four `*default*` columns are projected by DuckDB when it reads
+    -- catalogs we produce. We leave them NULL — no nested-type or
+    -- column-default writes yet.
+    initial_default VARCHAR,
+    default_value VARCHAR,
+    parent_column INTEGER,
+    default_value_type VARCHAR,
+    default_value_dialect VARCHAR,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );

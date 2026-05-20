@@ -68,6 +68,7 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    // Schema must match SQL_CREATE_SCHEMA in metadata_writer_sqlite.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
             column_id INTEGER PRIMARY KEY,
@@ -76,6 +77,11 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             column_type TEXT NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed INTEGER,
+            initial_default TEXT,
+            default_value TEXT,
+            parent_column INTEGER,
+            default_value_type TEXT,
+            default_value_dialect TEXT,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
@@ -93,6 +99,9 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
             file_size_bytes INTEGER NOT NULL,
             footer_size INTEGER,
             encryption_key TEXT,
+            record_count INTEGER,
+            row_id_start INTEGER,
+            mapping_id INTEGER,
             begin_snapshot INTEGER NOT NULL DEFAULT 1,
             end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
