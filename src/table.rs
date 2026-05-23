@@ -374,10 +374,7 @@ impl DuckLakeTable {
             &resolved_delete_path,
             validated_file_size(delete_file.file_size_bytes, &resolved_delete_path)?,
         );
-        if let Some(footer_size) = delete_file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(delete_file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
@@ -445,10 +442,7 @@ impl DuckLakeTable {
 
                 // Apply footer size hint if available from DuckLake metadata
                 // This reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
-                if let Some(footer_size) = table_file.file.footer_size
-                    && footer_size > 0
-                    && let Ok(hint) = usize::try_from(footer_size)
-                {
+                if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(table_file.file.footer_size) {
                     pf = pf.with_metadata_size_hint(hint);
                 }
 
@@ -525,10 +519,7 @@ impl DuckLakeTable {
             &resolved_path,
             validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(table_file.file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
@@ -755,10 +746,7 @@ impl DuckLakeTable {
             &resolved_path,
             validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(table_file.file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
 

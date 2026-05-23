@@ -42,6 +42,7 @@ pub mod encryption;
 pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
+pub(crate) mod parquet_meta;
 pub mod path_resolver;
 pub mod row_id;
 pub mod schema;
