@@ -108,4 +108,142 @@ impl MulticatalogManager {
         }
         Ok(out)
     }
+
+    /// Drop a catalog and every metadata row owned by it.
+    ///
+    /// Removes the catalog row, its mapping-table entries, and every
+    /// entity reachable through those mappings: snapshots, schemas,
+    /// tables, columns, data and delete file records, schema-version
+    /// history. Idempotent — returns `false` if no catalog by that name
+    /// exists.
+    ///
+    /// # Concurrency
+    ///
+    /// The catalog row is taken with `FOR UPDATE` before any deletion,
+    /// so concurrent writers (which acquire the same lock in
+    /// `lock_catalog`) serialise against the drop. A 30s `lock_timeout`
+    /// bounds how long this waits for an in-progress writer to release
+    /// the lock — matches
+    /// [`crate::metadata_writer_postgres::DEFAULT_LOCK_TIMEOUT_MS`]. The
+    /// entire teardown is one transaction; either everything is gone
+    /// or nothing changes.
+    ///
+    /// # What's NOT cleaned up
+    ///
+    /// Data files on object storage are not removed here. Vacuum
+    /// reclaims them later, matching the crate's drop-without-commit
+    /// convention. Callers needing tighter storage cleanup should list
+    /// the data file paths before calling this and schedule their
+    /// removal externally.
+    pub async fn drop_catalog(&self, name: &str) -> Result<bool> {
+        if name.trim().is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "Catalog name cannot be empty".to_string(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("SET LOCAL lock_timeout = 30000")
+            .execute(&mut *tx)
+            .await?;
+
+        // Resolve catalog_id under FOR UPDATE. Concurrent writers (which
+        // also take FOR UPDATE on this row in `lock_catalog`) serialise
+        // against the drop. If the row has already been deleted by a
+        // parallel drop, we treat this call as a no-op.
+        let row = sqlx::query(
+            "SELECT catalog_id FROM ducklake_catalog
+             WHERE catalog_name = $1 FOR UPDATE",
+        )
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let catalog_id: i64 = match row {
+            Some(r) => r.try_get(0)?,
+            None => {
+                tx.commit().await?;
+                return Ok(false);
+            },
+        };
+
+        // Order matters: anything that reads through the catalog mapping
+        // tables must run before we delete those mapping rows. Within
+        // catalog-owned entities the order is rows-that-reference-
+        // `table_id` first, then tables, then schemas, then snapshots.
+
+        // Catalog-scoped child rows that reference `table_id`. Filtered
+        // transitively through the schema map so we only touch rows
+        // owned by this catalog.
+        for child_table in [
+            "ducklake_data_file",
+            "ducklake_delete_file",
+            "ducklake_column",
+            "ducklake_schema_versions",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {} WHERE table_id IN (
+                    SELECT t.table_id FROM ducklake_table t
+                    JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+                    WHERE m.catalog_id = $1
+                )",
+                child_table
+            ))
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Tables and schemas owned by this catalog.
+        sqlx::query(
+            "DELETE FROM ducklake_table WHERE schema_id IN (
+                SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1
+            )",
+        )
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM ducklake_schema WHERE schema_id IN (
+                SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1
+            )",
+        )
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Snapshots are catalog-scoped only via the snapshot map; they
+        // carry no catalog_id of their own, so the map is the only path
+        // to locate them.
+        sqlx::query(
+            "DELETE FROM ducklake_snapshot WHERE snapshot_id IN (
+                SELECT snapshot_id FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1
+            )",
+        )
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Now safe to remove the mapping rows — nothing reads through
+        // them anymore.
+        sqlx::query("DELETE FROM ducklake_catalog_schema_map WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Finally the catalog row itself.
+        sqlx::query("DELETE FROM ducklake_catalog WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(true)
+    }
 }

@@ -389,3 +389,229 @@ async fn register_data_file_records_against_table() {
     assert_eq!(count, 100);
     assert_eq!(begin, setup.snapshot_id);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_returns_false_for_unknown_name() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    let dropped = mgr.drop_catalog("does_not_exist").await.unwrap();
+    assert!(!dropped, "dropping unknown catalog should report false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_rejects_empty_name() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    assert!(mgr.drop_catalog("").await.is_err());
+    assert!(mgr.drop_catalog("   ").await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_removes_empty_catalog() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let _ = mgr.create_catalog("pg_prod").await.unwrap();
+
+    let dropped = mgr.drop_catalog("pg_prod").await.unwrap();
+    assert!(dropped, "first drop should report true");
+
+    // No catalog row left.
+    assert!(mgr.find_catalog_id("pg_prod").await.unwrap().is_none());
+
+    // Second drop is a no-op.
+    let again = mgr.drop_catalog("pg_prod").await.unwrap();
+    assert!(!again, "second drop should report false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_removes_populated_catalog() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // Two tables across one schema, with a data file each + a DDL bump
+    // to populate ducklake_schema_versions.
+    let s1 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s1.table_id,
+        s1.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let mut cols_v2 = cols();
+    cols_v2.push(ColumnDef::new("age", "int32", true).unwrap());
+    let _ = w
+        .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
+        .unwrap();
+
+    let s_orders = w
+        .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s_orders.table_id,
+        s_orders.snapshot_id,
+        &DataFileInfo::new("o.parquet", 2048, 20),
+    )
+    .unwrap();
+
+    // Drop and verify every catalog-scoped table has no rows for this
+    // catalog. Iterate so a future column addition can't quietly skip a
+    // table.
+    let dropped = mgr.drop_catalog("pg_prod").await.unwrap();
+    assert!(dropped);
+
+    // Catalog and mapping rows.
+    for query in [
+        "SELECT COUNT(*) FROM ducklake_catalog",
+        "SELECT COUNT(*) FROM ducklake_catalog_schema_map",
+        "SELECT COUNT(*) FROM ducklake_catalog_snapshot_map",
+    ] {
+        let n: i64 = sqlx::query(query)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        assert_eq!(n, 0, "{} should be empty after drop", query);
+    }
+
+    // Entities owned by the catalog. With only one catalog, "owned by
+    // this catalog" is the same as "any row at all" — global zero is
+    // the right post-condition.
+    for table in [
+        "ducklake_schema",
+        "ducklake_table",
+        "ducklake_column",
+        "ducklake_snapshot",
+        "ducklake_data_file",
+        "ducklake_delete_file",
+        "ducklake_schema_versions",
+    ] {
+        let n: i64 = sqlx::query(&format!("SELECT COUNT(*) FROM {}", table))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        assert_eq!(n, 0, "{} should be empty after drop", table);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_isolates_other_catalogs() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("pg_prod").await.unwrap();
+    let cat_b = mgr.create_catalog("mysql_prod").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    wa.set_data_path("/data").unwrap();
+
+    // Populate both catalogs.
+    let sa = wa
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        sa.table_id,
+        sa.snapshot_id,
+        &DataFileInfo::new("a.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let sb = wb
+        .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        sb.table_id,
+        sb.snapshot_id,
+        &DataFileInfo::new("b.parquet", 2048, 20),
+    )
+    .unwrap();
+
+    // Drop catalog A. Catalog B's entities must survive.
+    let dropped = mgr.drop_catalog("pg_prod").await.unwrap();
+    assert!(dropped);
+
+    // Mapping rows: A gone, B intact.
+    for (cat_id, expected, label) in
+        [(cat_a, 0i64, "cat_a schema_map gone"), (cat_b, 1i64, "cat_b schema_map intact")]
+    {
+        let n: i64 =
+            sqlx::query("SELECT COUNT(*) FROM ducklake_catalog_schema_map WHERE catalog_id = $1")
+                .bind(cat_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get(0)
+                .unwrap();
+        assert_eq!(n, expected, "{}", label);
+    }
+
+    // Catalog B's entities reachable through its mapping rows must still exist.
+    let b_schema_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_schema s
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_schema_count, 1, "cat_b schema should survive");
+
+    let b_table_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_table t
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_table_count, 1, "cat_b table should survive");
+
+    let b_file_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file f
+         JOIN ducklake_table t ON t.table_id = f.table_id
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_file_count, 1, "cat_b data_file should survive");
+
+    // And the catalog row.
+    assert!(mgr.find_catalog_id("pg_prod").await.unwrap().is_none());
+    assert_eq!(
+        mgr.find_catalog_id("mysql_prod").await.unwrap(),
+        Some(cat_b)
+    );
+}
