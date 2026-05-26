@@ -615,3 +615,663 @@ async fn drop_catalog_isolates_other_catalogs() {
         Some(cat_b)
     );
 }
+
+// -- drop_table_in_catalog --------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_rejects_empty_names() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    assert!(
+        mgr.drop_table_in_catalog("", "public", "users")
+            .await
+            .is_err()
+    );
+    assert!(
+        mgr.drop_table_in_catalog("   ", "public", "users")
+            .await
+            .is_err()
+    );
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "", "users")
+            .await
+            .is_err()
+    );
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "   ", "users")
+            .await
+            .is_err()
+    );
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "public", "")
+            .await
+            .is_err()
+    );
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "public", "   ")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_returns_false_for_unknown_catalog() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    let dropped = mgr
+        .drop_table_in_catalog("does_not_exist", "public", "users")
+        .await
+        .unwrap();
+    assert!(
+        !dropped,
+        "dropping a table in an unknown catalog should report false"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_returns_false_for_unknown_table() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    let _ = mgr.create_catalog("pg_prod").await.unwrap();
+
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "ghost")
+        .await
+        .unwrap();
+    assert!(!dropped, "unknown table should report false");
+
+    // Schema-only mismatch is also "not found".
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "ghost_schema", "users")
+        .await
+        .unwrap();
+    assert!(!dropped, "unknown schema should report false");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_tombstones_table_and_children() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let s = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let snap_pre_drop: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped, "live table should be dropped");
+
+    // A new snapshot was allocated for the drop.
+    let snap_after_drop: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(
+        snap_after_drop,
+        snap_pre_drop + 1,
+        "drop should allocate exactly one new snapshot"
+    );
+
+    // Drop snapshot is registered under this catalog.
+    let in_map: bool = sqlx::query(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_catalog_snapshot_map
+            WHERE catalog_id = $1 AND snapshot_id = $2
+         )",
+    )
+    .bind(cat)
+    .bind(snap_after_drop)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert!(in_map, "drop snapshot should be in catalog_snapshot_map");
+
+    // ducklake_table row carries end_snapshot = drop snapshot.
+    let end_snap: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_table WHERE table_id = $1")
+            .bind(s.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(end_snap, Some(snap_after_drop));
+
+    // All currently-live child rows for this table now carry the drop snapshot.
+    for child_table in ["ducklake_column", "ducklake_data_file"] {
+        let live: i64 = sqlx::query(&format!(
+            "SELECT COUNT(*) FROM {} WHERE table_id = $1 AND end_snapshot IS NULL",
+            child_table
+        ))
+        .bind(s.table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+        assert_eq!(live, 0, "no live rows left in {} after drop", child_table);
+
+        let tombstoned: i64 = sqlx::query(&format!(
+            "SELECT COUNT(*) FROM {} WHERE table_id = $1 AND end_snapshot = $2",
+            child_table
+        ))
+        .bind(s.table_id)
+        .bind(snap_after_drop)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+        assert!(
+            tombstoned > 0,
+            "{} should have rows tombstoned at the drop snapshot",
+            child_table
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_hides_table_from_read_path_and_preserves_time_travel() {
+    use datafusion_ducklake::MulticatalogProvider;
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let s = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    // Snapshot of the table-creation commit; we'll time-travel to it post-drop.
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "pg_prod")
+        .await
+        .unwrap();
+    let snap_pre_drop = provider.get_current_snapshot().unwrap();
+
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped);
+
+    let snap_post_drop = provider.get_current_snapshot().unwrap();
+    assert!(
+        snap_post_drop > snap_pre_drop,
+        "current snapshot should advance past the drop"
+    );
+
+    // At the current snapshot the table is gone — schema lookup still
+    // resolves (schemas are dropped explicitly), but the table is not visible.
+    let schema_post = provider
+        .get_schema_by_name("public", snap_post_drop)
+        .unwrap()
+        .unwrap();
+    assert!(
+        provider
+            .get_table_by_name(schema_post.schema_id, "users", snap_post_drop)
+            .unwrap()
+            .is_none(),
+        "dropped table should not be visible at the drop snapshot"
+    );
+    assert!(
+        !provider
+            .table_exists(schema_post.schema_id, "users", snap_post_drop)
+            .unwrap(),
+        "table_exists should report false post-drop"
+    );
+
+    // Time travel: at the pre-drop snapshot the table is still resolvable.
+    let schema_pre = provider
+        .get_schema_by_name("public", snap_pre_drop)
+        .unwrap()
+        .unwrap();
+    let pre_drop_table = provider
+        .get_table_by_name(schema_pre.schema_id, "users", snap_pre_drop)
+        .unwrap();
+    assert!(
+        pre_drop_table.is_some(),
+        "pre-drop snapshot should still see the table (time travel)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_is_idempotent_on_second_call() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let s = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let first = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(first, "first drop tombstones the table");
+
+    let snap_after_first: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+
+    let second = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(!second, "second drop should be a no-op");
+
+    // No additional snapshot allocated on the no-op.
+    let snap_after_second: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(
+        snap_after_first, snap_after_second,
+        "idempotent no-op must not allocate a new snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_does_not_touch_siblings() {
+    use datafusion_ducklake::MulticatalogProvider;
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // Two tables in the same schema.
+    let s_users = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s_users.table_id,
+        s_users.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let s_orders = w
+        .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s_orders.table_id,
+        s_orders.snapshot_id,
+        &DataFileInfo::new("o.parquet", 2048, 20),
+    )
+    .unwrap();
+
+    // Same-named table in a different schema; must also survive.
+    let s_other_users = w
+        .begin_write_transaction("analytics", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s_other_users.table_id,
+        s_other_users.snapshot_id,
+        &DataFileInfo::new("au.parquet", 512, 5),
+    )
+    .unwrap();
+
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped);
+
+    // The other table in the same schema must still be live.
+    let orders_end_snap: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_table WHERE table_id = $1")
+            .bind(s_orders.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        orders_end_snap.is_none(),
+        "sibling table in the same schema must not be tombstoned"
+    );
+
+    // Same-named table in a different schema must still be live.
+    let other_end_snap: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_table WHERE table_id = $1")
+            .bind(s_other_users.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        other_end_snap.is_none(),
+        "same-named table in a different schema must not be tombstoned"
+    );
+
+    // And readability via the provider matches.
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "pg_prod")
+        .await
+        .unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+
+    let public_schema = provider
+        .get_schema_by_name("public", snap)
+        .unwrap()
+        .unwrap();
+    assert!(
+        provider
+            .get_table_by_name(public_schema.schema_id, "orders", snap)
+            .unwrap()
+            .is_some(),
+        "public.orders should still be readable"
+    );
+    assert!(
+        provider
+            .get_table_by_name(public_schema.schema_id, "users", snap)
+            .unwrap()
+            .is_none(),
+        "public.users should be hidden after drop"
+    );
+
+    let analytics_schema = provider
+        .get_schema_by_name("analytics", snap)
+        .unwrap()
+        .unwrap();
+    assert!(
+        provider
+            .get_table_by_name(analytics_schema.schema_id, "users", snap)
+            .unwrap()
+            .is_some(),
+        "analytics.users should still be readable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_allows_recreate_with_fresh_identity() {
+    use datafusion_ducklake::MulticatalogProvider;
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let s1 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s1.table_id,
+        s1.snapshot_id,
+        &DataFileInfo::new("v1.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped);
+
+    // Re-create the same `(schema, table)` after the drop. The writer
+    // should pick a fresh `table_id` (the tombstoned row is filtered
+    // out by `end_snapshot IS NULL` in the lookup) and the new table
+    // must be independently queryable with its own data.
+    let s2 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    assert_ne!(
+        s2.table_id, s1.table_id,
+        "recreated table must get a fresh table_id"
+    );
+    w.register_data_file(
+        s2.table_id,
+        s2.snapshot_id,
+        &DataFileInfo::new("v2.parquet", 2048, 20),
+    )
+    .unwrap();
+
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "pg_prod")
+        .await
+        .unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("public", snap)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "users", snap)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        table.table_id, s2.table_id,
+        "current snapshot must resolve to the recreated table_id"
+    );
+
+    // The recreated table's data file is visible at the current snapshot;
+    // the dropped table's data file is not (filtered by end_snapshot).
+    let visible_files = provider
+        .get_table_files_for_select(table.table_id, snap)
+        .unwrap();
+    assert_eq!(visible_files.len(), 1);
+    assert!(visible_files[0].file.path.ends_with("v2.parquet"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_bumps_schema_version_as_ddl() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // First DDL ⇒ schema_version 1.
+    let s = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("u.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let v_create: i64 =
+        sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(s.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(v_create, 1);
+
+    // Drop ⇒ DDL bump ⇒ schema_version 2 (per-catalog dense).
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped);
+
+    let drop_snap: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    let v_drop: i64 =
+        sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(drop_snap)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        v_drop, 2,
+        "drop snapshot must bump schema_version (DDL change)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_table_in_catalog_isolates_other_catalogs() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+
+    let cat_a = mgr.create_catalog("pg_prod").await.unwrap();
+    let cat_b = mgr.create_catalog("mysql_prod").await.unwrap();
+
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    wa.set_data_path("/data").unwrap();
+
+    // Same `(schema, table)` identity in both catalogs.
+    let sa = wa
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        sa.table_id,
+        sa.snapshot_id,
+        &DataFileInfo::new("a.parquet", 1024, 10),
+    )
+    .unwrap();
+
+    let sb = wb
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        sb.table_id,
+        sb.snapshot_id,
+        &DataFileInfo::new("b.parquet", 2048, 20),
+    )
+    .unwrap();
+
+    // Drop only in catalog A.
+    let dropped = mgr
+        .drop_table_in_catalog("pg_prod", "public", "users")
+        .await
+        .unwrap();
+    assert!(dropped);
+
+    // Catalog A's table_id is tombstoned, catalog B's is not.
+    let a_end_snap: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_table WHERE table_id = $1")
+            .bind(sa.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(a_end_snap.is_some(), "catalog A's table must be tombstoned");
+
+    let b_end_snap: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_table WHERE table_id = $1")
+            .bind(sb.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        b_end_snap.is_none(),
+        "catalog B's same-named table must NOT be tombstoned"
+    );
+
+    // The drop snapshot is registered only under catalog A.
+    let drop_snap = a_end_snap.unwrap();
+    let owners: Vec<i64> =
+        sqlx::query("SELECT catalog_id FROM ducklake_catalog_snapshot_map WHERE snapshot_id = $1")
+            .bind(drop_snap)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get::<i64, _>(0).unwrap())
+            .collect();
+    assert_eq!(
+        owners,
+        vec![cat_a],
+        "drop snapshot must be registered only under the dropping catalog"
+    );
+}
