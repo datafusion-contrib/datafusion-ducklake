@@ -455,10 +455,7 @@ impl TableChangesTable {
             &resolved_path,
             validated_file_size(data_file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = data_file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(data_file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
