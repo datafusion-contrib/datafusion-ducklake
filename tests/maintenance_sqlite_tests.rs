@@ -16,7 +16,9 @@ use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::SqliteMetadataWriter;
-use datafusion_ducklake::maintenance::{CleanupCriteria, ExpireCriteria, cleanup_old_files_sqlite};
+use datafusion_ducklake::maintenance::{
+    CleanupCriteria, ExpireCriteria, cleanup_old_files_sqlite, delete_orphaned_files_sqlite,
+};
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 
 fn cols() -> Vec<ColumnDef> {
@@ -374,4 +376,132 @@ async fn expire_and_cleanup_no_op_paths() {
         .await
         .unwrap();
     assert!(cleaned.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// delete_orphaned_files
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_removes_unreferenced_keeps_referenced() {
+    let h = setup().await;
+    // One registered, referenced file.
+    let s = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s.table_id,
+            s.snapshot_id,
+            &DataFileInfo::new("referenced.parquet", 100, 5),
+        )
+        .unwrap();
+    write_physical_file(&h.data_path, "main", "t", "referenced.parquet");
+
+    // Drop a stray file alongside it that's NOT in the catalog.
+    write_physical_file(&h.data_path, "main", "t", "orphan.parquet");
+    // And a non-parquet file that must be ignored (only .parquet is swept).
+    std::fs::write(
+        h.data_path.join("main").join("t").join("README.txt"),
+        b"keep me",
+    )
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let orphan_path = h.data_path.join("main").join("t").join("orphan.parquet");
+    let ref_path = h
+        .data_path
+        .join("main")
+        .join("t")
+        .join("referenced.parquet");
+    let readme = h.data_path.join("main").join("t").join("README.txt");
+
+    // Dry run reports the orphan without touching disk.
+    let dry = delete_orphaned_files_sqlite(&h.writer, store.clone(), CleanupCriteria::All, true)
+        .await
+        .unwrap();
+    assert_eq!(dry.len(), 1);
+    assert!(
+        dry[0].ends_with("main/t/orphan.parquet"),
+        "got {:?}",
+        dry[0]
+    );
+    assert!(orphan_path.exists());
+
+    // Real run deletes only the orphan.
+    let done = delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(done.len(), 1);
+    assert!(!orphan_path.exists(), "orphan should be gone");
+    assert!(ref_path.exists(), "referenced file must survive");
+    assert!(readme.exists(), "non-parquet file must be ignored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_older_than_skips_recent_files() {
+    // Critical safety check: a file just written (in-flight) is newer than the
+    // cutoff and must be kept even though it's unreferenced. Matches the
+    // upstream `last_modified < older_than` guard.
+    let h = setup().await;
+    write_physical_file(&h.data_path, "main", "t", "fresh_orphan.parquet");
+    let fresh = h
+        .data_path
+        .join("main")
+        .join("t")
+        .join("fresh_orphan.parquet");
+    assert!(fresh.exists());
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let deleted =
+        delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::OlderThan(cutoff), false)
+            .await
+            .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "files newer than cutoff must not be deleted (got {deleted:?})"
+    );
+    assert!(fresh.exists(), "fresh orphan survives older_than filter");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_spares_files_pending_in_scheduled_table() {
+    // Files in `ducklake_files_scheduled_for_deletion` are "queued for
+    // cleanup_old_files" — they may still exist on disk. delete_orphaned_files
+    // must treat them as referenced so it doesn't race ahead and delete them
+    // (cleanup_old_files would then double-delete and remove the bookkeeping).
+    let h = setup().await;
+    write_physical_file(&h.data_path, "main", "t", "scheduled.parquet");
+
+    // Seed the scheduled-for-deletion table directly. This matches what
+    // `expire_snapshots` would have done — but we shortcut it for the test.
+    let p = pool(&h).await;
+    sqlx::query(
+        "INSERT INTO ducklake_files_scheduled_for_deletion
+             (data_file_id, path, path_is_relative, schedule_start)
+         VALUES (?, ?, 1, CURRENT_TIMESTAMP)",
+    )
+    .bind(42_i64)
+    .bind("main/t/scheduled.parquet")
+    .execute(&p)
+    .await
+    .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "files in scheduled-for-deletion must be considered referenced (got {deleted:?})"
+    );
+    assert!(
+        h.data_path
+            .join("main")
+            .join("t")
+            .join("scheduled.parquet")
+            .exists()
+    );
 }

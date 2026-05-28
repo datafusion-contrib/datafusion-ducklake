@@ -789,6 +789,34 @@ impl MulticatalogManager {
         .await?;
         Ok(())
     }
+
+    /// Every physical file referenced by **any** catalog in this metadata DB:
+    /// data files, delete files, and still-scheduled-for-deletion rows. Global
+    /// (no catalog filter) — orphan cleanup operates on the whole shared
+    /// `data_path` and must subtract every catalog's referenced files to avoid
+    /// deleting another catalog's data.
+    ///
+    /// Used by [`crate::maintenance::delete_orphaned_files_multicatalog`].
+    pub(crate) async fn list_referenced_paths(&self) -> Result<Vec<(String, bool)>> {
+        let q = format!(
+            "SELECT {PG_RESOLVED_PATH} AS p, {PG_REL_FLAG} AS rel
+             FROM ducklake_data_file df
+             JOIN ducklake_table t ON t.table_id = df.table_id
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             UNION ALL
+             SELECT {PG_RESOLVED_PATH} AS p, {PG_REL_FLAG} AS rel
+             FROM ducklake_delete_file df
+             JOIN ducklake_table t ON t.table_id = df.table_id
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             UNION ALL
+             SELECT path AS p, path_is_relative AS rel
+             FROM ducklake_files_scheduled_for_deletion"
+        );
+        let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
+        rows.into_iter()
+            .map(|r| Ok((r.try_get::<String, _>(0)?, r.try_get::<bool, _>(1)?)))
+            .collect()
+    }
 }
 
 /// Insert `(catalog_id, data_file_id, resolved_path, rel)` rows into

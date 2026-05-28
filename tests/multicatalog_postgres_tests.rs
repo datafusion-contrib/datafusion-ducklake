@@ -1904,3 +1904,189 @@ async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
     .unwrap();
     assert_eq!(b_left, 1, "B's scheduled row remains");
 }
+
+// ---------------------------------------------------------------------------
+// delete_orphaned_files_multicatalog
+// ---------------------------------------------------------------------------
+
+/// The flagship use case: `drop_catalog` hard-deletes all of A's metadata,
+/// leaving A's data files unreferenced on disk. The orphan sweep finds them
+/// (they have no catalog row pointing at them anywhere) and removes them.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn delete_orphaned_files_reclaims_dropped_catalog_files() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    wa.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // Register one data file and put the real bytes on disk.
+    let s = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+    )
+    .unwrap();
+    let dir = data_path.join("public").join("t");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f1 = dir.join("f1.parquet");
+    std::fs::write(&f1, b"parquet-bytes").unwrap();
+
+    // Drop catalog — metadata is hard-deleted, but the file is still on disk.
+    assert!(mgr.drop_catalog("cat_a").await.unwrap());
+    assert!(f1.exists(), "drop_catalog must not touch storage");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // Orphan sweep finds f1 (no metadata row references it anywhere) and removes it.
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted.len(), 1, "should find exactly the one orphan");
+    assert!(!f1.exists(), "drop_catalog orphan must be reclaimed");
+}
+
+/// Global sweep must NOT delete files referenced by ANY catalog. With two
+/// catalogs sharing `data_path` plus a stray, only the stray gets removed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    wa.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // A and B each have one referenced data file.
+    let sa = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        sa.table_id,
+        sa.snapshot_id,
+        &DataFileInfo::new("a.parquet", 100, 5),
+    )
+    .unwrap();
+    let sb = wb
+        .begin_write_transaction("public", "u", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        sb.table_id,
+        sb.snapshot_id,
+        &DataFileInfo::new("b.parquet", 100, 5),
+    )
+    .unwrap();
+
+    // Materialise the three files: A's referenced, B's referenced, one stray.
+    let a_file = data_path.join("public").join("t").join("a.parquet");
+    let b_file = data_path.join("public").join("u").join("b.parquet");
+    let stray = data_path.join("public").join("t").join("stray.parquet");
+    std::fs::create_dir_all(a_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
+    std::fs::write(&a_file, b"a").unwrap();
+    std::fs::write(&b_file, b"b").unwrap();
+    std::fs::write(&stray, b"stray").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted.len(), 1, "only the stray is unreferenced");
+    assert!(
+        deleted[0].ends_with("public/t/stray.parquet"),
+        "got {:?}",
+        deleted[0]
+    );
+    assert!(!stray.exists());
+    assert!(a_file.exists(), "A's referenced file survives");
+    assert!(b_file.exists(), "B's referenced file survives");
+}
+
+/// `OlderThan` cutoff applied to `last_modified` skips files newer than the
+/// cutoff. Mirrors the upstream `last_modified < older_than` guard so in-flight
+/// writes from concurrent transactions aren't reaped.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn delete_orphaned_files_older_than_skips_recent_files() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("cat").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    w.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // Stray file written just now — newer than the cutoff below.
+    let stray = data_path.join("fresh.parquet");
+    std::fs::write(&stray, b"fresh").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // Cutoff is 1h in the past — the file's last_modified is way newer, so it
+    // must NOT be deleted.
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let deleted = delete_orphaned_files_multicatalog(
+        &mgr,
+        store.clone(),
+        CleanupCriteria::OlderThan(cutoff),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "files newer than cutoff must be skipped (got {deleted:?})"
+    );
+    assert!(stray.exists(), "fresh stray survives older_than filter");
+
+    // Sanity: with `All`, the same file IS deleted.
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert!(!stray.exists());
+}
