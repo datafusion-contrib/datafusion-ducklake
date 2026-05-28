@@ -3,6 +3,9 @@
 //! Requires multi-threaded Tokio runtime (`#[tokio::test(flavor = "multi_thread")]`).
 
 use crate::Result;
+use crate::maintenance::{
+    CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
+};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
@@ -11,6 +14,16 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
+
+/// Render a slice of ids as a SQL `IN (...)` body. Safe to interpolate because
+/// the values are `i64` (no injection surface) — same approach the upstream
+/// DuckLake C++ takes, and the only option since SQLite lacks array binds.
+fn id_list(ids: &[i64]) -> String {
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 const SQL_CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
@@ -105,6 +118,20 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER
 );
+
+-- Files queued for physical deletion by the two-phase vacuum (DuckLake spec).
+-- `expire_snapshots` GCs unreachable catalog rows and records the orphaned
+-- physical paths here; `cleanup_old_files` deletes the objects and removes
+-- these rows. `path` is stored relative to the catalog `data_path` root
+-- (i.e. already resolved through schema/table) so cleanup needs only a
+-- single-level join with `data_path`. Mirrors the upstream
+-- `ducklake_files_scheduled_for_deletion` table.
+CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
+    data_file_id INTEGER NOT NULL,
+    path VARCHAR NOT NULL,
+    path_is_relative BOOLEAN NOT NULL DEFAULT 1,
+    schedule_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 "#;
 
 /// SQLite-based metadata writer for DuckLake catalogs.
@@ -136,6 +163,370 @@ impl SqliteMetadataWriter {
         writer.initialize_schema()?;
         Ok(writer)
     }
+
+    /// Tombstone a live table at a new "drop snapshot".
+    ///
+    /// Allocates a fresh snapshot and sets `end_snapshot = <drop snapshot>` on the
+    /// currently-live rows for the named table in `ducklake_table`,
+    /// `ducklake_column`, `ducklake_data_file`, and `ducklake_delete_file`. Reads at
+    /// any snapshot `>=` the drop snapshot no longer see the table; earlier snapshots
+    /// are unaffected (time travel preserved). This is the single-catalog mirror of
+    /// [`crate::multicatalog::MulticatalogManager::drop_table_in_catalog`].
+    ///
+    /// Idempotent: returns `Ok(false)` (no snapshot allocated) when no live
+    /// `(schema, table)` pair exists. Physical data files are not removed — that is
+    /// the job of [`Self::expire_snapshots`] + [`crate::maintenance::cleanup_old_files_sqlite`].
+    ///
+    /// The table's `ducklake_table_stats` row is intentionally left in place:
+    /// `next_row_id` must stay monotonic across the table's lifetime, and a
+    /// recreate-after-drop gets a fresh `table_id`. The orphaned stats row is
+    /// reclaimed by [`Self::expire_snapshots`] once the table is fully expired.
+    pub fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(table_name, "Table")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Resolve the live table_id. `end_snapshot IS NULL` on both schema and
+            // table makes an already-dropped table a no-op (idempotent).
+            let table_id: i64 = match sqlx::query(
+                "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                   AND t.table_name = ? AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(r) => r.try_get(0)?,
+                None => {
+                    tx.commit().await?;
+                    return Ok(false);
+                },
+            };
+
+            let drop_snapshot: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+
+            for child in
+                ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
+            {
+                sqlx::query(&format!(
+                    "UPDATE {child} SET end_snapshot = ?
+                     WHERE table_id = ? AND end_snapshot IS NULL"
+                ))
+                .bind(drop_snapshot)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(true)
+        })
+    }
+
+    /// Expire snapshots and garbage-collect the catalog metadata they leave behind.
+    ///
+    /// Ports the official `ducklake_expire_snapshots` / `DuckLakeMetadataManager::DeleteSnapshots`.
+    /// The most recent snapshot is never expired. After deleting the chosen snapshot
+    /// rows, every table / data file / delete file no longer reachable by any surviving
+    /// snapshot is removed from the catalog and its physical path is recorded in
+    /// `ducklake_files_scheduled_for_deletion` for later physical deletion via
+    /// [`crate::maintenance::cleanup_old_files_sqlite`]. Returns the expired snapshots.
+    ///
+    /// Reachability is global here — correct for a single-catalog SQLite metadata DB.
+    /// The whole operation runs in one transaction, so a crash can't leave scheduled
+    /// rows out of sync with the catalog.
+    pub fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // The most recent snapshot is never expirable.
+            let most_recent: Option<i64> =
+                sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+            let most_recent = match most_recent {
+                Some(id) => id,
+                None => {
+                    tx.commit().await?;
+                    return Ok(Vec::new());
+                },
+            };
+
+            // 1. Resolve the snapshots to expire (excluding the most recent).
+            let candidates: Vec<ExpiredSnapshot> = match &criteria {
+                ExpireCriteria::Versions(versions) => {
+                    let ids: Vec<i64> = versions
+                        .iter()
+                        .copied()
+                        .filter(|&v| v != most_recent)
+                        .collect();
+                    if ids.is_empty() {
+                        tx.commit().await?;
+                        return Ok(Vec::new());
+                    }
+                    let rows = sqlx::query(&format!(
+                        "SELECT snapshot_id, snapshot_time FROM ducklake_snapshot
+                         WHERE snapshot_id IN ({}) ORDER BY snapshot_id",
+                        id_list(&ids)
+                    ))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    rows_to_snapshots(rows)?
+                },
+                ExpireCriteria::OlderThan(ts) => {
+                    let rows = sqlx::query(
+                        "SELECT snapshot_id, snapshot_time FROM ducklake_snapshot
+                         WHERE snapshot_id != ? AND snapshot_time < ? ORDER BY snapshot_id",
+                    )
+                    .bind(most_recent)
+                    .bind(format_sql_timestamp(ts))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    rows_to_snapshots(rows)?
+                },
+            };
+            if candidates.is_empty() {
+                tx.commit().await?;
+                return Ok(Vec::new());
+            }
+            let expire_ids: Vec<i64> = candidates.iter().map(|s| s.snapshot_id).collect();
+
+            // 2. Delete the snapshot rows themselves.
+            sqlx::query(&format!(
+                "DELETE FROM ducklake_snapshot WHERE snapshot_id IN ({})",
+                id_list(&expire_ids)
+            ))
+            .execute(&mut *tx)
+            .await?;
+
+            // 3. Tables whose lifetime is no longer covered by any surviving snapshot
+            //    AND which have no surviving live version.
+            let dead_tables: Vec<i64> = sqlx::query(
+                "SELECT t.table_id FROM ducklake_table t
+                 WHERE t.end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= t.begin_snapshot AND snapshot_id < t.end_snapshot)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_table t2
+                     WHERE t2.table_id = t.table_id
+                       AND (t2.end_snapshot IS NULL OR EXISTS (
+                           SELECT 1 FROM ducklake_snapshot
+                           WHERE snapshot_id >= t2.begin_snapshot
+                             AND snapshot_id < t2.end_snapshot)))",
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|r| r.try_get::<i64, _>(0))
+            .collect::<std::result::Result<_, _>>()?;
+            let dead_table_filter = if dead_tables.is_empty() {
+                "0".to_string()
+            } else {
+                format!("df.table_id IN ({})", id_list(&dead_tables))
+            };
+
+            // 4. Data files no longer referenced by any surviving snapshot (or belonging
+            //    to a dead table): schedule their physical paths, then drop the rows.
+            let dead_data_files = sqlx::query(&format!(
+                "SELECT df.data_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
+                 FROM ducklake_data_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE ({dead_table_filter}) OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
+            ))
+            .fetch_all(&mut *tx)
+            .await?;
+            let data_file_ids = schedule_files(&mut tx, dead_data_files).await?;
+            if !data_file_ids.is_empty() {
+                sqlx::query(&format!(
+                    "DELETE FROM ducklake_data_file WHERE data_file_id IN ({})",
+                    id_list(&data_file_ids)
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // 5. Delete files orphaned by the data files above, by a dead table, or no
+            //    longer referenced by any surviving snapshot. (Our writer does not emit
+            //    delete files yet, so this is a no-op for catalogs we produce.)
+            let dead_data_filter = if data_file_ids.is_empty() {
+                "0".to_string()
+            } else {
+                format!("df.data_file_id IN ({})", id_list(&data_file_ids))
+            };
+            let dead_delete_table_filter = if dead_tables.is_empty() {
+                "0".to_string()
+            } else {
+                format!("df.table_id IN ({})", id_list(&dead_tables))
+            };
+            let dead_delete_files = sqlx::query(&format!(
+                "SELECT df.delete_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
+                 FROM ducklake_delete_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE ({dead_data_filter}) OR ({dead_delete_table_filter})
+                    OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
+                        SELECT 1 FROM ducklake_snapshot
+                        WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
+            ))
+            .fetch_all(&mut *tx)
+            .await?;
+            let delete_file_ids = schedule_files(&mut tx, dead_delete_files).await?;
+            if !delete_file_ids.is_empty() {
+                sqlx::query(&format!(
+                    "DELETE FROM ducklake_delete_file WHERE delete_file_id IN ({})",
+                    id_list(&delete_file_ids)
+                ))
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // 6. Reclaim per-table metadata for fully-expired tables (this is where a
+            //    dropped table's orphaned ducklake_table_stats row is removed).
+            if !dead_tables.is_empty() {
+                let dead = id_list(&dead_tables);
+                for table in ["ducklake_table", "ducklake_table_stats", "ducklake_column"] {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE table_id IN ({dead})"))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+
+            // 7. Reclaim schemas no longer covered by any surviving snapshot.
+            sqlx::query(
+                "DELETE FROM ducklake_schema
+                 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= ducklake_schema.begin_snapshot
+                       AND snapshot_id < ducklake_schema.end_snapshot)",
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(candidates)
+        })
+    }
+
+    /// List files scheduled for physical deletion, optionally filtered by schedule time.
+    pub(crate) fn list_scheduled_for_deletion(
+        &self,
+        criteria: &CleanupCriteria,
+    ) -> Result<Vec<ScheduledFile>> {
+        block_on(async {
+            let rows = match criteria {
+                CleanupCriteria::All => {
+                    sqlx::query(
+                        "SELECT data_file_id, path, path_is_relative
+                     FROM ducklake_files_scheduled_for_deletion",
+                    )
+                    .fetch_all(&self.pool)
+                    .await?
+                },
+                CleanupCriteria::OlderThan(ts) => {
+                    sqlx::query(
+                        "SELECT data_file_id, path, path_is_relative
+                     FROM ducklake_files_scheduled_for_deletion
+                     WHERE schedule_start < ?",
+                    )
+                    .bind(format_sql_timestamp(ts))
+                    .fetch_all(&self.pool)
+                    .await?
+                },
+            };
+            rows.into_iter()
+                .map(|r| {
+                    Ok(ScheduledFile {
+                        data_file_id: r.try_get(0)?,
+                        path: r.try_get(1)?,
+                        path_is_relative: r.try_get::<i64, _>(2)? != 0,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    /// Remove scheduled-deletion bookkeeping rows after their objects are gone.
+    pub(crate) fn remove_scheduled(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        block_on(async {
+            sqlx::query(&format!(
+                "DELETE FROM ducklake_files_scheduled_for_deletion WHERE data_file_id IN ({})",
+                id_list(ids)
+            ))
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+/// SQL expression yielding a file path resolved relative to the catalog `data_path`
+/// root, mirroring the read-side hierarchical resolution (file → table → schema →
+/// data_path). An absolute path anywhere in the chain short-circuits to that absolute
+/// path. Assumes `/`-joined relative names (everything our writer produces).
+const RESOLVED_PATH: &str = "CASE
+    WHEN NOT df.path_is_relative THEN df.path
+    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
+    ELSE s.path || '/' || t.path || '/' || df.path
+END";
+
+/// Companion to [`RESOLVED_PATH`]: 1 only when the whole chain is relative (so the
+/// resolved path is relative to `data_path`), else 0 (the resolved path is absolute).
+const REL_FLAG: &str =
+    "(CASE WHEN df.path_is_relative AND t.path_is_relative AND s.path_is_relative
+           THEN 1 ELSE 0 END)";
+
+/// Map `(snapshot_id, snapshot_time)` rows to [`ExpiredSnapshot`]s.
+fn rows_to_snapshots(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Vec<ExpiredSnapshot>> {
+    rows.into_iter()
+        .map(|r| {
+            Ok(ExpiredSnapshot {
+                snapshot_id: r.try_get(0)?,
+                snapshot_time: r.try_get(1)?,
+            })
+        })
+        .collect()
+}
+
+/// Insert `(id, resolved_path, rel)` rows (as produced by [`RESOLVED_PATH`]/[`REL_FLAG`])
+/// into `ducklake_files_scheduled_for_deletion` and return the ids scheduled.
+async fn schedule_files(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+) -> Result<Vec<i64>> {
+    let mut ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i64 = row.try_get(0)?;
+        let path: String = row.try_get(1)?;
+        let rel: i64 = row.try_get(2)?;
+        sqlx::query(
+            "INSERT INTO ducklake_files_scheduled_for_deletion
+                 (data_file_id, path, path_is_relative, schedule_start)
+             VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+        )
+        .bind(id)
+        .bind(&path)
+        .bind(rel)
+        .execute(&mut **tx)
+        .await?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 impl MetadataWriter for SqliteMetadataWriter {

@@ -1830,6 +1830,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "base64 0.22.1",
+ "chrono",
  "datafusion",
  "duckdb",
  "futures",
