@@ -1275,3 +1275,455 @@ async fn drop_table_in_catalog_isolates_other_catalogs() {
         "drop snapshot must be registered only under the dropping catalog"
     );
 }
+
+// ---------------------------------------------------------------------------
+// expire_snapshots_in_catalog / cleanup_old_files_in_catalog
+// ---------------------------------------------------------------------------
+
+/// Write three Replace generations of one table for `writer`, returning the table id and
+/// the three snapshot ids. The first two data files end up superseded (end-snapshotted).
+fn three_generations(
+    writer: &PostgresMetadataWriter,
+    schema: &str,
+    table: &str,
+) -> (i64, i64, i64, i64) {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let s1 = writer
+        .begin_write_transaction(schema, table, &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            s1.table_id,
+            s1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 100, 5),
+        )
+        .unwrap();
+    let s2 = writer
+        .begin_write_transaction(schema, table, &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            s2.table_id,
+            s2.snapshot_id,
+            &DataFileInfo::new("f2.parquet", 100, 5),
+        )
+        .unwrap();
+    let s3 = writer
+        .begin_write_transaction(schema, table, &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            s3.table_id,
+            s3.snapshot_id,
+            &DataFileInfo::new("f3.parquet", 100, 5),
+        )
+        .unwrap();
+    (s1.table_id, s1.snapshot_id, s2.snapshot_id, s3.snapshot_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_in_catalog_empty_for_most_recent_and_unknown() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let s = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+    )
+    .unwrap();
+
+    // The only snapshot is the most recent — never expirable.
+    let expired = mgr
+        .expire_snapshots_in_catalog("pg_prod", ExpireCriteria::Versions(vec![s.snapshot_id]))
+        .await
+        .unwrap();
+    assert!(expired.is_empty());
+
+    // Unknown catalog is a no-op.
+    let none = mgr
+        .expire_snapshots_in_catalog("ghost", ExpireCriteria::Versions(vec![1]))
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_in_catalog_by_version_schedules_orphaned_file() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let (_tid, s1, _s2, _s3) = three_generations(&w, "public", "t");
+
+    let expired = mgr
+        .expire_snapshots_in_catalog("pg_prod", ExpireCriteria::Versions(vec![s1]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].snapshot_id, s1);
+
+    // Snapshot row and its catalog map row are both gone.
+    let snap_rows: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(s1)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(snap_rows, 0);
+    let map_rows: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_catalog_snapshot_map WHERE snapshot_id = $1")
+            .bind(s1)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(map_rows, 0, "no orphan snapshot-map row");
+
+    // f1 was scheduled, tagged with this catalog and the data_path-relative path.
+    let scheduled: Vec<(i64, String, bool)> = sqlx::query(
+        "SELECT catalog_id, path, path_is_relative FROM ducklake_files_scheduled_for_deletion",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<i64, _>(0).unwrap(),
+            r.try_get::<String, _>(1).unwrap(),
+            r.try_get::<bool, _>(2).unwrap(),
+        )
+    })
+    .collect();
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].0, cat);
+    assert_eq!(scheduled[0].1, "public/t/f1.parquet");
+    assert!(scheduled[0].2);
+
+    // f1's catalog row is gone; f2/f3 remain.
+    let live_files: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(live_files, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_in_catalog_full_after_drop_removes_table_metadata() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let s = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+    )
+    .unwrap();
+
+    // Drop allocates a second snapshot; expire the first (the drop snapshot is kept).
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "public", "t")
+            .await
+            .unwrap()
+    );
+    let expired = mgr
+        .expire_snapshots_in_catalog("pg_prod", ExpireCriteria::Versions(vec![s.snapshot_id]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+
+    for tbl in
+        ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_schema_versions"]
+    {
+        let cnt: i64 = sqlx::query(&format!("SELECT COUNT(*) FROM {tbl} WHERE table_id = $1"))
+            .bind(s.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+        assert_eq!(cnt, 0, "{tbl} fully reclaimed after expire");
+    }
+    let scheduled: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        scheduled, 1,
+        "the table's data file was scheduled for deletion"
+    );
+}
+
+/// The critical scoping regression: a data file in catalog A whose `[begin, end)` global
+/// snapshot range *contains* a snapshot belonging to catalog B must still be GC'd when A
+/// expires — a globally-scoped reachability check would wrongly keep it alive.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_in_catalog_is_scoped_to_catalog() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    wa.set_data_path("/data").unwrap();
+
+    // Interleave so B's snapshot sits between A's two snapshots:
+    //   a1 (A) < b1 (B) < a2 (A)  → A/f1 lives in [a1, a2), which contains b1.
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a1.table_id,
+        a1.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+    )
+    .unwrap();
+    let b1 = wb
+        .begin_write_transaction("public", "u", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        b1.table_id,
+        b1.snapshot_id,
+        &DataFileInfo::new("g1.parquet", 100, 5),
+    )
+    .unwrap();
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 100, 5),
+    )
+    .unwrap();
+    assert!(
+        b1.snapshot_id > a1.snapshot_id && b1.snapshot_id < a2.snapshot_id,
+        "test setup: B's snapshot must fall inside A/f1's lifetime range"
+    );
+
+    let expired = mgr
+        .expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![a1.snapshot_id]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+
+    // A/f1 was scheduled despite B's snapshot being in its global range (proves scoping).
+    let a_scheduled: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_a)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(
+        a_scheduled, 1,
+        "A/f1 must be GC'd — catalog-scoped reachability"
+    );
+
+    // Catalog B is entirely untouched.
+    let b_snap: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot WHERE snapshot_id = $1")
+        .bind(b1.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(b_snap, 1, "B's snapshot survives");
+    let b_files: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(b1.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_files, 1, "B's data file untouched");
+    let b_scheduled: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_scheduled, 0, "nothing scheduled for B");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    wa.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // A: two generations of public.t (f1 superseded by f2). B: two of public.u.
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a1.table_id,
+        a1.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+    )
+    .unwrap();
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 100, 5),
+    )
+    .unwrap();
+    let b1 = wb
+        .begin_write_transaction("public", "u", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        b1.table_id,
+        b1.snapshot_id,
+        &DataFileInfo::new("g1.parquet", 100, 5),
+    )
+    .unwrap();
+    let b2 = wb
+        .begin_write_transaction("public", "u", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.register_data_file(
+        b2.table_id,
+        b2.snapshot_id,
+        &DataFileInfo::new("g2.parquet", 100, 5),
+    )
+    .unwrap();
+
+    // Materialize the physical files.
+    for (sch, tbl, name) in [
+        ("public", "t", "f1.parquet"),
+        ("public", "t", "f2.parquet"),
+        ("public", "u", "g1.parquet"),
+        ("public", "u", "g2.parquet"),
+    ] {
+        let dir = data_path.join(sch).join(tbl);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), b"parquet-bytes").unwrap();
+    }
+
+    // Expire the first snapshot of each catalog so each has one scheduled file.
+    mgr.expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![a1.snapshot_id]))
+        .await
+        .unwrap();
+    mgr.expire_snapshots_in_catalog("cat_b", ExpireCriteria::Versions(vec![b1.snapshot_id]))
+        .await
+        .unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let a_f1 = data_path.join("public").join("t").join("f1.parquet");
+    let b_g1 = data_path.join("public").join("u").join("g1.parquet");
+
+    // Dry run for A reports its one file without deleting.
+    let dry =
+        cleanup_old_files_in_catalog(&mgr, "cat_a", store.clone(), CleanupCriteria::All, true)
+            .await
+            .unwrap();
+    assert_eq!(dry.len(), 1);
+    assert!(a_f1.exists());
+
+    // Real cleanup for A removes only A's file + bookkeeping row.
+    let done = cleanup_old_files_in_catalog(&mgr, "cat_a", store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(done.len(), 1);
+    assert!(!a_f1.exists(), "A/f1 deleted");
+    assert!(b_g1.exists(), "B/g1 untouched by A's cleanup");
+
+    let a_left: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_a)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(a_left, 0, "A's scheduled row cleared");
+    let b_left: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(b_left, 1, "B's scheduled row remains");
+}

@@ -118,6 +118,26 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
         table_id BIGINT NOT NULL,
         UNIQUE (table_id, begin_snapshot)
     )"#,
+    // Files queued for physical deletion by the two-phase vacuum (DuckLake
+    // spec). `expire_snapshots_in_catalog` GCs unreachable catalog rows and
+    // records the orphaned physical paths here; `cleanup_old_files` deletes
+    // the objects and removes these rows. `path` is stored relative to the
+    // catalog `data_path` root (already resolved through schema/table) so
+    // cleanup needs only a single-level join with `data_path`.
+    //
+    // Deviation from the single-catalog upstream schema: `catalog_id` scopes
+    // each scheduled file to its catalog. Without it cleanup couldn't tell
+    // catalogs apart — the data-file rows it would otherwise join against are
+    // already deleted by the time the file is scheduled.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
+        catalog_id BIGINT NOT NULL,
+        data_file_id BIGINT NOT NULL,
+        path VARCHAR NOT NULL,
+        path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
+        schedule_start TIMESTAMPTZ DEFAULT NOW()
+    )"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
+        ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_catalog_snapshot_map_snapshot
         ON ducklake_catalog_snapshot_map(snapshot_id)"#,
     r#"CREATE INDEX IF NOT EXISTS idx_catalog_schema_map_schema

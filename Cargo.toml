@@ -35,6 +35,8 @@ hex = { version = "0.4", optional = true }
 
 # Write support (optional)
 uuid = { version = "1.0", features = ["v4"], optional = true }
+# Used by the maintenance API (ExpireCriteria/CleanupCriteria OlderThan).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 # Metadata providers (optional)
 duckdb = { version = "1.4.1", optional = true }
@@ -70,7 +72,7 @@ duckdb-bundled = ["metadata-duckdb", "duckdb/bundled"]
 encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64", "dep:hex"]
 
 # Write support
-write = ["dep:uuid"]
+write = ["dep:uuid", "dep:chrono"]
 write-sqlite = ["write", "metadata-sqlite"]
 write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
 # Multicatalog read provider (independent of write support)
@@ -89,3 +91,7 @@ required-features = ["metadata-duckdb", "metadata-postgres"]
 [[example]]
 name = "multicatalog_write"
 required-features = ["write-postgres"]
+
+[[example]]
+name = "maintenance_demo"
+required-features = ["write-sqlite"]

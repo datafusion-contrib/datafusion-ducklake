@@ -65,6 +65,8 @@ pub mod metadata_provider_sqlite;
 #[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
+pub mod maintenance;
+#[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres;
