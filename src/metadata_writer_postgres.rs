@@ -76,6 +76,19 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
     )"#,
+    // Per-table running counters maintained inside the writer's transaction
+    // so concurrent writes hand out non-overlapping rowid ranges. `next_row_id`
+    // increases monotonically over the table's lifetime (rowids are never
+    // reused, even after end-snapshot); `record_count` and `file_size_bytes`
+    // mirror the currently-visible totals so DuckDB's `ducklake_table_info`
+    // aggregate sees correct numbers for tables this writer produced. Mirrors
+    // the sqlite writer's `ducklake_table_stats`.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_table_stats (
+        table_id BIGINT PRIMARY KEY,
+        record_count BIGINT NOT NULL DEFAULT 0,
+        next_row_id BIGINT NOT NULL DEFAULT 0,
+        file_size_bytes BIGINT NOT NULL DEFAULT 0
+    )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_delete_file (
         delete_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         data_file_id BIGINT NOT NULL,
@@ -453,13 +466,39 @@ impl MetadataWriter for PostgresMetadataWriter {
         file: &DataFileInfo,
     ) -> Result<i64> {
         block_on(async {
+            // Allocate row_id_start from the table's monotonic counter inside
+            // the same transaction so concurrent writers can't hand out
+            // overlapping ranges. The DuckLake row-lineage read path
+            // (RowIdExec) hard-errors on files where row_id_start is NULL and
+            // no embedded `_ducklake_internal_row_id` column is present, so
+            // every file we write must carry a value. Falls back to inserting
+            // a fresh stats row (next_row_id = 0) for tables created before
+            // this writer started maintaining `ducklake_table_stats`.
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
+            sqlx::query(
+                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES ($1, 0, 0, 0)
+                 ON CONFLICT (table_id) DO NOTHING",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let stats_row =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let row_id_start: i64 = stats_row.try_get(0)?;
+
             let row = sqlx::query(
-                "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, footer_size, record_count, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING data_file_id",
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -467,10 +506,28 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
+            .bind(row_id_start)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
             let id: i64 = row.try_get(0)?;
+
+            // Advance the counter and accumulate stats. `next_row_id`
+            // monotonically increases over the table's lifetime — rowids
+            // are never reused, even after end-snapshot.
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + $1,
+                     record_count    = record_count + $2,
+                     file_size_bytes = file_size_bytes + $3
+                 WHERE table_id = $4",
+            )
+            .bind(file.record_count)
+            .bind(file.record_count)
+            .bind(file.file_size_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
 
             tx.commit().await?;
             Ok(id)
@@ -478,6 +535,11 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
+        // Used by WriteMode::Replace. End-snapshotting every visible file
+        // drops the table's currently-visible row count and byte total to
+        // zero (the new files written next will rebuild them). `next_row_id`
+        // is deliberately NOT reset: rowids must stay monotonic across the
+        // table's lifetime so historical snapshots still resolve uniquely.
         block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
@@ -492,6 +554,15 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
             let n = result.rows_affected();
+
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET record_count = 0, file_size_bytes = 0
+                 WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
 
             tx.commit().await?;
             Ok(n)
@@ -796,6 +867,28 @@ impl MetadataWriter for PostgresMetadataWriter {
                      WHERE table_id = $2 AND end_snapshot IS NULL",
                 )
                 .bind(snapshot_id)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                // Mirror end_table_files: drop visible row/byte totals to
+                // zero while keeping next_row_id monotonic. Seed the row
+                // first in case this is a Replace on a brand-new table.
+                sqlx::query(
+                    "INSERT INTO ducklake_table_stats
+                         (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES ($1, 0, 0, 0)
+                     ON CONFLICT (table_id) DO NOTHING",
+                )
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET record_count = 0, file_size_bytes = 0
+                     WHERE table_id = $1",
+                )
                 .bind(table_id)
                 .execute(&mut *tx)
                 .await?;

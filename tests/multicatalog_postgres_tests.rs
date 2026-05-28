@@ -1275,3 +1275,180 @@ async fn drop_table_in_catalog_isolates_other_catalogs() {
         "drop snapshot must be registered only under the dropping catalog"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Row lineage / row_id_start coverage for the postgres writer. The read path
+// (RowIdExec) hard-errors on data files whose row_id_start is NULL and have
+// no embedded `_ducklake_internal_row_id` column, so the writer must populate
+// the column on every file it produces. These tests pin that contract.
+// ---------------------------------------------------------------------------
+
+async fn read_row_id_start(pool: &PgPool, file_id: i64) -> Option<i64> {
+    sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = $1")
+        .bind(file_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap()
+}
+
+async fn read_table_stats(pool: &PgPool, table_id: i64) -> (i64, i64, i64) {
+    let row = sqlx::query(
+        "SELECT record_count, next_row_id, file_size_bytes
+         FROM ducklake_table_stats WHERE table_id = $1",
+    )
+    .bind(table_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        row.try_get(0).unwrap(),
+        row.try_get(1).unwrap(),
+        row.try_get(2).unwrap(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_data_file_assigns_non_overlapping_row_id_start() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_rowid").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let setup = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // Three files of 100, 50, 200 rows -> row_id_start = 0, 100, 150;
+    // next_row_id = 350 after all three.
+    let f1 = w
+        .register_data_file(
+            setup.table_id,
+            setup.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 4096, 100),
+        )
+        .unwrap();
+    let f2 = w
+        .register_data_file(
+            setup.table_id,
+            setup.snapshot_id,
+            &DataFileInfo::new("f2.parquet", 2048, 50),
+        )
+        .unwrap();
+    let f3 = w
+        .register_data_file(
+            setup.table_id,
+            setup.snapshot_id,
+            &DataFileInfo::new("f3.parquet", 8192, 200),
+        )
+        .unwrap();
+
+    assert_eq!(read_row_id_start(&pool, f1).await, Some(0));
+    assert_eq!(read_row_id_start(&pool, f2).await, Some(100));
+    assert_eq!(read_row_id_start(&pool, f3).await, Some(150));
+
+    let (records, next, bytes) = read_table_stats(&pool, setup.table_id).await;
+    assert_eq!(records, 350);
+    assert_eq!(next, 350);
+    assert_eq!(bytes, 4096 + 2048 + 8192);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn replace_preserves_next_row_id_monotonic() {
+    // rowids must never be reused, even across WriteMode::Replace cycles.
+    // begin_write_transaction(Replace) end-snapshots the prior generation's
+    // files and clears record_count / file_size_bytes, but next_row_id stays
+    // put — so the first file of the new generation continues where the old
+    // generation left off.
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_replace").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let s1 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    w.register_data_file(
+        s1.table_id,
+        s1.snapshot_id,
+        &DataFileInfo::new("g1.parquet", 1024, 5),
+    )
+    .unwrap();
+    let (rc1, next1, _) = read_table_stats(&pool, s1.table_id).await;
+    assert_eq!(rc1, 5);
+    assert_eq!(next1, 5);
+
+    // Second Replace ends the first generation's files and resets visible
+    // totals to zero while preserving next_row_id.
+    let s2 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    let (rc2, next2, bytes2) = read_table_stats(&pool, s2.table_id).await;
+    assert_eq!(rc2, 0, "record_count must reset on Replace");
+    assert_eq!(next2, 5, "next_row_id must NOT reset on Replace");
+    assert_eq!(bytes2, 0);
+
+    // The first file of the new generation picks up at 5.
+    let f2_id = w
+        .register_data_file(
+            s2.table_id,
+            s2.snapshot_id,
+            &DataFileInfo::new("g2.parquet", 2048, 2),
+        )
+        .unwrap();
+    assert_eq!(
+        read_row_id_start(&pool, f2_id).await,
+        Some(5),
+        "post-replace files must start at the preserved counter, not 0",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_data_file_self_initialises_stats_for_legacy_tables() {
+    // Defensive path: a table that existed before this writer maintained
+    // ducklake_table_stats. The first register_data_file must self-initialise
+    // the stats row at 0 rather than fail with "no row".
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_legacy").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let setup = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // Simulate "legacy" state by removing whatever stats row may have been
+    // pre-populated. begin_write_transaction doesn't currently insert one,
+    // but being explicit keeps the test meaningful if that changes.
+    sqlx::query("DELETE FROM ducklake_table_stats WHERE table_id = $1")
+        .bind(setup.table_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let file_id = w
+        .register_data_file(
+            setup.table_id,
+            setup.snapshot_id,
+            &DataFileInfo::new("a.parquet", 50, 4),
+        )
+        .unwrap();
+    assert_eq!(read_row_id_start(&pool, file_id).await, Some(0));
+    let (records, next, _) = read_table_stats(&pool, setup.table_id).await;
+    assert_eq!(records, 4);
+    assert_eq!(next, 4);
+}
