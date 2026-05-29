@@ -220,8 +220,13 @@ async fn run_orphan_cleanup(
         }
     }
 
+    // Return absolute-style paths (leading `/`) to match `cleanup_old_files`'s
+    // return shape and the official `ducklake_delete_orphaned_files` output.
+    // ObjectPath strips the leading slash for object-store canonical form, so
+    // we add it back at the API boundary. The OS-level delete still uses the
+    // ObjectPath directly.
     if dry_run {
-        return Ok(orphans.into_iter().map(|p| p.to_string()).collect());
+        return Ok(orphans.into_iter().map(|p| format!("/{p}")).collect());
     }
 
     let mut deleted = Vec::with_capacity(orphans.len());
@@ -234,7 +239,7 @@ async fn run_orphan_cleanup(
             }) => {},
             Err(e) => return Err(e.into()),
         }
-        deleted.push(orphan.to_string());
+        deleted.push(format!("/{orphan}"));
     }
     Ok(deleted)
 }

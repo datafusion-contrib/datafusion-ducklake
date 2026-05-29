@@ -6,6 +6,7 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -503,5 +504,307 @@ async fn delete_orphaned_files_spares_files_pending_in_scheduled_table() {
             .join("t")
             .join("scheduled.parquet")
             .exists()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// delete_orphaned_files — edge-case contract coverage
+//
+// The orphan sweep relies on three implicit invariants that the happy-path
+// tests above don't exercise:
+//
+//   * `object_store::Path` normalises consecutive slashes, so a relative path
+//     starting with `/` (which the `RESOLVED_PATH` SQL CASE can emit when
+//     `s.path = ''`) still matches the listing for the same physical file.
+//   * `resolve_path` short-circuits when `path_is_relative = false`, so a
+//     data-file row whose `path` is absolute is keyed by that absolute path
+//     verbatim — and must still match `object_store.list`'s key for the same
+//     file when the file happens to live under `data_path`.
+//   * `object_store.list(Some(&prefix))` recurses into subdirectories — a
+//     hive-partitioned layout (`year=…/month=…/file.parquet`) must be fully
+//     visible.
+//
+// Plus two operational corners worth pinning down:
+//
+//   * `dry_run` and the real run return identical path sets — they take
+//     separate code paths inside `run_orphan_cleanup`.
+//   * `CleanupCriteria::All` against an empty catalog deletes every
+//     `.parquet` in `data_path`. Documented behaviour (mirrors the official
+//     `cleanup_all => true`), made explicit here so anyone changing the
+//     safety story sees the footgun directly.
+// ---------------------------------------------------------------------------
+
+/// Schema rows with `path = ''` (the DDL default) make the `RESOLVED_PATH`
+/// SQL emit a leading-slash relative path (`'' || '/' || t || '/' || f`).
+/// After `join_paths(base_key, "/t/f")` we get a path with a double slash.
+/// `ObjectPath::from(...)` normalises that to the single-slash form, which
+/// matches what `object_store.list` returns for the same file. This test
+/// locks the contract in case ObjectPath's normalisation ever weakens.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_handles_empty_schema_path() {
+    let h = setup().await;
+    let p = pool(&h).await;
+
+    // Bypass `begin_write_transaction` — it always passes `schema_name` as
+    // `path`, so we'd never naturally produce an empty `s.path`. Insert
+    // the catalog skeleton directly to exercise the DDL default.
+    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_time) VALUES (CURRENT_TIMESTAMP)")
+        .execute(&p)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
+         VALUES ('s', '', 1, 1)",
+    )
+    .execute(&p)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 't', 't', 1, 1)",
+    )
+    .execute(&p)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, record_count, begin_snapshot)
+         VALUES (1, 'f.parquet', 1, 100, 5, 1)",
+    )
+    .execute(&p)
+    .await
+    .unwrap();
+
+    // With s.path='' the resolved path collapses to `<data_path>/t/f.parquet`
+    // (the empty schema contributes nothing). The physical file lives there.
+    let dir = h.data_path.join("t");
+    std::fs::create_dir_all(&dir).unwrap();
+    let referenced = dir.join("f.parquet");
+    std::fs::write(&referenced, b"data").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "referenced file under empty-schema-path resolution must survive (got {deleted:?})"
+    );
+    assert!(referenced.exists(), "referenced file must still exist");
+}
+
+/// `path_is_relative = false` makes `RESOLVED_PATH` return `df.path` verbatim
+/// (no prepending). The orphan-cleanup resolver short-circuits in
+/// `resolve_path` and uses the absolute key as-is. A file at that absolute
+/// key — even if it happens to live under `data_path` — must be excluded
+/// from deletion. Our writer doesn't emit absolute paths, so the SQL CASE
+/// branch is otherwise untested by integration tests.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_handles_absolute_file_paths() {
+    let h = setup().await;
+    let p = pool(&h).await;
+    let s = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // Materialise the file at an absolute path that happens to fall under
+    // data_path — that's the configuration where the SQL CASE's absolute
+    // branch interacts with the listing.
+    write_physical_file(&h.data_path, "main", "t", "abs.parquet");
+    let abs_file = h.data_path.join("main").join("t").join("abs.parquet");
+    let abs_str = abs_file.to_str().unwrap().to_string();
+
+    // Register it with path_is_relative = false (= 0 in SQLite).
+    sqlx::query(
+        "INSERT INTO ducklake_data_file (table_id, path, path_is_relative, file_size_bytes, record_count, begin_snapshot)
+         VALUES (?, ?, 0, 100, 5, ?)",
+    )
+    .bind(s.table_id)
+    .bind(&abs_str)
+    .bind(s.snapshot_id)
+    .execute(&p)
+    .await
+    .unwrap();
+
+    // Drop a stray IN data_path so we know the sweep IS running.
+    write_physical_file(&h.data_path, "main", "t", "stray.parquet");
+    let stray = h.data_path.join("main").join("t").join("stray.parquet");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.len(),
+        1,
+        "stray is the only orphan (got {deleted:?})"
+    );
+    assert!(
+        deleted[0].ends_with("main/t/stray.parquet"),
+        "got {:?}",
+        deleted[0]
+    );
+    assert!(!stray.exists(), "stray deleted");
+    assert!(abs_file.exists(), "absolute-path registered file survives");
+}
+
+/// `object_store.list(Some(&prefix))` must recurse into subdirectories so
+/// partition-style layouts (`year=…/month=…/file.parquet`) are reachable.
+/// Our writer doesn't produce nested layouts today, but other tools might —
+/// and a future change to the listing call (e.g. switching to a delimiter
+/// to optimise paginating) could silently stop recursing.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_recurses_into_nested_directories() {
+    let h = setup().await;
+    let s = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s.table_id,
+            s.snapshot_id,
+            &DataFileInfo::new("ref.parquet", 100, 5),
+        )
+        .unwrap();
+    write_physical_file(&h.data_path, "main", "t", "ref.parquet");
+
+    // Two orphan files at progressively deeper nesting.
+    let deep_dir = h
+        .data_path
+        .join("main")
+        .join("t")
+        .join("year=2024")
+        .join("month=01");
+    std::fs::create_dir_all(&deep_dir).unwrap();
+    let level2 = deep_dir.join("partition.parquet");
+    std::fs::write(&level2, b"orphan-2").unwrap();
+    let deeper_dir = deep_dir.join("day=15");
+    std::fs::create_dir_all(&deeper_dir).unwrap();
+    let level3 = deeper_dir.join("nested.parquet");
+    std::fs::write(&level3, b"orphan-3").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted: HashSet<String> =
+        delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        deleted.len(),
+        2,
+        "both nested orphans must be discovered (got {deleted:?})"
+    );
+    assert!(!level2.exists());
+    assert!(!level3.exists());
+    assert!(
+        h.data_path
+            .join("main")
+            .join("t")
+            .join("ref.parquet")
+            .exists(),
+        "referenced survives"
+    );
+}
+
+/// dry_run and real-run must return identical path strings (callers might
+/// compare them or feed dry_run into a confirmation prompt then expect the
+/// same paths to be deleted on confirm). They take separate code paths
+/// (dry_run formats from the pre-delete `orphans` Vec; real-run formats
+/// per-orphan after `object_store.delete` succeeds), so a future refactor
+/// could diverge them.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_dry_run_matches_real_run() {
+    let h = setup().await;
+    let s = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s.table_id,
+            s.snapshot_id,
+            &DataFileInfo::new("ref.parquet", 100, 5),
+        )
+        .unwrap();
+    write_physical_file(&h.data_path, "main", "t", "ref.parquet");
+    for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
+        write_physical_file(&h.data_path, "main", "t", name);
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let dry: HashSet<String> =
+        delete_orphaned_files_sqlite(&h.writer, store.clone(), CleanupCriteria::All, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(dry.len(), 3);
+    // Dry-run must not touch disk.
+    for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
+        assert!(h.data_path.join("main").join("t").join(name).exists());
+    }
+
+    let real: HashSet<String> =
+        delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::All, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        dry, real,
+        "dry_run and real_run must return identical path sets"
+    );
+}
+
+/// `CleanupCriteria::All` against an empty catalog deletes every `.parquet`
+/// under `data_path`. This mirrors the official `cleanup_all => true`
+/// semantics but is the classic operator-misuse footgun — pointing the API
+/// at a data_path that has files but no catalog rows wipes everything.
+/// `OlderThan` is the only safeguard at the crate level; callers should
+/// enforce it as a policy invariant (e.g. an automated worker should never
+/// pass `All`). This test makes the contract explicit so anyone changing
+/// the safety story has to update it deliberately.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_orphaned_files_all_on_empty_catalog_wipes_data_path() {
+    let h = setup().await;
+    // No begin_write_transaction — the catalog is completely empty.
+    write_physical_file(&h.data_path, "main", "t", "innocent.parquet");
+    write_physical_file(&h.data_path, "main", "t", "innocent2.parquet");
+    let innocent1 = h.data_path.join("main").join("t").join("innocent.parquet");
+    let innocent2 = h.data_path.join("main").join("t").join("innocent2.parquet");
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // `All` on an empty catalog → everything in data_path is "unreferenced"
+    // → everything is deleted. Documented contract.
+    let deleted =
+        delete_orphaned_files_sqlite(&h.writer, store.clone(), CleanupCriteria::All, false)
+            .await
+            .unwrap();
+    assert_eq!(
+        deleted.len(),
+        2,
+        "All on empty catalog deletes every .parquet"
+    );
+    assert!(!innocent1.exists());
+    assert!(!innocent2.exists());
+
+    // Restore + verify `OlderThan` is the safeguard against the same scenario.
+    write_physical_file(&h.data_path, "main", "t", "fresh.parquet");
+    let fresh = h.data_path.join("main").join("t").join("fresh.parquet");
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+    let kept =
+        delete_orphaned_files_sqlite(&h.writer, store, CleanupCriteria::OlderThan(cutoff), false)
+            .await
+            .unwrap();
+    assert!(
+        kept.is_empty(),
+        "OlderThan filter saves a fresh unreferenced file"
+    );
+    assert!(
+        fresh.exists(),
+        "fresh file survives OlderThan sweep on empty catalog"
     );
 }

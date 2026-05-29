@@ -95,3 +95,7 @@ required-features = ["write-postgres"]
 [[example]]
 name = "maintenance_demo"
 required-features = ["write-sqlite"]
+
+[[example]]
+name = "orphan_cleanup_demo"
+required-features = ["write-sqlite"]
