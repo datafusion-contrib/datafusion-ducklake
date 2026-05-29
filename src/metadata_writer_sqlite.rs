@@ -473,6 +473,42 @@ impl SqliteMetadataWriter {
             Ok(())
         })
     }
+
+    /// Every physical file currently referenced by the catalog: live + tombstoned
+    /// data files, live + tombstoned delete files, and the still-scheduled
+    /// deletion queue (those rows haven't been processed by `cleanup_old_files`
+    /// yet, so the files might still exist on disk and must not be touched by
+    /// orphan cleanup). Each row is `(path, path_is_relative)` resolved relative
+    /// to the catalog `data_path` root; the caller resolves against the actual
+    /// `data_path` for comparison with object_store keys.
+    ///
+    /// Used by [`crate::maintenance::delete_orphaned_files_sqlite`].
+    pub(crate) fn list_referenced_paths(&self) -> Result<Vec<(String, bool)>> {
+        block_on(async {
+            let q = format!(
+                "SELECT {RESOLVED_PATH} AS p, {REL_FLAG} AS rel
+                 FROM ducklake_data_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 UNION ALL
+                 SELECT {RESOLVED_PATH} AS p, {REL_FLAG} AS rel
+                 FROM ducklake_delete_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 UNION ALL
+                 SELECT path AS p, CAST(path_is_relative AS INTEGER) AS rel
+                 FROM ducklake_files_scheduled_for_deletion"
+            );
+            let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
+            rows.into_iter()
+                .map(|r| {
+                    let p: String = r.try_get(0)?;
+                    let rel: i64 = r.try_get(1)?;
+                    Ok((p, rel != 0))
+                })
+                .collect()
+        })
+    }
 }
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
