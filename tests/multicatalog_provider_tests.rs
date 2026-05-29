@@ -354,3 +354,38 @@ async fn get_table_files_for_select_returns_visible_files_at_snapshot() {
     let files_at_1 = pa.get_table_files_for_select(table.table_id, 1).unwrap();
     assert_eq!(files_at_1.len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn get_table_files_for_select_returns_row_id_start_and_record_count() {
+    // The DuckLake row-lineage read path (RowIdExec) needs row_id_start to
+    // reconstruct rowids. The multicatalog reader used to drop these columns
+    // on the floor, so any consumer using row lineage saw the file as if no
+    // row_id_start were set — matching the single-catalog reader closes the
+    // gap.
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (cat_pg, _) = seed_two_catalogs(&pool).await.unwrap();
+
+    let pa = MulticatalogProvider::with_pool_and_id(pool.clone(), cat_pg)
+        .await
+        .unwrap();
+    let sn = pa.get_current_snapshot().unwrap();
+    let schema = pa.get_schema_by_name("public", sn).unwrap().unwrap();
+    let table = pa
+        .get_table_by_name(schema.schema_id, "users", sn)
+        .unwrap()
+        .unwrap();
+
+    let files = pa.get_table_files_for_select(table.table_id, sn).unwrap();
+    assert_eq!(files.len(), 1);
+    let f = &files[0];
+    // Three appends of 3 rows each (users-a, -b, -c) → the latest visible
+    // file (users-c) starts at offset 6 and carries 3 rows.
+    assert_eq!(f.row_id_start, Some(6), "row_id_start must be projected");
+    assert_eq!(
+        f.max_row_count,
+        Some(3),
+        "record_count must surface as max_row_count"
+    );
+    assert_eq!(f.snapshot_id, Some(sn), "snapshot_id is the query snapshot");
+}
