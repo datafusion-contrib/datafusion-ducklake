@@ -2090,3 +2090,77 @@ async fn delete_orphaned_files_older_than_skips_recent_files() {
     assert_eq!(deleted.len(), 1);
     assert!(!stray.exists());
 }
+
+/// dry_run and real-run must return identical path sets. They take separate
+/// code paths inside `run_orphan_cleanup` (dry_run formats from the pre-delete
+/// `orphans` Vec; real-run formats per-orphan after each `object_store.delete`
+/// succeeds), so a future refactor could diverge them.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn delete_orphaned_files_dry_run_matches_real_run() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("cat").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    w.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    // One referenced file + three orphans alongside it.
+    let s = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        s.snapshot_id,
+        &DataFileInfo::new("ref.parquet", 100, 5),
+    )
+    .unwrap();
+    let dir = data_path.join("public").join("t");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ref.parquet"), b"referenced").unwrap();
+    for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
+        std::fs::write(dir.join(name), b"orphan").unwrap();
+    }
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // Dry run reports the orphans without touching disk.
+    let dry: HashSet<String> =
+        delete_orphaned_files_multicatalog(&mgr, store.clone(), CleanupCriteria::All, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(dry.len(), 3, "dry_run finds all three orphans");
+    for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
+        assert!(dir.join(name).exists(), "dry_run must not touch disk");
+    }
+
+    // Real run returns the same set (order-independent).
+    let real: HashSet<String> =
+        delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+    assert_eq!(
+        dry, real,
+        "dry_run and real_run must return identical path sets"
+    );
+    assert!(dir.join("ref.parquet").exists(), "referenced file survives");
+    for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
+        assert!(!dir.join(name).exists(), "orphan deleted: {name}");
+    }
+}
