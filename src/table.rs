@@ -344,9 +344,12 @@ impl DuckLakeTable {
                     return Ok((self.schema.clone(), HashMap::new()));
                 }
 
-                let (read_schema, name_mapping) =
-                    build_read_schema_with_field_id_mapping(&self.columns, &field_id_map)
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping(
+                    &self.columns,
+                    &field_id_map,
+                    Some(builder.schema().as_ref()),
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
                 Ok((Arc::new(read_schema), name_mapping))
             })
@@ -474,12 +477,17 @@ impl DuckLakeTable {
         let parquet_exec: Arc<dyn ExecutionPlan> =
             DataSourceExec::from_data_source(file_scan_config);
 
-        // Wrap with ColumnRenameExec if column names differ
-        if !name_mapping.is_empty() {
-            let output_schema = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
-                None => self.schema.clone(),
-            };
+        // Wrap with ColumnRenameExec to present the catalog schema: when columns
+        // were renamed, OR when the file's physical Arrow type differs from the
+        // catalog type (e.g. a DuckDB ARRAY read as FixedSizeList vs the
+        // catalog's List, or a differing list child field name). The wrap coerces
+        // each column to `output_schema`, so the provider's advertised schema and
+        // its scan output stay identical.
+        let output_schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => self.schema.clone(),
+        };
+        if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
             Ok(Arc::new(ColumnRenameExec::new(
                 parquet_exec,
                 output_schema,
@@ -569,12 +577,14 @@ impl DuckLakeTable {
                 parquet_exec
             };
 
-        // Wrap with ColumnRenameExec if column names differ
-        if !name_mapping.is_empty() {
-            let output_schema = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
-                None => self.schema.clone(),
-            };
+        // Wrap with ColumnRenameExec to present the catalog schema (renames, or a
+        // file physical type that differs from the catalog type — see the
+        // no-delete path above). Coerces each column to `output_schema`.
+        let output_schema = match projection {
+            Some(indices) => Arc::new(self.schema.project(indices)?),
+            None => self.schema.clone(),
+        };
+        if !name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
             Ok(Arc::new(ColumnRenameExec::new(
                 exec_after_delete,
                 output_schema,
@@ -648,8 +658,12 @@ impl DuckLakeTable {
         let (physical_read_schema, mut name_mapping) = if field_id_map.is_empty() {
             (self.physical_schema.as_ref().clone(), HashMap::new())
         } else {
-            let (s, m) = build_read_schema_with_field_id_mapping(&self.columns, &field_id_map)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let (s, m) = build_read_schema_with_field_id_mapping(
+                &self.columns,
+                &field_id_map,
+                Some(builder.schema().as_ref()),
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
             (s, m)
         };
 
@@ -803,12 +817,15 @@ impl DuckLakeTable {
                 after_rowid
             };
 
-        // Apply column rename. Required when a physical column was renamed in
-        // the catalog, or when the embedded rowid column's parquet name
-        // differs from `"rowid"` (the common case — it's
-        // `_ducklake_internal_row_id`).
-        if !file_cfg.name_mapping.is_empty() {
-            let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
+        // Wrap with ColumnRenameExec to present the catalog schema. Required when
+        // a physical column was renamed in the catalog, when the embedded rowid
+        // column's parquet name differs from `"rowid"` (the common case — it's
+        // `_ducklake_internal_row_id`), or when the file's physical Arrow type
+        // differs from the catalog type (e.g. a DuckDB ARRAY read as
+        // FixedSizeList vs the catalog's List). Coerces each column to
+        // `output_schema`.
+        let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
+        if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
             Ok(Arc::new(ColumnRenameExec::new(
                 after_deletes,
                 output_schema,
