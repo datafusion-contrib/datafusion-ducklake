@@ -461,13 +461,14 @@ pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, Str
 pub fn build_read_schema_with_field_id_mapping(
     current_columns: &[DuckLakeTableColumn],
     parquet_field_ids: &HashMap<i32, String>,
+    file_schema: Option<&Schema>,
 ) -> Result<(Schema, HashMap<String, String>)> {
     let mut name_mapping: HashMap<String, String> = HashMap::new();
 
     let fields: Result<Vec<Field>> = current_columns
         .iter()
         .map(|col| {
-            let data_type = ducklake_to_arrow_type(&col.column_type)?;
+            let mut data_type = ducklake_to_arrow_type(&col.column_type)?;
             let field_id = i32::try_from(col.column_id).map_err(|_| {
                 DuckLakeError::Internal(format!(
                     "column_id {} for column '{}' exceeds i32 range for Parquet field_id",
@@ -485,6 +486,22 @@ pub fn build_read_schema_with_field_id_mapping(
                 } else {
                     (col.column_name.clone(), false) // No field_id, use current name
                 };
+
+            // For list/nested columns the Parquet reader reproduces the *file's*
+            // child field name (e.g. "" for files our streaming writer produces
+            // vs "item" for files written through the Arrow writer), and
+            // DataFusion's scan validates each batch against the read schema. The
+            // reconstructed name (always "item") may not match, so adopt the
+            // file's actual type for these columns when the file schema is known.
+            // Scalars keep the reconstructed type (precise per the catalog).
+            if matches!(
+                data_type,
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+            ) && let Some(fs) = file_schema
+                && let Ok(file_field) = fs.field_with_name(&read_name)
+            {
+                data_type = file_field.data_type().clone();
+            }
 
             if needs_rename {
                 name_mapping.insert(read_name.clone(), col.column_name.clone());
@@ -525,7 +542,8 @@ mod tests {
         parquet_field_ids.insert(2, "name".to_string()); // Same name
 
         let (read_schema, name_mapping) =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids).unwrap();
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids, None)
+                .unwrap();
 
         // Read schema should have original Parquet names
         assert_eq!(read_schema.field(0).name(), "user_id");
@@ -549,7 +567,8 @@ mod tests {
         parquet_field_ids.insert(1, "id".to_string()); // Same name
 
         let (read_schema, name_mapping) =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids).unwrap();
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids, None)
+                .unwrap();
 
         assert_eq!(read_schema.field(0).name(), "id");
         assert!(name_mapping.is_empty()); // No rename needed
@@ -568,7 +587,8 @@ mod tests {
         let parquet_field_ids = HashMap::new(); // No field_ids in Parquet
 
         let (read_schema, name_mapping) =
-            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids).unwrap();
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids, None)
+                .unwrap();
 
         // Falls back to current column name
         assert_eq!(read_schema.field(0).name(), "id");
@@ -1015,7 +1035,7 @@ mod tests {
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(i32::MAX, "id".to_string());
 
-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids, None);
         assert!(result.is_ok(), "column_id = i32::MAX should succeed");
     }
 
@@ -1030,7 +1050,7 @@ mod tests {
 
         let parquet_field_ids = HashMap::new();
 
-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids, None);
         assert!(result.is_err(), "column_id > i32::MAX should fail");
         match result {
             Err(DuckLakeError::Internal(msg)) => {
@@ -1061,7 +1081,7 @@ mod tests {
         let mut parquet_field_ids = HashMap::new();
         parquet_field_ids.insert(-1_i32, "id".to_string());
 
-        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids);
+        let result = build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids, None);
         assert!(
             result.is_ok(),
             "Negative column_id within i32 range should succeed"
