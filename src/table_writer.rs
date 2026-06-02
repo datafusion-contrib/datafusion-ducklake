@@ -1,15 +1,19 @@
 //! High-level table writer for DuckLake catalogs.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use object_store::ObjectStore;
+use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use tempfile::NamedTempFile;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
@@ -125,7 +129,13 @@ impl DuckLakeTableWriter {
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
             .set_compression(self.compression)
             .build();
-        let writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
+        // Stream the parquet to a local staging file rather than an in-memory
+        // buffer: a multi-GB table would otherwise be held whole in RAM and,
+        // worse, uploaded as a single PUT (object stores cap a single PUT at
+        // 5 GiB). `finish()` streams this file out via a multipart upload.
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
 
         Ok(TableWriteSession {
             metadata: Arc::clone(&self.metadata),
@@ -137,6 +147,7 @@ impl DuckLakeTableWriter {
             column_ids: setup.column_ids,
             schema_with_ids,
             writer: Some(writer),
+            temp: Some(temp),
             catalog_path,
             path_is_relative,
             row_count: 0,
@@ -192,7 +203,9 @@ impl DuckLakeTableWriter {
     }
 }
 
-/// Streaming write session. Buffer is dropped if not finished (no data uploaded).
+/// Streaming write session. Batches stream to a local staging file; the
+/// finished parquet is uploaded in `finish()`. If the session is dropped
+/// without finishing, the staging file is removed and nothing is uploaded.
 #[derive(Debug)]
 pub struct TableWriteSession {
     metadata: Arc<dyn MetadataWriter>,
@@ -204,7 +217,14 @@ pub struct TableWriteSession {
     #[allow(dead_code)]
     column_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
-    writer: Option<ArrowWriter<Vec<u8>>>,
+    /// Parquet writer streaming to the local staging file (`temp`). Batches are
+    /// written to disk as they arrive rather than buffered in memory, so peak
+    /// memory stays bounded by the parquet row-group size regardless of table
+    /// size. The finished file is streamed to object storage in `finish()`.
+    writer: Option<ArrowWriter<std::io::BufWriter<std::fs::File>>>,
+    /// Local staging file backing `writer`. Kept alive for the session; the
+    /// finished parquet is uploaded from it and the file is removed on drop.
+    temp: Option<NamedTempFile>,
     /// Path to register in catalog (may be relative filename or absolute path)
     catalog_path: String,
     /// Whether the catalog_path is relative to table path
@@ -276,15 +296,33 @@ impl TableWriteSession {
         let writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
-        let buffer = writer.into_inner()?;
+        let temp = self.temp.take().ok_or_else(|| {
+            crate::error::DuckLakeError::Internal("Writer already closed".to_string())
+        })?;
 
-        let file_size = buffer.len() as i64;
-        let footer_size = calculate_footer_size_from_bytes(&buffer)?;
+        // Finalise the parquet footer, then unwrap the `BufWriter` (its
+        // `into_inner` flushes any buffered footer bytes to the OS file) so the
+        // staging file on disk is the complete parquet.
+        let staged = writer.into_inner()?;
+        let mut file = staged
+            .into_inner()
+            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
 
-        // Upload via object_store
-        self.object_store
-            .put(&self.object_path, PutPayload::from(buffer))
-            .await?;
+        let file_size = file.metadata()?.len() as i64;
+        let footer_size = read_footer_size(&mut file)?;
+
+        // Stream the staged file to object storage. `BufWriter` chunks the
+        // payload and switches to a multipart upload for large files, so there
+        // is no 5 GiB single-PUT ceiling and memory stays bounded. On failure
+        // we abort so no incomplete multipart parts are left behind.
+        let local = tokio::fs::File::open(temp.path()).await?;
+        let mut reader = tokio::io::BufReader::new(local);
+        let mut upload =
+            ObjectBufWriter::new(Arc::clone(&self.object_store), self.object_path.clone());
+        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+            let _ = upload.abort().await;
+            return Err(e.into());
+        }
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
             .with_footer_size(footer_size);
@@ -304,7 +342,38 @@ impl TableWriteSession {
     }
 }
 
-// Drop is a no-op: buffer is simply dropped, nothing was uploaded to the store.
+// Drop deletes the staging `NamedTempFile`; a session abandoned before
+// `finish()` uploads nothing and leaves no local file behind.
+
+/// Stream a finished local parquet file to object storage and finalise the
+/// upload. `BufWriter` switches to a multipart upload once the payload exceeds
+/// its buffer, so files larger than the object store's single-PUT limit (5 GiB
+/// on S3) upload fine and memory stays bounded.
+async fn stream_to_upload<R>(reader: &mut R, upload: &mut ObjectBufWriter) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + ?Sized,
+{
+    tokio::io::copy(reader, upload).await?;
+    upload.shutdown().await?;
+    Ok(())
+}
+
+/// Read the parquet footer length (thrift metadata + 8-byte trailer) from the
+/// tail of a finished parquet file on disk. Stored as the nullable
+/// `footer_size` hint in the catalog; readers fall back to a standard footer
+/// read when it is absent.
+fn read_footer_size(file: &mut std::fs::File) -> Result<i64> {
+    let len = file.metadata()?.len();
+    if len < 8 {
+        return Err(crate::error::DuckLakeError::Internal(
+            "Invalid Parquet file: too small".to_string(),
+        ));
+    }
+    file.seek(SeekFrom::End(-8))?;
+    let mut tail = [0u8; 8];
+    file.read_exact(&mut tail)?;
+    calculate_footer_size_from_bytes(&tail)
+}
 
 fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
