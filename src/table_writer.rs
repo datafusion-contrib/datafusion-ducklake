@@ -334,7 +334,24 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
     let metadata_len =
         i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
             as i64;
-    Ok(metadata_len + 8)
+    if metadata_len <= 0 {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "Invalid Parquet file: non-positive metadata length {metadata_len}"
+        )));
+    }
+    // DuckLake spec / DuckDB-extension semantics: `footer_size` is the thrift
+    // metadata length stored in the last 8 bytes of the file (the i32 LE value),
+    // NOT including the trailing 4-byte length + 4-byte PAR1 magic. Verified by
+    // having the DuckDB DuckLake extension write a file and inspecting the value
+    // it stored in `ducklake_data_file.footer_size` — it equals exactly this i32.
+    // Returning `metadata_len + 8` produced "Parquet footer length stored in
+    // file is not equal to footer length provided" when the DuckDB reader later
+    // validated the persisted hint against its own footer probe.
+    //
+    // Read-side note: callers that want to use the stored value as a parquet
+    // prefetch hint (`with_metadata_size_hint`) must add the 8-byte trailer
+    // back via [`crate::parquet_meta::metadata_size_hint_from_footer`].
+    Ok(metadata_len)
 }
 
 #[cfg(test)]
@@ -443,8 +460,34 @@ mod tests {
 
         let footer_size = calculate_footer_size_from_bytes(&buffer).unwrap();
 
-        // Footer should be reasonable size (metadata + 8 bytes)
-        assert!(footer_size >= 8);
+        // `footer_size` must equal exactly the i32 LE value stored in the last
+        // 8 bytes of the file (the thrift metadata length), with no adjustment
+        // for the trailing length + PAR1 magic. The DuckDB DuckLake extension's
+        // reader validates this on open.
+        let expected = i32::from_le_bytes([
+            buffer[buffer.len() - 8],
+            buffer[buffer.len() - 7],
+            buffer[buffer.len() - 6],
+            buffer[buffer.len() - 5],
+        ]) as i64;
+        assert_eq!(footer_size, expected);
+        assert!(footer_size > 0);
         assert!(footer_size < 10000);
     }
+
+    #[test]
+    fn test_calculate_footer_size_rejects_negative_metadata_len() {
+        // Craft a trailer with a negative i32 (e.g., 0xFFFFFFFF = -1 LE) + PAR1.
+        // Per the contract, this must Err rather than silently return a negative
+        // size that downstream callers then have to defensively guard against.
+        let mut buffer = vec![0u8; 16]; // arbitrary leading bytes
+        buffer.extend_from_slice(&(-1i32).to_le_bytes());
+        buffer.extend_from_slice(b"PAR1");
+        let err = calculate_footer_size_from_bytes(&buffer).unwrap_err();
+        assert!(
+            format!("{err}").contains("non-positive metadata length"),
+            "unexpected error message: {err}"
+        );
+    }
+
 }

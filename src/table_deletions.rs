@@ -174,9 +174,7 @@ impl TableDeletionsTable {
             &resolved_path,
             validated_file_size(size_bytes, &resolved_path)?,
         );
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(Some(footer_size)) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
@@ -197,9 +195,7 @@ impl TableDeletionsTable {
         footer_size: i64,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = crate::parquet_meta::metadata_size_hint_from_footer(Some(footer_size)) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
