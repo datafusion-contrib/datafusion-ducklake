@@ -932,3 +932,62 @@ async fn test_zero_column_table_rejected() {
         err
     );
 }
+
+/// Write a table larger than `object_store::buffered::BufWriter`'s 10 MiB
+/// capacity so `finish()` takes the multipart-upload branch rather than a
+/// single PUT, then read it back. This is the path that lifts the object
+/// store's single-PUT size ceiling, so exercise it end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_streaming_write_large_file_uses_multipart() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("payload", DataType::Int64, false),
+    ]));
+
+    // ~1.5M rows * 16 bytes ≈ 24 MB of high-entropy (uncompressed) parquet,
+    // comfortably above the 10 MiB BufWriter capacity that triggers multipart.
+    const ROWS: i64 = 1_500_000;
+    let ids: Vec<i64> = (0..ROWS).collect();
+    let payload: Vec<i64> = (0..ROWS).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(ids)), Arc::new(Int64Array::from(payload))],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let result = table_writer
+        .write_table("main", "big", &[batch])
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, ROWS);
+    assert_eq!(result.files_written, 1);
+
+    // Read back: a complete, valid parquet means the multipart upload assembled
+    // correctly. Verify both the row count and an aggregate over every row.
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS n, SUM(id) AS s FROM test.main.big")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    let s = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, ROWS);
+    assert_eq!(s, ROWS * (ROWS - 1) / 2);
+}
