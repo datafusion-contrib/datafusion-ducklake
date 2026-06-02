@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use uuid::Uuid;
 
@@ -22,6 +23,10 @@ pub struct DuckLakeTableWriter {
     object_store: Arc<dyn ObjectStore>,
     /// The key path portion of the data_path (e.g., "/prefix/data/")
     base_key_path: String,
+    /// Compression codec for written data files. Defaults to `UNCOMPRESSED`;
+    /// override via [`DuckLakeTableWriter::with_compression`] to trade write
+    /// CPU for ~2x smaller files (e.g. `LZ4`, `SNAPPY`, `ZSTD`).
+    compression: Compression,
 }
 
 impl DuckLakeTableWriter {
@@ -36,7 +41,15 @@ impl DuckLakeTableWriter {
             metadata,
             object_store,
             base_key_path: key_path,
+            compression: Compression::UNCOMPRESSED,
         })
+    }
+
+    /// Override the parquet compression codec used for written data files.
+    /// Defaults to [`Compression::UNCOMPRESSED`].
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Begin a streaming write session.
@@ -110,6 +123,7 @@ impl DuckLakeTableWriter {
 
         let props = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression)
             .build();
         let writer = ArrowWriter::try_new(Vec::new(), schema_with_ids.clone(), Some(props))?;
 
