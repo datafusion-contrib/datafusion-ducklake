@@ -11,7 +11,10 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
 };
 use crate::path_resolver::resolve_path;
-use crate::row_id::{ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field};
+use crate::positional_source::PositionalFileSource;
+use crate::row_id::{
+    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field,
+};
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
@@ -31,6 +34,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -114,6 +118,17 @@ struct FileReadConfig {
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
+    /// Per-row-group starting physical row position (prefix sums of
+    /// `row_groups[i].num_rows()`). `row_group_starts[i]` is the 0-based file
+    /// position of the first row of row group `i`. Used to build row-group-
+    /// aligned scan partitions whose starting position is known at plan time,
+    /// so `FileRowNumberExec` can synthesize true physical positions instead of
+    /// counting stream arrivals. The Parquet footer is the source of truth; the
+    /// catalog does not store per-row-group counts.
+    row_group_starts: Vec<i64>,
+    /// Number of row groups in the file (`row_group_starts.len()`). Required to
+    /// build a `ParquetAccessPlan` of the correct length.
+    row_group_count: usize,
 }
 
 /// DuckLake table provider
@@ -523,72 +538,86 @@ impl DuckLakeTable {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (read_schema, name_mapping) = self.get_schema_mapping(state).await?;
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
 
-        // Resolve the data file path for scanning
-        let resolved_path = self.resolve_file_path(&table_file.file)?;
+        // Deletes filter by physical row position, so this is a positional path:
+        // it must read the file in row-group-aligned, non-repartitionable,
+        // non-pruning partitions and synthesize positions before filtering.
+        let deleted_positions = if let Some(ref delete_file) = table_file.delete_file {
+            let p = self.read_delete_file_positions(state, delete_file).await?;
+            (!p.is_empty()).then_some(p)
+        } else {
+            None
+        };
 
-        // Create PartitionedFile with footer size hint if available
-        let mut pf = PartitionedFile::new(
-            &resolved_path,
-            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-        );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
-            pf = pf.with_metadata_size_hint(hint);
-        }
-
-        // Use read_schema (with original Parquet names) for reading
-        let mut builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(read_schema.clone())),
-        )
-        .with_limit(limit)
-        .with_file_group(FileGroup::new(vec![pf]));
-
-        // Apply projection if provided
-        if let Some(proj) = projection {
-            builder = builder.with_projection_indices(Some(proj.clone()))?;
-        }
-
-        let file_scan_config = builder.build();
-        // Use DataSourceExec directly to preserve our ParquetSource with encryption factory
-        let parquet_exec: Arc<dyn ExecutionPlan> =
-            DataSourceExec::from_data_source(file_scan_config);
-
-        // Wrap with delete filter - we know there's a delete file since we partitioned
-        // The metadata already tells us which delete file goes with this data file
-        let exec_after_delete: Arc<dyn ExecutionPlan> =
-            if let Some(ref delete_file) = table_file.delete_file {
-                let deleted_positions = self.read_delete_file_positions(state, delete_file).await?;
-
-                if !deleted_positions.is_empty() {
-                    Arc::new(DeleteFilterExec::new(
-                        parquet_exec,
-                        table_file.file.path.clone(),
-                        Arc::new(deleted_positions),
-                    ))
-                } else {
-                    parquet_exec
-                }
-            } else {
-                parquet_exec
-            };
-
-        // Wrap with ColumnRenameExec to present the catalog schema (renames, or a
-        // file physical type that differs from the catalog type — see the
-        // no-delete path above). Coerces each column to `output_schema`.
         let output_schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => self.schema.clone(),
         };
-        if !name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
+
+        // Explicit parquet projection over `read_schema`. rowid is never
+        // projected on this path, so always read only the physical columns —
+        // for an embedded-rowid file, `read_schema` has a trailing embedded
+        // column we must NOT read here. With `projection = None` that means the
+        // physical columns `0..physical_len` (not "all of read_schema").
+        let proj_indices: Vec<usize> = match projection {
+            Some(indices) => indices.clone(),
+            None => (0..self.physical_schema.fields().len()).collect(),
+        };
+
+        let exec_after_delete: Arc<dyn ExecutionPlan> = if let Some(positions) = deleted_positions {
+            // Positional path: no scan-level limit (would drop rows before the
+            // delete filter); DataFusion enforces LIMIT above the table plan.
+            let target_partitions = state.config().target_partitions();
+            let (file_groups, partition_starts) =
+                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+
+            let source = PositionalFileSource::wrap(Arc::new(
+                self.create_parquet_source(file_cfg.read_schema.clone()),
+            ));
+            let mut builder =
+                FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+                    .with_file_groups(file_groups);
+            builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
+            let scan = DataSourceExec::from_data_source(builder.build());
+
+            let with_pos: Arc<dyn ExecutionPlan> =
+                Arc::new(FileRowNumberExec::new(scan, partition_starts));
+            Arc::new(DeleteFilterExec::try_new(
+                with_pos,
+                table_file.file.path.clone(),
+                Arc::new(positions),
+            )?)
+        } else {
+            // No actual deletes for this file: plain scan, scan-level limit OK.
+            let resolved_path = self.resolve_file_path(&table_file.file)?;
+            let mut pf = PartitionedFile::new(
+                &resolved_path,
+                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+            );
+            if let Some(footer_size) = table_file.file.footer_size
+                && footer_size > 0
+                && let Ok(hint) = usize::try_from(footer_size)
+            {
+                pf = pf.with_metadata_size_hint(hint);
+            }
+            let mut builder = FileScanConfigBuilder::new(
+                self.object_store_url.as_ref().clone(),
+                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
+            )
+            .with_limit(limit)
+            .with_file_group(FileGroup::new(vec![pf]));
+            builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
+            DataSourceExec::from_data_source(builder.build())
+        };
+
+        // ColumnRenameExec presents the catalog schema and, on the positional
+        // path, drops the internal `__ducklake_row_pos` column (by name).
+        if !file_cfg.name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
             Ok(Arc::new(ColumnRenameExec::new(
                 exec_after_delete,
                 output_schema,
-                name_mapping.clone(),
+                file_cfg.name_mapping.clone(),
             )))
         } else {
             Ok(exec_after_delete)
@@ -654,6 +683,18 @@ impl DuckLakeTable {
 
         let field_id_map = extract_parquet_field_ids(builder.metadata());
 
+        // Per-row-group starting positions (prefix sums of num_rows), read from
+        // the footer we already have open. Drives row-group-aligned scan
+        // partitioning on positional paths.
+        let row_groups = builder.metadata().row_groups();
+        let row_group_count = row_groups.len();
+        let mut row_group_starts = Vec::with_capacity(row_group_count);
+        let mut row_acc: i64 = 0;
+        for rg in row_groups {
+            row_group_starts.push(row_acc);
+            row_acc = row_acc.saturating_add(rg.num_rows());
+        }
+
         // Standard read_schema + name_mapping for physical columns.
         let (physical_read_schema, mut name_mapping) = if field_id_map.is_empty() {
             (self.physical_schema.as_ref().clone(), HashMap::new())
@@ -694,6 +735,8 @@ impl DuckLakeTable {
             read_schema,
             name_mapping,
             embedded_rowid_parquet_name,
+            row_group_starts,
+            row_group_count,
         });
 
         {
@@ -704,13 +747,96 @@ impl DuckLakeTable {
         Ok(cfg)
     }
 
+    /// Build row-group-aligned scan partitions for a single file on a
+    /// *positional* path (rowid synthesis and/or delete filtering).
+    ///
+    /// Returns one [`FileGroup`] per contiguous run of row groups (so each is a
+    /// distinct DataFusion partition) together with a `partition_starts` vector
+    /// whose `i`-th entry is the **true physical row position of the first row**
+    /// of `file_groups[i]`. The two vectors are 1:1; `FileRowNumberExec` uses
+    /// `partition_starts[partition]` to seed positions.
+    ///
+    /// Each chunk carries a whole-row-group `Scan`/`Skip` [`ParquetAccessPlan`]
+    /// (never a `RowSelection`), so within a partition the reader emits a
+    /// complete, contiguous, in-order run of physical rows. A single chunk
+    /// (`target_partitions == 1`, or a file with ≤1 row group) carries no access
+    /// plan and reads the whole file in order — identical to the legacy path.
+    fn build_row_group_partitions(
+        &self,
+        file: &DuckLakeFileData,
+        read_cfg: &FileReadConfig,
+        target_partitions: usize,
+    ) -> DataFusionResult<(Vec<FileGroup>, Vec<i64>)> {
+        let resolved_path = self.resolve_file_path(file)?;
+        let file_size = validated_file_size(file.file_size_bytes, &resolved_path)?;
+        let footer_hint = file
+            .footer_size
+            .filter(|&s| s > 0)
+            .and_then(|s| usize::try_from(s).ok());
+
+        let make_pf = |access: Option<ParquetAccessPlan>| {
+            let mut pf = PartitionedFile::new(&resolved_path, file_size);
+            if let Some(hint) = footer_hint {
+                pf = pf.with_metadata_size_hint(hint);
+            }
+            if let Some(plan) = access {
+                pf = pf.with_extensions(Arc::new(plan));
+            }
+            pf
+        };
+
+        let n = read_cfg.row_group_count;
+        let k = target_partitions.max(1).min(n.max(1));
+
+        // Single partition: whole file, in order, no access plan. Covers
+        // target_partitions == 1 and files with 0 or 1 row groups.
+        if k <= 1 {
+            return Ok((vec![FileGroup::new(vec![make_pf(None)])], vec![0]));
+        }
+
+        // Split the n row groups into k contiguous chunks as evenly as possible
+        // (row groups are written near-uniform, so group-count balancing closely
+        // tracks row-count balancing). The first `rem` chunks get one extra group.
+        let base = n / k;
+        let rem = n % k;
+        let mut file_groups = Vec::with_capacity(k);
+        let mut partition_starts = Vec::with_capacity(k);
+        let mut a = 0usize;
+        for chunk in 0..k {
+            let len = base + usize::from(chunk < rem);
+            let b = a + len;
+            debug_assert!(b <= n && len > 0);
+
+            let row_groups: Vec<RowGroupAccess> = (0..n)
+                .map(|rg| {
+                    if rg >= a && rg < b {
+                        RowGroupAccess::Scan
+                    } else {
+                        RowGroupAccess::Skip
+                    }
+                })
+                .collect();
+
+            file_groups.push(FileGroup::new(vec![make_pf(Some(ParquetAccessPlan::new(
+                row_groups,
+            )))]));
+            partition_starts.push(read_cfg.row_group_starts[a]);
+            a = b;
+        }
+        debug_assert_eq!(a, n);
+
+        Ok((file_groups, partition_starts))
+    }
+
     /// Build a plan for a single file when the synthetic `rowid` column is in
     /// the projection. Always uses per-file scans because each file may have a
     /// different layout (embedded rowid vs. synthesized) and a distinct
     /// `row_id_start`.
     ///
-    /// Order: ParquetExec(physical_proj [+ rowid if embedded]) →
-    ///   RowIdExec(?) → DeleteFilterExec(?) → ColumnRenameExec(?).
+    /// Order on the positional path (non-embedded, or any file with deletes):
+    ///   DataSourceExec → FileRowNumberExec → DeleteFilterExec(?) → RowIdExec(?)
+    ///   → ColumnRenameExec. Embedded-rowid files with no deletes keep a plain
+    ///   DataSourceExec → ColumnRenameExec (rowid read from the file).
     async fn build_exec_for_file_with_rowid(
         &self,
         state: &dyn Session,
@@ -722,22 +848,12 @@ impl DuckLakeTable {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
 
-        // Decompose user projection: which physical columns to read, and where
-        // rowid should appear in the output.
+        // Physical columns to read (everything the user asked for except rowid).
         let physical_proj: Vec<usize> = user_proj
             .iter()
             .filter(|&&i| i != rowid_idx)
             .copied()
             .collect();
-        let rowid_insert_pos: usize =
-            user_proj
-                .iter()
-                .position(|&i| i == rowid_idx)
-                .ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "build_exec_for_file_with_rowid called without rowid in projection".into(),
-                    )
-                })?;
 
         // Match the C++ extension: if the file embeds no rowid column AND the
         // catalog didn't record a `row_id_start`, lineage cannot be
@@ -750,72 +866,89 @@ impl DuckLakeTable {
             )));
         }
 
-        // Build the ParquetExec projection. When the file embeds rowid we
-        // splice it into the projection at `rowid_insert_pos` directly, so
-        // the parquet emits batches already in the user's requested column
-        // order (no extra reorder pass needed).
+        // Resolve deletes once.
+        let deleted_positions = if let Some(ref delete_file) = table_file.delete_file {
+            let p = self.read_delete_file_positions(state, delete_file).await?;
+            (!p.is_empty()).then_some(p)
+        } else {
+            None
+        };
+        let has_deletes = deleted_positions.is_some();
+
+        // We need synthesized physical positions when rowid must be synthesized
+        // (non-embedded) or when positional deletes must be applied. Embedded-
+        // rowid files with no deletes keep the legacy plain scan (rowid read from
+        // the file; reader-side pruning and scan-level limit are safe there).
+        let needs_position = !has_embedded || has_deletes;
+
+        // Parquet read projection. For embedded files, also read the embedded
+        // rowid column; `ColumnRenameExec` later maps it to `rowid` by name, so
+        // its position in the read projection is irrelevant.
         let parquet_projection: Vec<usize> = if has_embedded {
             let rowid_col_in_read_schema = file_cfg.read_schema.fields().len() - 1;
             let mut p = physical_proj.clone();
-            p.insert(rowid_insert_pos, rowid_col_in_read_schema);
+            p.push(rowid_col_in_read_schema);
             p
         } else {
             physical_proj.clone()
         };
 
-        // Resolve and configure the data file
-        let resolved_path = self.resolve_file_path(&table_file.file)?;
-        let mut pf = PartitionedFile::new(
-            &resolved_path,
-            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-        );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
-            pf = pf.with_metadata_size_hint(hint);
-        }
+        let after_deletes: Arc<dyn ExecutionPlan> = if needs_position {
+            // Positional path: row-group-aligned partitions + a non-repartition,
+            // non-pruning source, so each partition emits a complete, contiguous,
+            // in-order run of physical rows. No scan-level limit (it would drop
+            // rows before delete filtering); DataFusion enforces LIMIT above.
+            let target_partitions = state.config().target_partitions();
+            let (file_groups, partition_starts) =
+                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
 
-        let mut builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
-        )
-        .with_limit(limit)
-        .with_file_group(FileGroup::new(vec![pf]));
-        builder = builder.with_projection_indices(Some(parquet_projection))?;
+            let source = PositionalFileSource::wrap(Arc::new(
+                self.create_parquet_source(file_cfg.read_schema.clone()),
+            ));
+            let mut builder =
+                FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+                    .with_file_groups(file_groups);
+            builder = builder.with_projection_indices(Some(parquet_projection))?;
+            let scan = DataSourceExec::from_data_source(builder.build());
 
-        let parquet_exec: Arc<dyn ExecutionPlan> =
-            DataSourceExec::from_data_source(builder.build());
-
-        // Synthesize rowid only when the file doesn't already supply it.
-        let after_rowid: Arc<dyn ExecutionPlan> = if has_embedded {
-            parquet_exec
+            // Materialize the physical position, then (optionally) filter deletes
+            // by it, then (for non-embedded files) synthesize rowid from it.
+            let mut plan: Arc<dyn ExecutionPlan> =
+                Arc::new(FileRowNumberExec::new(scan, partition_starts));
+            if let Some(p) = deleted_positions {
+                plan = Arc::new(DeleteFilterExec::try_new(
+                    plan,
+                    table_file.file.path.clone(),
+                    Arc::new(p),
+                )?);
+            }
+            if !has_embedded {
+                plan = Arc::new(RowIdExec::try_new(plan, table_file.row_id_start)?);
+            }
+            plan
         } else {
-            Arc::new(RowIdExec::new_at(
-                parquet_exec,
-                table_file.row_id_start,
-                rowid_insert_pos,
-            ))
+            // Embedded rowid, no deletes: legacy plain scan (cardinality-
+            // preserving). Keep scan-level limit and reader pruning.
+            let resolved_path = self.resolve_file_path(&table_file.file)?;
+            let mut pf = PartitionedFile::new(
+                &resolved_path,
+                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+            );
+            if let Some(footer_size) = table_file.file.footer_size
+                && footer_size > 0
+                && let Ok(hint) = usize::try_from(footer_size)
+            {
+                pf = pf.with_metadata_size_hint(hint);
+            }
+            let mut builder = FileScanConfigBuilder::new(
+                self.object_store_url.as_ref().clone(),
+                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
+            )
+            .with_limit(limit)
+            .with_file_group(FileGroup::new(vec![pf]));
+            builder = builder.with_projection_indices(Some(parquet_projection))?;
+            DataSourceExec::from_data_source(builder.build())
         };
-
-        // Apply delete filter if needed. DeleteFilterExec tracks file
-        // position, which is preserved through both RowIdExec and an embedded
-        // rowid projection (both leave row order untouched).
-        let after_deletes: Arc<dyn ExecutionPlan> =
-            if let Some(ref delete_file) = table_file.delete_file {
-                let deleted_positions = self.read_delete_file_positions(state, delete_file).await?;
-                if !deleted_positions.is_empty() {
-                    Arc::new(DeleteFilterExec::new(
-                        after_rowid,
-                        table_file.file.path.clone(),
-                        Arc::new(deleted_positions),
-                    ))
-                } else {
-                    after_rowid
-                }
-            } else {
-                after_rowid
-            };
 
         // Wrap with ColumnRenameExec to present the catalog schema. Required when
         // a physical column was renamed in the catalog, when the embedded rowid

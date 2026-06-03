@@ -1,7 +1,12 @@
 //! Custom execution plan for filtering deleted rows
 //!
-//! This module implements a DataFusion execution plan that wraps the Parquet scan
-//! and filters out rows marked as deleted in delete files.
+//! Wraps a positional scan and drops rows whose **physical file position**
+//! appears in a positional delete file. The physical position is read from the
+//! internal [`ROW_POS_COLUMN_NAME`] column materialized by
+//! [`FileRowNumberExec`](crate::row_id::FileRowNumberExec) — never from stream
+//! arrival order — so filtering is correct regardless of how the scan is
+//! partitioned or merged. The position column is passed through unchanged for
+//! any downstream consumer (e.g. `RowIdExec`); the final projection drops it.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -9,64 +14,64 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
-/// Custom execution plan that filters out deleted rows
+use crate::row_id::ROW_POS_COLUMN_NAME;
+
+/// Custom execution plan that filters out deleted rows by physical position.
 #[derive(Debug)]
 pub struct DeleteFilterExec {
-    /// The input execution plan (typically ParquetExec)
+    /// The input execution plan (carries [`ROW_POS_COLUMN_NAME`]).
     input: Arc<dyn ExecutionPlan>,
-    /// Path of the file being scanned
+    /// Path of the file being scanned (for display).
     file_path: String,
-    /// Set of deleted row positions for this file (shared across streams)
+    /// Set of deleted physical row positions for this file (shared across streams).
     deleted_positions: Arc<HashSet<i64>>,
-    /// Cached plan properties
+    /// Index of [`ROW_POS_COLUMN_NAME`] in the input schema.
+    pos_index: usize,
+    /// Cached plan properties.
     properties: Arc<PlanProperties>,
 }
 
 impl DeleteFilterExec {
-    pub fn new(
+    /// Build a `DeleteFilterExec`. The input must carry the
+    /// [`ROW_POS_COLUMN_NAME`] column (from `FileRowNumberExec`); errors otherwise.
+    pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         file_path: String,
         deleted_positions: Arc<HashSet<i64>>,
-    ) -> Self {
-        // Clone properties from input plan
+    ) -> DataFusionResult<Self> {
+        let pos_index = input.schema().index_of(ROW_POS_COLUMN_NAME).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "DeleteFilterExec input is missing the `{ROW_POS_COLUMN_NAME}` column"
+            ))
+        })?;
+        // Filtering only drops rows; partitioning/ordering are preserved.
         let properties = input.properties().clone();
-
-        Self {
+        Ok(Self {
             input,
             file_path,
             deleted_positions,
+            pos_index,
             properties,
-        }
+        })
     }
 }
 
 impl DisplayAs for DeleteFilterExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "DeleteFilterExec: file={}, deletes={}",
-                    self.file_path,
-                    self.deleted_positions.len()
-                )
-            },
-            DisplayFormatType::TreeRender => {
-                write!(
-                    f,
-                    "DeleteFilterExec: file={}, deletes={}",
-                    self.file_path,
-                    self.deleted_positions.len()
-                )
-            },
-        }
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "DeleteFilterExec: file={}, deletes={}",
+            self.file_path,
+            self.deleted_positions.len()
+        )
     }
 }
 
@@ -87,6 +92,11 @@ impl ExecutionPlan for DeleteFilterExec {
         vec![&self.input]
     }
 
+    /// Order-preserving: drops rows but never reorders them.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -96,14 +106,11 @@ impl ExecutionPlan for DeleteFilterExec {
                 "DeleteFilterExec expects exactly one child".into(),
             ));
         }
-
-        let deleted_positions = self.deleted_positions.clone();
-
-        Ok(Arc::new(DeleteFilterExec::new(
-            children[0].clone(),
+        Ok(Arc::new(DeleteFilterExec::try_new(
+            children.into_iter().next().unwrap(),
             self.file_path.clone(),
-            deleted_positions,
-        )))
+            self.deleted_positions.clone(),
+        )?))
     }
 
     fn execute(
@@ -111,21 +118,19 @@ impl ExecutionPlan for DeleteFilterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-
         Ok(Box::pin(DeleteFilterStream {
-            input: input_stream,
+            input: self.input.execute(partition, context)?,
             deleted_positions: self.deleted_positions.clone(),
-            row_offset: 0,
+            pos_index: self.pos_index,
         }))
     }
 }
 
-/// Stream that filters deleted rows from input batches
+/// Stream that filters deleted rows by reading the physical-position column.
 struct DeleteFilterStream {
     input: SendableRecordBatchStream,
     deleted_positions: Arc<HashSet<i64>>,
-    row_offset: i64,
+    pos_index: usize,
 }
 
 impl Stream for DeleteFilterStream {
@@ -133,17 +138,7 @@ impl Stream for DeleteFilterStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.input).poll_next(cx) {
-            Poll::Ready(Some(Ok(batch))) => {
-                // Filter the batch
-                match self.filter_batch(&batch) {
-                    Ok(filtered_batch) => {
-                        // Update row offset for next batch
-                        self.row_offset += batch.num_rows() as i64;
-                        Poll::Ready(Some(Ok(filtered_batch)))
-                    },
-                    Err(e) => Poll::Ready(Some(Err(e))),
-                }
-            },
+            Poll::Ready(Some(Ok(batch))) => Poll::Ready(Some(self.filter_batch(&batch))),
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
@@ -153,41 +148,34 @@ impl Stream for DeleteFilterStream {
 
 impl DeleteFilterStream {
     fn filter_batch(&self, batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
-        // If no deletes for this file, return batch as-is
         if self.deleted_positions.is_empty() {
             return Ok(batch.clone());
         }
 
-        // Build list of row indices to keep
-        let num_rows = batch.num_rows();
-        let mut keep_indices: Vec<usize> = Vec::with_capacity(num_rows);
+        let pos = batch
+            .column(self.pos_index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!("`{ROW_POS_COLUMN_NAME}` column is not Int64"))
+            })?;
 
+        let num_rows = batch.num_rows();
+        let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            let global_pos = self.row_offset + i as i64;
-            if !self.deleted_positions.contains(&global_pos) {
-                keep_indices.push(i);
+            if !self.deleted_positions.contains(&pos.value(i)) {
+                keep_indices.push(i as u32);
             }
         }
 
-        // If all rows are kept, return original batch
         if keep_indices.len() == num_rows {
             return Ok(batch.clone());
         }
 
-        // Special case: if there are no columns (COUNT(*) case), create an empty batch with the filtered row count
-        if batch.num_columns() == 0 {
-            let mut options = RecordBatchOptions::new();
-            options = options.with_row_count(Some(keep_indices.len()));
-            return RecordBatch::try_new_with_options(batch.schema(), vec![], &options)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
-        }
-
-        // Use Arrow's take kernel to select rows
         use arrow::array::UInt32Array;
         use arrow::compute::take;
 
-        let indices = UInt32Array::from(keep_indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
-
+        let indices = UInt32Array::from(keep_indices);
         let filtered_columns: DataFusionResult<Vec<_>> = batch
             .columns()
             .iter()
@@ -211,134 +199,66 @@ impl RecordBatchStream for DeleteFilterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int32Array};
+    use arrow::array::{Array, ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::EmptyRecordBatchStream;
 
-    #[test]
-    fn test_filter_batch_ignores_out_of_bounds_positions() {
-        // Create a simple RecordBatch with 4 rows
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    /// Build a batch with a value column and a `__ducklake_row_pos` column.
+    fn batch(values: &[i32], positions: &[i64]) -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::row_id::row_pos_field(),
+        ]));
+        let b = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(values.to_vec())) as ArrayRef,
+                Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        (schema, b)
+    }
 
-        let id_array = Int32Array::from(vec![1, 2, 3, 4]);
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
-                .unwrap();
+    fn stream(schema: SchemaRef, deleted: &[i64]) -> DeleteFilterStream {
+        DeleteFilterStream {
+            input: Box::pin(EmptyRecordBatchStream::new(schema)),
+            deleted_positions: Arc::new(deleted.iter().copied().collect::<HashSet<i64>>()),
+            pos_index: 1,
+        }
+    }
 
-        // Create delete positions: 1 (valid), 1000, 2000, 5000 (all out of bounds)
-        // Only position 1 should actually delete a row (the row with id=2)
-        let deleted_positions: HashSet<i64> = [1, 1000, 2000, 5000].into_iter().collect();
-
-        // Create a DeleteFilterStream with row_offset=0
-        let stream = DeleteFilterStream {
-            input: Box::pin(EmptyRecordBatchStream::new(schema.clone())),
-            deleted_positions: Arc::new(deleted_positions),
-            row_offset: 0,
-        };
-
-        // Apply the filter
-        let filtered_batch = stream.filter_batch(&batch).unwrap();
-
-        // Should have 3 rows (only position 1 was deleted, positions 1000+ are out of bounds)
-        assert_eq!(
-            filtered_batch.num_rows(),
-            3,
-            "Expected 3 rows after filtering (only position 1 is valid)"
-        );
-
-        // Verify the correct rows remain (ids 1, 3, 4)
-        let filtered_ids = filtered_batch
-            .column(0)
+    fn ids(b: &RecordBatch) -> Vec<i32> {
+        b.column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        let ids: Vec<i32> = filtered_ids.values().to_vec();
-        assert_eq!(
-            ids,
-            vec![1, 3, 4],
-            "Expected ids [1, 3, 4] after deleting position 1 (id=2)"
-        );
+            .unwrap()
+            .values()
+            .to_vec()
     }
 
     #[test]
-    fn test_filter_batch_all_out_of_bounds_positions() {
-        // Test the edge case where ALL delete positions are beyond the file
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-
-        let id_array = Int32Array::from(vec![10, 20, 30]);
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as Arc<dyn Array>])
-                .unwrap();
-
-        // All positions are way beyond the 3-row file
-        let deleted_positions: HashSet<i64> = [1000, 2000, 3000, 9999].into_iter().collect();
-
-        let stream = DeleteFilterStream {
-            input: Box::pin(EmptyRecordBatchStream::new(schema.clone())),
-            deleted_positions: Arc::new(deleted_positions),
-            row_offset: 0,
-        };
-
-        let filtered_batch = stream.filter_batch(&batch).unwrap();
-
-        // Should have all 3 rows (no valid delete positions)
-        assert_eq!(
-            filtered_batch.num_rows(),
-            3,
-            "All rows should remain when delete positions are out of bounds"
-        );
-
-        let filtered_ids = filtered_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        let ids: Vec<i32> = filtered_ids.values().to_vec();
-        assert_eq!(ids, vec![10, 20, 30]);
+    fn deletes_row_at_listed_position() {
+        // positions [0,1,2,3]; delete position 1 (id=2). 1000 is out of range.
+        let (schema, b) = batch(&[1, 2, 3, 4], &[0, 1, 2, 3]);
+        let filtered = stream(schema, &[1, 1000]).filter_batch(&b).unwrap();
+        assert_eq!(ids(&filtered), vec![1, 3, 4]);
     }
 
     #[test]
-    fn test_filter_batch_with_row_offset() {
-        // Test that row_offset is correctly considered when checking positions
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            false,
-        )]));
+    fn keeps_all_when_no_position_matches() {
+        let (schema, b) = batch(&[10, 20, 30], &[0, 1, 2]);
+        let filtered = stream(schema, &[1000, 2000]).filter_batch(&b).unwrap();
+        assert_eq!(ids(&filtered), vec![10, 20, 30]);
+    }
 
-        let array = Int32Array::from(vec![100, 200, 300, 400]);
-        let batch =
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as Arc<dyn Array>]).unwrap();
-
-        // Delete position 11 and 1000 (way out of bounds)
-        // With row_offset=10, this batch contains global positions [10, 11, 12, 13]
-        // So position 11 should delete the second row (value=200)
-        let deleted_positions: HashSet<i64> = [11, 1000].into_iter().collect();
-
-        let stream = DeleteFilterStream {
-            input: Box::pin(EmptyRecordBatchStream::new(schema.clone())),
-            deleted_positions: Arc::new(deleted_positions),
-            row_offset: 10, // This batch starts at global position 10
-        };
-
-        let filtered_batch = stream.filter_batch(&batch).unwrap();
-
-        // Should have 3 rows (position 11 deleted, position 1000 ignored)
-        assert_eq!(filtered_batch.num_rows(), 3);
-
-        let filtered_values = filtered_batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-
-        let values: Vec<i32> = filtered_values.values().to_vec();
-        assert_eq!(
-            values,
-            vec![100, 300, 400],
-            "Position 11 (value=200) should be deleted, 1000 ignored"
-        );
+    #[test]
+    fn deletes_by_physical_position_not_arrival_order() {
+        // Positions are non-contiguous and out of arrival order: this batch
+        // holds physical rows {10, 11, 12, 13}. Deleting position 11 must drop
+        // the row whose pos==11 (value 200), regardless of its index in the batch.
+        let (schema, b) = batch(&[100, 200, 300, 400], &[10, 11, 12, 13]);
+        let filtered = stream(schema, &[11, 1000]).filter_batch(&b).unwrap();
+        assert_eq!(ids(&filtered), vec![100, 300, 400]);
     }
 }

@@ -43,6 +43,7 @@ pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
 pub mod path_resolver;
+pub(crate) mod positional_source;
 pub mod row_id;
 pub mod schema;
 pub mod table;

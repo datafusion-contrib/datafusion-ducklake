@@ -1,17 +1,36 @@
-//! Synthetic `rowid` column injection for DuckLake row lineage.
+//! Physical row position and synthetic `rowid` column injection for DuckLake
+//! row lineage.
 //!
-//! DuckLake assigns each row a globally unique `rowid` BIGINT. For files
-//! written by INSERT, the catalog records the file's `row_id_start`, and the
-//! per-row rowid is `row_id_start + position_in_file`. This module implements
-//! an execution plan ([`RowIdExec`]) that appends that synthetic column to
-//! each batch streaming out of a per-file Parquet scan, in file order.
+//! DuckLake assigns each row a globally unique `rowid` BIGINT. For files written
+//! by INSERT, the catalog records the file's `row_id_start`, and the per-row
+//! rowid is `row_id_start + physical_row_position`, where `physical_row_position`
+//! is the row's 0-based position in the physical Parquet file. Positional delete
+//! files use the same physical position in their `pos` column.
+//!
+//! The physical position is **not** derivable from stream arrival order: when
+//! DataFusion splits a file across scan partitions and merges them, arrival
+//! order no longer matches file order. Instead we:
+//!
+//! 1. partition the scan on row-group boundaries (so each partition's first
+//!    physical row is known — see `table.rs::build_row_group_partitions`), then
+//! 2. materialize the physical position as an internal column
+//!    ([`ROW_POS_COLUMN_NAME`]) with [`FileRowNumberExec`], seeding each
+//!    partition's counter from that partition's starting row.
+//!
+//! Downstream, [`RowIdExec`] reads that column to compute `rowid`, and
+//! `DeleteFilterExec` reads it to filter deleted positions — neither counts
+//! stream rows, so both are correct regardless of partitioning or merge order.
+//! DataFusion upstream is adding Parquet metadata / virtual-column support
+//! (apache/datafusion#20135, apache/datafusion#22026). If a future DataFusion
+//! release exposes a Parquet physical `row_number` column, prefer that
+//! reader-level source for [`ROW_POS_COLUMN_NAME`]: it can preserve more Parquet
+//! pruning while still producing true physical positions.
 //!
 //! Files written by `UPDATE` / compaction store the original rowids inline in
 //! the parquet as a column tagged with [`ROW_ID_PARQUET_FIELD_ID`] (typically
-//! named `_ducklake_internal_row_id`). Those files do NOT use this exec —
-//! `DuckLakeTable` reads the embedded column directly via the parquet scan
-//! and renames it; `RowIdExec` is only used when no embedded column is
-//! present. See `table.rs::build_exec_for_file_with_rowid`.
+//! named `_ducklake_internal_row_id`). Those files do NOT use [`RowIdExec`] —
+//! `DuckLakeTable` reads the embedded column directly via the parquet scan and
+//! renames it. See `table.rs::build_exec_for_file_with_rowid`.
 
 use std::any::Any;
 use std::pin::Pin;
@@ -23,7 +42,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{Distribution, EquivalenceProperties};
+use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -31,6 +50,13 @@ use futures::Stream;
 
 /// Name of the synthetic rowid column exposed when row lineage is enabled.
 pub const ROWID_COLUMN_NAME: &str = "rowid";
+
+/// Name of the internal physical-row-position column produced by
+/// [`FileRowNumberExec`] and consumed by [`RowIdExec`] / `DeleteFilterExec`.
+/// Projected away before the table's output schema (by `ColumnRenameExec`),
+/// so it never reaches the user. The double-underscore prefix avoids collisions
+/// with real catalog columns.
+pub const ROW_POS_COLUMN_NAME: &str = "__ducklake_row_pos";
 
 /// Iceberg / DuckLake reserved parquet field-id for the row-id column.
 /// Matches `MultiFileReader::ROW_ID_FIELD_ID` in DuckDB
@@ -46,52 +72,44 @@ pub fn rowid_field() -> Field {
     Field::new(ROWID_COLUMN_NAME, DataType::Int64, true)
 }
 
-/// Execution plan that appends a synthetic `rowid` BIGINT column to each batch.
+/// Build the Arrow Field for the internal physical-position column. Non-null:
+/// every row has a well-defined physical position.
+pub fn row_pos_field() -> Field {
+    Field::new(ROW_POS_COLUMN_NAME, DataType::Int64, false)
+}
+
+// ---------------------------------------------------------------------------
+// FileRowNumberExec — materialize the true physical row position as a column
+// ---------------------------------------------------------------------------
+
+/// Execution plan that appends an internal [`ROW_POS_COLUMN_NAME`] BIGINT column
+/// holding each row's **true physical position in the file**.
 ///
-/// For a row at position `p` within the file, `rowid = row_id_start + p`. The
-/// row_id_start is supplied per-file at plan construction. If `row_id_start` is
-/// `None`, the column is emitted as all NULL (caller's catalog doesn't track
-/// lineage for this file).
-///
-/// The plan does not change row count or row order, so it composes cleanly with
-/// a downstream `DeleteFilterExec` whose internal position cursor stays aligned.
+/// Correctness rests on a precondition enforced by its construction in
+/// `table.rs`: the input is a row-group-aligned, non-repartitionable,
+/// non-pruning scan, so partition `p` emits a complete, contiguous, in-order run
+/// of physical rows beginning at `partition_starts[p]`. The per-partition cursor
+/// then equals the physical position. Once materialized, the column travels with
+/// each row, so any reordering above this exec is harmless.
 #[derive(Debug)]
-pub struct RowIdExec {
+pub struct FileRowNumberExec {
     input: Arc<dyn ExecutionPlan>,
-    /// File's catalog-recorded `row_id_start`. None ⇒ emit NULL rowids.
-    row_id_start: Option<i64>,
-    /// Position in the output schema where the rowid column is inserted.
-    /// Valid range: 0..=input.schema().fields().len().
-    insert_at: usize,
-    /// Output schema = input schema with rowid inserted at `insert_at`.
+    /// Starting physical row position for each input partition (1:1 with the
+    /// scan's file groups).
+    partition_starts: Arc<Vec<i64>>,
+    /// Output schema = input schema with [`ROW_POS_COLUMN_NAME`] appended.
     schema: SchemaRef,
     properties: Arc<PlanProperties>,
 }
 
-impl RowIdExec {
-    /// Append rowid as the last column. Convenience for the common case.
-    pub fn new(input: Arc<dyn ExecutionPlan>, row_id_start: Option<i64>) -> Self {
-        let insert_at = input.schema().fields().len();
-        Self::new_at(input, row_id_start, insert_at)
-    }
-
-    /// Insert rowid at a specific output column position.
-    pub fn new_at(
-        input: Arc<dyn ExecutionPlan>,
-        row_id_start: Option<i64>,
-        insert_at: usize,
-    ) -> Self {
-        let input_schema = input.schema();
-        let input_len = input_schema.fields().len();
-        let insert_at = insert_at.min(input_len);
-
-        let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
-        fields.insert(insert_at, Arc::new(rowid_field()));
+impl FileRowNumberExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, partition_starts: Vec<i64>) -> Self {
+        let mut fields: Vec<Arc<Field>> = input.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(row_pos_field()));
         let schema = Arc::new(Schema::new(fields));
 
-        let eq_properties = EquivalenceProperties::new(schema.clone());
         let properties = Arc::new(PlanProperties::new(
-            eq_properties,
+            EquivalenceProperties::new(schema.clone()),
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
@@ -99,28 +117,197 @@ impl RowIdExec {
 
         Self {
             input,
-            row_id_start,
-            insert_at,
+            partition_starts: Arc::new(partition_starts),
             schema,
             properties,
         }
     }
 }
 
-impl DisplayAs for RowIdExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default
-            | DisplayFormatType::Verbose
-            | DisplayFormatType::TreeRender => {
-                write!(
-                    f,
-                    "RowIdExec: row_id_start={}",
-                    self.row_id_start
-                        .map_or_else(|| "NULL".to_string(), |v| v.to_string())
-                )
-            },
+impl DisplayAs for FileRowNumberExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "FileRowNumberExec: starts={:?}",
+            self.partition_starts.as_ref()
+        )
+    }
+}
+
+impl ExecutionPlan for FileRowNumberExec {
+    fn name(&self) -> &str {
+        "FileRowNumberExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    /// Order-preserving: appends a column without reordering or dropping rows.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    /// Refuse extra input partitioning. Our per-partition seeds are 1:1 with the
+    /// scan's row-group-aligned file groups; if `EnforceDistribution` inserted a
+    /// round-robin `RepartitionExec` below us to parallelize, the child would
+    /// report more partitions than we have seeds (and rows would be shuffled out
+    /// of physical order). Returning `false` keeps exactly the scan's partitions.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "FileRowNumberExec expects exactly one child".into(),
+            ));
         }
+        Ok(Arc::new(FileRowNumberExec::new(
+            children.into_iter().next().unwrap(),
+            self.partition_starts.as_ref().clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let start = *self.partition_starts.get(partition).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "FileRowNumberExec: no starting position for partition {partition} \
+                 (have {} partitions)",
+                self.partition_starts.len()
+            ))
+        })?;
+        Ok(Box::pin(FileRowNumberStream {
+            input: self.input.execute(partition, context)?,
+            schema: self.schema.clone(),
+            cursor: start,
+        }))
+    }
+}
+
+struct FileRowNumberStream {
+    input: SendableRecordBatchStream,
+    schema: SchemaRef,
+    /// Physical position of the first row of the next batch.
+    cursor: i64,
+}
+
+impl Stream for FileRowNumberStream {
+    type Item = DataFusionResult<RecordBatch>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.input).poll_next(cx) {
+            Poll::Ready(Some(Ok(batch))) => {
+                let n = batch.num_rows();
+                let mut builder = Int64Array::builder(n);
+                for i in 0..n {
+                    builder.append_value(self.cursor + i as i64);
+                }
+                self.cursor += n as i64;
+
+                let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
+                cols.push(Arc::new(builder.finish()));
+                let out = RecordBatch::try_new(self.schema.clone(), cols)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
+                Poll::Ready(Some(out))
+            },
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl RecordBatchStream for FileRowNumberStream {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RowIdExec — derive rowid from the physical-position column
+// ---------------------------------------------------------------------------
+
+/// Execution plan that appends a synthetic `rowid` BIGINT column computed as
+/// `row_id_start + __ducklake_row_pos`, reading the position column produced by
+/// [`FileRowNumberExec`] (possibly via a `DeleteFilterExec`).
+///
+/// Stateless w.r.t. row order: it reads a per-row value and appends a per-row
+/// value, so it is correct under any partitioning. The position column is passed
+/// through unchanged for any downstream consumer; the final projection
+/// (`ColumnRenameExec`) drops it. If `row_id_start` is `None` the rowid column is
+/// emitted as all-NULL (the per-file plan in `table.rs` hard-errors before
+/// reaching here for non-embedded files with no `row_id_start`, so this is a
+/// defensive fallback only).
+#[derive(Debug)]
+pub struct RowIdExec {
+    input: Arc<dyn ExecutionPlan>,
+    row_id_start: Option<i64>,
+    /// Index of [`ROW_POS_COLUMN_NAME`] in the input schema.
+    pos_index: usize,
+    /// Output schema = input schema with `rowid` appended.
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl RowIdExec {
+    /// Build a `RowIdExec`. The input must carry the [`ROW_POS_COLUMN_NAME`]
+    /// column (produced by [`FileRowNumberExec`]); errors otherwise.
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        row_id_start: Option<i64>,
+    ) -> DataFusionResult<Self> {
+        let input_schema = input.schema();
+        let pos_index = input_schema.index_of(ROW_POS_COLUMN_NAME).map_err(|_| {
+            DataFusionError::Internal(format!(
+                "RowIdExec input is missing the `{ROW_POS_COLUMN_NAME}` column"
+            ))
+        })?;
+
+        let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(rowid_field()));
+        let schema = Arc::new(Schema::new(fields));
+
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            input.output_partitioning().clone(),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        ));
+
+        Ok(Self {
+            input,
+            row_id_start,
+            pos_index,
+            schema,
+            properties,
+        })
+    }
+}
+
+impl DisplayAs for RowIdExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "RowIdExec: row_id_start={}",
+            self.row_id_start
+                .map_or_else(|| "NULL".to_string(), |v| v.to_string())
+        )
     }
 }
 
@@ -141,19 +328,9 @@ impl ExecutionPlan for RowIdExec {
         vec![&self.input]
     }
 
-    /// Rowid synthesis relies on rows arriving in file order on a single
-    /// stream — the cursor counts position-in-file. If DataFusion's
-    /// `EnforceDistribution` / `Repartition` rules inserted a `RepartitionExec`
-    /// below us, batches would arrive interleaved across partitions and
-    /// rowid = row_id_start + cursor would no longer correspond to the row's
-    /// real file offset. Pin the child to a single partition to prevent that.
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        vec![Distribution::SinglePartition]
-    }
-
-    /// Order-preserving wrapper: we do not reorder or drop rows, we only
-    /// append a column. Declaring this lets DataFusion's order-aware
-    /// optimizations (e.g. avoiding sorts after RowIdExec) fire.
+    /// Order-preserving column append. No distribution requirement: the rowid
+    /// value is computed from the per-row position column, so it is correct
+    /// regardless of how the input is partitioned or merged.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }
@@ -167,11 +344,10 @@ impl ExecutionPlan for RowIdExec {
                 "RowIdExec expects exactly one child".into(),
             ));
         }
-        Ok(Arc::new(RowIdExec::new_at(
+        Ok(Arc::new(RowIdExec::try_new(
             children.into_iter().next().unwrap(),
             self.row_id_start,
-            self.insert_at,
-        )))
+        )?))
     }
 
     fn execute(
@@ -183,8 +359,7 @@ impl ExecutionPlan for RowIdExec {
             input: self.input.execute(partition, context)?,
             schema: self.schema.clone(),
             row_id_start: self.row_id_start,
-            insert_at: self.insert_at,
-            cursor: 0,
+            pos_index: self.pos_index,
         }))
     }
 }
@@ -193,9 +368,7 @@ struct RowIdStream {
     input: SendableRecordBatchStream,
     schema: SchemaRef,
     row_id_start: Option<i64>,
-    insert_at: usize,
-    /// Position in the file of the first row of the next batch (file-order).
-    cursor: i64,
+    pos_index: usize,
 }
 
 impl Stream for RowIdStream {
@@ -207,9 +380,21 @@ impl Stream for RowIdStream {
                 let n = batch.num_rows();
                 let rowid_col: ArrayRef = match self.row_id_start {
                     Some(start) => {
+                        let pos = match batch
+                            .column(self.pos_index)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                        {
+                            Some(p) => p,
+                            None => {
+                                return Poll::Ready(Some(Err(DataFusionError::Internal(format!(
+                                    "`{ROW_POS_COLUMN_NAME}` column is not Int64"
+                                )))));
+                            },
+                        };
                         let mut builder = Int64Array::builder(n);
                         for i in 0..n {
-                            builder.append_value(start + self.cursor + i as i64);
+                            builder.append_value(start + pos.value(i));
                         }
                         Arc::new(builder.finish())
                     },
@@ -221,11 +406,9 @@ impl Stream for RowIdStream {
                         Arc::new(builder.finish())
                     },
                 };
-                self.cursor += n as i64;
 
                 let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-                let pos = self.insert_at.min(cols.len());
-                cols.insert(pos, rowid_col);
+                cols.push(rowid_col);
                 let out = RecordBatch::try_new(self.schema.clone(), cols)
                     .map_err(|e| DataFusionError::ArrowError(Box::new(e), None));
                 Poll::Ready(Some(out))
@@ -248,244 +431,185 @@ mod tests {
     use super::*;
     use arrow::array::{Array, Int32Array};
     use datafusion::datasource::memory::MemorySourceConfig;
+    use futures::StreamExt;
 
-    fn small_batch(schema: SchemaRef, values: &[i32]) -> RecordBatch {
-        RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(values.to_vec())) as ArrayRef],
-        )
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn appends_sequential_rowids_across_batches() {
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let b1 = small_batch(input_schema.clone(), &[10, 20, 30]);
-        let b2 = small_batch(input_schema.clone(), &[40, 50]);
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![b1, b2]], input_schema.clone(), None).unwrap();
-
-        let exec = Arc::new(RowIdExec::new(mem, Some(1000)));
-        assert_eq!(exec.schema().field(1).name(), ROWID_COLUMN_NAME);
-
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        use futures::StreamExt;
-
-        let first = stream.next().await.unwrap().unwrap();
-        let rowids = first
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(rowids, vec![1000, 1001, 1002]);
-
-        let second = stream.next().await.unwrap().unwrap();
-        let rowids = second
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(rowids, vec![1003, 1004]);
-    }
-
-    #[tokio::test]
-    async fn inserts_rowid_at_requested_position() {
-        let input_schema = Arc::new(Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Int32, false),
+    /// Build an input batch shaped like a `FileRowNumberExec` output: a value
+    /// column `v` plus the internal `__ducklake_row_pos` column.
+    fn batch_with_pos(values: &[i32], positions: &[i64]) -> (SchemaRef, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int32, false),
+            row_pos_field(),
         ]));
         let batch = RecordBatch::try_new(
-            input_schema.clone(),
+            schema.clone(),
             vec![
-                Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
-                Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+                Arc::new(Int32Array::from(values.to_vec())) as ArrayRef,
+                Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef,
             ],
         )
         .unwrap();
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None).unwrap();
-
-        // Insert rowid at position 1 → schema should be [a, rowid, b]
-        let exec = Arc::new(RowIdExec::new_at(mem, Some(500), 1));
-        assert_eq!(exec.schema().field(0).name(), "a");
-        assert_eq!(exec.schema().field(1).name(), ROWID_COLUMN_NAME);
-        assert_eq!(exec.schema().field(2).name(), "b");
-
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        use futures::StreamExt;
-
-        let out = stream.next().await.unwrap().unwrap();
-        let rowids = out
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(rowids, vec![500, 501]);
-        // Verify physical columns still in place around rowid
-        let a = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        let b = out
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(a, vec![10, 20]);
-        assert_eq!(b, vec![100, 200]);
+        (schema, batch)
     }
 
+    // --- FileRowNumberExec ---
+
     #[tokio::test]
-    async fn rowid_only_projection_empty_input_columns() {
-        // The input has zero columns (count-rows-only mode). RowIdExec
-        // should still emit a single-column batch with the rowid values.
-        // This is the shape that flows from a parquet scan when only rowid
-        // is in the projection.
-        let input_schema = Arc::new(Schema::new(Vec::<Field>::new()));
-        let batch = RecordBatch::try_new_with_options(
-            input_schema.clone(),
-            vec![],
-            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(3)),
-        )
-        .unwrap();
-        let mem =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema.clone(), None).unwrap();
-
-        let exec = Arc::new(RowIdExec::new(mem, Some(42)));
-        assert_eq!(exec.schema().fields().len(), 1);
-        assert_eq!(exec.schema().field(0).name(), ROWID_COLUMN_NAME);
-
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        use futures::StreamExt;
-        let out = stream.next().await.unwrap().unwrap();
-        assert_eq!(out.num_rows(), 3);
-        assert_eq!(out.num_columns(), 1);
-        let rowids = out
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
+    async fn file_row_number_seeds_per_partition() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mk = |vals: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vals)) as ArrayRef],
+            )
             .unwrap()
-            .values()
-            .to_vec();
-        assert_eq!(rowids, vec![42, 43, 44]);
-    }
-
-    #[tokio::test]
-    async fn empty_batch_passes_through_with_empty_rowid_column() {
-        // A zero-row batch from the input should produce a zero-row batch
-        // out, with the rowid column present and the cursor unchanged so
-        // the next non-empty batch picks up at the right offset.
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let empty_batch = RecordBatch::try_new(
-            input_schema.clone(),
-            vec![Arc::new(Int32Array::from(Vec::<i32>::new())) as ArrayRef],
-        )
-        .unwrap();
-        let next_batch = small_batch(input_schema.clone(), &[7, 8]);
+        };
+        // Two partitions: partition 0 starts at 0, partition 1 starts at 100.
         let mem = MemorySourceConfig::try_new_exec(
-            &[vec![empty_batch, next_batch]],
-            input_schema.clone(),
+            &[vec![mk(vec![1, 2, 3])], vec![mk(vec![4, 5])]],
+            schema.clone(),
             None,
         )
         .unwrap();
+        let exec = Arc::new(FileRowNumberExec::new(mem, vec![0, 100]));
+        assert_eq!(exec.schema().field(1).name(), ROW_POS_COLUMN_NAME);
 
-        let exec = Arc::new(RowIdExec::new(mem, Some(100)));
         let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        use futures::StreamExt;
+        let pos_of = |b: &RecordBatch| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
 
-        let first = stream.next().await.unwrap().unwrap();
-        assert_eq!(first.num_rows(), 0);
-        assert_eq!(first.num_columns(), 2);
+        let mut s0 = exec.clone().execute(0, ctx.clone()).unwrap();
+        let p0 = s0.next().await.unwrap().unwrap();
+        assert_eq!(pos_of(&p0), vec![0, 1, 2]);
 
-        let second = stream.next().await.unwrap().unwrap();
-        let rowids = second
-            .column(1)
+        let mut s1 = exec.execute(1, ctx).unwrap();
+        let p1 = s1.next().await.unwrap().unwrap();
+        assert_eq!(
+            pos_of(&p1),
+            vec![100, 101],
+            "partition 1 seeds at its start"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_row_number_continues_across_batches() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mk = |vals: Vec<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vals)) as ArrayRef],
+            )
+            .unwrap()
+        };
+        let mem = MemorySourceConfig::try_new_exec(
+            &[vec![mk(vec![1, 2, 3]), mk(vec![4, 5])]],
+            schema.clone(),
+            None,
+        )
+        .unwrap();
+        let exec = Arc::new(FileRowNumberExec::new(mem, vec![10]));
+        let ctx = Arc::new(TaskContext::default());
+        let mut s = exec.execute(0, ctx).unwrap();
+
+        let pos_of = |b: &RecordBatch| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(pos_of(&s.next().await.unwrap().unwrap()), vec![10, 11, 12]);
+        assert_eq!(pos_of(&s.next().await.unwrap().unwrap()), vec![13, 14]);
+    }
+
+    #[tokio::test]
+    async fn file_row_number_zero_column_input() {
+        // COUNT(*)-style input: zero data columns, only a row count.
+        let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let batch = RecordBatch::try_new_with_options(
+            schema.clone(),
+            vec![],
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(4)),
+        )
+        .unwrap();
+        let mem = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        let exec = Arc::new(FileRowNumberExec::new(mem, vec![7]));
+        let ctx = Arc::new(TaskContext::default());
+        let mut s = exec.execute(0, ctx).unwrap();
+        let out = s.next().await.unwrap().unwrap();
+        assert_eq!(out.num_columns(), 1);
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec(),
+            vec![7, 8, 9, 10]
+        );
+    }
+
+    // --- RowIdExec ---
+
+    #[tokio::test]
+    async fn rowid_is_start_plus_position() {
+        // Positions deliberately non-contiguous to prove rowid reads the column
+        // rather than counting arrivals.
+        let (schema, batch) = batch_with_pos(&[10, 20, 30], &[5, 6, 9]);
+        let mem = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        let exec = Arc::new(RowIdExec::try_new(mem, Some(1000)).unwrap());
+
+        // Output appends rowid after the input columns (v, pos, rowid).
+        assert_eq!(exec.schema().field(2).name(), ROWID_COLUMN_NAME);
+
+        let ctx = Arc::new(TaskContext::default());
+        let mut s = exec.execute(0, ctx).unwrap();
+        let out = s.next().await.unwrap().unwrap();
+        let rowids = out
+            .column(2)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap()
             .values()
             .to_vec();
-        // Cursor should NOT have advanced past the empty batch — second
-        // batch rows still start at row_id_start + 0.
-        assert_eq!(rowids, vec![100, 101]);
+        assert_eq!(rowids, vec![1005, 1006, 1009]);
+        // Position column passed through unchanged for downstream consumers.
+        assert_eq!(
+            out.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec(),
+            vec![5, 6, 9]
+        );
     }
 
     #[tokio::test]
-    async fn insert_at_out_of_range_clamps_to_end() {
-        // Caller asks to insert at position 99 when the input has only 1
-        // column. The constructor clamps to input.len() (= 1) so the rowid
-        // ends up appended at the end.
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let b = small_batch(input_schema.clone(), &[1, 2]);
-        let mem = MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
-
-        let exec = Arc::new(RowIdExec::new_at(mem, Some(10), 99));
-        assert_eq!(exec.schema().fields().len(), 2);
-        assert_eq!(exec.schema().field(0).name(), "v");
-        assert_eq!(exec.schema().field(1).name(), ROWID_COLUMN_NAME);
+    async fn rowid_null_when_start_is_none() {
+        let (schema, batch) = batch_with_pos(&[1, 2], &[0, 1]);
+        let mem = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).unwrap();
+        let exec = Arc::new(RowIdExec::try_new(mem, None).unwrap());
+        let ctx = Arc::new(TaskContext::default());
+        let mut s = exec.execute(0, ctx).unwrap();
+        let out = s.next().await.unwrap().unwrap();
+        let rowid = out.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(rowid.is_null(0) && rowid.is_null(1));
     }
 
     #[test]
-    fn declares_single_partition_input_to_block_repartition() {
-        // Regression guard for the cursor-vs-RepartitionExec hazard: if
-        // either of these defaults reverts, DataFusion's optimizer could
-        // legally insert a RepartitionExec under RowIdExec and break
-        // rowid computation silently. We do not over-assert the exact
-        // Distribution shape — just that it is SinglePartition for the
-        // sole child.
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let mem = MemorySourceConfig::try_new_exec(&[vec![]], input_schema, None).unwrap();
-        let exec = RowIdExec::new(mem, Some(0));
-
-        let dists = exec.required_input_distribution();
-        assert_eq!(dists.len(), 1);
+    fn rowid_errors_without_position_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let mem = MemorySourceConfig::try_new_exec(&[vec![]], schema, None).unwrap();
         assert!(
-            matches!(dists[0], Distribution::SinglePartition),
-            "RowIdExec must require a single-partition input; got {:?}",
-            dists[0]
+            RowIdExec::try_new(mem, Some(0)).is_err(),
+            "RowIdExec must require the position column"
         );
-        assert_eq!(
-            exec.maintains_input_order(),
-            vec![true],
-            "RowIdExec preserves row order — must declare it so DataFusion's \
-             order-aware optimizations can fire",
-        );
-    }
-
-    #[tokio::test]
-    async fn emits_null_when_row_id_start_is_none() {
-        let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-        let b = small_batch(input_schema.clone(), &[1, 2]);
-        let mem = MemorySourceConfig::try_new_exec(&[vec![b]], input_schema.clone(), None).unwrap();
-
-        let exec = Arc::new(RowIdExec::new(mem, None));
-        let ctx = Arc::new(TaskContext::default());
-        let mut stream = exec.execute(0, ctx).unwrap();
-        use futures::StreamExt;
-
-        let batch = stream.next().await.unwrap().unwrap();
-        let rowid_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(rowid_col.len(), 2);
-        assert!(rowid_col.is_null(0));
-        assert!(rowid_col.is_null(1));
     }
 }

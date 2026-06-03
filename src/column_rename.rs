@@ -138,48 +138,54 @@ impl Stream for ColumnRenameStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.input).poll_next(cx) {
             Poll::Ready(Some(Ok(batch))) => {
-                let result: DataFusionResult<RecordBatch> = if batch.num_columns() == 0 {
-                    // COUNT(*) case: preserve row count with empty schema
-                    use arrow::record_batch::RecordBatchOptions;
-                    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-                    RecordBatch::try_new_with_options(
-                        Arc::clone(&self.output_schema),
-                        vec![],
-                        &options,
-                    )
-                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                } else {
-                    // Build columns by looking up each output field in the input batch
-                    let input_schema = batch.schema();
-                    let columns: DataFusionResult<Vec<_>> = self
-                        .output_schema
-                        .fields()
-                        .iter()
-                        .map(|output_field| {
-                            // Check if this column was renamed (new_name -> old_name)
-                            let input_name = self
-                                .reverse_mapping
-                                .get(output_field.name())
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| output_field.name().as_str());
+                let result: DataFusionResult<RecordBatch> =
+                    if self.output_schema.fields().is_empty() {
+                        // Zero OUTPUT columns (e.g. COUNT(*)): preserve the row count
+                        // with an empty schema. This must key off the output schema,
+                        // not the input: on positional paths the input still carries
+                        // the internal `__ducklake_row_pos` column (1 input column),
+                        // yet the output is zero columns and the count must survive.
+                        use arrow::record_batch::RecordBatchOptions;
+                        let options =
+                            RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                        RecordBatch::try_new_with_options(
+                            Arc::clone(&self.output_schema),
+                            vec![],
+                            &options,
+                        )
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    } else {
+                        // Build columns by looking up each output field in the input batch
+                        let input_schema = batch.schema();
+                        let columns: DataFusionResult<Vec<_>> = self
+                            .output_schema
+                            .fields()
+                            .iter()
+                            .map(|output_field| {
+                                // Check if this column was renamed (new_name -> old_name)
+                                let input_name = self
+                                    .reverse_mapping
+                                    .get(output_field.name())
+                                    .map(|s| s.as_str())
+                                    .unwrap_or_else(|| output_field.name().as_str());
 
-                            let idx = input_schema
-                                .index_of(input_name)
-                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-                            // Coerce the column read from the file back to the
-                            // catalog (output) type, keeping the provider
-                            // self-consistent: it advertises and emits the catalog
-                            // schema regardless of the file's physical Arrow type.
-                            // Identical types clone cheaply.
-                            coerce_column(batch.column(idx), output_field.data_type())
+                                let idx = input_schema
+                                    .index_of(input_name)
+                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                                // Coerce the column read from the file back to the
+                                // catalog (output) type, keeping the provider
+                                // self-consistent: it advertises and emits the catalog
+                                // schema regardless of the file's physical Arrow type.
+                                // Identical types clone cheaply.
+                                coerce_column(batch.column(idx), output_field.data_type())
+                            })
+                            .collect();
+
+                        columns.and_then(|cols| {
+                            RecordBatch::try_new(Arc::clone(&self.output_schema), cols)
+                                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                         })
-                        .collect();
-
-                    columns.and_then(|cols| {
-                        RecordBatch::try_new(Arc::clone(&self.output_schema), cols)
-                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                    })
-                };
+                    };
 
                 Poll::Ready(Some(result))
             },
