@@ -31,6 +31,14 @@ pub struct DuckLakeTableWriter {
     /// override via [`DuckLakeTableWriter::with_compression`] to trade write
     /// CPU for ~2x smaller files (e.g. `LZ4`, `SNAPPY`, `ZSTD`).
     compression: Compression,
+    /// Optional max rows per parquet row group. `None` leaves the parquet
+    /// default. Set via [`DuckLakeTableWriter::with_max_row_group_rows`].
+    max_row_group_rows: Option<usize>,
+    /// Optional max *uncompressed* bytes per parquet row group. `None` leaves
+    /// the parquet default (rows-only). A reader decodes a whole row group at
+    /// once, so a byte cap bounds reader memory for wide schemas (e.g. large
+    /// vector columns). Set via [`DuckLakeTableWriter::with_max_row_group_bytes`].
+    max_row_group_bytes: Option<usize>,
 }
 
 impl DuckLakeTableWriter {
@@ -46,6 +54,8 @@ impl DuckLakeTableWriter {
             object_store,
             base_key_path: key_path,
             compression: Compression::UNCOMPRESSED,
+            max_row_group_rows: None,
+            max_row_group_bytes: None,
         })
     }
 
@@ -53,6 +63,24 @@ impl DuckLakeTableWriter {
     /// Defaults to [`Compression::UNCOMPRESSED`].
     pub fn with_compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Cap the number of rows per parquet row group. Leaves the parquet
+    /// default when unset.
+    pub fn with_max_row_group_rows(mut self, rows: usize) -> Self {
+        self.max_row_group_rows = Some(rows);
+        self
+    }
+
+    /// Cap the *uncompressed* bytes per parquet row group, flushing the row
+    /// group once it is reached. Because a parquet reader must decode an entire
+    /// row group into memory at once, this bounds reader memory for wide
+    /// schemas (e.g. large `List`/`FixedSizeList` vector columns) that would
+    /// otherwise build multi-GiB row groups at the rows-only default. Leaves
+    /// the parquet default when unset.
+    pub fn with_max_row_group_bytes(mut self, bytes: usize) -> Self {
+        self.max_row_group_bytes = Some(bytes);
         self
     }
 
@@ -125,10 +153,21 @@ impl DuckLakeTableWriter {
         // Strip leading slash for object_store Path (it expects relative keys)
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
-        let props = WriterProperties::builder()
+        // Apply caller-configured row-group caps. The ArrowWriter enforces both
+        // natively (flushing the row group when either is hit). The byte cap
+        // matters for wide schemas: a parquet reader decodes a whole row group
+        // at once, so an uncapped large vector column builds multi-GiB row
+        // groups that OOM readers. Both default to the parquet default (unset).
+        let mut props_builder = WriterProperties::builder()
             .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-            .set_compression(self.compression)
-            .build();
+            .set_compression(self.compression);
+        if let Some(rows) = self.max_row_group_rows {
+            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
+        }
+        if let Some(bytes) = self.max_row_group_bytes {
+            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
+        }
+        let props = props_builder.build();
         // Stream the parquet to a local staging file rather than an in-memory
         // buffer: a multi-GB table would otherwise be held whole in RAM and,
         // worse, uploaded as a single PUT (object stores cap a single PUT at
