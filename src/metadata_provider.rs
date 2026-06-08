@@ -493,6 +493,11 @@ pub struct DuckLakeTableFile {
     /// Total rows in this file (`record_count` from the catalog), before any
     /// delete files are applied. Used for synthetic `rowid` generation.
     pub max_row_count: Option<i64>,
+    /// Number of rows removed by the associated `delete_file` visible at the
+    /// queried snapshot (`delete_count` from `ducklake_delete_file`). `None`
+    /// when there is no visible delete file. Net live rows for this file are
+    /// `max_row_count - delete_count`.
+    pub delete_count: Option<i64>,
 }
 
 impl DuckLakeTableFile {
@@ -503,6 +508,7 @@ impl DuckLakeTableFile {
             row_id_start: None,
             snapshot_id: None,
             max_row_count: None,
+            delete_count: None,
         }
     }
 }
@@ -572,6 +578,27 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>>;
     //     todo: support select with file pruning
+
+    /// Net number of live rows in a table at a snapshot, accounting for delete
+    /// files: `SUM(record_count) - SUM(delete_count)` over the files visible at
+    /// `snapshot_id`. This matches a `SELECT COUNT(*)` against the table at that
+    /// snapshot without scanning any data — the counts come from catalog
+    /// metadata.
+    ///
+    /// The default implementation derives the count from
+    /// [`get_table_files_for_select`](Self::get_table_files_for_select), so it
+    /// is computed from exactly the file set a scan would read and stays correct
+    /// across deletes, replacements, and compaction. A file whose
+    /// `max_row_count` is unset (foreign catalogs that omit `record_count`)
+    /// contributes 0 and cannot be counted from metadata alone.
+    fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
+        let files = self.get_table_files_for_select(table_id, snapshot_id)?;
+        let net: i64 = files
+            .iter()
+            .map(|f| f.max_row_count.unwrap_or(0) - f.delete_count.unwrap_or(0))
+            .sum();
+        Ok(net.max(0) as u64)
+    }
 
     // Dynamic lookup methods for on-demand metadata retrieval
 

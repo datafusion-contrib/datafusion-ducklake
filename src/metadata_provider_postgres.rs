@@ -257,16 +257,20 @@ impl MetadataProvider for PostgresMetadataProvider {
                     let row_id_start: Option<i64> = row.try_get(6)?;
                     let record_count: Option<i64> = row.try_get(7)?;
 
-                    let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
-                        Some(DuckLakeFileData {
-                            path: row.try_get(9)?,
-                            path_is_relative: row.try_get(10)?,
-                            file_size_bytes: row.try_get(11)?,
-                            footer_size: row.try_get(12)?,
-                            encryption_key: row.try_get(13)?,
-                        })
+                    let (delete_file, delete_count) = if row.try_get::<Option<i64>, _>(8)?.is_some()
+                    {
+                        (
+                            Some(DuckLakeFileData {
+                                path: row.try_get(9)?,
+                                path_is_relative: row.try_get(10)?,
+                                file_size_bytes: row.try_get(11)?,
+                                footer_size: row.try_get(12)?,
+                                encryption_key: row.try_get(13)?,
+                            }),
+                            row.try_get(14)?,
+                        )
                     } else {
-                        None
+                        (None, None)
                     };
 
                     Ok(DuckLakeTableFile {
@@ -275,6 +279,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
                         max_row_count: record_count,
+                        delete_count,
                     })
                 })
                 .collect()
@@ -523,6 +528,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                             row_id_start: None,
                             snapshot_id: None,
                             max_row_count: row.try_get(14)?,
+                            delete_count: None,
                         },
                     })
                 })

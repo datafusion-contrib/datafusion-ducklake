@@ -193,19 +193,21 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let record_count: Option<i64> = row.get(7)?;
 
                     // Parse delete file (columns 8-14) if exists
-                    let delete_file = if let Ok(Some(_)) = row.get::<_, Option<i64>>(8) {
-                        Some(DuckLakeFileData {
-                            path: row.get(9)?,
-                            path_is_relative: row.get(10)?,
-                            file_size_bytes: row.get(11)?,
-                            footer_size: row.get(12)?,
-                            encryption_key: row.get(13)?,
-                        })
-                    } else {
-                        None
-                    };
-
-                    let _delete_count: Option<i64> = row.get(14)?;
+                    let (delete_file, delete_count) =
+                        if let Ok(Some(_)) = row.get::<_, Option<i64>>(8) {
+                            (
+                                Some(DuckLakeFileData {
+                                    path: row.get(9)?,
+                                    path_is_relative: row.get(10)?,
+                                    file_size_bytes: row.get(11)?,
+                                    footer_size: row.get(12)?,
+                                    encryption_key: row.get(13)?,
+                                }),
+                                row.get(14)?,
+                            )
+                        } else {
+                            (None, None)
+                        };
 
                     Ok(DuckLakeTableFile {
                         file: data_file,
@@ -213,6 +215,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
                         max_row_count: record_count,
+                        delete_count,
                     })
                 },
             )?
@@ -397,6 +400,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             row_id_start: None,
                             snapshot_id: None,
                             max_row_count,
+                            delete_count: None,
                         },
                     })
                 },
