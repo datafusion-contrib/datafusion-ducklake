@@ -265,6 +265,15 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult>;
+
+    /// The catalog id this writer is scoped to, when the backend has a notion
+    /// of catalogs (multicatalog Postgres). Single-catalog backends (SQLite)
+    /// return `None`, which keeps `DuckLakeTableWriter` from inserting a
+    /// per-catalog directory segment into newly-written file paths and so
+    /// preserves today's `{data_path}/{schema}/{table}/…` layout.
+    fn catalog_id(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[cfg(test)]
