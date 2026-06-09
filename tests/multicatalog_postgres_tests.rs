@@ -2221,7 +2221,7 @@ async fn writes_segregate_data_files_by_catalog_directory() {
         let table_writer =
             DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store)).unwrap();
         table_writer
-            .write_table("public", "users", &[batch.clone()])
+            .write_table("public", "users", std::slice::from_ref(&batch))
             .await
             .unwrap();
     }
