@@ -708,12 +708,20 @@ impl MetadataWriter for PostgresMetadataWriter {
                 if let Some(row) = existing {
                     row.try_get(0)?
                 } else {
+                    // Multicatalog segregation: encode the catalog id into the
+                    // schema's *path* (not its name) so two catalogs holding
+                    // their own `public` schema land in disjoint physical
+                    // subtrees. The reader's resolution chain
+                    // (`data_path + schema.path + table.path + file.path`)
+                    // then puts files under `cat_{id}/{schema}/{table}/…`,
+                    // matching the `DuckLakeTableWriter` upload location.
+                    let scoped_schema_path = format!("cat_{catalog_id}/{schema_name}");
                     let row = sqlx::query(
                         "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                          VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
                     )
                     .bind(schema_name)
-                    .bind(schema_name)
+                    .bind(&scoped_schema_path)
                     .bind(snapshot_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -923,6 +931,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                 column_ids,
             })
         })
+    }
+
+    fn catalog_id(&self) -> Option<i64> {
+        Some(self.catalog_id)
     }
 }
 

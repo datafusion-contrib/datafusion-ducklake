@@ -93,7 +93,18 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
-        let table_key = join_paths(&join_paths(&self.base_key_path, schema_name)?, table_name)?;
+        // Multicatalog backends share one physical `data_path`, so without a
+        // per-catalog segment two catalogs writing the same (schema, table)
+        // would dump files into the same directory. Prepend `cat_{id}` to keep
+        // them physically isolated. Single-catalog backends report `None` and
+        // skip the segment, preserving the historical `{schema}/{table}/…`
+        // layout. `cat_` prefix + numeric id is rename-safe and needs no
+        // sanitisation.
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
         let file_name = format!("{}.parquet", Uuid::new_v4());
         self.begin_write_internal(
             schema_name,

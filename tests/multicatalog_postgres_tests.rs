@@ -11,7 +11,8 @@
 
 use datafusion_ducklake::metadata_writer::{ColumnDef, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
-    MulticatalogManager, PostgresMetadataWriter, initialize_multicatalog_schema,
+    DuckLakeTableWriter, MulticatalogManager, PostgresMetadataWriter,
+    initialize_multicatalog_schema,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -2163,4 +2164,130 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
     for name in ["o1.parquet", "o2.parquet", "o3.parquet"] {
         assert!(!dir.join(name).exists(), "orphan deleted: {name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-catalog data-path segregation. Two catalogs sharing one physical
+// data_path must NOT commingle files under `{data_path}/{schema}/{table}/…`.
+// The writer encodes the catalog id into `ducklake_schema.path` (as
+// `cat_{catalog_id}/{schema_name}`), so the read-side resolution chain
+// `data_path + schema.path + table.path + file.path` naturally produces a
+// per-catalog subtree.
+//
+// The strongest assertion is end-to-end: rebuild the resolution chain from
+// the three stored columns and assert the resulting absolute path is a real
+// file on disk. If the writer's upload prefix and the catalog-stored
+// schema.path ever drift apart, this assertion fails immediately.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn writes_segregate_data_files_by_catalog_directory() {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("pg_a").await.unwrap();
+    let cat_b = mgr.create_catalog("pg_b").await.unwrap();
+    assert_ne!(cat_a, cat_b);
+
+    // Both catalogs share one physical root.
+    let root = TempDir::new().unwrap();
+    let data_path = root.path().to_str().unwrap().to_string();
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1])), Arc::new(StringArray::from(vec![Some("x")]))],
+    )
+    .unwrap();
+
+    // Write one row through each catalog into the same `public.users`.
+    for cid in [cat_a, cat_b] {
+        let writer = PostgresMetadataWriter::with_pool(pool.clone(), cid)
+            .await
+            .unwrap();
+        writer.set_data_path(&data_path).unwrap();
+        let table_writer =
+            DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store)).unwrap();
+        table_writer
+            .write_table("public", "users", std::slice::from_ref(&batch))
+            .await
+            .unwrap();
+    }
+
+    // Pull every (catalog_id, schema.path, table.path, file.path) tuple. The
+    // multicatalog reader walks exactly these columns plus data_path; if our
+    // writer's upload prefix doesn't match this chain, the file isn't where
+    // the reader will look.
+    let rows = sqlx::query(
+        "SELECT m.catalog_id,
+                s.schema_name, s.path AS schema_path,
+                t.table_name,  t.path AS table_path,
+                d.path         AS file_path
+         FROM ducklake_data_file d
+         JOIN ducklake_table t              ON t.table_id  = d.table_id
+         JOIN ducklake_schema s             ON s.schema_id = t.schema_id
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "one file per catalog");
+
+    let mut top_segments = std::collections::HashSet::new();
+    for row in &rows {
+        let cid: i64 = row.try_get("catalog_id").unwrap();
+        let schema_name: String = row.try_get("schema_name").unwrap();
+        let schema_path: String = row.try_get("schema_path").unwrap();
+        let table_name: String = row.try_get("table_name").unwrap();
+        let table_path: String = row.try_get("table_path").unwrap();
+        let file_path: String = row.try_get("file_path").unwrap();
+
+        // schema_name is what the user asked for; schema.path is where files
+        // physically land. The id-prefixed path is what gives each catalog
+        // its own subtree without renaming the user-visible schema.
+        assert_eq!(schema_name, "public");
+        assert_eq!(
+            schema_path,
+            format!("cat_{cid}/public"),
+            "catalog {cid} schema.path must carry the cat_<id> prefix",
+        );
+        assert_eq!(table_path, table_name); // unchanged
+        assert!(
+            file_path.ends_with(".parquet") && !file_path.contains('/'),
+            "data_file.path should still be just the bare filename, got {file_path:?}",
+        );
+
+        // End-to-end: rebuild the reader's resolution chain manually and
+        // assert it points at a real file. This is the assertion that would
+        // have caught the bug where the writer's upload prefix didn't match
+        // schema.path.
+        let resolved = root
+            .path()
+            .join(&schema_path)
+            .join(&table_path)
+            .join(&file_path);
+        assert!(
+            resolved.is_file(),
+            "resolved path missing on disk: {resolved:?}",
+        );
+
+        top_segments.insert(schema_path.split('/').next().unwrap_or("").to_string());
+    }
+    assert_eq!(
+        top_segments.len(),
+        2,
+        "two catalogs must land under distinct cat_<id> top segments: {top_segments:?}",
+    );
 }
