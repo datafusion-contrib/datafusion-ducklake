@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -990,4 +990,69 @@ async fn test_streaming_write_large_file_uses_multipart() {
         .value(0);
     assert_eq!(n, ROWS);
     assert_eq!(s, ROWS * (ROWS - 1) / 2);
+}
+
+/// End-to-end regression for nanosecond tz-aware timestamps.
+///
+/// A `Timestamp(Nanosecond, Some(tz))` column (the pandas/PyArrow default for
+/// tz-aware datetimes) used to be cataloged as µs `timestamptz`, so the served
+/// schema disagreed with the physical parquet and the read path silently
+/// truncated the sub-microsecond fraction on every scan. This writes ns values
+/// with non-zero sub-µs digits and asserts they survive the full
+/// write -> catalog -> read round-trip at full precision.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_and_read_nanosecond_timestamptz() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "event_ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ),
+    ]));
+
+    // Values with a non-zero sub-microsecond fraction: truncation to µs would
+    // zero the last three digits, so exact equality proves no precision loss.
+    let ns_values = vec![1_000_000_000_123_456_789i64, 1_700_000_000_987_654_321i64];
+    let ts_array = TimestampNanosecondArray::from(ns_values.clone()).with_timezone("UTC");
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(ts_array)],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    table_writer
+        .write_table("main", "events", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let df = ctx
+        .sql("SELECT event_ts FROM test.main.events ORDER BY id")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+
+    // Served schema must keep nanosecond precision, not collapse to µs.
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        "served column must round-trip as nanosecond tz-aware"
+    );
+
+    let col = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("column reads back as TimestampNanosecondArray");
+    assert_eq!(
+        col.values(),
+        ns_values.as_slice(),
+        "sub-microsecond fraction must survive the round-trip"
+    );
 }

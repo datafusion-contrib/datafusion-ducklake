@@ -50,6 +50,10 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
             TimeUnit::Microsecond,
             Some("UTC".into()),
         )),
+        "timestamptz_ns" => Ok(DataType::Timestamp(
+            TimeUnit::Nanosecond,
+            Some("UTC".into()),
+        )),
         "timestamp_s" => Ok(DataType::Timestamp(TimeUnit::Second, None)),
         "timestamp_ms" => Ok(DataType::Timestamp(TimeUnit::Millisecond, None)),
         "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
@@ -118,6 +122,13 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         DataType::Timestamp(TimeUnit::Millisecond, None) => Ok("timestamp_ms".to_string()),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok("timestamp".to_string()),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => Ok("timestamp_ns".to_string()),
+        // Tz-aware timestamps. DuckLake distinguishes nanosecond precision
+        // (`timestamptz_ns` -> TIMESTAMP_TZ_NS) from microsecond (`timestamptz`
+        // -> TIMESTAMP_TZ); collapsing ns into `timestamptz` truncates the
+        // served value to µs on read while the physical parquet keeps ns. Second
+        // and millisecond tz timestamps have no DuckLake type, so they widen
+        // losslessly to µs `timestamptz`.
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Ok("timestamptz_ns".to_string()),
         DataType::Timestamp(_, Some(_)) => Ok("timestamptz".to_string()),
         DataType::Interval(_) => Ok("interval".to_string()),
 
@@ -630,6 +641,15 @@ mod tests {
             ducklake_to_arrow_type("timestamp").unwrap(),
             DataType::Timestamp(TimeUnit::Microsecond, None)
         );
+        assert_eq!(
+            ducklake_to_arrow_type("timestamptz").unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+        // Nanosecond tz-aware timestamps map to DuckLake's TIMESTAMP_TZ_NS.
+        assert_eq!(
+            ducklake_to_arrow_type("timestamptz_ns").unwrap(),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+        );
     }
 
     #[test]
@@ -795,6 +815,37 @@ mod tests {
             .unwrap(),
             "timestamptz"
         );
+        // Nanosecond tz-aware timestamps get their own DuckLake type rather than
+        // collapsing to µs `timestamptz` (which would silently truncate on read).
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "timestamptz_ns"
+        );
+        // A non-UTC zone label still selects the ns type by unit; the instant is
+        // UTC-normalised and the zone relabels to UTC on read (DuckLake stores an
+        // instant, not the zone name).
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/New_York".into())
+            ))
+            .unwrap(),
+            "timestamptz_ns"
+        );
+        // Second/millisecond tz timestamps have no DuckLake type; they widen
+        // losslessly to µs `timestamptz`.
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into())
+            ))
+            .unwrap(),
+            "timestamptz"
+        );
     }
 
     #[test]
@@ -834,6 +885,9 @@ mod tests {
             DataType::Binary,
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             DataType::Decimal128(10, 2),
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
             DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
@@ -844,6 +898,34 @@ mod tests {
             let back = ducklake_to_arrow_type(&ducklake).unwrap();
             assert_eq!(original, back, "Roundtrip failed for {:?}", original);
         }
+    }
+
+    /// Regression: a nanosecond tz-aware timestamp (the pandas/PyArrow default
+    /// for tz-aware datetimes) must not be cataloged as µs `timestamptz`. Doing
+    /// so left the physical parquet at ns while the catalog claimed µs, so the
+    /// read path silently truncated sub-microsecond precision on every scan.
+    #[test]
+    fn test_nanosecond_timestamptz_preserves_precision() {
+        let ns_tz = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+
+        // Catalog type must encode nanosecond precision, not collapse to µs.
+        let ducklake = arrow_to_ducklake_type(&ns_tz).unwrap();
+        assert_eq!(ducklake, "timestamptz_ns");
+        assert_ne!(
+            ducklake, "timestamptz",
+            "ns tz-aware timestamp must not collapse to µs timestamptz"
+        );
+
+        // And the catalog type round-trips back to nanosecond precision, so the
+        // served schema matches the physical parquet and no ns->µs cast occurs.
+        let back = ducklake_to_arrow_type(&ducklake).unwrap();
+        assert_eq!(back, ns_tz);
+
+        // The two tz precisions stay distinct (not mutually promotable): changing
+        // a column's precision is not a safe widening.
+        assert!(!is_promotable("timestamptz", "timestamptz_ns"));
+        assert!(!is_promotable("timestamptz_ns", "timestamptz"));
+        assert!(!types_compatible("timestamptz", "timestamptz_ns"));
     }
 
     #[test]
