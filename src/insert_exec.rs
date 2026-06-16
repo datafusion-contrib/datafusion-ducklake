@@ -119,6 +119,17 @@ impl ExecutionPlan for DuckLakeInsertExec {
         vec![&self.input]
     }
 
+    /// Require all input rows in a single partition.
+    ///
+    /// `execute` only drives `input.execute(0)`, so without this DataFusion
+    /// would feed a multi-partition input (e.g. a parallel scan or aggregation)
+    /// straight through and partitions `1..N` would be silently dropped. Asking
+    /// for `SinglePartition` makes the optimizer insert a `CoalescePartitionsExec`
+    /// that merges every input partition into partition 0 before we read it.
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_expr::Distribution> {
+        vec![datafusion::physical_expr::Distribution::SinglePartition]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
