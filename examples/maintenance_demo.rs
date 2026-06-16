@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         s2.table_id,
         s2.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )?;
     touch_file(&data_path, "main", "t", "f1.parquet")?;
     print_state(&pool, &data_path, "Step 2 — write f1 (INSERT)").await?;
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         s3.table_id,
         s3.snapshot_id,
         &DataFileInfo::new("f2.parquet", 100, 5),
+        WriteMode::Replace,
     )?;
     touch_file(&data_path, "main", "t", "f2.parquet")?;
     print_state(&pool, &data_path, "Step 3 — Replace: end f1, write f2").await?;

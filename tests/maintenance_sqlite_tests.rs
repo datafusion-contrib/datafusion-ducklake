@@ -91,6 +91,7 @@ async fn drop_table_tombstones_children_and_is_idempotent() {
             s.table_id,
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
 
@@ -164,6 +165,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s1.table_id,
             s1.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     let s2 = writer
@@ -174,6 +176,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s2.table_id,
             s2.snapshot_id,
             &DataFileInfo::new("f2.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     let s3 = writer
@@ -184,6 +187,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s3.table_id,
             s3.snapshot_id,
             &DataFileInfo::new("f3.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     (s1.table_id, s1.snapshot_id, s2.snapshot_id, s3.snapshot_id)
@@ -248,6 +252,7 @@ async fn expire_full_after_drop_reclaims_all_table_metadata() {
             s.table_id,
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     // Drop allocates snapshot 2; the table is now fully tombstoned in [1, 2).
@@ -396,6 +401,7 @@ async fn delete_orphaned_files_removes_unreferenced_keeps_referenced() {
             s.table_id,
             s.snapshot_id,
             &DataFileInfo::new("referenced.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "referenced.parquet");
@@ -665,6 +671,7 @@ async fn delete_orphaned_files_recurses_into_nested_directories() {
             s.table_id,
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "ref.parquet");
@@ -726,6 +733,7 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
             s.table_id,
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "ref.parquet");

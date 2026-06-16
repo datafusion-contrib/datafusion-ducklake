@@ -215,6 +215,13 @@ impl SchemaProvider for DuckLakeSchema {
             .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        // CREATE TABLE registers no data file, so publish the head here; without
+        // this the new (empty) table never becomes visible on multicatalog
+        // backends that defer the head advance out of begin_write_transaction.
+        writer
+            .publish_snapshot(setup.table_id, setup.snapshot_id, WriteMode::Replace)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;

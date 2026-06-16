@@ -235,13 +235,26 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Vec<i64>>;
 
-    /// Register a new data file. Returns the assigned data_file_id.
+    /// Register a new data file and publish its snapshot as the catalog head,
+    /// atomically. For `Replace`, retires the prior generation in the same
+    /// transaction. Returns the assigned data_file_id.
     fn register_data_file(
         &self,
         table_id: i64,
         snapshot_id: i64,
         file: &DataFileInfo,
+        mode: WriteMode,
     ) -> Result<i64>;
+
+    /// Publish a write's snapshot as the catalog head with no data file (CREATE
+    /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.
+    ///
+    /// Default no-op: single-catalog backends advance the head by inserting the
+    /// snapshot row in `begin_write_transaction`. Multicatalog Postgres
+    /// overrides this to insert the `ducklake_catalog_snapshot_map` head row.
+    fn publish_snapshot(&self, _table_id: i64, _snapshot_id: i64, _mode: WriteMode) -> Result<()> {
+        Ok(())
+    }
 
     /// End all existing data files for a table. Returns count of files ended.
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64>;
