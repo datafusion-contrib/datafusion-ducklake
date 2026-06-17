@@ -306,6 +306,56 @@ async fn assert_table_in_catalog(
     }
 }
 
+/// Retire the generation preceding `snapshot_id` for a Replace: end-snapshot
+/// every still-live file from an earlier snapshot and zero the visible
+/// record/byte totals. The `begin_snapshot < snapshot_id` guard leaves the
+/// current write's own files untouched (multi-file safety); `next_row_id` stays
+/// monotonic so rowids are never reused.
+async fn retire_prior_generation(
+    table_id: i64,
+    snapshot_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_data_file SET end_snapshot = $1
+         WHERE table_id = $2 AND end_snapshot IS NULL AND begin_snapshot < $1",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE ducklake_table_stats
+         SET record_count = 0, file_size_bytes = 0
+         WHERE table_id = $1",
+    )
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Publish `snapshot_id` as the catalog head by mapping it to the catalog.
+/// Idempotent (the write path calls it once, but a retried/multi-file commit
+/// must not fail on the PK).
+async fn advance_catalog_head(
+    catalog_id: i64,
+    snapshot_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
+         VALUES ($1, $2)
+         ON CONFLICT (catalog_id, snapshot_id) DO NOTHING",
+    )
+    .bind(catalog_id)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 impl MetadataWriter for PostgresMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
@@ -484,16 +534,16 @@ impl MetadataWriter for PostgresMetadataWriter {
         table_id: i64,
         snapshot_id: i64,
         file: &DataFileInfo,
+        mode: WriteMode,
     ) -> Result<i64> {
         block_on(async {
-            // Allocate row_id_start from the table's monotonic counter inside
-            // the same transaction so concurrent writers can't hand out
-            // overlapping ranges. The DuckLake row-lineage read path
-            // (RowIdExec) hard-errors on files where row_id_start is NULL and
-            // no embedded `_ducklake_internal_row_id` column is present, so
-            // every file we write must carry a value. Falls back to inserting
-            // a fresh stats row (next_row_id = 0) for tables created before
-            // this writer started maintaining `ducklake_table_stats`.
+            // Single atomic commit: retire the prior generation (Replace), insert
+            // the new file, accumulate stats, and advance the catalog head. The
+            // head is published only here so it never resolves to a snapshot
+            // whose file is still uploading. row_id_start is drawn from the
+            // table's monotonic counter under the catalog lock so concurrent
+            // writers hand out non-overlapping ranges; the stats row is seeded
+            // for tables created before this writer maintained it.
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -506,6 +556,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+
+            if mode == WriteMode::Replace {
+                retire_prior_generation(table_id, snapshot_id, &mut tx).await?;
+            }
 
             let stats_row =
                 sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
@@ -534,7 +588,9 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
-            // are never reused, even after end-snapshot.
+            // are never reused, even after end-snapshot. For Replace the
+            // record/byte totals were just zeroed, so this leaves them at the
+            // new file's values.
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + $1,
@@ -549,8 +605,35 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+
             tx.commit().await?;
             Ok(id)
+        })
+    }
+
+    fn publish_snapshot(&self, table_id: i64, snapshot_id: i64, mode: WriteMode) -> Result<()> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            if mode == WriteMode::Replace {
+                sqlx::query(
+                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES ($1, 0, 0, 0)
+                     ON CONFLICT (table_id) DO NOTHING",
+                )
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+                retire_prior_generation(table_id, snapshot_id, &mut tx).await?;
+            }
+
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+
+            tx.commit().await?;
+            Ok(())
         })
     }
 
@@ -685,14 +768,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             let snapshot_id: i64 = row.try_get(0)?;
 
-            sqlx::query(
-                "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
-                 VALUES ($1, $2)",
-            )
-            .bind(catalog_id)
-            .bind(snapshot_id)
-            .execute(&mut *tx)
-            .await?;
+            // The head advance (ducklake_catalog_snapshot_map insert) and the
+            // Replace retirement are deferred to the commit point
+            // (register_data_file / publish_snapshot) so the head never resolves
+            // to a snapshot whose data file is still uploading.
 
             let schema_id: i64 = {
                 let existing = sqlx::query(
@@ -889,38 +968,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
-            if mode == WriteMode::Replace {
-                sqlx::query(
-                    "UPDATE ducklake_data_file SET end_snapshot = $1
-                     WHERE table_id = $2 AND end_snapshot IS NULL",
-                )
-                .bind(snapshot_id)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-
-                // Mirror end_table_files: drop visible row/byte totals to
-                // zero while keeping next_row_id monotonic. Seed the row
-                // first in case this is a Replace on a brand-new table.
-                sqlx::query(
-                    "INSERT INTO ducklake_table_stats
-                         (table_id, record_count, next_row_id, file_size_bytes)
-                     VALUES ($1, 0, 0, 0)
-                     ON CONFLICT (table_id) DO NOTHING",
-                )
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    "UPDATE ducklake_table_stats
-                     SET record_count = 0, file_size_bytes = 0
-                     WHERE table_id = $1",
-                )
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+            // Replace retirement (end old files + zero stats) is deferred to the
+            // commit point (register_data_file / publish_snapshot).
 
             tx.commit().await?;
 

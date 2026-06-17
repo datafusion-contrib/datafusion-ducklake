@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("ref.parquet", 100, 5),
+        WriteMode::Replace,
     )?;
     touch_file(&data_path, "main", "t", "ref.parquet")?;
     print_state(

@@ -200,6 +200,7 @@ impl DuckLakeTableWriter {
             temp: Some(temp),
             catalog_path,
             path_is_relative,
+            mode,
             row_count: 0,
         })
     }
@@ -279,6 +280,9 @@ pub struct TableWriteSession {
     catalog_path: String,
     /// Whether the catalog_path is relative to table path
     path_is_relative: bool,
+    /// Replace vs Append; passed to `register_data_file` so the head advance and
+    /// (for Replace) prior-generation retirement commit atomically with the file.
+    mode: WriteMode,
     row_count: i64,
 }
 
@@ -380,7 +384,7 @@ impl TableWriteSession {
             file_info = file_info.with_absolute_path();
         }
         self.metadata
-            .register_data_file(self.table_id, self.snapshot_id, &file_info)?;
+            .register_data_file(self.table_id, self.snapshot_id, &file_info, self.mode)?;
 
         Ok(WriteResult {
             snapshot_id: self.snapshot_id,

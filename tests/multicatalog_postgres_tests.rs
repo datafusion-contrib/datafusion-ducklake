@@ -39,6 +39,109 @@ fn cols() -> Vec<ColumnDef> {
     ]
 }
 
+/// Current catalog head = MAX(snapshot_id) over the catalog's mapping rows
+/// (mirrors `MulticatalogProvider::get_current_snapshot`).
+async fn current_head(pool: &PgPool, catalog_id: i64) -> i64 {
+    sqlx::query(
+        "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+         WHERE catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap()
+}
+
+/// Total record_count of the files visible to a reader at the current head —
+/// the same window predicate the read path applies.
+async fn visible_records_at_head(pool: &PgPool, catalog_id: i64, table_id: i64) -> i64 {
+    let head = current_head(pool, catalog_id).await;
+    sqlx::query(
+        "SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file
+         WHERE table_id = $1
+           AND $2 >= begin_snapshot
+           AND ($2 < end_snapshot OR end_snapshot IS NULL)",
+    )
+    .bind(table_id)
+    .bind(head)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap()
+}
+
+/// Regression for the transient empty-read bug: a managed-load Replace must
+/// never expose a committed state where the head advanced but the table has
+/// zero live files. The head advance + prior-generation retirement happen only
+/// at the commit point (register_data_file), so a reader interleaved between
+/// begin_write_transaction and register_data_file — i.e. during the data upload
+/// — still sees the fully-complete OLD generation.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn replace_is_atomic_no_empty_read_window() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_atomic").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // Generation 1: a committed, non-empty table.
+    let s1 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s1.table_id,
+        s1.snapshot_id,
+        &DataFileInfo::new("g1.parquet", 1024, 10),
+        WriteMode::Replace,
+    )
+    .unwrap();
+    assert_eq!(current_head(&pool, cat).await, s1.snapshot_id);
+    assert_eq!(visible_records_at_head(&pool, cat, s1.table_id).await, 10);
+
+    // Begin generation 2 (Replace). The data upload would run here, between
+    // setup and the commit. The new snapshot row exists but is NOT yet the head
+    // and the old file is NOT yet retired.
+    let s2 = w
+        .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // A reader interleaved during the upload sees the OLD generation intact:
+    // head unchanged, old data fully visible. (Pre-fix the head had already
+    // advanced to s2 and the old file was already retired ⇒ count == 0.)
+    assert_eq!(
+        current_head(&pool, cat).await,
+        s1.snapshot_id,
+        "head must NOT advance before the new data file is registered"
+    );
+    assert_eq!(
+        visible_records_at_head(&pool, cat, s1.table_id).await,
+        10,
+        "old generation must stay fully visible during the upload window"
+    );
+
+    // Commit generation 2: head advances and generation 1 retires atomically.
+    w.register_data_file(
+        s2.table_id,
+        s2.snapshot_id,
+        &DataFileInfo::new("g2.parquet", 2048, 7),
+        WriteMode::Replace,
+    )
+    .unwrap();
+    assert_eq!(current_head(&pool, cat).await, s2.snapshot_id);
+    assert_eq!(
+        visible_records_at_head(&pool, cat, s2.table_id).await,
+        7,
+        "new generation visible, old generation retired"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn initialize_multicatalog_schema_is_idempotent() {
@@ -111,14 +214,22 @@ async fn single_catalog_ddl_then_dml_assigns_versions() {
         .unwrap();
     writer.set_data_path("/data").unwrap();
 
-    // First commit: DDL (table doesn't exist).
+    // First commit: DDL (table doesn't exist). publish_snapshot maps the
+    // snapshot as the head — the next commit's schema_version is computed over
+    // mapped predecessors, so without publishing the bump wouldn't advance.
     let setup1 = writer
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(setup1.table_id, setup1.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     // Second commit: same columns -> DML, carry forward schema_version.
     let setup2 = writer
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(setup2.table_id, setup2.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     let v1: i64 =
@@ -160,6 +271,9 @@ async fn single_catalog_ddl_then_dml_assigns_versions() {
     let setup3 = writer
         .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
         .unwrap();
+    writer
+        .publish_snapshot(setup3.table_id, setup3.snapshot_id, WriteMode::Replace)
+        .unwrap();
     let v3: i64 =
         sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
             .bind(setup3.snapshot_id)
@@ -191,8 +305,14 @@ async fn cross_catalog_isolation_same_schema_name() {
     let setup_a = writer_a
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
+    writer_a
+        .publish_snapshot(setup_a.table_id, setup_a.snapshot_id, WriteMode::Replace)
+        .unwrap();
     let setup_b = writer_b
         .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    writer_b
+        .publish_snapshot(setup_b.table_id, setup_b.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     // Schemas: two "public" rows, one per catalog, with different schema_ids.
@@ -253,17 +373,26 @@ async fn schema_version_is_per_catalog_dense_under_interleaving() {
         .unwrap();
     wa.set_data_path("/data").unwrap();
 
+    // Each write publishes its snapshot as the head; schema_version is computed
+    // over mapped predecessors, so publishing is what lets later DDL bumps see
+    // the prior versions (per-catalog dense).
     // cat_a DDL (creates users)
     let a1 = wa
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.publish_snapshot(a1.table_id, a1.snapshot_id, WriteMode::Replace)
         .unwrap();
     // cat_a DML (Replace, same schema)
     let a2 = wa
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
+    wa.publish_snapshot(a2.table_id, a2.snapshot_id, WriteMode::Replace)
+        .unwrap();
     // cat_b DDL (creates orders) — happens in between cat_a's DDLs
     let b1 = wb
         .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.publish_snapshot(b1.table_id, b1.snapshot_id, WriteMode::Replace)
         .unwrap();
     // cat_a DDL: adds age column
     let mut cols_v2 = cols();
@@ -271,9 +400,13 @@ async fn schema_version_is_per_catalog_dense_under_interleaving() {
     let a3 = wa
         .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
         .unwrap();
+    wa.publish_snapshot(a3.table_id, a3.snapshot_id, WriteMode::Replace)
+        .unwrap();
     // cat_b DML
     let b2 = wb
         .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
+        .unwrap();
+    wb.publish_snapshot(b2.table_id, b2.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     let get_v = |snap_id: i64| {
@@ -306,11 +439,19 @@ async fn no_orphan_mapping_rows() {
         .await
         .unwrap();
     w.set_data_path("/data").unwrap();
-    let _ = w
+    // Publish each write: a committed write maps its snapshot. (An uncommitted
+    // write deliberately leaves an unmapped snapshot — the head only advances at
+    // the commit point — so the "every snapshot is mapped" check below holds
+    // only once published.)
+    let s1 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    let _ = w
+    w.publish_snapshot(s1.table_id, s1.snapshot_id, WriteMode::Replace)
+        .unwrap();
+    let s2 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.publish_snapshot(s2.table_id, s2.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     // Every entry in the maps must point at a real row.
@@ -369,7 +510,7 @@ async fn register_data_file_records_against_table() {
 
     let file = DataFileInfo::new("abc.parquet", 4096, 100).with_footer_size(256);
     let file_id = w
-        .register_data_file(setup.table_id, setup.snapshot_id, &file)
+        .register_data_file(setup.table_id, setup.snapshot_id, &file, WriteMode::Replace)
         .unwrap();
     assert!(file_id > 0);
 
@@ -449,13 +590,16 @@ async fn drop_catalog_removes_populated_catalog() {
         s1.table_id,
         s1.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
     let mut cols_v2 = cols();
     cols_v2.push(ColumnDef::new("age", "int32", true).unwrap());
-    let _ = w
+    let s_ddl = w
         .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
+        .unwrap();
+    w.publish_snapshot(s_ddl.table_id, s_ddl.snapshot_id, WriteMode::Replace)
         .unwrap();
 
     let s_orders = w
@@ -465,6 +609,7 @@ async fn drop_catalog_removes_populated_catalog() {
         s_orders.table_id,
         s_orders.snapshot_id,
         &DataFileInfo::new("o.parquet", 2048, 20),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -536,6 +681,7 @@ async fn drop_catalog_isolates_other_catalogs() {
         sa.table_id,
         sa.snapshot_id,
         &DataFileInfo::new("a.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -546,6 +692,7 @@ async fn drop_catalog_isolates_other_catalogs() {
         sb.table_id,
         sb.snapshot_id,
         &DataFileInfo::new("b.parquet", 2048, 20),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -712,6 +859,7 @@ async fn drop_table_in_catalog_tombstones_table_and_children() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -823,6 +971,7 @@ async fn drop_table_in_catalog_hides_table_from_read_path_and_preserves_time_tra
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -898,6 +1047,7 @@ async fn drop_table_in_catalog_is_idempotent_on_second_call() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -956,6 +1106,7 @@ async fn drop_table_in_catalog_does_not_touch_siblings() {
         s_users.table_id,
         s_users.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -966,6 +1117,7 @@ async fn drop_table_in_catalog_does_not_touch_siblings() {
         s_orders.table_id,
         s_orders.snapshot_id,
         &DataFileInfo::new("o.parquet", 2048, 20),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -977,6 +1129,7 @@ async fn drop_table_in_catalog_does_not_touch_siblings() {
         s_other_users.table_id,
         s_other_users.snapshot_id,
         &DataFileInfo::new("au.parquet", 512, 5),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1074,6 +1227,7 @@ async fn drop_table_in_catalog_allows_recreate_with_fresh_identity() {
         s1.table_id,
         s1.snapshot_id,
         &DataFileInfo::new("v1.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1098,6 +1252,7 @@ async fn drop_table_in_catalog_allows_recreate_with_fresh_identity() {
         s2.table_id,
         s2.snapshot_id,
         &DataFileInfo::new("v2.parquet", 2048, 20),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1148,6 +1303,7 @@ async fn drop_table_in_catalog_bumps_schema_version_as_ddl() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("u.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1215,6 +1371,7 @@ async fn drop_table_in_catalog_isolates_other_catalogs() {
         sa.table_id,
         sa.snapshot_id,
         &DataFileInfo::new("a.parquet", 1024, 10),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1225,6 +1382,7 @@ async fn drop_table_in_catalog_isolates_other_catalogs() {
         sb.table_id,
         sb.snapshot_id,
         &DataFileInfo::new("b.parquet", 2048, 20),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1332,6 +1490,7 @@ async fn register_data_file_assigns_non_overlapping_row_id_start() {
             setup.table_id,
             setup.snapshot_id,
             &DataFileInfo::new("f1.parquet", 4096, 100),
+            WriteMode::Replace,
         )
         .unwrap();
     let f2 = w
@@ -1339,6 +1498,7 @@ async fn register_data_file_assigns_non_overlapping_row_id_start() {
             setup.table_id,
             setup.snapshot_id,
             &DataFileInfo::new("f2.parquet", 2048, 50),
+            WriteMode::Append,
         )
         .unwrap();
     let f3 = w
@@ -1346,6 +1506,7 @@ async fn register_data_file_assigns_non_overlapping_row_id_start() {
             setup.table_id,
             setup.snapshot_id,
             &DataFileInfo::new("f3.parquet", 8192, 200),
+            WriteMode::Append,
         )
         .unwrap();
 
@@ -1363,10 +1524,10 @@ async fn register_data_file_assigns_non_overlapping_row_id_start() {
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn replace_preserves_next_row_id_monotonic() {
     // rowids must never be reused, even across WriteMode::Replace cycles.
-    // begin_write_transaction(Replace) end-snapshots the prior generation's
-    // files and clears record_count / file_size_bytes, but next_row_id stays
-    // put — so the first file of the new generation continues where the old
-    // generation left off.
+    // The Replace commit (register_data_file / publish_snapshot) end-snapshots
+    // the prior generation's files and clears record_count / file_size_bytes,
+    // but next_row_id stays put — so the first file of the new generation
+    // continues where the old generation left off.
     use datafusion_ducklake::metadata_writer::DataFileInfo;
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let mgr = MulticatalogManager::new(pool.clone());
@@ -1383,28 +1544,34 @@ async fn replace_preserves_next_row_id_monotonic() {
         s1.table_id,
         s1.snapshot_id,
         &DataFileInfo::new("g1.parquet", 1024, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let (rc1, next1, _) = read_table_stats(&pool, s1.table_id).await;
     assert_eq!(rc1, 5);
     assert_eq!(next1, 5);
 
-    // Second Replace ends the first generation's files and resets visible
-    // totals to zero while preserving next_row_id.
+    // Second Replace: publish_snapshot retires the first generation's files and
+    // resets visible totals to zero while preserving next_row_id (the retirement
+    // moved here from begin_write_transaction).
     let s2 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.publish_snapshot(s2.table_id, s2.snapshot_id, WriteMode::Replace)
         .unwrap();
     let (rc2, next2, bytes2) = read_table_stats(&pool, s2.table_id).await;
     assert_eq!(rc2, 0, "record_count must reset on Replace");
     assert_eq!(next2, 5, "next_row_id must NOT reset on Replace");
     assert_eq!(bytes2, 0);
 
-    // The first file of the new generation picks up at 5.
+    // The first file of the new generation picks up at 5. The generation was
+    // already published above, so this registration is additive (Append).
     let f2_id = w
         .register_data_file(
             s2.table_id,
             s2.snapshot_id,
             &DataFileInfo::new("g2.parquet", 2048, 2),
+            WriteMode::Append,
         )
         .unwrap();
     assert_eq!(
@@ -1446,6 +1613,7 @@ async fn register_data_file_self_initialises_stats_for_legacy_tables() {
             setup.table_id,
             setup.snapshot_id,
             &DataFileInfo::new("a.parquet", 50, 4),
+            WriteMode::Replace,
         )
         .unwrap();
     assert_eq!(read_row_id_start(&pool, file_id).await, Some(0));
@@ -1474,6 +1642,7 @@ fn three_generations(
             s1.table_id,
             s1.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     let s2 = writer
@@ -1484,6 +1653,7 @@ fn three_generations(
             s2.table_id,
             s2.snapshot_id,
             &DataFileInfo::new("f2.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     let s3 = writer
@@ -1494,6 +1664,7 @@ fn three_generations(
             s3.table_id,
             s3.snapshot_id,
             &DataFileInfo::new("f3.parquet", 100, 5),
+            WriteMode::Replace,
         )
         .unwrap();
     (s1.table_id, s1.snapshot_id, s2.snapshot_id, s3.snapshot_id)
@@ -1519,6 +1690,7 @@ async fn expire_in_catalog_empty_for_most_recent_and_unknown() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1629,6 +1801,7 @@ async fn expire_in_catalog_full_after_drop_removes_table_metadata() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1701,6 +1874,7 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
         a1.table_id,
         a1.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let b1 = wb
@@ -1710,6 +1884,7 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
         b1.table_id,
         b1.snapshot_id,
         &DataFileInfo::new("g1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let a2 = wa
@@ -1719,6 +1894,7 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
         a2.table_id,
         a2.snapshot_id,
         &DataFileInfo::new("f2.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     assert!(
@@ -1814,6 +1990,7 @@ async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
         a1.table_id,
         a1.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let a2 = wa
@@ -1823,6 +2000,7 @@ async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
         a2.table_id,
         a2.snapshot_id,
         &DataFileInfo::new("f2.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let b1 = wb
@@ -1832,6 +2010,7 @@ async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
         b1.table_id,
         b1.snapshot_id,
         &DataFileInfo::new("g1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let b2 = wb
@@ -1841,6 +2020,7 @@ async fn cleanup_old_files_in_catalog_is_scoped_to_catalog() {
         b2.table_id,
         b2.snapshot_id,
         &DataFileInfo::new("g2.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -1943,6 +2123,7 @@ async fn delete_orphaned_files_reclaims_dropped_catalog_files() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let dir = data_path.join("public").join("t");
@@ -2000,6 +2181,7 @@ async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
         sa.table_id,
         sa.snapshot_id,
         &DataFileInfo::new("a.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let sb = wb
@@ -2009,6 +2191,7 @@ async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
         sb.table_id,
         sb.snapshot_id,
         &DataFileInfo::new("b.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
 
@@ -2126,6 +2309,7 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
         s.table_id,
         s.snapshot_id,
         &DataFileInfo::new("ref.parquet", 100, 5),
+        WriteMode::Replace,
     )
     .unwrap();
     let dir = data_path.join("public").join("t");

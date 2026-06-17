@@ -702,6 +702,10 @@ impl MetadataWriter for SqliteMetadataWriter {
         table_id: i64,
         snapshot_id: i64,
         file: &DataFileInfo,
+        // Single-catalog SQLite advances the head and retires the prior
+        // generation in `begin_write_transaction`, so registration is
+        // mode-agnostic here.
+        _mode: WriteMode,
     ) -> Result<i64> {
         block_on(async {
             // Allocate row_id_start from the table's monotonic counter inside
@@ -1151,7 +1155,7 @@ mod tests {
         let file = DataFileInfo::new("data.parquet", 1024, 100).with_footer_size(256);
 
         let file_id = writer
-            .register_data_file(table_id, snapshot_id, &file)
+            .register_data_file(table_id, snapshot_id, &file, WriteMode::Append)
             .unwrap();
         assert_eq!(file_id, 1);
     }
@@ -1203,6 +1207,7 @@ mod tests {
                 table_id,
                 snapshot_id,
                 &DataFileInfo::new("a.parquet", 100, 3),
+                WriteMode::Append,
             )
             .unwrap();
         let f2_id = writer
@@ -1210,6 +1215,7 @@ mod tests {
                 table_id,
                 snapshot_id,
                 &DataFileInfo::new("b.parquet", 250, 7),
+                WriteMode::Append,
             )
             .unwrap();
 
@@ -1235,7 +1241,12 @@ mod tests {
             .unwrap();
 
         writer
-            .register_data_file(table_id, snap1, &DataFileInfo::new("a.parquet", 100, 5))
+            .register_data_file(
+                table_id,
+                snap1,
+                &DataFileInfo::new("a.parquet", 100, 5),
+                WriteMode::Append,
+            )
             .unwrap();
 
         let snap2 = writer.create_snapshot().unwrap();
@@ -1247,7 +1258,12 @@ mod tests {
         assert_eq!(bytes, 0, "file_size_bytes cleared");
 
         let f2_id = writer
-            .register_data_file(table_id, snap2, &DataFileInfo::new("b.parquet", 200, 2))
+            .register_data_file(
+                table_id,
+                snap2,
+                &DataFileInfo::new("b.parquet", 200, 2),
+                WriteMode::Append,
+            )
             .unwrap();
         assert_eq!(
             read_row_id_start(&writer, f2_id).await,
@@ -1284,6 +1300,7 @@ mod tests {
                 table_id,
                 snapshot_id,
                 &DataFileInfo::new("a.parquet", 50, 4),
+                WriteMode::Append,
             )
             .unwrap();
         assert_eq!(read_row_id_start(&writer, file_id).await, Some(0));
@@ -1306,7 +1323,7 @@ mod tests {
         // Register a file
         let file = DataFileInfo::new("data1.parquet", 1024, 100);
         writer
-            .register_data_file(table_id, snapshot1, &file)
+            .register_data_file(table_id, snapshot1, &file, WriteMode::Append)
             .unwrap();
 
         // End files at new snapshot
