@@ -535,6 +535,12 @@ impl MetadataWriter for PostgresMetadataWriter {
         snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
+        // Multicatalog Postgres finalizes the column generation in
+        // `begin_write_transaction` (column visibility is gated by the deferred
+        // `ducklake_catalog_snapshot_map` head row, not `end_snapshot`), so the
+        // commit point does not re-stamp columns.
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
     ) -> Result<i64> {
         block_on(async {
             // Single atomic commit: retire the prior generation (Replace), insert
@@ -612,7 +618,14 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    fn publish_snapshot(&self, table_id: i64, snapshot_id: i64, mode: WriteMode) -> Result<()> {
+    fn publish_snapshot(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        mode: WriteMode,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<()> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;

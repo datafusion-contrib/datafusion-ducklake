@@ -219,7 +219,13 @@ impl SchemaProvider for DuckLakeSchema {
         // this the new (empty) table never becomes visible on multicatalog
         // backends that defer the head advance out of begin_write_transaction.
         writer
-            .publish_snapshot(setup.table_id, setup.snapshot_id, WriteMode::Replace)
+            .publish_snapshot(
+                setup.table_id,
+                setup.snapshot_id,
+                WriteMode::Replace,
+                &columns,
+                &setup.column_ids,
+            )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Resolve table path

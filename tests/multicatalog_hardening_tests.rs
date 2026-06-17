@@ -234,6 +234,8 @@ async fn register_data_file_rejects_cross_catalog_table_id() {
         snap,
         &DataFileInfo::new("evil.parquet", 1024, 1),
         WriteMode::Replace,
+        &[],
+        &[],
     );
     let err = result.expect_err("must reject cross-catalog table_id");
     assert!(

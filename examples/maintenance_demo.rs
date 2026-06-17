@@ -53,6 +53,15 @@ async fn main() -> anyhow::Result<()> {
         &[ColumnDef::new("id", "int64", false)?, ColumnDef::new("name", "varchar", true)?],
         WriteMode::Replace,
     )?;
+    // CREATE TABLE registers no data file; publish the (empty) snapshot so it
+    // becomes the head — begin_write_transaction now only RESERVES the id.
+    writer.publish_snapshot(
+        s1.table_id,
+        s1.snapshot_id,
+        WriteMode::Replace,
+        &cols(),
+        &s1.column_ids,
+    )?;
     print_state(&pool, &data_path, "Step 1 — CREATE TABLE main.t").await?;
 
     // --- snap 2: write data file f1 ("INSERT") ---------------------------------------
@@ -67,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         s2.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
         WriteMode::Replace,
+        &cols(),
+        &s2.column_ids,
     )?;
     touch_file(&data_path, "main", "t", "f1.parquet")?;
     print_state(&pool, &data_path, "Step 2 — write f1 (INSERT)").await?;
@@ -78,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
         s3.snapshot_id,
         &DataFileInfo::new("f2.parquet", 100, 5),
         WriteMode::Replace,
+        &cols(),
+        &s3.column_ids,
     )?;
     touch_file(&data_path, "main", "t", "f2.parquet")?;
     print_state(&pool, &data_path, "Step 3 — Replace: end f1, write f2").await?;

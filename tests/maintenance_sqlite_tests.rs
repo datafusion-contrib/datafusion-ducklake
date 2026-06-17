@@ -92,6 +92,8 @@ async fn drop_table_tombstones_children_and_is_idempotent() {
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s.column_ids,
         )
         .unwrap();
 
@@ -166,6 +168,8 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s1.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s1.column_ids,
         )
         .unwrap();
     let s2 = writer
@@ -177,6 +181,8 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s2.snapshot_id,
             &DataFileInfo::new("f2.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s2.column_ids,
         )
         .unwrap();
     let s3 = writer
@@ -188,6 +194,8 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
             s3.snapshot_id,
             &DataFileInfo::new("f3.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s3.column_ids,
         )
         .unwrap();
     (s1.table_id, s1.snapshot_id, s2.snapshot_id, s3.snapshot_id)
@@ -253,6 +261,8 @@ async fn expire_full_after_drop_reclaims_all_table_metadata() {
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s.column_ids,
         )
         .unwrap();
     // Drop allocates snapshot 2; the table is now fully tombstoned in [1, 2).
@@ -402,6 +412,8 @@ async fn delete_orphaned_files_removes_unreferenced_keeps_referenced() {
             s.snapshot_id,
             &DataFileInfo::new("referenced.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s.column_ids,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "referenced.parquet");
@@ -672,6 +684,8 @@ async fn delete_orphaned_files_recurses_into_nested_directories() {
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s.column_ids,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "ref.parquet");
@@ -734,6 +748,8 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
             WriteMode::Replace,
+            &cols(),
+            &s.column_ids,
         )
         .unwrap();
     write_physical_file(&h.data_path, "main", "t", "ref.parquet");
@@ -814,5 +830,207 @@ async fn delete_orphaned_files_all_on_empty_catalog_wipes_data_path() {
     assert!(
         fresh.exists(),
         "fresh file survives OlderThan sweep on empty catalog"
+    );
+}
+
+// --- spec-aligned atomic Replace: the transient-empty-read regression --------------
+
+/// Rows visible to a reader resolving at `snapshot` (the file-visibility predicate).
+async fn visible_rows(pool: &SqlitePool, table_id: i64, snapshot: i64) -> i64 {
+    scalar_i64(
+        pool,
+        &format!(
+            "SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file
+             WHERE table_id = {table_id}
+               AND {snapshot} >= begin_snapshot
+               AND ({snapshot} < end_snapshot OR end_snapshot IS NULL)"
+        ),
+    )
+    .await
+}
+
+async fn head(pool: &SqlitePool) -> i64 {
+    scalar_i64(
+        pool,
+        "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_defers_head_and_retirement_until_register() {
+    // A read interleaved between begin_write_transaction and register_data_file
+    // on a Replace must still see the OLD generation (never count = 0), and the
+    // head must not advance to a fileless snapshot. begin only RESERVES the
+    // snapshot id; the snapshot-row insert + prior-generation retirement happen
+    // atomically in register_data_file. Pre-fix this asserts FALSE (begin
+    // committed the snapshot row and retired the old files before the upload).
+    let h = setup().await;
+    let p = pool(&h).await;
+
+    // Generation 1: committed, non-empty.
+    let s1 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s1.table_id,
+            s1.snapshot_id,
+            &DataFileInfo::new("gen1.parquet", 100, 5),
+            WriteMode::Replace,
+            &cols(),
+            &s1.column_ids,
+        )
+        .unwrap();
+    assert_eq!(head(&p).await, s1.snapshot_id, "gen 1 is the head");
+    assert_eq!(visible_rows(&p, s1.table_id, s1.snapshot_id).await, 5);
+
+    // Begin generation 2 — the upload window. Reserves only.
+    let s2 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    assert_eq!(s2.snapshot_id, s1.snapshot_id + 1, "reserved the next id");
+
+    // DURING THE WINDOW: head unchanged, gen 1 fully visible (no empty read).
+    assert_eq!(
+        head(&p).await,
+        s1.snapshot_id,
+        "head must stay at gen 1 until register commits the snapshot",
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            &format!(
+                "SELECT COUNT(*) FROM ducklake_data_file
+                 WHERE table_id = {} AND end_snapshot IS NULL",
+                s1.table_id
+            ),
+        )
+        .await,
+        1,
+        "gen 1 file must not be retired during the upload window",
+    );
+    assert_eq!(
+        visible_rows(&p, s1.table_id, s1.snapshot_id).await,
+        5,
+        "old generation still serves its complete data",
+    );
+
+    // Commit generation 2 — atomic flip.
+    h.writer
+        .register_data_file(
+            s2.table_id,
+            s2.snapshot_id,
+            &DataFileInfo::new("gen2.parquet", 100, 7),
+            WriteMode::Replace,
+            &cols(),
+            &s2.column_ids,
+        )
+        .unwrap();
+
+    assert_eq!(head(&p).await, s2.snapshot_id, "head advanced to gen 2");
+    assert_eq!(
+        visible_rows(&p, s2.table_id, s2.snapshot_id).await,
+        7,
+        "gen 2 fully visible at the new head",
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            &format!(
+                "SELECT COUNT(*) FROM ducklake_data_file
+                 WHERE table_id = {} AND end_snapshot = {}",
+                s1.table_id, s2.snapshot_id
+            ),
+        )
+        .await,
+        1,
+        "gen 1 file retired exactly at the new snapshot",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_does_not_leak_new_column_generation_until_register() {
+    // The SQLite read path resolves a table's columns by `end_snapshot IS NULL`
+    // only (not snapshot-scoped), so the new column generation of a
+    // schema-evolving Replace must NOT appear until register_data_file commits.
+    let h = setup().await;
+    let p = pool(&h).await;
+
+    let live_cols = |table_id: i64| {
+        format!(
+            "SELECT COUNT(*) FROM ducklake_column \
+             WHERE table_id = {table_id} AND end_snapshot IS NULL"
+        )
+    };
+
+    // Generation 1: two columns.
+    let s1 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s1.table_id,
+            s1.snapshot_id,
+            &DataFileInfo::new("g1.parquet", 100, 5),
+            WriteMode::Replace,
+            &cols(),
+            &s1.column_ids,
+        )
+        .unwrap();
+    assert_eq!(scalar_i64(&p, &live_cols(s1.table_id)).await, 2);
+
+    // Begin a schema-evolving Replace (three columns), then pause before commit.
+    let evolved = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+        ColumnDef::new("extra", "int64", true).unwrap(),
+    ];
+    let s2 = h
+        .writer
+        .begin_write_transaction("main", "t", &evolved, WriteMode::Replace)
+        .unwrap();
+
+    // DURING THE WINDOW: still the OLD 2-column generation.
+    assert_eq!(
+        scalar_i64(&p, &live_cols(s1.table_id)).await,
+        2,
+        "new column generation must not be visible until register commits",
+    );
+
+    h.writer
+        .register_data_file(
+            s2.table_id,
+            s2.snapshot_id,
+            &DataFileInfo::new("g2.parquet", 100, 7),
+            WriteMode::Replace,
+            &evolved,
+            &s2.column_ids,
+        )
+        .unwrap();
+
+    // After commit: the new 3-column generation, with the reserved ids the
+    // staged parquet's field_id metadata references.
+    assert_eq!(
+        scalar_i64(&p, &live_cols(s2.table_id)).await,
+        3,
+        "new column generation visible after register",
+    );
+    let max_live_col = scalar_i64(
+        &p,
+        &format!(
+            "SELECT COALESCE(MAX(column_id), 0) FROM ducklake_column \
+             WHERE table_id = {} AND end_snapshot IS NULL",
+            s2.table_id
+        ),
+    )
+    .await;
+    assert_eq!(
+        max_live_col,
+        *s2.column_ids.iter().max().unwrap(),
+        "committed column ids match the ids reserved at begin",
     );
 }

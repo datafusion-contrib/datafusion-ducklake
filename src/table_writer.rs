@@ -194,6 +194,7 @@ impl DuckLakeTableWriter {
             snapshot_id: setup.snapshot_id,
             schema_id: setup.schema_id,
             table_id: setup.table_id,
+            columns,
             column_ids: setup.column_ids,
             schema_with_ids,
             writer: Some(writer),
@@ -265,7 +266,11 @@ pub struct TableWriteSession {
     snapshot_id: i64,
     schema_id: i64,
     table_id: i64,
-    #[allow(dead_code)]
+    /// Column generation for this write (in `column_order`). Threaded to the
+    /// metadata writer at `finish()` so single-catalog backends, which defer the
+    /// column generation out of `begin_write_transaction`, can insert the
+    /// column rows with `column_ids` at the atomic commit.
+    columns: Vec<ColumnDef>,
     column_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
     /// Parquet writer streaming to the local staging file (`temp`). Batches are
@@ -383,8 +388,14 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        self.metadata
-            .register_data_file(self.table_id, self.snapshot_id, &file_info, self.mode)?;
+        self.metadata.register_data_file(
+            self.table_id,
+            self.snapshot_id,
+            &file_info,
+            self.mode,
+            &self.columns,
+            &self.column_ids,
+        )?;
 
         Ok(WriteResult {
             snapshot_id: self.snapshot_id,

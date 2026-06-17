@@ -238,21 +238,40 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Register a new data file and publish its snapshot as the catalog head,
     /// atomically. For `Replace`, retires the prior generation in the same
     /// transaction. Returns the assigned data_file_id.
+    ///
+    /// `columns` / `column_ids` describe the snapshot's column generation (in
+    /// `column_order`, ids matching `WriteSetupResult::column_ids`). Backends
+    /// that finalize columns in `begin_write_transaction` (multicatalog
+    /// Postgres) ignore them; single-catalog backends (SQLite) defer the
+    /// column generation to this commit and use them to insert the column rows.
     fn register_data_file(
         &self,
         table_id: i64,
         snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
     ) -> Result<i64>;
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
     /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.
+    /// See [`MetadataWriter::register_data_file`] for `columns` / `column_ids`.
     ///
-    /// Default no-op: single-catalog backends advance the head by inserting the
-    /// snapshot row in `begin_write_transaction`. Multicatalog Postgres
-    /// overrides this to insert the `ducklake_catalog_snapshot_map` head row.
-    fn publish_snapshot(&self, _table_id: i64, _snapshot_id: i64, _mode: WriteMode) -> Result<()> {
+    /// Default no-op. Backends that advance the head in
+    /// `begin_write_transaction` could rely on it, but both shipped backends
+    /// override: multicatalog Postgres inserts the
+    /// `ducklake_catalog_snapshot_map` head row, and SQLite (which defers the
+    /// `ducklake_snapshot` row insert out of `begin_write_transaction`) inserts
+    /// the snapshot row + column generation here.
+    fn publish_snapshot(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _mode: WriteMode,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<()> {
         Ok(())
     }
 

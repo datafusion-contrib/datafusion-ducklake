@@ -59,6 +59,8 @@ async fn seed_two_catalogs(pool: &PgPool) -> anyhow::Result<(i64, i64)> {
             setup.snapshot_id,
             &DataFileInfo::new(fname, 1024, 3),
             WriteMode::Replace,
+            &[],
+            &[],
         )
         .unwrap();
     };
