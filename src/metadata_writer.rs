@@ -237,7 +237,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Register a new data file and publish its snapshot as the catalog head,
     /// atomically. For `Replace`, retires the prior generation in the same
-    /// transaction. Returns the assigned data_file_id.
+    /// transaction. Returns the committed snapshot id: assigned at this commit
+    /// for SQLite (so it may differ from `WriteSetupResult::snapshot_id` under
+    /// concurrency), reserved at begin for Postgres.
     ///
     /// `columns` / `column_ids` describe the snapshot's column generation (in
     /// `column_order`, ids matching `WriteSetupResult::column_ids`). Backends

@@ -388,7 +388,9 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        self.metadata.register_data_file(
+        // register_data_file returns the committed snapshot id (assigned at
+        // the commit for SQLite, reserved at begin for Postgres).
+        let committed_snapshot_id = self.metadata.register_data_file(
             self.table_id,
             self.snapshot_id,
             &file_info,
@@ -398,7 +400,7 @@ impl TableWriteSession {
         )?;
 
         Ok(WriteResult {
-            snapshot_id: self.snapshot_id,
+            snapshot_id: committed_snapshot_id,
             table_id: self.table_id,
             schema_id: self.schema_id,
             files_written: 1,

@@ -1034,3 +1034,85 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
         "committed column ids match the ids reserved at begin",
     );
 }
+
+/// Two concurrent same-table Replace writers that commit out of reservation
+/// order must leave exactly one file and one column generation live at the
+/// head, with no inverted (end_snapshot < begin_snapshot) column lifetimes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_out_of_order_commit_does_not_corrupt() {
+    let h = setup().await;
+    let p = pool(&h).await;
+
+    // Generation 1: committed, non-empty.
+    let s0 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s0.table_id,
+            s0.snapshot_id,
+            &DataFileInfo::new("gen0.parquet", 100, 5),
+            WriteMode::Replace,
+            &cols(),
+            &s0.column_ids,
+        )
+        .unwrap();
+    let tid = s0.table_id;
+
+    // Two Replace writers open their windows...
+    let w1 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let w2 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // ...and commit in the OPPOSITE order (w2 before w1).
+    h.writer
+        .register_data_file(
+            w2.table_id,
+            w2.snapshot_id,
+            &DataFileInfo::new("gen_w2.parquet", 100, 7),
+            WriteMode::Replace,
+            &cols(),
+            &w2.column_ids,
+        )
+        .unwrap();
+    h.writer
+        .register_data_file(
+            w1.table_id,
+            w1.snapshot_id,
+            &DataFileInfo::new("gen_w1.parquet", 100, 3),
+            WriteMode::Replace,
+            &cols(),
+            &w1.column_ids,
+        )
+        .unwrap();
+
+    let live_files = scalar_i64(&p, &format!("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = {tid} AND end_snapshot IS NULL")).await;
+    let live_cols = scalar_i64(
+        &p,
+        &format!(
+            "SELECT COUNT(*) FROM ducklake_column WHERE table_id = {tid} AND end_snapshot IS NULL"
+        ),
+    )
+    .await;
+    let inverted = scalar_i64(&p, &format!("SELECT COUNT(*) FROM ducklake_column WHERE table_id = {tid} AND end_snapshot IS NOT NULL AND end_snapshot < begin_snapshot")).await;
+
+    assert_eq!(
+        inverted, 0,
+        "no column may end before it begins (published snapshot mutated)"
+    );
+    assert_eq!(
+        live_files, 1,
+        "exactly one file generation may be live at the head after Replace"
+    );
+    assert_eq!(
+        live_cols,
+        cols().len() as i64,
+        "exactly one column generation may be live at the head"
+    );
+}

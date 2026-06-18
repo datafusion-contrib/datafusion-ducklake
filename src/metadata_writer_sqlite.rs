@@ -207,13 +207,14 @@ impl SqliteMetadataWriter {
                 },
             };
 
-            let drop_snapshot = reserve_ids(&mut tx, "next_snapshot_id", 1).await?;
-            sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, CURRENT_TIMESTAMP)",
+            let drop_snapshot: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
+                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
+                 RETURNING snapshot_id",
             )
-            .bind(drop_snapshot)
-            .execute(&mut *tx)
-            .await?;
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
 
             for child in
                 ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
@@ -639,19 +640,21 @@ async fn retire_prior_generation(
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
-    snapshot_id: i64,
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
-) -> Result<()> {
-    // Insert the deferred snapshot row with its reserved id — THIS is the head
-    // advance.
-    sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, CURRENT_TIMESTAMP)",
+) -> Result<i64> {
+    // Assign the snapshot id in commit order: one INSERT ... SELECT MAX+1
+    // RETURNING takes the write lock for the read and insert together, so
+    // concurrent writers can't collide or publish out of order.
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
+         SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
+         RETURNING snapshot_id",
     )
-    .bind(snapshot_id)
-    .execute(&mut **tx)
-    .await?;
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
 
     // Finalize the column generation: end the prior columns and insert the new
     // set with the reserved column_ids (matching the parquet field_ids).
@@ -694,20 +697,21 @@ async fn finalize_snapshot(
         .await?;
         retire_prior_generation(tx, table_id, snapshot_id).await?;
     }
-    Ok(())
+    Ok(snapshot_id)
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id = reserve_ids(&mut tx, "next_snapshot_id", 1).await?;
-            sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, CURRENT_TIMESTAMP)",
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
+                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
+                 RETURNING snapshot_id",
             )
-            .bind(snapshot_id)
-            .execute(&mut *tx)
-            .await?;
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -844,7 +848,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
-        snapshot_id: i64,
+        _snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         columns: &[ColumnDef],
@@ -858,7 +862,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             // only ever resolves to fully-populated data (no empty-read window).
             let mut tx = self.pool.begin().await?;
 
-            finalize_snapshot(&mut tx, table_id, snapshot_id, columns, column_ids, mode).await?;
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode).await?;
 
             // Seed the stats row for the Append path (Replace already seeded it
             // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
@@ -878,11 +883,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
             let row_id_start: i64 = stats_row.try_get(0)?;
 
-            let data_file_row = sqlx::query(
+            sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -892,9 +897,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            let data_file_id: i64 = data_file_row.try_get(0)?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -914,14 +918,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             tx.commit().await?;
-            Ok(data_file_id)
+            Ok(snapshot_id)
         })
     }
 
     fn publish_snapshot(
         &self,
         table_id: i64,
-        snapshot_id: i64,
+        _snapshot_id: i64,
         mode: WriteMode,
         columns: &[ColumnDef],
         column_ids: &[i64],
@@ -935,7 +939,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         // register_data_file instead.
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            finalize_snapshot(&mut tx, table_id, snapshot_id, columns, column_ids, mode).await?;
+            finalize_snapshot(&mut tx, table_id, columns, column_ids, mode).await?;
             tx.commit().await?;
             Ok(())
         })
@@ -1020,17 +1024,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             // pre-existing catalog continues without reusing ids.
             sqlx::query(
                 "INSERT INTO ducklake_metadata (key, value, scope)
-                 SELECT 'next_snapshot_id',
-                        CAST(COALESCE((SELECT MAX(snapshot_id) FROM ducklake_snapshot), 0) AS TEXT),
-                        NULL
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM ducklake_metadata WHERE key = 'next_snapshot_id' AND scope IS NULL
-                 )",
-            )
-            .execute(&self.pool)
-            .await?;
-            sqlx::query(
-                "INSERT INTO ducklake_metadata (key, value, scope)
                  SELECT 'next_column_id',
                         CAST(COALESCE((SELECT MAX(column_id) FROM ducklake_column), 0) AS TEXT),
                         NULL
@@ -1061,14 +1054,20 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
-            // Reserve the snapshot id from the monotonic counter WITHOUT inserting
-            // the row. The head is COALESCE(MAX(snapshot_id), 0), so inserting here
-            // would advance the head before the data file exists — the
-            // transient-empty-read bug. The row is inserted at the atomic commit
-            // point (`finalize_snapshot`, from register_data_file /
-            // publish_snapshot). The counter serializes under SQLite's write lock,
-            // so concurrent writers get distinct ids and never collide.
-            let snapshot_id = reserve_ids(&mut tx, "next_snapshot_id", 1).await?;
+            // Reserve the column ids first so the counter UPDATE takes the write
+            // lock up front, avoiding a lock-upgrade deadlock between concurrent
+            // begins. These ids match the staged parquet field ids.
+            let n = columns.len() as i64;
+            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
+            let column_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+
+            // Tentative id for WriteSetupResult; the real one is assigned at the
+            // commit (finalize_snapshot), so it may differ under concurrency.
+            let snapshot_id: i64 =
+                sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM ducklake_snapshot")
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
 
             let schema_id: i64 = {
                 let existing = sqlx::query(
@@ -1189,9 +1188,6 @@ impl MetadataWriter for SqliteMetadataWriter {
             // reserved ids are returned so the staged parquet's `field_id`
             // metadata matches the ids eventually committed, and the counter keeps
             // concurrent writers' blocks disjoint.
-            let n = columns.len() as i64;
-            let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            let column_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
             // No snapshot row, no column rows, and no Replace retirement are
             // written here — all are deferred to the atomic commit so the head
@@ -1316,10 +1312,12 @@ mod tests {
 
         let file = DataFileInfo::new("data.parquet", 1024, 100).with_footer_size(256);
 
-        let file_id = writer
+        // register_data_file returns the committed snapshot id (head); the
+        // first write commits snapshot 1.
+        let committed = writer
             .register_data_file(table_id, snapshot_id, &file, WriteMode::Append, &[], &[])
             .unwrap();
-        assert_eq!(file_id, 1);
+        assert_eq!(committed, 1);
     }
 
     /// Reserve the next snapshot id the way `begin_write_transaction` now does
@@ -1328,24 +1326,20 @@ mod tests {
     /// drive `register_data_file` directly must reserve (not `create_snapshot`)
     /// the snapshot they register, since registration owns the snapshot insert.
     async fn reserve_snapshot(writer: &SqliteMetadataWriter) -> i64 {
-        sqlx::query(
-            "UPDATE ducklake_metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
-             WHERE key = 'next_snapshot_id' AND scope IS NULL
-             RETURNING CAST(value AS INTEGER)",
-        )
-        .fetch_one(&writer.pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap()
+        sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM ducklake_snapshot")
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap()
     }
 
     /// Helper for the row-lineage tests: read back what `register_data_file`
     /// wrote into the catalog so we can assert on `row_id_start` and the
     /// stats counter directly.
-    async fn read_row_id_start(writer: &SqliteMetadataWriter, file_id: i64) -> Option<i64> {
-        let row = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE data_file_id = ?")
-            .bind(file_id)
+    async fn read_row_id_start(writer: &SqliteMetadataWriter, path: &str) -> Option<i64> {
+        let row = sqlx::query("SELECT row_id_start FROM ducklake_data_file WHERE path = ?")
+            .bind(path)
             .fetch_one(&writer.pool)
             .await
             .unwrap();
@@ -1381,7 +1375,7 @@ mod tests {
             .get_or_create_table(schema_id, "t", None, snap1)
             .unwrap();
 
-        let f1_id = writer
+        writer
             .register_data_file(
                 table_id,
                 snap1,
@@ -1392,7 +1386,7 @@ mod tests {
             )
             .unwrap();
         let snap2 = reserve_snapshot(&writer).await;
-        let f2_id = writer
+        writer
             .register_data_file(
                 table_id,
                 snap2,
@@ -1403,8 +1397,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(read_row_id_start(&writer, f1_id).await, Some(0));
-        assert_eq!(read_row_id_start(&writer, f2_id).await, Some(3));
+        assert_eq!(read_row_id_start(&writer, "a.parquet").await, Some(0));
+        assert_eq!(read_row_id_start(&writer, "b.parquet").await, Some(3));
 
         let (records, next, bytes) = read_table_stats(&writer, table_id).await;
         assert_eq!(records, 10, "record_count = 3 + 7");
@@ -1444,7 +1438,7 @@ mod tests {
         assert_eq!(bytes, 0, "file_size_bytes cleared");
 
         let snap3 = reserve_snapshot(&writer).await;
-        let f2_id = writer
+        writer
             .register_data_file(
                 table_id,
                 snap3,
@@ -1455,7 +1449,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            read_row_id_start(&writer, f2_id).await,
+            read_row_id_start(&writer, "b.parquet").await,
             Some(5),
             "post-replace files must start at the preserved counter, not 0",
         );
@@ -1484,7 +1478,7 @@ mod tests {
             .await
             .unwrap();
 
-        let file_id = writer
+        writer
             .register_data_file(
                 table_id,
                 snapshot_id,
@@ -1494,7 +1488,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(read_row_id_start(&writer, file_id).await, Some(0));
+        assert_eq!(read_row_id_start(&writer, "a.parquet").await, Some(0));
         let (records, next, _) = read_table_stats(&writer, table_id).await;
         assert_eq!(records, 4);
         assert_eq!(next, 4);

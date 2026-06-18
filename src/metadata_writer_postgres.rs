@@ -574,11 +574,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             let row_id_start: i64 = stats_row.try_get(0)?;
 
-            let row = sqlx::query(
+            sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -588,9 +588,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .fetch_one(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-            let id: i64 = row.try_get(0)?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -614,7 +613,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;
-            Ok(id)
+            Ok(snapshot_id)
         })
     }
 
