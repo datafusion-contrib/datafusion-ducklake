@@ -97,3 +97,60 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  test-full:
+    name: Test (single-catalog backends + encryption, Docker)
+    runs-on: ubuntu-latest
+    env:
+      # Bundled-DuckDB debug binaries are huge and this job links ~25 of them
+      # under the full feature set, which exhausts the runner's disk during
+      # linking (lld dies with SIGBUS). Dropping debuginfo keeps them small.
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/microsoft
+          df -h /
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      - name: Cache target directory
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: target
+          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-full-
+
+      # Runs the single-catalog suites across every metadata backend
+      # (Postgres/MySQL via testcontainers, SQLite, DuckDB) + encryption.
+      # `skip-tests-with-docker` is NOT set, so the container-backed suites run.
+      # Multicatalog (the runtimedb-specific layer, gated on `write-postgres`) is
+      # intentionally excluded here — its test files stay in-tree but don't run.
+      - name: Run single-catalog test suite
+        run: cargo test --features "duckdb-bundled encryption metadata-mysql metadata-postgres metadata-sqlite write-sqlite"
