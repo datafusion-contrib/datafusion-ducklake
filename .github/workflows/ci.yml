@@ -43,8 +43,19 @@ jobs:
           - ubuntu-latest
           - macos-latest
         rust: [stable]
+    env:
+      # Bundled-DuckDB debug binaries are large; dropping debuginfo keeps the
+      # test link step from exhausting the runner's disk (see free-disk step).
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/microsoft
+          df -h /
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
