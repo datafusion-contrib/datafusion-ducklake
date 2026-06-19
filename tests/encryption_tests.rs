@@ -114,6 +114,7 @@ fn create_catalog_with_encrypted_file(
             column_type VARCHAR NOT NULL,
             column_order INTEGER NOT NULL,
             nulls_allowed BOOLEAN DEFAULT true,
+            parent_column BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT
         );
@@ -127,6 +128,8 @@ fn create_catalog_with_encrypted_file(
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
             encryption_key VARCHAR,
+            record_count BIGINT,
+            row_id_start BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT
         );
