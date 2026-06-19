@@ -345,3 +345,76 @@ async fn test_schema_shows_renamed_columns() -> Result<()> {
 
     Ok(())
 }
+
+/// Repro: a column is renamed AFTER the first file is written, then a SECOND
+/// file is written post-rename. The two parquet files carry the same field_id
+/// under DIFFERENT physical names (`id` vs `new_id`). The read path must map
+/// field_id -> physical name PER FILE; deriving one mapping from the first file
+/// and applying it to every file reads the other file's renamed column as NULL.
+fn create_catalog_renamed_with_post_rename_file(catalog_path: &Path) -> Result<()> {
+    let conn = duckdb::Connection::open_in_memory()?;
+    conn.execute("INSTALL ducklake;", [])?;
+    conn.execute("LOAD ducklake;", [])?;
+    let ducklake_path = format!("ducklake:{}", catalog_path.display());
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    conn.execute(
+        "CREATE TABLE test_catalog.test_table (id INT, name VARCHAR);",
+        [],
+    )?;
+    // File 1: physical column `id`.
+    conn.execute(
+        "INSERT INTO test_catalog.test_table VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie');",
+        [],
+    )?;
+    conn.execute(
+        "ALTER TABLE test_catalog.test_table RENAME COLUMN id TO new_id;",
+        [],
+    )?;
+    // File 2: written AFTER the rename -> physical column `new_id`.
+    conn.execute(
+        "INSERT INTO test_catalog.test_table VALUES (4,'Dave'),(5,'Eve');",
+        [],
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rename_with_post_rename_file_reads_all_rows() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("renamed_multifile.ducklake");
+    create_catalog_renamed_with_post_rename_file(&catalog_path)?;
+
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
+    let catalog = DuckLakeCatalog::new(provider)?;
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    let df = ctx
+        .sql("SELECT new_id FROM ducklake.main.test_table")
+        .await?;
+    let batches = df.collect().await?;
+
+    let mut ids: Vec<i32> = Vec::new();
+    let mut nulls = 0usize;
+    for b in &batches {
+        let a = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        for i in 0..a.len() {
+            if a.is_null(i) {
+                nulls += 1;
+            } else {
+                ids.push(a.value(i));
+            }
+        }
+    }
+    ids.sort();
+    assert_eq!(
+        nulls, 0,
+        "renamed column read NULL (post-rename file mis-mapped)"
+    );
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "all rows from both files read correctly"
+    );
+    Ok(())
+}

@@ -47,7 +47,6 @@ use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
-use tokio::sync::OnceCell;
 
 #[cfg(feature = "encryption")]
 use datafusion::execution::parquet_encryption::EncryptionFactory;
@@ -97,7 +96,7 @@ pub fn delete_file_schema() -> SchemaRef {
 }
 
 /// Cached schema mapping for renamed columns
-type SchemaMappingCache = (SchemaRef, HashMap<String, String>);
+type SchemaMapping = (SchemaRef, HashMap<String, String>);
 
 /// Per-file read configuration computed for the row-lineage scan path.
 ///
@@ -157,8 +156,6 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
     table_files: Vec<DuckLakeTableFile>,
-    /// Cached schema mapping (read_schema, name_mapping) - computed once on first scan
-    schema_mapping_cache: OnceCell<SchemaMappingCache>,
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
@@ -245,7 +242,6 @@ impl DuckLakeTable {
             table_files,
             #[cfg(feature = "encryption")]
             encryption_factory,
-            schema_mapping_cache: OnceCell::new(),
             file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "write")]
             schema_name: None,
@@ -291,84 +287,73 @@ impl DuckLakeTable {
         ParquetSource::new(schema)
     }
 
-    /// Get the cached schema mapping, computing it once from the first file if needed.
-    /// All files in a DuckLake table have the same schema structure, so we only need to check one.
-    async fn get_schema_mapping(
+    /// Compute the field_id -> physical-name read schema and rename mapping for a
+    /// SINGLE file. Physical column names can differ across files (e.g. a column
+    /// renamed after some files were written), so this is resolved per file.
+    async fn file_schema_mapping(
         &self,
         state: &dyn Session,
-    ) -> DataFusionResult<&SchemaMappingCache> {
-        self.schema_mapping_cache
-            .get_or_try_init(|| async {
-                // If no files, use current schema with no rename mapping
-                let Some(first_file) = self.table_files.first() else {
-                    return Ok((self.schema.clone(), HashMap::new()));
-                };
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<SchemaMapping> {
+        let resolved_path = self.resolve_file_path(file)?;
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url.as_ref())?;
+        let object_path = ObjectPath::from(resolved_path.as_str());
 
-                let resolved_path = self.resolve_file_path(&first_file.file)?;
-                let object_store = state
-                    .runtime_env()
-                    .object_store(self.object_store_url.as_ref())?;
-                let object_path = ObjectPath::from(resolved_path.as_str());
+        let reader = ParquetObjectReader::new(object_store, object_path);
 
-                let reader = ParquetObjectReader::new(object_store, object_path);
+        // Build the ParquetRecordBatchStreamBuilder with decryption if needed
+        #[cfg(feature = "encryption")]
+        let builder = {
+            use parquet::arrow::arrow_reader::ArrowReaderOptions;
 
-                // Build the ParquetRecordBatchStreamBuilder with decryption if needed
-                #[cfg(feature = "encryption")]
-                let builder = {
-                    use parquet::arrow::arrow_reader::ArrowReaderOptions;
-
-                    // Check if file has encryption key
-                    let options = if let Some(ref key) = first_file.file.encryption_key {
-                        if !key.is_empty() {
-                            let key_bytes =
-                                crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                            let decryption_props =
-                                parquet::encryption::decrypt::FileDecryptionProperties::builder(
-                                    key_bytes,
-                                )
-                                .build()
-                                .map_err(|e| {
-                                    DataFusionError::Execution(format!(
-                                        "Failed to create decryption properties: {}",
-                                        e
-                                    ))
-                                })?;
-                            ArrowReaderOptions::new()
-                                .with_file_decryption_properties(decryption_props)
-                        } else {
-                            ArrowReaderOptions::new()
-                        }
-                    } else {
-                        ArrowReaderOptions::new()
-                    };
-
-                    ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-                        .await
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?
-                };
-
-                #[cfg(not(feature = "encryption"))]
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-                let field_id_map = extract_parquet_field_ids(builder.metadata());
-
-                // No field_ids means external file - use current schema directly
-                if field_id_map.is_empty() {
-                    return Ok((self.schema.clone(), HashMap::new()));
+            // Check if file has encryption key
+            let options = if let Some(ref key) = file.encryption_key {
+                if !key.is_empty() {
+                    let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+                    let decryption_props =
+                        parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
+                            .build()
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to create decryption properties: {}",
+                                    e
+                                ))
+                            })?;
+                    ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
+                } else {
+                    ArrowReaderOptions::new()
                 }
+            } else {
+                ArrowReaderOptions::new()
+            };
 
-                let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping(
-                    &self.columns,
-                    &field_id_map,
-                    Some(builder.schema().as_ref()),
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
 
-                Ok((Arc::new(read_schema), name_mapping))
-            })
+        #[cfg(not(feature = "encryption"))]
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let field_id_map = extract_parquet_field_ids(builder.metadata());
+
+        // No field_ids means external file - use current schema directly
+        if field_id_map.is_empty() {
+            return Ok((self.schema.clone(), HashMap::new()));
+        }
+
+        let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping(
+            &self.columns,
+            &field_id_map,
+            Some(builder.schema().as_ref()),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok((Arc::new(read_schema), name_mapping))
     }
 
     /// Read a delete file and extract all deleted row positions
@@ -450,67 +435,93 @@ impl DuckLakeTable {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let (read_schema, name_mapping) = self.get_schema_mapping(state).await?;
+        // Physical column names can differ across files (e.g. a column renamed
+        // after some files were written), so the field_id -> physical-name read
+        // schema must be resolved PER FILE. Group files that share the same
+        // physical schema into one ParquetSource and union the groups; the common
+        // case (no schema evolution) stays a single group / single scan.
+        let mut groups: Vec<(SchemaMapping, Vec<PartitionedFile>)> = Vec::new();
+        let mut group_index: HashMap<String, usize> = HashMap::new();
 
-        let partitioned_files: Vec<PartitionedFile> = files
-            .iter()
-            .map(|table_file| {
-                let resolved_path = self.resolve_file_path(&table_file.file)?;
-                let mut pf = PartitionedFile::new(
-                    &resolved_path,
-                    validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-                );
+        for table_file in files {
+            let mapping = self.file_schema_mapping(state, &table_file.file).await?;
 
-                // Apply footer size hint if available from DuckLake metadata
-                // This reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
-                if let Some(footer_size) = table_file.file.footer_size
-                    && footer_size > 0
-                    && let Ok(hint) = usize::try_from(footer_size)
-                {
-                    pf = pf.with_metadata_size_hint(hint);
-                }
+            let resolved_path = self.resolve_file_path(&table_file.file)?;
+            let mut pf = PartitionedFile::new(
+                &resolved_path,
+                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+            );
+            // Footer size hint cuts I/O from 2 reads to 1 per file (helps S3/MinIO).
+            if let Some(footer_size) = table_file.file.footer_size
+                && footer_size > 0
+                && let Ok(hint) = usize::try_from(footer_size)
+            {
+                pf = pf.with_metadata_size_hint(hint);
+            }
 
-                Ok(pf)
-            })
-            .collect::<DataFusionResult<Vec<_>>>()?;
+            // Group key: physical field names + types, then the rename mapping.
+            let (read_schema, name_mapping) = &mapping;
+            let mut key = String::new();
+            for f in read_schema.fields() {
+                key.push_str(f.name());
+                key.push('\u{1}');
+                key.push_str(&format!("{:?}", f.data_type()));
+                key.push('\u{2}');
+            }
+            let mut pairs: Vec<(&String, &String)> = name_mapping.iter().collect();
+            pairs.sort();
+            for (k, v) in pairs {
+                key.push_str(k);
+                key.push('\u{3}');
+                key.push_str(v);
+                key.push('\u{4}');
+            }
 
-        // Use read_schema (with original Parquet names) for reading
-        let mut builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(read_schema.clone())),
-        )
-        .with_limit(limit)
-        .with_file_group(FileGroup::new(partitioned_files));
-
-        // Apply projection if provided
-        if let Some(proj) = projection {
-            builder = builder.with_projection_indices(Some(proj.clone()))?;
+            match group_index.get(&key) {
+                Some(&gi) => groups[gi].1.push(pf),
+                None => {
+                    group_index.insert(key, groups.len());
+                    groups.push((mapping, vec![pf]));
+                },
+            }
         }
 
-        let file_scan_config = builder.build();
-        // Use DataSourceExec directly to preserve our ParquetSource with encryption factory
-        let parquet_exec: Arc<dyn ExecutionPlan> =
-            DataSourceExec::from_data_source(file_scan_config);
-
-        // Wrap with ColumnRenameExec to present the catalog schema: when columns
-        // were renamed, OR when the file's physical Arrow type differs from the
-        // catalog type (e.g. a DuckDB ARRAY read as FixedSizeList vs the
-        // catalog's List, or a differing list child field name). The wrap coerces
-        // each column to `output_schema`, so the provider's advertised schema and
-        // its scan output stay identical.
         let output_schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => self.schema.clone(),
         };
-        if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
-            Ok(Arc::new(ColumnRenameExec::new(
-                parquet_exec,
-                output_schema,
-                name_mapping.clone(),
-            )))
-        } else {
-            Ok(parquet_exec)
+
+        // Build one scan per physical-schema group; ColumnRenameExec coerces each
+        // group to the catalog schema (renamed columns or a differing Arrow type).
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
+        for ((read_schema, name_mapping), partitioned_files) in groups {
+            let mut builder = FileScanConfigBuilder::new(
+                self.object_store_url.as_ref().clone(),
+                Arc::new(self.create_parquet_source(read_schema.clone())),
+            )
+            .with_limit(limit)
+            .with_file_group(FileGroup::new(partitioned_files));
+
+            if let Some(proj) = projection {
+                builder = builder.with_projection_indices(Some(proj.clone()))?;
+            }
+
+            let parquet_exec: Arc<dyn ExecutionPlan> =
+                DataSourceExec::from_data_source(builder.build());
+
+            let exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
+                Arc::new(ColumnRenameExec::new(
+                    parquet_exec,
+                    output_schema.clone(),
+                    name_mapping,
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                parquet_exec
+            };
+            execs.push(exec);
         }
+
+        combine_execution_plans(execs)
     }
 
     /// Configure this table for write operations.
