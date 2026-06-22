@@ -387,6 +387,78 @@ async fn test_insert_overwrite() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_insert_overwrite_empty_truncates() {
+    // Regression (#10): an INSERT OVERWRITE whose source yields ZERO rows must
+    // TRUNCATE the table (Replace retires the prior generation), not silently
+    // leave the old rows live while reporting success.
+    let (_ctx, temp_dir) = create_writable_catalog().await;
+    let object_store = create_object_store();
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+
+    // Populate with 3 rows.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    datafusion_ducklake::DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .write_table("main", "ow_empty", &[batch])
+        .await
+        .unwrap();
+
+    // Fresh writable ctx; overwrite from a source filtered to zero rows.
+    let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let src = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![10, 20])), Arc::new(StringArray::from(vec!["x", "y"]))],
+    )
+    .unwrap();
+    ctx.register_batch("src", src).unwrap();
+
+    ctx.sql("INSERT OVERWRITE ducklake.main.ow_empty SELECT * FROM src WHERE 1 = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // After an empty overwrite the table must be EMPTY.
+    let read_ctx = create_read_context(&temp_dir).await;
+    let batches = read_ctx
+        .sql("SELECT COUNT(*) as cnt FROM ducklake.main.ow_empty")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(
+        count, 0,
+        "empty INSERT OVERWRITE must truncate the table, not leave stale rows"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_sql_insert_values() {
     let (_ctx, temp_dir) = create_writable_catalog().await;
     let object_store = create_object_store();

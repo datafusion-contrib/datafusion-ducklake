@@ -175,7 +175,12 @@ impl ExecutionPlan for DuckLakeInsertExec {
             let input_stream = input.execute(0, Arc::clone(&context))?;
             let batches: Vec<RecordBatch> = input_stream.try_collect().await?;
 
-            if batches.is_empty() {
+            // An empty input is a genuine no-op only for Append. For
+            // Replace/Overwrite we must still run the write session so the prior
+            // generation is retired (truncated): finish() registers a 0-row file
+            // and finalize_snapshot runs the Replace retirement. Returning early
+            // here would leave the old rows live while reporting count=0 success.
+            if batches.is_empty() && write_mode == WriteMode::Append {
                 let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
