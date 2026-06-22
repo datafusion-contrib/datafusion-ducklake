@@ -656,32 +656,78 @@ async fn finalize_snapshot(
     .await?
     .try_get(0)?;
 
-    // Finalize the column generation: end the prior columns and insert the new
-    // set with the reserved column_ids (matching the parquet field_ids).
-    sqlx::query(
-        "UPDATE ducklake_column SET end_snapshot = ?
+    // Update the column generation SURGICALLY so each column keeps a stable
+    // column_id (== parquet field_id) across writes: end only removed columns,
+    // insert only new ones, and leave unchanged columns (and their ids) in place.
+    // Re-minting ids every write would orphan the field_ids baked into
+    // already-written files, making their rows read back as NULL.
+    use std::collections::{HashMap, HashSet};
+    let current = sqlx::query(
+        "SELECT column_name, column_order, nulls_allowed
+         FROM ducklake_column
          WHERE table_id = ? AND end_snapshot IS NULL",
     )
-    .bind(snapshot_id)
     .bind(table_id)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
 
+    let new_names: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let mut current_by_name: HashMap<String, (i64, bool)> = HashMap::new();
+    for row in &current {
+        let name: String = row.try_get(0)?;
+        let order: i64 = row.try_get(1)?;
+        let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+        if !new_names.contains(name.as_str()) {
+            // Column dropped in the new schema: end its generation.
+            sqlx::query(
+                "UPDATE ducklake_column SET end_snapshot = ?
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(&name)
+            .execute(&mut **tx)
+            .await?;
+        }
+        current_by_name.insert(name, (order, nullable));
+    }
+
     for (order, (col, column_id)) in columns.iter().zip(column_ids.iter()).enumerate() {
-        sqlx::query(
-            "INSERT INTO ducklake_column
-                 (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(column_id)
-        .bind(table_id)
-        .bind(&col.name)
-        .bind(&col.ducklake_type)
-        .bind(order as i64)
-        .bind(col.is_nullable)
-        .bind(snapshot_id)
-        .execute(&mut **tx)
-        .await?;
+        match current_by_name.get(&col.name) {
+            // Existing column kept: its id stays stable. Sync order/nullability
+            // only if they changed (type changes are rejected at begin).
+            Some(&(cur_order, cur_nullable)) => {
+                if cur_order != order as i64 || cur_nullable != col.is_nullable {
+                    sqlx::query(
+                        "UPDATE ducklake_column SET column_order = ?, nulls_allowed = ?
+                         WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(order as i64)
+                    .bind(col.is_nullable)
+                    .bind(table_id)
+                    .bind(&col.name)
+                    .execute(&mut **tx)
+                    .await?;
+                }
+            },
+            // Newly added column: insert it with its reserved id.
+            None => {
+                sqlx::query(
+                    "INSERT INTO ducklake_column
+                         (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(column_id)
+                .bind(table_id)
+                .bind(&col.name)
+                .bind(&col.ducklake_type)
+                .bind(order as i64)
+                .bind(col.is_nullable)
+                .bind(snapshot_id)
+                .execute(&mut **tx)
+                .await?;
+            },
+        }
     }
 
     if mode == WriteMode::Replace {
@@ -1059,7 +1105,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // begins. These ids match the staged parquet field ids.
             let n = columns.len() as i64;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
-            let column_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
+            // Freshly reserved ids. Only a genuinely-new column actually consumes
+            // one below; an existing column keeps its current id, so some of these
+            // may go unused (harmless monotonic-counter gaps).
+            let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
             // Tentative id for WriteSetupResult; the real one is assigned at the
             // commit (finalize_snapshot), so it may differ under concurrency.
@@ -1121,9 +1170,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             };
 
-            // Get existing columns to check schema compatibility for appends
+            // Get existing columns to (a) check schema compatibility for appends
+            // and (b) REUSE each column's id. column_id == parquet field_id == a
+            // column's stable identity; re-minting it every write would orphan the
+            // field_ids already baked into previously-written files, so an
+            // unchanged column must keep its id.
             let rows = sqlx::query(
-                "SELECT column_name, column_type, nulls_allowed
+                "SELECT column_name, column_type, nulls_allowed, column_id
                  FROM ducklake_column
                  WHERE table_id = ? AND end_snapshot IS NULL
                  ORDER BY column_order",
@@ -1133,10 +1186,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
+            let mut existing_ids: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             for row in rows {
                 let name: String = row.try_get(0)?;
                 let col_type: String = row.try_get(1)?;
                 let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+                let cid: i64 = row.try_get(3)?;
+                existing_ids.insert(name.clone(), cid);
                 existing_columns.push((name, col_type, nullable));
             }
 
@@ -1179,15 +1236,19 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // Columns in existing but not in new schema are implicitly removed - this is allowed
             }
 
-            // Reserve a contiguous column_id block from the monotonic counter
-            // WITHOUT inserting the column rows. The new column generation is
-            // written at the commit point (`finalize_snapshot`), not here, because
-            // the SQLite read path resolves a table's columns by `end_snapshot IS
-            // NULL` only (not snapshot-scoped) — inserting at begin would leak the
-            // new generation to concurrent reads during the upload window. The
-            // reserved ids are returned so the staged parquet's `field_id`
-            // metadata matches the ids eventually committed, and the counter keeps
-            // concurrent writers' blocks disjoint.
+            // Final per-column ids: reuse the existing id for a column already in
+            // the table, consume a freshly reserved id only for a genuinely new
+            // column. These are baked into the staged parquet's field_id metadata,
+            // so they must equal the ids `finalize_snapshot` commits. Column rows
+            // themselves are written at the commit point (not here): the SQLite
+            // read path resolves columns by `end_snapshot IS NULL` only (not
+            // snapshot-scoped), so inserting at begin would leak the new
+            // generation to concurrent reads during the upload window.
+            let column_ids: Vec<i64> = columns
+                .iter()
+                .zip(fresh_ids.iter())
+                .map(|(col, &fresh)| existing_ids.get(&col.name).copied().unwrap_or(fresh))
+                .collect();
 
             // No snapshot row, no column rows, and no Replace retirement are
             // written here — all are deferred to the atomic commit so the head

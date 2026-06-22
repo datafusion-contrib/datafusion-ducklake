@@ -342,6 +342,63 @@ async fn test_append_semantics() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_append_preserves_first_file_values() {
+    // Regression: a second append must not orphan the first file's column ids.
+    // Reading back must return BOTH batches' actual values, not NULLs.
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("value", DataType::Int32, true),
+    ]));
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![100, 200]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[batch1])
+        .await
+        .unwrap();
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(Int32Array::from(vec![300, 400]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
+        .unwrap()
+        .append_table("main", "t", &[batch2])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT id, value FROM test.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut got: Vec<(i32, i32)> = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let vals = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        for i in 0..b.num_rows() {
+            assert!(
+                !ids.is_null(i) && !vals.is_null(i),
+                "append lost a row's values (read back NULL)"
+            );
+            got.push((ids.value(i), vals.value(i)));
+        }
+    }
+    got.sort();
+    assert_eq!(got, vec![(1, 100), (2, 200), (3, 300), (4, 400)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_tables_same_schema() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
