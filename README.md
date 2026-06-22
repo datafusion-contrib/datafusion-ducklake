@@ -14,6 +14,9 @@ To meet the [Hotdata](https://www.hotdata.dev) team, [Join the Hotdata Discord](
 
 - Read and write queries against DuckLake catalogs (INSERT INTO support)
 - DuckDB, PostgreSQL, MySQL, and SQLite catalog backends
+- PostgreSQL multi-catalog support: manage and read multiple independent DuckLake catalogs within a single metadata store
+- Maintenance operations: `DROP TABLE`, expire snapshots, clean up superseded files, and delete orphaned files
+- Configurable writer output: Parquet compression and row-group sizing (by row count and byte size)
 - Local filesystem and S3-compatible object stores (MinIO, S3)
 - Snapshot-based consistency
 - Basic and decimal types
@@ -45,6 +48,7 @@ This project is under active development. The roadmap below reflects major areas
 
 ### Metadata & Catalog Improvements
 
+- ~~Multi-catalog support (PostgreSQL)~~ (Done in v0.3.0)
 - Metadata caching to reduce repeated catalog lookups
 - Clear abstraction boundaries between catalog, metadata provider, and execution
 
@@ -60,6 +64,8 @@ This project is under active development. The roadmap below reflects major areas
 
 - ~~Initial write support for DuckLake tables~~ (Done in v0.0.5)
 - ~~S3/ObjectStore write support~~ (Done in v0.0.6)
+- ~~Row lineage (`rowid` virtual column)~~ (Done in v0.3.0)
+- ~~Maintenance: `DROP TABLE`, expire snapshots, cleanup / orphan-file reclamation~~ (Done in v0.3.0)
 - UPDATE and DELETE operations
 
 ### Time Travel & Versioning

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-22
+
+### Added
+- **PostgreSQL multi-catalog support.** Manage and read multiple independent DuckLake catalogs within a single PostgreSQL metadata store, including per-catalog data-file segregation on disk, single-table tombstone drops (`drop_table_in_catalog`), and `row_id_start` projection on reads / population on data-file registration (#117, #120, #121, #124, #132).
+- **Row lineage.** `rowid` virtual column exposing DuckLake row IDs, opt-in via `DuckLakeCatalog::with_row_lineage(true)`. Compatible with files produced by DuckDB's `UPDATE` / compaction (#115).
+- **Maintenance API.** Single-catalog `DROP TABLE`, `expire_snapshots`, and `cleanup_old_files` for reclaiming superseded data, plus `delete_orphaned_files` for storage-scan reclamation of untracked files (#122, #123).
+- **Writer tuning.** Configurable Parquet compression (`DuckLakeTableWriter::with_compression`) and row-group caps by row count and byte size (`with_max_row_group_rows` / `with_max_row_group_bytes`) (#126, #128).
+- `MetadataProvider::get_table_row_count()`, which accounts for delete files (#131).
+
+### Changed
+- Writer streams table writes through a staging file with multipart upload instead of buffering in memory, reducing peak memory for large writes (#127).
+- CI: gate the single-catalog backend test suite and fix/quarantine drifted fixtures (#139); run on `ubuntu-latest` instead of `ubuntu-latest-m` (#118).
+
+### Fixed
+- Correct reads across schema evolution and repeated writes, resolving per-file schema mapping for schema-evolving reads (#140, #141).
+- Make `WriteMode::Replace` atomic to close a transient empty-read window, for both the single-catalog SQLite path and the general path (#135, #138).
+- Truncate the table on a zero-row `INSERT OVERWRITE` / Replace (#142).
+- Require single-partition input in `DuckLakeInsertExec` (#137).
+- Derive `rowid` and delete positions from physical file position (#129).
+- Map nanosecond timezone-aware timestamps to `timestamptz_ns` (#133).
+- Emit catalog list type for `ARRAY`-backed columns (#125).
+- Align `ducklake_column` / `ducklake_data_file` schema with the DuckLake spec (#116).
+
 ## [0.2.1] - 2026-05-05
 
 ### Added
@@ -124,6 +147,7 @@ Initial release.
 - Filter pushdown to Parquet
 - Query-scoped snapshot isolation
 
+[0.3.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.1.1...v0.1.2
