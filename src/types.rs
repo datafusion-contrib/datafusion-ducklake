@@ -466,9 +466,12 @@ pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, Str
     field_id_map
 }
 
-/// Build a schema for reading Parquet files with renamed columns.
-/// Returns (read_schema, name_mapping) where read_schema uses original Parquet names
-/// and name_mapping maps old->new for columns that were renamed.
+/// Build a schema for reading Parquet files across schema evolution.
+/// Returns (read_schema, name_mapping): read_schema uses each column's physical
+/// name in the file, and name_mapping maps that physical name -> current name for
+/// renamed columns. A current column whose field_id is absent from a file that
+/// otherwise carries field_ids is read as an all-NULL column (the file predates
+/// the column, or it was dropped then re-added under the same name).
 pub fn build_read_schema_with_field_id_mapping(
     current_columns: &[DuckLakeTableColumn],
     parquet_field_ids: &HashMap<i32, String>,
@@ -487,15 +490,26 @@ pub fn build_read_schema_with_field_id_mapping(
                 ))
             })?;
 
-            let (read_name, needs_rename) =
+            // Resolve the physical name this column has in THIS file:
+            //  - field_id present: that physical name (rename if it differs).
+            //  - file has no field_ids: external/legacy parquet, match by name.
+            //  - file has field_ids but not this one's: the column is absent from
+            //    this file (added later, or DROPped + re-ADDed under the same name
+            //    with a fresh field_id) and must read as NULL. Matching by name
+            //    would alias a different same-named column (e.g. the still-present
+            //    dropped column) and leak stale data, so use a name guaranteed
+            //    absent so the scan null-fills it, then rename it back.
+            let (read_name, needs_rename, is_absent) =
                 if let Some(parquet_name) = parquet_field_ids.get(&field_id) {
                     if parquet_name != &col.column_name {
-                        (parquet_name.clone(), true) // Column was renamed
+                        (parquet_name.clone(), true, false) // Column was renamed
                     } else {
-                        (col.column_name.clone(), false)
+                        (col.column_name.clone(), false, false)
                     }
+                } else if parquet_field_ids.is_empty() {
+                    (col.column_name.clone(), false, false) // external/legacy file
                 } else {
-                    (col.column_name.clone(), false) // No field_id, use current name
+                    (format!("__ducklake_absent_field_{}", field_id), true, true)
                 };
 
             // For list/nested columns the Parquet reader reproduces the *file's*
@@ -504,11 +518,14 @@ pub fn build_read_schema_with_field_id_mapping(
             // DataFusion's scan validates each batch against the read schema. The
             // reconstructed name (always "item") may not match, so adopt the
             // file's actual type for these columns when the file schema is known.
-            // Scalars keep the reconstructed type (precise per the catalog).
-            if matches!(
-                data_type,
-                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
-            ) && let Some(fs) = file_schema
+            // Scalars keep the reconstructed type (precise per the catalog). An
+            // absent column has a synthetic name not in the file, so skip it.
+            if !is_absent
+                && matches!(
+                    data_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+                )
+                && let Some(fs) = file_schema
                 && let Ok(file_field) = fs.field_with_name(&read_name)
             {
                 data_type = file_field.data_type().clone();
@@ -518,7 +535,14 @@ pub fn build_read_schema_with_field_id_mapping(
                 name_mapping.insert(read_name.clone(), col.column_name.clone());
             }
 
-            Ok(Field::new(read_name, data_type, col.is_nullable))
+            // An absent column is materialised as a null array by the scan, so its
+            // read field must be nullable; the catalog nullability is still
+            // enforced on output by ColumnRenameExec.
+            Ok(Field::new(
+                read_name,
+                data_type,
+                col.is_nullable || is_absent,
+            ))
         })
         .collect();
 
@@ -604,6 +628,52 @@ mod tests {
         // Falls back to current column name
         assert_eq!(read_schema.field(0).name(), "id");
         assert!(name_mapping.is_empty());
+    }
+
+    #[test]
+    fn test_build_read_schema_absent_field_id_reads_null() {
+        // `tag` (column_id 2) was DROPped then re-ADDed, so it has a fresh
+        // field_id that is absent from a pre-drop file. The file still physically
+        // carries a column literally named "tag" (the dropped one, different
+        // field_id), which must NOT be aliased.
+        let current_columns = vec![
+            DuckLakeTableColumn {
+                column_id: 1,
+                column_name: "id".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+            },
+            DuckLakeTableColumn {
+                column_id: 2,
+                column_name: "tag".to_string(),
+                column_type: "varchar".to_string(),
+                is_nullable: true,
+            },
+        ];
+
+        let mut parquet_field_ids = HashMap::new();
+        parquet_field_ids.insert(1, "id".to_string()); // file has field_ids, but not 2
+
+        let (read_schema, name_mapping) =
+            build_read_schema_with_field_id_mapping(&current_columns, &parquet_field_ids, None)
+                .unwrap();
+
+        // `id` reads by name; `tag` gets a synthetic absent name (so the scan
+        // null-fills it) mapped back to "tag", instead of binding to the
+        // physically-present dropped "tag".
+        assert_eq!(read_schema.field(0).name(), "id");
+        assert_ne!(read_schema.field(1).name(), "tag");
+        assert!(
+            read_schema
+                .field(1)
+                .name()
+                .starts_with("__ducklake_absent_field_")
+        );
+        assert!(read_schema.field(1).is_nullable());
+        assert_eq!(
+            name_mapping.get(read_schema.field(1).name()),
+            Some(&"tag".to_string())
+        );
     }
 
     #[test]

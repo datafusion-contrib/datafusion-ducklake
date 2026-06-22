@@ -419,11 +419,11 @@ async fn test_rename_with_post_rename_file_reads_all_rows() -> Result<()> {
     Ok(())
 }
 
-// ===== SCRATCH ADVERSARIAL TESTS (to be reverted) =====
+// ===== Schema-evolution regression tests =====
 
 /// SELECT * (projection=None) over rename + post-rename file.
 #[tokio::test]
-async fn scratch_select_star_rename_multifile() -> Result<()> {
+async fn test_select_star_rename_multifile_reads_all_rows() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("star.ducklake");
     create_catalog_renamed_with_post_rename_file(&catalog_path)?;
@@ -485,7 +485,7 @@ fn create_catalog_rename_then_delete(catalog_path: &Path) -> Result<()> {
 }
 
 #[tokio::test]
-async fn scratch_rename_mixed_with_delete() -> Result<()> {
+async fn test_rename_mixed_with_delete_reads_all_rows() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("mixdel.ducklake");
     create_catalog_rename_then_delete(&catalog_path)?;
@@ -549,12 +549,17 @@ fn create_catalog_drop_readd(catalog_path: &Path) -> Result<()> {
 }
 
 #[tokio::test]
-async fn scratch_drop_readd_column() -> Result<()> {
+async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let catalog_path = temp_dir.path().join("dropreadd.ducklake");
     create_catalog_drop_readd(&catalog_path)?;
 
-    // What does duckdb itself say the answer is?
+    // The re-added `tag` must read NULL for rows written before the DROP and 'z'
+    // for the row written after the re-ADD — NOT the dropped column's stale data.
+    let expected: Vec<(i32, Option<String>)> =
+        vec![(1, None), (2, None), (3, Some("z".to_string()))];
+
+    // Pin the expectation to DuckDB's own answer so it stays honest.
     {
         let conn = duckdb::Connection::open_in_memory()?;
         conn.execute("INSTALL ducklake;", [])?;
@@ -563,12 +568,11 @@ async fn scratch_drop_readd_column() -> Result<()> {
         conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
         let mut stmt = conn.prepare("SELECT id, tag FROM test_catalog.test_table ORDER BY id")?;
         let mut rows = stmt.query([])?;
-        println!("DUCKDB GROUND TRUTH:");
+        let mut duck: Vec<(i32, Option<String>)> = Vec::new();
         while let Some(r) = rows.next()? {
-            let id: i32 = r.get(0)?;
-            let tag: Option<String> = r.get(1)?;
-            println!("  id={} tag={:?}", id, tag);
+            duck.push((r.get(0)?, r.get(1)?));
         }
+        assert_eq!(duck, expected, "DuckDB ground truth changed");
     }
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
@@ -580,7 +584,7 @@ async fn scratch_drop_readd_column() -> Result<()> {
         .sql("SELECT id, tag FROM ducklake.main.test_table ORDER BY id")
         .await?;
     let batches = df.collect().await?;
-    println!("DATAFUSION-DUCKLAKE:");
+    let mut got: Vec<(i32, Option<String>)> = Vec::new();
     for b in &batches {
         let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         let tags = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
@@ -590,8 +594,13 @@ async fn scratch_drop_readd_column() -> Result<()> {
             } else {
                 Some(tags.value(i).to_string())
             };
-            println!("  id={} tag={:?}", ids.value(i), tag);
+            got.push((ids.value(i), tag));
         }
     }
+
+    assert_eq!(
+        got, expected,
+        "re-added column must read NULL for pre-drop rows, not the dropped column's stale data"
+    );
     Ok(())
 }
