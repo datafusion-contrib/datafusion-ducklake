@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/datafusion-ducklake)](https://docs.rs/datafusion-ducklake)
 [![CI](https://github.com/hotdata-dev/datafusion-ducklake/actions/workflows/ci.yml/badge.svg)](https://github.com/hotdata-dev/datafusion-ducklake/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Discord](https://img.shields.io/badge/Discord-Hotdata-5865F2?logo=discord&logoColor=white)](https://discord.gg/cdHczfxxBc)
+[![Discord](https://img.shields.io/badge/Discord-DataFusion%2BDuckLake-5865F2?logo=discord&logoColor=white)](https://discord.com/channels/885562378132000778/1492192627666321452)
 
 A [DataFusion](https://datafusion.apache.org/) extension for reading and writing
 [DuckLake](https://ducklake.select) catalogs. DuckLake is an integrated data lake and
@@ -104,19 +104,12 @@ df.show().await?;
 
 ---
 
-## Writing & multi-catalog (PostgreSQL)
+## Writing a catalog
 
-> **Experimental.** PostgreSQL write support is built on a **multi-catalog** layout that
-> lets a single Postgres metadata store host many independent DuckLake catalogs. This
-> layout is **specific to this library** — it is not part of the DuckLake specification
-> and is not (yet) supported or accepted upstream. Catalogs written this way are read
-> back with this crate's `MulticatalogProvider`; they are not interchangeable with a
-> standard single-catalog DuckLake store. The API and on-disk/in-catalog layout may
-> change. It is useful today for multi-tenant deployments or keeping many logical
-> lakehouses in one database, but treat it as a preview.
-
-Tables are created through the writer API; once a table exists, you can append to it with
-SQL `INSERT INTO`. (SQL `CREATE TABLE` / CTAS is not supported on this path — DataFusion
+PostgreSQL writes go through the **experimental multi-catalog layout** described in the
+[next section](#multi-catalog-postgresql-experimental) — treat them as a preview. Tables
+are created through the writer API; once a table exists, you append to it with SQL
+`INSERT INTO`. (SQL `CREATE TABLE` / CTAS is not supported on this path — DataFusion
 cannot create the schema, so the first write goes through `DuckLakeTableWriter`.)
 
 ```rust,ignore
@@ -141,7 +134,7 @@ writer.set_data_path("/abs/path/to/data")?;
 let object_store: Arc<dyn object_store::ObjectStore> =
     Arc::new(object_store::local::LocalFileSystem::new());
 let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store)?;
-table_writer.write_table("public", "events", &[batch]).await?;
+table_writer.write_table("public", "events", &[batch]).await?; // `batch` is your RecordBatch
 
 // Now append with SQL, reading the same catalog back through MulticatalogProvider
 let provider = MulticatalogProvider::with_pool(pool.clone(), "my_catalog").await?;
@@ -153,14 +146,37 @@ ctx.sql("SELECT count(*) FROM ducklake.public.events").await?.show().await?;
 ```
 
 Writer output is configurable (Parquet compression, row-group sizing by row count and
-byte size). See [`examples/multicatalog_write.rs`](examples/multicatalog_write.rs) for a
-full end-to-end walkthrough and [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake)
-for the writer options.
+byte size). See [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake) for the
+writer options.
 
 > Writing to a **standard, single-catalog** DuckLake store (the spec-compliant layout) is
 > supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`),
 > where SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
 > [`tests/sql_write_tests.rs`](tests/sql_write_tests.rs).
+
+---
+
+## Multi-catalog (PostgreSQL, experimental)
+
+A single PostgreSQL metadata store can host **multiple independent DuckLake catalogs** —
+useful for multi-tenant deployments or keeping many logical lakehouses in one database.
+
+> ⚠️ **Experimental and library-specific.** This multi-catalog layout is **not part of the
+> DuckLake specification** and is not (yet) supported or accepted upstream. Catalogs
+> written this way are read back only through this crate's `MulticatalogProvider` — they
+> are **not** interchangeable with a standard single-catalog DuckLake store. The API and
+> on-disk/in-catalog layout may change. PostgreSQL write support currently depends on this
+> path, so treat it as a preview.
+
+- **Create and manage** catalogs with `MulticatalogManager` (feature `write-postgres`):
+  `initialize_multicatalog_schema` bootstraps the shared tables, then `create_catalog`,
+  and `drop_table_in_catalog` manage their contents.
+- **Read** a specific catalog with `MulticatalogProvider::with_pool(pool, "name")`
+  (feature `multicatalog-postgres`), which plugs into a `DuckLakeCatalog` like any other
+  metadata provider.
+
+See [`examples/multicatalog_write.rs`](examples/multicatalog_write.rs) for an end-to-end
+walkthrough (bootstrap → create catalogs → write → read back).
 
 ---
 
