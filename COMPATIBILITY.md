@@ -12,8 +12,11 @@ backends, object stores, types, capabilities, and current limitations. The
 ## Catalog backends
 
 DuckLake stores catalog metadata in a SQL database. Reads are supported on all four
-backends below; writes (`INSERT`, `CREATE TABLE AS SELECT`, `DROP TABLE`, maintenance)
-are currently implemented for SQLite and PostgreSQL only.
+backends below; writes (`INSERT`, `DROP TABLE`, maintenance) are currently implemented
+for SQLite and PostgreSQL only. SQL `CREATE TABLE`/CTAS works on the SQLite
+single-catalog path; the PostgreSQL path is the experimental multi-catalog layout (see
+below) where tables are created via `DuckLakeTableWriter` and then appended to with
+`INSERT INTO`.
 
 | Backend    | Read | Write | Multi-catalog | Feature flags                                          |
 |------------|:----:|:-----:|:-------------:|--------------------------------------------------------|
@@ -22,10 +25,19 @@ are currently implemented for SQLite and PostgreSQL only.
 | PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
 | MySQL      |  ✅  |  ❌   |      ❌       | `metadata-mysql`                                       |
 
-**Multi-catalog** (PostgreSQL only) lets a single metadata store hold multiple
-independent DuckLake catalogs. Reading multiple catalogs requires
+**Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
+multiple independent DuckLake catalogs. Reading multiple catalogs requires
 `multicatalog-postgres` (`MulticatalogProvider`); creating/managing them requires
 `write-postgres` (`MulticatalogManager`).
+
+> ⚠️ The multi-catalog layout is **specific to this library** — it is not part of the
+> DuckLake specification and is not (yet) supported or accepted upstream. Catalogs
+> written this way are only readable through `MulticatalogProvider`, not as standard
+> single-catalog DuckLake stores. PostgreSQL writes currently go through this path, so
+> **all PostgreSQL write support should be treated as experimental** and subject to
+> change. Note also that SQL `CREATE TABLE`/CTAS is not available on this path (the first
+> write of a table goes through `DuckLakeTableWriter`); `INSERT INTO` works once a table
+> exists.
 
 ---
 
@@ -79,8 +91,8 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Capability                                              | Status |
 |---------------------------------------------------------|:------:|
 | `SELECT` against DuckLake tables                        |   ✅   |
-| `INSERT INTO`                                           |   ✅   |
-| `CREATE TABLE AS SELECT`                                |   ✅   |
+| `INSERT INTO` (table must already exist on the PostgreSQL path) | ✅ |
+| `CREATE TABLE AS SELECT` (SQL DDL; SQLite single-catalog only — not on the PostgreSQL multi-catalog path) | 🟧 |
 | `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
 | Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
@@ -92,7 +104,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
 | Configurable writer output (compression, row-group sizing) | ✅  |
-| Multi-catalog (PostgreSQL)                              |   ✅   |
+| Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec) | ✅ |
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.

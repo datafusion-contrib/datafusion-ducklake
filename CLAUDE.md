@@ -10,7 +10,7 @@ DataFusion-DuckLake is a DataFusion extension that provides read and write acces
 
 The extension integrates DuckLake with Apache DataFusion by implementing DataFusion's catalog and table provider interfaces.
 
-Reads are supported on all four catalog backends. Writes (`INSERT`, `CREATE TABLE AS SELECT`, `DROP TABLE`, and the maintenance API) are feature-gated and currently implemented for SQLite and PostgreSQL (`write-sqlite`, `write-postgres`). See `COMPATIBILITY.md` for the full backend/feature matrix.
+Reads are supported on all four catalog backends. Writes are feature-gated and currently implemented for SQLite (`write-sqlite`) and PostgreSQL (`write-postgres`). SQLite uses the standard single-catalog layout and supports SQL `CREATE TABLE AS SELECT` + `INSERT INTO`; PostgreSQL writes go through the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
 
 ## Commands
 
@@ -57,7 +57,7 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/insert_partitioning_tests.rs`)
    - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`
    - `maintenance.rs`: expire snapshots, clean up superseded files, reclaim orphaned files (Rust API, not SQL DDL)
-   - Multi-catalog (PostgreSQL): `MulticatalogManager` (`multicatalog.rs`) creates/manages many catalogs in one store; `MulticatalogProvider` (`multicatalog_provider.rs`, feature `multicatalog-postgres`) reads them
+   - Multi-catalog (PostgreSQL, **experimental & library-specific** — not part of the DuckLake spec, not accepted upstream): `MulticatalogManager` (`multicatalog.rs`) creates/manages many catalogs in one store; `MulticatalogProvider` (`multicatalog_provider.rs`, feature `multicatalog-postgres`) reads them. All PostgreSQL writes currently go through this path. SQL CTAS is unsupported here (first write of a table goes through `DuckLakeTableWriter`); `INSERT INTO` works once the table exists.
 
 4. **Additional capabilities**
    - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)

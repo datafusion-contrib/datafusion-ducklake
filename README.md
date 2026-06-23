@@ -14,10 +14,14 @@ or object storage.
 The goal of this project is to make DuckLake a first-class, Arrow-native lakehouse
 format inside DataFusion.
 
+This project is maintained by [Hotdata](https://www.hotdata.dev) with support from the
+community. Come talk to us on [the Hotdata Discord](https://discord.gg/cdHczfxxBc).
+
 - 📦 **crates.io:** <https://crates.io/crates/datafusion-ducklake>
 - 📖 **API docs:** <https://docs.rs/datafusion-ducklake>
 - 🧩 **Feature & backend support:** see [COMPATIBILITY.md](COMPATIBILITY.md)
-- 💬 **Discord:** [DataFusion+DuckLake](https://discord.com/channels/885562378132000778/1492192627666321452) · [Hotdata](https://discord.gg/cdHczfxxBc)
+- 💬 **Project chat:** [DataFusion+DuckLake Discord](https://discord.com/channels/885562378132000778/1492192627666321452) — development and usage discussion
+- 🧡 **Meet the team:** [Hotdata Discord](https://discord.gg/cdHczfxxBc)
 
 ---
 
@@ -34,24 +38,24 @@ backends and write support are opt-in via feature flags — see
 [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
 
 ```toml
-# Cargo.toml — e.g. read PostgreSQL catalogs and write to SQLite ones
+# Cargo.toml — read PostgreSQL catalogs
+# (for the experimental multi-catalog write path, use features = ["write-postgres"])
 [dependencies]
-datafusion-ducklake = { version = "0.3", features = ["metadata-postgres", "write-sqlite"] }
+datafusion-ducklake = { version = "0.3", features = ["metadata-postgres"] }
 ```
 
 The examples below also use `datafusion`, `object_store`, and `url` directly — add them
 to your `[dependencies]` as well (this crate does not re-export them).
 
-Run a query against an existing catalog with the bundled example:
+Run a query against an existing PostgreSQL catalog with the bundled example:
 
 ```bash
-# DuckDB catalog
-cargo run --example basic_query -- catalog.db "SELECT * FROM main.users"
-
-# SQLite / PostgreSQL / MySQL catalogs (enable the matching backend feature)
-cargo run --example basic_query --features metadata-sqlite -- \
-  "sqlite:///path/to/catalog.db" "SELECT * FROM main.users"
+cargo run --example basic_query --features metadata-postgres -- \
+  "postgresql://user:password@localhost:5432/database" "SELECT * FROM main.users"
 ```
+
+(The example also accepts DuckDB, SQLite, and MySQL connection strings with the matching
+`metadata-*` feature — see [COMPATIBILITY.md](COMPATIBILITY.md).)
 
 ---
 
@@ -63,15 +67,15 @@ Register a `DuckLakeCatalog` with a `SessionContext` and query it with normal SQ
 ```rust,ignore
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
-use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
+use datafusion_ducklake::{DuckLakeCatalog, PostgresMetadataProvider};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use url::Url;
 
 // (inside an async fn)
-// Read metadata from a DuckDB catalog
-let provider = DuckdbMetadataProvider::new("catalog.db")?;
+// Read metadata from a PostgreSQL catalog
+let provider = PostgresMetadataProvider::new("postgresql://user:pass@localhost:5432/db").await?;
 
 // Register object stores for any non-local data (S3 / MinIO)
 let runtime = Arc::new(RuntimeEnv::default());
@@ -100,56 +104,63 @@ df.show().await?;
 
 ---
 
-## Writing a catalog
+## Writing & multi-catalog (PostgreSQL)
 
-Writes are supported on **SQLite** and **PostgreSQL** catalogs (enable `write-sqlite`
-or `write-postgres`). Build the catalog with `with_writer`, then use standard SQL —
-`INSERT INTO` and `CREATE TABLE AS SELECT` both work:
+> **Experimental.** PostgreSQL write support is built on a **multi-catalog** layout that
+> lets a single Postgres metadata store host many independent DuckLake catalogs. This
+> layout is **specific to this library** — it is not part of the DuckLake specification
+> and is not (yet) supported or accepted upstream. Catalogs written this way are read
+> back with this crate's `MulticatalogProvider`; they are not interchangeable with a
+> standard single-catalog DuckLake store. The API and on-disk/in-catalog layout may
+> change. It is useful today for multi-tenant deployments or keeping many logical
+> lakehouses in one database, but treat it as a preview.
+
+Tables are created through the writer API; once a table exists, you can append to it with
+SQL `INSERT INTO`. (SQL `CREATE TABLE` / CTAS is not supported on this path — DataFusion
+cannot create the schema, so the first write goes through `DuckLakeTableWriter`.)
 
 ```rust,ignore
 use datafusion::prelude::*;
-// `MetadataWriter` is the trait that provides `set_data_path` / `create_snapshot`
+use datafusion_ducklake::metadata_writer::MetadataWriter; // set_data_path
 use datafusion_ducklake::{
-    DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, MulticatalogManager, MulticatalogProvider,
+    PostgresMetadataWriter, initialize_multicatalog_schema,
 };
+use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
-let conn = "sqlite:catalog.db?mode=rwc";
+let pool = PgPoolOptions::new().connect("postgresql://user:pass@localhost:5432/db").await?;
 
-// Initialize a writer (creates the DuckLake schema + first snapshot if new)
-let writer = SqliteMetadataWriter::new_with_init(conn).await?;
-writer.set_data_path("data/")?;
-writer.create_snapshot()?;
+// One-time: bootstrap the multi-catalog tables, then create a named catalog
+initialize_multicatalog_schema(&pool).await?;
+let catalog_id = MulticatalogManager::new(pool.clone()).create_catalog("my_catalog").await?;
 
-// A writable catalog pairs a read provider with the writer
-let provider = SqliteMetadataProvider::new(conn).await?;
-let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
+// Create a table by writing the first batch through the table writer
+let writer = Arc::new(PostgresMetadataWriter::with_pool(pool.clone(), catalog_id).await?);
+writer.set_data_path("/abs/path/to/data")?;
+let object_store: Arc<dyn object_store::ObjectStore> =
+    Arc::new(object_store::local::LocalFileSystem::new());
+let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store)?;
+table_writer.write_table("public", "events", &[batch]).await?;
 
+// Now append with SQL, reading the same catalog back through MulticatalogProvider
+let provider = MulticatalogProvider::with_pool(pool.clone(), "my_catalog").await?;
+let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), writer)?;
 let ctx = SessionContext::new();
 ctx.register_catalog("ducklake", Arc::new(catalog));
-
-ctx.sql("CREATE TABLE ducklake.main.events AS SELECT * FROM source").await?.collect().await?;
-ctx.sql("INSERT INTO ducklake.main.events VALUES (1, 'a')").await?.collect().await?;
+ctx.sql("INSERT INTO ducklake.public.events VALUES (1, 'a')").await?.collect().await?;
+ctx.sql("SELECT count(*) FROM ducklake.public.events").await?.show().await?;
 ```
 
 Writer output is configurable (Parquet compression, row-group sizing by row count and
-byte size). See [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake) and the
-examples in [`examples/`](examples/).
+byte size). See [`examples/multicatalog_write.rs`](examples/multicatalog_write.rs) for a
+full end-to-end walkthrough and [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake)
+for the writer options.
 
----
-
-## Multi-catalog (PostgreSQL)
-
-A single PostgreSQL metadata store can host **multiple independent DuckLake catalogs**.
-This is useful for multi-tenant deployments or keeping many logical lakehouses in one
-database.
-
-- **Read** multiple catalogs with `MulticatalogProvider` (feature `multicatalog-postgres`).
-- **Create and manage** them with `MulticatalogManager` (feature `write-postgres`, which
-  pulls in multi-catalog support).
-
-See [`examples/multicatalog_write.rs`](examples/multicatalog_write.rs) for an end-to-end
-walkthrough.
+> Writing to a **standard, single-catalog** DuckLake store (the spec-compliant layout) is
+> supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`),
+> where SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
+> [`tests/sql_write_tests.rs`](tests/sql_write_tests.rs).
 
 ---
 
@@ -179,27 +190,8 @@ A few highlights worth knowing up front:
 
 ---
 
-## Roadmap
-
-This project is under active development. The list below is forward-looking; for what
-has already shipped, see [CHANGELOG.md](CHANGELOG.md).
-
-- **Write:** `UPDATE` and `DELETE` operations
-- **Time travel:** SQL-level historical queries (`AS OF`); programmatic snapshot binding
-  via `DuckLakeCatalog::with_snapshot` already ships
-- **Query planning:** partition-aware file pruning, improved predicate pushdown, fewer
-  metadata round-trips during planning
-- **Metadata:** optional caching layer to reduce repeated catalog lookups
-- **Types:** broader support for complex and nested types
-- **Object stores:** Google Cloud Storage and Azure Blob Storage
-- **Ergonomics:** cleaner APIs for embedding in other DataFusion-based systems, better
-  error messages, more docs and examples
-
-For the most up-to-date view, see the open issues and pull requests.
-
----
-
 ## Project status
 
 This project is in alpha and evolving alongside DataFusion and DuckLake. APIs may change
-as core abstractions are refined. Feedback, issues, and contributions are welcome.
+as core abstractions are refined. See [CHANGELOG.md](CHANGELOG.md) for release history.
+Feedback, issues, and contributions are welcome.
