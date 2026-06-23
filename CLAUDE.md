@@ -250,7 +250,7 @@ Representative groups:
 
 Run tests with:
 ```bash
-cargo test                    # All tests (no setup required)
+cargo test                    # Default features; postgres/mysql/multicatalog tests need Docker
 cargo test delete_filter      # Delete file tests only
 cargo test concurrent         # Concurrency tests only
 cargo test --ignored          # Performance benchmarks

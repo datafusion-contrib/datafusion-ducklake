@@ -45,7 +45,9 @@ datafusion-ducklake = { version = "0.3", features = ["metadata-postgres"] }
 ```
 
 The examples below also use `datafusion`, `object_store`, and `url` directly — add them
-to your `[dependencies]` as well (this crate does not re-export them).
+to your `[dependencies]` as well (this crate does not re-export them). The write example
+additionally uses `sqlx` (with its `postgres` and `runtime-tokio` features) to open the
+connection pool.
 
 Run a query against an existing PostgreSQL catalog with the bundled example:
 
@@ -182,9 +184,10 @@ walkthrough (bootstrap → create catalogs → write → read back).
 
 ## Maintenance
 
-The `maintenance` API (feature `write`) handles lakehouse upkeep from Rust: expiring old
-snapshots, cleaning up superseded files, and reclaiming orphaned files. `DROP TABLE` is
-available through `MetadataWriter`. See
+The `maintenance` API handles lakehouse upkeep from Rust: expiring old snapshots,
+cleaning up superseded files, and reclaiming orphaned files. The concrete entry points
+are backend-gated (`write-sqlite` / `write-postgres`). `DROP TABLE` is available through
+`MetadataWriter`. See
 [`examples/maintenance_demo.rs`](examples/maintenance_demo.rs) and
 [`examples/orphan_cleanup_demo.rs`](examples/orphan_cleanup_demo.rs).
 
