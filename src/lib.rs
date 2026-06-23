@@ -8,8 +8,9 @@
 //! - **Catalog Database**: SQL database (DuckDB, SQLite, PostgreSQL, MySQL) storing metadata as SQL tables
 //! - **Data Storage**: Apache Parquet files stored on disk/object storage
 //!
-//! This extension provides read-only access to DuckLake catalogs through DataFusion's
-//! catalog and table provider interfaces.
+//! This extension provides read and write access to DuckLake catalogs through DataFusion's
+//! catalog and table provider interfaces. Writes are feature-gated (`write-sqlite`,
+//! `write-postgres`); see `COMPATIBILITY.md` for the full backend/feature matrix.
 //!
 //! ## Example
 //!

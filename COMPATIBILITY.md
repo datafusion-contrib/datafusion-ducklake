@@ -1,0 +1,119 @@
+# Compatibility & Feature Matrix
+
+This is the authoritative reference for what `datafusion-ducklake` supports: catalog
+backends, object stores, types, capabilities, and current limitations. The
+[README](README.md) covers getting started; this file covers "does it support X?".
+
+> Status: alpha. APIs and supported surface change as DataFusion and the DuckLake
+> spec evolve. See [CHANGELOG.md](CHANGELOG.md) for what shipped when.
+
+---
+
+## Catalog backends
+
+DuckLake stores catalog metadata in a SQL database. Reads are supported on all four
+backends below; writes (`INSERT`, `CREATE TABLE AS SELECT`, `DROP TABLE`, maintenance)
+are currently implemented for SQLite and PostgreSQL only.
+
+| Backend    | Read | Write | Multi-catalog | Feature flags                                          |
+|------------|:----:|:-----:|:-------------:|--------------------------------------------------------|
+| DuckDB     |  ✅  |  ❌   |      ❌       | `metadata-duckdb` (default)                            |
+| SQLite     |  ✅  |  ✅   |      ❌       | `metadata-sqlite`, `write-sqlite`                      |
+| PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
+| MySQL      |  ✅  |  ❌   |      ❌       | `metadata-mysql`                                       |
+
+**Multi-catalog** (PostgreSQL only) lets a single metadata store hold multiple
+independent DuckLake catalogs. Reading multiple catalogs requires
+`multicatalog-postgres` (`MulticatalogProvider`); creating/managing them requires
+`write-postgres` (`MulticatalogManager`).
+
+---
+
+## Object stores
+
+| Store                       | Supported | Notes                                              |
+|-----------------------------|:---------:|----------------------------------------------------|
+| Local filesystem            |    ✅     | Available by default via DataFusion's object store |
+| S3-compatible (S3, MinIO)   |    ✅     | Register with `RuntimeEnv::register_object_store`  |
+| Google Cloud Storage        |    ❌     | Not currently wired up                             |
+| Azure Blob Storage          |    ❌     | Not currently wired up                             |
+
+---
+
+## Feature flags
+
+| Feature                  | Description                                                              | Default |
+|--------------------------|--------------------------------------------------------------------------|:-------:|
+| `metadata-duckdb`        | DuckDB catalog read backend                                              |   ✅    |
+| `duckdb-bundled`         | Statically compile & bundle DuckDB (disable for dynamic linking)         |   ✅    |
+| `metadata-sqlite`        | SQLite catalog read backend                                              |         |
+| `metadata-postgres`      | PostgreSQL catalog read backend                                          |         |
+| `metadata-mysql`         | MySQL catalog read backend                                               |         |
+| `write`                  | Base write support (INSERT, CTAS, maintenance API); needs a write backend|         |
+| `write-sqlite`           | Write to SQLite catalogs (`write` + `metadata-sqlite`)                   |         |
+| `write-postgres`         | Write to PostgreSQL catalogs (`write` + `metadata-postgres` + multi-catalog) |     |
+| `multicatalog-postgres`  | Read multiple catalogs from one PostgreSQL store                         |         |
+| `encryption`             | Parquet Modular Encryption (PME) reads                                   |         |
+| `skip-tests-with-docker` | CI-only: skip tests that require Docker                                  |         |
+
+For dynamic linking against a system `libduckdb`, disable defaults and re-enable just
+the read backend: `--no-default-features --features metadata-duckdb` (requires
+`libduckdb` installed; set `DUCKDB_LIB_DIR` and `DUCKDB_INCLUDE_DIR`).
+
+---
+
+## Type support
+
+| Category                         | Status | Notes                                          |
+|----------------------------------|:------:|------------------------------------------------|
+| Integers / floats / boolean      |   ✅   |                                                |
+| Strings / dates / timestamps     |   ✅   |                                                |
+| Decimal (precision & scale)      |   ✅   |                                                |
+| Geometry                         |   ✅   | Mapped to `Binary` (WKB)                        |
+| Complex / nested (list, struct, map) | 🟧 | Minimal support; many cases return errors      |
+
+---
+
+## Capabilities
+
+| Capability                                              | Status |
+|---------------------------------------------------------|:------:|
+| `SELECT` against DuckLake tables                        |   ✅   |
+| `INSERT INTO`                                           |   ✅   |
+| `CREATE TABLE AS SELECT`                                |   ✅   |
+| `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
+| Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
+| Snapshot-based consistency (bound at catalog creation)  |   ✅   |
+| Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
+| Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
+| Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
+| SQL-queryable `information_schema`                      |   ✅   |
+| Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`) | ✅ |
+| Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
+| Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
+| Configurable writer output (compression, row-group sizing) | ✅  |
+| Multi-catalog (PostgreSQL)                              |   ✅   |
+
+Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
+`MetadataWriter`), not SQL DDL.
+
+---
+
+## Limitations
+
+- **Write backends:** DuckDB and MySQL are read-only; writes require SQLite or PostgreSQL.
+- **No SQL-level time travel:** a catalog is bound to a single snapshot. You *can* select
+  the snapshot programmatically — `DuckLakeCatalog::with_snapshot(provider, snapshot_id)`
+  binds to a specific one, and querying another point in time means creating another
+  catalog. What's missing is SQL-level historical querying (`AS OF`) within one handle.
+- **No partition-based file pruning** on read.
+- **Complex / nested types** have minimal support.
+- **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
+- **Data inlining is not read.** DuckDB's ducklake extension inlines small INSERTs
+  (≤ `ducklake_default_data_inlining_row_limit`, default 10 rows) into the catalog
+  rather than Parquet files. This crate only reads `ducklake_data_file` rows, so inlined
+  data is invisible — `SELECT COUNT(*)` will silently undercount. If you write through
+  DuckDB and read through this crate, either disable inlining at write time
+  (`SET ducklake_default_data_inlining_row_limit = 0` on every writer connection) or run
+  `COMPACT` before reading. Catalogs written entirely through this crate's
+  `SqliteMetadataWriter` are unaffected — we never inline.

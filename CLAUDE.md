@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DataFusion-DuckLake is a DataFusion extension that provides read-only access to DuckLake catalogs. DuckLake is an integrated data lake and catalog format that stores:
+DataFusion-DuckLake is a DataFusion extension that provides read and write access to DuckLake catalogs. DuckLake is an integrated data lake and catalog format that stores:
 - **Metadata**: In SQL databases (DuckDB, SQLite, PostgreSQL, MySQL) as structured catalog tables
 - **Data**: As Apache Parquet files on disk or object storage (S3, MinIO)
 
 The extension integrates DuckLake with Apache DataFusion by implementing DataFusion's catalog and table provider interfaces.
+
+Reads are supported on all four catalog backends. Writes (`INSERT`, `CREATE TABLE AS SELECT`, `DROP TABLE`, and the maintenance API) are feature-gated and currently implemented for SQLite and PostgreSQL (`write-sqlite`, `write-postgres`). See `COMPATIBILITY.md` for the full backend/feature matrix.
 
 ## Commands
 
@@ -33,13 +35,13 @@ cargo run --example basic_query -- <catalog.db> <sql>
 
 The codebase follows a layered architecture with clear separation of concerns:
 
-1. **MetadataProvider Layer** (`src/metadata_provider.rs`, `src/metadata_provider_duckdb.rs`)
+1. **MetadataProvider Layer** (`src/metadata_provider.rs` + per-backend impls)
    - Abstraction for querying DuckLake catalog metadata
    - `MetadataProvider` trait defines interface for listing schemas, tables, columns, and data files
    - Also provides individual lookup methods: `get_schema_by_name()`, `get_table_by_name()`, and `table_exists()`
-   - `DuckdbMetadataProvider` implements the trait using DuckDB as the catalog backend
+   - Four feature-gated implementations: `DuckdbMetadataProvider` (`metadata_provider_duckdb.rs`), `SqliteMetadataProvider` (`metadata_provider_sqlite.rs`), `PostgresMetadataProvider` (`metadata_provider_postgres.rs`), `MySqlMetadataProvider` (`metadata_provider_mysql.rs`)
    - Executes SQL queries against standard DuckLake catalog tables (`ducklake_snapshot`, `ducklake_schema`, `ducklake_table`, `ducklake_column`, `ducklake_data_file`, `ducklake_delete_file`, `ducklake_metadata`)
-   - Thread-safe: Uses a single shared connection protected by Mutex for efficiency
+   - Thread-safe: DuckDB uses a single shared connection protected by Mutex; the sqlx-based backends (sqlite/postgres/mysql) use async connection pools
    - Supports delete files: `get_table_files_for_select()` returns data files with associated delete files
 
 2. **DataFusion Integration Layer** (`src/catalog.rs`, `src/schema.rs`, `src/table.rs`)
@@ -49,21 +51,38 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `DuckLakeTable`: Implements `TableProvider`, caches table structure and file lists at creation time
    - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching
 
-3. **Path Resolution** (`src/path_resolver.rs`)
+3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
+   - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`) and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`)
+   - `DuckLakeTableWriter` / `TableWriteSession` (`table_writer.rs`): write Arrow batches to Parquet with configurable compression and row-group sizing
+   - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/insert_partitioning_tests.rs`)
+   - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`
+   - `maintenance.rs`: expire snapshots, clean up superseded files, reclaim orphaned files (Rust API, not SQL DDL)
+   - Multi-catalog (PostgreSQL): `MulticatalogManager` (`multicatalog.rs`) creates/manages many catalogs in one store; `MulticatalogProvider` (`multicatalog_provider.rs`, feature `multicatalog-postgres`) reads them
+
+4. **Additional capabilities**
+   - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)
+   - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`; registered via `register_ducklake_functions()`
+   - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
+   - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
+   - `column_rename.rs`: reads Parquet files whose physical column names predate a rename
+   - `table_changes.rs` / `table_deletions.rs`: change-data-capture between snapshots
+   - `positional_source.rs`: preserves physical row positions (used by rowid and delete filtering)
+
+5. **Path Resolution** (`src/path_resolver.rs`)
    - Centralized utilities for parsing object store URLs and resolving hierarchical paths
    - `parse_object_store_url()`: Parses S3, file://, or local paths into ObjectStoreUrl and path components
    - `resolve_path()`: Resolves relative or absolute paths in the catalog hierarchy
    - `PathResolver`: Maintains base URL and path for hierarchical resolution (catalog -> schema -> table -> file)
    - Handles S3, MinIO, and local filesystem paths uniformly
 
-4. **Delete File Filtering** (`src/delete_filter.rs`)
+6. **Delete File Filtering** (`src/delete_filter.rs`)
    - `DeleteFilterExec`: Custom execution plan that wraps Parquet scans and filters deleted rows
    - Implements MOR (Merge-On-Read) pattern for row-level deletes
    - Delete files contain `(file_path: VARCHAR, pos: INT64)` schema
    - Efficiently filters rows by position during query execution
    - Supports COUNT(*) optimization (zero-column batches)
 
-5. **Type Mapping** (`src/types.rs`)
+7. **Type Mapping** (`src/types.rs`)
    - Converts DuckLake type strings to Arrow DataTypes
    - Handles basic types (integers, floats, strings, dates, timestamps)
    - Supports decimals with precision/scale parsing
@@ -96,7 +115,7 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
 - Simple implementation (no cache invalidation logic)
 
 **Trade-offs**:
-- Small query overhead per metadata lookup (acceptable for read-only DuckDB connections)
+- Small query overhead per metadata lookup (acceptable for typical catalog sizes)
 - Future optimization: Add optional caching layer via wrapper implementation
 
 ### Data Flow
@@ -205,23 +224,29 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 ```
 
 ### Current Limitations
-- Read-only access (no writes to DuckLake catalogs)
-- Complex types (nested lists, structs, maps) return errors (not yet supported)
-- No partition-based file pruning (TODO: add to `MetadataProvider` trait)
-- Single metadata provider implementation (DuckDB only)
+- Writes are supported on SQLite and PostgreSQL only; DuckDB and MySQL are read-only
+- No `UPDATE` / `DELETE` operations yet (delete files are read but not written)
+- No SQL-level time travel (`AS OF`); a catalog binds to one snapshot, selectable programmatically via `DuckLakeCatalog::with_snapshot`
+- Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
+- No partition-based file pruning on read
+- DuckDB-encrypted (non-PME) Parquet files are not supported
+- Data inlining is not read (see `COMPATIBILITY.md` for the `COUNT(*)` undercount caveat)
 - No optional metadata caching layer (all lookups are dynamic)
 
 ### Testing
-The project includes comprehensive tests:
-- **Unit tests**: `src/delete_filter.rs` - Delete file schema and position extraction
-- **Integration tests**:
-  - `tests/delete_filter_tests.rs` - End-to-end delete filtering scenarios
-  - `tests/concurrent_tests.rs` - Thread-safety and concurrent query handling
-  - `tests/object_store_integration_test.rs` - S3/MinIO integration
-- **Test data generation**: All test data is generated in Rust using `tests/common/mod.rs` helpers
-  - No external shell scripts required
-  - Tests use temporary directories for isolation
-  - Each test generates its own DuckLake catalog on-the-fly
+The project includes comprehensive tests (`tests/`, ~27 integration files plus unit
+tests in `src/`). Many are feature-gated — e.g. write tests need `write-sqlite`, and
+the postgres/mysql provider and multicatalog tests require Docker (`testcontainers`).
+Representative groups:
+- **Reads & deletes**: `delete_filter_tests.rs`, `missing_delete_file_tests.rs`, `table_tests.rs`, `row_count_tests.rs`
+- **Writes**: `write_tests.rs`, `sql_write_tests.rs`, `concurrent_write_tests.rs`, `insert_partitioning_tests.rs`
+- **Backends**: `sqlite_metadata_provider_test.rs`, `postgres_metadata_provider_test.rs`, `mysql_metadata_provider_test.rs`, `hybrid_asyncdb.rs`
+- **Multicatalog**: `multicatalog_provider_tests.rs`, `multicatalog_postgres_tests.rs`, `multicatalog_hardening_tests.rs`
+- **Capabilities**: `information_schema_test.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
+- **Concurrency & object store**: `concurrent_tests.rs`, `object_store_integration_test.rs`
+- **SQL logic tests**: `sqllogictest_runner.rs` driving `tests/sqllogictests/`
+- **Test data generation**: helpers in `tests/common/mod.rs` — each test builds its own
+  DuckLake catalog in a temp directory on the fly; no external shell scripts required
 
 Run tests with:
 ```bash
