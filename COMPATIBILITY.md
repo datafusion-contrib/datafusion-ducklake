@@ -111,6 +111,47 @@ Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` modu
 
 ---
 
+## Write concurrency
+
+Both write backends use the same **commit-time** model: a write's snapshot id, all its
+metadata rows, and its publication are written in **one transaction**, with the snapshot id
+assigned at commit (so per-catalog id order == commit order) and nothing visible until that
+transaction commits. There are no "dormant" (committed-but-unpublished) rows, so reads never
+observe another writer's uncommitted schema, a transient empty table, or a torn generation.
+On Postgres multi-catalog the begin step only *reserves* ids (via the IDENTITY sequence) and
+reads existing state; it writes nothing.
+
+`WriteMode::Replace` (SQL `INSERT OVERWRITE`, and the first write of a table) is
+**abort-on-conflict** under concurrency, matching DuckLake's snapshot isolation:
+
+- **Two concurrent `Replace`s of the same table never silently union.** The first to
+  commit wins; the later one — whose base is now stale — aborts with
+  `DuckLakeError::Conflict` (retryable by the caller). The check runs at the commit point
+  under the catalog lock: a `Replace` aborts if any data file **or** column of the table has
+  `begin_snapshot`/`end_snapshot` newer than the catalog head it began on.
+- **Column ids are stable** across writes: an unchanged column keeps its `column_id`
+  (== parquet field-id); a same-schema `Replace` rewrites no column rows. Only added/removed
+  columns are written.
+
+Known edges:
+
+- **`Append` (`INSERT INTO`) is not conflict-checked.** Concurrent appends commute and are
+  both retained (matching DuckLake); a *stale* `Append` issued before a concurrent `Replace`
+  is not detected. Use `Replace` for overwrite semantics.
+- A **fileless same-schema `Replace`** (an empty-table overwrite that writes no data file and
+  changes no column) leaves no per-table footprint, so it resolves **last-writer-wins** rather
+  than abort-on-conflict (both backends). Data-bearing and schema-changing replaces are
+  conflict-checked.
+- A **type change on `Replace`** is not applied to a kept (same-named) column — the column
+  keeps its existing type (matches the SQLite writer). Add/remove columns work.
+- A single `Replace` is assumed to register **one** data file (the current writer path); the
+  conflict check is not designed for multiple `register_data_file` calls sharing one base.
+- Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
+  rejected by a unique index, surfacing as a raw database unique-violation rather than a
+  clean `Conflict`. A `DROP` racing a write can likewise surface as a raw unique-violation.
+
+---
+
 ## Limitations
 
 - **Write backends:** DuckDB and MySQL are read-only; writes require SQLite or PostgreSQL.

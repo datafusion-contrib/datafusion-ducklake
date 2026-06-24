@@ -189,11 +189,39 @@ pub struct WriteResult {
     pub records_written: i64,
 }
 
+/// The ids actually committed by `register_data_file` / `publish_snapshot`.
+///
+/// On multicatalog Postgres all metadata is written at the commit point, so the
+/// committed `snapshot_id` is assigned there and the `schema_id`/`table_id` are
+/// the real committed ids (which may differ from the begin-time reservations in
+/// [`WriteSetupResult`] if a concurrent writer created the schema/table first).
+/// Callers should use these for the authoritative result rather than the
+/// begin-time reservations.
+#[derive(Debug, Clone, Copy)]
+pub struct CommitIds {
+    /// Snapshot id assigned at commit (the new catalog head for this write).
+    pub snapshot_id: i64,
+    /// Committed schema id.
+    pub schema_id: i64,
+    /// Committed table id.
+    pub table_id: i64,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
     /// Snapshot ID created for this write
     pub snapshot_id: i64,
+    /// The catalog head observed at `begin_write_transaction` (the base for
+    /// `Replace` conflict detection), threaded back to the commit step. If a
+    /// concurrent writer committed a newer generation of the table since this base
+    /// — i.e. any data file or column with `begin_snapshot`/`end_snapshot > base`
+    /// — the commit aborts with [`crate::DuckLakeError::Conflict`]. Both backends
+    /// now share this model: snapshot ids are assigned at *commit* (single-catalog
+    /// SQLite `MAX(snapshot_id)+1`; multicatalog Postgres a plain `IDENTITY`
+    /// insert), so per-catalog id order == commit order and the scalar
+    /// `> base` test is exact.
+    pub base_snapshot_id: i64,
     /// Schema ID (may be newly created)
     pub schema_id: i64,
     /// Table ID (may be newly created)
@@ -246,35 +274,62 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// that finalize columns in `begin_write_transaction` (multicatalog
     /// Postgres) ignore them; single-catalog backends (SQLite) defer the
     /// column generation to this commit and use them to insert the column rows.
+    ///
+    /// `base_snapshot` is the catalog head observed at `begin_write_transaction`
+    /// ([`WriteSetupResult::base_snapshot_id`]). For `Replace`, the commit aborts
+    /// with [`crate::DuckLakeError::Conflict`] if any data file of the table has
+    /// `begin_snapshot` or `end_snapshot` greater than `base_snapshot` — i.e.
+    /// another writer published a newer generation since this write began — so
+    /// concurrent replaces never silently union or clobber each other.
+    ///
+    /// `schema_name` / `table_name` identify the target. Multicatalog Postgres
+    /// writes ALL metadata at this commit (the schema/table get-or-create happens
+    /// here, keyed by these names) so it needs them; single-catalog SQLite already
+    /// created the schema/table at begin and ignores them.
+    /// Returns the [`CommitIds`] actually committed (the snapshot id assigned at
+    /// commit, and the real schema/table ids — which may differ from the
+    /// begin-time reservations if a concurrent writer created them first).
+    #[allow(clippy::too_many_arguments)]
     fn register_data_file(
         &self,
         table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
+        base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
-    ) -> Result<i64>;
+    ) -> Result<CommitIds>;
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
     /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.
-    /// See [`MetadataWriter::register_data_file`] for `columns` / `column_ids`.
+    /// See [`MetadataWriter::register_data_file`] for the parameters.
     ///
     /// Default no-op. Backends that advance the head in
     /// `begin_write_transaction` could rely on it, but both shipped backends
-    /// override: multicatalog Postgres inserts the
-    /// `ducklake_catalog_snapshot_map` head row, and SQLite (which defers the
-    /// `ducklake_snapshot` row insert out of `begin_write_transaction`) inserts
-    /// the snapshot row + column generation here.
+    /// override: multicatalog Postgres writes the snapshot/schema/table/column
+    /// metadata and inserts the `ducklake_catalog_snapshot_map` head row, and
+    /// SQLite (which defers the `ducklake_snapshot` row insert out of
+    /// `begin_write_transaction`) inserts the snapshot row + column generation here.
+    #[allow(clippy::too_many_arguments)]
     fn publish_snapshot(
         &self,
         _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
         _snapshot_id: i64,
         _mode: WriteMode,
+        _base_snapshot: i64,
         _columns: &[ColumnDef],
         _column_ids: &[i64],
-    ) -> Result<()> {
-        Ok(())
+    ) -> Result<CommitIds> {
+        Ok(CommitIds {
+            snapshot_id: _snapshot_id,
+            schema_id: 0,
+            table_id: _table_id,
+        })
     }
 
     /// End all existing data files for a table. Returns count of files ended.

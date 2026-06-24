@@ -12,7 +12,7 @@
 use crate::Result;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
+    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -306,6 +306,99 @@ async fn assert_table_in_catalog(
     }
 }
 
+/// Reject only a `table_id` hint that exists and belongs to ANOTHER catalog. A
+/// hint that does not yet exist is fine — it is the id reserved at begin that
+/// `finalize_snapshot` is about to create under this catalog (first write to a
+/// new table). Used by the commit path (`register_data_file`/`publish_snapshot`),
+/// which must tolerate a not-yet-created table while still catching a caller that
+/// hands in a different catalog's table.
+async fn assert_table_not_in_other_catalog(
+    catalog_id: i64,
+    table_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT m.catalog_id FROM ducklake_table t
+         LEFT JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+         WHERE t.table_id = $1",
+    )
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(r) = row {
+        let owner: Option<i64> = r.try_get(0)?;
+        if owner != Some(catalog_id) {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "table_id {} does not belong to catalog_id {}",
+                table_id, catalog_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reserve `n` ids from the IDENTITY-backing sequence of `table.col` WITHOUT
+/// inserting rows, so begin can hand out column/schema/table ids (column ids are
+/// the parquet field-ids baked into the staged file) that the commit later
+/// inserts explicitly via `OVERRIDING SYSTEM VALUE`. Sequences are
+/// non-transactional, so gaps from an aborted write are fine and expected. The
+/// ids come back in order.
+async fn reserve_ids(
+    table: &str,
+    col: &str,
+    n: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Vec<i64>> {
+    if n <= 0 {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        "SELECT nextval(pg_get_serial_sequence($1, $2)) FROM generate_series(1, $3)",
+    )
+    .bind(table)
+    .bind(col)
+    .bind(n)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(|r| Ok(r.try_get(0)?)).collect()
+}
+
+/// Optimistic-concurrency check for a `Replace` commit. Run under the catalog
+/// `FOR UPDATE` lock at the commit point, BEFORE this writer inserts its own
+/// files/columns and before `advance_catalog_head`. Because snapshot ids are
+/// assigned at commit (id order == commit order per catalog) and all metadata is
+/// written at commit (no dormant rows), this scalar check is exact: if any data
+/// file OR column of the table has `begin_snapshot` or `end_snapshot` > `base`
+/// (the catalog head observed at begin), another writer committed a generation
+/// of this table since this write began ⇒ [`DuckLakeError::Conflict`]. Catches a
+/// data Replace (new file begin), a fileless `CREATE`/Replace (new column begin),
+/// and a DROP (end-stamp). The writer's own rows are not written yet, so the
+/// check never self-conflicts. (`Append` does not call this: concurrent appends
+/// commute, matching upstream DuckLake.)
+async fn detect_replace_conflict(
+    table_id: i64,
+    base_snapshot: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let conflict = sqlx::query(
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM ducklake_data_file
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))
+           OR EXISTS (SELECT 1 FROM ducklake_column
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))",
+    )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if conflict.is_some() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "Replace on table {table_id} conflicts with a concurrent write committed since \
+             snapshot {base_snapshot}; aborting (retry the write against the new generation)"
+        )));
+    }
+    Ok(())
+}
+
 /// Retire the generation preceding `snapshot_id` for a Replace: end-snapshot
 /// every still-live file from an earlier snapshot and zero the visible
 /// record/byte totals. The `begin_snapshot < snapshot_id` guard leaves the
@@ -354,6 +447,320 @@ async fn advance_catalog_head(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// The atomic commit point for a multicatalog Postgres write, shared by
+/// `register_data_file` (with a data file) and `publish_snapshot` (fileless).
+/// The CALLER already holds the catalog `FOR UPDATE` lock and an open tx.
+///
+/// All metadata — the snapshot row, the get-or-create schema/table rows, the
+/// column generation, the `schema_versions` row, and the Replace retirement — is
+/// written HERE so nothing is visible until `advance_catalog_head` maps the
+/// snapshot (the caller runs that LAST). The `snapshot_id` is a plain IDENTITY
+/// insert, so per-catalog id order == commit order, which is what makes the
+/// scalar [`detect_replace_conflict`] and the dense schema_version computation
+/// exact. The reserved schema/table/column ids from begin are inserted with
+/// `OVERRIDING SYSTEM VALUE`; the reused column ids keep parquet field-ids stable.
+///
+/// Returns `(committed_snapshot_id, table_id)`.
+///
+/// `table_id_hint` is the id reserved for the table at begin; it is used only
+/// when the table does not yet exist (first write). The schema id is re-derived
+/// here — looked up if the schema already exists, else a fresh id is reserved
+/// from the sequence — because the reserved schema id from begin is not threaded
+/// through the commit (it is never baked into anything; the parquet path encodes
+/// the catalog id, not the schema id).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_snapshot(
+    catalog_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    table_id_hint: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    mode: WriteMode,
+    base_snapshot: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(i64, i64, i64)> {
+    // 1. Resolve the live schema id under the lock. Reuse it if present; else
+    //    reserve a fresh id from the sequence (the row is inserted in step 4 once
+    //    the snapshot id exists for begin_snapshot).
+    let (schema_id, schema_was_created): (i64, bool) = {
+        let existing = sqlx::query(
+            "SELECT s.schema_id FROM ducklake_schema s
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+             WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
+        )
+        .bind(catalog_id)
+        .bind(schema_name)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(row) = existing {
+            (row.try_get(0)?, false)
+        } else {
+            let id = reserve_ids("ducklake_schema", "schema_id", 1, tx).await?[0];
+            (id, true)
+        }
+    };
+
+    // 2. Conflict check for Replace, BEFORE inserting any of this writer's rows.
+    //    Resolve the table id first; a brand-new table has no prior generation to
+    //    conflict with, so skip the check (base == head, no rows exist yet).
+    if mode == WriteMode::Replace && !schema_was_created {
+        let existing_table_id: Option<i64> = sqlx::query(
+            "SELECT table_id FROM ducklake_table
+             WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+        )
+        .bind(schema_id)
+        .bind(table_name)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|r| r.try_get(0))
+        .transpose()?;
+        if let Some(tid) = existing_table_id {
+            detect_replace_conflict(tid, base_snapshot, tx).await?;
+        }
+    }
+
+    // 3. Allocate the snapshot id in commit order (plain IDENTITY). schema_version
+    //    is patched in below once we know it.
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+         VALUES (NOW(), 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+
+    // 4. Insert the schema row (with its reserved id) if it is new. The catalog id
+    //    is encoded into the schema's *path* (not its name) so two catalogs holding
+    //    their own `public` land in disjoint physical subtrees: the reader's
+    //    resolution chain (`data_path + schema.path + table.path + file.path`) then
+    //    puts files under `cat_{id}/{schema}/{table}/…`, matching the upload
+    //    location.
+    if schema_was_created {
+        let scoped_schema_path = format!("cat_{catalog_id}/{schema_name}");
+        sqlx::query(
+            "INSERT INTO ducklake_schema
+                 (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+             OVERRIDING SYSTEM VALUE
+             VALUES ($1, $2, $3, TRUE, $4)",
+        )
+        .bind(schema_id)
+        .bind(schema_name)
+        .bind(&scoped_schema_path)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO ducklake_catalog_schema_map (catalog_id, schema_id)
+             VALUES ($1, $2)",
+        )
+        .bind(catalog_id)
+        .bind(schema_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // 5. get-or-create table under the lock. Capture whether we created it.
+    let (table_id, table_was_created): (i64, bool) = {
+        let existing = sqlx::query(
+            "SELECT table_id FROM ducklake_table
+             WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+        )
+        .bind(schema_id)
+        .bind(table_name)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(row) = existing {
+            (row.try_get(0)?, false)
+        } else {
+            sqlx::query(
+                "INSERT INTO ducklake_table
+                     (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, $2, $3, $4, TRUE, $5)",
+            )
+            .bind(table_id_hint)
+            .bind(schema_id)
+            .bind(table_name)
+            .bind(table_name)
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
+            (table_id_hint, true)
+        }
+    };
+
+    // 6. Read the columns live AT COMMIT (under the lock) to classify DDL vs DML
+    //    and drive the surgical column update below.
+    let existing_column_rows = sqlx::query(
+        "SELECT column_name, column_type, nulls_allowed, column_order, column_id
+         FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let existing_columns: Vec<(String, String, bool)> = existing_column_rows
+        .iter()
+        .map(|row| {
+            let name: String = row.try_get(0)?;
+            let col_type: String = row.try_get(1)?;
+            let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+            Ok::<_, sqlx::Error>((name, col_type, nullable))
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    // name -> (column_id, column_order, nullable) for the surgical update. The
+    // column_id is used to detect field-id drift: if the caller's staged parquet
+    // baked a column_id (at begin) that no longer matches the committed column
+    // (e.g. an Append whose table was created by a concurrent writer with
+    // different ids), the file's field-ids would resolve to NULL — so we abort.
+    let mut current_by_name: std::collections::HashMap<String, (i64, i64, bool)> =
+        std::collections::HashMap::new();
+    for row in &existing_column_rows {
+        let name: String = row.try_get(0)?;
+        let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+        let order: i64 = row.try_get(3)?;
+        let id: i64 = row.try_get(4)?;
+        current_by_name.insert(name, (id, order, nullable));
+    }
+
+    let is_ddl = table_was_created || columns_differ(&existing_columns, columns);
+
+    // No `< S` window: ids are commit-ordered, so MAX over mapped predecessors is
+    // the immediately-preceding version. DDL bumps; DML carries forward (with a v1
+    // floor for the very first write to the catalog).
+    let prev_max: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    let new_schema_version = if is_ddl {
+        prev_max + 1
+    } else if prev_max == 0 {
+        1
+    } else {
+        prev_max
+    };
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+        .bind(new_schema_version)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+
+    // 7. Write the column generation SURGICALLY (mode-independent, matching the
+    //    SQLite writer) so each kept column keeps a STABLE column_id (== parquet
+    //    field_id). End only removed columns, insert only genuinely-new ones (with
+    //    their reserved ids), and sync order/nullability on the rest in place.
+    //    Stable ids are required even for Replace: a concurrent in-flight Append
+    //    baked the kept columns' ids into its parquet, so re-minting them would make
+    //    that Append's rows read back as all-NULL. The prior generation's retired
+    //    files keep their old ids for time travel. (The Replace conflict check does
+    //    not depend on a column re-mint — see the data-file/column scan above.)
+    {
+        use std::collections::HashSet;
+        let new_names: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        for name in current_by_name.keys() {
+            if !new_names.contains(name.as_str()) {
+                sqlx::query(
+                    "UPDATE ducklake_column SET end_snapshot = $1
+                     WHERE table_id = $2 AND column_name = $3 AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(name)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        for (order, (col, column_id)) in columns.iter().zip(column_ids.iter()).enumerate() {
+            match current_by_name.get(&col.name) {
+                Some(&(cur_id, cur_order, cur_nullable)) => {
+                    // Field-id drift: the staged parquet baked `*column_id` for this
+                    // column at begin, but the committed column now has a different
+                    // id (a concurrent writer created the table/column with other
+                    // ids between this writer's begin and commit). Registering the
+                    // file would make this column read back as all-NULL, so abort —
+                    // the caller retries against the now-committed schema. (Append
+                    // is otherwise not conflict-checked; this guards correctness,
+                    // not isolation.)
+                    if *column_id != cur_id {
+                        return Err(crate::DuckLakeError::Conflict(format!(
+                            "column '{}' of table {table_id} was created concurrently with a \
+                             different field id ({cur_id}, staged {column_id}); aborting to avoid \
+                             a NULL-filled read (retry the write)",
+                            col.name
+                        )));
+                    }
+                    if cur_order != order as i64 || cur_nullable != col.is_nullable {
+                        sqlx::query(
+                            "UPDATE ducklake_column SET column_order = $1, nulls_allowed = $2
+                             WHERE table_id = $3 AND column_name = $4 AND end_snapshot IS NULL",
+                        )
+                        .bind(order as i64)
+                        .bind(col.is_nullable)
+                        .bind(table_id)
+                        .bind(&col.name)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                },
+                None => {
+                    sqlx::query(
+                        "INSERT INTO ducklake_column
+                             (column_id, table_id, column_name, column_type, column_order,
+                              nulls_allowed, begin_snapshot)
+                         OVERRIDING SYSTEM VALUE
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    )
+                    .bind(column_id)
+                    .bind(table_id)
+                    .bind(&col.name)
+                    .bind(&col.ducklake_type)
+                    .bind(order as i64)
+                    .bind(col.is_nullable)
+                    .bind(snapshot_id)
+                    .execute(&mut **tx)
+                    .await?;
+                },
+            }
+        }
+    }
+
+    // 8. One ducklake_schema_versions row per DDL (UNIQUE(table_id, begin_snapshot)).
+    if is_ddl {
+        sqlx::query(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(snapshot_id)
+        .bind(new_schema_version)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    // 9. Replace retirement: end the prior generation's files + zero the visible
+    //    totals. The `begin_snapshot < S` guard spares this write's own files.
+    if mode == WriteMode::Replace {
+        sqlx::query(
+            "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+             VALUES ($1, 0, 0, 0)
+             ON CONFLICT (table_id) DO NOTHING",
+        )
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+        retire_prior_generation(table_id, snapshot_id, tx).await?;
+    }
+
+    Ok((snapshot_id, schema_id, table_id))
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
@@ -532,27 +939,43 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
-        snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
-        // Multicatalog Postgres finalizes the column generation in
-        // `begin_write_transaction` (column visibility is gated by the deferred
-        // `ducklake_catalog_snapshot_map` head row, not `end_snapshot`), so the
-        // commit point does not re-stamp columns.
-        _columns: &[ColumnDef],
-        _column_ids: &[i64],
-    ) -> Result<i64> {
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
         block_on(async {
-            // Single atomic commit: retire the prior generation (Replace), insert
-            // the new file, accumulate stats, and advance the catalog head. The
-            // head is published only here so it never resolves to a snapshot
-            // whose file is still uploading. row_id_start is drawn from the
-            // table's monotonic counter under the catalog lock so concurrent
-            // writers hand out non-overlapping ranges; the stats row is seeded
-            // for tables created before this writer maintained it.
+            // Single atomic commit. finalize_snapshot writes ALL metadata (the
+            // snapshot row, get-or-create schema/table, the column generation, the
+            // schema_versions row, and the Replace retirement) and returns the
+            // committed snapshot id + real table id. We then register the file and
+            // advance the catalog head LAST, so nothing is visible until the head
+            // maps the snapshot. row_id_start is drawn from the table's monotonic
+            // counter under the catalog lock so concurrent writers hand out
+            // non-overlapping ranges; the stats row is seeded for tables created
+            // before this writer maintained it. The passed `table_id` is the id
+            // reserved at begin (== the committed id); we tolerate it not existing
+            // yet (first write) but reject another catalog's id.
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
-            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+                self.catalog_id,
+                schema_name,
+                table_name,
+                table_id,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+                &mut tx,
+            )
+            .await?;
 
             sqlx::query(
                 "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
@@ -563,10 +986,6 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            if mode == WriteMode::Replace {
-                retire_prior_generation(table_id, snapshot_id, &mut tx).await?;
-            }
-
             let stats_row =
                 sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
                     .bind(table_id)
@@ -574,11 +993,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             let row_id_start: i64 = stats_row.try_get(0)?;
 
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -588,8 +1007,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            let _data_file_id: i64 = inserted.try_get(0)?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -610,42 +1030,58 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;
-            Ok(snapshot_id)
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
         })
     }
 
     fn publish_snapshot(
         &self,
         table_id: i64,
-        snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
         mode: WriteMode,
-        _columns: &[ColumnDef],
-        _column_ids: &[i64],
-    ) -> Result<()> {
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
         block_on(async {
+            // Fileless commit point (CREATE TABLE, zero-row Replace). Same atomic
+            // model as register_data_file minus the data-file insert: write all
+            // metadata via finalize_snapshot, then advance the head LAST.
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
-            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            if mode == WriteMode::Replace {
-                sqlx::query(
-                    "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
-                     VALUES ($1, 0, 0, 0)
-                     ON CONFLICT (table_id) DO NOTHING",
-                )
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-                retire_prior_generation(table_id, snapshot_id, &mut tx).await?;
-            }
+            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+                self.catalog_id,
+                schema_name,
+                table_name,
+                table_id,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+                &mut tx,
+            )
+            .await?;
 
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;
-            Ok(())
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
         })
     }
 
@@ -768,23 +1204,30 @@ impl MetadataWriter for PostgresMetadataWriter {
         let catalog_id = self.catalog_id;
         let lock_timeout_ms = self.lock_timeout_ms;
         block_on(async {
+            // RESERVE ONLY: this transaction inserts NOTHING into ducklake_snapshot
+            // / ducklake_schema / ducklake_table / ducklake_column /
+            // ducklake_schema_versions / either map table. All of that is written
+            // atomically at the commit point (register_data_file /
+            // publish_snapshot → finalize_snapshot) and assigned a commit-ordered
+            // snapshot id there, so no metadata row is ever readable before its
+            // write has published. Here we only reserve ids from the IDENTITY
+            // sequences (gaps are fine) and capture the conflict base.
+            //
+            // The catalog FOR UPDATE lock is held so the existing-column read and
+            // the id-reuse map are consistent and the returned field-ids are
+            // stable; it is released at tx.commit (which commits only the
+            // non-transactional sequence advances).
             let mut tx = self.pool.begin().await?;
             lock_catalog(catalog_id, lock_timeout_ms, &mut tx).await?;
 
-            // schema_version is patched in below once we know it.
-            let row = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
-                 VALUES (CURRENT_TIMESTAMP, 0) RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?;
-            let snapshot_id: i64 = row.try_get(0)?;
-
-            // The head advance (ducklake_catalog_snapshot_map insert) and the
-            // Replace retirement are deferred to the commit point
-            // (register_data_file / publish_snapshot) so the head never resolves
-            // to a snapshot whose data file is still uploading.
-
+            // Look up (do NOT create) the live schema; reserve a fresh id if
+            // absent. setup.schema_id is informational (no caller bakes it into a
+            // file — the parquet path encodes the catalog id, not the schema id),
+            // so for a brand-new schema this reserved id is NOT the committed id:
+            // finalize_snapshot re-derives/reserves the schema id at the commit.
+            // The reservation here keeps setup.schema_id distinct & non-zero across
+            // concurrent new schemas (sequence gaps from the unused reservation are
+            // expected and harmless).
             let schema_id: i64 = {
                 let existing = sqlx::query(
                     "SELECT s.schema_id FROM ducklake_schema s
@@ -795,43 +1238,15 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(schema_name)
                 .fetch_optional(&mut *tx)
                 .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    // Multicatalog segregation: encode the catalog id into the
-                    // schema's *path* (not its name) so two catalogs holding
-                    // their own `public` schema land in disjoint physical
-                    // subtrees. The reader's resolution chain
-                    // (`data_path + schema.path + table.path + file.path`)
-                    // then puts files under `cat_{id}/{schema}/{table}/…`,
-                    // matching the `DuckLakeTableWriter` upload location.
-                    let scoped_schema_path = format!("cat_{catalog_id}/{schema_name}");
-                    let row = sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
-                    )
-                    .bind(schema_name)
-                    .bind(&scoped_schema_path)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let id: i64 = row.try_get(0)?;
-
-                    sqlx::query(
-                        "INSERT INTO ducklake_catalog_schema_map (catalog_id, schema_id)
-                         VALUES ($1, $2)",
-                    )
-                    .bind(catalog_id)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    id
+                match existing {
+                    Some(row) => row.try_get(0)?,
+                    None => reserve_ids("ducklake_schema", "schema_id", 1, &mut tx).await?[0],
                 }
             };
 
-            let (table_id, table_was_created): (i64, bool) = {
+            // Look up (do NOT create) the live table; reserve an id if absent. The
+            // reserved id IS used (threaded to finalize as table_id_hint).
+            let table_id: i64 = {
                 let existing = sqlx::query(
                     "SELECT table_id FROM ducklake_table
                      WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
@@ -840,28 +1255,19 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(table_name)
                 .fetch_optional(&mut *tx)
                 .await?;
-
                 if let Some(row) = existing {
-                    (row.try_get(0)?, false)
+                    row.try_get(0)?
                 } else {
-                    let row = sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES ($1, $2, $3, TRUE, $4) RETURNING table_id",
-                    )
-                    .bind(schema_id)
-                    .bind(table_name)
-                    .bind(table_name)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    (row.try_get(0)?, true)
+                    reserve_ids("ducklake_table", "table_id", 1, &mut tx).await?[0]
                 }
             };
 
-            // Fetch existing columns to drive (a) schema-evolution checks for Append,
-            // (b) DDL/DML classification.
-            let existing_column_rows = sqlx::query(
-                "SELECT column_name, column_type, nulls_allowed
+            // Read existing columns (name, type, nullable, id) to drive (a) the
+            // Append schema-evolution check and (b) id reuse: an unchanged column
+            // keeps its column_id (== parquet field_id), so an already-written
+            // file's field-ids stay valid.
+            let rows = sqlx::query(
+                "SELECT column_name, column_type, nulls_allowed, column_id
                  FROM ducklake_column
                  WHERE table_id = $1 AND end_snapshot IS NULL
                  ORDER BY column_order",
@@ -869,16 +1275,17 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .fetch_all(&mut *tx)
             .await?;
-
-            let existing_columns: Vec<(String, String, bool)> = existing_column_rows
-                .iter()
-                .map(|row| {
-                    let name: String = row.try_get(0)?;
-                    let col_type: String = row.try_get(1)?;
-                    let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
-                    Ok::<_, sqlx::Error>((name, col_type, nullable))
-                })
-                .collect::<std::result::Result<_, _>>()?;
+            let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
+            let mut existing_ids: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
+            for row in rows {
+                let name: String = row.try_get(0)?;
+                let col_type: String = row.try_get(1)?;
+                let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+                let cid: i64 = row.try_get(3)?;
+                existing_ids.insert(name.clone(), cid);
+                existing_columns.push((name, col_type, nullable));
+            }
 
             // Append-mode schema evolution validation (same rules as SQLite writer).
             if mode == WriteMode::Append && !existing_columns.is_empty() {
@@ -907,86 +1314,54 @@ impl MetadataWriter for PostgresMetadataWriter {
                 }
             }
 
-            // Classify DDL vs DML. DDL = first write (table just created) or the
-            // column set changed from what exists. DML = same schema, just data.
-            let is_ddl = table_was_created || columns_differ(&existing_columns, columns);
+            // Reserve N column ids, then compute the final per-column ids. These
+            // are baked into the staged parquet's field_id metadata, so they must
+            // equal what finalize_snapshot inserts at commit.
+            //
+            // Mode-independent (matching the SQLite writer): REUSE the existing id
+            // for a column whose NAME already exists, consume a freshly-reserved id
+            // only for a genuinely-new column. Stable ids are required for BOTH
+            // modes — a concurrent in-flight Append bakes the kept columns' ids into
+            // its parquet, so a Replace must NOT re-mint them (re-minting would make
+            // that Append's rows read back as all-NULL). The Replace conflict check
+            // does not rely on a column re-mint: a data Replace leaves a new data
+            // file (begin > base) and a schema-changing Replace ends/inserts the
+            // changed columns (begin/end > base); a fileless same-schema Replace
+            // leaves no trace and resolves last-writer-wins, exactly like SQLite.
+            let fresh_ids = reserve_ids(
+                "ducklake_column",
+                "column_id",
+                columns.len() as i64,
+                &mut tx,
+            )
+            .await?;
+            let column_ids: Vec<i64> = columns
+                .iter()
+                .zip(fresh_ids.iter())
+                .map(|(col, &fresh)| existing_ids.get(&col.name).copied().unwrap_or(fresh))
+                .collect();
 
-            // Allocate schema_version under the catalog lock we already hold.
-            // Per spec: per-catalog dense; DDL bumps, DML carries forward.
-            let max_row = sqlx::query(
-                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
-                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
-                 WHERE m.catalog_id = $1 AND s.snapshot_id < $2",
+            // base = catalog head observed at begin. The Replace commit aborts if
+            // any file/column of the table moved past it (a concurrent writer
+            // committed a newer generation). Snapshot ids are commit-ordered, so
+            // this scalar head is an exact conflict base.
+            let base_snapshot_id: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+                 WHERE catalog_id = $1",
             )
             .bind(catalog_id)
-            .bind(snapshot_id)
             .fetch_one(&mut *tx)
-            .await?;
-            let prev_max: i64 = max_row.try_get(0)?;
-            let new_schema_version = if is_ddl {
-                prev_max + 1
-            } else if prev_max == 0 {
-                // No prior snapshot for this catalog yet — even a DML-classified
-                // path needs a valid v1.
-                1
-            } else {
-                prev_max
-            };
+            .await?
+            .try_get(0)?;
 
-            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
-                .bind(new_schema_version)
-                .bind(snapshot_id)
-                .execute(&mut *tx)
-                .await?;
-
-            // End existing columns and insert the new set.
-            sqlx::query(
-                "UPDATE ducklake_column SET end_snapshot = $1
-                 WHERE table_id = $2 AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            let mut column_ids = Vec::with_capacity(columns.len());
-            for (order, col) in columns.iter().enumerate() {
-                let row = sqlx::query(
-                    "INSERT INTO ducklake_column (table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6) RETURNING column_id",
-                )
-                .bind(table_id)
-                .bind(&col.name)
-                .bind(&col.ducklake_type)
-                .bind(order as i64)
-                .bind(col.is_nullable)
-                .bind(snapshot_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                column_ids.push(row.try_get(0)?);
-            }
-
-            // Record a row in ducklake_schema_versions for every DDL — the
-            // UNIQUE(table_id, begin_snapshot) constraint ensures no duplicates.
-            if is_ddl {
-                sqlx::query(
-                    "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(snapshot_id)
-                .bind(new_schema_version)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            // Replace retirement (end old files + zero stats) is deferred to the
-            // commit point (register_data_file / publish_snapshot).
-
+            // Commit the (sequence-only) reservation transaction.
             tx.commit().await?;
 
             Ok(WriteSetupResult {
-                snapshot_id,
+                // snapshot_id is vestigial here (like SQLite's): the real id is
+                // assigned at the commit by finalize_snapshot.
+                snapshot_id: 0,
+                base_snapshot_id,
                 schema_id,
                 table_id,
                 column_ids,

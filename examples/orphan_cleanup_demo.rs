@@ -66,9 +66,12 @@ async fn main() -> anyhow::Result<()> {
     )?;
     writer.register_data_file(
         s.table_id,
+        "main",
+        "t",
         s.snapshot_id,
         &DataFileInfo::new("ref.parquet", 100, 5),
         WriteMode::Replace,
+        s.base_snapshot_id,
         &[ColumnDef::new("id", "int64", false)?, ColumnDef::new("name", "varchar", true)?],
         &s.column_ids,
     )?;

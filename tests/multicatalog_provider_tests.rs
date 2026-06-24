@@ -51,33 +51,40 @@ async fn seed_two_catalogs(pool: &PgPool) -> anyhow::Result<(i64, i64)> {
     let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_mysql).await?;
     wa.set_data_path("/data")?;
 
+    // Columns are written at the commit now (multicatalog Postgres), so the
+    // register must carry the table/column generation, not `&[]`.
     let reg = |w: &PostgresMetadataWriter,
+               table: &str,
+               cols: &[ColumnDef],
                setup: datafusion_ducklake::metadata_writer::WriteSetupResult,
                fname: &str| {
         w.register_data_file(
             setup.table_id,
+            "public",
+            table,
             setup.snapshot_id,
             &DataFileInfo::new(fname, 1024, 3),
             WriteMode::Replace,
-            &[],
-            &[],
+            setup.base_snapshot_id,
+            cols,
+            &setup.column_ids,
         )
         .unwrap();
     };
 
     // pg_prod: DDL, then DML
     let s1 = wa.begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)?;
-    reg(&wa, s1, "users-a.parquet");
+    reg(&wa, "users", &users_cols(), s1, "users-a.parquet");
     let s2 = wa.begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)?;
-    reg(&wa, s2, "users-b.parquet");
+    reg(&wa, "users", &users_cols(), s2, "users-b.parquet");
     // mysql_prod: DDL
     let s3 = wb.begin_write_transaction("public", "orders", &orders_cols(), WriteMode::Replace)?;
-    reg(&wb, s3, "orders-a.parquet");
+    reg(&wb, "orders", &orders_cols(), s3, "orders-a.parquet");
     // pg_prod: column-add DDL
     let mut v2 = users_cols();
     v2.push(ColumnDef::new("age", "int32", true).unwrap());
     let s4 = wa.begin_write_transaction("public", "users", &v2, WriteMode::Replace)?;
-    reg(&wa, s4, "users-c.parquet");
+    reg(&wa, "users", &v2, s4, "users-c.parquet");
     Ok((cat_pg, cat_mysql))
 }
 
@@ -237,7 +244,7 @@ async fn table_structure_reflects_latest_columns_after_ddl() {
         .unwrap()
         .unwrap();
 
-    let cols = pa.get_table_structure(table.table_id).unwrap();
+    let cols = pa.get_table_structure(table.table_id, sn).unwrap();
     // After the column-add DDL: id, name, age
     assert_eq!(cols.len(), 3);
     assert_eq!(cols[0].column_name, "id");

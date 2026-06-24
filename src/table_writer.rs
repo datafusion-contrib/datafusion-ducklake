@@ -191,8 +191,10 @@ impl DuckLakeTableWriter {
             metadata: Arc::clone(&self.metadata),
             object_store: Arc::clone(&self.object_store),
             object_path,
+            schema_name: schema_name.to_string(),
+            table_name: table_name.to_string(),
             snapshot_id: setup.snapshot_id,
-            schema_id: setup.schema_id,
+            base_snapshot_id: setup.base_snapshot_id,
             table_id: setup.table_id,
             columns,
             column_ids: setup.column_ids,
@@ -263,8 +265,16 @@ pub struct TableWriteSession {
     metadata: Arc<dyn MetadataWriter>,
     object_store: Arc<dyn ObjectStore>,
     object_path: ObjectPath,
+    /// Target identifiers threaded to `register_data_file`. Multicatalog Postgres
+    /// writes the schema/table metadata at the commit (keyed by these names);
+    /// single-catalog SQLite ignores them (it created them at begin).
+    schema_name: String,
+    table_name: String,
     snapshot_id: i64,
-    schema_id: i64,
+    /// Catalog head observed at `begin_write_transaction`; threaded to
+    /// `register_data_file` so a `Replace` commit can abort if another writer
+    /// published a newer generation of the table since this write began.
+    base_snapshot_id: i64,
     table_id: i64,
     /// Column generation for this write (in `column_order`). Threaded to the
     /// metadata writer at `finish()` so single-catalog backends, which defer the
@@ -388,21 +398,25 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        // register_data_file returns the committed snapshot id (assigned at
-        // the commit for SQLite, reserved at begin for Postgres).
-        let committed_snapshot_id = self.metadata.register_data_file(
+        // register_data_file returns the ids actually committed (snapshot id
+        // assigned at commit; real schema/table ids, which may differ from the
+        // begin-time reservations under a concurrent create). Report those.
+        let committed = self.metadata.register_data_file(
             self.table_id,
+            &self.schema_name,
+            &self.table_name,
             self.snapshot_id,
             &file_info,
             self.mode,
+            self.base_snapshot_id,
             &self.columns,
             &self.column_ids,
         )?;
 
         Ok(WriteResult {
-            snapshot_id: committed_snapshot_id,
-            table_id: self.table_id,
-            schema_id: self.schema_id,
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
             files_written: 1,
             records_written: self.row_count,
         })

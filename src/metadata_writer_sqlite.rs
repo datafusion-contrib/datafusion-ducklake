@@ -8,7 +8,7 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
+    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -595,6 +595,37 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Optimistic-concurrency check for a `Replace` commit (mirrors the Postgres
+/// writer). Run while holding the SQLite write lock, before retiring the prior
+/// generation: if any data file of the table has `begin_snapshot` or
+/// `end_snapshot` newer than `base_snapshot` (the head observed when this write
+/// began), another writer published a newer generation in the meantime, so this
+/// `Replace` aborts with [`DuckLakeError::Conflict`] rather than clobbering it.
+/// (`Append` does not call this: concurrent appends commute.)
+async fn detect_replace_conflict(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let conflict: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM ducklake_data_file
+         WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)
+         LIMIT 1",
+    )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if conflict.is_some() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "Replace on table {table_id} conflicts with a concurrent write committed since \
+             snapshot {base_snapshot}; aborting (retry the write against the new generation)"
+        )));
+    }
+    Ok(())
+}
+
 /// Retire the prior generation's still-visible data files at `snapshot_id` and
 /// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard
 /// spares files registered for *this* snapshot, so a multi-file write does not
@@ -643,6 +674,7 @@ async fn finalize_snapshot(
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
+    base_snapshot: i64,
 ) -> Result<i64> {
     // Assign the snapshot id in commit order: one INSERT ... SELECT MAX+1
     // RETURNING takes the write lock for the read and insert together, so
@@ -731,6 +763,10 @@ async fn finalize_snapshot(
     }
 
     if mode == WriteMode::Replace {
+        // Abort if a concurrent writer published a newer generation since this
+        // write began (held under the write lock acquired by the MAX+1 insert
+        // above, so the check sees a consistent committed state).
+        detect_replace_conflict(tx, table_id, base_snapshot).await?;
         // Seed the stats row (first write to a brand-new table) so retire's
         // zero-update has a row, then retire the prior data generation.
         sqlx::query(
@@ -894,12 +930,17 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
+        // SQLite created the schema/table at begin, so the names are unused here;
+        // accepted only to satisfy the trait shared with multicatalog Postgres.
+        _schema_name: &str,
+        _table_name: &str,
         _snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
+        base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
-    ) -> Result<i64> {
+    ) -> Result<CommitIds> {
         block_on(async {
             // Single atomic commit: insert the deferred snapshot row + finalize
             // the column generation + retire the prior generation (Replace),
@@ -909,7 +950,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut tx = self.pool.begin().await?;
 
             let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode).await?;
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
 
             // Seed the stats row for the Append path (Replace already seeded it
             // in finalize_snapshot); INSERT OR IGNORE is a no-op if it exists.
@@ -963,19 +1005,34 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let schema_id: i64 =
+                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+
             tx.commit().await?;
-            Ok(snapshot_id)
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
         })
     }
 
     fn publish_snapshot(
         &self,
         table_id: i64,
+        // SQLite created the schema/table at begin; names unused (trait parity).
+        _schema_name: &str,
+        _table_name: &str,
         _snapshot_id: i64,
         mode: WriteMode,
+        base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
-    ) -> Result<()> {
+    ) -> Result<CommitIds> {
         // Fileless commit point. Single-catalog SQLite defers the snapshot-row
         // insert out of begin_write_transaction, so this is no longer a no-op:
         // it inserts the deferred snapshot row + column generation and, for
@@ -985,9 +1042,21 @@ impl MetadataWriter for SqliteMetadataWriter {
         // register_data_file instead.
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            finalize_snapshot(&mut tx, table_id, columns, column_ids, mode).await?;
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
+            let schema_id: i64 =
+                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
             tx.commit().await?;
-            Ok(())
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
         })
     }
 
@@ -1110,13 +1179,17 @@ impl MetadataWriter for SqliteMetadataWriter {
             // may go unused (harmless monotonic-counter gaps).
             let fresh_ids: Vec<i64> = ((last_column_id - n + 1)..=last_column_id).collect();
 
-            // Tentative id for WriteSetupResult; the real one is assigned at the
-            // commit (finalize_snapshot), so it may differ under concurrency.
-            let snapshot_id: i64 =
-                sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM ducklake_snapshot")
+            // The catalog head this write is based on; a Replace commit aborts if
+            // another writer published a newer generation of the table past it.
+            let base_snapshot_id: i64 =
+                sqlx::query("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+
+            // Tentative id for WriteSetupResult; the real one is assigned at the
+            // commit (finalize_snapshot), so it may differ under concurrency.
+            let snapshot_id: i64 = base_snapshot_id + 1;
 
             let schema_id: i64 = {
                 let existing = sqlx::query(
@@ -1260,6 +1333,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             Ok(WriteSetupResult {
                 snapshot_id,
+                base_snapshot_id,
                 schema_id,
                 table_id,
                 column_ids,
@@ -1376,9 +1450,19 @@ mod tests {
         // register_data_file returns the committed snapshot id (head); the
         // first write commits snapshot 1.
         let committed = writer
-            .register_data_file(table_id, snapshot_id, &file, WriteMode::Append, &[], &[])
+            .register_data_file(
+                table_id,
+                "main",
+                "users",
+                snapshot_id,
+                &file,
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
-        assert_eq!(committed, 1);
+        assert_eq!(committed.snapshot_id, 1);
     }
 
     /// Reserve the next snapshot id the way `begin_write_transaction` now does
@@ -1439,9 +1523,14 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
+
+                "main",
+
+                "t",
                 snap1,
                 &DataFileInfo::new("a.parquet", 100, 3),
                 WriteMode::Append,
+                0, // base_snapshot: unused for Append (no conflict check)
                 &[],
                 &[],
             )
@@ -1450,9 +1539,14 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
+
+                "main",
+
+                "t",
                 snap2,
                 &DataFileInfo::new("b.parquet", 250, 7),
                 WriteMode::Append,
+                0, // base_snapshot: unused for Append (no conflict check)
                 &[],
                 &[],
             )
@@ -1482,9 +1576,14 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
+
+                "main",
+
+                "t",
                 snap1,
                 &DataFileInfo::new("a.parquet", 100, 5),
                 WriteMode::Append,
+                0, // base_snapshot: unused for Append (no conflict check)
                 &[],
                 &[],
             )
@@ -1502,9 +1601,14 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
+
+                "main",
+
+                "t",
                 snap3,
                 &DataFileInfo::new("b.parquet", 200, 2),
                 WriteMode::Append,
+                0, // base_snapshot: unused for Append (no conflict check)
                 &[],
                 &[],
             )
@@ -1542,9 +1646,14 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
+
+                "main",
+
+                "legacy",
                 snapshot_id,
                 &DataFileInfo::new("a.parquet", 50, 4),
                 WriteMode::Append,
+                0, // base_snapshot: unused for Append (no conflict check)
                 &[],
                 &[],
             )
@@ -1569,7 +1678,7 @@ mod tests {
         // Register a file
         let file = DataFileInfo::new("data1.parquet", 1024, 100);
         writer
-            .register_data_file(table_id, snapshot1, &file, WriteMode::Append, &[], &[])
+            .register_data_file(table_id, "main", "users", snapshot1, &file, WriteMode::Append, 0, &[], &[])
             .unwrap();
 
         // End files at new snapshot

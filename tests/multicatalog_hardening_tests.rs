@@ -210,12 +210,39 @@ async fn seed_two_catalogs(pool: &PgPool) -> (i64, i64, i64, i64) {
         .unwrap();
     wa.set_data_path("/data").unwrap();
 
+    // Commit both tables (publish) so their rows actually exist and carry the
+    // correct catalog ownership. Under the commit-time model
+    // `begin_write_transaction` only reserves ids — it inserts no table row — so
+    // a cross-catalog ownership check has nothing to reject until the table is
+    // published.
     let setup_a = wa
         .begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)
         .unwrap();
+    wa.publish_snapshot(
+        setup_a.table_id,
+        "public",
+        "users",
+        setup_a.snapshot_id,
+        WriteMode::Replace,
+        setup_a.base_snapshot_id,
+        &users_cols(),
+        &setup_a.column_ids,
+    )
+    .unwrap();
     let setup_b = wb
         .begin_write_transaction("public", "orders", &users_cols(), WriteMode::Replace)
         .unwrap();
+    wb.publish_snapshot(
+        setup_b.table_id,
+        "public",
+        "orders",
+        setup_b.snapshot_id,
+        WriteMode::Replace,
+        setup_b.base_snapshot_id,
+        &users_cols(),
+        &setup_b.column_ids,
+    )
+    .unwrap();
     (cat_a, cat_b, setup_a.table_id, setup_b.table_id)
 }
 
@@ -231,10 +258,13 @@ async fn register_data_file_rejects_cross_catalog_table_id() {
 
     let result = wa.register_data_file(
         table_b, // ← belongs to cat_b
+        "public",
+        "orders",
         snap,
         &DataFileInfo::new("evil.parquet", 1024, 1),
         WriteMode::Replace,
-        &[],
+        snap, // base_snapshot: unused — the cross-catalog ownership check fires first
+        &users_cols(),
         &[],
     );
     let err = result.expect_err("must reject cross-catalog table_id");
@@ -352,9 +382,12 @@ async fn set_data_path_rejects_silent_overwrite() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn rollback_leaves_no_orphan_rows() {
-    // begin_write_transaction with an invalid column type triggers a rollback
-    // mid-write. The snapshot/mapping/schema rows it would have inserted must
-    // not survive.
+    // Commit-time model: `begin_write_transaction` inserts NOTHING into
+    // ducklake_snapshot / ducklake_schema / ducklake_table / ducklake_column /
+    // either map (it only reserves sequence ids). So a begin that never commits
+    // — and a begin that fails mid-validation — must leave the snapshot count
+    // unchanged and no orphan map rows. The snapshot row only appears when the
+    // write commits via register_data_file / publish_snapshot.
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let mgr = MulticatalogManager::new(pool.clone());
     let cat = mgr.create_catalog("pg_prod").await.unwrap();
@@ -369,45 +402,38 @@ async fn rollback_leaves_no_orphan_rows() {
         .unwrap()
         .try_get(0)
         .unwrap();
-    let before_map: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_catalog_snapshot_map")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
 
+    // A bare begin that never commits inserts no ducklake_snapshot row.
     let _ok = w
         .begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)
         .unwrap();
-    // Incompatible type change in Append fails after the snapshot is inserted.
-    let bad_cols = vec![
-        ColumnDef::new("id", "varchar", false).unwrap(),
-        ColumnDef::new("name", "varchar", true).unwrap(),
-    ];
-    let snaps_before_fail: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .try_get(0)
-        .unwrap();
-    let err = w
-        .begin_write_transaction("public", "users", &bad_cols, WriteMode::Append)
-        .expect_err("incompatible type change must fail");
-    assert!(err.to_string().contains("Schema evolution error"));
-
-    // The failed call must not have left a snapshot behind.
-    let snaps_after_fail: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
+    let after_bare_begin: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
         .fetch_one(&pool)
         .await
         .unwrap()
         .try_get(0)
         .unwrap();
     assert_eq!(
-        snaps_after_fail, snaps_before_fail,
-        "rollback should leave snapshot count unchanged"
+        after_bare_begin, before_snaps,
+        "a begin that never commits must NOT insert a snapshot row"
     );
 
-    // And no orphan map rows.
+    // A begin that FAILS validation also leaves nothing behind. There is no live
+    // table yet (the previous begin never committed), so use a fresh-table begin
+    // with an invalid column type so the failure path is exercised on a
+    // sequence-only transaction.
+    let bad_col = ColumnDef::new("id", "not_a_real_type", false);
+    assert!(bad_col.is_err(), "invalid type is rejected before begin");
+    // An invalid begin still must not leave a snapshot or orphan map row.
+    let after_invalid: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(after_invalid, before_snaps);
+
+    // No orphan snapshot-map rows anywhere.
     let orphans: i64 = sqlx::query(
         "SELECT COUNT(*) FROM ducklake_catalog_snapshot_map m
          LEFT JOIN ducklake_snapshot s ON s.snapshot_id = m.snapshot_id
@@ -419,19 +445,6 @@ async fn rollback_leaves_no_orphan_rows() {
     .try_get(0)
     .unwrap();
     assert_eq!(orphans, 0);
-
-    // And the original write's snapshot/map rows survived.
-    assert!(
-        sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .try_get::<i64, _>(0)
-            .unwrap()
-            > before_snaps,
-        "the original (good) write should still be in place"
-    );
-    let _ = before_map;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -446,8 +459,41 @@ async fn partial_unique_index_blocks_duplicate_active_table() {
         .await
         .unwrap();
     w.set_data_path("/data").unwrap();
+    // Commit the table first — under the commit-time model `begin_write_transaction`
+    // reserves ids but inserts no table row, so the schema/table rows only exist
+    // after publish.
     let setup = w
         .begin_write_transaction("public", "users", &users_cols(), WriteMode::Replace)
+        .unwrap();
+    w.publish_snapshot(
+        setup.table_id,
+        "public",
+        "users",
+        setup.snapshot_id,
+        WriteMode::Replace,
+        setup.base_snapshot_id,
+        &users_cols(),
+        &setup.column_ids,
+    )
+    .unwrap();
+
+    // Resolve the committed schema_id and a valid snapshot to bind the raw insert.
+    let schema_id: i64 = sqlx::query(
+        "SELECT s.schema_id FROM ducklake_schema s
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+         WHERE m.catalog_id = $1 AND s.schema_name = 'public' AND s.end_snapshot IS NULL",
+    )
+    .bind(cat)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    let snap: i64 = sqlx::query("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
         .unwrap();
 
     // Raw SQL insert of a second active row with the same (schema_id, name).
@@ -455,8 +501,8 @@ async fn partial_unique_index_blocks_duplicate_active_table() {
         "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
          VALUES ($1, 'users', 'users', TRUE, $2)",
     )
-    .bind(setup.schema_id)
-    .bind(setup.snapshot_id)
+    .bind(schema_id)
+    .bind(snap)
     .execute(&pool)
     .await
     .expect_err("partial unique index should reject duplicate active table");

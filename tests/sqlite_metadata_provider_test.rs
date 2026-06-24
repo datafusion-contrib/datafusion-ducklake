@@ -422,7 +422,8 @@ async fn populate_from_duckdb_catalog(
             .execute(pool)
             .await?;
 
-            let columns = duckdb_provider.get_table_structure(table.table_id)?;
+            let columns = duckdb_provider
+                .get_table_structure(table.table_id, duckdb_provider.get_current_snapshot()?)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
@@ -717,8 +718,11 @@ async fn test_get_table_structure() {
         .await
         .expect("Failed to populate test data");
 
+    let snapshot = provider
+        .get_current_snapshot()
+        .expect("Should get snapshot");
     let columns = provider
-        .get_table_structure(1)
+        .get_table_structure(1, snapshot)
         .expect("Should get table structure");
 
     assert_eq!(columns.len(), 3, "users table should have 3 columns");
@@ -852,13 +856,13 @@ async fn test_concurrent_access() {
     for _ in 0..10 {
         let provider = provider.clone();
         let task = tokio::spawn(async move {
-            let _snapshot = provider
+            let snapshot = provider
                 .get_current_snapshot()
                 .expect("Should get snapshot");
             let _schemas = provider.list_schemas(1).expect("Should list schemas");
             let _tables = provider.list_tables(1, 1).expect("Should list tables");
             let _columns = provider
-                .get_table_structure(1)
+                .get_table_structure(1, snapshot)
                 .expect("Should get structure");
         });
         tasks.push(task);

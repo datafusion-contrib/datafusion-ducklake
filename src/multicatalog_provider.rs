@@ -198,16 +198,28 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
-    fn get_table_structure(&self, table_id: i64) -> Result<Vec<DuckLakeTableColumn>> {
-        // Columns inherit catalog via table_id. No scoping.
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>> {
+        // Columns inherit catalog via table_id (a table belongs to exactly one
+        // catalog), but must still be SNAPSHOT-scoped like list_tables /
+        // list_schemas: reading by `end_snapshot IS NULL` alone leaks a
+        // concurrent or aborted writer's begin-time column generation (which
+        // commits before the head advances). Match the catalog head window.
         block_on(async {
             let rows = sqlx::query(
                 "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
                  FROM ducklake_column
-                 WHERE table_id = $1 AND end_snapshot IS NULL
+                 WHERE table_id = $1
+                   AND $2 >= begin_snapshot
+                   AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY column_order",
             )
             .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
             .fetch_all(&self.pool)
             .await?;
 

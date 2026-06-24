@@ -57,8 +57,11 @@ async fn main() -> anyhow::Result<()> {
     // becomes the head — begin_write_transaction now only RESERVES the id.
     writer.publish_snapshot(
         s1.table_id,
+        "main",
+        "t",
         s1.snapshot_id,
         WriteMode::Replace,
+        s1.base_snapshot_id,
         &cols(),
         &s1.column_ids,
     )?;
@@ -73,9 +76,12 @@ async fn main() -> anyhow::Result<()> {
     )?;
     writer.register_data_file(
         s2.table_id,
+        "main",
+        "t",
         s2.snapshot_id,
         &DataFileInfo::new("f1.parquet", 100, 5),
         WriteMode::Replace,
+        s2.base_snapshot_id,
         &cols(),
         &s2.column_ids,
     )?;
@@ -86,9 +92,12 @@ async fn main() -> anyhow::Result<()> {
     let s3 = writer.begin_write_transaction("main", "t", &cols(), WriteMode::Replace)?;
     writer.register_data_file(
         s3.table_id,
+        "main",
+        "t",
         s3.snapshot_id,
         &DataFileInfo::new("f2.parquet", 100, 5),
         WriteMode::Replace,
+        s3.base_snapshot_id,
         &cols(),
         &s3.column_ids,
     )?;

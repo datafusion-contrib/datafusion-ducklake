@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Concurrent `WriteMode::Replace` on the experimental PostgreSQL multi-catalog write path could union conflicting generations instead of rejecting one.** Converged the multi-catalog writer onto DuckLake's commit-time model: a snapshot's id is assigned at commit (commit-ordered), and all of its metadata — snapshot, schema/table, columns, data files, and the published head — is written in a single transaction, so committed-but-unpublished rows are never visible to readers or conflict checks. `Replace` now aborts with a `Conflict` error when another writer published a newer generation of the table since the write began. Column field-ids stay stable across a same-schema `Replace`, and an `Append` racing a table creation aborts rather than producing NULL-filled reads. No on-disk format, DuckLake spec, or public API change (#146).
+
 ## [0.3.1] - 2026-06-23
 
 ### Documentation

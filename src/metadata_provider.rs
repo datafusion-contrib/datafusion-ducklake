@@ -20,7 +20,9 @@ pub const SQL_LIST_TABLES: &str =
 pub const SQL_GET_TABLE_COLUMNS: &str =
     "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
      FROM ducklake_column
-     WHERE table_id = ? AND end_snapshot IS NULL
+     WHERE table_id = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
      ORDER BY column_order";
 
 pub const SQL_GET_DATA_FILES: &str = "
@@ -230,6 +232,8 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
       AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
       AND ? >= t.begin_snapshot
       AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+      AND ? >= c.begin_snapshot
+      AND (? < c.end_snapshot OR c.end_snapshot IS NULL)
     ORDER BY s.schema_name, t.table_name, c.column_order";
 
 pub const SQL_LIST_ALL_FILES: &str = "
@@ -568,8 +572,17 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// List tables for a specific snapshot
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>>;
 
-    /// Get table structure (columns) - not snapshot-dependent as column definitions don't change
-    fn get_table_structure(&self, table_id: i64) -> Result<Vec<DuckLakeTableColumn>>;
+    /// Get table structure (columns) visible at `snapshot_id`. Columns are
+    /// snapshot-scoped (`snapshot_id >= begin_snapshot AND (snapshot_id <
+    /// end_snapshot OR end_snapshot IS NULL)`), matching upstream DuckLake and
+    /// the catalog's own snapshot-scoped `list_tables`/`list_schemas`. This is
+    /// required for correct reads under schema evolution and to hide
+    /// uncommitted/dormant column generations on the multicatalog write path.
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>>;
 
     /// Get table files for a specific snapshot
     fn get_table_files_for_select(

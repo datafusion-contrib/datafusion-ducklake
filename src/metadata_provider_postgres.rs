@@ -171,15 +171,23 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
-    fn get_table_structure(&self, table_id: i64) -> Result<Vec<DuckLakeTableColumn>> {
+    fn get_table_structure(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeTableColumn>> {
         block_on(async {
             let rows = sqlx::query(
                 "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
                  FROM ducklake_column
-                 WHERE table_id = $1 AND end_snapshot IS NULL
+                 WHERE table_id = $1
+                   AND $2 >= begin_snapshot
+                   AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY column_order",
             )
             .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
             .fetch_all(&self.pool)
             .await?;
 
@@ -415,8 +423,12 @@ impl MetadataProvider for PostgresMetadataProvider {
                    AND ($2 < s.end_snapshot OR s.end_snapshot IS NULL)
                    AND $3 >= t.begin_snapshot
                    AND ($4 < t.end_snapshot OR t.end_snapshot IS NULL)
+                   AND $5 >= c.begin_snapshot
+                   AND ($6 < c.end_snapshot OR c.end_snapshot IS NULL)
                  ORDER BY s.schema_name, t.table_name, c.column_order",
             )
+            .bind(snapshot_id)
+            .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)

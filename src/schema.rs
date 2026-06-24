@@ -218,11 +218,14 @@ impl SchemaProvider for DuckLakeSchema {
         // CREATE TABLE registers no data file, so publish the head here; without
         // this the new (empty) table never becomes visible on multicatalog
         // backends that defer the head advance out of begin_write_transaction.
-        writer
+        let committed = writer
             .publish_snapshot(
                 setup.table_id,
+                &self.schema_name,
+                &name,
                 setup.snapshot_id,
                 WriteMode::Replace,
+                setup.base_snapshot_id,
                 &columns,
                 &setup.column_ids,
             )
@@ -232,12 +235,14 @@ impl SchemaProvider for DuckLakeSchema {
         let table_path = resolve_path(&self.schema_path, &name, true)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Create writable DuckLakeTable
+        // Build the table provider from the COMMITTED ids/snapshot (the begin-time
+        // `setup.snapshot_id` is vestigial on the commit-time path; the real
+        // snapshot is assigned at commit).
         let writable_table = DuckLakeTable::new(
-            setup.table_id,
+            committed.table_id,
             name,
             self.provider.clone(),
-            setup.snapshot_id,
+            committed.snapshot_id,
             self.object_store_url.clone(),
             table_path,
         )

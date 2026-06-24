@@ -89,9 +89,14 @@ async fn drop_table_tombstones_children_and_is_idempotent() {
     h.writer
         .register_data_file(
             s.table_id,
+
+            "main",
+
+            "users",
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            s.base_snapshot_id,
             &cols(),
             &s.column_ids,
         )
@@ -165,9 +170,14 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s1.table_id,
+
+            "main",
+
+            "t",
             s1.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            s1.base_snapshot_id,
             &cols(),
             &s1.column_ids,
         )
@@ -178,9 +188,14 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s2.table_id,
+
+            "main",
+
+            "t",
             s2.snapshot_id,
             &DataFileInfo::new("f2.parquet", 100, 5),
             WriteMode::Replace,
+            s2.base_snapshot_id,
             &cols(),
             &s2.column_ids,
         )
@@ -191,9 +206,14 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s3.table_id,
+
+            "main",
+
+            "t",
             s3.snapshot_id,
             &DataFileInfo::new("f3.parquet", 100, 5),
             WriteMode::Replace,
+            s3.base_snapshot_id,
             &cols(),
             &s3.column_ids,
         )
@@ -258,9 +278,14 @@ async fn expire_full_after_drop_reclaims_all_table_metadata() {
     h.writer
         .register_data_file(
             s.table_id,
+
+            "main",
+
+            "t",
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
             WriteMode::Replace,
+            s.base_snapshot_id,
             &cols(),
             &s.column_ids,
         )
@@ -409,9 +434,14 @@ async fn delete_orphaned_files_removes_unreferenced_keeps_referenced() {
     h.writer
         .register_data_file(
             s.table_id,
+
+            "main",
+
+            "t",
             s.snapshot_id,
             &DataFileInfo::new("referenced.parquet", 100, 5),
             WriteMode::Replace,
+            s.base_snapshot_id,
             &cols(),
             &s.column_ids,
         )
@@ -681,9 +711,14 @@ async fn delete_orphaned_files_recurses_into_nested_directories() {
     h.writer
         .register_data_file(
             s.table_id,
+
+            "main",
+
+            "t",
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
             WriteMode::Replace,
+            s.base_snapshot_id,
             &cols(),
             &s.column_ids,
         )
@@ -745,9 +780,14 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
     h.writer
         .register_data_file(
             s.table_id,
+
+            "main",
+
+            "t",
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
             WriteMode::Replace,
+            s.base_snapshot_id,
             &cols(),
             &s.column_ids,
         )
@@ -876,9 +916,14 @@ async fn replace_defers_head_and_retirement_until_register() {
     h.writer
         .register_data_file(
             s1.table_id,
+
+            "main",
+
+            "t",
             s1.snapshot_id,
             &DataFileInfo::new("gen1.parquet", 100, 5),
             WriteMode::Replace,
+            s1.base_snapshot_id,
             &cols(),
             &s1.column_ids,
         )
@@ -922,9 +967,14 @@ async fn replace_defers_head_and_retirement_until_register() {
     h.writer
         .register_data_file(
             s2.table_id,
+
+            "main",
+
+            "t",
             s2.snapshot_id,
             &DataFileInfo::new("gen2.parquet", 100, 7),
             WriteMode::Replace,
+            s2.base_snapshot_id,
             &cols(),
             &s2.column_ids,
         )
@@ -974,9 +1024,14 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
     h.writer
         .register_data_file(
             s1.table_id,
+
+            "main",
+
+            "t",
             s1.snapshot_id,
             &DataFileInfo::new("g1.parquet", 100, 5),
             WriteMode::Replace,
+            s1.base_snapshot_id,
             &cols(),
             &s1.column_ids,
         )
@@ -1004,9 +1059,14 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
     h.writer
         .register_data_file(
             s2.table_id,
+
+            "main",
+
+            "t",
             s2.snapshot_id,
             &DataFileInfo::new("g2.parquet", 100, 7),
             WriteMode::Replace,
+            s2.base_snapshot_id,
             &evolved,
             &s2.column_ids,
         )
@@ -1035,15 +1095,18 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
     );
 }
 
-/// Two concurrent same-table Replace writers that commit out of reservation
-/// order must leave exactly one file and one column generation live at the
-/// head, with no inverted (end_snapshot < begin_snapshot) column lifetimes.
+/// Two concurrent same-table Replace writers based on the same generation that
+/// commit out of reservation order: the FIRST to commit wins, and the second —
+/// whose base generation is now stale — aborts with a [`DuckLakeError::Conflict`]
+/// (DuckLake-style optimistic concurrency) rather than silently unioning with or
+/// clobbering the winner. Exactly one file and one column generation stay live at
+/// the head, with no inverted (end_snapshot < begin_snapshot) column lifetimes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replace_out_of_order_commit_does_not_corrupt() {
+async fn replace_out_of_order_commit_conflicts() {
     let h = setup().await;
     let p = pool(&h).await;
 
-    // Generation 1: committed, non-empty.
+    // Generation 0: committed, non-empty.
     let s0 = h
         .writer
         .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
@@ -1051,16 +1114,21 @@ async fn replace_out_of_order_commit_does_not_corrupt() {
     h.writer
         .register_data_file(
             s0.table_id,
+
+            "main",
+
+            "t",
             s0.snapshot_id,
             &DataFileInfo::new("gen0.parquet", 100, 5),
             WriteMode::Replace,
+            s0.base_snapshot_id,
             &cols(),
             &s0.column_ids,
         )
         .unwrap();
     let tid = s0.table_id;
 
-    // Two Replace writers open their windows...
+    // Two Replace writers open their windows on the SAME base generation...
     let w1 = h
         .writer
         .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
@@ -1070,27 +1138,43 @@ async fn replace_out_of_order_commit_does_not_corrupt() {
         .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
         .unwrap();
 
-    // ...and commit in the OPPOSITE order (w2 before w1).
+    // ...and commit in the OPPOSITE order (w2 before w1). w2 commits first and
+    // wins; w1's base is now stale, so its commit must be rejected.
     h.writer
         .register_data_file(
             w2.table_id,
+
+            "main",
+
+            "t",
             w2.snapshot_id,
             &DataFileInfo::new("gen_w2.parquet", 100, 7),
             WriteMode::Replace,
+            w2.base_snapshot_id,
             &cols(),
             &w2.column_ids,
         )
         .unwrap();
-    h.writer
-        .register_data_file(
-            w1.table_id,
-            w1.snapshot_id,
-            &DataFileInfo::new("gen_w1.parquet", 100, 3),
-            WriteMode::Replace,
-            &cols(),
-            &w1.column_ids,
-        )
-        .unwrap();
+    let w1_result = h.writer.register_data_file(
+        w1.table_id,
+
+        "main",
+
+        "t",
+        w1.snapshot_id,
+        &DataFileInfo::new("gen_w1.parquet", 100, 3),
+        WriteMode::Replace,
+        w1.base_snapshot_id,
+        &cols(),
+        &w1.column_ids,
+    );
+    assert!(
+        matches!(
+            w1_result,
+            Err(datafusion_ducklake::DuckLakeError::Conflict(_))
+        ),
+        "the out-of-order (stale-base) Replace must abort with a conflict, got {w1_result:?}"
+    );
 
     let live_files = scalar_i64(&p, &format!("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = {tid} AND end_snapshot IS NULL")).await;
     let live_cols = scalar_i64(
@@ -1101,6 +1185,7 @@ async fn replace_out_of_order_commit_does_not_corrupt() {
     )
     .await;
     let inverted = scalar_i64(&p, &format!("SELECT COUNT(*) FROM ducklake_column WHERE table_id = {tid} AND end_snapshot IS NOT NULL AND end_snapshot < begin_snapshot")).await;
+    let winner = scalar_i64(&p, &format!("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = {tid} AND end_snapshot IS NULL AND path = 'gen_w2.parquet'")).await;
 
     assert_eq!(
         inverted, 0,
@@ -1108,7 +1193,11 @@ async fn replace_out_of_order_commit_does_not_corrupt() {
     );
     assert_eq!(
         live_files, 1,
-        "exactly one file generation may be live at the head after Replace"
+        "exactly one file generation may be live at the head after the conflict"
+    );
+    assert_eq!(
+        winner, 1,
+        "the first committer (w2) is the surviving live generation"
     );
     assert_eq!(
         live_cols,

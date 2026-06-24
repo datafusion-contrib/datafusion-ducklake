@@ -67,6 +67,13 @@ pub enum DuckLakeError {
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
 
+    /// A concurrent write conflict detected at commit time: another writer
+    /// published a newer generation of the table since this write began. The
+    /// loser aborts (DuckLake-style optimistic concurrency) rather than silently
+    /// unioning or clobbering the concurrent commit. Callers may retry.
+    #[error("Write conflict: {0}")]
+    Conflict(String),
+
     /// Generic error
     #[error("Internal error: {0}")]
     Internal(String),

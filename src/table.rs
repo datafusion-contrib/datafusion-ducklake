@@ -196,7 +196,7 @@ impl DuckLakeTable {
         table_path: String,
     ) -> Result<Self> {
         // Load ALL metadata with this snapshot_id
-        let columns = provider.get_table_structure(table_id)?;
+        let columns = provider.get_table_structure(table_id, snapshot_id)?;
         let physical_schema = Arc::new(build_arrow_schema(&columns)?);
         let schema = physical_schema.clone();
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;

@@ -204,7 +204,7 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
         // Get table structure and build Arrow schema
         let columns = self
             .provider
-            .get_table_structure(table.table_id)
+            .get_table_structure(table.table_id, end_snapshot)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let table_schema = Arc::new(
@@ -346,7 +346,7 @@ impl TableFunctionImpl for DucklakeTableDeletionsFunction {
         // Get table structure and build Arrow schema
         let columns = self
             .provider
-            .get_table_structure(table.table_id)
+            .get_table_structure(table.table_id, end_snapshot)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let table_schema = Arc::new(
