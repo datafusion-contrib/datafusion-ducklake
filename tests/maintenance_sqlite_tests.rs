@@ -89,9 +89,7 @@ async fn drop_table_tombstones_children_and_is_idempotent() {
     h.writer
         .register_data_file(
             s.table_id,
-
             "main",
-
             "users",
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
@@ -170,9 +168,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s1.table_id,
-
             "main",
-
             "t",
             s1.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
@@ -188,9 +184,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s2.table_id,
-
             "main",
-
             "t",
             s2.snapshot_id,
             &DataFileInfo::new("f2.parquet", 100, 5),
@@ -206,9 +200,7 @@ fn three_generations(writer: &SqliteMetadataWriter) -> (i64, i64, i64, i64) {
     writer
         .register_data_file(
             s3.table_id,
-
             "main",
-
             "t",
             s3.snapshot_id,
             &DataFileInfo::new("f3.parquet", 100, 5),
@@ -278,9 +270,7 @@ async fn expire_full_after_drop_reclaims_all_table_metadata() {
     h.writer
         .register_data_file(
             s.table_id,
-
             "main",
-
             "t",
             s.snapshot_id,
             &DataFileInfo::new("f1.parquet", 100, 5),
@@ -434,9 +424,7 @@ async fn delete_orphaned_files_removes_unreferenced_keeps_referenced() {
     h.writer
         .register_data_file(
             s.table_id,
-
             "main",
-
             "t",
             s.snapshot_id,
             &DataFileInfo::new("referenced.parquet", 100, 5),
@@ -711,9 +699,7 @@ async fn delete_orphaned_files_recurses_into_nested_directories() {
     h.writer
         .register_data_file(
             s.table_id,
-
             "main",
-
             "t",
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
@@ -780,9 +766,7 @@ async fn delete_orphaned_files_dry_run_matches_real_run() {
     h.writer
         .register_data_file(
             s.table_id,
-
             "main",
-
             "t",
             s.snapshot_id,
             &DataFileInfo::new("ref.parquet", 100, 5),
@@ -916,9 +900,7 @@ async fn replace_defers_head_and_retirement_until_register() {
     h.writer
         .register_data_file(
             s1.table_id,
-
             "main",
-
             "t",
             s1.snapshot_id,
             &DataFileInfo::new("gen1.parquet", 100, 5),
@@ -967,9 +949,7 @@ async fn replace_defers_head_and_retirement_until_register() {
     h.writer
         .register_data_file(
             s2.table_id,
-
             "main",
-
             "t",
             s2.snapshot_id,
             &DataFileInfo::new("gen2.parquet", 100, 7),
@@ -1024,9 +1004,7 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
     h.writer
         .register_data_file(
             s1.table_id,
-
             "main",
-
             "t",
             s1.snapshot_id,
             &DataFileInfo::new("g1.parquet", 100, 5),
@@ -1059,9 +1037,7 @@ async fn replace_does_not_leak_new_column_generation_until_register() {
     h.writer
         .register_data_file(
             s2.table_id,
-
             "main",
-
             "t",
             s2.snapshot_id,
             &DataFileInfo::new("g2.parquet", 100, 7),
@@ -1114,9 +1090,7 @@ async fn replace_out_of_order_commit_conflicts() {
     h.writer
         .register_data_file(
             s0.table_id,
-
             "main",
-
             "t",
             s0.snapshot_id,
             &DataFileInfo::new("gen0.parquet", 100, 5),
@@ -1143,9 +1117,7 @@ async fn replace_out_of_order_commit_conflicts() {
     h.writer
         .register_data_file(
             w2.table_id,
-
             "main",
-
             "t",
             w2.snapshot_id,
             &DataFileInfo::new("gen_w2.parquet", 100, 7),
@@ -1157,9 +1129,7 @@ async fn replace_out_of_order_commit_conflicts() {
         .unwrap();
     let w1_result = h.writer.register_data_file(
         w1.table_id,
-
         "main",
-
         "t",
         w1.snapshot_id,
         &DataFileInfo::new("gen_w1.parquet", 100, 3),

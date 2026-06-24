@@ -352,14 +352,13 @@ async fn reserve_ids(
     if n <= 0 {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
-        "SELECT nextval(pg_get_serial_sequence($1, $2)) FROM generate_series(1, $3)",
-    )
-    .bind(table)
-    .bind(col)
-    .bind(n)
-    .fetch_all(&mut **tx)
-    .await?;
+    let rows =
+        sqlx::query("SELECT nextval(pg_get_serial_sequence($1, $2)) FROM generate_series(1, $3)")
+            .bind(table)
+            .bind(col)
+            .bind(n)
+            .fetch_all(&mut **tx)
+            .await?;
     rows.into_iter().map(|r| Ok(r.try_get(0)?)).collect()
 }
 

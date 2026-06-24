@@ -1523,9 +1523,7 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
-
                 "main",
-
                 "t",
                 snap1,
                 &DataFileInfo::new("a.parquet", 100, 3),
@@ -1539,9 +1537,7 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
-
                 "main",
-
                 "t",
                 snap2,
                 &DataFileInfo::new("b.parquet", 250, 7),
@@ -1576,9 +1572,7 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
-
                 "main",
-
                 "t",
                 snap1,
                 &DataFileInfo::new("a.parquet", 100, 5),
@@ -1601,9 +1595,7 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
-
                 "main",
-
                 "t",
                 snap3,
                 &DataFileInfo::new("b.parquet", 200, 2),
@@ -1646,9 +1638,7 @@ mod tests {
         writer
             .register_data_file(
                 table_id,
-
                 "main",
-
                 "legacy",
                 snapshot_id,
                 &DataFileInfo::new("a.parquet", 50, 4),
@@ -1678,7 +1668,17 @@ mod tests {
         // Register a file
         let file = DataFileInfo::new("data1.parquet", 1024, 100);
         writer
-            .register_data_file(table_id, "main", "users", snapshot1, &file, WriteMode::Append, 0, &[], &[])
+            .register_data_file(
+                table_id,
+                "main",
+                "users",
+                snapshot1,
+                &file,
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // End files at new snapshot

@@ -108,7 +108,8 @@ async fn replace_is_atomic_no_empty_read_window() {
             &cols(),
             &s1.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     assert_eq!(current_head(&pool, cat).await, g1_snap);
     assert_eq!(visible_records_at_head(&pool, cat, s1.table_id).await, 10);
 
@@ -146,7 +147,8 @@ async fn replace_is_atomic_no_empty_read_window() {
             &cols(),
             &s2.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     assert_eq!(current_head(&pool, cat).await, g2_snap);
     assert_eq!(
         visible_records_at_head(&pool, cat, s2.table_id).await,
@@ -194,7 +196,8 @@ async fn concurrent_replace_conflicts_no_union() {
             &cols(),
             &s0.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let tid = s0.table_id;
 
     // Two Replace writers open their windows on the SAME base generation; their
@@ -222,7 +225,8 @@ async fn concurrent_replace_conflicts_no_union() {
             &cols(),
             &w2.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let w1_result = w.register_data_file(
         w1.table_id,
         "public",
@@ -1019,31 +1023,49 @@ async fn schema_version_is_per_catalog_dense_under_interleaving() {
     let a1 = wa
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    wa.publish_snapshot(a1.table_id,
-"public",
-"users", a1.snapshot_id, WriteMode::Replace, a1.base_snapshot_id, &cols(),
-&a1.column_ids,)
-        .unwrap();
+    wa.publish_snapshot(
+        a1.table_id,
+        "public",
+        "users",
+        a1.snapshot_id,
+        WriteMode::Replace,
+        a1.base_snapshot_id,
+        &cols(),
+        &a1.column_ids,
+    )
+    .unwrap();
     let a1_snap = current_head(&pool, cat_a).await;
     // cat_a DML (Replace, same schema)
     let a2 = wa
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    wa.publish_snapshot(a2.table_id,
-"public",
-"users", a2.snapshot_id, WriteMode::Replace, a2.base_snapshot_id, &cols(),
-&a2.column_ids,)
-        .unwrap();
+    wa.publish_snapshot(
+        a2.table_id,
+        "public",
+        "users",
+        a2.snapshot_id,
+        WriteMode::Replace,
+        a2.base_snapshot_id,
+        &cols(),
+        &a2.column_ids,
+    )
+    .unwrap();
     let a2_snap = current_head(&pool, cat_a).await;
     // cat_b DDL (creates orders) — happens in between cat_a's DDLs
     let b1 = wb
         .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
         .unwrap();
-    wb.publish_snapshot(b1.table_id,
-"public",
-"orders", b1.snapshot_id, WriteMode::Replace, b1.base_snapshot_id, &cols(),
-&b1.column_ids,)
-        .unwrap();
+    wb.publish_snapshot(
+        b1.table_id,
+        "public",
+        "orders",
+        b1.snapshot_id,
+        WriteMode::Replace,
+        b1.base_snapshot_id,
+        &cols(),
+        &b1.column_ids,
+    )
+    .unwrap();
     let b1_snap = current_head(&pool, cat_b).await;
     // cat_a DDL: adds age column
     let mut cols_v2 = cols();
@@ -1051,21 +1073,33 @@ async fn schema_version_is_per_catalog_dense_under_interleaving() {
     let a3 = wa
         .begin_write_transaction("public", "users", &cols_v2, WriteMode::Replace)
         .unwrap();
-    wa.publish_snapshot(a3.table_id,
-"public",
-"users", a3.snapshot_id, WriteMode::Replace, a3.base_snapshot_id, &cols_v2,
-&a3.column_ids,)
-        .unwrap();
+    wa.publish_snapshot(
+        a3.table_id,
+        "public",
+        "users",
+        a3.snapshot_id,
+        WriteMode::Replace,
+        a3.base_snapshot_id,
+        &cols_v2,
+        &a3.column_ids,
+    )
+    .unwrap();
     let a3_snap = current_head(&pool, cat_a).await;
     // cat_b DML
     let b2 = wb
         .begin_write_transaction("public", "orders", &cols(), WriteMode::Replace)
         .unwrap();
-    wb.publish_snapshot(b2.table_id,
-"public",
-"orders", b2.snapshot_id, WriteMode::Replace, b2.base_snapshot_id, &cols(),
-&b2.column_ids,)
-        .unwrap();
+    wb.publish_snapshot(
+        b2.table_id,
+        "public",
+        "orders",
+        b2.snapshot_id,
+        WriteMode::Replace,
+        b2.base_snapshot_id,
+        &cols(),
+        &b2.column_ids,
+    )
+    .unwrap();
     let b2_snap = current_head(&pool, cat_b).await;
 
     let get_v = |snap_id: i64| {
@@ -1105,19 +1139,31 @@ async fn no_orphan_mapping_rows() {
     let s1 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    w.publish_snapshot(s1.table_id,
-"public",
-"users", s1.snapshot_id, WriteMode::Replace, s1.base_snapshot_id, &cols(),
-&s1.column_ids,)
-        .unwrap();
+    w.publish_snapshot(
+        s1.table_id,
+        "public",
+        "users",
+        s1.snapshot_id,
+        WriteMode::Replace,
+        s1.base_snapshot_id,
+        &cols(),
+        &s1.column_ids,
+    )
+    .unwrap();
     let s2 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    w.publish_snapshot(s2.table_id,
-"public",
-"users", s2.snapshot_id, WriteMode::Replace, s2.base_snapshot_id, &cols(),
-&s2.column_ids,)
-        .unwrap();
+    w.publish_snapshot(
+        s2.table_id,
+        "public",
+        "users",
+        s2.snapshot_id,
+        WriteMode::Replace,
+        s2.base_snapshot_id,
+        &cols(),
+        &s2.column_ids,
+    )
+    .unwrap();
 
     // Every entry in the maps must point at a real row.
     let orphan_snaps: i64 = sqlx::query(
@@ -1206,7 +1252,10 @@ async fn dormant_rows_invisible_until_publish() {
         .await
         .unwrap();
     let head = provider.get_current_snapshot().unwrap();
-    let schema = provider.get_schema_by_name("public", head).unwrap().unwrap();
+    let schema = provider
+        .get_schema_by_name("public", head)
+        .unwrap()
+        .unwrap();
     let names: Vec<String> = provider
         .list_tables(schema.schema_id, head)
         .unwrap()
@@ -1267,7 +1316,8 @@ async fn register_data_file_records_against_table() {
             &cols(),
             &setup.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     assert!(file_id > 0);
 
     let row = sqlx::query(
@@ -2136,7 +2186,8 @@ async fn drop_table_in_catalog_bumps_schema_version_as_ddl() {
             &cols(),
             &s.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
 
     let v_create: i64 =
         sqlx::query("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
@@ -2415,11 +2466,17 @@ async fn replace_preserves_next_row_id_monotonic() {
     let s2 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    w.publish_snapshot(s2.table_id,
-"public",
-"users", s2.snapshot_id, WriteMode::Replace, s2.base_snapshot_id, &cols(),
-&s2.column_ids,)
-        .unwrap();
+    w.publish_snapshot(
+        s2.table_id,
+        "public",
+        "users",
+        s2.snapshot_id,
+        WriteMode::Replace,
+        s2.base_snapshot_id,
+        &cols(),
+        &s2.column_ids,
+    )
+    .unwrap();
     let (rc2, next2, bytes2) = read_table_stats(&pool, s2.table_id).await;
     assert_eq!(rc2, 0, "record_count must reset on Replace");
     assert_eq!(next2, 5, "next_row_id must NOT reset on Replace");
@@ -2510,7 +2567,8 @@ fn three_generations(
             &cols(),
             &s1.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let s2 = writer
         .begin_write_transaction(schema, table, &cols(), WriteMode::Replace)
         .unwrap();
@@ -2526,7 +2584,8 @@ fn three_generations(
             &cols(),
             &s2.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let s3 = writer
         .begin_write_transaction(schema, table, &cols(), WriteMode::Replace)
         .unwrap();
@@ -2542,7 +2601,8 @@ fn three_generations(
             &cols(),
             &s3.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     (s1.table_id, snap1, snap2, snap3)
 }
 
@@ -2690,7 +2750,8 @@ async fn expire_in_catalog_full_after_drop_removes_table_metadata() {
             &cols(),
             &s.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
 
     // Drop allocates a second snapshot; expire the first (the drop snapshot is kept).
     assert!(
@@ -2769,7 +2830,8 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
             &cols(),
             &a1.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let b1 = wb
         .begin_write_transaction("public", "u", &cols(), WriteMode::Replace)
         .unwrap();
@@ -2785,7 +2847,8 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
             &cols(),
             &b1.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     let a2 = wa
         .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
         .unwrap();
@@ -2801,7 +2864,8 @@ async fn expire_in_catalog_is_scoped_to_catalog() {
             &cols(),
             &a2.column_ids,
         )
-        .unwrap().snapshot_id;
+        .unwrap()
+        .snapshot_id;
     assert!(
         b1_snap > a1_snap && b1_snap < a2_snap,
         "test setup: B's snapshot must fall inside A/f1's lifetime range"
@@ -3520,11 +3584,7 @@ async fn multicatalog_write_read_value_roundtrip() {
         .unwrap();
     assert_eq!(
         read_rows(pool.clone()).await,
-        vec![
-            (1, Some("a".into())),
-            (2, Some("b".into())),
-            (3, Some("c".into())),
-        ],
+        vec![(1, Some("a".into())), (2, Some("b".into())), (3, Some("c".into())),],
         "initial generation values must round-trip (not NULL / not empty)",
     );
 
@@ -3545,11 +3605,7 @@ async fn multicatalog_write_read_value_roundtrip() {
         .unwrap();
     assert_eq!(
         read_rows(pool.clone()).await,
-        vec![
-            (10, Some("x".into())),
-            (20, Some("y".into())),
-            (30, Some("z".into())),
-        ],
+        vec![(10, Some("x".into())), (20, Some("y".into())), (30, Some("z".into())),],
         "Append must add to the current generation with values intact",
     );
 }
