@@ -324,6 +324,27 @@ async fn set_columns_rejects_cross_catalog_table_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn promote_column_type_rejects_cross_catalog_table_id() {
+    // BLOCKER guard: table_ids are global across the multicatalog store, so a
+    // promote scoped to cat_a must refuse a table_id owned by cat_b (else it would
+    // silently mutate another catalog's column).
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (cat_a, _cat_b, _table_a, table_b) = seed_two_catalogs(&pool).await;
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+
+    let result = wa.promote_column_type(table_b, "id", "int64");
+    let err = result.expect_err("must reject cross-catalog table_id");
+    assert!(
+        err.to_string().contains("does not belong to catalog"),
+        "expected ownership error, got: {}",
+        err
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn get_or_create_table_rejects_cross_catalog_schema_id() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let mgr = MulticatalogManager::new(pool.clone());

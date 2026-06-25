@@ -51,8 +51,15 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
     )"#,
+    // Multicatalog layout (NOT the upstream/DuckDB-readable single-catalog format,
+    // so it is free to carry DB-level guarantees — design §4.1). `column_id` keeps
+    // its IDENTITY (a global sequence the allocator reserves from), but is NO LONGER
+    // a single-row PRIMARY KEY: a versioned / type-promoted column needs a second
+    // row sharing the same `column_id`. Identity is the composite
+    // (table_id, column_id, begin_snapshot); a partial unique index (below) enforces
+    // at most one *live* version per field-id.
     r#"CREATE TABLE IF NOT EXISTS ducklake_column (
-        column_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        column_id BIGINT GENERATED ALWAYS AS IDENTITY,
         table_id BIGINT NOT NULL,
         column_name VARCHAR NOT NULL,
         column_type VARCHAR NOT NULL,
@@ -60,7 +67,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         nulls_allowed BOOLEAN DEFAULT TRUE,
         parent_column BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        PRIMARY KEY (table_id, column_id, begin_snapshot)
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_data_file (
         data_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -162,6 +170,11 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     // writer (manual SQL, external migrations).
     r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_active_table_per_schema
         ON ducklake_table(schema_id, table_name) WHERE end_snapshot IS NULL"#,
+    // At most one *live* version per field-id (design §4.1, reviews #2/#3). The
+    // promote's retire-then-insert (end the old row, then insert the new live row,
+    // in one txn) keeps this satisfied at every commit boundary.
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_ducklake_column_live
+        ON ducklake_column(table_id, column_id) WHERE end_snapshot IS NULL"#,
 ];
 
 /// Run a slice of DDL statements against the pool. Each statement executes independently.
@@ -169,6 +182,37 @@ pub(crate) async fn execute_ddl_statements(pool: &PgPool, statements: &[&str]) -
     for stmt in statements {
         sqlx::query(stmt).execute(pool).await?;
     }
+    Ok(())
+}
+
+/// Upgrade an existing multicatalog store's `ducklake_column` from the legacy
+/// single-row `column_id` PRIMARY KEY to the composite
+/// `(table_id, column_id, begin_snapshot)` PK, so a versioned / type-promoted
+/// column can have a second row sharing its `column_id`. `CREATE TABLE IF NOT
+/// EXISTS` only shapes fresh stores; Postgres can `ALTER` a PK in place (unlike
+/// SQLite). Idempotent (only acts when the current PK is the single-column one;
+/// a no-op once composite) and lossless. The `IDENTITY` on `column_id` (the
+/// allocator's sequence) is independent of the PK and survives the swap. The
+/// partial unique index is created idempotently by `SQL_CREATE_STANDARD_TABLES`.
+pub(crate) async fn migrate_ducklake_column_to_composite_pk(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"DO $$
+        DECLARE pk_name text;
+        BEGIN
+            -- Find the PRIMARY KEY iff it is a single-column PK (the legacy shape).
+            SELECT conname INTO pk_name
+            FROM pg_constraint
+            WHERE conrelid = 'ducklake_column'::regclass
+              AND contype = 'p'
+              AND array_length(conkey, 1) = 1;
+            IF pk_name IS NOT NULL THEN
+                EXECUTE 'ALTER TABLE ducklake_column DROP CONSTRAINT ' || quote_ident(pk_name);
+                EXECUTE 'ALTER TABLE ducklake_column ADD PRIMARY KEY (table_id, column_id, begin_snapshot)';
+            END IF;
+        END $$;"#,
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -789,6 +833,135 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn promote_column_type(
+        &self,
+        table_id: i64,
+        column_name: &str,
+        new_ducklake_type: &str,
+    ) -> Result<i64> {
+        // Reject an unknown target type before opening a transaction.
+        crate::types::ducklake_to_arrow_type(new_ducklake_type)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            // Ownership guard (matches every other table_id-taking mutator,
+            // e.g. set_columns / end_table_files): table_ids are global across the
+            // multicatalog store, so refuse a table_id that belongs to a different
+            // catalog — otherwise a promote scoped to this catalog could silently
+            // mutate another catalog's column.
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            // Live version of the column.
+            let row = sqlx::query(
+                "SELECT column_id, column_type, column_order, nulls_allowed
+                 FROM ducklake_column
+                 WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .bind(column_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: no live column '{column_name}' in table {table_id}"
+                ))
+            })?;
+            let column_id: i64 = row.try_get("column_id")?;
+            let cur_type: String = row.try_get("column_type")?;
+            let column_order: i64 = row.try_get("column_order")?;
+            let nulls_allowed: bool =
+                row.try_get::<Option<bool>, _>("nulls_allowed")?.unwrap_or(true);
+
+            // No-op / not-a-widening guards (canonical first so an alias-only
+            // restatement is "no change", not attempted).
+            if crate::types::types_equal_canonical(&cur_type, new_ducklake_type) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: column '{column_name}' is already type '{cur_type}' (no change)"
+                )));
+            }
+            if !crate::types::is_promotable(&cur_type, new_ducklake_type) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: '{cur_type}' -> '{new_ducklake_type}' is not an allowed lossless widening for column '{column_name}'"
+                )));
+            }
+
+            // New snapshot + advance this catalog's head.
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            sqlx::query(
+                "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)",
+            )
+            .bind(self.catalog_id)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // A promote IS schema evolution → bump schema_version (per-catalog dense)
+            // and record the ledger row (same model as a DDL data-write commit).
+            let prev_max: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1 AND s.snapshot_id <> $2",
+            )
+            .bind(self.catalog_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            let new_schema_version = prev_max + 1;
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+                .bind(new_schema_version)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(snapshot_id)
+            .bind(new_schema_version)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Retire the live row, insert the new version with the SAME column_id
+            // (OVERRIDING SYSTEM VALUE — column_id is IDENTITY). Retire-before-insert
+            // keeps the live-version partial unique index satisfied at all times.
+            sqlx::query(
+                "UPDATE ducklake_column SET end_snapshot = $1
+                 WHERE table_id = $2 AND column_id = $3 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(column_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_column
+                     (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(column_id)
+            .bind(table_id)
+            .bind(column_name)
+            .bind(new_ducklake_type)
+            .bind(column_order)
+            .bind(nulls_allowed)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
     fn get_or_create_schema(
         &self,
         name: &str,
@@ -1182,6 +1355,9 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
             execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
+            // Upgrade a pre-existing store's ducklake_column to the composite PK
+            // (legacy single-row column_id PK → versioned-capable). Idempotent.
+            migrate_ducklake_column_to_composite_pk(&self.pool).await?;
             Ok(())
         })
     }
@@ -1286,8 +1462,15 @@ impl MetadataWriter for PostgresMetadataWriter {
                 existing_columns.push((name, col_type, nullable));
             }
 
-            // Append-mode schema evolution validation (same rules as SQLite writer).
-            if mode == WriteMode::Append && !existing_columns.is_empty() {
+            // Data-write policy (§5, same rules as the SQLite writer): a data write
+            // — Replace OR Append — must NOT change a column's type. A type change is
+            // schema evolution and must go through `promote_column_type`, never a data
+            // write; silently keeping the old catalog type (the "C" bug) corrupts
+            // reads. Canonical comparison (`int64` ≡ `bigint`) so an alias-only
+            // restatement is a no-op. Append additionally requires a genuinely new
+            // column to be nullable (a Replace overwrites every row, so a new
+            // non-nullable column is fine there).
+            if !existing_columns.is_empty() {
                 use std::collections::HashMap;
                 let existing_map: HashMap<&str, (&str, bool)> = existing_columns
                     .iter()
@@ -1298,13 +1481,18 @@ impl MetadataWriter for PostgresMetadataWriter {
 
                 for new_col in columns.iter() {
                     if let Some((existing_type, _)) = existing_map.get(new_col.name.as_str()) {
-                        if !crate::types::types_compatible(existing_type, &new_col.ducklake_type) {
+                        // Same-name column: a (canonical) type change is rejected in BOTH
+                        // modes. Not `types_compatible` — that accepts widenings, the
+                        // silent acceptance we are closing.
+                        if !crate::types::types_equal_canonical(existing_type, &new_col.ducklake_type)
+                        {
                             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
-                                new_col.name, existing_type, new_col.ducklake_type
+                                "Column '{}' type change ('{}' -> '{}') is not allowed on a {:?} data write; \
+                                 use promote_column_type for a widening, then write data under the new type.",
+                                new_col.name, existing_type, new_col.ducklake_type, mode
                             )));
                         }
-                    } else if !new_col.is_nullable {
+                    } else if mode == WriteMode::Append && !new_col.is_nullable {
                         return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                             "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
                             new_col.name
@@ -1387,10 +1575,21 @@ fn columns_differ(existing: &[(String, String, bool)], proposed: &[ColumnDef]) -
         if ex_name != &new_col.name {
             return true;
         }
-        if !crate::types::types_compatible(ex_type, &new_col.ducklake_type) {
+        // A same-name type difference here can only be the benign Append-vs-promote
+        // race: a data write that PASSED the §5 begin-time reject (its staged type
+        // matched the type AT BEGIN) but whose column a concurrent promote widened
+        // before this commit. The staged (narrower) type losslessly widens to the
+        // committed type and is served via cast-on-read, so it is NOT a schema
+        // change and must NOT bump schema_version (§4.5/E2). Treat canonical-equal
+        // OR staged-widens-to-committed as "same"; anything else is real DDL.
+        // (Not `types_compatible`: that also accepts committed-widens-to-staged,
+        // which here would wrongly classify the race as DDL.)
+        let same_type = crate::types::types_equal_canonical(ex_type, &new_col.ducklake_type)
+            || crate::types::is_promotable(&new_col.ducklake_type, ex_type);
+        if !same_type {
             return true;
         }
-        // Same-name same-compatible-type same-nullability ⇒ no DDL.
+        // Same-name same-(compatible-direction)-type same-nullability ⇒ no DDL.
         if *ex_nullable != new_col.is_nullable {
             return true;
         }

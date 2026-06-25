@@ -142,8 +142,25 @@ Known edges:
   changes no column) leaves no per-table footprint, so it resolves **last-writer-wins** rather
   than abort-on-conflict (both backends). Data-bearing and schema-changing replaces are
   conflict-checked.
-- A **type change on `Replace`** is not applied to a kept (same-named) column — the column
-  keeps its existing type (matches the SQLite writer). Add/remove columns work.
+- A **column type change is rejected on a data write** (`Replace` **and** `Append`) — this is
+  a **behavior change**: previously a type change on `Replace` was silently dropped (the column
+  kept its old type, corrupting reads); it is now a clear error. Schema evolution goes through
+  the explicit, widening-only **`promote_column_type`** (it retires the old column version and
+  inserts a new one with the **same field-id**, mirroring upstream DuckLake's `ALTER`-vs-`INSERT`
+  separation; reads cast old narrow files up to the widened type). A widening refresh should call
+  `promote_column_type`, then write under the new type. Add/remove columns on `Replace` still work.
+- **Schema evolution is versioned.** A promote leaves two `ducklake_column` rows sharing one
+  `column_id` (old retired via `end_snapshot`, new live), matching upstream. On the
+  **PostgreSQL multicatalog** layout this is enforced by a composite PK + a partial unique
+  index; on the **SQLite single-catalog** layout `ducklake_column` matches upstream's bare
+  shape (no PK) and the one-live-version invariant is enforced in the writer + tests. Catalogs
+  created by an earlier version are migrated in place on open (idempotent, lossless).
+- **`schema_version` is maintained on the PostgreSQL multicatalog layout only.** The SQLite
+  single-catalog layout omits `schema_version` / `ducklake_schema_versions` (nothing reads them
+  on that path). Consequently SQLite catalogs are DuckLake-*design*-faithful but **not yet a
+  drop-in DuckDB catalog** — DuckDB's reader also needs `next_catalog_id`/`next_file_id` and
+  other columns/tables that this layout doesn't write. Full DuckDB read-compat is a tracked
+  follow-up, not part of the type-promotion change.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

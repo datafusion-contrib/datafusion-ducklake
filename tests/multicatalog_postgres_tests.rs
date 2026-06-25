@@ -3609,3 +3609,598 @@ async fn multicatalog_write_read_value_roundtrip() {
         "Append must add to the current generation with values intact",
     );
 }
+
+/// Postgres-multicatalog counterpart of the SQLite bug-C proof: promote a column
+/// int32 -> int64, append a value BEYOND the int32 range under the widened type,
+/// and read back across the old int32 file + the new int64 file — old values
+/// up-cast and the beyond-range value survives. Exercises the composite-PK base
+/// model, promote_column_type, and cast-on-read on the priority backend.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_promote_widens_column_and_old_values_read_back() {
+    use arrow::array::{Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, MetadataWriter, MulticatalogProvider};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("promote").await.unwrap();
+    // One writer, reused across write/promote/append via Arc clones.
+    let writer: Arc<dyn MetadataWriter> =
+        Arc::new(PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap());
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // t(id int32) = [1, 2, 3] — physically int32 Parquet.
+    let i32_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let b32 =
+        RecordBatch::try_new(i32_schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let res = DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&store))
+        .unwrap()
+        .write_table("public", "t", &[b32])
+        .await
+        .unwrap();
+
+    // Promote id int32 -> int64 (schema evolution; no data rewritten).
+    writer
+        .promote_column_type(res.table_id, "id", "int64")
+        .unwrap();
+
+    // Append a value BEYOND the int32 range under the widened type (bug C's value).
+    let beyond_i32 = 5_000_000_000_i64;
+    let i64_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let b64 = RecordBatch::try_new(
+        i64_schema,
+        vec![Arc::new(Int64Array::from(vec![beyond_i32]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&store))
+        .unwrap()
+        .append_table("public", "t", &[b64])
+        .await
+        .unwrap();
+
+    // Read back through the multicatalog provider: column is Int64, old file
+    // up-casts, beyond-range value intact.
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "promote")
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("promote", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id FROM promote.public.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0].schema().field(0).data_type(),
+        &DataType::Int64,
+        "promoted column must read as Int64"
+    );
+    let mut got: Vec<i64> = Vec::new();
+    for b in &batches {
+        let ids = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id column should be Int64 after promote");
+        got.extend(ids.values().iter().copied());
+    }
+    got.sort();
+    assert_eq!(
+        got,
+        vec![1, 2, 3, beyond_i32],
+        "old int32 file up-casts AND the beyond-i32 value survives across the promote"
+    );
+}
+
+/// Safe-to-migrate (Postgres): a multicatalog store whose `ducklake_column` is in
+/// the LEGACY single-row `column_id` PK shape (as a pre-change version wrote it),
+/// holding real data, must convert to the composite PK on the next bootstrap and
+/// keep its data — then support a promote. Guards the bug where the migration was
+/// wired only into `initialize_schema`, not the multicatalog bootstrap that
+/// runtimedb actually calls.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
+    use arrow::array::{Array, Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, MulticatalogProvider};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("legacy").await.unwrap(); // catalog_id is i64 (Copy) — reusable
+
+    // Write real data t(id int32) = [1,2,3] (fresh DDL → composite PK).
+    {
+        let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+        let temp = TempDir::new().unwrap();
+        let data_path = temp.path().join("data");
+        std::fs::create_dir_all(&data_path).unwrap();
+        writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+        let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let b32 =
+            RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        // Keep the temp dir alive for the whole test by leaking it (data files must
+        // outlive the read below).
+        std::mem::forget(temp);
+        DuckLakeTableWriter::new(Arc::new(writer), store)
+            .unwrap()
+            .write_table("public", "t", &[b32])
+            .await
+            .unwrap();
+    }
+
+    // DOWNGRADE ducklake_column to the legacy single-row column_id PK (simulating
+    // a catalog written by a pre-change datafusion-ducklake version).
+    sqlx::query("DROP INDEX IF EXISTS idx_ducklake_column_live")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_column DROP CONSTRAINT ducklake_column_pkey")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_column ADD PRIMARY KEY (column_id)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pk_len: i32 = sqlx::query_scalar(
+        "SELECT array_length(conkey, 1) FROM pg_constraint
+         WHERE conrelid = 'ducklake_column'::regclass AND contype = 'p'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk_len, 1, "downgrade produced the legacy single-column PK");
+
+    // Re-run the multicatalog bootstrap → the migration converts the PK.
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let pk_len_after: i32 = sqlx::query_scalar(
+        "SELECT array_length(conkey, 1) FROM pg_constraint
+         WHERE conrelid = 'ducklake_column'::regclass AND contype = 'p'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pk_len_after, 3, "bootstrap migrated the legacy PK to the composite PK");
+
+    // Data preserved — reads through the provider return the original values.
+    let read = |pool: PgPool| async move {
+        let provider = MulticatalogProvider::with_pool(pool, "legacy").await.unwrap();
+        let catalog = DuckLakeCatalog::new(provider).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("legacy", Arc::new(catalog));
+        ctx.sql("SELECT id FROM legacy.public.t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+    };
+    let batches = read(pool.clone()).await;
+    let ids = batches[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(ids.values(), &[1, 2, 3], "data survived the Postgres migration");
+
+    // The migrated catalog now supports promote (two versioned rows, same id).
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_name = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let writer2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    writer2.promote_column_type(table_id, "id", "int64").unwrap();
+    let n_versions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_column WHERE table_id = $1 AND column_name = 'id'",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(n_versions, 2, "promote on the migrated catalog leaves two versioned rows");
+
+    let batches2 = read(pool.clone()).await;
+    assert_eq!(batches2[0].schema().field(0).data_type(), &DataType::Int64);
+    let ids2 = batches2[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ids2.values(), &[1, 2, 3], "post-migration promote widens + reads intact");
+}
+
+/// §5 on Postgres: both Replace and Append must REJECT a column type change
+/// (schema evolution must go through promote_column_type, not a data write).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_replace_and_append_reject_type_change() {
+    use arrow::array::{Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("reject").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let s64 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let b32 =
+        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+
+    // Build a fresh table writer (the writer Arc is consumed per call).
+    let tw = |store: Arc<dyn ObjectStore>, dp: String| {
+        let pool = pool.clone();
+        async move {
+            let w = PostgresMetadataWriter::with_pool(pool, cat).await.unwrap();
+            w.set_data_path(&dp).unwrap();
+            DuckLakeTableWriter::new(Arc::new(w), store).unwrap()
+        }
+    };
+    let dp = data_path.to_str().unwrap().to_string();
+
+    // Create t(id int32).
+    tw(Arc::clone(&store), dp.clone())
+        .await
+        .write_table("public", "t", &[b32])
+        .await
+        .unwrap();
+
+    // Replace with id int64 → rejected.
+    let b64a =
+        RecordBatch::try_new(s64.clone(), vec![Arc::new(Int64Array::from(vec![9_999_999_999]))])
+            .unwrap();
+    let replace_res = tw(Arc::clone(&store), dp.clone())
+        .await
+        .write_table("public", "t", &[b64a])
+        .await;
+    assert!(replace_res.is_err(), "Replace with a type change must be rejected on Postgres");
+
+    // Append with id int64 → rejected.
+    let b64b =
+        RecordBatch::try_new(s64, vec![Arc::new(Int64Array::from(vec![4, 5]))]).unwrap();
+    let append_res = tw(Arc::clone(&store), dp.clone())
+        .await
+        .append_table("public", "t", &[b64b])
+        .await;
+    assert!(append_res.is_err(), "Append with a type change must be rejected on Postgres");
+}
+
+/// Phase C on Postgres: a promote leaves the multicatalog `ducklake_column` in the
+/// upstream versioned shape — two rows sharing the same `column_id`, old retired +
+/// new live with the widened type.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_promote_leaves_two_versioned_rows() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("tworows").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let b32 =
+        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let res = DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&store))
+        .unwrap()
+        .write_table("public", "t", &[b32])
+        .await
+        .unwrap();
+
+    let promoter = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    promoter.promote_column_type(res.table_id, "id", "int64").unwrap();
+
+    let rows = sqlx::query(
+        "SELECT column_id, column_type, end_snapshot FROM ducklake_column
+         WHERE table_id = $1 AND column_name = 'id' ORDER BY begin_snapshot",
+    )
+    .bind(res.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "promote must leave two versioned rows");
+    let cid0: i64 = rows[0].try_get("column_id").unwrap();
+    let cid1: i64 = rows[1].try_get("column_id").unwrap();
+    let t0: String = rows[0].try_get("column_type").unwrap();
+    let t1: String = rows[1].try_get("column_type").unwrap();
+    let e0: Option<i64> = rows[0].try_get("end_snapshot").unwrap();
+    let e1: Option<i64> = rows[1].try_get("end_snapshot").unwrap();
+    assert_eq!(cid0, cid1, "both versions share the same column_id");
+    assert_eq!(t0, "int32");
+    assert!(e0.is_some(), "old version retired");
+    assert_eq!(t1, "int64");
+    assert!(e1.is_none(), "new version live");
+}
+
+/// Concurrency: two promotes fired at the SAME column at once must not corrupt —
+/// exactly one wins, the catalog ends with exactly two versioned rows and exactly
+/// one live version (no double-promote, no two-live-rows). Exercises lock_catalog
+/// + the partial unique index under real multi-connection contention.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_concurrent_promotes_one_wins_no_corruption() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("race").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let b32 =
+        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let res = DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&store))
+        .unwrap()
+        .write_table("public", "t", &[b32])
+        .await
+        .unwrap();
+    let tid = res.table_id;
+
+    // Two independent writers (separate connections) promote the same column at once.
+    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let h1 = tokio::task::spawn_blocking(move || w1.promote_column_type(tid, "id", "int64"));
+    let h2 = tokio::task::spawn_blocking(move || w2.promote_column_type(tid, "id", "int64"));
+    let (r1, r2) = tokio::join!(h1, h2);
+    let r1 = r1.unwrap();
+    let r2 = r2.unwrap();
+
+    assert!(
+        r1.is_ok() ^ r2.is_ok(),
+        "exactly one concurrent promote must succeed; got r1={r1:?} r2={r2:?}"
+    );
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_column WHERE table_id = $1 AND column_name = 'id'",
+    )
+    .bind(tid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(total, 2, "no double-promote: exactly two versioned rows, got {total}");
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_column
+         WHERE table_id = $1 AND column_name = 'id' AND end_snapshot IS NULL",
+    )
+    .bind(tid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 1, "exactly one live version after concurrent promotes, got {live}");
+}
+
+/// §14 E2: `schema_version` advances on a schema change (promote) but NOT on a
+/// data write (Append) — the spec-native "schema changed" signal consumers rely on.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn head_sv(pool: &PgPool, cat: i64) -> i64 {
+        sqlx::query_scalar(
+            "SELECT s.schema_version FROM ducklake_snapshot s
+             JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+             WHERE m.catalog_id = $1 ORDER BY s.snapshot_id DESC LIMIT 1",
+        )
+        .bind(cat)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("schemaver").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let dp = data_path.to_str().unwrap().to_string();
+    let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let mk = |v: Vec<i32>| {
+        RecordBatch::try_new(s32.clone(), vec![Arc::new(Int32Array::from(v))]).unwrap()
+    };
+
+    // Create table (DDL).
+    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    w0.set_data_path(&dp).unwrap();
+    let res = DuckLakeTableWriter::new(Arc::new(w0), Arc::clone(&store))
+        .unwrap()
+        .write_table("public", "t", &[mk(vec![1, 2, 3])])
+        .await
+        .unwrap();
+    let sv_create = head_sv(&pool, cat).await;
+
+    // Append (data write, same schema) — must NOT bump schema_version.
+    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    w1.set_data_path(&dp).unwrap();
+    DuckLakeTableWriter::new(Arc::new(w1), Arc::clone(&store))
+        .unwrap()
+        .append_table("public", "t", &[mk(vec![4, 5])])
+        .await
+        .unwrap();
+    let sv_append = head_sv(&pool, cat).await;
+    assert_eq!(sv_append, sv_create, "a data write (Append) must not bump schema_version");
+
+    // Promote (schema change) — MUST bump schema_version.
+    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    w2.promote_column_type(res.table_id, "id", "int64").unwrap();
+    let sv_promote = head_sv(&pool, cat).await;
+    assert!(
+        sv_promote > sv_append,
+        "a promote must bump schema_version ({sv_append} -> {sv_promote})"
+    );
+}
+
+/// MAJOR-1 regression: an Append that BEGINS pre-promote (staged int32) and
+/// COMMITS after a promote (column now int64) is a benign data write — it must
+/// NOT be misclassified as DDL, so schema_version must stay put and no extra
+/// ducklake_schema_versions row is written. Values still round-trip.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
+    use arrow::array::{Array, Int64Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, MulticatalogProvider};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn head_sv(pool: &PgPool, cat: i64) -> i64 {
+        sqlx::query_scalar(
+            "SELECT s.schema_version FROM ducklake_snapshot s
+             JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+             WHERE m.catalog_id = $1 ORDER BY s.snapshot_id DESC LIMIT 1",
+        )
+        .bind(cat)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("racebump").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let dp = data_path.to_str().unwrap().to_string();
+    let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+
+    // t(id int32) = [1,2,3]
+    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    w0.set_data_path(&dp).unwrap();
+    let res = DuckLakeTableWriter::new(Arc::new(w0), Arc::clone(&store))
+        .unwrap()
+        .write_table(
+            "public",
+            "t",
+            &[RecordBatch::try_new(s32.clone(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
+                .unwrap()],
+        )
+        .await
+        .unwrap();
+
+    // Begin an Append session under the (current) int32 schema and stage a batch.
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    wa.set_data_path(&dp).unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(wa), Arc::clone(&store)).unwrap();
+    let mut session = tw
+        .begin_write("public", "t", s32.as_ref(), WriteMode::Append)
+        .unwrap();
+    session
+        .write_batch(
+            &RecordBatch::try_new(s32.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))]).unwrap(),
+        )
+        .unwrap();
+
+    // A promote commits in between (int32 -> int64): bumps schema_version.
+    let wp = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    wp.promote_column_type(res.table_id, "id", "int64").unwrap();
+    let sv_after_promote = head_sv(&pool, cat).await;
+    let ledger_after_promote: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1",
+    )
+    .bind(res.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Finish the Append AFTER the promote — must NOT bump schema_version.
+    session.finish().await.unwrap();
+    let sv_after_append = head_sv(&pool, cat).await;
+    assert_eq!(
+        sv_after_append, sv_after_promote,
+        "benign Append racing a promote must NOT bump schema_version ({sv_after_promote} -> {sv_after_append})"
+    );
+
+    // The racing Append must NOT add a ducklake_schema_versions ledger row (it's a
+    // data write, not DDL — only table-create + the promote are legitimate rows).
+    let ledger_after_append: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1",
+    )
+    .bind(res.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger_after_append, ledger_after_promote,
+        "the racing Append must not add a schema_versions ledger row"
+    );
+
+    // Values round-trip (old + appended, all int64).
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "racebump").await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("racebump", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id FROM racebump.public.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut got: Vec<i64> = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        got.extend(ids.values().iter().copied());
+    }
+    got.sort();
+    assert_eq!(got, vec![1, 2, 3, 4, 5], "all rows present and correct after the race");
+}

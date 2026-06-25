@@ -105,7 +105,11 @@ impl DuckLakeCatalog {
     /// use std::sync::Arc;
     ///
     /// let provider = SqliteMetadataProvider::new("sqlite:catalog.db?mode=rwc").await?;
-    /// let writer = SqliteMetadataWriter::new("sqlite:catalog.db?mode=rwc").await?;
+    /// // Use `new_with_init` for a writable catalog: it creates the schema if
+    /// // absent AND runs idempotent migrations (e.g. upgrading a legacy
+    /// // `ducklake_column` so type promotion works). Plain `new()` is connect-only
+    /// // and skips migrations, so a pre-existing catalog opened that way is not upgraded.
+    /// let writer = SqliteMetadataWriter::new_with_init("sqlite:catalog.db?mode=rwc").await?;
     ///
     /// let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
     /// # Ok(())

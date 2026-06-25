@@ -318,18 +318,21 @@ pub fn normalize_ducklake_type(ducklake_type: &str) -> Result<String> {
     arrow_to_ducklake_type(&arrow_type)
 }
 
-/// Check if a type can be safely promoted (widened) to another type.
+/// The allowlist of **lossless** type widenings that `promote_column_type` may
+/// apply during schema evolution. Both type strings are normalized first.
 ///
-/// Type promotion allows safe widening of numeric types during schema evolution.
-/// Both type strings are normalized before comparison.
-///
-/// Supported promotions:
+/// This is a deliberately small, owned set (design §6) — the published DuckLake
+/// stable-spec widenings, every entry provably lossless:
 /// - Signed integer widening: int8 -> int16 -> int32 -> int64
 /// - Unsigned integer widening: uint8 -> uint16 -> uint32 -> uint64
 /// - Float widening: float32 -> float64
-/// - Integer to float: any int -> float64
-/// - Timestamp: timestamp -> timestamptz
-/// - Decimal: smaller precision/scale -> larger precision/scale
+///
+/// Deliberately **excluded** (each would need its own justified lossless entry +
+/// cast-on-read coverage): integer -> float (`int64`/`uint64 -> float64` loses
+/// precision past 2^53), `timestamp -> timestamptz`, and decimal precision/scale
+/// widening. The read path is more permissive (it casts whatever a file holds);
+/// this set only bounds what a *promote* may write. Same-type returns `true`
+/// (a no-op); callers wanting strict change-detection use `types_equal_canonical`.
 pub fn is_promotable(from: &str, to: &str) -> bool {
     let from_arrow = match ducklake_to_arrow_type(from) {
         Ok(t) => t,
@@ -387,27 +390,21 @@ fn is_arrow_promotable(from: &DataType, to: &DataType) -> bool {
         return true;
     }
 
-    // Integer to float64 (safe for reasonable values)
-    if signed_int_rank(from).is_some() && matches!(to, Float64) {
-        return true;
-    }
-
-    // Timestamp -> TimestampTZ
-    if matches!(from, Timestamp(_, None)) && matches!(to, Timestamp(_, Some(_))) {
-        return true;
-    }
-
-    // Decimal widening: integer digits don't shrink AND fractional digits don't shrink.
-    // We check (tp - ts >= fp - fs) to ensure the integer part has enough room,
-    // in addition to (ts >= fs) for the fractional part.
-    match (from, to) {
-        (Decimal128(fp, fs) | Decimal256(fp, fs), Decimal128(tp, ts) | Decimal256(tp, ts)) => {
-            let from_int_digits = *fp as i16 - *fs as i16;
-            let to_int_digits = *tp as i16 - *ts as i16;
-            ts >= fs && to_int_digits >= from_int_digits
-        },
-        _ => false,
-    }
+    // DEFAULT allowlist ends here. Everything below is DELIBERATELY excluded
+    // (design §6, review #4): the default promote set is the small, provably
+    // LOSSLESS set from the published DuckLake stable-spec widenings — signed
+    // integer widening, unsigned integer widening, and Float32 -> Float64 — and
+    // nothing else. Notably:
+    //   - `Int64`/`UInt64 -> Float64` is NOT lossless (precision loss past 2^53),
+    //   - integer -> float in general, `Timestamp -> TimestampTZ` (a semantic
+    //     reinterpretation, not a pure widen), and `Decimal` precision/scale
+    //     widening each need their own individually justified lossless entry +
+    //     cast-on-read coverage before being added here.
+    // We own this set rather than tracking upstream's `TypePromotionIsAllowed`
+    // (which delegates to a broad, DuckDB-version-dependent rule). The READ path
+    // stays permissive (it casts whatever a file physically holds); this set only
+    // governs what `promote_column_type` is allowed to WRITE.
+    false
 }
 
 /// Check if two DuckLake type strings are compatible for schema evolution.
@@ -431,6 +428,22 @@ pub fn types_compatible(existing_type: &str, new_type: &str) -> bool {
 
     // Then check if promotion is allowed
     is_promotable(existing_type, new_type)
+}
+
+/// Two DuckLake type strings denote the *same* type modulo aliases
+/// (`int64` ≡ `bigint`, `int` ≡ `int32`), with **no** promotion/widening.
+///
+/// This is the comparison used by the data-write policy (§5 of the column
+/// versioning design) and the commit-time type guard (§4.6): a data write
+/// (`Replace`/`Append`) may not change a column's type, but an alias-only
+/// restatement is a no-op. Unlike [`types_compatible`], a widening such as
+/// `int32 -> int64` is **not** considered equal — that is schema evolution and
+/// must go through an explicit promotion, never a data write.
+pub fn types_equal_canonical(a: &str, b: &str) -> bool {
+    match (normalize_ducklake_type(a), normalize_ducklake_type(b)) {
+        (Ok(na), Ok(nb)) => na == nb,
+        _ => false,
+    }
 }
 
 /// Build an Arrow schema from a list of DuckLake table columns
@@ -1368,43 +1381,34 @@ mod tests {
     }
 
     #[test]
-    fn test_promotable_int_to_float64() {
-        assert!(is_promotable("int8", "float64"));
-        assert!(is_promotable("int16", "float64"));
-        assert!(is_promotable("int32", "float64"));
-        assert!(is_promotable("int64", "float64"));
-    }
-
-    #[test]
-    fn test_promotable_int_to_float32_rejected() {
-        // We only allow int -> float64, not int -> float32
+    fn test_promotable_int_to_float_excluded() {
+        // int -> float is NOT in the conservative default set (design §6, review
+        // #4): int64/uint64 -> float64 loses precision past 2^53, so the whole
+        // int->float family is excluded until added as a justified per-width entry.
+        assert!(!is_promotable("int8", "float64"));
+        assert!(!is_promotable("int16", "float64"));
+        assert!(!is_promotable("int32", "float64"));
+        assert!(!is_promotable("int64", "float64"));
         assert!(!is_promotable("int32", "float32"));
     }
 
     #[test]
-    fn test_promotable_timestamp_to_timestamptz() {
-        assert!(is_promotable("timestamp", "timestamptz"));
-    }
-
-    #[test]
-    fn test_promotable_timestamptz_to_timestamp_rejected() {
+    fn test_promotable_timestamp_to_timestamptz_excluded() {
+        // timestamp -> timestamptz is a semantic reinterpretation, not a pure
+        // widen; excluded from the default set (both directions rejected).
+        assert!(!is_promotable("timestamp", "timestamptz"));
         assert!(!is_promotable("timestamptz", "timestamp"));
     }
 
     #[test]
-    fn test_promotable_decimal_widening() {
-        assert!(is_promotable("decimal(10, 2)", "decimal(18, 4)"));
-        assert!(is_promotable("decimal(10, 2)", "decimal(10, 2)")); // same
-        assert!(is_promotable("decimal(10, 2)", "decimal(20, 2)")); // wider precision
-        assert!(is_promotable("decimal(10, 2)", "decimal(12, 4)")); // wider scale with enough integer digits
-    }
-
-    #[test]
-    fn test_promotable_decimal_narrowing_rejected() {
-        assert!(!is_promotable("decimal(18, 4)", "decimal(10, 2)"));
-        assert!(!is_promotable("decimal(20, 2)", "decimal(10, 2)")); // narrower precision
-        // Scale widening that shrinks integer digits: 10-2=8 integer digits vs 12-8=4
-        assert!(!is_promotable("decimal(10, 2)", "decimal(12, 8)"));
+    fn test_promotable_decimal_excluded() {
+        // Decimal precision/scale widening is excluded from the conservative
+        // default set; it needs its own justified lossless entry + cast-on-read.
+        assert!(!is_promotable("decimal(10, 2)", "decimal(18, 4)"));
+        assert!(!is_promotable("decimal(10, 2)", "decimal(20, 2)"));
+        assert!(!is_promotable("decimal(18, 4)", "decimal(10, 2)")); // narrowing also rejected
+        // Same decimal type is still trivially "promotable" (a no-op).
+        assert!(is_promotable("decimal(10, 2)", "decimal(10, 2)"));
     }
 
     #[test]
@@ -1455,7 +1459,27 @@ mod tests {
     fn test_types_compatible_with_promotion() {
         assert!(types_compatible("int32", "int64"));
         assert!(types_compatible("float32", "float64"));
-        assert!(types_compatible("timestamp", "timestamptz"));
+        // timestamp -> timestamptz is no longer in the conservative promote set
+        // (design §6, review #4) — a semantic reinterpretation, not a pure widen.
+        assert!(!types_compatible("timestamp", "timestamptz"));
+    }
+
+    #[test]
+    fn test_types_equal_canonical() {
+        // Alias-only differences are EQUAL — the §5 data-write "no-op" case
+        // (a Replace/Append restating bigint as int64 must NOT be rejected).
+        assert!(types_equal_canonical("int64", "bigint"));
+        assert!(types_equal_canonical("bigint", "int64"));
+        assert!(types_equal_canonical("int", "int32"));
+        assert!(types_equal_canonical("text", "varchar"));
+        assert!(types_equal_canonical("INT64", "int64")); // case-insensitive
+        // A genuine widening is NOT canonical-equal — it must go through
+        // promote_column_type, not a data write (unlike `types_compatible`).
+        assert!(!types_equal_canonical("int32", "int64"));
+        assert!(!types_equal_canonical("float32", "float64"));
+        // Unrelated / unknown types differ.
+        assert!(!types_equal_canonical("int32", "varchar"));
+        assert!(!types_equal_canonical("foobar", "int32"));
     }
 
     #[test]

@@ -263,6 +263,32 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Vec<i64>>;
 
+    /// Promote (widen) an existing column's type in place — DuckLake schema
+    /// evolution, distinct from a data write (which *rejects* type changes; see
+    /// [`MetadataWriter::begin_write_transaction`]).
+    ///
+    /// In a single transaction: validate the change is a lossless widening
+    /// ([`crate::types::is_promotable`]), create a new snapshot, retire the live
+    /// `ducklake_column` row (set its `end_snapshot`), and insert a new row with
+    /// the **same `column_id`**, the new `column_type`, and `begin_snapshot` = the
+    /// new snapshot. The stable `column_id` keeps Parquet field-ids valid, so
+    /// files written before and after both resolve to their snapshot's version
+    /// (the read path casts old narrow values up to the widened type). Returns the
+    /// new snapshot id.
+    ///
+    /// Default impl errors — backends that don't support promotion yet return
+    /// [`crate::DuckLakeError::InvalidConfig`].
+    fn promote_column_type(
+        &self,
+        _table_id: i64,
+        _column_name: &str,
+        _new_ducklake_type: &str,
+    ) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "promote_column_type is not supported on this metadata backend".to_string(),
+        ))
+    }
+
     /// Register a new data file and publish its snapshot as the catalog head,
     /// atomically. For `Replace`, retires the prior generation in the same
     /// transaction. Returns the committed snapshot id: assigned at this commit

@@ -56,25 +56,31 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
     end_snapshot INTEGER
 );
 
+-- Faithful match of upstream `duckdb/ducklake` `ducklake_column`
+-- (`ducklake_metadata_manager.cpp:258`): a BARE table — no PRIMARY KEY, no
+-- NOT NULL, no DEFAULT — in upstream's exact column order. `column_id` is
+-- deliberately NOT a single-row PK: a column is versioned by
+-- `[begin_snapshot, end_snapshot)` and a stable-id type promotion writes a
+-- SECOND row with the same `column_id`, which a single-row PK would forbid.
+-- One-live-row / non-null / ownership invariants are enforced in the writer
+-- code + tests, exactly as upstream guarantees them (its table has no such
+-- constraints). The four `*default*` columns + `parent_column` are projected by
+-- DuckDB when it reads catalogs we produce; we leave them NULL (no nested-type
+-- or column-default writes yet). See docs/column-id-versioning-design.md §4.1.
 CREATE TABLE IF NOT EXISTS ducklake_column (
-    column_id INTEGER PRIMARY KEY,
-    table_id INTEGER NOT NULL,
-    column_name VARCHAR NOT NULL,
-    column_type VARCHAR NOT NULL,
-    column_order INTEGER NOT NULL,
-    nulls_allowed BOOLEAN DEFAULT 1,
-    -- Mirror the upstream DuckLake spec (ducklake_metadata_manager.cpp):
-    -- `parent_column` is projected by our reader's SQL_GET_TABLE_COLUMNS;
-    -- the four `*default*` columns are projected by DuckDB when it reads
-    -- catalogs we produce. We leave them NULL — no nested-type or
-    -- column-default writes yet.
+    column_id BIGINT,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    table_id BIGINT,
+    column_order BIGINT,
+    column_name VARCHAR,
+    column_type VARCHAR,
     initial_default VARCHAR,
     default_value VARCHAR,
-    parent_column INTEGER,
+    nulls_allowed BOOLEAN,
+    parent_column BIGINT,
     default_value_type VARCHAR,
-    default_value_dialect VARCHAR,
-    begin_snapshot INTEGER NOT NULL,
-    end_snapshot INTEGER
+    default_value_dialect VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_data_file (
@@ -595,6 +601,111 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Upgrade an existing `ducklake_column` from the legacy shape
+/// (`column_id INTEGER PRIMARY KEY` — this library's pre-versioning layout) to
+/// upstream's bare shape (`column_id BIGINT`, no PK; see `SQL_CREATE_SCHEMA`).
+///
+/// `CREATE TABLE IF NOT EXISTS` only shapes *new* catalogs; a catalog written by
+/// an earlier version keeps its old table, so we must rebuild it in place — SQLite
+/// cannot `ALTER TABLE ... DROP PRIMARY KEY`. The single-row PK forbade a second
+/// row sharing a `column_id`, which a versioned / type-promoted column requires,
+/// so this migration is what lets existing users' catalogs support type promotion.
+///
+/// **Idempotent:** a no-op once `column_id` is no longer a PK (re-runs on every
+/// `initialize_schema`). **Crash-safe:** the rebuild is one transaction (SQLite
+/// DDL is transactional), so a crash leaves either the old or the new table whole,
+/// never a half-state. **Lossless:** every row and every `column_id` value is
+/// preserved (field-ids baked in Parquet stay valid), and it tolerates older
+/// catalogs missing some of the 13 columns (those are filled with `NULL`).
+async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
+    // Legacy shape iff `column_id` is a PRIMARY KEY. `pragma_table_info` returns
+    // one row per column with a `pk` flag (0 = not part of the PK).
+    let info = sqlx::query("SELECT name, pk FROM pragma_table_info('ducklake_column')")
+        .fetch_all(pool)
+        .await?;
+    let mut legacy_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut column_id_is_pk = false;
+    for row in &info {
+        let name: String = row.try_get("name")?;
+        let pk: i64 = row.try_get("pk")?;
+        if name == "column_id" && pk != 0 {
+            column_id_is_pk = true;
+        }
+        legacy_cols.insert(name);
+    }
+    if !column_id_is_pk {
+        // Fresh (already bare) or previously migrated — nothing to do.
+        return Ok(());
+    }
+
+    // Target = upstream's exact bare column set/order. MUST stay in sync with the
+    // `ducklake_column` DDL in `SQL_CREATE_SCHEMA`.
+    const TARGET: &[&str] = &[
+        "column_id",
+        "begin_snapshot",
+        "end_snapshot",
+        "table_id",
+        "column_order",
+        "column_name",
+        "column_type",
+        "initial_default",
+        "default_value",
+        "nulls_allowed",
+        "parent_column",
+        "default_value_type",
+        "default_value_dialect",
+    ];
+    // Copy each target column from the legacy table if present, else NULL — so a
+    // catalog that predates the `*default*`/`parent_column` columns still migrates.
+    let select_list = TARGET
+        .iter()
+        .map(|c| {
+            if legacy_cols.contains(*c) {
+                (*c).to_string()
+            } else {
+                "NULL".to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert_list = TARGET.join(", ");
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "CREATE TABLE ducklake_column__migrate (
+            column_id BIGINT,
+            begin_snapshot BIGINT,
+            end_snapshot BIGINT,
+            table_id BIGINT,
+            column_order BIGINT,
+            column_name VARCHAR,
+            column_type VARCHAR,
+            initial_default VARCHAR,
+            default_value VARCHAR,
+            nulls_allowed BOOLEAN,
+            parent_column BIGINT,
+            default_value_type VARCHAR,
+            default_value_dialect VARCHAR
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "INSERT INTO ducklake_column__migrate ({insert_list}) \
+         SELECT {select_list} FROM ducklake_column"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DROP TABLE ducklake_column")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("ALTER TABLE ducklake_column__migrate RENAME TO ducklake_column")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Optimistic-concurrency check for a `Replace` commit (mirrors the Postgres
 /// writer). Run while holding the SQLite write lock, before retiring the prior
 /// generation: if any data file of the table has `begin_snapshot` or
@@ -872,6 +983,99 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn promote_column_type(
+        &self,
+        table_id: i64,
+        column_name: &str,
+        new_ducklake_type: &str,
+    ) -> Result<i64> {
+        // Reject an unknown target type up front (before opening a transaction).
+        crate::types::ducklake_to_arrow_type(new_ducklake_type)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+
+            // Locate the live version of the column.
+            let row = sqlx::query(
+                "SELECT column_id, column_type, column_order, nulls_allowed
+                 FROM ducklake_column
+                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .bind(column_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: no live column '{column_name}' in table {table_id}"
+                ))
+            })?;
+            let column_id: i64 = row.try_get("column_id")?;
+            let cur_type: String = row.try_get("column_type")?;
+            let column_order: i64 = row.try_get("column_order")?;
+            let nulls_allowed: bool =
+                row.try_get::<Option<bool>, _>("nulls_allowed")?.unwrap_or(true);
+
+            // No-op / not-a-widening guards. Canonical equality first so an
+            // alias-only restatement is reported as "no change", not attempted.
+            if crate::types::types_equal_canonical(&cur_type, new_ducklake_type) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: column '{column_name}' is already type '{cur_type}' (no change)"
+                )));
+            }
+            if !crate::types::is_promotable(&cur_type, new_ducklake_type) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "promote_column_type: '{cur_type}' -> '{new_ducklake_type}' is not an allowed lossless widening for column '{column_name}'"
+                )));
+            }
+
+            // New snapshot for the schema change (mirrors create_snapshot).
+            let new_snapshot: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
+                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
+                 RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+
+            // Retire the live row and insert a new version with the SAME column_id
+            // (stable field-id). Old/new data files each resolve to their snapshot's
+            // version; the read path casts old narrow values up to the new type.
+            sqlx::query(
+                "UPDATE ducklake_column SET end_snapshot = ?
+                 WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .bind(column_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_column
+                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?)",
+            )
+            .bind(column_id)
+            .bind(new_snapshot)
+            .bind(table_id)
+            .bind(column_order)
+            .bind(column_name)
+            .bind(new_ducklake_type)
+            .bind(nulls_allowed)
+            .execute(&mut *tx)
+            .await?;
+
+            // TODO(schema_version, task #3): bump ducklake_snapshot.schema_version on
+            // this DDL snapshot so consumers can detect the change.
+            // TODO(commit-time type guard, task #4): close the window where an Append
+            // that began before this promote commits afterward under the old type
+            // (the §5 begin-time reject is the fail-fast layer only).
+
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
     fn set_columns(
         &self,
         table_id: i64,
@@ -1130,6 +1334,10 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
+            // Upgrade a pre-existing catalog's `ducklake_column` from the legacy
+            // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
+            // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
+            migrate_ducklake_column_drop_pk(&self.pool).await?;
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved in begin_write_transaction and inserted at the commit, so
             // they can't use rowid autoincrement (inserting the ducklake_snapshot
@@ -1270,10 +1478,15 @@ impl MetadataWriter for SqliteMetadataWriter {
                 existing_columns.push((name, col_type, nullable));
             }
 
-            // For append mode, validate schema compatibility with evolution rules:
-            // - Allowed: add nullable columns, remove columns, reorder columns
-            // - Disallowed: add non-nullable columns, type changes for existing columns
-            if mode == WriteMode::Append && !existing_columns.is_empty() {
+            // Data-write policy (§5): a data write — Replace OR Append — must NOT
+            // change a column's type. A type change is schema evolution and must
+            // go through `promote_column_type`, never a data write; silently
+            // keeping the old catalog type (the historic "C" bug) corrupts reads.
+            // The comparison is canonical (`int64` ≡ `bigint`) so an alias-only
+            // restatement is a no-op, not an error. Append additionally requires a
+            // genuinely new column to be nullable (a Replace overwrites every row,
+            // so a new non-nullable column is fine there).
+            if !existing_columns.is_empty() {
                 use std::collections::HashMap;
 
                 // Build map of existing columns: name -> (type, nullable)
@@ -1288,25 +1501,27 @@ impl MetadataWriter for SqliteMetadataWriter {
                     if let Some((existing_type, _existing_nullable)) =
                         existing_map.get(new_col.name.as_str())
                     {
-                        // Column exists - check type compatibility (normalize aliases + allow promotions)
-                        if !crate::types::types_compatible(existing_type, &new_col.ducklake_type) {
+                        // Same-name column: a (canonical) type change is rejected in
+                        // BOTH modes. Not `types_compatible` — that accepts widenings,
+                        // which is exactly the silent acceptance we are closing.
+                        if !crate::types::types_equal_canonical(existing_type, &new_col.ducklake_type)
+                        {
                             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Schema evolution error: column '{}' has type '{}' in existing table but '{}' in new schema. Type changes are not allowed.",
-                                new_col.name, existing_type, new_col.ducklake_type
+                                "Column '{}' type change ('{}' -> '{}') is not allowed on a {:?} data write; \
+                                 use promote_column_type for a widening, then write data under the new type.",
+                                new_col.name, existing_type, new_col.ducklake_type, mode
                             )));
                         }
-                        // Note: We allow nullable changes (strict -> nullable is safe for reads)
-                    } else {
-                        // New column - must be nullable
-                        if !new_col.is_nullable {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
-                                new_col.name
-                            )));
-                        }
+                        // Nullable changes remain allowed (strict -> nullable is safe for reads).
+                    } else if mode == WriteMode::Append && !new_col.is_nullable {
+                        // New column on append - must be nullable.
+                        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                            "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
+                            new_col.name
+                        )));
                     }
                 }
-                // Columns in existing but not in new schema are implicitly removed - this is allowed
+                // Columns in existing but not in new schema are implicitly removed - this is allowed.
             }
 
             // Final per-column ids: reuse the existing id for a column already in
@@ -1355,6 +1570,97 @@ mod tests {
             .await
             .unwrap();
         (writer, temp_dir)
+    }
+
+    /// An existing user's catalog (legacy `column_id INTEGER PRIMARY KEY`) must be
+    /// upgraded in place to upstream's bare shape: rows + `column_id`s preserved,
+    /// the single-row PK gone (so versioned/promoted columns become expressible),
+    /// and the migration idempotent. This is the "people already using the
+    /// library" path — `CREATE TABLE IF NOT EXISTS` alone would not touch them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_legacy_column_pk_to_bare_shape() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("legacy.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&conn_str).await.unwrap();
+
+        // Build the LEGACY ducklake_column exactly as a pre-versioning catalog had it.
+        sqlx::query(
+            "CREATE TABLE ducklake_column (
+                column_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                column_name VARCHAR NOT NULL,
+                column_type VARCHAR NOT NULL,
+                column_order INTEGER NOT NULL,
+                nulls_allowed BOOLEAN DEFAULT 1,
+                initial_default VARCHAR,
+                default_value VARCHAR,
+                parent_column INTEGER,
+                default_value_type VARCHAR,
+                default_value_dialect VARCHAR,
+                begin_snapshot INTEGER NOT NULL,
+                end_snapshot INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ducklake_column
+                 (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+             VALUES (5, 1, 'id', 'int32', 0, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Sanity: the legacy PK rejects a second row sharing the column_id.
+        let dup = sqlx::query(
+            "INSERT INTO ducklake_column
+                 (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
+             VALUES (5, 1, 'id', 'int64', 0, 1, 2)",
+        )
+        .execute(&pool)
+        .await;
+        assert!(dup.is_err(), "legacy single-row PK must reject a duplicate column_id");
+
+        // Migrate.
+        migrate_ducklake_column_drop_pk(&pool).await.unwrap();
+
+        // Row + column_id value preserved.
+        let row = sqlx::query(
+            "SELECT column_id, column_name, column_type FROM ducklake_column WHERE begin_snapshot = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<i64, _>("column_id").unwrap(), 5);
+        assert_eq!(row.try_get::<String, _>("column_name").unwrap(), "id");
+        assert_eq!(row.try_get::<String, _>("column_type").unwrap(), "int32");
+
+        // The PK is gone: a SECOND version row with the same column_id now coexists
+        // (the whole point — versioned / type-promoted columns).
+        sqlx::query(
+            "INSERT INTO ducklake_column
+                 (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed)
+             VALUES (5, 2, NULL, 1, 0, 'id', 'int64', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_column WHERE column_id = 5")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cnt, 2, "two version rows sharing a column_id must coexist post-migration");
+
+        // Idempotent: re-running is a no-op and leaves data intact.
+        migrate_ducklake_column_drop_pk(&pool).await.unwrap();
+        let cnt2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_column")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cnt2, 2, "migration must be idempotent");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1431,6 +1737,217 @@ mod tests {
         assert_eq!(column_ids.len(), 2);
         assert_eq!(column_ids[0], 1);
         assert_eq!(column_ids[1], 2);
+    }
+
+    /// Phase C (catalog-state faithfulness): a type promotion must leave the
+    /// `ducklake_column` table in upstream DuckLake's exact versioned shape — TWO
+    /// rows sharing the SAME `column_id`, the old one retired (`end_snapshot` set)
+    /// and the new one live (`end_snapshot IS NULL`) with the widened type. This is
+    /// precisely the two-rows-per-column the old single-row PK forbade.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn promote_leaves_two_versioned_column_rows_same_id() {
+        let (writer, _temp) = create_test_writer().await;
+        let snap1 = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
+        let (table_id, _) = writer.get_or_create_table(schema_id, "t", None, snap1).unwrap();
+        writer
+            .set_columns(table_id, &[ColumnDef::new("id", "int32", false).unwrap()], snap1)
+            .unwrap();
+
+        let snap2 = writer.promote_column_type(table_id, "id", "int64").unwrap();
+        assert!(snap2 > snap1, "promote creates a newer snapshot");
+
+        let rows = sqlx::query(
+            "SELECT column_id, column_type, begin_snapshot, end_snapshot
+             FROM ducklake_column
+             WHERE table_id = ? AND column_name = 'id'
+             ORDER BY begin_snapshot",
+        )
+        .bind(table_id)
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2, "promote must leave TWO versioned rows for the column");
+
+        let cid0: i64 = rows[0].try_get("column_id").unwrap();
+        let type0: String = rows[0].try_get("column_type").unwrap();
+        let end0: Option<i64> = rows[0].try_get("end_snapshot").unwrap();
+        let cid1: i64 = rows[1].try_get("column_id").unwrap();
+        let type1: String = rows[1].try_get("column_type").unwrap();
+        let begin1: i64 = rows[1].try_get("begin_snapshot").unwrap();
+        let end1: Option<i64> = rows[1].try_get("end_snapshot").unwrap();
+
+        assert_eq!(cid0, cid1, "both versions share the SAME column_id (stable field-id)");
+        assert_eq!(type0, "int32", "old version retains its int32 type");
+        assert_eq!(end0, Some(snap2), "old version retired at the promote snapshot");
+        assert_eq!(type1, "int64", "new version carries the widened int64 type");
+        assert_eq!(begin1, snap2, "new version begins at the promote snapshot");
+        assert_eq!(end1, None, "new version is the live one");
+
+        // D4: exactly ONE live row per field-id after the promote.
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ducklake_column
+             WHERE table_id = ? AND column_name = 'id' AND end_snapshot IS NULL",
+        )
+        .bind(table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1, "exactly one live version per field-id after promote");
+    }
+
+    /// Phase D (old-version data → latest): a catalog whose `ducklake_column` is in
+    /// the LEGACY single-row-PK shape (as a previous datafusion-ducklake version
+    /// wrote it), holding real data files, must upgrade in place on re-open and read
+    /// its values back intact — then support a promote. We simulate the old version
+    /// by writing with the current writer, then rebuilding `ducklake_column` to the
+    /// legacy shape; re-opening runs the forward migration.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase_d_legacy_catalog_with_data_upgrades_and_reads() {
+        use crate::{DuckLakeCatalog, DuckLakeTableWriter, SqliteMetadataProvider};
+        use arrow::array::{Array, Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::prelude::SessionContext;
+        use object_store::local::LocalFileSystem;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("test.db");
+        let data_path = temp.path().join("data");
+        std::fs::create_dir_all(&data_path).unwrap();
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+        // 1. Write real data (t(id int32) = [1,2,3]) with the current writer.
+        {
+            let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+            writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+            let store: std::sync::Arc<dyn object_store::ObjectStore> =
+                std::sync::Arc::new(LocalFileSystem::new());
+            let schema =
+                std::sync::Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![std::sync::Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            DuckLakeTableWriter::new(std::sync::Arc::new(writer), store)
+                .unwrap()
+                .write_table("main", "t", &[batch])
+                .await
+                .unwrap();
+        }
+
+        // 2. Downgrade ducklake_column to the LEGACY single-row-PK shape (what an
+        //    older version wrote), preserving rows + column_ids. Data files untouched.
+        {
+            let pool = SqlitePool::connect(&conn_str).await.unwrap();
+            sqlx::query("ALTER TABLE ducklake_column RENAME TO ducklake_column__tmp")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE ducklake_column (
+                    column_id INTEGER PRIMARY KEY,
+                    table_id INTEGER NOT NULL,
+                    column_name VARCHAR NOT NULL,
+                    column_type VARCHAR NOT NULL,
+                    column_order INTEGER NOT NULL,
+                    nulls_allowed BOOLEAN DEFAULT 1,
+                    initial_default VARCHAR,
+                    default_value VARCHAR,
+                    parent_column INTEGER,
+                    default_value_type VARCHAR,
+                    default_value_dialect VARCHAR,
+                    begin_snapshot INTEGER NOT NULL,
+                    end_snapshot INTEGER
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO ducklake_column
+                     (column_id, table_id, column_name, column_type, column_order,
+                      nulls_allowed, begin_snapshot, end_snapshot)
+                 SELECT column_id, table_id, column_name, column_type, column_order,
+                        nulls_allowed, begin_snapshot, end_snapshot
+                 FROM ducklake_column__tmp",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("DROP TABLE ducklake_column__tmp")
+                .execute(&pool)
+                .await
+                .unwrap();
+            // Sanity: it really is the legacy PK shape now.
+            let is_pk: i64 = sqlx::query_scalar(
+                "SELECT pk FROM pragma_table_info('ducklake_column') WHERE name = 'column_id'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(is_pk, 1, "downgrade produced the legacy single-row PK");
+            pool.close().await;
+        }
+
+        // 3. Re-open with the current version → initialize_schema runs the forward
+        //    migration (legacy PK -> bare shape).
+        let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+        let is_pk: i64 = sqlx::query_scalar(
+            "SELECT pk FROM pragma_table_info('ducklake_column') WHERE name = 'column_id'",
+        )
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        assert_eq!(is_pk, 0, "re-open migrated the legacy PK away");
+
+        // 4. The old data reads back intact through the full provider.
+        let read_conn = format!("sqlite:{}", db_path.display());
+        let provider = SqliteMetadataProvider::new(&read_conn).await.unwrap();
+        let catalog = DuckLakeCatalog::new(provider).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("test", std::sync::Arc::new(catalog));
+        let batches = ctx
+            .sql("SELECT id FROM test.main.t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ids.values(), &[1, 2, 3], "old-version data reads intact after upgrade");
+
+        // 5. The migrated catalog now supports promote (versioning enabled).
+        let table_id: i64 =
+            sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_name = 't'")
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap();
+        writer.promote_column_type(table_id, "id", "int64").unwrap();
+        let provider2 = SqliteMetadataProvider::new(&read_conn).await.unwrap();
+        let catalog2 = DuckLakeCatalog::new(provider2).unwrap();
+        let ctx2 = SessionContext::new();
+        ctx2.register_catalog("test", std::sync::Arc::new(catalog2));
+        let batches2 = ctx2
+            .sql("SELECT id FROM test.main.t ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(batches2[0].schema().field(0).data_type(), &DataType::Int64);
+        let ids2 = batches2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids2.values(), &[1, 2, 3], "post-upgrade promote widens + reads intact");
     }
 
     #[tokio::test(flavor = "multi_thread")]
