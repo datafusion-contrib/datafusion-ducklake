@@ -452,14 +452,21 @@ pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, Str
     let schema_descr = metadata.file_metadata().schema_descr();
     let mut field_id_map = HashMap::new();
 
-    for i in 0..schema_descr.num_columns() {
-        let column = schema_descr.column(i);
-        let basic_info = column.self_type().get_basic_info();
-
+    // DuckLake assigns one field_id per *top-level* column (`column_id` == the
+    // top-level field's field_id), so read ids off the top-level fields — the
+    // root group's direct children — NOT the Parquet leaf columns.
+    //
+    // For a scalar the top-level field *is* the leaf, so both are equivalent. But
+    // for a nested column (List / struct / map) the field_id lives on the group
+    // node while the leaves carry none — e.g. a `List<Float32>` column `v` is
+    // `v (group, field_id=2) -> list -> element (leaf, no id)`. Walking the leaves
+    // (`num_columns()`) misses `v`'s id entirely, so the matcher treats the column
+    // as absent and null-fills it. Walking top-level fields finds the id where it
+    // actually sits.
+    for field in schema_descr.root_schema().get_fields() {
+        let basic_info = field.get_basic_info();
         if basic_info.has_id() {
-            let field_id = basic_info.id();
-            let column_name = column.name().to_string();
-            field_id_map.insert(field_id, column_name);
+            field_id_map.insert(basic_info.id(), field.name().to_string());
         }
     }
 

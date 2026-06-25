@@ -130,6 +130,79 @@ async fn test_write_and_read_basic_types() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_write_and_read_list_column_roundtrip() {
+    // Nested write->read coverage: a `List` column must round-trip its VALUES, not
+    // get null-filled by the field-id read mapping. The field-id sits on the
+    // top-level node; the List leaf carries none, so a leaf-only field-id lookup
+    // would treat the column as absent. Isolates WRITE (raw parquet) vs READ.
+    use arrow::datatypes::Float32Type;
+
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let v = arrow::array::ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(1.0f32), Some(2.0), Some(3.0)]),
+        Some(vec![Some(4.0f32), Some(5.0), Some(6.0)]),
+        Some(vec![Some(7.0f32), Some(8.0), Some(9.0)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", v.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(v)],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let res = table_writer
+        .write_table("main", "vecs", &[batch])
+        .await
+        .unwrap();
+    assert_eq!(res.records_written, 3);
+
+    // (1) RAW parquet: did the WRITE persist the values, and do leaf columns carry field-ids?
+    let data_dir = temp_dir.path().join("data").join("main").join("vecs");
+    let pq = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "parquet").unwrap_or(false))
+        .expect("a parquet file was written");
+    {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let file = std::fs::File::open(&pq).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let raw = reader.next().unwrap().unwrap();
+        let vidx = raw.schema().index_of("v").unwrap();
+        assert_eq!(
+            raw.column(vidx).null_count(),
+            0,
+            "WRITE side: raw parquet must persist v values (no nulls)"
+        );
+    }
+
+    // (2) ducklake READ-BACK: does the read return the values, or null-fill the List?
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT v FROM test.main.vecs")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let nulls: usize = batches.iter().map(|b| b.column(0).null_count()).sum();
+    assert_eq!(total, 3, "read returns 3 rows");
+    assert_eq!(
+        nulls, 0,
+        "READ side: ducklake must return v VALUES, not null-fill the List column"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_write_temporal_types() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
@@ -396,6 +469,73 @@ async fn test_append_preserves_first_file_values() {
     }
     got.sort();
     assert_eq!(got, vec![(1, 100), (2, 200), (3, 300), (4, 400)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_append_list_columns_multi_file() {
+    // Regression guard for the per-file field-id read mapping on NESTED columns.
+    // A write + an append produce two separate Parquet files; each is matched
+    // independently via extract_parquet_field_ids. A List column's field-id lives
+    // on its top-level node, so a leaf-only walk would null-fill it in EVERY file.
+    // The single-file List roundtrip and the multi-file scalar append tests would
+    // both still pass under that bug, so this multi-file List case is the one that
+    // actually fails if the field-id walk regresses to leaves.
+    use arrow::datatypes::Float32Type;
+
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let v1 = arrow::array::ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(1.0f32), Some(2.0), Some(3.0)]),
+        Some(vec![Some(4.0f32), Some(5.0), Some(6.0)]),
+    ]);
+    let v2 = arrow::array::ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(7.0f32), Some(8.0), Some(9.0)]),
+        Some(vec![Some(10.0f32), Some(11.0), Some(12.0)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("v", v1.data_type().clone(), true),
+    ]));
+
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(v1)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "vt", &[batch1])
+        .await
+        .unwrap();
+
+    let batch2 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(v2)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
+        .unwrap()
+        .append_table("main", "vt", &[batch2])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT id, v FROM test.main.vt ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let v_nulls: usize = batches.iter().map(|b| b.column(1).null_count()).sum();
+    assert_eq!(total, 4, "both files' rows must be read");
+    assert_eq!(
+        v_nulls, 0,
+        "List column must survive a multi-file (write + append) read; a leaf-only \
+         field-id walk would null-fill it in each file"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

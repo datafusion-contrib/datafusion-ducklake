@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Concurrent `WriteMode::Replace` on the experimental PostgreSQL multi-catalog write path could union conflicting generations instead of rejecting one.** Converged the multi-catalog writer onto DuckLake's commit-time model: a snapshot's id is assigned at commit (commit-ordered), and all of its metadata — snapshot, schema/table, columns, data files, and the published head — is written in a single transaction, so committed-but-unpublished rows are never visible to readers or conflict checks. `Replace` now aborts with a `Conflict` error when another writer published a newer generation of the table since the write began. Column field-ids stay stable across a same-schema `Replace`, and an `Append` racing a table creation aborts rather than producing NULL-filled reads. No on-disk format, DuckLake spec, or public API change (#146).
+- **Nested (`List` / struct / map) columns could read back all-NULL.** The read-schema field-id matcher built its `field_id → column` map from Parquet *leaf* columns, but a column's field-id is stamped on its *top-level* field — which for a nested column is the group node, leaving the leaf with no id. The column was therefore treated as absent from the file and null-filled. Field-ids are now read from the top-level fields, so nested columns resolve correctly; scalar columns are unaffected (their top-level field is the leaf). Adds a `List` write→read roundtrip regression test.
 
 ## [0.3.1] - 2026-06-23
 
