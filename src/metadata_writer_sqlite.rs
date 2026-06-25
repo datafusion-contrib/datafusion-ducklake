@@ -1012,8 +1012,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             let column_id: i64 = row.try_get("column_id")?;
             let cur_type: String = row.try_get("column_type")?;
             let column_order: i64 = row.try_get("column_order")?;
-            let nulls_allowed: bool =
-                row.try_get::<Option<bool>, _>("nulls_allowed")?.unwrap_or(true);
+            let nulls_allowed: bool = row
+                .try_get::<Option<bool>, _>("nulls_allowed")?
+                .unwrap_or(true);
 
             // No-op / not-a-widening guards. Canonical equality first so an
             // alias-only restatement is reported as "no change", not attempted.
@@ -1504,8 +1505,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                         // Same-name column: a (canonical) type change is rejected in
                         // BOTH modes. Not `types_compatible` — that accepts widenings,
                         // which is exactly the silent acceptance we are closing.
-                        if !crate::types::types_equal_canonical(existing_type, &new_col.ducklake_type)
-                        {
+                        if !crate::types::types_equal_canonical(
+                            existing_type,
+                            &new_col.ducklake_type,
+                        ) {
                             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                                 "Column '{}' type change ('{}' -> '{}') is not allowed on a {:?} data write; \
                                  use promote_column_type for a widening, then write data under the new type.",
@@ -1622,7 +1625,10 @@ mod tests {
         )
         .execute(&pool)
         .await;
-        assert!(dup.is_err(), "legacy single-row PK must reject a duplicate column_id");
+        assert!(
+            dup.is_err(),
+            "legacy single-row PK must reject a duplicate column_id"
+        );
 
         // Migrate.
         migrate_ducklake_column_drop_pk(&pool).await.unwrap();
@@ -1648,11 +1654,15 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let cnt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_column WHERE column_id = 5")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(cnt, 2, "two version rows sharing a column_id must coexist post-migration");
+        let cnt: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_column WHERE column_id = 5")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            cnt, 2,
+            "two version rows sharing a column_id must coexist post-migration"
+        );
 
         // Idempotent: re-running is a no-op and leaves data intact.
         migrate_ducklake_column_drop_pk(&pool).await.unwrap();
@@ -1749,9 +1759,15 @@ mod tests {
         let (writer, _temp) = create_test_writer().await;
         let snap1 = writer.create_snapshot().unwrap();
         let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
-        let (table_id, _) = writer.get_or_create_table(schema_id, "t", None, snap1).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap1)
+            .unwrap();
         writer
-            .set_columns(table_id, &[ColumnDef::new("id", "int32", false).unwrap()], snap1)
+            .set_columns(
+                table_id,
+                &[ColumnDef::new("id", "int32", false).unwrap()],
+                snap1,
+            )
             .unwrap();
 
         let snap2 = writer.promote_column_type(table_id, "id", "int64").unwrap();
@@ -1768,7 +1784,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rows.len(), 2, "promote must leave TWO versioned rows for the column");
+        assert_eq!(
+            rows.len(),
+            2,
+            "promote must leave TWO versioned rows for the column"
+        );
 
         let cid0: i64 = rows[0].try_get("column_id").unwrap();
         let type0: String = rows[0].try_get("column_type").unwrap();
@@ -1778,9 +1798,16 @@ mod tests {
         let begin1: i64 = rows[1].try_get("begin_snapshot").unwrap();
         let end1: Option<i64> = rows[1].try_get("end_snapshot").unwrap();
 
-        assert_eq!(cid0, cid1, "both versions share the SAME column_id (stable field-id)");
+        assert_eq!(
+            cid0, cid1,
+            "both versions share the SAME column_id (stable field-id)"
+        );
         assert_eq!(type0, "int32", "old version retains its int32 type");
-        assert_eq!(end0, Some(snap2), "old version retired at the promote snapshot");
+        assert_eq!(
+            end0,
+            Some(snap2),
+            "old version retired at the promote snapshot"
+        );
         assert_eq!(type1, "int64", "new version carries the widened int64 type");
         assert_eq!(begin1, snap2, "new version begins at the promote snapshot");
         assert_eq!(end1, None, "new version is the live one");
@@ -1794,7 +1821,10 @@ mod tests {
         .fetch_one(&writer.pool)
         .await
         .unwrap();
-        assert_eq!(live, 1, "exactly one live version per field-id after promote");
+        assert_eq!(
+            live, 1,
+            "exactly one live version per field-id after promote"
+        );
     }
 
     /// Phase D (old-version data → latest): a catalog whose `ducklake_column` is in
@@ -1820,7 +1850,9 @@ mod tests {
 
         // 1. Write real data (t(id int32) = [1,2,3]) with the current writer.
         {
-            let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+            let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+                .await
+                .unwrap();
             writer.set_data_path(data_path.to_str().unwrap()).unwrap();
             let store: std::sync::Arc<dyn object_store::ObjectStore> =
                 std::sync::Arc::new(LocalFileSystem::new());
@@ -1894,7 +1926,9 @@ mod tests {
 
         // 3. Re-open with the current version → initialize_schema runs the forward
         //    migration (legacy PK -> bare shape).
-        let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+        let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
         let is_pk: i64 = sqlx::query_scalar(
             "SELECT pk FROM pragma_table_info('ducklake_column') WHERE name = 'column_id'",
         )
@@ -1921,7 +1955,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        assert_eq!(ids.values(), &[1, 2, 3], "old-version data reads intact after upgrade");
+        assert_eq!(
+            ids.values(),
+            &[1, 2, 3],
+            "old-version data reads intact after upgrade"
+        );
 
         // 5. The migrated catalog now supports promote (versioning enabled).
         let table_id: i64 =
@@ -1947,7 +1985,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ids2.values(), &[1, 2, 3], "post-upgrade promote widens + reads intact");
+        assert_eq!(
+            ids2.values(),
+            &[1, 2, 3],
+            "post-upgrade promote widens + reads intact"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

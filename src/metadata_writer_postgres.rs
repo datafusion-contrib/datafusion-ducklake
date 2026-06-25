@@ -869,8 +869,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             let column_id: i64 = row.try_get("column_id")?;
             let cur_type: String = row.try_get("column_type")?;
             let column_order: i64 = row.try_get("column_order")?;
-            let nulls_allowed: bool =
-                row.try_get::<Option<bool>, _>("nulls_allowed")?.unwrap_or(true);
+            let nulls_allowed: bool = row
+                .try_get::<Option<bool>, _>("nulls_allowed")?
+                .unwrap_or(true);
 
             // No-op / not-a-widening guards (canonical first so an alias-only
             // restatement is "no change", not attempted).
@@ -1484,8 +1485,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                         // Same-name column: a (canonical) type change is rejected in BOTH
                         // modes. Not `types_compatible` — that accepts widenings, the
                         // silent acceptance we are closing.
-                        if !crate::types::types_equal_canonical(existing_type, &new_col.ducklake_type)
-                        {
+                        if !crate::types::types_equal_canonical(
+                            existing_type,
+                            &new_col.ducklake_type,
+                        ) {
                             return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                                 "Column '{}' type change ('{}' -> '{}') is not allowed on a {:?} data write; \
                                  use promote_column_type for a widening, then write data under the new type.",

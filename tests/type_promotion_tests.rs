@@ -71,9 +71,11 @@ async fn replace_same_schema_roundtrips_values() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let batch =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let batch = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[batch])
@@ -106,9 +108,11 @@ async fn replace_with_type_change_is_rejected() {
     let object_store = create_object_store();
 
     // t(id int32)
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
@@ -140,9 +144,11 @@ async fn append_with_type_change_is_rejected() {
     let (writer, _temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
@@ -173,9 +179,11 @@ async fn promote_widens_column_and_old_values_read_back() {
     let object_store = create_object_store();
 
     // t(id int32) = [1, 2, 3], written to a physically-int32 Parquet file.
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
@@ -186,7 +194,10 @@ async fn promote_widens_column_and_old_values_read_back() {
     let new_snapshot = writer
         .promote_column_type(res.table_id, "id", "int64")
         .unwrap();
-    assert!(new_snapshot > res.snapshot_id, "promote creates a newer snapshot");
+    assert!(
+        new_snapshot > res.snapshot_id,
+        "promote creates a newer snapshot"
+    );
 
     // Now append a value BEYOND the int32 range under the widened type — exactly
     // the value bug C used to silently lose. This is a normal data write (the
@@ -259,7 +270,10 @@ async fn promote_rejects_non_widening() {
 
     // int64 -> int64 is a no-op; reported as an error (no change), not applied.
     let noop = writer.promote_column_type(res.table_id, "id", "bigint");
-    assert!(noop.is_err(), "no-op (same canonical type) promote must be rejected");
+    assert!(
+        noop.is_err(),
+        "no-op (same canonical type) promote must be rejected"
+    );
 }
 
 /// §4.6 race — settled empirically. An Append SESSION begins under the old (int32)
@@ -277,9 +291,11 @@ async fn append_session_racing_a_promote_never_corrupts() {
     let object_store = create_object_store();
 
     // t(id int32) = [1, 2, 3].
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
@@ -329,7 +345,10 @@ async fn append_session_racing_a_promote_never_corrupts() {
     // On SQLite the write lock serializes the two, so the Append commits (its
     // int32 file casts up under the now-int64 column — benign), and all rows are
     // present and correct. No NULL-fill, no lost rows, no reverted type.
-    assert!(finish_result.is_ok(), "the racing Append should commit cleanly: {finish_result:?}");
+    assert!(
+        finish_result.is_ok(),
+        "the racing Append should commit cleanly: {finish_result:?}"
+    );
     assert_eq!(
         got,
         vec![1, 2, 3, 4, 5],
@@ -392,7 +411,11 @@ async fn promote_float32_to_float64_roundtrip() {
         let vs = b.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
         got.extend(vs.values().iter().copied());
     }
-    assert_eq!(got, vec![1.5, 2.5, 1.0e10], "f32 file up-casts to f64, values intact");
+    assert_eq!(
+        got,
+        vec![1.5, 2.5, 1.0e10],
+        "f32 file up-casts to f64, values intact"
+    );
 }
 
 /// §14 A1/G3 — a FILTER on the promoted column spans the old (int32) and new
@@ -403,9 +426,11 @@ async fn filter_on_promoted_column_spans_old_and_new_files() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
@@ -452,15 +477,19 @@ async fn count_star_across_promote_boundary() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
-    let b32 =
-        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![1, 2, 3]))])
-            .unwrap();
+    let b32 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
         .unwrap()
         .write_table("main", "t", &[b32])
         .await
         .unwrap();
-    writer.promote_column_type(res.table_id, "id", "int64").unwrap();
+    writer
+        .promote_column_type(res.table_id, "id", "int64")
+        .unwrap();
     let b64 = RecordBatch::try_new(
         int64_schema(),
         vec![Arc::new(Int64Array::from(vec![5_000_000_000_i64, 6_000_000_000]))],
@@ -486,5 +515,8 @@ async fn count_star_across_promote_boundary() {
         .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0);
-    assert_eq!(cnt, 5, "COUNT(*) must span the old int32 file + new int64 file (3 + 2)");
+    assert_eq!(
+        cnt, 5,
+        "COUNT(*) must span the old int32 file + new int64 file (3 + 2)"
+    );
 }

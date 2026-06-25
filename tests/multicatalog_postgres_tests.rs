@@ -3632,8 +3632,11 @@ async fn multicatalog_promote_widens_column_and_old_values_read_back() {
     let mgr = MulticatalogManager::new(pool.clone());
     let cat = mgr.create_catalog("promote").await.unwrap();
     // One writer, reused across write/promote/append via Arc clones.
-    let writer: Arc<dyn MetadataWriter> =
-        Arc::new(PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap());
+    let writer: Arc<dyn MetadataWriter> = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), cat)
+            .await
+            .unwrap(),
+    );
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
@@ -3731,7 +3734,9 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
 
     // Write real data t(id int32) = [1,2,3] (fresh DDL → composite PK).
     {
-        let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+        let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+            .await
+            .unwrap();
         let temp = TempDir::new().unwrap();
         let data_path = temp.path().join("data");
         std::fs::create_dir_all(&data_path).unwrap();
@@ -3782,11 +3787,16 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(pk_len_after, 3, "bootstrap migrated the legacy PK to the composite PK");
+    assert_eq!(
+        pk_len_after, 3,
+        "bootstrap migrated the legacy PK to the composite PK"
+    );
 
     // Data preserved — reads through the provider return the original values.
     let read = |pool: PgPool| async move {
-        let provider = MulticatalogProvider::with_pool(pool, "legacy").await.unwrap();
+        let provider = MulticatalogProvider::with_pool(pool, "legacy")
+            .await
+            .unwrap();
         let catalog = DuckLakeCatalog::new(provider).unwrap();
         let ctx = SessionContext::new();
         ctx.register_catalog("legacy", Arc::new(catalog));
@@ -3798,8 +3808,16 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
             .unwrap()
     };
     let batches = read(pool.clone()).await;
-    let ids = batches[0].column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-    assert_eq!(ids.values(), &[1, 2, 3], "data survived the Postgres migration");
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(
+        ids.values(),
+        &[1, 2, 3],
+        "data survived the Postgres migration"
+    );
 
     // The migrated catalog now supports promote (two versioned rows, same id).
     let table_id: i64 =
@@ -3807,8 +3825,12 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    let writer2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
-    writer2.promote_column_type(table_id, "id", "int64").unwrap();
+    let writer2 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    writer2
+        .promote_column_type(table_id, "id", "int64")
+        .unwrap();
     let n_versions: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ducklake_column WHERE table_id = $1 AND column_name = 'id'",
     )
@@ -3816,12 +3838,23 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(n_versions, 2, "promote on the migrated catalog leaves two versioned rows");
+    assert_eq!(
+        n_versions, 2,
+        "promote on the migrated catalog leaves two versioned rows"
+    );
 
     let batches2 = read(pool.clone()).await;
     assert_eq!(batches2[0].schema().field(0).data_type(), &DataType::Int64);
-    let ids2 = batches2[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    assert_eq!(ids2.values(), &[1, 2, 3], "post-migration promote widens + reads intact");
+    let ids2 = batches2[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(
+        ids2.values(),
+        &[1, 2, 3],
+        "post-migration promote widens + reads intact"
+    );
 }
 
 /// §5 on Postgres: both Replace and Append must REJECT a column type change
@@ -3847,8 +3880,7 @@ async fn multicatalog_replace_and_append_reject_type_change() {
 
     let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let s64 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-    let b32 =
-        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let b32 = RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
 
     // Build a fresh table writer (the writer Arc is consumed per call).
     let tw = |store: Arc<dyn ObjectStore>, dp: String| {
@@ -3869,23 +3901,30 @@ async fn multicatalog_replace_and_append_reject_type_change() {
         .unwrap();
 
     // Replace with id int64 → rejected.
-    let b64a =
-        RecordBatch::try_new(s64.clone(), vec![Arc::new(Int64Array::from(vec![9_999_999_999]))])
-            .unwrap();
+    let b64a = RecordBatch::try_new(
+        s64.clone(),
+        vec![Arc::new(Int64Array::from(vec![9_999_999_999]))],
+    )
+    .unwrap();
     let replace_res = tw(Arc::clone(&store), dp.clone())
         .await
         .write_table("public", "t", &[b64a])
         .await;
-    assert!(replace_res.is_err(), "Replace with a type change must be rejected on Postgres");
+    assert!(
+        replace_res.is_err(),
+        "Replace with a type change must be rejected on Postgres"
+    );
 
     // Append with id int64 → rejected.
-    let b64b =
-        RecordBatch::try_new(s64, vec![Arc::new(Int64Array::from(vec![4, 5]))]).unwrap();
+    let b64b = RecordBatch::try_new(s64, vec![Arc::new(Int64Array::from(vec![4, 5]))]).unwrap();
     let append_res = tw(Arc::clone(&store), dp.clone())
         .await
         .append_table("public", "t", &[b64b])
         .await;
-    assert!(append_res.is_err(), "Append with a type change must be rejected on Postgres");
+    assert!(
+        append_res.is_err(),
+        "Append with a type change must be rejected on Postgres"
+    );
 }
 
 /// Phase C on Postgres: a promote leaves the multicatalog `ducklake_column` in the
@@ -3910,19 +3949,24 @@ async fn multicatalog_promote_leaves_two_versioned_rows() {
     std::fs::create_dir_all(&data_path).unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
 
-    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-    let b32 =
-        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let b32 = RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&store))
         .unwrap()
         .write_table("public", "t", &[b32])
         .await
         .unwrap();
 
-    let promoter = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
-    promoter.promote_column_type(res.table_id, "id", "int64").unwrap();
+    let promoter = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    promoter
+        .promote_column_type(res.table_id, "id", "int64")
+        .unwrap();
 
     let rows = sqlx::query(
         "SELECT column_id, column_type, end_snapshot FROM ducklake_column
@@ -3969,11 +4013,12 @@ async fn multicatalog_concurrent_promotes_one_wins_no_corruption() {
     std::fs::create_dir_all(&data_path).unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
 
-    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-    let b32 =
-        RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+    let b32 = RecordBatch::try_new(s32, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&store))
         .unwrap()
         .write_table("public", "t", &[b32])
@@ -3982,8 +4027,12 @@ async fn multicatalog_concurrent_promotes_one_wins_no_corruption() {
     let tid = res.table_id;
 
     // Two independent writers (separate connections) promote the same column at once.
-    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
-    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     let h1 = tokio::task::spawn_blocking(move || w1.promote_column_type(tid, "id", "int64"));
     let h2 = tokio::task::spawn_blocking(move || w2.promote_column_type(tid, "id", "int64"));
     let (r1, r2) = tokio::join!(h1, h2);
@@ -4002,7 +4051,10 @@ async fn multicatalog_concurrent_promotes_one_wins_no_corruption() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(total, 2, "no double-promote: exactly two versioned rows, got {total}");
+    assert_eq!(
+        total, 2,
+        "no double-promote: exactly two versioned rows, got {total}"
+    );
 
     let live: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ducklake_column
@@ -4012,7 +4064,10 @@ async fn multicatalog_concurrent_promotes_one_wins_no_corruption() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(live, 1, "exactly one live version after concurrent promotes, got {live}");
+    assert_eq!(
+        live, 1,
+        "exactly one live version after concurrent promotes, got {live}"
+    );
 }
 
 /// §14 E2: `schema_version` advances on a schema change (promote) but NOT on a
@@ -4054,7 +4109,9 @@ async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
     };
 
     // Create table (DDL).
-    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     w0.set_data_path(&dp).unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(w0), Arc::clone(&store))
         .unwrap()
@@ -4064,7 +4121,9 @@ async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
     let sv_create = head_sv(&pool, cat).await;
 
     // Append (data write, same schema) — must NOT bump schema_version.
-    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w1 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     w1.set_data_path(&dp).unwrap();
     DuckLakeTableWriter::new(Arc::new(w1), Arc::clone(&store))
         .unwrap()
@@ -4072,10 +4131,15 @@ async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
         .await
         .unwrap();
     let sv_append = head_sv(&pool, cat).await;
-    assert_eq!(sv_append, sv_create, "a data write (Append) must not bump schema_version");
+    assert_eq!(
+        sv_append, sv_create,
+        "a data write (Append) must not bump schema_version"
+    );
 
     // Promote (schema change) — MUST bump schema_version.
-    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w2 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     w2.promote_column_type(res.table_id, "id", "int64").unwrap();
     let sv_promote = head_sv(&pool, cat).await;
     assert!(
@@ -4091,7 +4155,7 @@ async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
-    use arrow::array::{Array, Int64Array, Int32Array};
+    use arrow::array::{Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
@@ -4124,7 +4188,9 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
     let s32 = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
     // t(id int32) = [1,2,3]
-    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let w0 = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     w0.set_data_path(&dp).unwrap();
     let res = DuckLakeTableWriter::new(Arc::new(w0), Arc::clone(&store))
         .unwrap()
@@ -4138,7 +4204,9 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
         .unwrap();
 
     // Begin an Append session under the (current) int32 schema and stage a batch.
-    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     wa.set_data_path(&dp).unwrap();
     let tw = DuckLakeTableWriter::new(Arc::new(wa), Arc::clone(&store)).unwrap();
     let mut session = tw
@@ -4146,21 +4214,23 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
         .unwrap();
     session
         .write_batch(
-            &RecordBatch::try_new(s32.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))]).unwrap(),
+            &RecordBatch::try_new(s32.clone(), vec![Arc::new(Int32Array::from(vec![4, 5]))])
+                .unwrap(),
         )
         .unwrap();
 
     // A promote commits in between (int32 -> int64): bumps schema_version.
-    let wp = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+    let wp = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     wp.promote_column_type(res.table_id, "id", "int64").unwrap();
     let sv_after_promote = head_sv(&pool, cat).await;
-    let ledger_after_promote: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1",
-    )
-    .bind(res.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let ledger_after_promote: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1")
+            .bind(res.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     // Finish the Append AFTER the promote — must NOT bump schema_version.
     session.finish().await.unwrap();
@@ -4172,20 +4242,21 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
 
     // The racing Append must NOT add a ducklake_schema_versions ledger row (it's a
     // data write, not DDL — only table-create + the promote are legitimate rows).
-    let ledger_after_append: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1",
-    )
-    .bind(res.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let ledger_after_append: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ducklake_schema_versions WHERE table_id = $1")
+            .bind(res.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         ledger_after_append, ledger_after_promote,
         "the racing Append must not add a schema_versions ledger row"
     );
 
     // Values round-trip (old + appended, all int64).
-    let provider = MulticatalogProvider::with_pool(pool.clone(), "racebump").await.unwrap();
+    let provider = MulticatalogProvider::with_pool(pool.clone(), "racebump")
+        .await
+        .unwrap();
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("racebump", Arc::new(catalog));
@@ -4202,5 +4273,9 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
         got.extend(ids.values().iter().copied());
     }
     got.sort();
-    assert_eq!(got, vec![1, 2, 3, 4, 5], "all rows present and correct after the race");
+    assert_eq!(
+        got,
+        vec![1, 2, 3, 4, 5],
+        "all rows present and correct after the race"
+    );
 }
