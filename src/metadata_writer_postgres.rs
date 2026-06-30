@@ -10,6 +10,7 @@
 //! with unchanged columns).
 
 use crate::Result;
+use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
@@ -882,9 +883,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 )));
             }
             if !crate::types::is_promotable(&cur_type, new_ducklake_type) {
-                return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "promote_column_type: '{cur_type}' -> '{new_ducklake_type}' is not an allowed lossless widening for column '{column_name}'"
-                )));
+                return Err(crate::DuckLakeError::UnsupportedTypeChange {
+                    operation: TypeChangeOperation::PromoteColumnType,
+                    column: column_name.to_string(),
+                    from: cur_type,
+                    to: new_ducklake_type.to_string(),
+                });
             }
 
             // New snapshot + advance this catalog's head.
@@ -1490,11 +1494,17 @@ impl MetadataWriter for PostgresMetadataWriter {
                             existing_type,
                             &new_col.ducklake_type,
                         ) {
-                            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                                "Column '{}' type change ('{}' -> '{}') is not allowed on a {:?} data write; \
-                                 use promote_column_type for a widening, then write data under the new type.",
-                                new_col.name, existing_type, new_col.ducklake_type, mode
-                            )));
+                            return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
+                                operation: TypeChangeOperation::DataWrite {
+                                    mode: match mode {
+                                        WriteMode::Replace => TypeChangeWriteMode::Replace,
+                                        WriteMode::Append => TypeChangeWriteMode::Append,
+                                    },
+                                },
+                                column: new_col.name.clone(),
+                                from: (*existing_type).to_string(),
+                                to: new_col.ducklake_type.clone(),
+                            });
                         }
                     } else if mode == WriteMode::Append && !new_col.is_nullable {
                         return Err(crate::error::DuckLakeError::InvalidConfig(format!(

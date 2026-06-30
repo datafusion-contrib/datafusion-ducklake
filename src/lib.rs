@@ -86,7 +86,7 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
-pub use error::DuckLakeError;
+pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::MetadataProvider;
 pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;

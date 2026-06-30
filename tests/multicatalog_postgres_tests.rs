@@ -11,8 +11,8 @@
 
 use datafusion_ducklake::metadata_writer::{ColumnDef, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
-    DuckLakeTableWriter, MulticatalogManager, PostgresMetadataWriter,
-    initialize_multicatalog_schema,
+    DuckLakeError, DuckLakeTableWriter, MulticatalogManager, PostgresMetadataWriter,
+    TypeChangeOperation, TypeChangeWriteMode, initialize_multicatalog_schema,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -37,6 +37,44 @@ fn cols() -> Vec<ColumnDef> {
         ColumnDef::new("id", "int64", false).unwrap(),
         ColumnDef::new("name", "varchar", true).unwrap(),
     ]
+}
+
+fn assert_unsupported_type_change<T>(
+    res: datafusion_ducklake::Result<T>,
+    expected_operation: TypeChangeOperation,
+    expected_column: &str,
+    expected_from: &str,
+    expected_to: &str,
+    context: &str,
+) {
+    match res {
+        Err(DuckLakeError::UnsupportedTypeChange {
+            operation,
+            column,
+            from,
+            to,
+        }) => {
+            assert_eq!(operation, expected_operation, "{context}: operation");
+            assert_eq!(column, expected_column, "{context}: column");
+            assert_eq!(from, expected_from, "{context}: from");
+            assert_eq!(to, expected_to, "{context}: to");
+        },
+        Err(other) => panic!("{context}: expected UnsupportedTypeChange, got {other:?}"),
+        Ok(_) => panic!("{context}: expected UnsupportedTypeChange, got Ok"),
+    }
+}
+
+fn assert_invalid_config<T>(res: datafusion_ducklake::Result<T>, context: &str) {
+    match res {
+        Err(DuckLakeError::InvalidConfig(_)) => {},
+        Err(DuckLakeError::UnsupportedTypeChange {
+            ..
+        }) => {
+            panic!("{context}: expected InvalidConfig, got UnsupportedTypeChange")
+        },
+        Err(other) => panic!("{context}: expected InvalidConfig, got {other:?}"),
+        Ok(_) => panic!("{context}: expected InvalidConfig, got Ok"),
+    }
 }
 
 /// Current catalog head = MAX(snapshot_id) over the catalog's mapping rows
@@ -3653,6 +3691,15 @@ async fn multicatalog_promote_widens_column_and_old_values_read_back() {
         .await
         .unwrap();
 
+    assert_invalid_config(
+        writer.promote_column_type(res.table_id, "id", "integer"),
+        "no-op (same canonical type) promote must be rejected without UnsupportedTypeChange",
+    );
+    assert_invalid_config(
+        writer.promote_column_type(res.table_id, "missing", "int64"),
+        "missing-column promote must be rejected without UnsupportedTypeChange",
+    );
+
     // Promote id int32 -> int64 (schema evolution; no data rewritten).
     writer
         .promote_column_type(res.table_id, "id", "int64")
@@ -3910,9 +3957,15 @@ async fn multicatalog_replace_and_append_reject_type_change() {
         .await
         .write_table("public", "t", &[b64a])
         .await;
-    assert!(
-        replace_res.is_err(),
-        "Replace with a type change must be rejected on Postgres"
+    assert_unsupported_type_change(
+        replace_res,
+        TypeChangeOperation::DataWrite {
+            mode: TypeChangeWriteMode::Replace,
+        },
+        "id",
+        "int32",
+        "int64",
+        "Replace with a type change must be rejected on Postgres",
     );
 
     // Append with id int64 → rejected.
@@ -3921,9 +3974,15 @@ async fn multicatalog_replace_and_append_reject_type_change() {
         .await
         .append_table("public", "t", &[b64b])
         .await;
-    assert!(
-        append_res.is_err(),
-        "Append with a type change must be rejected on Postgres"
+    assert_unsupported_type_change(
+        append_res,
+        TypeChangeOperation::DataWrite {
+            mode: TypeChangeWriteMode::Append,
+        },
+        "id",
+        "int32",
+        "int64",
+        "Append with a type change must be rejected on Postgres",
     );
 }
 

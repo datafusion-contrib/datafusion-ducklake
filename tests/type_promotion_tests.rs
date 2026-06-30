@@ -19,8 +19,8 @@ use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode,
+    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter, TypeChangeOperation, TypeChangeWriteMode, WriteMode,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -59,6 +59,44 @@ async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     (writer, temp_dir)
+}
+
+fn assert_unsupported_type_change<T>(
+    res: datafusion_ducklake::Result<T>,
+    expected_operation: TypeChangeOperation,
+    expected_column: &str,
+    expected_from: &str,
+    expected_to: &str,
+    context: &str,
+) {
+    match res {
+        Err(DuckLakeError::UnsupportedTypeChange {
+            operation,
+            column,
+            from,
+            to,
+        }) => {
+            assert_eq!(operation, expected_operation, "{context}: operation");
+            assert_eq!(column, expected_column, "{context}: column");
+            assert_eq!(from, expected_from, "{context}: from");
+            assert_eq!(to, expected_to, "{context}: to");
+        },
+        Err(other) => panic!("{context}: expected UnsupportedTypeChange, got {other:?}"),
+        Ok(_) => panic!("{context}: expected UnsupportedTypeChange, got Ok"),
+    }
+}
+
+fn assert_invalid_config<T>(res: datafusion_ducklake::Result<T>, context: &str) {
+    match res {
+        Err(DuckLakeError::InvalidConfig(_)) => {},
+        Err(DuckLakeError::UnsupportedTypeChange {
+            ..
+        }) => {
+            panic!("{context}: expected InvalidConfig, got UnsupportedTypeChange")
+        },
+        Err(other) => panic!("{context}: expected InvalidConfig, got {other:?}"),
+        Ok(_) => panic!("{context}: expected InvalidConfig, got Ok"),
+    }
 }
 
 /// A read-only `SessionContext` over the same catalog (registered as `test`).
@@ -148,9 +186,15 @@ async fn replace_with_type_change_is_rejected() {
         .write_table("main", "t", &[b64])
         .await;
 
-    assert!(
-        res.is_err(),
-        "Replace with a column type change must be rejected (got Ok — the silent type-drop bug C)"
+    assert_unsupported_type_change(
+        res,
+        TypeChangeOperation::DataWrite {
+            mode: TypeChangeWriteMode::Replace,
+        },
+        "id",
+        "int32",
+        "int64",
+        "Replace with a column type change must be rejected",
     );
 }
 
@@ -180,9 +224,15 @@ async fn append_with_type_change_is_rejected() {
         .append_table("main", "t", &[b64])
         .await;
 
-    assert!(
-        res.is_err(),
-        "Append with a column type change (even a widening) must be rejected (got Ok — silent acceptance)"
+    assert_unsupported_type_change(
+        res,
+        TypeChangeOperation::DataWrite {
+            mode: TypeChangeWriteMode::Append,
+        },
+        "id",
+        "int32",
+        "int64",
+        "Append with a column type change must be rejected",
     );
 }
 
@@ -284,13 +334,26 @@ async fn promote_rejects_non_widening() {
 
     // int64 -> int32 is a narrowing; must be rejected.
     let narrow = writer.promote_column_type(res.table_id, "id", "int32");
-    assert!(narrow.is_err(), "narrowing promote must be rejected");
+    assert_unsupported_type_change(
+        narrow,
+        TypeChangeOperation::PromoteColumnType,
+        "id",
+        "int64",
+        "int32",
+        "narrowing promote must be rejected",
+    );
 
     // int64 -> int64 is a no-op; reported as an error (no change), not applied.
     let noop = writer.promote_column_type(res.table_id, "id", "bigint");
-    assert!(
-        noop.is_err(),
-        "no-op (same canonical type) promote must be rejected"
+    assert_invalid_config(
+        noop,
+        "no-op (same canonical type) promote must be rejected without UnsupportedTypeChange",
+    );
+
+    let missing = writer.promote_column_type(res.table_id, "missing", "int32");
+    assert_invalid_config(
+        missing,
+        "missing-column promote must be rejected without UnsupportedTypeChange",
     );
 }
 
