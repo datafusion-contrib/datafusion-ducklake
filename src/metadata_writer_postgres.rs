@@ -12,7 +12,8 @@
 use crate::Result;
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
+    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    columns_differ, validate_name,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -1564,46 +1565,9 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 }
 
-/// Return true when the existing column set differs from the proposed one in a
-/// way that requires a DDL bump: a different number of columns, a renamed
-/// column, a changed type, or a changed nullability.
-///
-/// Columns are compared positionally so a pure reorder counts as DDL — matches
-/// the conservative interpretation of the spec.
-fn columns_differ(existing: &[(String, String, bool)], proposed: &[ColumnDef]) -> bool {
-    if existing.len() != proposed.len() {
-        return true;
-    }
-    for ((ex_name, ex_type, ex_nullable), new_col) in existing.iter().zip(proposed.iter()) {
-        if ex_name != &new_col.name {
-            return true;
-        }
-        // A same-name type difference here can only be the benign Append-vs-promote
-        // race: a data write that PASSED the §5 begin-time reject (its staged type
-        // matched the type AT BEGIN) but whose column a concurrent promote widened
-        // before this commit. The staged (narrower) type losslessly widens to the
-        // committed type and is served via cast-on-read, so it is NOT a schema
-        // change and must NOT bump schema_version (§4.5/E2). Treat canonical-equal
-        // OR staged-widens-to-committed as "same"; anything else is real DDL.
-        // (Not `types_compatible`: that also accepts committed-widens-to-staged,
-        // which here would wrongly classify the race as DDL.)
-        let same_type = crate::types::types_equal_canonical(ex_type, &new_col.ducklake_type)
-            || crate::types::is_promotable(&new_col.ducklake_type, ex_type);
-        if !same_type {
-            return true;
-        }
-        // Same-name same-(compatible-direction)-type same-nullability ⇒ no DDL.
-        if *ex_nullable != new_col.is_nullable {
-            return true;
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::metadata_writer::ColumnDef;
+    use crate::metadata_writer::{ColumnDef, columns_differ};
 
     #[test]
     fn test_columns_differ_identical() {
@@ -1641,11 +1605,27 @@ mod tests {
     }
 
     #[test]
-    fn test_columns_differ_type_widening_is_compatible() {
-        // int32 -> int64 is a safe promotion per types_compatible(); we treat
-        // that as the same column, no DDL bump needed.
+    fn test_columns_differ_forward_widening_is_a_change() {
+        // existing int32 -> proposed int64 is a forward widening. Since #149 this
+        // is NOT "the same column": on a data write it's rejected at begin-time
+        // (widenings must go through promote_column_type), and if it reaches
+        // columns_differ it must classify as DDL. Only the benign promote-race
+        // direction below is treated as same-type.
         let existing = vec![("id".into(), "int32".into(), false)];
         let proposed = vec![ColumnDef::new("id", "int64", false).unwrap()];
+        assert!(columns_differ(&existing, &proposed));
+    }
+
+    #[test]
+    fn test_columns_differ_benign_promote_race_is_not_ddl() {
+        // The Append-vs-promote race: the committed column was already widened to
+        // int64 by a concurrent promote, while this write staged the narrower
+        // int32 (which passed the begin-time reject against the type AT BEGIN).
+        // The staged int32 losslessly widens to the committed int64 and is served
+        // via cast-on-read, so it is NOT a schema change and must not bump
+        // schema_version.
+        let existing = vec![("id".into(), "int64".into(), false)];
+        let proposed = vec![ColumnDef::new("id", "int32", false).unwrap()];
         assert!(!columns_differ(&existing, &proposed));
     }
 

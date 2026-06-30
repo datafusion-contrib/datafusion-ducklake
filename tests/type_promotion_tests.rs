@@ -22,6 +22,24 @@ use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
     SqliteMetadataWriter, WriteMode,
 };
+use sqlx::Row;
+use sqlx::sqlite::SqlitePool;
+
+/// Open a read pool over the catalog's SQLite file.
+async fn open_pool(temp_dir: &TempDir) -> SqlitePool {
+    let db_path = temp_dir.path().join("test.db");
+    SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap()
+}
+
+/// The catalog's current (max) `schema_version`.
+async fn max_schema_version(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
 
 fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(LocalFileSystem::new())
@@ -518,5 +536,431 @@ async fn count_star_across_promote_boundary() {
     assert_eq!(
         cnt, 5,
         "COUNT(*) must span the old int32 file + new int64 file (3 + 2)"
+    );
+}
+
+// ── schema_version tracking (issue #151: SQLite snapshot DDL model) ──
+
+/// A fresh catalog is shaped to track schema_version: `ducklake_snapshot` carries
+/// the `schema_version` column and the `ducklake_schema_versions` ledger table
+/// exists. Matches the Postgres writer (and upstream, modulo the deliberately
+/// omitted `next_catalog_id`/`next_file_id` allocator columns).
+#[tokio::test(flavor = "multi_thread")]
+async fn new_catalog_has_schema_version_shape() {
+    let (_writer, temp_dir) = create_test_env().await;
+    let pool = open_pool(&temp_dir).await;
+
+    let has_col: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('ducklake_snapshot') WHERE name = 'schema_version'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        has_col, 1,
+        "ducklake_snapshot must carry a schema_version column"
+    );
+
+    let has_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ducklake_schema_versions'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        has_table, 1,
+        "ducklake_schema_versions ledger table must exist"
+    );
+}
+
+/// A type promotion is DDL: it bumps the per-catalog `schema_version` and writes
+/// one `ducklake_schema_versions` ledger row at the promote snapshot. Resolves the
+/// `TODO(schema_version)` left in `promote_column_type` by #149.
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_bumps_schema_version_and_records_ledger_row() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    // Create t(id int32) — DDL, so schema_version becomes 1.
+    let batch = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    let v_before = max_schema_version(&pool).await;
+    assert_eq!(v_before, 1, "table creation is DDL → schema_version 1");
+
+    // Promote id int32 -> int64.
+    let table_id: i64 = sqlx::query_scalar(
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let promote_snapshot = writer.promote_column_type(table_id, "id", "int64").unwrap();
+
+    let v_after = max_schema_version(&pool).await;
+    assert_eq!(
+        v_after,
+        v_before + 1,
+        "promote is DDL → schema_version bumps by 1"
+    );
+
+    // Exactly one ledger row, at the promote snapshot, with the bumped version.
+    let row = sqlx::query(
+        "SELECT begin_snapshot, schema_version, table_id
+         FROM ducklake_schema_versions WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(table_id)
+    .bind(promote_snapshot)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let ledger_version: i64 = row.try_get("schema_version").unwrap();
+    assert_eq!(
+        ledger_version, v_after,
+        "ledger row carries the bumped schema_version"
+    );
+}
+
+/// A pure data write (an Append with an unchanged schema) must NOT bump
+/// `schema_version` — only schema changes do. This is the trap the shared
+/// `columns_differ` classifier guards against; mirrors the Postgres E2 test.
+#[tokio::test(flavor = "multi_thread")]
+async fn data_write_does_not_bump_schema_version() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    // Create t(id int32) — DDL → schema_version 1.
+    let b1 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[b1])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    let v_after_create = max_schema_version(&pool).await;
+    assert_eq!(v_after_create, 1);
+
+    // Append more rows under the SAME schema — a pure data write.
+    let b2 =
+        RecordBatch::try_new(int32_schema(), vec![Arc::new(Int32Array::from(vec![4, 5]))]).unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
+        .unwrap()
+        .append_table("main", "t", &[b2])
+        .await
+        .unwrap();
+
+    let v_after_append = max_schema_version(&pool).await;
+    assert_eq!(
+        v_after_append, v_after_create,
+        "a same-schema Append is a data write and must NOT bump schema_version"
+    );
+
+    // And it wrote no ledger row for the append snapshot.
+    let ledger_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_schema_versions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger_rows, 1,
+        "only the table-creation DDL writes a ledger row; the Append writes none"
+    );
+}
+
+/// Resolve the live `table_id` for `main.t` in the catalog.
+async fn live_table_id(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't' AND end_snapshot IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A `drop_table` is DDL: it bumps `schema_version` but writes NO
+/// `ducklake_schema_versions` row (the table has no live schema afterward). Drop
+/// is the one DDL where the bump and the ledger diverge — the easiest place for
+/// the two halves to drift — so it gets its own test (mirrors the Postgres path).
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_table_bumps_schema_version_without_ledger_row() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let batch = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    let v_before = max_schema_version(&pool).await;
+    assert_eq!(v_before, 1);
+
+    assert!(
+        writer.drop_table("main", "t").unwrap(),
+        "table existed → dropped"
+    );
+
+    let v_after = max_schema_version(&pool).await;
+    assert_eq!(v_after, v_before + 1, "drop is DDL → schema_version bumps");
+
+    // The drop snapshot is the latest; it must carry NO ledger row, and the total
+    // ledger count stays at 1 (just the table-creation row).
+    let drop_snap: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let at_drop: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot = ?",
+    )
+    .bind(drop_snap)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(at_drop, 0, "a drop writes no ducklake_schema_versions row");
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_schema_versions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "only the create DDL left a ledger row");
+}
+
+/// An Append that ADDS a (nullable) column is a schema change, classified as DDL
+/// through the shared `columns_differ` — the exact path that helper was extracted
+/// for. It must bump `schema_version` and write a ledger row. (The promote tests
+/// never exercise `columns_differ`; this is its only SQLite write-path coverage.)
+#[tokio::test(flavor = "multi_thread")]
+async fn append_adding_column_is_ddl_and_bumps_schema_version() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    // t(id int32) — DDL → schema_version 1.
+    let b1 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[b1])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    assert_eq!(max_schema_version(&pool).await, 1);
+    let table_id = live_table_id(&pool).await;
+
+    // Append rows under a WIDER schema: add a nullable `extra` column.
+    let wider = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("extra", DataType::Int32, true),
+    ]));
+    let b2 = RecordBatch::try_new(
+        wider,
+        vec![
+            Arc::new(Int32Array::from(vec![4, 5])),
+            Arc::new(Int32Array::from(vec![Some(40), Some(50)])),
+        ],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
+        .unwrap()
+        .append_table("main", "t", &[b2])
+        .await
+        .unwrap();
+
+    let v_after = max_schema_version(&pool).await;
+    assert_eq!(
+        v_after, 2,
+        "adding a column is DDL → schema_version bumps to 2"
+    );
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_schema_versions WHERE table_id = ?")
+            .bind(table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(total, 2, "create + add-column each wrote a ledger row");
+}
+
+/// A same-schema `Replace` (CTAS over an existing table) is a pure data write and
+/// must NOT bump `schema_version` — Replace takes a distinct sub-path from Append
+/// (retire + re-insert column rows), so it gets its own no-bump test.
+#[tokio::test(flavor = "multi_thread")]
+async fn same_schema_replace_does_not_bump_schema_version() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let b1 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[b1])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    assert_eq!(max_schema_version(&pool).await, 1);
+
+    // Replace with the SAME schema, different rows.
+    let b2 = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![7, 8, 9, 10]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[b2])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        max_schema_version(&pool).await,
+        1,
+        "a same-schema Replace is a data write and must NOT bump schema_version"
+    );
+}
+
+/// Sequential schema changes produce a dense, monotonic `schema_version`
+/// (1 → 2 → 3), each with its own ledger row. Guards `bump_schema_version`'s
+/// MAX-over-other-snapshots formulation against an off-by-one on the second bump.
+#[tokio::test(flavor = "multi_thread")]
+async fn sequential_promotes_are_monotonic() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    // t(a int32, b int32) — DDL → schema_version 1.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![3, 4]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    let table_id = live_table_id(&pool).await;
+    assert_eq!(max_schema_version(&pool).await, 1);
+
+    writer.promote_column_type(table_id, "a", "int64").unwrap();
+    assert_eq!(max_schema_version(&pool).await, 2, "first promote → 2");
+
+    writer.promote_column_type(table_id, "b", "int64").unwrap();
+    assert_eq!(max_schema_version(&pool).await, 3, "second promote → 3");
+
+    // Three distinct ledger rows (create, promote a, promote b), versions 1/2/3.
+    let versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT schema_version FROM ducklake_schema_versions WHERE table_id = ? ORDER BY schema_version",
+    )
+    .bind(table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(versions, vec![1, 2, 3], "dense monotonic ledger versions");
+}
+
+/// End-to-end across the migration seam: a pre-existing catalog whose
+/// `ducklake_snapshot` predates `schema_version` (with historical snapshots) is
+/// migrated on open, then a write + promote must produce a correct, monotonic
+/// `schema_version` that continues past the legacy snapshots. Covers the
+/// migrate-then-write path the unit migration test does not exercise.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrated_legacy_catalog_writes_and_promotes() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // Pre-create a LEGACY ducklake_snapshot (no schema_version) with history.
+    {
+        let pool = SqlitePool::connect(&conn_str).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE ducklake_snapshot (
+                snapshot_id INTEGER PRIMARY KEY,
+                snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id) VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    // Open via the writer: runs SQL_CREATE_SCHEMA (creates the remaining tables) +
+    // migrate_add_schema_version (adds the column, backfilling history to 0).
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let object_store = create_object_store();
+
+    let batch = RecordBatch::try_new(
+        int32_schema(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let pool = open_pool(&temp_dir).await;
+    // First write is DDL; schema_version starts from the backfilled-0 history → 1.
+    assert_eq!(
+        max_schema_version(&pool).await,
+        1,
+        "first write after migration → version 1"
+    );
+    let table_id = live_table_id(&pool).await;
+
+    writer.promote_column_type(table_id, "id", "int64").unwrap();
+    assert_eq!(
+        max_schema_version(&pool).await,
+        2,
+        "promote after migration → version 2"
+    );
+
+    // New snapshots continue past the legacy ids (no reuse/collision).
+    let max_snap: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        max_snap >= 4,
+        "snapshot ids continue past the 2 legacy snapshots"
     );
 }

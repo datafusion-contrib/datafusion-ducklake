@@ -121,6 +121,45 @@ impl ColumnDef {
     }
 }
 
+/// Whether `proposed` is a *schema change* relative to `existing` — i.e. whether a
+/// commit carrying it is DDL (and must bump `schema_version`) rather than a pure
+/// data write (which carries `schema_version` forward).
+///
+/// `existing` is the table's currently-live columns as `(name, ducklake_type,
+/// nullable)`, ordered by `column_order`; `proposed` is the incoming schema. The
+/// comparison is positional, mirroring upstream's per-column diff.
+///
+/// A same-name type difference is NOT treated as a change when it's the benign
+/// Append-vs-promote race: a data write that PASSED the begin-time type reject (its
+/// staged type matched the type AT BEGIN) but whose column a concurrent promote
+/// widened before this commit. The staged (narrower) type losslessly widens to the
+/// committed type and is served via cast-on-read, so it must NOT bump
+/// `schema_version`. We accept canonical-equal OR staged-widens-to-committed;
+/// anything else is real DDL. (Not `types_compatible`, which would also accept
+/// committed-widens-to-staged and wrongly classify the race as DDL.)
+///
+/// Shared by the SQLite and Postgres writers so the DDL/DML classification can't
+/// drift between backends.
+pub(crate) fn columns_differ(existing: &[(String, String, bool)], proposed: &[ColumnDef]) -> bool {
+    if existing.len() != proposed.len() {
+        return true;
+    }
+    for ((ex_name, ex_type, ex_nullable), new_col) in existing.iter().zip(proposed.iter()) {
+        if ex_name != &new_col.name {
+            return true;
+        }
+        let same_type = crate::types::types_equal_canonical(ex_type, &new_col.ducklake_type)
+            || crate::types::is_promotable(&new_col.ducklake_type, ex_type);
+        if !same_type {
+            return true;
+        }
+        if *ex_nullable != new_col.is_nullable {
+            return true;
+        }
+    }
+    false
+}
+
 /// Information about a data file to register in the catalog.
 ///
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.

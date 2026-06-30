@@ -155,12 +155,15 @@ Known edges:
   index; on the **SQLite single-catalog** layout `ducklake_column` matches upstream's bare
   shape (no PK) and the one-live-version invariant is enforced in the writer + tests. Catalogs
   created by an earlier version are migrated in place on open (idempotent, lossless).
-- **`schema_version` is maintained on the PostgreSQL multicatalog layout only.** The SQLite
-  single-catalog layout omits `schema_version` / `ducklake_schema_versions` (nothing reads them
-  on that path). Consequently SQLite catalogs are DuckLake-*design*-faithful but **not yet a
-  drop-in DuckDB catalog** — DuckDB's reader also needs `next_catalog_id`/`next_file_id` and
-  other columns/tables that this layout doesn't write. Full DuckDB read-compat is a tracked
-  follow-up, not part of the type-promotion change.
+- **`schema_version` is maintained on both write layouts.** SQLite and PostgreSQL both carry
+  `schema_version` on `ducklake_snapshot` and a `ducklake_schema_versions` ledger table, bumped
+  on a schema change (table create, column add/remove/reorder, type promotion) and carried
+  forward on a pure data write — matching upstream's `if (SchemaChangesMade()) schema_version++`.
+  Both deliberately omit upstream's `next_catalog_id` / `next_file_id` snapshot columns (this
+  library allocates ids from its own counters, never from the snapshot row). Because of that
+  omission a SQLite catalog is DuckLake-*design*-faithful but **not yet a drop-in DuckDB
+  catalog** — DuckDB's writer expects those allocator columns. Full DuckDB write-compat is a
+  tracked follow-up.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are

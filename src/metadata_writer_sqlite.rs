@@ -8,7 +8,8 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, validate_name,
+    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    columns_differ, validate_name,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -32,9 +33,31 @@ CREATE TABLE IF NOT EXISTS ducklake_metadata (
     scope VARCHAR
 );
 
+-- `schema_version` is the per-catalog monotonic schema counter from the DuckLake
+-- spec (`ducklake_metadata_manager.cpp:232`): it bumps on a schema change (DDL)
+-- and is carried forward unchanged on a data write, exactly mirroring upstream's
+-- `if (SchemaChangesMade()) schema_version++` (`ducklake_transaction_state.cpp:1826`)
+-- and the validated Postgres writer here. Upstream also stores `next_catalog_id` /
+-- `next_file_id` on this row as ITS id allocators; we deliberately omit them (as the
+-- Postgres writer does) because this library allocates ids from its own counters
+-- (the `next_column_id` metadata row + autoincrement PKs), never from the snapshot.
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id INTEGER PRIMARY KEY,
-    snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    schema_version INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-table schema-change ledger (DuckLake spec, `ducklake_metadata_manager.cpp:281`):
+-- one row per (table that changed schema, snapshot at which it changed). Written on
+-- every DDL that leaves the table live (create, column add/remove/reorder, type
+-- promotion); NOT written for a drop (the table has no live schema afterward). Rows
+-- are never tombstoned (no `end_snapshot`); they go unreferenced once the table is
+-- fully expired and are reclaimed by vacuum — same as upstream `DropTables`.
+CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
+    begin_snapshot INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    UNIQUE (table_id, begin_snapshot)
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_schema (
@@ -193,8 +216,19 @@ impl SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Take the write lock up front (write-lock-first invariant; see
+            // `insert_snapshot`) by allocating the snapshot before any read, so a
+            // concurrent drop/promote blocks on the lock rather than failing a
+            // deferred read→write upgrade. A drop is DDL → also bump schema_version.
+            // No ducklake_schema_versions row: the table has no live schema
+            // afterward (matches upstream `DropTables` and
+            // `multicatalog.rs::drop_table_in_catalog`).
+            let (drop_snapshot, _schema_version) = insert_snapshot(&mut tx).await?;
+
             // Resolve the live table_id. `end_snapshot IS NULL` on both schema and
-            // table makes an already-dropped table a no-op (idempotent).
+            // table makes an already-dropped table a no-op (idempotent): we return
+            // without committing, so `tx` rolls back and the snapshot allocated
+            // above leaves no trace.
             let table_id: i64 = match sqlx::query(
                 "SELECT t.table_id FROM ducklake_table t
                  JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -207,20 +241,10 @@ impl SqliteMetadataWriter {
             .await?
             {
                 Some(r) => r.try_get(0)?,
-                None => {
-                    tx.commit().await?;
-                    return Ok(false);
-                },
+                None => return Ok(false),
             };
 
-            let drop_snapshot: i64 = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
-                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
-                 RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
+            bump_schema_version(&mut tx, drop_snapshot).await?;
 
             for child in
                 ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
@@ -405,7 +429,17 @@ impl SqliteMetadataWriter {
             //    dropped table's orphaned ducklake_table_stats row is removed).
             if !dead_tables.is_empty() {
                 let dead = id_list(&dead_tables);
-                for table in ["ducklake_table", "ducklake_table_stats", "ducklake_column"] {
+                // `ducklake_schema_versions` is keyed by table_id and has no
+                // end_snapshot; reclaim its rows here once the table is fully
+                // expired (a recreate-after-drop gets a fresh table_id, so this
+                // can't strand a live table's ledger). Matches the Postgres
+                // multicatalog cleanup and upstream GC.
+                for table in [
+                    "ducklake_table",
+                    "ducklake_table_stats",
+                    "ducklake_column",
+                    "ducklake_schema_versions",
+                ] {
                     sqlx::query(&format!("DELETE FROM {table} WHERE table_id IN ({dead})"))
                         .execute(&mut *tx)
                         .await?;
@@ -706,6 +740,41 @@ async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Upgrade a pre-existing catalog to track `schema_version`: add the
+/// `ducklake_snapshot.schema_version` column (the `ducklake_schema_versions` table
+/// is handled by `CREATE TABLE IF NOT EXISTS` in `SQL_CREATE_SCHEMA`). `CREATE
+/// TABLE IF NOT EXISTS` only shapes *new* catalogs, and SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, so we probe `pragma_table_info` and add the column
+/// only when missing.
+///
+/// **Idempotent:** a no-op once the column exists (re-runs on every
+/// `initialize_schema`). **Lossless:** existing snapshot rows take the column
+/// `DEFAULT 0`. We deliberately do NOT fabricate a dense historical
+/// `schema_version` / backfill `ducklake_schema_versions`: this library never
+/// recorded which past snapshots were DDL, so any backfill would be guessed
+/// history. The counter grows correctly from the next DDL commit forward, which is
+/// monotonic and honest (old snapshots simply read as version 0).
+async fn migrate_add_schema_version(pool: &SqlitePool) -> Result<()> {
+    let info = sqlx::query("SELECT name FROM pragma_table_info('ducklake_snapshot')")
+        .fetch_all(pool)
+        .await?;
+    let mut has_schema_version = false;
+    for row in &info {
+        let name: String = row.try_get("name")?;
+        if name == "schema_version" {
+            has_schema_version = true;
+        }
+    }
+    if !has_schema_version {
+        sqlx::query(
+            "ALTER TABLE ducklake_snapshot ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Optimistic-concurrency check for a `Replace` commit (mirrors the Postgres
 /// writer). Run while holding the SQLite write lock, before retiring the prior
 /// generation: if any data file of the table has `begin_snapshot` or
@@ -766,6 +835,79 @@ async fn retire_prior_generation(
     Ok(())
 }
 
+/// Insert the next `ducklake_snapshot` row in commit order, carrying
+/// `schema_version` forward (the pure-data-write default), and return
+/// `(snapshot_id, schema_version)`.
+///
+/// This is the FIRST write of a commit transaction, so the `INSERT ... SELECT
+/// MAX+1 RETURNING` takes the SQLite write lock up front — preserving the
+/// "write-lock-first" invariant that keeps concurrent writers from deadlocking on
+/// a read→write lock upgrade. A DDL commit follows this with
+/// [`bump_schema_version`]; mirrors the Postgres writer's insert-then-`UPDATE
+/// schema_version` shape.
+///
+/// Unlike the Postgres writer there is no `prev_max == 0 ⇒ 1` data-write floor:
+/// on SQLite the first write to any table is always classified as DDL (its
+/// `existing` columns are empty → `is_ddl` → bumps to 1), so a `schema_version`
+/// of 0 carried forward by a pure data write is unreachable.
+async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(i64, i64)> {
+    let row = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP,
+                COALESCE(MAX(schema_version), 0)
+         FROM ducklake_snapshot
+         RETURNING snapshot_id, schema_version",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((row.try_get(0)?, row.try_get(1)?))
+}
+
+/// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
+/// `prev_max + 1` (max over the OTHER snapshots, so re-running is stable) and
+/// return the new value. Mirrors upstream `if (SchemaChangesMade()) schema_version++`
+/// and the Postgres writer's `UPDATE ducklake_snapshot SET schema_version = $1`.
+async fn bump_schema_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot_id: i64,
+) -> Result<i64> {
+    let prev_max: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot WHERE snapshot_id <> ?",
+    )
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let new_version = prev_max + 1;
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = ? WHERE snapshot_id = ?")
+        .bind(new_version)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(new_version)
+}
+
+/// Record a `ducklake_schema_versions` ledger row for a DDL that leaves the table
+/// live (create, column add/remove/reorder, type promotion). Not called for a
+/// drop — the table has no live schema afterward (matches upstream `DropTables`
+/// and `multicatalog.rs::drop_table_in_catalog`).
+async fn record_schema_version(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot_id: i64,
+    schema_version: i64,
+    table_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
+         VALUES (?, ?, ?)",
+    )
+    .bind(snapshot_id)
+    .bind(schema_version)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// The atomic commit point for a single-catalog write. Inserts the deferred
 /// `ducklake_snapshot` row (its reserved id was returned by
 /// `begin_write_transaction` but NOT inserted there), finalizes the column
@@ -787,39 +929,56 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
 ) -> Result<i64> {
-    // Assign the snapshot id in commit order: one INSERT ... SELECT MAX+1
-    // RETURNING takes the write lock for the read and insert together, so
-    // concurrent writers can't collide or publish out of order.
-    let snapshot_id: i64 = sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
-         SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
-         RETURNING snapshot_id",
-    )
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
+    // Allocate the snapshot FIRST (carrying schema_version forward): this INSERT
+    // takes the SQLite write lock up front, so concurrent writers can't collide,
+    // publish out of order, or deadlock on a read→write lock upgrade. schema_version
+    // is corrected to a DDL bump below once we've classified the commit.
+    let (snapshot_id, mut schema_version) = insert_snapshot(tx).await?;
 
-    // Update the column generation SURGICALLY so each column keeps a stable
-    // column_id (== parquet field_id) across writes: end only removed columns,
-    // insert only new ones, and leave unchanged columns (and their ids) in place.
-    // Re-minting ids every write would orphan the field_ids baked into
-    // already-written files, making their rows read back as NULL.
+    // Classify this commit as DDL vs pure data write. `current` is the table's live
+    // columns ordered by `column_order`; an empty set means a brand-new table (the
+    // creating write is DDL). Mirrors the Postgres writer's
+    // `table_was_created || columns_differ` and upstream `SchemaChangesMade()`.
     use std::collections::{HashMap, HashSet};
     let current = sqlx::query(
-        "SELECT column_name, column_order, nulls_allowed
+        "SELECT column_name, column_type, column_order, nulls_allowed
          FROM ducklake_column
-         WHERE table_id = ? AND end_snapshot IS NULL",
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
     )
     .bind(table_id)
     .fetch_all(&mut **tx)
     .await?;
 
+    let mut existing: Vec<(String, String, bool)> = Vec::with_capacity(current.len());
+    for row in &current {
+        let name: String = row.try_get("column_name")?;
+        let ty: String = row.try_get("column_type")?;
+        let nullable: bool = row
+            .try_get::<Option<bool>, _>("nulls_allowed")?
+            .unwrap_or(true);
+        existing.push((name, ty, nullable));
+    }
+    let is_ddl = existing.is_empty() || columns_differ(&existing, columns);
+    if is_ddl {
+        // A DDL commit bumps the per-catalog schema_version (the insert above only
+        // carried it forward). A pure data write keeps the carried value.
+        schema_version = bump_schema_version(tx, snapshot_id).await?;
+    }
+
+    // Reconcile the column generation SURGICALLY so each column keeps a stable
+    // column_id (== parquet field_id) across writes: end only removed columns,
+    // insert only new ones, and leave unchanged columns (and their ids) in place.
+    // Re-minting ids every write would orphan the field_ids baked into
+    // already-written files, making their rows read back as NULL.
     let new_names: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let mut current_by_name: HashMap<String, (i64, bool)> = HashMap::new();
     for row in &current {
-        let name: String = row.try_get(0)?;
-        let order: i64 = row.try_get(1)?;
-        let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
+        let name: String = row.try_get("column_name")?;
+        let order: i64 = row.try_get("column_order")?;
+        let nullable: bool = row
+            .try_get::<Option<bool>, _>("nulls_allowed")?
+            .unwrap_or(true);
         if !new_names.contains(name.as_str()) {
             // Column dropped in the new schema: end its generation.
             sqlx::query(
@@ -890,6 +1049,14 @@ async fn finalize_snapshot(
         .await?;
         retire_prior_generation(tx, table_id, snapshot_id).await?;
     }
+
+    // Record the schema-change ledger row for a DDL commit (table create, or a
+    // column add / remove / reorder). A pure data write carries schema_version
+    // forward and writes no row. (Drop is handled in `drop_table`: it bumps but
+    // writes no row, since the table has no live schema afterward.)
+    if is_ddl {
+        record_schema_version(tx, snapshot_id, schema_version, table_id).await?;
+    }
     Ok(snapshot_id)
 }
 
@@ -897,14 +1064,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id: i64 = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
-                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
-                 RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
+            // A bare snapshot carries no schema change of its own → carry
+            // schema_version forward (no DDL bump, no ledger row).
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             tx.commit().await?;
             Ok(snapshot_id)
         })
@@ -994,6 +1156,13 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            // Take the write lock up front (write-lock-first invariant; see
+            // `insert_snapshot`) by allocating the snapshot before any read, so a
+            // concurrent promote/drop blocks on the lock rather than failing a
+            // deferred read→write upgrade. If a guard below rejects the promote, the
+            // early return drops `tx`, rolling back this snapshot (no trace, no gap).
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+
             // Locate the live version of the column.
             let row = sqlx::query(
                 "SELECT column_id, column_type, column_order, nulls_allowed
@@ -1029,15 +1198,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 )));
             }
 
-            // New snapshot for the schema change (mirrors create_snapshot).
-            let new_snapshot: i64 = sqlx::query(
-                "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time)
-                 SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP FROM ducklake_snapshot
-                 RETURNING snapshot_id",
-            )
-            .fetch_one(&mut *tx)
-            .await?
-            .try_get(0)?;
+            // A promote IS schema evolution → DDL: bump schema_version on the
+            // snapshot allocated above and (below) record the ledger row, matching
+            // the Postgres writer and upstream `CHANGE_COLUMN_TYPE`.
+            let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
 
             // Retire the live row and insert a new version with the SAME column_id
             // (stable field-id). Old/new data files each resolve to their snapshot's
@@ -1066,11 +1230,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // TODO(schema_version, task #3): bump ducklake_snapshot.schema_version on
-            // this DDL snapshot so consumers can detect the change.
+            // Record the schema-change ledger row so consumers can detect the change.
+            record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+
             // TODO(commit-time type guard, task #4): close the window where an Append
-            // that began before this promote commits afterward under the old type
-            // (the §5 begin-time reject is the fail-fast layer only).
+            // whose staging began before this promote commits afterward under the old
+            // type (the §5 begin-time reject is the fail-fast layer only). Lower-
+            // priority on SQLite than Postgres: SQLite serializes commits on a single
+            // write lock (this transaction now holds it from `insert_snapshot` onward),
+            // so a promote and a data-write commit can't interleave — only their
+            // begin-time staging can, which the §5 reject already guards.
 
             tx.commit().await?;
             Ok(new_snapshot)
@@ -1339,6 +1508,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
             // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
             migrate_ducklake_column_drop_pk(&self.pool).await?;
+            // Upgrade a pre-existing catalog to track schema_version (add the
+            // ducklake_snapshot.schema_version column; idempotent, lossless).
+            migrate_add_schema_version(&self.pool).await?;
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved in begin_write_transaction and inserted at the commit, so
             // they can't use rowid autoincrement (inserting the ducklake_snapshot
@@ -1671,6 +1843,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt2, 2, "migration must be idempotent");
+    }
+
+    /// An existing catalog whose `ducklake_snapshot` predates `schema_version`
+    /// (the pre-#151 shape) must gain the column in place: idempotent, lossless,
+    /// and existing snapshot rows take the `DEFAULT 0`. `CREATE TABLE IF NOT
+    /// EXISTS` alone would not touch a pre-existing catalog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_add_schema_version_to_legacy_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("legacy.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&conn_str).await.unwrap();
+
+        // Legacy ducklake_snapshot: no schema_version column, with existing rows.
+        sqlx::query(
+            "CREATE TABLE ducklake_snapshot (
+                snapshot_id INTEGER PRIMARY KEY,
+                snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id) VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Migrate.
+        migrate_add_schema_version(&pool).await.unwrap();
+
+        // Column now exists and existing rows are backfilled to 0 (lossless).
+        let has_col: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('ducklake_snapshot') WHERE name = 'schema_version'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(has_col, 1, "schema_version column must be added");
+        let max_v: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            max_v, 0,
+            "pre-existing snapshots backfill to schema_version 0"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "no snapshot rows lost in the migration");
+
+        // Idempotent: re-running is a no-op.
+        migrate_add_schema_version(&pool).await.unwrap();
+        let rows2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows2, 2, "migration must be idempotent");
     }
 
     #[tokio::test(flavor = "multi_thread")]

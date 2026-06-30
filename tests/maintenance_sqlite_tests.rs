@@ -292,7 +292,16 @@ async fn expire_full_after_drop_reclaims_all_table_metadata() {
 
     let p = pool(&h).await;
     let tid = s.table_id;
-    for tbl in ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_table_stats"] {
+    // `ducklake_schema_versions` (the schema-change ledger, written on the create
+    // DDL) must be reclaimed alongside the rest — otherwise it leaks forever
+    // across create/drop/expire cycles.
+    for tbl in [
+        "ducklake_table",
+        "ducklake_column",
+        "ducklake_data_file",
+        "ducklake_table_stats",
+        "ducklake_schema_versions",
+    ] {
         let cnt = scalar_i64(
             &p,
             &format!("SELECT COUNT(*) FROM {tbl} WHERE table_id = {tid}"),
