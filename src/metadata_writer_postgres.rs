@@ -1250,8 +1250,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             // files does not move this file's rows, and a concurrent delete on
             // THIS file is caught by the compare-and-swap below; neither must
             // block the delete. Abort iff the target is no longer the live file.
+            // Select the BIGINT `data_file_id` (not a literal `1`, which Postgres
+            // types as INT4 and cannot decode into i64) — we only need existence.
             let target_live: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM ducklake_data_file
+                "SELECT data_file_id FROM ducklake_data_file
                  WHERE data_file_id = $1 AND end_snapshot IS NULL",
             )
             .bind(data_file_id)
