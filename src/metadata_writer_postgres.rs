@@ -13,8 +13,8 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
-    columns_differ, validate_name,
+    ColumnDef, CommitIds, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteSetupResult, columns_differ, validate_name,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -1207,6 +1207,123 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+
+            // advance_catalog_head MUST be the last write before commit.
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_delete_file(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        data_file_id: i64,
+        expected_prev_delete_file: Option<i64>,
+        base_snapshot: i64,
+        delete: &DeleteFileInfo,
+    ) -> Result<CommitIds> {
+        block_on(async {
+            // Single atomic commit under the catalog lock: fence on
+            // `base_snapshot`, compare-and-swap the currently-live delete file
+            // for this data file, allocate the snapshot, retire the prior delete
+            // file, insert the new cumulative one, and advance the catalog head
+            // LAST — so at most one delete file is ever live per data file and
+            // nothing is visible until the head maps the snapshot.
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            // Fence: a concurrent write that advanced the table's data generation
+            // since `base_snapshot` may have invalidated the resolved positions.
+            detect_replace_conflict(table_id, base_snapshot, &mut tx).await?;
+
+            // Compare-and-swap on the currently-live delete file for this data
+            // file (`end_snapshot IS NULL`); a concurrent delete on the same data
+            // file makes it differ from what the caller saw.
+            let current_prev: Option<i64> = sqlx::query_scalar(
+                "SELECT delete_file_id FROM ducklake_delete_file
+                 WHERE data_file_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(data_file_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if current_prev != expected_prev_delete_file {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "delete on data file {data_file_id} conflicts with a concurrent delete \
+                     (expected live delete file {expected_prev_delete_file:?}, found \
+                     {current_prev:?}); retry against the new generation"
+                )));
+            }
+
+            // Allocate the snapshot (commit-ordered IDENTITY). A delete is
+            // non-DDL, so carry the per-catalog `schema_version` forward.
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            let prev_max: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+                .bind(prev_max.max(1))
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Retire the prior delete file (cumulative: the new file carries all
+            // still-deleted positions, so the old one is superseded).
+            if let Some(prev) = expected_prev_delete_file {
+                sqlx::query(
+                    "UPDATE ducklake_delete_file SET end_snapshot = $1
+                     WHERE delete_file_id = $2 AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(prev)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            sqlx::query(
+                "INSERT INTO ducklake_delete_file
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, delete_count, begin_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(data_file_id)
+            .bind(table_id)
+            .bind(&delete.path)
+            .bind(delete.path_is_relative)
+            .bind(delete.file_size_bytes)
+            .bind(delete.footer_size)
+            .bind(delete.delete_count)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
 
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;

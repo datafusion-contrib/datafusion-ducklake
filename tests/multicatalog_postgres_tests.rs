@@ -111,6 +111,145 @@ async fn visible_records_at_head(pool: &PgPool, catalog_id: i64, table_id: i64) 
     .unwrap()
 }
 
+/// #864: the postgres `set_delete_file` write — fenced, cumulative,
+/// ≤1-live-delete-file-per-data-file. Asserts the metadata effects directly (the
+/// read-side application via `DeleteFilterExec` is backend-agnostic and covered
+/// by the sqlite round-trip in `positional_delete_tests`).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn set_delete_file_postgres_cumulative_and_fenced() {
+    use datafusion_ducklake::DeleteFileInfo;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_delete").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // A committed data file with 4 rows.
+    let s1 = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s1.table_id,
+        "public",
+        "t",
+        s1.snapshot_id,
+        &DataFileInfo::new("g1.parquet", 1024, 4),
+        WriteMode::Replace,
+        s1.base_snapshot_id,
+        &cols(),
+        &s1.column_ids,
+    )
+    .unwrap();
+    let table_id = s1.table_id;
+    let data_file_id: i64 = sqlx::query(
+        "SELECT data_file_id FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+
+    // First delete: no prior. Records 2 positions.
+    let base1 = current_head(&pool, cat).await;
+    let ids1 = w
+        .set_delete_file(
+            table_id,
+            "public",
+            "t",
+            base1,
+            data_file_id,
+            None,
+            base1,
+            &DeleteFileInfo::new("d1.parquet", 100, 2),
+        )
+        .unwrap();
+    assert!(ids1.snapshot_id > base1, "head advances");
+    assert_eq!(current_head(&pool, cat).await, ids1.snapshot_id);
+    let (live_count, live_id, dcount, begin): (i64, i64, i64, i64) = {
+        let row = sqlx::query(
+            "SELECT COUNT(*), MIN(delete_file_id), MIN(delete_count), MIN(begin_snapshot)
+             FROM ducklake_delete_file WHERE data_file_id = $1 AND end_snapshot IS NULL",
+        )
+        .bind(data_file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        (
+            row.try_get(0).unwrap(),
+            row.try_get(1).unwrap(),
+            row.try_get(2).unwrap(),
+            row.try_get(3).unwrap(),
+        )
+    };
+    assert_eq!(live_count, 1, "one live delete file");
+    assert_eq!(dcount, 2);
+    assert_eq!(begin, ids1.snapshot_id, "delete file begins at the new snapshot");
+
+    // A stale CAS (still thinks there's no prior) is rejected.
+    let base_stale = current_head(&pool, cat).await;
+    let err = w
+        .set_delete_file(
+            table_id,
+            "public",
+            "t",
+            base_stale,
+            data_file_id,
+            None,
+            base_stale,
+            &DeleteFileInfo::new("d_bad.parquet", 100, 1),
+        )
+        .expect_err("stale expected_prev_delete_file must be rejected");
+    assert!(
+        matches!(err, DuckLakeError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+
+    // Cumulative second delete: supersede the first (prior retired, one live).
+    let base2 = current_head(&pool, cat).await;
+    let ids2 = w
+        .set_delete_file(
+            table_id,
+            "public",
+            "t",
+            base2,
+            data_file_id,
+            Some(live_id),
+            base2,
+            &DeleteFileInfo::new("d2.parquet", 150, 3),
+        )
+        .unwrap();
+    let live_after: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_delete_file WHERE data_file_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(data_file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(live_after, 1, "still exactly one live delete file");
+    let prior_end: Option<i64> =
+        sqlx::query("SELECT end_snapshot FROM ducklake_delete_file WHERE delete_file_id = $1")
+            .bind(live_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        prior_end,
+        Some(ids2.snapshot_id),
+        "prior delete file retired at the new snapshot"
+    );
+}
+
 /// Regression for the transient empty-read bug: a managed-load Replace must
 /// never expose a committed state where the head advanced but the table has
 /// zero live files. The head advance + prior-generation retirement happen only
