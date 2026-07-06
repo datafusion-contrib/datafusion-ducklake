@@ -421,10 +421,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Register a positional delete file for a single data file, superseding any
     /// prior live delete file for it (at most one is live per data file).
     ///
-    /// In one transaction: check that `expected_prev_delete_file` (the prior live
-    /// delete file's id, or `None`) and `base_snapshot` still match, else return
-    /// [`crate::DuckLakeError::Conflict`]; then end the prior delete file and
-    /// insert `delete`, which must carry the cumulative position set.
+    /// In one transaction, abort with [`crate::DuckLakeError::Conflict`] if either
+    /// the target `data_file_id` is no longer the live data file (a concurrent
+    /// Replace/compaction retired it since `base_snapshot`, invalidating the
+    /// resolved positions) or the currently-live delete file for it no longer
+    /// matches `expected_prev_delete_file` (a concurrent delete on the same file
+    /// won the race). A concurrent *append* that only adds other files does NOT
+    /// conflict — it never moves this file's rows. Otherwise end the prior delete
+    /// file and insert `delete`, which must carry the cumulative position set.
     ///
     /// Default: unsupported; backends override it.
     #[allow(clippy::too_many_arguments)]

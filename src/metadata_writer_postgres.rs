@@ -1243,9 +1243,27 @@ impl MetadataWriter for PostgresMetadataWriter {
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            // Fence: a concurrent write that advanced the table's data generation
-            // since `base_snapshot` may have invalidated the resolved positions.
-            detect_replace_conflict(table_id, base_snapshot, &mut tx).await?;
+            // Target-file fence: the resolved positions are physical row indices
+            // in `data_file_id`, and a parquet data file is immutable — so only a
+            // concurrent write that RETIRED this file (a Replace/compaction) since
+            // `base_snapshot` can invalidate them. An append that adds *other*
+            // files does not move this file's rows, and a concurrent delete on
+            // THIS file is caught by the compare-and-swap below; neither must
+            // block the delete. Abort iff the target is no longer the live file.
+            let target_live: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE data_file_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(data_file_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if target_live.is_none() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "delete targets data file {data_file_id}, which was retired by a \
+                     concurrent write since snapshot {base_snapshot}; retry against the \
+                     new generation"
+                )));
+            }
 
             // Compare-and-swap on the currently-live delete file for this data
             // file (`end_snapshot IS NULL`); a concurrent delete on the same data

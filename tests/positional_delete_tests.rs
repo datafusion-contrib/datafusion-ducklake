@@ -396,3 +396,157 @@ async fn resolve_write_and_apply_positional_delete() {
         "resolve -> write_delete_file -> set_delete_file deletes ids 2,4"
     );
 }
+
+/// #864 fence: a concurrent APPEND that adds an unrelated data file must NOT
+/// block a positional delete on a still-live data file. The resolved positions
+/// are physical row indices in the target file, which an append never moves, so
+/// the delete commits even against a pre-append `base_snapshot` and both files
+/// coexist. (The old table-wide fence rejected this; the target-file fence does
+/// not.)
+#[tokio::test(flavor = "multi_thread")]
+async fn set_delete_file_allows_concurrent_append_to_other_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(create_writer(&temp_dir).await);
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // Data file D: ids [1,2,3,4] at physical positions 0..3.
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let db_path = temp_dir.path().join("test.db");
+    let pool = SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE end_snapshot IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let df_row = sqlx::query(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let data_file_id: i64 = df_row.try_get(0).unwrap();
+    let data_file_path: String = df_row.try_get(1).unwrap();
+    // Base snapshot captured BEFORE the concurrent append.
+    let base: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Concurrent append: adds a NEW data file (ids [5,6]) and advances the head,
+    // so the table's data generation moved past `base`.
+    let batch2 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![5, 6]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .append_table("main", "t", &[batch2])
+        .await
+        .unwrap();
+    assert_eq!(
+        read_ids(&temp_dir).await,
+        vec![1, 2, 3, 4, 5, 6],
+        "after append"
+    );
+
+    // Delete positions {1,3} (ids 2,4) on the ORIGINAL file, committing against
+    // the pre-append `base`. Must succeed despite the intervening append.
+    let del = temp_dir.path().join("delete_append.parquet");
+    let size = write_delete_parquet(&del, &data_file_path, &[1, 3]);
+    let info = DeleteFileInfo::new(del.to_string_lossy().to_string(), size, 2).with_absolute_path();
+    writer
+        .set_delete_file(table_id, "main", "t", base, data_file_id, None, base, &info)
+        .expect("append to an unrelated file must not block the delete");
+
+    assert_eq!(
+        read_ids(&temp_dir).await,
+        vec![1, 3, 5, 6],
+        "positions 1,3 deleted from the original file; appended rows untouched"
+    );
+}
+
+/// #864 fence: a positional delete on a data file that a concurrent Replace has
+/// RETIRED must be rejected — the resolved positions refer to a file that is no
+/// longer live, so committing them would mask the wrong generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_delete_file_rejects_delete_on_retired_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(create_writer(&temp_dir).await);
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let db_path = temp_dir.path().join("test.db");
+    let pool = SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE end_snapshot IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let df_row = sqlx::query(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let data_file_id: i64 = df_row.try_get(0).unwrap();
+    let data_file_path: String = df_row.try_get(1).unwrap();
+    let base: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Concurrent Replace: retires the original data file and writes a new one.
+    let batch2 = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![7, 8]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .write_table("main", "t", &[batch2])
+        .await
+        .unwrap();
+
+    // Deleting from the now-retired file must Conflict.
+    let del = temp_dir.path().join("delete_retired.parquet");
+    let size = write_delete_parquet(&del, &data_file_path, &[1]);
+    let info = DeleteFileInfo::new(del.to_string_lossy().to_string(), size, 1).with_absolute_path();
+    let err = writer
+        .set_delete_file(table_id, "main", "t", base, data_file_id, None, base, &info)
+        .expect_err("delete on a retired data file must be rejected");
+    assert!(
+        matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "expected a Conflict, got {err:?}"
+    );
+}

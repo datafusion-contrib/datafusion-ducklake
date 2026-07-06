@@ -1425,10 +1425,27 @@ impl MetadataWriter for SqliteMetadataWriter {
             // `insert_snapshot`); a delete carries `schema_version` forward.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
 
-            // Base-snapshot fence: if a concurrent write advanced the table's
-            // data generation since `base_snapshot`, the positions we resolved
-            // may be stale — abort so the caller retries against the new head.
-            detect_replace_conflict(&mut tx, table_id, base_snapshot).await?;
+            // Target-file fence: the resolved positions are physical row indices
+            // in `data_file_id`, and a parquet data file is immutable — so only a
+            // concurrent write that RETIRED this file (a Replace/compaction) since
+            // `base_snapshot` can invalidate them. An append that adds *other*
+            // files does not move this file's rows, and a concurrent delete on
+            // THIS file is caught by the compare-and-swap below; neither must
+            // block the delete. Abort iff the target is no longer the live file.
+            let target_live: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE data_file_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(data_file_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if target_live.is_none() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "delete targets data file {data_file_id}, which was retired by a \
+                     concurrent write since snapshot {base_snapshot}; retry against the \
+                     new generation"
+                )));
+            }
 
             // Compare-and-swap on the currently-live delete file for this data
             // file (`end_snapshot IS NULL`). If it isn't what the caller saw, a
