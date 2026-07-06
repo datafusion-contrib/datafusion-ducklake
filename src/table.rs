@@ -12,7 +12,8 @@ use crate::metadata_provider::{
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
 use crate::row_id::{
-    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, rowid_field,
+    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, ROWID_COLUMN_NAME, RowIdExec,
+    rowid_field,
 };
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
@@ -25,7 +26,7 @@ use crate::metadata_writer::{MetadataWriter, WriteMode};
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
-use arrow::array::{Array, Int64Array};
+use arrow::array::{Array, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -365,11 +366,75 @@ impl DuckLakeTable {
     /// `position = rowid - row_id_start`.
     pub async fn resolve_positions(
         &self,
-        _state: &dyn Session,
-        _data_file: &DuckLakeFileData,
-        _predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        state: &dyn Session,
+        data_file: &DuckLakeFileData,
+        predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     ) -> DataFusionResult<HashSet<i64>> {
-        todo!("resolve_positions is not yet implemented")
+        // Positional scan of the data file: read the physical data columns and
+        // materialize the true physical row position (`ROW_POS_COLUMN_NAME`) via
+        // `FileRowNumberExec`, WITHOUT applying any delete files. Then evaluate
+        // `predicate` per batch and collect the physical positions of matching
+        // rows — exactly the `pos` values a positional delete file records.
+        //
+        // `predicate` is expressed against the table's logical column order
+        // (column index i = the i-th logical/data field); `Column::evaluate` is
+        // index-based, so it resolves against the read batch regardless of any
+        // physical rename. `ROW_POS_COLUMN_NAME` is appended last and is never
+        // referenced by the predicate. Valid for insert-only files, where the
+        // physical position equals `rowid - row_id_start`.
+        let file_cfg = self.build_file_read_config(state, data_file).await?;
+
+        // Row-group-aligned partitions + a non-repartition, non-pruning source so
+        // `FileRowNumberExec` yields true physical positions (mirrors the scan
+        // paths in `build_exec_for_file_with_rowid`).
+        let target_partitions = state.config().target_partitions();
+        let (file_groups, partition_starts) =
+            self.build_row_group_partitions(data_file, &file_cfg, target_partitions)?;
+
+        let source = PositionalFileSource::wrap(Arc::new(
+            self.create_parquet_source(file_cfg.read_schema.clone()),
+        ));
+        // Physical data columns only (logical order); embedded/rowid columns are
+        // not needed to evaluate the predicate or read positions.
+        let physical_proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
+        let scan = DataSourceExec::from_data_source(
+            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+                .with_file_groups(file_groups)
+                .with_partitioned_by_file_group(true)
+                .with_projection_indices(Some(physical_proj))?
+                .build(),
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FileRowNumberExec::new(scan, partition_starts));
+        let pos_idx = plan.schema().index_of(ROW_POS_COLUMN_NAME)?;
+
+        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
+
+        let mut positions = HashSet::new();
+        for batch in &batches {
+            let mask = predicate.evaluate(batch)?.into_array(batch.num_rows())?;
+            let mask = mask
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "resolve_positions: predicate did not evaluate to a boolean".to_string(),
+                    )
+                })?;
+            let pos = batch
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+                })?;
+            for i in 0..batch.num_rows() {
+                // A NULL predicate result is treated as non-match (SQL semantics).
+                if mask.is_valid(i) && mask.value(i) {
+                    positions.insert(pos.value(i));
+                }
+            }
+        }
+        Ok(positions)
     }
 
     /// Read a delete file and extract all deleted row positions
