@@ -484,8 +484,16 @@ impl DuckLakeFileData {
 /// Represents a data file and its associated delete file (if any) for a DuckLake table
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableFile {
+    /// Catalog `data_file_id` — the identity a positional-delete write targets
+    /// (`MetadataWriter::set_delete_file`). Needed by the mutation path; the read
+    /// path ignores it.
+    pub data_file_id: i64,
     /// Metadata for the data file
     pub file: DuckLakeFileData,
+    /// Catalog `delete_file_id` of the currently-live delete file for this data
+    /// file, or `None` if none is live. The compare-and-swap `expected_prev`
+    /// when superseding it with a cumulative delete file.
+    pub delete_file_id: Option<i64>,
     /// Optional associated delete file containing deleted row positions
     pub delete_file: Option<DuckLakeFileData>,
     /// Starting row ID for this file. Combined with each row's position in the
@@ -507,7 +515,12 @@ pub struct DuckLakeTableFile {
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {
         Self {
+            // A bare file with no catalog context: `data_file_id` is unset (0)
+            // and there is no associated delete file. Not for the mutation path,
+            // which reads files (with real ids) via `get_table_files_for_select`.
+            data_file_id: 0,
             file,
+            delete_file_id: None,
             delete_file: None,
             row_id_start: None,
             snapshot_id: None,

@@ -272,6 +272,16 @@ impl DuckLakeTable {
             .then(|| self.physical_schema.fields().len())
     }
 
+    /// The table's live data files (each with its catalog `data_file_id`, any
+    /// live delete file, and that delete file's `delete_file_id`) at the snapshot
+    /// this table was opened at. The positional-delete flow iterates these: for
+    /// each, [`Self::resolve_positions`] finds the rows to delete,
+    /// [`Self::read_delete_file_positions`] reads the already-deleted set, and
+    /// the union is written back via `set_delete_file` (CAS on `delete_file_id`).
+    pub fn files(&self) -> &[DuckLakeTableFile] {
+        &self.table_files
+    }
+
     /// Resolve a file path (data or delete file) to its absolute path
     fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
@@ -437,12 +447,14 @@ impl DuckLakeTable {
         Ok(positions)
     }
 
-    /// Read a delete file and extract all deleted row positions
+    /// Read a delete file and return the set of physical row positions it marks
+    /// deleted (the `pos` column). Callers use this to form the cumulative
+    /// (prior ∪ new) position set when superseding a data file's live delete
+    /// file via [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
-    /// The delete file is already associated with a specific data file via metadata.
-    /// We only need to extract the "pos" column - the "file_path" column is
-    /// metadata/documentation only (for Iceberg compatibility).
-    async fn read_delete_file_positions(
+    /// The delete file is already associated with a specific data file via
+    /// metadata; only `pos` is read (the `file_path` column is documentation).
+    pub async fn read_delete_file_positions(
         &self,
         state: &dyn Session,
         delete_file: &DuckLakeFileData,

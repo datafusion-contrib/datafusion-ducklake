@@ -248,7 +248,9 @@ impl MetadataProvider for MySqlMetadataProvider {
                     };
 
                     Ok(DuckLakeTableFile {
+                        data_file_id: row.try_get(0)?,
                         file: data_file,
+                        delete_file_id: row.try_get(8)?,
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
@@ -502,7 +504,9 @@ impl MetadataProvider for MySqlMetadataProvider {
                         schema_name: row.try_get(0)?,
                         table_name: row.try_get(1)?,
                         file: DuckLakeTableFile {
+                            data_file_id: row.try_get(2)?,
                             file: data_file,
+                            delete_file_id: row.try_get(8)?,
                             delete_file,
                             row_id_start: None,
                             snapshot_id: None,

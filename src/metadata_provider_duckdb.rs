@@ -185,7 +185,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 [table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
                 |row| {
                     // Parse data file (columns 0-7)
-                    let _data_file_id: i64 = row.get(0)?;
+                    let data_file_id: i64 = row.get(0)?;
                     let data_file = DuckLakeFileData {
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
@@ -197,8 +197,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let record_count: Option<i64> = row.get(7)?;
 
                     // Parse delete file (columns 8-14) if exists
-                    let (delete_file, delete_count) =
-                        if let Ok(Some(_)) = row.get::<_, Option<i64>>(8) {
+                    let (delete_file, delete_count, delete_file_id) =
+                        if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
                             (
                                 Some(DuckLakeFileData {
                                     path: row.get(9)?,
@@ -208,13 +208,16 @@ impl MetadataProvider for DuckdbMetadataProvider {
                                     encryption_key: row.get(13)?,
                                 }),
                                 row.get(14)?,
+                                Some(dfid),
                             )
                         } else {
-                            (None, None)
+                            (None, None, None)
                         };
 
                     Ok(DuckLakeTableFile {
+                        data_file_id,
                         file: data_file,
+                        delete_file_id,
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
@@ -377,7 +380,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;
 
-                    // Parse data file (skip column 2: data_file_id, only used for JOIN)
+                    // Column 2 is data_file_id; columns 3-7 are the data file.
+                    let data_file_id: i64 = row.get(2)?;
                     let data_file = DuckLakeFileData {
                         path: row.get(3)?,
                         path_is_relative: row.get(4)?,
@@ -386,18 +390,21 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         encryption_key: row.get(7)?,
                     };
 
-                    // Parse optional delete file (column 8: delete_file_id, check if exists but don't store)
-                    let delete_file =
-                        if let Ok(Some(_delete_file_id)) = row.get::<_, Option<i64>>(8) {
-                            Some(DuckLakeFileData {
-                                path: row.get(9)?,
-                                path_is_relative: row.get(10)?,
-                                file_size_bytes: row.get(11)?,
-                                footer_size: row.get(12)?,
-                                encryption_key: row.get(13)?,
-                            })
+                    // Column 8 is delete_file_id (NULL when no live delete file).
+                    let (delete_file, delete_file_id) =
+                        if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
+                            (
+                                Some(DuckLakeFileData {
+                                    path: row.get(9)?,
+                                    path_is_relative: row.get(10)?,
+                                    file_size_bytes: row.get(11)?,
+                                    footer_size: row.get(12)?,
+                                    encryption_key: row.get(13)?,
+                                }),
+                                Some(dfid),
+                            )
                         } else {
-                            None
+                            (None, None)
                         };
 
                     let max_row_count = row.get::<_, Option<i64>>(14)?;
@@ -406,7 +413,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         schema_name,
                         table_name,
                         file: DuckLakeTableFile {
+                            data_file_id,
                             file: data_file,
+                            delete_file_id,
                             delete_file,
                             row_id_start: None,
                             snapshot_id: None,
