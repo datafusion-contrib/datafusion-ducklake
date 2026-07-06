@@ -17,8 +17,11 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode, WriteResult};
+use crate::metadata_writer::{
+    ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteResult,
+};
 use crate::path_resolver::join_paths;
+use crate::table::delete_file_schema;
 
 /// High-level writer for DuckLake tables.
 #[derive(Debug)]
@@ -254,6 +257,79 @@ impl DuckLakeTableWriter {
         }
 
         session.finish().await
+    }
+
+    /// Write a positional `(file_path, pos)` delete parquet, upload it, and
+    /// return the [`DeleteFileInfo`] to register via
+    /// [`MetadataWriter::set_delete_file`].
+    ///
+    /// `positions` is the CUMULATIVE set of still-deleted physical row positions
+    /// for `data_file_path`: the engine keeps at most one live delete file per
+    /// data file, so each write carries the full set (the prior file is retired
+    /// on commit). The delete file lands beside the data files it masks — the
+    /// same `cat_{id}/{schema}/{table}/` layout as [`Self::begin_write`] — and is
+    /// registered relative to the table, so the reader resolves it exactly like a
+    /// data file. Readers key deletes off `pos`; `file_path` is recorded for
+    /// provenance.
+    pub async fn write_delete_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        positions: &[i64],
+    ) -> Result<DeleteFileInfo> {
+        use arrow::array::{Int64Array, StringArray};
+
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let object_path_str = join_paths(&table_key, &file_name)?;
+        // Strip leading slash for object_store Path (it expects relative keys).
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+        let schema = delete_file_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
+                Arc::new(Int64Array::from(positions.to_vec())),
+            ],
+        )?;
+
+        // Stream to a local staging file, then multipart-upload it — the same
+        // bounded-memory path `finish()` uses for data files.
+        let props = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression)
+            .build();
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let mut writer = ArrowWriter::try_new(staging, schema, Some(props))?;
+        writer.write(&batch)?;
+        let staged = writer.into_inner()?;
+        let mut file = staged
+            .into_inner()
+            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+        let file_size = file.metadata()?.len() as i64;
+        let footer_size = read_footer_size(&mut file)?;
+
+        let local = tokio::fs::File::open(temp.path()).await?;
+        let mut reader = tokio::io::BufReader::new(local);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+            let _ = upload.abort().await;
+            return Err(e.into());
+        }
+
+        // Registered relative to the table path (like data files); the reader
+        // resolves it against the same table data dir.
+        Ok(
+            DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
+                .with_footer_size(footer_size),
+        )
     }
 }
 

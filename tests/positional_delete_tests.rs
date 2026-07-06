@@ -18,9 +18,12 @@ use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
 use datafusion_ducklake::{
-    DeleteFileInfo, DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter,
+    DeleteFileInfo, DuckLakeCatalog, DuckLakeFileData, DuckLakeTable, DuckLakeTableWriter,
+    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -279,5 +282,117 @@ async fn set_delete_file_rejects_stale_prior() {
     assert!(
         matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
         "expected a Conflict, got {err:?}"
+    );
+}
+
+/// The full crate-side delete pipeline, end to end: `resolve_positions` finds
+/// the matching rows' physical positions, `write_delete_file` writes and uploads
+/// the `(file_path, pos)` delete parquet, `set_delete_file` registers it, and the
+/// read path applies it. This is the only test that drives `resolve_positions`
+/// (position discovery) and `write_delete_file` (delete-file authoring); the
+/// other tests hand-build the delete parquet and positions.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolve_write_and_apply_positional_delete() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(create_writer(&temp_dir).await);
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    // Write ids [1,2,3,4] as one insert-only data file (physical positions 0..3).
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))]).unwrap();
+    DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+    assert_eq!(read_ids(&temp_dir).await, vec![1, 2, 3, 4], "baseline");
+
+    // Catalog ids + the data file's stored (path, path_is_relative, size), which
+    // are what `DuckLakeFileData` needs to be scanned.
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}", db_path.display());
+    let pool = SqlitePool::connect(&conn_str).await.unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE end_snapshot IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let df_row = sqlx::query(
+        "SELECT data_file_id, path, path_is_relative, file_size_bytes
+         FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let data_file_id: i64 = df_row.try_get(0).unwrap();
+    let data_file_path: String = df_row.try_get(1).unwrap();
+    let path_is_relative: bool = df_row.try_get::<i64, _>(2).unwrap() != 0;
+    let file_size_bytes: i64 = df_row.try_get(3).unwrap();
+    let data_file =
+        DuckLakeFileData::new(data_file_path.clone(), path_is_relative, file_size_bytes);
+
+    // Resolve positions for `id = 2 OR id = 4` — ids at physical positions 1 and
+    // 3. The predicate is index-based against the table's logical column order
+    // (`id` is column 0).
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(catalog));
+    let schema_provider = ctx.catalog("test").unwrap().schema("main").unwrap();
+    let table_provider = schema_provider.table("t").await.unwrap().unwrap();
+    // `TableProvider: Any` in DataFusion 54 (no `as_any()` method); upcast to
+    // `dyn Any` to reach the concrete `DuckLakeTable`.
+    let table = (table_provider.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<DuckLakeTable>()
+        .expect("provider is a DuckLakeTable");
+
+    let data_schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let id: Arc<dyn PhysicalExpr> = col("id", &data_schema).unwrap();
+    let eq2: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(id.clone(), Operator::Eq, lit(2i32)));
+    let eq4: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(id, Operator::Eq, lit(4i32)));
+    let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(eq2, Operator::Or, eq4));
+
+    let state = ctx.state();
+    let positions = table
+        .resolve_positions(&state, &data_file, predicate)
+        .await
+        .unwrap();
+    let mut positions: Vec<i64> = positions.into_iter().collect();
+    positions.sort_unstable();
+    assert_eq!(
+        positions,
+        vec![1, 3],
+        "ids 2 and 4 sit at positions 1 and 3"
+    );
+
+    // Author the delete file from those positions and register it (no prior).
+    let del_info = DuckLakeTableWriter::new(writer.clone(), object_store.clone())
+        .unwrap()
+        .write_delete_file("main", "t", &data_file_path, &positions)
+        .await
+        .unwrap();
+    let base: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    writer
+        .set_delete_file(
+            table_id,
+            "main",
+            "t",
+            base,
+            data_file_id,
+            None,
+            base,
+            &del_info,
+        )
+        .unwrap();
+
+    assert_eq!(
+        read_ids(&temp_dir).await,
+        vec![1, 3],
+        "resolve -> write_delete_file -> set_delete_file deletes ids 2,4"
     );
 }

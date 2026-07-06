@@ -190,7 +190,10 @@ async fn set_delete_file_postgres_cumulative_and_fenced() {
     };
     assert_eq!(live_count, 1, "one live delete file");
     assert_eq!(dcount, 2);
-    assert_eq!(begin, ids1.snapshot_id, "delete file begins at the new snapshot");
+    assert_eq!(
+        begin, ids1.snapshot_id,
+        "delete file begins at the new snapshot"
+    );
 
     // A stale CAS (still thinks there's no prior) is rejected.
     let base_stale = current_head(&pool, cat).await;
