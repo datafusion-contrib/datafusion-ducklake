@@ -289,12 +289,22 @@ impl DuckLakeTable {
     }
 
     /// Create a ParquetSource with encryption support if enabled and needed
-    fn create_parquet_source(&self, schema: SchemaRef) -> ParquetSource {
+    fn create_parquet_source(&self, schema: SchemaRef, state: &dyn Session) -> ParquetSource {
+        // Honor the session's Parquet filter-pushdown settings so a highly
+        // selective predicate is evaluated during decoding (non-matching rows
+        // are never fully materialized). Previously these were left at
+        // TableParquetOptions defaults (both false), which silently ignored a
+        // caller's `datafusion.execution.parquet.pushdown_filters` setting.
+        let parquet_cfg = &state.config().options().execution.parquet;
+        let source = ParquetSource::new(schema);
         #[cfg(feature = "encryption")]
-        if let Some(ref factory) = self.encryption_factory {
-            return ParquetSource::new(schema).with_encryption_factory(Arc::clone(factory));
-        }
-        ParquetSource::new(schema)
+        let source = match &self.encryption_factory {
+            Some(factory) => source.with_encryption_factory(Arc::clone(factory)),
+            None => source,
+        };
+        source
+            .with_pushdown_filters(parquet_cfg.pushdown_filters)
+            .with_reorder_filters(parquet_cfg.reorder_filters)
     }
 
     /// Compute the field_id -> physical-name read schema and rename mapping for a
@@ -402,7 +412,7 @@ impl DuckLakeTable {
             self.build_row_group_partitions(data_file, &file_cfg, target_partitions)?;
 
         let source = PositionalFileSource::wrap(Arc::new(
-            self.create_parquet_source(file_cfg.read_schema.clone()),
+            self.create_parquet_source(file_cfg.read_schema.clone(), state),
         ));
         // Physical data columns only (logical order); embedded/rowid columns are
         // not needed to evaluate the predicate or read positions.
@@ -480,7 +490,7 @@ impl DuckLakeTable {
         // Create file scan config for the delete file
         let file_scan_config = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(delete_schema)),
+            Arc::new(self.create_parquet_source(delete_schema, state)),
         )
         .with_file_group(FileGroup::new(vec![pf]))
         .build();
@@ -590,7 +600,7 @@ impl DuckLakeTable {
         for ((read_schema, name_mapping), partitioned_files) in groups {
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(read_schema.clone())),
+                Arc::new(self.create_parquet_source(read_schema.clone(), state)),
             )
             .with_limit(limit)
             .with_file_group(FileGroup::new(partitioned_files));
@@ -677,7 +687,7 @@ impl DuckLakeTable {
                 self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
 
             let source = PositionalFileSource::wrap(Arc::new(
-                self.create_parquet_source(file_cfg.read_schema.clone()),
+                self.create_parquet_source(file_cfg.read_schema.clone(), state),
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
@@ -712,7 +722,7 @@ impl DuckLakeTable {
             }
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
+                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone(), state)),
             )
             .with_limit(limit)
             .with_file_group(FileGroup::new(vec![pf]));
@@ -1012,7 +1022,7 @@ impl DuckLakeTable {
                 self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
 
             let source = PositionalFileSource::wrap(Arc::new(
-                self.create_parquet_source(file_cfg.read_schema.clone()),
+                self.create_parquet_source(file_cfg.read_schema.clone(), state),
             ));
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
@@ -1056,7 +1066,7 @@ impl DuckLakeTable {
             }
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
-                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
+                Arc::new(self.create_parquet_source(file_cfg.read_schema.clone(), state)),
             )
             .with_limit(limit)
             .with_file_group(FileGroup::new(vec![pf]));
