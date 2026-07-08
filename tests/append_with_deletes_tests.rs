@@ -22,8 +22,9 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
 use datafusion_ducklake::{
-    DeleteFileEntry, DuckLakeCatalog, DuckLakeFileData, DuckLakeTable, DuckLakeTableWriter,
-    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+    DataFileInfo, DeleteFileEntry, DeleteFileInfo, DuckLakeCatalog, DuckLakeError,
+    DuckLakeFileData, DuckLakeTable, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter, WriteMode,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
@@ -361,5 +362,62 @@ async fn update_spanning_two_data_files_commits_one_snapshot() {
         snaps,
         vec![result.snapshot_id],
         "both deletes and the append committed in exactly one snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn register_data_file_with_deletes_rejects_invalid_entries() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = create_writer(&temp_dir).await;
+
+    // The entries are validated before any database work, so no table need exist;
+    // the file/delete infos are placeholders.
+    let file = DataFileInfo::new("new.parquet", 1, 1);
+    let entry = |data_file_id: i64| DeleteFileEntry {
+        data_file_id,
+        expected_prev_delete_file: None,
+        delete: DeleteFileInfo::new("del.parquet", 1, 1),
+    };
+
+    // Replace + deletes is rejected up front: Replace retires the very files the
+    // deletes target, so the combination can never succeed.
+    let err = writer
+        .register_data_file_with_deletes(
+            1,
+            "main",
+            "t",
+            0,
+            &file,
+            &[entry(1)],
+            WriteMode::Replace,
+            0,
+            &[],
+            &[],
+        )
+        .expect_err("Replace + deletes must be rejected");
+    assert!(
+        matches!(err, DuckLakeError::InvalidConfig(_)),
+        "got {err:?}"
+    );
+
+    // Two entries for the same data file are rejected (positions must be unioned
+    // into one entry per file).
+    let err = writer
+        .register_data_file_with_deletes(
+            1,
+            "main",
+            "t",
+            0,
+            &file,
+            &[entry(7), entry(7)],
+            WriteMode::Append,
+            0,
+            &[],
+            &[],
+        )
+        .expect_err("duplicate data_file_id must be rejected");
+    assert!(
+        matches!(err, DuckLakeError::InvalidConfig(_)),
+        "got {err:?}"
     );
 }

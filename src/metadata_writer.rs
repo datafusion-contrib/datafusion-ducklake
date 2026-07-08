@@ -279,6 +279,39 @@ pub struct DeleteFileEntry {
     pub delete: DeleteFileInfo,
 }
 
+/// Validate the `deletes` of a
+/// [`MetadataWriter::register_data_file_with_deletes`] call before any work.
+///
+/// Positional deletes require [`WriteMode::Append`]: a `Replace` retires the
+/// very data files the deletes target, so the fence could never find them and
+/// the commit would abort with a misleading "retired by a concurrent write"
+/// error. Each entry must also target a distinct data file — positions are
+/// cumulative per file, so the caller unions them into one entry per file;
+/// duplicates would otherwise abort on the second entry's compare-and-swap.
+pub(crate) fn validate_delete_entries(mode: WriteMode, deletes: &[DeleteFileEntry]) -> Result<()> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    if mode == WriteMode::Replace {
+        return Err(DuckLakeError::InvalidConfig(
+            "register_data_file_with_deletes: positional deletes require WriteMode::Append; \
+             Replace retires the data files the deletes target"
+                .to_string(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(deletes.len());
+    for entry in deletes {
+        if !seen.insert(entry.data_file_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "register_data_file_with_deletes: duplicate delete entry for data file {}; \
+                 each entry must target a distinct data file",
+                entry.data_file_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {

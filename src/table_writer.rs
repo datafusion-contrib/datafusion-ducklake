@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::Result;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteResult,
+    WriteResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
@@ -471,6 +471,9 @@ impl TableWriteSession {
     /// each delete file (see [`DuckLakeTableWriter::write_delete_file`]) before
     /// calling this; `deletes` may be empty (equivalent to `finish`).
     pub async fn finish_with_deletes(mut self, deletes: &[DeleteFileEntry]) -> Result<WriteResult> {
+        // Reject an unsupported combination before uploading the staged parquet,
+        // so a misuse leaves no orphan object in storage.
+        validate_delete_entries(self.mode, deletes)?;
         let file_info = self.upload_staged().await?;
         let committed = self.metadata.register_data_file_with_deletes(
             self.table_id,

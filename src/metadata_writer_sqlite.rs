@@ -10,7 +10,7 @@ use crate::maintenance::{
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteSetupResult, columns_differ, validate_name,
+    WriteSetupResult, columns_differ, validate_delete_entries, validate_name,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -1525,6 +1525,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
+        validate_delete_entries(mode, deletes)?;
         block_on(async {
             // One atomic commit for a combined append + positional deletes (an
             // update/upsert). finalize_snapshot allocates the snapshot + finalizes
