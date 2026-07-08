@@ -263,6 +263,22 @@ impl DeleteFileInfo {
     }
 }
 
+/// One data file's positional delete, applied as part of a combined
+/// [`MetadataWriter::register_data_file_with_deletes`] commit. Supersedes the
+/// live delete file for `data_file_id` with `delete` (which must be cumulative),
+/// guarded by the same compare-and-swap as
+/// [`MetadataWriter::set_delete_file`].
+#[derive(Debug, Clone)]
+pub struct DeleteFileEntry {
+    /// The existing data file whose rows are being (partly) deleted.
+    pub data_file_id: i64,
+    /// The live delete file the caller resolved against for `data_file_id`
+    /// (compare-and-swap guard), or `None` if none was live.
+    pub expected_prev_delete_file: Option<i64>,
+    /// The new cumulative delete file (all still-deleted positions for the file).
+    pub delete: DeleteFileInfo,
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {
@@ -445,6 +461,46 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(
             "set_delete_file is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Atomically register one new data file AND apply positional deletes to
+    /// existing data files, in a SINGLE snapshot — the primitive behind an
+    /// update/upsert (supersede rows and insert their new versions in one commit).
+    ///
+    /// In one transaction: allocate one snapshot; insert `file` and advance the
+    /// stats/row-lineage counter exactly as
+    /// [`register_data_file`](MetadataWriter::register_data_file); then, for each
+    /// [`DeleteFileEntry`], apply the same target-file fence + compare-and-swap +
+    /// retire-prior + insert-cumulative as
+    /// [`set_delete_file`](MetadataWriter::set_delete_file), all stamped with that
+    /// one snapshot. Advance the catalog head LAST, so the append and every delete
+    /// become visible together — never a half-applied intermediate state. Aborts
+    /// with [`crate::DuckLakeError::Conflict`] on the first entry whose target
+    /// data file was retired since `base_snapshot`, or whose live delete file no
+    /// longer matches `expected_prev_delete_file`.
+    ///
+    /// `deletes` may be empty (equivalent to
+    /// [`register_data_file`](MetadataWriter::register_data_file)); each entry
+    /// must target a distinct `data_file_id`.
+    ///
+    /// Default: unsupported; backends override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _file: &DataFileInfo,
+        _deletes: &[DeleteFileEntry],
+        _mode: WriteMode,
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "register_data_file_with_deletes is not supported by this metadata writer".to_string(),
         ))
     }
 

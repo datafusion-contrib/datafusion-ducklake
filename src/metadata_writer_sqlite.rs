@@ -9,7 +9,7 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode,
+    ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
     WriteSetupResult, columns_differ, validate_name,
 };
 use sqlx::Row;
@@ -1494,6 +1494,161 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes(
+        &self,
+        table_id: i64,
+        // SQLite created the schema/table at begin; names unused (trait parity).
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        block_on(async {
+            // One atomic commit for a combined append + positional deletes (an
+            // update/upsert). finalize_snapshot allocates the snapshot + finalizes
+            // the column generation; the new data file AND every delete file are
+            // stamped with that one id and committed together, so the head only
+            // ever resolves to the fully-applied mutation.
+            let mut tx = self.pool.begin().await?;
+
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
+
+            // Register the new data file (inserted row versions), as in
+            // register_data_file. Deletes are accounted at read time
+            // (delete_count), so record_count stays gross — no adjustment for them.
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let stats_row =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let row_id_start: i64 = stats_row.try_get(0)?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(table_id)
+            .bind(&file.path)
+            .bind(file.path_is_relative)
+            .bind(file.file_size_bytes)
+            .bind(file.footer_size)
+            .bind(file.record_count)
+            .bind(row_id_start)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + ?,
+                     record_count    = record_count + ?,
+                     file_size_bytes = file_size_bytes + ?
+                 WHERE table_id = ?",
+            )
+            .bind(file.record_count)
+            .bind(file.record_count)
+            .bind(file.file_size_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Apply each positional delete with the same fence + compare-and-swap as
+            // set_delete_file, stamped with this snapshot. Each entry targets a
+            // distinct data file, so there is no intra-transaction CAS contention.
+            for entry in deletes {
+                let target_live: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM ducklake_data_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(entry.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if target_live.is_none() {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "delete targets data file {}, which was retired by a concurrent write \
+                         since snapshot {base_snapshot}; retry against the new generation",
+                        entry.data_file_id
+                    )));
+                }
+
+                let current_prev: Option<i64> = sqlx::query_scalar(
+                    "SELECT delete_file_id FROM ducklake_delete_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(entry.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if current_prev != entry.expected_prev_delete_file {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "delete on data file {} conflicts with a concurrent delete (expected live \
+                         delete file {:?}, found {current_prev:?}); retry against the new generation",
+                        entry.data_file_id, entry.expected_prev_delete_file
+                    )));
+                }
+
+                if let Some(prev) = entry.expected_prev_delete_file {
+                    sqlx::query(
+                        "UPDATE ducklake_delete_file SET end_snapshot = ?
+                         WHERE delete_file_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(prev)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                sqlx::query(
+                    "INSERT INTO ducklake_delete_file
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, delete_count, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(entry.data_file_id)
+                .bind(table_id)
+                .bind(&entry.delete.path)
+                .bind(entry.delete.path_is_relative)
+                .bind(entry.delete.file_size_bytes)
+                .bind(entry.delete.footer_size)
+                .bind(entry.delete.delete_count)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")

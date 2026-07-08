@@ -18,7 +18,8 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteResult,
+    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteResult,
 };
 use crate::path_resolver::join_paths;
 use crate::table::delete_file_schema;
@@ -438,6 +439,65 @@ impl TableWriteSession {
     }
 
     pub async fn finish(mut self) -> Result<WriteResult> {
+        let file_info = self.upload_staged().await?;
+        // register_data_file returns the ids actually committed (snapshot id
+        // assigned at commit; real schema/table ids, which may differ from the
+        // begin-time reservations under a concurrent create). Report those.
+        let committed = self.metadata.register_data_file(
+            self.table_id,
+            &self.schema_name,
+            &self.table_name,
+            self.snapshot_id,
+            &file_info,
+            self.mode,
+            self.base_snapshot_id,
+            &self.columns,
+            &self.column_ids,
+        )?;
+
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: 1,
+            records_written: self.row_count,
+        })
+    }
+
+    /// Like [`finish`](Self::finish), but atomically applies positional
+    /// `deletes` to existing data files in the SAME snapshot as this append —
+    /// the commit behind an update/upsert (supersede rows and insert their new
+    /// versions in one snapshot). The caller resolves the positions and writes
+    /// each delete file (see [`DuckLakeTableWriter::write_delete_file`]) before
+    /// calling this; `deletes` may be empty (equivalent to `finish`).
+    pub async fn finish_with_deletes(mut self, deletes: &[DeleteFileEntry]) -> Result<WriteResult> {
+        let file_info = self.upload_staged().await?;
+        let committed = self.metadata.register_data_file_with_deletes(
+            self.table_id,
+            &self.schema_name,
+            &self.table_name,
+            self.snapshot_id,
+            &file_info,
+            deletes,
+            self.mode,
+            self.base_snapshot_id,
+            &self.columns,
+            &self.column_ids,
+        )?;
+
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: 1,
+            records_written: self.row_count,
+        })
+    }
+
+    /// Finalise + upload the staged parquet and return its [`DataFileInfo`],
+    /// leaving the metadata commit to the caller. Shared by
+    /// [`finish`](Self::finish) and [`finish_with_deletes`](Self::finish_with_deletes).
+    async fn upload_staged(&mut self) -> Result<DataFileInfo> {
         let writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())
         })?;
@@ -474,28 +534,7 @@ impl TableWriteSession {
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }
-        // register_data_file returns the ids actually committed (snapshot id
-        // assigned at commit; real schema/table ids, which may differ from the
-        // begin-time reservations under a concurrent create). Report those.
-        let committed = self.metadata.register_data_file(
-            self.table_id,
-            &self.schema_name,
-            &self.table_name,
-            self.snapshot_id,
-            &file_info,
-            self.mode,
-            self.base_snapshot_id,
-            &self.columns,
-            &self.column_ids,
-        )?;
-
-        Ok(WriteResult {
-            snapshot_id: committed.snapshot_id,
-            table_id: committed.table_id,
-            schema_id: committed.schema_id,
-            files_written: 1,
-            records_written: self.row_count,
-        })
+        Ok(file_info)
     }
 }
 

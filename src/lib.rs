@@ -107,8 +107,8 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteResult,
-    WriteSetupResult,
+    ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
+    WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres::PostgresMetadataWriter;
