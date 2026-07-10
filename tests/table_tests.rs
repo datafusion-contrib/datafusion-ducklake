@@ -7,7 +7,11 @@ use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use datafusion::common::stats::Precision;
+use datafusion::common::{ScalarValue, Statistics};
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::*;
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
@@ -179,6 +183,128 @@ fn create_populated_table_catalog(catalog_path: &std::path::Path) -> anyhow::Res
         "INSERT INTO test_catalog.tbl SELECT i, repeat('x', 100) FROM range(0, 1000) t(i);",
         [],
     )?;
+    Ok(())
+}
+
+fn collect_partitioned_file_statistics(
+    plan: &Arc<dyn ExecutionPlan>,
+    output: &mut Vec<Arc<Statistics>>,
+) {
+    if let Some(exec) = plan.downcast_ref::<DataSourceExec>()
+        && let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>()
+    {
+        for group in &config.file_groups {
+            output.extend(
+                group
+                    .iter()
+                    .filter_map(|file| file.statistics.as_ref().map(Arc::clone)),
+            );
+        }
+    }
+    for child in plan.children() {
+        collect_partitioned_file_statistics(child, output);
+    }
+}
+
+/// DuckLake's table-, table-column-, and file-column statistic rows are all
+/// surfaced through their corresponding DataFusion statistics objects.
+#[tokio::test]
+async fn test_catalog_statistics_are_exposed_to_datafusion() -> DataFusionResult<()> {
+    let temp_dir =
+        TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let catalog_path = temp_dir.path().join("column_stats.ducklake");
+    create_populated_table_catalog(&catalog_path)
+        .map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
+
+    let catalog = create_catalog(&catalog_path.to_string_lossy())?;
+    let schema = datafusion::catalog::CatalogProvider::schema(catalog.as_ref(), "main")
+        .expect("main schema exists");
+    let table = schema
+        .table("tbl")
+        .await
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        .expect("tbl present in main schema");
+
+    // Verify the provider loaded all three DuckLake statistics tables before
+    // checking their DataFusion representation below.
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().to_string())
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let snapshot = provider
+        .get_current_snapshot()
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let schema_meta = provider
+        .get_schema_by_name("main", snapshot)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        .expect("main schema metadata");
+    let table_meta = provider
+        .get_table_by_name(schema_meta.schema_id, "tbl", snapshot)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        .expect("tbl metadata");
+    let columns = provider
+        .get_table_structure(table_meta.table_id, snapshot)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let a_id = columns
+        .iter()
+        .find(|column| column.column_name == "a")
+        .expect("a column metadata")
+        .column_id;
+    let catalog_stats = provider
+        .get_table_statistics(table_meta.table_id, snapshot)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    assert_eq!(
+        catalog_stats
+            .table
+            .as_ref()
+            .and_then(|stats| stats.record_count),
+        Some(1000)
+    );
+    let table_a = catalog_stats
+        .columns
+        .iter()
+        .find(|stats| stats.column_id == a_id)
+        .expect("table_column_stats for a");
+    assert_eq!(table_a.contains_null, Some(false));
+    assert_eq!(table_a.min_value.as_deref(), Some("0"));
+    assert_eq!(table_a.max_value.as_deref(), Some("999"));
+    let file_a = catalog_stats
+        .files
+        .iter()
+        .find(|stats| stats.column_id == a_id)
+        .expect("file_column_stats for a");
+    assert_eq!(file_a.value_count, Some(1000));
+    assert_eq!(file_a.null_count, Some(0));
+    assert_eq!(file_a.min_value.as_deref(), Some("0"));
+    assert_eq!(file_a.max_value.as_deref(), Some("999"));
+
+    let table_stats = table.statistics().expect("table statistics");
+    assert_eq!(table_stats.num_rows, Precision::Exact(1000));
+    assert!(matches!(
+        table_stats.total_byte_size,
+        Precision::Inexact(bytes) if bytes > 0
+    ));
+    assert_eq!(table_stats.column_statistics.len(), 2);
+    let a = &table_stats.column_statistics[0];
+    assert_eq!(a.null_count, Precision::Exact(0));
+    assert_eq!(a.min_value, Precision::Exact(ScalarValue::Int32(Some(0))));
+    assert_eq!(a.max_value, Precision::Exact(ScalarValue::Int32(Some(999))));
+    assert!(matches!(a.byte_size, Precision::Inexact(bytes) if bytes > 0));
+
+    let state = SessionContext::new().state();
+    let plan = table.scan(&state, None, &[], None).await?;
+    let mut file_stats = Vec::new();
+    collect_partitioned_file_statistics(&plan, &mut file_stats);
+    assert_eq!(file_stats.len(), 1, "the data file should carry statistics");
+    let file = &file_stats[0];
+    assert_eq!(file.num_rows, Precision::Exact(1000));
+    assert_eq!(
+        file.column_statistics[0].min_value,
+        Precision::Exact(ScalarValue::Int32(Some(0)))
+    );
+    assert_eq!(
+        file.column_statistics[0].max_value,
+        Precision::Exact(ScalarValue::Int32(Some(999)))
+    );
+
     Ok(())
 }
 

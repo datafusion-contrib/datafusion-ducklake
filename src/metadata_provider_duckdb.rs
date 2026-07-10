@@ -1,17 +1,24 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileWithTable, MetadataProvider, SQL_GET_DATA_FILES,
-    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME,
-    SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMNS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
-    SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, reconstruct_list_columns,
-    reconstruct_list_columns_with_table,
+    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
+    DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics,
+    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider,
+    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
+    SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS,
+    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
+    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("does not exist") || message.contains("not found")
+}
 
 /// DuckDB metadata provider
 ///
@@ -229,6 +236,69 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(files)
+    }
+
+    fn get_table_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<DuckLakeStatistics> {
+        let conn = self.connection();
+
+        let table = match conn.prepare(SQL_GET_TABLE_STATS) {
+            Ok(mut stmt) => {
+                let mut rows = stmt.query([table_id])?;
+                rows.next()?
+                    .map(|row| {
+                        Ok::<_, duckdb::Error>(DuckLakeTableStatistics {
+                            record_count: row.get(0)?,
+                            file_size_bytes: row.get(1)?,
+                        })
+                    })
+                    .transpose()?
+            },
+            Err(error) if is_missing_statistics_table(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+
+        let columns = match conn.prepare(SQL_GET_TABLE_COLUMN_STATS) {
+            Ok(mut stmt) => stmt
+                .query_map([table_id], |row| {
+                    Ok(DuckLakeTableColumnStatistics {
+                        column_id: row.get(0)?,
+                        contains_null: row.get(1)?,
+                        min_value: row.get(2)?,
+                        max_value: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+
+        let files = match conn.prepare(SQL_GET_FILE_COLUMN_STATS) {
+            Ok(mut stmt) => stmt
+                .query_map([table_id, snapshot_id, snapshot_id], |row| {
+                    Ok(DuckLakeFileColumnStatistics {
+                        data_file_id: row.get(0)?,
+                        column_id: row.get(1)?,
+                        column_size_bytes: row.get(2)?,
+                        value_count: row.get(3)?,
+                        null_count: row.get(4)?,
+                        min_value: row.get(5)?,
+                        max_value: row.get(6)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(DuckLakeStatistics {
+            table,
+            columns,
+            files,
+        })
     }
 
     fn get_schema_by_name(

@@ -13,14 +13,20 @@
 
 use crate::Result;
 use crate::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileData, DuckLakeTableColumn,
-    DuckLakeTableFile, FileWithTable, MetadataProvider, SchemaMetadata, SnapshotMetadata,
-    TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
+    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
+    DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics,
+    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
     reconstruct_list_columns_with_table,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::types::chrono::NaiveDateTime;
+
+fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("does not exist") || message.contains("undefined table")
+}
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -326,6 +332,100 @@ impl MetadataProvider for MulticatalogProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
+        block_on(async {
+            let table = match sqlx::query(
+                "SELECT record_count, file_size_bytes
+                 FROM ducklake_table_stats WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await
+            {
+                Ok(row) => row
+                    .map(|row| {
+                        Ok::<_, sqlx::Error>(DuckLakeTableStatistics {
+                            record_count: row.try_get(0)?,
+                            file_size_bytes: row.try_get(1)?,
+                        })
+                    })
+                    .transpose()?,
+                Err(error) if is_missing_statistics_table(&error) => None,
+                Err(error) => return Err(error.into()),
+            };
+
+            let columns = match sqlx::query(
+                "SELECT column_id, contains_null, min_value, max_value
+                 FROM ducklake_table_column_stats WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeTableColumnStatistics {
+                            column_id: row.try_get(0)?,
+                            contains_null: row.try_get(1)?,
+                            min_value: row.try_get(2)?,
+                            max_value: row.try_get(3)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+
+            let files = match sqlx::query(
+                "SELECT
+                    stats.data_file_id,
+                    stats.column_id,
+                    stats.column_size_bytes,
+                    stats.value_count,
+                    stats.null_count,
+                    stats.min_value,
+                    stats.max_value
+                 FROM ducklake_file_column_stats AS stats
+                 INNER JOIN ducklake_data_file AS data
+                    ON data.data_file_id = stats.data_file_id
+                    AND data.table_id = stats.table_id
+                 WHERE stats.table_id = $1
+                   AND $2 >= data.begin_snapshot
+                   AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeFileColumnStatistics {
+                            data_file_id: row.try_get(0)?,
+                            column_id: row.try_get(1)?,
+                            column_size_bytes: row.try_get(2)?,
+                            value_count: row.try_get(3)?,
+                            null_count: row.try_get(4)?,
+                            min_value: row.try_get(5)?,
+                            max_value: row.try_get(6)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+
+            Ok(DuckLakeStatistics {
+                table,
+                columns,
+                files,
+            })
         })
     }
 

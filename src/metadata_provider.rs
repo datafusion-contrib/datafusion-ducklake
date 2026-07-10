@@ -52,6 +52,31 @@ pub const SQL_GET_DATA_FILES: &str = "
       AND ? >= data.begin_snapshot
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
 
+pub const SQL_GET_TABLE_STATS: &str =
+    "SELECT record_count, file_size_bytes FROM ducklake_table_stats WHERE table_id = ?";
+
+pub const SQL_GET_TABLE_COLUMN_STATS: &str = "
+    SELECT column_id, contains_null, min_value, max_value
+    FROM ducklake_table_column_stats
+    WHERE table_id = ?";
+
+pub const SQL_GET_FILE_COLUMN_STATS: &str = "
+    SELECT
+        stats.data_file_id,
+        stats.column_id,
+        stats.column_size_bytes,
+        stats.value_count,
+        stats.null_count,
+        stats.min_value,
+        stats.max_value
+    FROM ducklake_file_column_stats AS stats
+    INNER JOIN ducklake_data_file AS data
+        ON data.data_file_id = stats.data_file_id
+        AND data.table_id = stats.table_id
+    WHERE stats.table_id = ?
+      AND ? >= data.begin_snapshot
+      AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
+
 pub const SQL_GET_DATA_PATH: &str =
     "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL";
 
@@ -512,6 +537,48 @@ pub struct DuckLakeTableFile {
     pub delete_count: Option<i64>,
 }
 
+/// Statistics cached for a table in the DuckLake catalog.
+///
+/// `table` and `columns` describe the current table generation. Per-file
+/// statistics are filtered to the data files visible at the requested
+/// snapshot so callers can also use them for time-travel scans.
+#[derive(Debug, Clone, Default)]
+pub struct DuckLakeStatistics {
+    pub table: Option<DuckLakeTableStatistics>,
+    pub columns: Vec<DuckLakeTableColumnStatistics>,
+    pub files: Vec<DuckLakeFileColumnStatistics>,
+}
+
+/// A row from `ducklake_table_stats`.
+#[derive(Debug, Clone)]
+pub struct DuckLakeTableStatistics {
+    pub record_count: Option<i64>,
+    pub file_size_bytes: Option<i64>,
+}
+
+/// A row from `ducklake_table_column_stats` containing the fields DataFusion
+/// can represent in [`datafusion::common::ColumnStatistics`].
+#[derive(Debug, Clone)]
+pub struct DuckLakeTableColumnStatistics {
+    pub column_id: i64,
+    pub contains_null: Option<bool>,
+    pub min_value: Option<String>,
+    pub max_value: Option<String>,
+}
+
+/// A row from `ducklake_file_column_stats` containing the fields DataFusion
+/// can represent in [`datafusion::common::ColumnStatistics`].
+#[derive(Debug, Clone)]
+pub struct DuckLakeFileColumnStatistics {
+    pub data_file_id: i64,
+    pub column_id: i64,
+    pub column_size_bytes: Option<i64>,
+    pub value_count: Option<i64>,
+    pub null_count: Option<i64>,
+    pub min_value: Option<String>,
+    pub max_value: Option<String>,
+}
+
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {
         Self {
@@ -604,6 +671,18 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>>;
     //     todo: support select with file pruning
+
+    /// Load table-, column-, and file-level statistics from the DuckLake
+    /// catalog. Implementations should return unknown statistics when the
+    /// optional statistics tables do not exist (for compatibility with older
+    /// catalogs) rather than making the table unreadable.
+    fn get_table_statistics(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<DuckLakeStatistics> {
+        Ok(DuckLakeStatistics::default())
+    }
 
     /// Net number of live rows in a table at a snapshot, accounting for delete
     /// files: `SUM(record_count) - SUM(delete_count)` over the files visible at

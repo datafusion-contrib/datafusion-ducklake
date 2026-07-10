@@ -7,7 +7,8 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
-    DuckLakeFileData, DuckLakeTableColumn, DuckLakeTableFile, MetadataProvider,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableFile, MetadataProvider,
 };
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
@@ -31,8 +32,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
+use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
@@ -81,6 +82,410 @@ pub(crate) fn validated_record_count(record_count: i64, file_path: &str) -> Data
             record_count, file_path
         ))
     })
+}
+
+fn statistic_usize(value: i64, statistic: &str) -> Option<usize> {
+    match usize::try_from(value) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(
+                value,
+                statistic,
+                "Ignoring invalid negative DuckLake statistic"
+            );
+            None
+        },
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let compact: String = value.chars().filter(|c| *c != '-').collect();
+    if !compact.len().is_multiple_of(2) {
+        return None;
+    }
+    compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
+
+/// Decode DuckLake's string representation for min/max statistics into a
+/// scalar whose type exactly matches the Arrow field.
+fn parse_statistic_scalar(
+    value: &str,
+    column: &DuckLakeTableColumn,
+    data_type: &DataType,
+) -> Option<ScalarValue> {
+    let ducklake_type = column.column_type.trim().to_ascii_lowercase();
+
+    // These types either have no scalar min/max in DuckLake or use
+    // `extra_stats`, which DataFusion's ColumnStatistics cannot represent.
+    if ducklake_type.starts_with("list")
+        || ducklake_type.starts_with("array")
+        || ducklake_type.starts_with("struct")
+        || ducklake_type.starts_with("map")
+        || matches!(
+            ducklake_type.as_str(),
+            "geometry"
+                | "point"
+                | "linestring"
+                | "polygon"
+                | "multipoint"
+                | "multilinestring"
+                | "multipolygon"
+                | "geometrycollection"
+                | "linestring z"
+                | "timetz"
+                | "time with time zone"
+                | "interval"
+        )
+    {
+        return None;
+    }
+
+    // Arrow has no representation for DuckDB's infinite date/timestamp
+    // sentinels, so leave that bound unknown.
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "infinity" | "-infinity"
+    ) {
+        return None;
+    }
+
+    let parsed = match data_type {
+        DataType::Boolean => match value {
+            "0" | "false" => Some(ScalarValue::Boolean(Some(false))),
+            "1" | "true" => Some(ScalarValue::Boolean(Some(true))),
+            _ => None,
+        },
+        DataType::Utf8 => Some(ScalarValue::Utf8(Some(value.to_string()))),
+        DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(Some(value.to_string()))),
+        DataType::Utf8View => Some(ScalarValue::Utf8View(Some(value.to_string()))),
+        DataType::Binary => decode_hex(value).map(|value| ScalarValue::Binary(Some(value))),
+        DataType::LargeBinary => {
+            decode_hex(value).map(|value| ScalarValue::LargeBinary(Some(value)))
+        },
+        DataType::BinaryView => decode_hex(value).map(|value| ScalarValue::BinaryView(Some(value))),
+        DataType::FixedSizeBinary(size) => decode_hex(value)
+            .filter(|value| value.len() == *size as usize)
+            .map(|value| ScalarValue::FixedSizeBinary(*size, Some(value))),
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Map(_, _) => None,
+        _ => ScalarValue::try_from_string(value.to_string(), data_type).ok(),
+    };
+
+    if parsed.is_none() {
+        tracing::debug!(
+            column = %column.column_name,
+            ducklake_type = %column.column_type,
+            value,
+            "Ignoring DuckLake statistic that could not be decoded"
+        );
+    }
+    parsed
+}
+
+fn scalar_precision(
+    value: Option<&str>,
+    column: &DuckLakeTableColumn,
+    data_type: &DataType,
+    exact: bool,
+) -> Precision<ScalarValue> {
+    match value.and_then(|value| parse_statistic_scalar(value, column, data_type)) {
+        Some(value) if exact => Precision::Exact(value),
+        Some(value) => Precision::Inexact(value),
+        None => Precision::Absent,
+    }
+}
+
+fn file_row_count(
+    file: &DuckLakeTableFile,
+    file_columns: Option<&HashMap<i64, DuckLakeFileColumnStatistics>>,
+) -> Precision<usize> {
+    let gross = file.max_row_count.or_else(|| {
+        file_columns.and_then(|columns| columns.values().find_map(|stats| stats.value_count))
+    });
+    let Some(gross) = gross.and_then(|value| statistic_usize(value, "record_count")) else {
+        return Precision::Absent;
+    };
+
+    if file.delete_file.is_some() {
+        let Some(deleted) = file
+            .delete_count
+            .and_then(|value| statistic_usize(value, "delete_count"))
+        else {
+            return Precision::Absent;
+        };
+        gross
+            .checked_sub(deleted)
+            .map(Precision::Exact)
+            .unwrap_or(Precision::Absent)
+    } else {
+        Precision::Exact(gross)
+    }
+}
+
+fn build_datafusion_statistics(
+    schema: &Schema,
+    columns: &[DuckLakeTableColumn],
+    table_files: &[DuckLakeTableFile],
+    catalog: DuckLakeStatistics,
+    use_current_table_statistics: bool,
+) -> (Statistics, HashMap<i64, Arc<Statistics>>) {
+    let table_column_rows: HashMap<i64, DuckLakeTableColumnStatistics> = catalog
+        .columns
+        .into_iter()
+        .map(|stats| (stats.column_id, stats))
+        .collect();
+    let mut file_column_rows: HashMap<i64, HashMap<i64, DuckLakeFileColumnStatistics>> =
+        HashMap::new();
+    for stats in catalog.files {
+        file_column_rows
+            .entry(stats.data_file_id)
+            .or_default()
+            .insert(stats.column_id, stats);
+    }
+
+    let mut file_statistics = HashMap::with_capacity(table_files.len());
+    for file in table_files {
+        let raw_columns = file_column_rows.get(&file.data_file_id);
+        let has_deletes = file.delete_file.is_some();
+        let mut statistics = Statistics::new_unknown(schema);
+        statistics.num_rows = file_row_count(file, raw_columns);
+        statistics.total_byte_size =
+            statistic_usize(file.file.file_size_bytes, "data_file.file_size_bytes")
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent);
+
+        for (index, column) in columns.iter().enumerate() {
+            let Some(raw) = raw_columns.and_then(|stats| stats.get(&column.column_id)) else {
+                continue;
+            };
+            let field_type = schema.field(index).data_type();
+            let exact = !has_deletes;
+            let column_statistics = &mut statistics.column_statistics[index];
+            column_statistics.null_count = raw
+                .null_count
+                .and_then(|value| statistic_usize(value, "file_column_stats.null_count"))
+                .map(|value| {
+                    if exact {
+                        Precision::Exact(value)
+                    } else {
+                        Precision::Inexact(value)
+                    }
+                })
+                .unwrap_or(Precision::Absent);
+            column_statistics.min_value =
+                scalar_precision(raw.min_value.as_deref(), column, field_type, exact);
+            column_statistics.max_value =
+                scalar_precision(raw.max_value.as_deref(), column, field_type, exact);
+            column_statistics.byte_size = raw
+                .column_size_bytes
+                .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent);
+        }
+
+        file_statistics.insert(file.data_file_id, Arc::new(statistics));
+    }
+
+    let mut table_statistics = Statistics::new_unknown(schema);
+
+    // Per-file row counts are snapshot-aware and exact when all required
+    // counts are present. Fall back to the approximate current-table counter.
+    let mut row_total = Some(0usize);
+    for file in table_files {
+        let value = file_row_count(file, file_column_rows.get(&file.data_file_id));
+        row_total = match (row_total, value.get_value()) {
+            (Some(total), Some(value)) => total.checked_add(*value),
+            _ => None,
+        };
+    }
+    table_statistics.num_rows = if let Some(rows) = row_total {
+        Precision::Exact(rows)
+    } else if use_current_table_statistics {
+        catalog
+            .table
+            .as_ref()
+            .and_then(|stats| stats.record_count)
+            .and_then(|value| statistic_usize(value, "table_stats.record_count"))
+            .map(Precision::Inexact)
+            .unwrap_or(Precision::Absent)
+    } else {
+        Precision::Absent
+    };
+
+    // DuckLake stores compressed file bytes while DataFusion describes Arrow
+    // output bytes, so this value is necessarily an estimate.
+    table_statistics.total_byte_size = if use_current_table_statistics {
+        catalog
+            .table
+            .as_ref()
+            .and_then(|stats| stats.file_size_bytes)
+            .and_then(|value| statistic_usize(value, "table_stats.file_size_bytes"))
+            .map(Precision::Inexact)
+            .unwrap_or_else(|| fallback_table_byte_size(table_files))
+    } else {
+        fallback_table_byte_size(table_files)
+    };
+
+    let any_deletes = table_files.iter().any(|file| file.delete_file.is_some());
+    for (index, column) in columns.iter().enumerate() {
+        let field_type = schema.field(index).data_type();
+        let output = &mut table_statistics.column_statistics[index];
+
+        // Table-column rows are not snapshot-versioned. Only use them for the
+        // current table generation, and mark bounds inexact because deletes can
+        // leave conservative (wider) bounds behind.
+        if use_current_table_statistics && let Some(raw) = table_column_rows.get(&column.column_id)
+        {
+            if raw.contains_null == Some(false) {
+                output.null_count = Precision::Exact(0);
+            }
+            output.min_value =
+                scalar_precision(raw.min_value.as_deref(), column, field_type, false);
+            output.max_value =
+                scalar_precision(raw.max_value.as_deref(), column, field_type, false);
+        }
+
+        if table_files.is_empty() {
+            output.null_count = Precision::Exact(0);
+            output.byte_size = Precision::Exact(0);
+            continue;
+        }
+
+        let mut null_total = Some(0usize);
+        let mut byte_total = Some(0usize);
+        let mut min_value: Option<ScalarValue> = None;
+        let mut max_value: Option<ScalarValue> = None;
+        let mut min_complete = true;
+        let mut max_complete = true;
+
+        for file in table_files {
+            let Some(raw) = file_column_rows
+                .get(&file.data_file_id)
+                .and_then(|stats| stats.get(&column.column_id))
+            else {
+                null_total = None;
+                byte_total = None;
+                min_complete = false;
+                max_complete = false;
+                continue;
+            };
+
+            null_total = match (
+                null_total,
+                raw.null_count
+                    .and_then(|value| statistic_usize(value, "file_column_stats.null_count")),
+            ) {
+                (Some(total), Some(value)) => total.checked_add(value),
+                _ => None,
+            };
+            byte_total = match (
+                byte_total,
+                raw.column_size_bytes.and_then(|value| {
+                    statistic_usize(value, "file_column_stats.column_size_bytes")
+                }),
+            ) {
+                (Some(total), Some(value)) => total.checked_add(value),
+                _ => None,
+            };
+
+            let all_null =
+                matches!((raw.value_count, raw.null_count), (Some(v), Some(n)) if v == n);
+            match raw
+                .min_value
+                .as_deref()
+                .and_then(|value| parse_statistic_scalar(value, column, field_type))
+            {
+                Some(value) => {
+                    min_value = match min_value {
+                        Some(current) => current.partial_cmp(&value).map(|ordering| {
+                            if ordering.is_le() {
+                                current
+                            } else {
+                                value
+                            }
+                        }),
+                        None => Some(value),
+                    };
+                    min_complete &= min_value.is_some();
+                },
+                None if all_null => {},
+                None => min_complete = false,
+            }
+            match raw
+                .max_value
+                .as_deref()
+                .and_then(|value| parse_statistic_scalar(value, column, field_type))
+            {
+                Some(value) => {
+                    max_value = match max_value {
+                        Some(current) => current.partial_cmp(&value).map(|ordering| {
+                            if ordering.is_ge() {
+                                current
+                            } else {
+                                value
+                            }
+                        }),
+                        None => Some(value),
+                    };
+                    max_complete &= max_value.is_some();
+                },
+                None if all_null => {},
+                None => max_complete = false,
+            }
+        }
+
+        if let Some(value) = null_total {
+            output.null_count = if any_deletes {
+                Precision::Inexact(value)
+            } else {
+                Precision::Exact(value)
+            };
+        }
+        if let Some(value) = byte_total {
+            output.byte_size = Precision::Inexact(value);
+        }
+        if min_complete && let Some(value) = min_value {
+            output.min_value = if any_deletes {
+                Precision::Inexact(value)
+            } else {
+                Precision::Exact(value)
+            };
+        }
+        if max_complete && let Some(value) = max_value {
+            output.max_value = if any_deletes {
+                Precision::Inexact(value)
+            } else {
+                Precision::Exact(value)
+            };
+        }
+    }
+
+    (table_statistics, file_statistics)
+}
+
+fn fallback_table_byte_size(table_files: &[DuckLakeTableFile]) -> Precision<usize> {
+    let data_bytes: i128 = table_files
+        .iter()
+        .map(|file| i128::from(file.file.file_size_bytes))
+        .sum();
+    let delete_bytes: i128 = table_files
+        .iter()
+        .filter_map(|file| file.delete_file.as_ref())
+        .map(|file| i128::from(file.file_size_bytes))
+        .sum();
+    usize::try_from((data_bytes - delete_bytes).max(0))
+        .map(Precision::Inexact)
+        .unwrap_or(Precision::Absent)
 }
 
 /// Returns the expected schema for DuckLake delete files
@@ -156,6 +561,10 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
     table_files: Vec<DuckLakeTableFile>,
+    /// Table-level statistics for the physical schema.
+    table_statistics: Statistics,
+    /// Per-data-file statistics keyed by `data_file_id`.
+    file_statistics: HashMap<i64, Arc<Statistics>>,
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
@@ -200,6 +609,18 @@ impl DuckLakeTable {
         let physical_schema = Arc::new(build_arrow_schema(&columns)?);
         let schema = physical_schema.clone();
         let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
+        let catalog_statistics = provider.get_table_statistics(table_id, snapshot_id)?;
+        // `ducklake_table_stats` and `ducklake_table_column_stats` describe the
+        // current table generation. They must not be applied to an older
+        // snapshot if a newer commit landed after the catalog was opened.
+        let use_current_table_statistics = provider.get_current_snapshot()? == snapshot_id;
+        let (table_statistics, file_statistics) = build_datafusion_statistics(
+            physical_schema.as_ref(),
+            &columns,
+            &table_files,
+            catalog_statistics,
+            use_current_table_statistics,
+        );
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
@@ -240,6 +661,8 @@ impl DuckLakeTable {
             row_lineage: false,
             columns,
             table_files,
+            table_statistics,
+            file_statistics,
             #[cfg(feature = "encryption")]
             encryption_factory,
             file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
@@ -286,6 +709,40 @@ impl DuckLakeTable {
     fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    /// Build a DataFusion file descriptor and attach the catalog's file-level
+    /// statistics. `include_rowid` adds an unknown trailing statistic for an
+    /// embedded rowid column so the vector still matches the scan schema.
+    fn partitioned_data_file(
+        &self,
+        table_file: &DuckLakeTableFile,
+        include_rowid: bool,
+    ) -> DataFusionResult<PartitionedFile> {
+        let resolved_path = self.resolve_file_path(&table_file.file)?;
+        let mut file = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+        );
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            file = file.with_metadata_size_hint(hint);
+        }
+        if let Some(statistics) = self.file_statistics.get(&table_file.data_file_id) {
+            let statistics = if include_rowid {
+                let mut statistics = statistics.as_ref().clone();
+                statistics
+                    .column_statistics
+                    .push(ColumnStatistics::new_unknown());
+                Arc::new(statistics)
+            } else {
+                Arc::clone(statistics)
+            };
+            file = file.with_statistics(statistics);
+        }
+        Ok(file)
     }
 
     /// Create a ParquetSource with encryption support if enabled and needed
@@ -538,19 +995,7 @@ impl DuckLakeTable {
 
         for table_file in files {
             let mapping = self.file_schema_mapping(state, &table_file.file).await?;
-
-            let resolved_path = self.resolve_file_path(&table_file.file)?;
-            let mut pf = PartitionedFile::new(
-                &resolved_path,
-                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-            );
-            // Footer size hint cuts I/O from 2 reads to 1 per file (helps S3/MinIO).
-            if let Some(footer_size) = table_file.file.footer_size
-                && footer_size > 0
-                && let Ok(hint) = usize::try_from(footer_size)
-            {
-                pf = pf.with_metadata_size_hint(hint);
-            }
+            let pf = self.partitioned_data_file(table_file, false)?;
 
             // Group key: physical field names + types, then the rename mapping.
             let (read_schema, name_mapping) = &mapping;
@@ -699,17 +1144,10 @@ impl DuckLakeTable {
             )?)
         } else {
             // No actual deletes for this file: plain scan, scan-level limit OK.
-            let resolved_path = self.resolve_file_path(&table_file.file)?;
-            let mut pf = PartitionedFile::new(
-                &resolved_path,
-                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-            );
-            if let Some(footer_size) = table_file.file.footer_size
-                && footer_size > 0
-                && let Ok(hint) = usize::try_from(footer_size)
-            {
-                pf = pf.with_metadata_size_hint(hint);
-            }
+            let pf = self.partitioned_data_file(
+                table_file,
+                file_cfg.embedded_rowid_parquet_name.is_some(),
+            )?;
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
                 Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
@@ -1043,17 +1481,7 @@ impl DuckLakeTable {
         } else {
             // Embedded rowid, no deletes: legacy plain scan (cardinality-
             // preserving). Keep scan-level limit and reader pruning.
-            let resolved_path = self.resolve_file_path(&table_file.file)?;
-            let mut pf = PartitionedFile::new(
-                &resolved_path,
-                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-            );
-            if let Some(footer_size) = table_file.file.footer_size
-                && footer_size > 0
-                && let Ok(hint) = usize::try_from(footer_size)
-            {
-                pf = pf.with_metadata_size_hint(hint);
-            }
+            let pf = self.partitioned_data_file(table_file, true)?;
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
                 Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
@@ -1110,43 +1538,13 @@ impl TableProvider for DuckLakeTable {
     }
 
     fn statistics(&self) -> Option<Statistics> {
-        // Aggregate per-file byte sizes from the cached `table_files`. Mirrors
-        // DuckLake's own `ducklake_table_info` aggregate exactly:
-        //
-        //     total_byte_size == SUM(data_file.file_size_bytes)
-        //                       - SUM(delete_file.file_size_bytes)
-        //
-        // The values come from the ducklake catalog, so this is the same
-        // source of truth `ducklake_table_info` uses — no extra round trips
-        // and the numbers will match byte-for-byte.
-        //
-        // Marked `Precision::Inexact` because DataFusion documents
-        // `total_byte_size` as the *uncompressed Arrow output* size, while
-        // the catalog tracks *compressed parquet* bytes. For wide
-        // column types (List(Float64) embeddings) the two are nearly
-        // identical; for narrow scalar schemas the on-disk number is 3-5x
-        // smaller than Arrow output. Reporting compressed bytes Inexact
-        // gives consumers a useful lower-bound estimate without misleading
-        // the optimiser into thinking it's exact Arrow size. When
-        // `record_count` is plumbed through `DuckLakeFileData`, a follow-up
-        // can populate `num_rows` and use `calculate_total_byte_size` for a
-        // closer Arrow-side estimate.
-        let data_bytes: i64 = self
-            .table_files
-            .iter()
-            .map(|f| f.file.file_size_bytes)
-            .sum();
-        let delete_bytes: i64 = self
-            .table_files
-            .iter()
-            .filter_map(|f| f.delete_file.as_ref())
-            .map(|df| df.file_size_bytes)
-            .sum();
-        let net_bytes = (data_bytes - delete_bytes).max(0) as usize;
-
-        let mut stats = Statistics::new_unknown(&self.schema);
-        stats.total_byte_size = Precision::Inexact(net_bytes);
-        Some(stats)
+        let mut statistics = self.table_statistics.clone();
+        if self.row_lineage {
+            statistics
+                .column_statistics
+                .push(ColumnStatistics::new_unknown());
+        }
+        Some(statistics)
     }
 
     fn supports_filters_pushdown(
@@ -1424,5 +1822,43 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bad.parquet"));
         assert!(msg.contains(&i64::MIN.to_string()));
+    }
+
+    #[test]
+    fn test_parse_ducklake_statistic_encodings() {
+        let boolean = DuckLakeTableColumn::new(1, "flag".to_string(), "boolean".to_string(), true);
+        assert_eq!(
+            parse_statistic_scalar("1", &boolean, &DataType::Boolean),
+            Some(ScalarValue::Boolean(Some(true)))
+        );
+
+        let blob = DuckLakeTableColumn::new(2, "bytes".to_string(), "blob".to_string(), true);
+        assert_eq!(
+            parse_statistic_scalar("68656C6C6F", &blob, &DataType::BinaryView),
+            Some(ScalarValue::BinaryView(Some(b"hello".to_vec())))
+        );
+
+        let uuid = DuckLakeTableColumn::new(3, "id".to_string(), "uuid".to_string(), true);
+        assert_eq!(
+            parse_statistic_scalar(
+                "550e8400-e29b-41d4-a716-446655440000",
+                &uuid,
+                &DataType::FixedSizeBinary(16),
+            ),
+            Some(ScalarValue::FixedSizeBinary(
+                16,
+                Some(vec![
+                    0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55,
+                    0x44, 0x00, 0x00,
+                ]),
+            ))
+        );
+
+        let decimal =
+            DuckLakeTableColumn::new(4, "amount".to_string(), "decimal(10,2)".to_string(), true);
+        assert_eq!(
+            parse_statistic_scalar("123.45", &decimal, &DataType::Decimal128(10, 2)),
+            Some(ScalarValue::Decimal128(Some(12_345), 10, 2))
+        );
     }
 }
