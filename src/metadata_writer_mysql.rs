@@ -34,8 +34,8 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult, columns_differ,
-    validate_name,
+    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    columns_differ, validate_name,
 };
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions};
@@ -230,13 +230,12 @@ async fn reserve_ids(
 /// than `INSERT … SELECT … WHERE NOT EXISTS`, because that self-referential
 /// `INSERT … SELECT` against `ducklake_metadata` is rejected by MySQL (1093).
 async fn seed_counter(pool: &MySqlPool, key: &str, max_sql: &str) -> Result<()> {
-    let exists: i64 = sqlx::query(
-        "SELECT COUNT(*) FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL",
-    )
-    .bind(key)
-    .fetch_one(pool)
-    .await?
-    .try_get(0)?;
+    let exists: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL")
+            .bind(key)
+            .fetch_one(pool)
+            .await?
+            .try_get(0)?;
     if exists == 0 {
         let start: i64 = sqlx::query(max_sql).fetch_one(pool).await?.try_get(0)?;
         sqlx::query("INSERT INTO ducklake_metadata (`key`, `value`, scope) VALUES (?, ?, NULL)")

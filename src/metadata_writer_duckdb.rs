@@ -892,8 +892,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 .collect();
 
             for new_col in columns.iter() {
-                if let Some((existing_type, _existing_nullable)) =
-                    existing_map.get(new_col.name())
+                if let Some((existing_type, _existing_nullable)) = existing_map.get(new_col.name())
                 {
                     if !crate::types::types_equal_canonical(existing_type, new_col.ducklake_type())
                     {
@@ -1015,7 +1014,9 @@ mod tests {
             .expect("table 'users' must exist");
         assert_eq!(table.table_name, "users");
 
-        let cols = provider.get_table_structure(table.table_id, snapshot).unwrap();
+        let cols = provider
+            .get_table_structure(table.table_id, snapshot)
+            .unwrap();
         assert_eq!(cols.len(), 2, "both columns must read back");
         assert_eq!(cols[0].column_name, "id");
         assert_eq!(cols[0].column_type, "int64");
@@ -1033,7 +1034,11 @@ mod tests {
         assert_eq!(files[0].file.file_size_bytes, 1024);
         assert_eq!(files[0].file.footer_size, Some(256));
         assert_eq!(files[0].max_row_count, Some(3));
-        assert_eq!(files[0].row_id_start, Some(0), "first file starts at rowid 0");
+        assert_eq!(
+            files[0].row_id_start,
+            Some(0),
+            "first file starts at rowid 0"
+        );
     }
 
     /// A second Append hands out a fresh, non-overlapping rowid range and
