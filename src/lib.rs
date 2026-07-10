@@ -70,6 +70,10 @@ pub mod insert_exec;
 pub mod maintenance;
 #[cfg(feature = "write")]
 pub mod metadata_writer;
+#[cfg(feature = "write-duckdb")]
+pub mod metadata_writer_duckdb;
+#[cfg(feature = "write-mysql")]
+pub mod metadata_writer_mysql;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres;
 #[cfg(feature = "write-sqlite")]
@@ -110,6 +114,10 @@ pub use metadata_writer::{
     ColumnDef, CommitIds, DataFileInfo, DeleteFileInfo, MetadataWriter, WriteMode, WriteResult,
     WriteSetupResult,
 };
+#[cfg(feature = "write-duckdb")]
+pub use metadata_writer_duckdb::DuckdbMetadataWriter;
+#[cfg(feature = "write-mysql")]
+pub use metadata_writer_mysql::MySqlMetadataWriter;
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres::PostgresMetadataWriter;
 #[cfg(feature = "write-sqlite")]
