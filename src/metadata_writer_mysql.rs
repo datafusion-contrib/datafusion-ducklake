@@ -12,14 +12,14 @@
 //!
 //! Requires a multi-threaded Tokio runtime (`#[tokio::test(flavor =
 //! "multi_thread")]`): the sync trait methods bridge async sqlx via
-//! [`crate::metadata_provider::block_on`], exactly like the SQLite writer.
+//! `crate::metadata_provider::block_on`, exactly like the SQLite writer.
 //!
 //! ## MySQL dialect adaptations vs the SQLite template
 //!
 //! 1. **No `RETURNING`.** Auto-increment PK ids (`schema_id`, `table_id`,
 //!    `data_file_id`) are read back with `MySqlQueryResult::last_insert_id()`;
 //!    counter-allocated ids (`column_id`, `snapshot_id`) are read back with an
-//!    `UPDATE` followed by a `SELECT` in the same transaction ([`reserve_ids`]).
+//!    `UPDATE` followed by a `SELECT` in the same transaction (`reserve_ids`).
 //! 2. **DDL type mapping.** `INTEGER`→`BIGINT`, bounded names→`VARCHAR(1024)`,
 //!    long/path values→`TEXT`, `BOOLEAN`→`TINYINT(1)`. Every table is InnoDB so
 //!    transactions + `SELECT … FOR UPDATE`-style row locks actually serialize.
