@@ -216,7 +216,9 @@ impl AsyncDB for HybridDuckLakeDB {
                         DefaultColumnType::Integer
                     },
                     DataType::Float32 | DataType::Float64 => DefaultColumnType::FloatingPoint,
-                    DataType::Utf8 | DataType::LargeUtf8 => DefaultColumnType::Text,
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                        DefaultColumnType::Text
+                    },
                     _ => DefaultColumnType::Any,
                 })
                 .collect::<Vec<_>>();
@@ -276,6 +278,14 @@ fn convert_batch_to_strings(batch: &RecordBatch) -> Result<Vec<Vec<String>>, Hyb
                     },
                     DataType::Utf8 => {
                         let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::LargeUtf8 => {
+                        let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                        arr.value(row_idx).to_string()
+                    },
+                    DataType::Utf8View => {
+                        let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
                         arr.value(row_idx).to_string()
                     },
                     DataType::Boolean => {

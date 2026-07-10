@@ -289,12 +289,10 @@ async fn test_read_pme_encrypted_parquet() -> anyhow::Result<()> {
     assert_eq!(id_col.value(1), 2);
     assert_eq!(id_col.value(2), 3);
 
-    // Check name column
-    let name_col = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    // Check name column. DuckLake string columns scan as Utf8View; cast to Utf8
+    // so the assertions read the values through a StringArray.
+    let name_col_arr = arrow::compute::cast(batch.column(1), &DataType::Utf8).unwrap();
+    let name_col = name_col_arr.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(name_col.value(0), "Alice");
     assert_eq!(name_col.value(1), "Bob");
     assert_eq!(name_col.value(2), "Charlie");

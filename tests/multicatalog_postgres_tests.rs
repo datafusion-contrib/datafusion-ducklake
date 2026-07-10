@@ -3741,8 +3741,13 @@ async fn multicatalog_write_read_value_roundtrip() {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id column is Int64");
-            let names = b
-                .column(1)
+            // DuckLake string columns scan as Utf8View; cast to Utf8 to read via StringArray.
+            let names_col = datafusion::arrow::compute::cast(
+                b.column(1),
+                &datafusion::arrow::datatypes::DataType::Utf8,
+            )
+            .expect("cast name column to Utf8");
+            let names = names_col
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .expect("name column is Utf8");

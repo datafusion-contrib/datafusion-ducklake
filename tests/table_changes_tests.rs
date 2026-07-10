@@ -68,8 +68,24 @@ fn get_string_column(batch: &RecordBatch, col_idx: usize) -> Vec<String> {
             .collect();
     }
 
+    // Try StringViewArray (Utf8View) — the layout scanned user string columns use.
+    if let Some(array) = column
+        .as_any()
+        .downcast_ref::<arrow::array::StringViewArray>()
+    {
+        return (0..array.len())
+            .filter_map(|i| {
+                if array.is_null(i) {
+                    None
+                } else {
+                    Some(array.value(i).to_string())
+                }
+            })
+            .collect();
+    }
+
     panic!(
-        "Expected StringArray or LargeStringArray, got {:?}",
+        "Expected StringArray, LargeStringArray, or StringViewArray, got {:?}",
         column.data_type()
     );
 }

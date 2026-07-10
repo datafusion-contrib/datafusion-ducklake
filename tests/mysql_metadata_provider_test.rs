@@ -969,13 +969,19 @@ async fn test_query_real_parquet_files() {
         .as_any()
         .downcast_ref::<Int32Array>()
         .unwrap();
-    let name_col = batch
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let email_col = batch
-        .column(2)
+    // DuckLake string columns scan as Utf8View; cast to Utf8 to read via StringArray.
+    let name_col_arr = datafusion::arrow::compute::cast(
+        batch.column(1),
+        &datafusion::arrow::datatypes::DataType::Utf8,
+    )
+    .unwrap();
+    let name_col = name_col_arr.as_any().downcast_ref::<StringArray>().unwrap();
+    let email_col_arr = datafusion::arrow::compute::cast(
+        batch.column(2),
+        &datafusion::arrow::datatypes::DataType::Utf8,
+    )
+    .unwrap();
+    let email_col = email_col_arr
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
@@ -1015,11 +1021,12 @@ async fn test_query_with_filter() {
     assert_eq!(batch.num_rows(), 2, "Should have 2 rows (Charlie, Diana)");
 
     use datafusion::arrow::array::StringArray;
-    let name_col = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let name_col_arr = datafusion::arrow::compute::cast(
+        batch.column(0),
+        &datafusion::arrow::datatypes::DataType::Utf8,
+    )
+    .unwrap();
+    let name_col = name_col_arr.as_any().downcast_ref::<StringArray>().unwrap();
 
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");

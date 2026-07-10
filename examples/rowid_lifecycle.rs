@@ -18,7 +18,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray, StringViewArray};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
@@ -322,6 +322,12 @@ fn rows_from_batches(batches: &[RecordBatch]) -> Result<Vec<Row>, Box<dyn Error>
             };
 
             let name = if let Some(arr) = name_col.as_any().downcast_ref::<StringArray>() {
+                if arr.is_null(i) {
+                    None
+                } else {
+                    Some(arr.value(i).to_string())
+                }
+            } else if let Some(arr) = name_col.as_any().downcast_ref::<StringViewArray>() {
                 if arr.is_null(i) {
                     None
                 } else {

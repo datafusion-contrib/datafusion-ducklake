@@ -117,7 +117,10 @@ fn get_int_column(batch: &RecordBatch, col_idx: usize) -> Vec<i32> {
 
 /// Helper to get string column values from a batch
 fn get_string_column(batch: &RecordBatch, col_idx: usize) -> Vec<String> {
-    let column = batch.column(col_idx);
+    // Cast to Utf8 so the helper reads any string layout the provider produces
+    // (Utf8 / LargeUtf8 / Utf8View); DuckLake string columns now scan as Utf8View.
+    let column =
+        arrow::compute::cast(batch.column(col_idx), &arrow::datatypes::DataType::Utf8).unwrap();
     let array = column.as_any().downcast_ref::<StringArray>().unwrap();
     (0..array.len())
         .map(|i| array.value(i).to_string())
@@ -587,7 +590,9 @@ async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
     let mut got: Vec<(i32, Option<String>)> = Vec::new();
     for b in &batches {
         let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-        let tags = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let tags_col =
+            arrow::compute::cast(b.column(1), &arrow::datatypes::DataType::Utf8).unwrap();
+        let tags = tags_col.as_any().downcast_ref::<StringArray>().unwrap();
         for i in 0..b.num_rows() {
             let tag = if tags.is_null(i) {
                 None

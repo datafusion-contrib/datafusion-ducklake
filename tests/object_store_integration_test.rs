@@ -303,8 +303,11 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
         .as_any()
         .downcast_ref::<arrow::array::Int32Array>()
         .expect("id column should be Int32");
-    let name_col = results[0]
-        .column(1)
+    // DuckLake string columns scan as Utf8View; cast to Utf8 to read via StringArray.
+    let name_col_arr =
+        arrow::compute::cast(results[0].column(1), &arrow::datatypes::DataType::Utf8)
+            .expect("cast name column to Utf8");
+    let name_col = name_col_arr
         .as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .expect("name column should be String");

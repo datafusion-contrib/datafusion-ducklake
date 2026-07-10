@@ -14,7 +14,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, StringArray, StringViewArray};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, PostgresMetadataProvider};
@@ -321,6 +321,12 @@ fn extract_rows(
                     KeyValue::I64(arr.value(i))
                 }
             } else if let Some(arr) = key_col.as_any().downcast_ref::<StringArray>() {
+                if arr.is_null(i) {
+                    KeyValue::Null
+                } else {
+                    KeyValue::Str(arr.value(i).to_string())
+                }
+            } else if let Some(arr) = key_col.as_any().downcast_ref::<StringViewArray>() {
                 if arr.is_null(i) {
                     KeyValue::Null
                 } else {

@@ -59,20 +59,30 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         "timestamp_ns" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
         "interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
 
-        // String types
-        "varchar" | "text" | "string" => Ok(DataType::Utf8),
-        "json" => Ok(DataType::Utf8), // JSON stored as UTF8 string
+        // String types. Mapped to the "view" layout (Utf8View) rather than Utf8
+        // to match DataFusion's default parquet read behaviour: its
+        // `schema_force_view_types` option (on by default) rewrites Utf8/LargeUtf8
+        // columns to Utf8View during schema inference. Building the scan from an
+        // explicit catalog-derived schema bypasses that inference, so the view
+        // layout is requested here instead. View arrays avoid the 2 GiB limit on a
+        // single i32-offset value buffer and are cheaper to hash/compare for
+        // group-by; DataFusion's parquet reader decodes the existing BYTE_ARRAY
+        // columns straight into view arrays, so no cast and no data rewrite occurs.
+        "varchar" | "text" | "string" => Ok(DataType::Utf8View),
+        "json" => Ok(DataType::Utf8View), // JSON stored as UTF8 string
 
-        // Binary types
-        "blob" | "binary" | "bytea" => Ok(DataType::Binary),
+        // Binary types. BinaryView for the same reasons as the string types above.
+        "blob" | "binary" | "bytea" => Ok(DataType::BinaryView),
         "uuid" => Ok(DataType::FixedSizeBinary(16)),
 
-        // Geometry types (stored as binary WKB format)
+        // Geometry types (stored as binary WKB format). Kept as Binary (not
+        // promoted to BinaryView): the WKB bytes are consumed by geometry
+        // functions that expect a Binary layout.
         "point" | "linestring" | "polygon" | "multipoint" | "multilinestring" | "multipolygon"
         | "geometrycollection" | "linestring z" | "geometry" => Ok(DataType::Binary),
 
         // Time with timezone - not directly supported, use string
-        "timetz" | "time with time zone" => Ok(DataType::Utf8),
+        "timetz" | "time with time zone" => Ok(DataType::Utf8View),
 
         _ => {
             // Check for complex types (struct, map)
@@ -132,11 +142,13 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         DataType::Timestamp(_, Some(_)) => Ok("timestamptz".to_string()),
         DataType::Interval(_) => Ok("interval".to_string()),
 
-        // String types
-        DataType::Utf8 | DataType::LargeUtf8 => Ok("varchar".to_string()),
+        // String types. Utf8View is the canonical read layout (see
+        // `ducklake_to_arrow_type`); Utf8/LargeUtf8 map here as well so batches
+        // produced by other code paths still round-trip to the same DuckLake type.
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok("varchar".to_string()),
 
         // Binary types
-        DataType::Binary | DataType::LargeBinary => Ok("blob".to_string()),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Ok("blob".to_string()),
         DataType::FixedSizeBinary(16) => Ok("uuid".to_string()),
         DataType::FixedSizeBinary(_) => Ok("blob".to_string()),
 
@@ -708,8 +720,116 @@ mod tests {
             ducklake_to_arrow_type("float64").unwrap(),
             DataType::Float64
         );
-        assert_eq!(ducklake_to_arrow_type("varchar").unwrap(), DataType::Utf8);
-        assert_eq!(ducklake_to_arrow_type("blob").unwrap(), DataType::Binary);
+        assert_eq!(
+            ducklake_to_arrow_type("varchar").unwrap(),
+            DataType::Utf8View
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("blob").unwrap(),
+            DataType::BinaryView
+        );
+    }
+
+    #[test]
+    fn test_string_types_map_to_utf8view() {
+        // String columns use the Utf8View layout so wide, high-cardinality
+        // group-by does not hit the 2 GiB i32-offset buffer limit, matching
+        // DataFusion's default parquet read behaviour (schema_force_view_types).
+        for t in ["varchar", "text", "string", "json", "timetz", "time with time zone"] {
+            assert_eq!(
+                ducklake_to_arrow_type(t).unwrap(),
+                DataType::Utf8View,
+                "{t} should map to Utf8View"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binary_types_map_to_binaryview() {
+        for t in ["blob", "binary", "bytea"] {
+            assert_eq!(
+                ducklake_to_arrow_type(t).unwrap(),
+                DataType::BinaryView,
+                "{t} should map to BinaryView"
+            );
+        }
+    }
+
+    #[test]
+    fn test_geometry_stays_binary() {
+        // Geometry WKB is consumed by geometry functions that expect the Binary
+        // layout, so it is deliberately not promoted to BinaryView.
+        for t in [
+            "geometry",
+            "point",
+            "linestring",
+            "polygon",
+            "multipoint",
+            "multilinestring",
+            "multipolygon",
+            "geometrycollection",
+        ] {
+            assert_eq!(
+                ducklake_to_arrow_type(t).unwrap(),
+                DataType::Binary,
+                "{t} should stay Binary"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uuid_stays_fixed_size_binary() {
+        assert_eq!(
+            ducklake_to_arrow_type("uuid").unwrap(),
+            DataType::FixedSizeBinary(16)
+        );
+    }
+
+    #[test]
+    fn test_view_types_write_back_to_string_and_blob() {
+        // The write direction accepts every string/binary Arrow layout, including
+        // the view layouts now produced on read, so a read/write round-trip keeps
+        // the DuckLake catalog type stable.
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::Utf8View).unwrap(),
+            "varchar"
+        );
+        assert_eq!(arrow_to_ducklake_type(&DataType::Utf8).unwrap(), "varchar");
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::LargeUtf8).unwrap(),
+            "varchar"
+        );
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::BinaryView).unwrap(),
+            "blob"
+        );
+        assert_eq!(arrow_to_ducklake_type(&DataType::Binary).unwrap(), "blob");
+        assert_eq!(
+            arrow_to_ducklake_type(&DataType::LargeBinary).unwrap(),
+            "blob"
+        );
+    }
+
+    #[test]
+    fn test_string_binary_normalize_is_stable() {
+        // normalize = arrow_to_ducklake_type(ducklake_to_arrow_type(t)); it must
+        // still terminate at the canonical DuckLake type now that the read layout
+        // is a view type, otherwise schema-evolution comparisons would error.
+        assert_eq!(normalize_ducklake_type("varchar").unwrap(), "varchar");
+        assert_eq!(normalize_ducklake_type("text").unwrap(), "varchar");
+        assert_eq!(normalize_ducklake_type("json").unwrap(), "varchar");
+        assert_eq!(normalize_ducklake_type("blob").unwrap(), "blob");
+        assert_eq!(normalize_ducklake_type("binary").unwrap(), "blob");
+    }
+
+    #[test]
+    fn test_view_type_list_children() {
+        // list<varchar> recurses through the same mapping, so its element is
+        // Utf8View.
+        assert_eq!(
+            ducklake_to_arrow_type("list<varchar>").unwrap(),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true)))
+        );
     }
 
     #[test]
@@ -752,7 +872,7 @@ mod tests {
     #[test]
     fn test_list_type_various_elements() {
         let cases = vec![
-            ("list<varchar>", DataType::Utf8),
+            ("list<varchar>", DataType::Utf8View),
             ("list<float64>", DataType::Float64),
             ("list<boolean>", DataType::Boolean),
             ("list<date>", DataType::Date32),
@@ -768,19 +888,19 @@ mod tests {
     #[test]
     fn test_array_type_angle_bracket() {
         let result = ducklake_to_arrow_type("array<varchar>").unwrap();
-        let expected = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let expected = DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true)));
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_list_type_postgres_bracket_syntax() {
         let cases = vec![
-            ("varchar[]", DataType::Utf8),
+            ("varchar[]", DataType::Utf8View),
             ("float64[]", DataType::Float64),
             ("int32[]", DataType::Int32),
             ("boolean[]", DataType::Boolean),
             ("bigint[]", DataType::Int64),
-            ("text[]", DataType::Utf8),
+            ("text[]", DataType::Utf8View),
             ("float[]", DataType::Float32),
             ("integer[]", DataType::Int32),
         ];
@@ -965,14 +1085,18 @@ mod tests {
 
     #[test]
     fn test_arrow_to_ducklake_roundtrip() {
-        // Verify roundtrip: arrow -> ducklake -> arrow for common types
+        // Verify roundtrip: arrow -> ducklake -> arrow for common types. Strings
+        // and binary use the view layouts (Utf8View/BinaryView) here because that
+        // is the canonical Arrow type `ducklake_to_arrow_type` produces; the
+        // non-view layouts collapse to the same DuckLake type and are covered by
+        // `test_view_types_write_back_to_string_and_blob`.
         let test_types = vec![
             DataType::Boolean,
             DataType::Int32,
             DataType::Int64,
             DataType::Float64,
-            DataType::Utf8,
-            DataType::Binary,
+            DataType::Utf8View,
+            DataType::BinaryView,
             DataType::Date32,
             DataType::Timestamp(TimeUnit::Microsecond, None),
             DataType::Timestamp(TimeUnit::Nanosecond, None),
@@ -980,7 +1104,7 @@ mod tests {
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
             DataType::Decimal128(10, 2),
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
         ];
 
         for original in test_types {
@@ -1177,7 +1301,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 2);
         assert_eq!(
             *schema.field(1).data_type(),
-            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true)))
         );
     }
 

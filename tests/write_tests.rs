@@ -8,8 +8,9 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+    Array, BinaryViewArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
+    ListArray, ListBuilder, StringArray, StringBuilder, StringViewArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -119,14 +120,157 @@ async fn test_write_and_read_basic_types() {
         .unwrap();
     assert_eq!(ids.values(), &[1, 2, 3]);
 
-    let names = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    // DuckLake string columns scan as Utf8View; cast to Utf8 to assert via StringArray.
+    let names_arr = arrow::compute::cast(batches[0].column(1), &DataType::Utf8).unwrap();
+    let names = names_arr.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(names.value(0), "Alice");
     assert_eq!(names.value(1), "Bob");
     assert!(names.is_null(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_read_view_columns_roundtrip() {
+    // A string column scans as Utf8View and a blob column as BinaryView, matching
+    // DataFusion's schema_force_view_types default. This drives the full
+    // write -> scan pipeline with view arrays as input (the layout a write-back
+    // produces once the provider serves view types), and asserts the scan returns
+    // view arrays end to end, not i32-offset Utf8/Binary.
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8View, true),
+        Field::new("data", DataType::BinaryView, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringViewArray::from(vec![
+                Some("Alice"),
+                Some("Bob"),
+                None,
+            ])),
+            Arc::new(BinaryViewArray::from(vec![
+                Some(b"xx".as_ref()),
+                Some(b"yyy".as_ref()),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    table_writer
+        .write_table("main", "views", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT id, name, data FROM test.main.views ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+
+    // The scan must expose the view layouts end to end.
+    assert_eq!(batch.schema().field(1).data_type(), &DataType::Utf8View);
+    assert_eq!(batch.schema().field(2).data_type(), &DataType::BinaryView);
+
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("name should scan as StringViewArray");
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Bob");
+    assert!(names.is_null(2));
+
+    let data = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .expect("data should scan as BinaryViewArray");
+    assert_eq!(data.value(0), b"xx");
+    assert_eq!(data.value(1), b"yyy");
+    assert!(data.is_null(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_read_list_of_string_roundtrip() {
+    // A list<varchar> column scans with a Utf8View element. The file is written
+    // with a Utf8 list child while the catalog type resolves to List(Utf8View),
+    // so the read path recasts the list element (List(Utf8) -> List(Utf8View)) in
+    // ColumnRenameExec. Exercises that element recast end to end.
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+
+    let mut tags_builder = ListBuilder::new(StringBuilder::new());
+    tags_builder.values().append_value("a");
+    tags_builder.values().append_value("b");
+    tags_builder.append(true);
+    tags_builder.values().append_value("c");
+    tags_builder.append(true);
+    let tags = tags_builder.finish();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("tags", tags.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(tags)],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    table_writer
+        .write_table("main", "taglists", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT id, tags FROM test.main.taglists ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+
+    // The list element scans as Utf8View.
+    match batch.schema().field(1).data_type() {
+        DataType::List(field) => {
+            assert_eq!(
+                field.data_type(),
+                &DataType::Utf8View,
+                "list element should scan as Utf8View"
+            );
+        },
+        other => panic!("expected List, got {other:?}"),
+    }
+
+    // Values survive the List(Utf8) -> List(Utf8View) element recast. Read each
+    // row's element slice via a Utf8 cast so the assertion is layout-agnostic.
+    let tags = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .expect("tags should be a ListArray");
+    let row0 = arrow::compute::cast(&tags.value(0), &DataType::Utf8).unwrap();
+    let row0 = row0.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(row0.value(0), "a");
+    assert_eq!(row0.value(1), "b");
+    let row1 = arrow::compute::cast(&tags.value(1), &DataType::Utf8).unwrap();
+    let row1 = row1.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(row1.value(0), "c");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -575,20 +719,14 @@ async fn test_multiple_tables_same_schema() {
 
     let df1 = ctx.sql("SELECT name FROM test.main.t1").await.unwrap();
     let batches1 = df1.collect().await.unwrap();
-    let names1 = batches1[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let names1_arr = arrow::compute::cast(batches1[0].column(0), &DataType::Utf8).unwrap();
+    let names1 = names1_arr.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(names1.value(0), "table1");
 
     let df2 = ctx.sql("SELECT name FROM test.main.t2").await.unwrap();
     let batches2 = df2.collect().await.unwrap();
-    let names2 = batches2[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
+    let names2_arr = arrow::compute::cast(batches2[0].column(0), &DataType::Utf8).unwrap();
+    let names2 = names2_arr.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(names2.value(0), "table2");
 }
 
