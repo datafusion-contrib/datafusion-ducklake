@@ -52,7 +52,11 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-async fn writer_for(pool: &PgPool, cat: i64, data_path: &std::path::Path) -> Arc<PostgresMetadataWriter> {
+async fn writer_for(
+    pool: &PgPool,
+    cat: i64,
+    data_path: &std::path::Path,
+) -> Arc<PostgresMetadataWriter> {
     let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
         .await
         .unwrap();
@@ -68,7 +72,9 @@ async fn read_pairs(pool: &PgPool, cat_name: &str) -> Vec<(i32, i32)> {
     let ctx = SessionContext::new();
     ctx.register_catalog(cat_name, Arc::new(catalog));
     let batches = ctx
-        .sql(&format!("SELECT id, val FROM {cat_name}.public.t ORDER BY id"))
+        .sql(&format!(
+            "SELECT id, val FROM {cat_name}.public.t ORDER BY id"
+        ))
         .await
         .unwrap()
         .collect()
@@ -234,8 +240,15 @@ async fn positional_delete_and_truncate_commit_postgres() {
     let removed = writer
         .commit_truncate(table_meta.table_id, "public", "t", head2)
         .unwrap();
-    assert_eq!(removed, 2, "gross 4 minus 2 already-deleted = 2 live rows removed");
-    assert_eq!(read_pairs(&pool, cat_name).await, Vec::<(i32, i32)>::new(), "table empty");
+    assert_eq!(
+        removed, 2,
+        "gross 4 minus 2 already-deleted = 2 live rows removed"
+    );
+    assert_eq!(
+        read_pairs(&pool, cat_name).await,
+        Vec::<(i32, i32)>::new(),
+        "table empty"
+    );
     let snaps_after_truncate = catalog_snapshot_count(&pool, cat).await;
 
     // --- no-op guard: a second truncate must NOT commit a snapshot. ---

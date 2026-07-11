@@ -329,7 +329,11 @@ async fn delete_truncate_repeat_same_ctx_no_spurious_snapshot() {
     let c1 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
     assert_eq!(c1, 4, "first truncate removes all rows");
     let after_first = snapshot_count(&temp).await;
-    assert_eq!(after_first, before + 1, "first truncate commits exactly one snapshot");
+    assert_eq!(
+        after_first,
+        before + 1,
+        "first truncate commits exactly one snapshot"
+    );
 
     // Second truncate in the SAME (pinned) session: a DB-level no-op.
     let c2 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
@@ -339,7 +343,11 @@ async fn delete_truncate_repeat_same_ctx_no_spurious_snapshot() {
         after_first,
         "a no-op truncate must not create a snapshot"
     );
-    assert_eq!(read_ids(&temp).await, Vec::<i32>::new(), "table stays empty");
+    assert_eq!(
+        read_ids(&temp).await,
+        Vec::<i32>::new(),
+        "table stays empty"
+    );
 }
 
 /// A second filtered DELETE in the SAME session that re-touches a file modified by
