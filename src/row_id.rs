@@ -65,6 +65,27 @@ pub const ROW_POS_COLUMN_NAME: &str = "__ducklake_row_pos";
 /// survive across file rewrites.
 pub const ROW_ID_PARQUET_FIELD_ID: i32 = 2_147_483_540;
 
+/// Parquet column name our writer uses for the embedded row-id column on files
+/// produced by `UPDATE` / compaction. The read path matches the column by its
+/// [`ROW_ID_PARQUET_FIELD_ID`] field-id, not this name, so the exact string is
+/// cosmetic; we mirror the DuckLake extension's `_ducklake_internal_row_id`.
+pub const EMBEDDED_ROW_ID_COLUMN_NAME: &str = "_ducklake_internal_row_id";
+
+/// Build the Arrow [`Field`] for the embedded row-id column written into
+/// `UPDATE` / compaction output parquet. Carries the reserved
+/// [`ROW_ID_PARQUET_FIELD_ID`] as its `PARQUET:field_id` metadata so a later
+/// read detects it (see `table.rs::build_file_read_config`) and serves the
+/// original rowids inline rather than synthesizing `row_id_start + position`.
+/// Nullable to match the read-side `rowid` field.
+pub fn embedded_rowid_field() -> Field {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "PARQUET:field_id".to_string(),
+        ROW_ID_PARQUET_FIELD_ID.to_string(),
+    );
+    Field::new(EMBEDDED_ROW_ID_COLUMN_NAME, DataType::Int64, true).with_metadata(metadata)
+}
+
 /// Build the Arrow Field for the rowid column. Nullable so we can emit NULL
 /// for files whose catalog row_id_start is unrecorded (e.g. older catalogs).
 pub fn rowid_field() -> Field {

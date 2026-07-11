@@ -84,6 +84,8 @@ pub mod multicatalog;
 pub mod multicatalog_provider;
 #[cfg(feature = "write")]
 pub mod table_writer;
+#[cfg(feature = "write")]
+pub mod update_exec;
 
 // Result type for DuckLake operations
 pub type Result<T> = std::result::Result<T, DuckLakeError>;
@@ -128,3 +130,5 @@ pub use multicatalog::{MulticatalogManager, initialize_multicatalog_schema};
 pub use multicatalog_provider::MulticatalogProvider;
 #[cfg(feature = "write")]
 pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+#[cfg(feature = "write")]
+pub use update_exec::DuckLakeUpdateExec;

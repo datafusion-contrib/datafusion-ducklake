@@ -1875,6 +1875,12 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn catalog_id(&self) -> Option<i64> {
         Some(self.catalog_id)
     }
+
+    /// Multicatalog Postgres implements the atomic append-with-deletes commit,
+    /// so it supports row-level `UPDATE`.
+    fn supports_update(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ use crate::metadata_writer::{
     WriteResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
+use crate::row_id::embedded_rowid_field;
 use crate::table::delete_file_schema;
 
 /// High-level writer for DuckLake tables.
@@ -118,6 +119,49 @@ impl DuckLakeTableWriter {
             file_name.clone(),
             file_name,
             true,
+            false,
+            mode,
+        )
+    }
+
+    /// Begin a streaming write session whose parquet output carries an extra
+    /// embedded row-id column (field-id [`ROW_ID_PARQUET_FIELD_ID`]) appended
+    /// after the table's data columns, so rewritten rows preserve their DuckLake
+    /// row lineage across the file rewrite (the commit behind `UPDATE` /
+    /// compaction).
+    ///
+    /// `arrow_schema` describes ONLY the table's data columns (no rowid), exactly
+    /// as for [`begin_write`](Self::begin_write); the embedded column is added to
+    /// the parquet schema here and is NOT registered as a catalog column. Batches
+    /// passed to [`TableWriteSession::write_batch`] must therefore have the data
+    /// columns in order followed by a trailing `Int64` rowid column holding each
+    /// row's original rowid. A later read detects the embedded column by its
+    /// field-id and serves those rowids inline instead of synthesizing
+    /// `row_id_start + position`.
+    ///
+    /// [`ROW_ID_PARQUET_FIELD_ID`]: crate::row_id::ROW_ID_PARQUET_FIELD_ID
+    pub fn begin_write_with_embedded_rowid(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            table_key,
+            file_name.clone(),
+            file_name,
+            true,
+            true,
             mode,
         )
     }
@@ -141,6 +185,7 @@ impl DuckLakeTableWriter {
             file_name,
             full_path,
             false,
+            false,
             mode,
         )
     }
@@ -155,14 +200,27 @@ impl DuckLakeTableWriter {
         file_name: String,
         catalog_path: String,
         path_is_relative: bool,
+        embed_rowid: bool,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids =
-            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+        // Data columns carry their catalog field-ids. When embedding row lineage,
+        // append the reserved-field-id rowid column AFTER them; it is a parquet-only
+        // column (not a catalog column), so it is absent from `columns`/`column_ids`
+        // and the metadata commit never sees it.
+        let schema_with_ids = {
+            let mut schema = build_schema_with_field_ids(arrow_schema, &setup.column_ids);
+            if embed_rowid {
+                let mut fields: Vec<Field> =
+                    schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+                fields.push(embedded_rowid_field());
+                schema = Schema::new_with_metadata(fields, schema.metadata().clone());
+            }
+            Arc::new(schema)
+        };
 
         let object_path_str = join_paths(&file_dir, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys)

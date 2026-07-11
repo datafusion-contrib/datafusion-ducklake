@@ -5,12 +5,14 @@
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt32Array};
+use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -23,27 +25,46 @@ use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use futures::Stream;
+use futures::{Stream, StreamExt};
+use object_store::path::Path as ObjectPath;
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::async_reader::ParquetObjectReader;
 
 use crate::metadata_provider::{DataFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::table::validated_file_size;
+use crate::positional_source::PositionalFileSource;
+use crate::row_id::{FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME};
+use crate::table::{delete_file_schema, validated_file_size, validated_record_count};
+use crate::types::extract_parquet_field_ids;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
 #[cfg(feature = "encryption")]
 use datafusion::execution::parquet_encryption::EncryptionFactory;
 
-/// Type of change captured in CDC output
+/// Type of change captured in CDC output.
+///
+/// [`UpdatePreimage`](ChangeType::UpdatePreimage) /
+/// [`UpdatePostimage`](ChangeType::UpdatePostimage) are the paired old/new row
+/// versions of an `UPDATE`: `ducklake_table_changes` correlates a same-snapshot
+/// delete + insert that share a rowid into this pair (the DuckLake spirit of an
+/// update in a change feed) instead of surfacing them as an unrelated delete and
+/// insert. The `as_str` values match the DuckLake change-feed spec strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeType {
     Insert,
     Delete,
+    /// The old version of a row that an `UPDATE` rewrote in this snapshot.
+    UpdatePreimage,
+    /// The new version of a row that an `UPDATE` rewrote in this snapshot.
+    UpdatePostimage,
 }
 
 impl ChangeType {
@@ -52,6 +73,8 @@ impl ChangeType {
         match self {
             ChangeType::Insert => "insert",
             ChangeType::Delete => "delete",
+            ChangeType::UpdatePreimage => "update_preimage",
+            ChangeType::UpdatePostimage => "update_postimage",
         }
     }
 }
@@ -514,6 +537,246 @@ impl TableChangesTable {
             cdc_exec_schema,
         )))
     }
+
+    /// Read a file's parquet footer and return the physical name of its embedded
+    /// row-id column ([`ROW_ID_PARQUET_FIELD_ID`]) when present. A file that
+    /// carries one is the postimage side of an `UPDATE` / compaction.
+    async fn detect_embedded_rowid_name(
+        &self,
+        state: &dyn Session,
+        path: &str,
+        is_relative: bool,
+    ) -> DataFusionResult<Option<String>> {
+        let resolved = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url.as_ref())?;
+        let reader = ParquetObjectReader::new(object_store, ObjectPath::from(resolved.as_str()));
+        let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let field_ids = extract_parquet_field_ids(builder.metadata());
+        Ok(field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned())
+    }
+
+    /// The read schema for a data file: the table columns, plus the embedded
+    /// rowid column (under its physical name) when `embedded_name` is `Some`.
+    fn read_schema_with_optional_rowid(&self, embedded_name: &Option<String>) -> SchemaRef {
+        match embedded_name {
+            Some(name) => {
+                let mut fields: Vec<Field> = self
+                    .table_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                fields.push(Field::new(name, DataType::Int64, true));
+                Arc::new(Schema::new(fields))
+            },
+            None => self.table_schema.clone(),
+        }
+    }
+
+    /// Plain scan of an inserted data file: table columns, plus the embedded
+    /// rowid column when the file has one. No positions needed (postimage rowids
+    /// come from the embedded column; plain inserts need no rowid).
+    fn build_insert_scan(
+        &self,
+        data_file: &DataFileChange,
+        embedded_name: &Option<String>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let resolved = resolve_path(
+            &self.table_path,
+            &data_file.path,
+            data_file.path_is_relative,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut pf = PartitionedFile::new(
+            &resolved,
+            validated_file_size(data_file.file_size_bytes, &resolved)?,
+        );
+        if let Some(footer) = data_file.footer_size
+            && footer > 0
+            && let Ok(hint) = usize::try_from(footer)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let read_schema = self.read_schema_with_optional_rowid(embedded_name);
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(ParquetSource::new(read_schema)),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
+        Ok(DataSourceExec::from_data_source(builder.build()))
+    }
+
+    /// Positional scan of a delete's source data file: table columns, the
+    /// embedded rowid column when present, and the internal physical-position
+    /// column. `PositionalFileSource` + `FileRowNumberExec` guarantee true
+    /// physical positions so deleted rows can be matched to the delete file's
+    /// `pos` set regardless of scan partitioning.
+    fn build_delete_data_scan(
+        &self,
+        resolved_path: &str,
+        size_bytes: i64,
+        footer_size: i64,
+        embedded_name: &Option<String>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let mut pf = PartitionedFile::new(
+            resolved_path,
+            validated_file_size(size_bytes, resolved_path)?,
+        );
+        if footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let read_schema = self.read_schema_with_optional_rowid(embedded_name);
+        let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
+        let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+            .with_file_group(FileGroup::new(vec![pf]))
+            .with_partitioned_by_file_group(true);
+        let scan = DataSourceExec::from_data_source(builder.build());
+        Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
+    }
+
+    /// Scan of a positional delete file (the standard `(file_path, pos)` schema);
+    /// the correlation path reads its `pos` column to find newly-deleted rows.
+    fn build_delete_file_scan(
+        &self,
+        path: &str,
+        is_relative: bool,
+        size_bytes: i64,
+        footer_size: i64,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let resolved = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let mut pf = PartitionedFile::new(&resolved, validated_file_size(size_bytes, &resolved)?);
+        if footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(ParquetSource::new(delete_file_schema())),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
+        Ok(DataSourceExec::from_data_source(builder.build()))
+    }
+
+    /// Build the correlated change feed: pair a same-snapshot delete + insert
+    /// that share a rowid into `update_preimage` (old) + `update_postimage`
+    /// (new); surface unmatched inserts as `insert`; and DROP unmatched deletes
+    /// (pure deletes stay out of `ducklake_table_changes`, matching its historical
+    /// insert-oriented behaviour — they remain available via
+    /// `ducklake_table_deletions`).
+    async fn build_correlated_changes(
+        &self,
+        state: &dyn Session,
+        data_files: &[DataFileChange],
+        embedded_names: &[Option<String>],
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let table_len = self.table_schema.fields().len();
+
+        let mut insert_units = Vec::with_capacity(data_files.len());
+        for (df, name) in data_files.iter().zip(embedded_names.iter()) {
+            insert_units.push(InsertUnit {
+                snapshot_id: df.begin_snapshot,
+                scan: self.build_insert_scan(df, name)?,
+                embedded: name.is_some(),
+            });
+        }
+
+        let delete_files = self
+            .provider
+            .get_delete_files_added_between_snapshots(
+                self.table_id,
+                self.start_snapshot,
+                self.end_snapshot,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let mut delete_units = Vec::with_capacity(delete_files.len());
+        for dfc in &delete_files {
+            validated_record_count(dfc.data_record_count, &dfc.data_file_path)?;
+            let resolved = resolve_path(
+                &self.table_path,
+                &dfc.data_file_path,
+                dfc.data_file_path_is_relative,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let old_embedded = self
+                .detect_embedded_rowid_name(
+                    state,
+                    &dfc.data_file_path,
+                    dfc.data_file_path_is_relative,
+                )
+                .await?;
+            let data_scan = self.build_delete_data_scan(
+                &resolved,
+                dfc.data_file_size_bytes,
+                dfc.data_file_footer_size,
+                &old_embedded,
+            )?;
+            let current_delete_scan = match &dfc.current_delete_path {
+                Some(p) => Some(self.build_delete_file_scan(
+                    p,
+                    dfc.current_delete_path_is_relative.unwrap_or(true),
+                    dfc.current_delete_file_size_bytes.unwrap_or(0),
+                    dfc.current_delete_footer_size.unwrap_or(0),
+                )?),
+                None => None,
+            };
+            let previous_delete_scan = match &dfc.previous_delete_path {
+                Some(p) => Some(self.build_delete_file_scan(
+                    p,
+                    dfc.previous_delete_path_is_relative.unwrap_or(true),
+                    dfc.previous_delete_file_size_bytes.unwrap_or(0),
+                    dfc.previous_delete_footer_size.unwrap_or(0),
+                )?),
+                None => None,
+            };
+            delete_units.push(DeleteUnit {
+                snapshot_id: dfc.snapshot_id,
+                data_scan,
+                embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
+                current_delete_scan,
+                previous_delete_scan,
+                record_count: dfc.data_record_count,
+                row_id_start: dfc.data_row_id_start,
+            });
+        }
+
+        let full: Arc<dyn ExecutionPlan> = Arc::new(TableChangesExec::new(
+            insert_units,
+            delete_units,
+            self.table_schema.clone(),
+            self.output_schema.clone(),
+            table_len,
+        ));
+
+        // The exec emits the full `[table columns, snapshot_id, change_type]`
+        // schema; honor the requested projection with a ProjectionExec on top.
+        match projection {
+            None => Ok(full),
+            Some(indices) => {
+                let exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = indices
+                    .iter()
+                    .map(|&i| {
+                        let f = self.output_schema.field(i);
+                        (
+                            Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
+                            f.name().to_string(),
+                        )
+                    })
+                    .collect();
+                Ok(Arc::new(ProjectionExec::try_new(exprs, full)?))
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -550,6 +813,26 @@ impl TableProvider for TableChangesTable {
         if data_files.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
+        }
+
+        // Detect which added data files carry an embedded rowid column: those are
+        // the postimages of an UPDATE / compaction. Only when at least one is
+        // present do we correlate delete+insert pairs — a catalog of plain
+        // INSERTs (no embedded files) stays on the historical insert-only path
+        // below, byte-for-byte unchanged (no delete reads, no reclassification).
+        let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
+        let mut any_embedded = false;
+        for data_file in &data_files {
+            let name = self
+                .detect_embedded_rowid_name(state, &data_file.path, data_file.path_is_relative)
+                .await?;
+            any_embedded |= name.is_some();
+            embedded_names.push(name);
+        }
+        if any_embedded {
+            return self
+                .build_correlated_changes(state, &data_files, &embedded_names, projection)
+                .await;
         }
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
@@ -594,4 +877,462 @@ impl TableProvider for TableChangesTable {
             UnionExec::try_new(execs)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Correlated change feed (insert / delete / update_preimage / update_postimage)
+// ---------------------------------------------------------------------------
+
+/// One inserted data file added in the snapshot range. When `embedded`, the
+/// scan's trailing column is the file's embedded rowid (an UPDATE / compaction
+/// postimage); otherwise the file is a plain INSERT and needs no rowid.
+#[derive(Clone)]
+struct InsertUnit {
+    snapshot_id: i64,
+    scan: Arc<dyn ExecutionPlan>,
+    embedded: bool,
+}
+
+/// One delete applied in the snapshot range: enough to read the newly-deleted
+/// rows of the source data file (the delete positions minus the previous
+/// generation's) together with each row's rowid.
+#[derive(Clone)]
+struct DeleteUnit {
+    snapshot_id: i64,
+    /// Positional scan of the source data file: `[table columns..., (embedded
+    /// rowid), __ducklake_row_pos]`.
+    data_scan: Arc<dyn ExecutionPlan>,
+    /// Column index of the source file's embedded rowid, or `None` (rowids are
+    /// then `row_id_start + position`).
+    embedded_col_idx: Option<usize>,
+    /// Scan of the current delete file, or `None` for a full-file delete.
+    current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
+    /// Scan of the delete file this one superseded, if any.
+    previous_delete_scan: Option<Arc<dyn ExecutionPlan>>,
+    record_count: i64,
+    row_id_start: i64,
+}
+
+/// Rows carrying their `(snapshot_id, rowid)` correlation key alongside the
+/// table columns, ready to be tagged once update pairs are known.
+struct KeyedRows {
+    snapshot_id: i64,
+    table_batch: RecordBatch,
+    rowid: Int64Array,
+}
+
+/// Execution plan for the correlated `ducklake_table_changes` feed. Collects the
+/// inserted rows (with embedded rowids) and the newly-deleted rows (with
+/// synthesized/embedded rowids), pairs those sharing a `(snapshot_id, rowid)`
+/// into preimage/postimage, and emits the tagged rows. Single output partition.
+#[derive(Debug)]
+pub struct TableChangesExec {
+    insert_units: Vec<InsertUnit>,
+    delete_units: Vec<DeleteUnit>,
+    #[allow(dead_code)]
+    table_schema: SchemaRef,
+    output_schema: SchemaRef,
+    table_len: usize,
+    properties: Arc<PlanProperties>,
+}
+
+impl std::fmt::Debug for InsertUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InsertUnit")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("embedded", &self.embedded)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for DeleteUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteUnit")
+            .field("snapshot_id", &self.snapshot_id)
+            .field("embedded_col_idx", &self.embedded_col_idx)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableChangesExec {
+    fn new(
+        insert_units: Vec<InsertUnit>,
+        delete_units: Vec<DeleteUnit>,
+        table_schema: SchemaRef,
+        output_schema: SchemaRef,
+        table_len: usize,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::execution_plan::EmissionType::Final,
+            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+        ));
+        Self {
+            insert_units,
+            delete_units,
+            table_schema,
+            output_schema,
+            table_len,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for TableChangesExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
+                write!(
+                    f,
+                    "TableChangesExec: inserts={}, deletes={}",
+                    self.insert_units.len(),
+                    self.delete_units.len()
+                )
+            },
+        }
+    }
+}
+
+impl ExecutionPlan for TableChangesExec {
+    fn name(&self) -> &str {
+        "TableChangesExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    /// No DataFusion children: the per-file scans are internal and executed
+    /// directly, so the optimizer never rewrites them.
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(
+                "TableChangesExec has no children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "TableChangesExec only supports partition 0, got {partition}"
+            )));
+        }
+
+        let insert_units = self.insert_units.clone();
+        let delete_units = self.delete_units.clone();
+        let output_schema = self.output_schema.clone();
+        let table_len = self.table_len;
+
+        let fut = async move {
+            correlate_changes(
+                insert_units,
+                delete_units,
+                output_schema,
+                table_len,
+                context,
+            )
+            .await
+        };
+
+        let schema = self.output_schema.clone();
+        let stream = futures::stream::once(fut)
+            .map(|res: DataFusionResult<Vec<RecordBatch>>| match res {
+                Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
+                Err(e) => futures::stream::iter(std::iter::once(Err(e))).boxed(),
+            })
+            .flatten();
+
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream),
+        ))
+    }
+}
+
+/// Collect the inserted and deleted rows, correlate update pairs by
+/// `(snapshot_id, rowid)`, and produce the tagged output batches.
+async fn correlate_changes(
+    insert_units: Vec<InsertUnit>,
+    delete_units: Vec<DeleteUnit>,
+    output_schema: SchemaRef,
+    table_len: usize,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    // Inserted rows: split into postimage candidates (embedded rowid) and plain
+    // inserts (no rowid, can never pair with a delete).
+    let mut postimages: Vec<KeyedRows> = Vec::new();
+    let mut plain_inserts: Vec<(i64, RecordBatch)> = Vec::new();
+    for unit in &insert_units {
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&unit.scan), context.clone()).await?;
+        for b in batches {
+            if b.num_rows() == 0 {
+                continue;
+            }
+            if unit.embedded {
+                let rowid = b
+                    .column(table_len)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("embedded rowid column is not Int64".to_string())
+                    })?
+                    .clone();
+                let table_batch = b.project(&(0..table_len).collect::<Vec<_>>())?;
+                postimages.push(KeyedRows {
+                    snapshot_id: unit.snapshot_id,
+                    table_batch,
+                    rowid,
+                });
+            } else {
+                plain_inserts.push((unit.snapshot_id, b));
+            }
+        }
+    }
+
+    // Deleted rows: the positions newly masked at this snapshot, with each row's
+    // rowid (embedded column when the source file has one, else row_id_start +
+    // physical position).
+    let mut preimages: Vec<KeyedRows> = Vec::new();
+    for unit in &delete_units {
+        let current = collect_delete_positions(&unit.current_delete_scan, context.clone()).await?;
+        let current: HashSet<i64> = match current {
+            Some(set) => set,
+            None => (0..unit.record_count).collect(),
+        };
+        let previous = collect_delete_positions(&unit.previous_delete_scan, context.clone())
+            .await?
+            .unwrap_or_default();
+
+        let data_batches =
+            datafusion::physical_plan::collect(Arc::clone(&unit.data_scan), context.clone())
+                .await?;
+        for b in data_batches {
+            let n = b.num_rows();
+            if n == 0 {
+                continue;
+            }
+            let pos_idx = b.schema().index_of(ROW_POS_COLUMN_NAME)?;
+            let pos = b
+                .column(pos_idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+                })?;
+            let embedded = match unit.embedded_col_idx {
+                Some(idx) => Some(
+                    b.column(idx)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(
+                                "embedded rowid column is not Int64".to_string(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+
+            let mut keep: Vec<u32> = Vec::new();
+            let mut rowids: Vec<i64> = Vec::new();
+            for i in 0..n {
+                let p = pos.value(i);
+                if current.contains(&p) && !previous.contains(&p) {
+                    keep.push(i as u32);
+                    rowids.push(match embedded {
+                        Some(arr) => arr.value(i),
+                        None => unit.row_id_start + p,
+                    });
+                }
+            }
+            if keep.is_empty() {
+                continue;
+            }
+            let indices = UInt32Array::from(keep);
+            let table_cols: Vec<ArrayRef> = (0..table_len)
+                .map(|c| {
+                    take(b.column(c).as_ref(), &indices, None)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                })
+                .collect::<DataFusionResult<_>>()?;
+            let table_batch = RecordBatch::try_new(
+                Arc::new(Schema::new(
+                    (0..table_len)
+                        .map(|c| b.schema().field(c).clone())
+                        .collect::<Vec<_>>(),
+                )),
+                table_cols,
+            )?;
+            preimages.push(KeyedRows {
+                snapshot_id: unit.snapshot_id,
+                table_batch,
+                rowid: Int64Array::from(rowids),
+            });
+        }
+    }
+
+    // Update pairs = keys present in BOTH an embedded insert and a delete.
+    let post_keys: HashSet<(i64, i64)> = postimages
+        .iter()
+        .flat_map(|k| (0..k.rowid.len()).map(move |i| (k.snapshot_id, k.rowid.value(i))))
+        .collect();
+    let update_keys: HashSet<(i64, i64)> = preimages
+        .iter()
+        .flat_map(|k| (0..k.rowid.len()).map(move |i| (k.snapshot_id, k.rowid.value(i))))
+        .filter(|key| post_keys.contains(key))
+        .collect();
+
+    let mut out: Vec<RecordBatch> = Vec::new();
+    for (snap, batch) in &plain_inserts {
+        out.push(append_cdc_columns(
+            batch,
+            *snap,
+            ChangeType::Insert,
+            &output_schema,
+        )?);
+    }
+    for k in &postimages {
+        // Rows whose key is an update pair become postimages; the rest are plain
+        // inserts (embedded file with no matching delete, e.g. compaction).
+        if let Some(b) = filter_and_tag(
+            k,
+            &key_mask(k, &update_keys, true),
+            ChangeType::UpdatePostimage,
+            &output_schema,
+        )? {
+            out.push(b);
+        }
+        if let Some(b) = filter_and_tag(
+            k,
+            &key_mask(k, &update_keys, false),
+            ChangeType::Insert,
+            &output_schema,
+        )? {
+            out.push(b);
+        }
+    }
+    for k in &preimages {
+        // Only rows paired with an insert are surfaced (as preimages); pure
+        // deletes stay out of the changes feed.
+        if let Some(b) = filter_and_tag(
+            k,
+            &key_mask(k, &update_keys, true),
+            ChangeType::UpdatePreimage,
+            &output_schema,
+        )? {
+            out.push(b);
+        }
+    }
+    Ok(out)
+}
+
+/// Collect the `pos` set from a delete-file scan (`None` scan => `None`).
+async fn collect_delete_positions(
+    scan: &Option<Arc<dyn ExecutionPlan>>,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<Option<HashSet<i64>>> {
+    let Some(scan) = scan else {
+        return Ok(None);
+    };
+    let batches = datafusion::physical_plan::collect(Arc::clone(scan), context).await?;
+    let mut set = HashSet::new();
+    for b in &batches {
+        if b.num_columns() < 2 {
+            continue;
+        }
+        let pos = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("delete `pos` column is not Int64".to_string())
+            })?;
+        for i in 0..pos.len() {
+            if !pos.is_null(i) {
+                set.insert(pos.value(i));
+            }
+        }
+    }
+    Ok(Some(set))
+}
+
+/// Append the CDC `snapshot_id` + `change_type` columns to a table-column batch.
+fn append_cdc_columns(
+    table_batch: &RecordBatch,
+    snapshot_id: i64,
+    change: ChangeType,
+    output_schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let n = table_batch.num_rows();
+    let mut cols: Vec<ArrayRef> = table_batch.columns().to_vec();
+    cols.push(Arc::new(Int64Array::from(vec![snapshot_id; n])));
+    cols.push(Arc::new(StringArray::from(vec![change.as_str(); n])));
+    RecordBatch::try_new(output_schema.clone(), cols)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// A row-selection mask over `keyed`: `want_update` selects rows whose
+/// `(snapshot_id, rowid)` is (or is not) an update pair.
+fn key_mask(
+    keyed: &KeyedRows,
+    update_keys: &HashSet<(i64, i64)>,
+    want_update: bool,
+) -> BooleanArray {
+    BooleanArray::from(
+        (0..keyed.rowid.len())
+            .map(|i| {
+                let is_update = update_keys.contains(&(keyed.snapshot_id, keyed.rowid.value(i)));
+                is_update == want_update
+            })
+            .collect::<Vec<bool>>(),
+    )
+}
+
+/// Filter `keyed`'s table columns by `mask`, tag with `change`, and append the
+/// CDC columns. Returns `None` when the mask selects no rows.
+fn filter_and_tag(
+    keyed: &KeyedRows,
+    mask: &BooleanArray,
+    change: ChangeType,
+    output_schema: &SchemaRef,
+) -> DataFusionResult<Option<RecordBatch>> {
+    if mask.true_count() == 0 {
+        return Ok(None);
+    }
+    let cols: Vec<ArrayRef> = keyed
+        .table_batch
+        .columns()
+        .iter()
+        .map(|c| {
+            arrow::compute::filter(c.as_ref(), mask)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        })
+        .collect::<DataFusionResult<_>>()?;
+    let filtered = RecordBatch::try_new(keyed.table_batch.schema(), cols)?;
+    Ok(Some(append_cdc_columns(
+        &filtered,
+        keyed.snapshot_id,
+        change,
+        output_schema,
+    )?))
 }

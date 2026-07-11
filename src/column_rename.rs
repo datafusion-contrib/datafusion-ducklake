@@ -210,7 +210,7 @@ impl RecordBatchStream for ColumnRenameStream {
 /// and would fail `RecordBatch::try_new`. After casting we therefore re-stamp the
 /// array's `DataType` to the target when only nested field metadata differs —
 /// the buffer layout is identical, so this is a zero-copy metadata swap.
-fn coerce_column(
+pub(crate) fn coerce_column(
     col: &arrow::array::ArrayRef,
     target: &arrow::datatypes::DataType,
 ) -> DataFusionResult<arrow::array::ArrayRef> {

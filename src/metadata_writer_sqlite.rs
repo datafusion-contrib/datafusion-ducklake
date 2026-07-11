@@ -1062,6 +1062,12 @@ async fn finalize_snapshot(
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    /// SQLite implements the atomic append-with-deletes commit, so it supports
+    /// row-level `UPDATE`.
+    fn supports_update(&self) -> bool {
+        true
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;

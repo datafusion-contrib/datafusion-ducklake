@@ -23,6 +23,18 @@ use crate::types::{
 use crate::insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 use crate::metadata_writer::{MetadataWriter, WriteMode};
+#[cfg(feature = "write")]
+use crate::update_exec::DuckLakeUpdateExec;
+#[cfg(feature = "write")]
+use arrow::array::ArrayRef;
+#[cfg(feature = "write")]
+use datafusion::common::DFSchema;
+#[cfg(feature = "write")]
+use datafusion::logical_expr::Operator;
+#[cfg(feature = "write")]
+use datafusion::physical_expr::PhysicalExpr;
+#[cfg(feature = "write")]
+use datafusion::physical_expr::expressions::BinaryExpr;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -1097,6 +1109,321 @@ impl DuckLakeTable {
         }
         Arc::new(Schema::new(fields))
     }
+
+    /// A read-only clone of this table (no writer, no rowid projection, fresh
+    /// per-file read-config cache) carrying exactly the metadata a scan needs.
+    /// [`DuckLakeUpdateExec`] holds one so it can drive the per-file update
+    /// scans ([`Self::compute_file_update`]) at execute time — `update()` only
+    /// has `&self`, so it cannot hand the exec an `Arc<Self>` directly.
+    #[cfg(feature = "write")]
+    fn read_only_clone(&self) -> DuckLakeTable {
+        DuckLakeTable {
+            table_id: self.table_id,
+            table_name: self.table_name.clone(),
+            provider: Arc::clone(&self.provider),
+            object_store_url: self.object_store_url.clone(),
+            table_path: self.table_path.clone(),
+            schema: self.physical_schema.clone(),
+            physical_schema: self.physical_schema.clone(),
+            row_lineage: false,
+            columns: self.columns.clone(),
+            table_files: self.table_files.clone(),
+            file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(feature = "encryption")]
+            encryption_factory: self.encryption_factory.clone(),
+            schema_name: None,
+            writer: None,
+        }
+    }
+
+    /// Physical (data-column) schema this table reads/writes, without the
+    /// synthetic `rowid`. Used by [`DuckLakeUpdateExec`] to author the rewritten
+    /// data file.
+    #[cfg(feature = "write")]
+    pub(crate) fn physical_schema(&self) -> SchemaRef {
+        self.physical_schema.clone()
+    }
+
+    /// Build the positional read plan (and the metadata needed to interpret it)
+    /// for one source file of an `UPDATE`. Runs at PLAN time: it reads the
+    /// parquet footer (field-ids, row-group layout) and the file's live delete
+    /// positions — the same plan-time reads `scan()` performs — but executes NO
+    /// data scan and mutates nothing. The returned [`UpdateSourceScan::scan`]
+    /// yields the physical data columns (logical order), the embedded rowid
+    /// column when the file has one, and the internal physical-position column;
+    /// [`Self::apply_update_to_batches`] turns its collected batches into the
+    /// rewritten rows at execute time.
+    ///
+    /// Errors if the file has neither an embedded `_ducklake_internal_row_id`
+    /// column nor a catalog `row_id_start`: its lineage cannot be reconstructed,
+    /// so rewriting it would fabricate rowids.
+    #[cfg(feature = "write")]
+    pub(crate) async fn build_update_scan(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+    ) -> DataFusionResult<UpdateSourceScan> {
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+        let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
+
+        if !has_embedded && table_file.row_id_start.is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
+                 `row_id_start` in the catalog — cannot preserve row lineage through UPDATE",
+                table_file.file.path
+            )));
+        }
+
+        // Rows already masked by a live delete file must not be re-updated, and
+        // must remain masked in the file's new cumulative delete.
+        let existing_deleted: HashSet<i64> = if let Some(ref delete_file) = table_file.delete_file {
+            self.read_delete_file_positions(state, delete_file).await?
+        } else {
+            HashSet::new()
+        };
+
+        // Positional scan: row-group-aligned partitions + a non-repartition,
+        // non-pruning source so `FileRowNumberExec` yields true physical
+        // positions. Project the physical columns (logical order) and, for an
+        // embedded file, the embedded rowid column too.
+        let physical_len = self.physical_schema.fields().len();
+        let target_partitions = state.config().target_partitions();
+        let (file_groups, partition_starts) =
+            self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+        let source = PositionalFileSource::wrap(Arc::new(
+            self.create_parquet_source(file_cfg.read_schema.clone()),
+        ));
+        let mut proj: Vec<usize> = (0..physical_len).collect();
+        let embedded_batch_idx = if has_embedded {
+            proj.push(file_cfg.read_schema.fields().len() - 1);
+            Some(physical_len)
+        } else {
+            None
+        };
+        let scan = DataSourceExec::from_data_source(
+            FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+                .with_file_groups(file_groups)
+                .with_partitioned_by_file_group(true)
+                .with_projection_indices(Some(proj))?
+                .build(),
+        );
+        let mut plan: Arc<dyn ExecutionPlan> =
+            Arc::new(FileRowNumberExec::new(scan, partition_starts));
+        if !existing_deleted.is_empty() {
+            plan = Arc::new(DeleteFilterExec::try_new(
+                plan,
+                table_file.file.path.clone(),
+                Arc::new(existing_deleted.clone()),
+            )?);
+        }
+        let pos_index = plan.schema().index_of(ROW_POS_COLUMN_NAME)?;
+
+        Ok(UpdateSourceScan {
+            scan: plan,
+            physical_len,
+            embedded_batch_idx,
+            pos_index,
+            row_id_start: table_file.row_id_start,
+            existing_deleted,
+            data_file_id: table_file.data_file_id,
+            delete_file_id: table_file.delete_file_id,
+            source_path: table_file.file.path.clone(),
+        })
+    }
+
+    /// Turn the batches collected from an [`UpdateSourceScan`] into the rewritten
+    /// row versions for one source file: select the rows matching `predicate`
+    /// (or every live row when it is `None`), apply `assignments`, and RETAIN
+    /// each row's original rowid so lineage survives the rewrite. Pure and
+    /// synchronous — the exec runs it at execute time after `collect`ing the
+    /// scan, so no [`Session`] is required.
+    ///
+    /// `assignments` are `(physical_column_index, new_value_expr)`; unlisted
+    /// columns carry through unchanged. Returned batches are
+    /// `[physical columns (catalog types)..., rowid]`, ready for
+    /// [`DuckLakeTableWriter::begin_write_with_embedded_rowid`](crate::table_writer::DuckLakeTableWriter::begin_write_with_embedded_rowid).
+    /// The original rowid is the embedded column when the file has one, else
+    /// `row_id_start + physical_position`.
+    #[cfg(feature = "write")]
+    pub(crate) fn apply_update_to_batches(
+        &self,
+        scan: &UpdateSourceScan,
+        batches: &[RecordBatch],
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+        assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+    ) -> DataFusionResult<FileUpdateOutput> {
+        let physical_len = scan.physical_len;
+
+        // Output schema for the rewritten rows: physical columns + rowid.
+        let mut out_fields: Vec<Arc<Field>> =
+            self.physical_schema.fields().iter().cloned().collect();
+        out_fields.push(Arc::new(rowid_field()));
+        let out_schema = Arc::new(Schema::new(out_fields));
+
+        let mut updated_batches: Vec<RecordBatch> = Vec::new();
+        let mut new_positions: Vec<i64> = Vec::new();
+
+        for batch in batches {
+            let n = batch.num_rows();
+            if n == 0 {
+                continue;
+            }
+
+            // Coerce physical columns to the catalog types the assignment /
+            // predicate exprs (and the writer) expect.
+            let mut phys_cols: Vec<ArrayRef> = Vec::with_capacity(physical_len);
+            for i in 0..physical_len {
+                phys_cols.push(crate::column_rename::coerce_column(
+                    batch.column(i),
+                    self.physical_schema.field(i).data_type(),
+                )?);
+            }
+            let phys_batch = RecordBatch::try_new(self.physical_schema.clone(), phys_cols.clone())?;
+
+            let row_pos = batch
+                .column(scan.pos_index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+                })?;
+
+            // Predicate mask (all rows when there is no WHERE). A NULL predicate
+            // result is a non-match (SQL semantics).
+            let mask: BooleanArray = match predicate {
+                Some(p) => {
+                    let arr = p.evaluate(&phys_batch)?.into_array(n)?;
+                    let b = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "UPDATE predicate did not evaluate to a boolean".to_string(),
+                        )
+                    })?;
+                    BooleanArray::from(
+                        (0..n)
+                            .map(|i| b.is_valid(i) && b.value(i))
+                            .collect::<Vec<bool>>(),
+                    )
+                },
+                None => BooleanArray::from(vec![true; n]),
+            };
+            if mask.true_count() == 0 {
+                continue;
+            }
+
+            // Keep only matched rows, then apply the assignments to them.
+            let matched_phys: Vec<ArrayRef> = phys_cols
+                .iter()
+                .map(|c| arrow::compute::filter(c.as_ref(), &mask))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let matched_batch =
+                RecordBatch::try_new(self.physical_schema.clone(), matched_phys.clone())?;
+            let matched_rows = matched_batch.num_rows();
+
+            let mut out_cols = matched_phys;
+            for (col_idx, expr) in assignments {
+                let val = expr.evaluate(&matched_batch)?.into_array(matched_rows)?;
+                out_cols[*col_idx] = crate::column_rename::coerce_column(
+                    &val,
+                    self.physical_schema.field(*col_idx).data_type(),
+                )?;
+            }
+
+            // Original rowids: embedded column when present, else synthesized.
+            let matched_pos = arrow::compute::filter(row_pos, &mask)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            let matched_pos = matched_pos
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("filtered Int64Array");
+            let rowid_col: ArrayRef = if let Some(idx) = scan.embedded_batch_idx {
+                let embedded = batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Internal("embedded rowid column is not Int64".to_string())
+                    })?;
+                let embedded: ArrayRef = Arc::new(embedded.clone());
+                arrow::compute::filter(embedded.as_ref(), &mask)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+            } else {
+                let start = scan
+                    .row_id_start
+                    .expect("row_id_start checked in build_update_scan");
+                Arc::new(Int64Array::from(
+                    matched_pos
+                        .values()
+                        .iter()
+                        .map(|p| start + p)
+                        .collect::<Vec<i64>>(),
+                ))
+            };
+            out_cols.push(rowid_col);
+            updated_batches.push(RecordBatch::try_new(out_schema.clone(), out_cols)?);
+
+            new_positions.extend(matched_pos.values().iter().copied());
+        }
+
+        let matched_count = new_positions.len();
+        let mut cumulative = scan.existing_deleted.clone();
+        cumulative.extend(new_positions);
+        let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
+        cumulative_positions.sort_unstable();
+
+        Ok(FileUpdateOutput {
+            updated_batches,
+            matched_count,
+            cumulative_positions,
+        })
+    }
+}
+
+/// Per-source-file read plan + metadata for an `UPDATE`, produced by
+/// [`DuckLakeTable::build_update_scan`] at plan time and consumed by
+/// [`DuckLakeUpdateExec`] at execute time.
+#[cfg(feature = "write")]
+#[derive(Clone)]
+pub(crate) struct UpdateSourceScan {
+    /// Positional read plan yielding `[physical columns..., (embedded rowid),
+    /// __ducklake_row_pos]` for the source file, already masking rows removed by
+    /// its live delete file.
+    pub(crate) scan: Arc<dyn ExecutionPlan>,
+    /// Number of physical (data) columns at the front of each scanned batch.
+    pub(crate) physical_len: usize,
+    /// Column index of the embedded rowid in each scanned batch, or `None` when
+    /// the file has no embedded rowid (rowids are synthesized from
+    /// `row_id_start + position`).
+    pub(crate) embedded_batch_idx: Option<usize>,
+    /// Column index of the internal physical-position column in each batch.
+    pub(crate) pos_index: usize,
+    /// The source file's catalog `row_id_start` (used to synthesize rowids for a
+    /// non-embedded file).
+    pub(crate) row_id_start: Option<i64>,
+    /// Positions already masked by the file's live delete file, carried forward
+    /// into the new cumulative delete.
+    pub(crate) existing_deleted: HashSet<i64>,
+    /// Catalog id of the source data file (the positional delete's target).
+    pub(crate) data_file_id: i64,
+    /// Catalog id of the file's currently-live delete file (compare-and-swap
+    /// guard when superseding it), or `None`.
+    pub(crate) delete_file_id: Option<i64>,
+    /// The source data file's catalog path (records the delete's provenance).
+    pub(crate) source_path: String,
+}
+
+/// The rewrite produced for one source data file by
+/// [`DuckLakeTable::apply_update_to_batches`].
+#[cfg(feature = "write")]
+pub(crate) struct FileUpdateOutput {
+    /// Rewritten row versions, `[physical columns..., rowid]`, carrying each
+    /// row's original rowid. Empty when no rows matched.
+    pub(crate) updated_batches: Vec<RecordBatch>,
+    /// Number of rows this update rewrote in the source file.
+    pub(crate) matched_count: usize,
+    /// Physical positions to mask on the source file afterwards: the rows this
+    /// update supersedes unioned with any already-deleted rows (sorted).
+    pub(crate) cumulative_positions: Vec<i64>,
 }
 
 #[async_trait]
@@ -1284,6 +1611,91 @@ impl TableProvider for DuckLakeTable {
             self.table_name.clone(),
             self.schema(),
             write_mode,
+            self.object_store_url.clone(),
+        )))
+    }
+
+    /// Plan an `UPDATE t SET col = expr [, ...] [WHERE ...]`.
+    ///
+    /// `assignments` are `(column_name, new_value_expr)` for each SET (identity
+    /// `c = c` assignments are already dropped by the planner). `filters` are the
+    /// unqualified, AND-conjunctive WHERE predicates; an empty `filters` updates
+    /// every live row. The returned [`DuckLakeUpdateExec`] performs the update at
+    /// execute time and yields a single `count: UInt64` row — planning here is
+    /// side-effect-free (no scans, no writes), so `EXPLAIN` never mutates data.
+    #[cfg(feature = "write")]
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("Schema name not set for writable table".to_string())
+        })?;
+
+        // DuckDB / MySQL metadata writers do not implement the atomic
+        // append-with-deletes commit UPDATE needs. Reject up front rather than
+        // rewriting files and only failing at commit.
+        if !writer.supports_update() {
+            return Err(DataFusionError::NotImplemented(
+                "UPDATE not supported on this metadata backend".to_string(),
+            ));
+        }
+
+        // Assignment / filter expressions reference the table's DATA columns
+        // (unqualified), never the synthetic `rowid`. Plan them against the
+        // physical schema so column indices line up with the scanned batches.
+        let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let mut phys_assignments: Vec<(usize, Arc<dyn PhysicalExpr>)> =
+            Vec::with_capacity(assignments.len());
+        for (col_name, expr) in assignments {
+            let idx = self.physical_schema.index_of(&col_name).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "UPDATE assignment targets unknown column '{col_name}'"
+                ))
+            })?;
+            let pexpr = state.create_physical_expr(expr, &df_schema)?;
+            phys_assignments.push((idx, pexpr));
+        }
+
+        // AND the WHERE predicates into one physical expression; empty => update
+        // all rows (represented as `None`).
+        let mut predicate: Option<Arc<dyn PhysicalExpr>> = None;
+        for f in filters {
+            let pe = state.create_physical_expr(f, &df_schema)?;
+            predicate = Some(match predicate {
+                None => pe,
+                Some(prev) => Arc::new(BinaryExpr::new(prev, Operator::And, pe)),
+            });
+        }
+
+        // Build the per-file positional read plans now (plan time). This reads
+        // parquet footers + live delete positions — the same plan-time reads
+        // `scan()` does — but no data scan and no mutation happen here; the exec
+        // collects each scan and performs the rewrite + atomic commit at execute
+        // time.
+        let mut scans = Vec::with_capacity(self.table_files.len());
+        for tf in &self.table_files {
+            scans.push(self.build_update_scan(state, tf).await?);
+        }
+
+        Ok(Arc::new(DuckLakeUpdateExec::new(
+            Arc::new(self.read_only_clone()),
+            Arc::clone(writer),
+            schema_name.clone(),
+            self.table_name.clone(),
+            scans,
+            phys_assignments,
+            predicate,
             self.object_store_url.clone(),
         )))
     }

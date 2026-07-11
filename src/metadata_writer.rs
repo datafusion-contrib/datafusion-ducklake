@@ -597,6 +597,19 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn catalog_id(&self) -> Option<i64> {
         None
     }
+
+    /// Whether this backend supports row-level `UPDATE` (append the rewritten
+    /// rows + apply positional deletes in one snapshot via
+    /// [`register_data_file_with_deletes`](MetadataWriter::register_data_file_with_deletes)).
+    ///
+    /// Default `false`. Backends that implement the atomic append-with-deletes
+    /// commit (SQLite, multicatalog Postgres) override it to `true`. The `UPDATE`
+    /// planner path (`DuckLakeTable::update`) checks this up front and returns a
+    /// clean "not supported" error for backends that don't (DuckDB, MySQL),
+    /// rather than doing the file rewrites and only failing at commit.
+    fn supports_update(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
