@@ -20,6 +20,8 @@ use crate::types::{
 };
 
 #[cfg(feature = "write")]
+use crate::delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write")]
 use crate::insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 use crate::metadata_writer::{MetadataWriter, WriteMode};
@@ -55,6 +57,21 @@ use datafusion::execution::parquet_encryption::EncryptionFactory;
 pub const DELETE_FILE_PATH_COL: &str = "file_path";
 pub const DELETE_POS_COL: &str = "pos";
 
+/// Parquet field-id DuckLake's own `ducklake` extension assigns to a positional
+/// delete file's `file_path` column (its `FILENAME` virtual column). We stamp it
+/// on the delete files we WRITE so DuckDB can read our deletes back. This is the
+/// DuckDB id (`i32::MAX - 1`), NOT Iceberg's positional-delete id `2147483546`.
+pub const DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_646;
+/// Parquet field-id DuckLake assigns to a positional delete file's `pos` column
+/// (its `FILE_ROW_NUMBER`/ordinal virtual column) — the DuckDB id (`i32::MAX -
+/// 2`), NOT Iceberg's `2147483545`. See [`DELETE_FILE_PATH_FIELD_ID`].
+pub const DELETE_POS_FIELD_ID: i32 = 2_147_483_645;
+
+/// Build a `PARQUET:field_id` field-metadata map for the given reserved id.
+fn parquet_field_id_metadata(field_id: i32) -> HashMap<String, String> {
+    HashMap::from([("PARQUET:field_id".to_string(), field_id.to_string())])
+}
+
 /// Validate and convert file_size_bytes from i64 (as stored in DuckLake metadata) to u64.
 ///
 /// DuckLake stores file sizes as signed integers in SQL. A negative value indicates
@@ -85,13 +102,19 @@ pub(crate) fn validated_record_count(record_count: i64, file_path: &str) -> Data
 
 /// Returns the expected schema for DuckLake delete files
 ///
-/// Delete files have a standard schema: (file_path: VARCHAR, pos: INT64)
-/// The file_path column is metadata/documentation only (for Iceberg compatibility).
-/// The pos column contains the row positions to delete.
+/// Delete files have a standard schema: (file_path: VARCHAR, pos: INT64).
+/// The file_path column records which data file the positions belong to (only
+/// `pos` is consumed on read; the catalog already maps delete->data file). Both
+/// fields carry DuckLake's reserved parquet field-ids
+/// ([`DELETE_FILE_PATH_FIELD_ID`], [`DELETE_POS_FIELD_ID`]) so that delete files
+/// WE write are readable by DuckDB's `ducklake` extension. Reads match by column
+/// name, so the ids are inert on the read path (files without them still read).
 pub fn delete_file_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false),
-        Field::new(DELETE_POS_COL, DataType::Int64, false),
+        Field::new(DELETE_FILE_PATH_COL, DataType::Utf8, false)
+            .with_metadata(parquet_field_id_metadata(DELETE_FILE_PATH_FIELD_ID)),
+        Field::new(DELETE_POS_COL, DataType::Int64, false)
+            .with_metadata(parquet_field_id_metadata(DELETE_POS_FIELD_ID)),
     ]))
 }
 
@@ -134,12 +157,23 @@ struct FileReadConfig {
 ///
 /// Represents a table within a DuckLake schema and provides access to data via Parquet files.
 /// Caches snapshot_id and uses it to load all metadata atomically.
+///
+/// `Clone` shares the `file_read_config_cache` (it is `Arc`-wrapped): a clone is
+/// a cheap handle over the same cached parquet metadata. `delete_from` clones the
+/// table into the returned `DuckLakeDeleteExec` so the delete work runs at
+/// `execute` time (never at plan/EXPLAIN time).
+#[derive(Clone)]
 pub struct DuckLakeTable {
     #[allow(dead_code)]
     table_id: i64,
     table_name: String,
     #[allow(dead_code)]
     provider: Arc<dyn MetadataProvider>,
+    /// Snapshot this table was opened at. Threaded to the delete-commit path as
+    /// the `base_snapshot` (the generation the resolved positions were read
+    /// against) for conflict diagnostics.
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    snapshot_id: i64,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     /// Table path for resolving relative file paths
@@ -159,8 +193,9 @@ pub struct DuckLakeTable {
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
-    /// scans don't re-fetch.
-    file_read_config_cache: std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>,
+    /// scans don't re-fetch. `Arc`-wrapped so a cloned table (see `delete_from`)
+    /// shares the same memoized configs.
+    file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
     /// Encryption factory for decrypting encrypted Parquet files (when encryption feature is enabled)
     #[cfg(feature = "encryption")]
     encryption_factory: Option<Arc<dyn EncryptionFactory>>,
@@ -233,6 +268,7 @@ impl DuckLakeTable {
             table_id,
             table_name: table_name.into(),
             provider,
+            snapshot_id,
             object_store_url,
             table_path,
             schema,
@@ -242,7 +278,7 @@ impl DuckLakeTable {
             table_files,
             #[cfg(feature = "encryption")]
             encryption_factory,
-            file_read_config_cache: std::sync::Mutex::new(HashMap::new()),
+            file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "write")]
             schema_name: None,
             #[cfg(feature = "write")]
@@ -515,6 +551,26 @@ impl DuckLakeTable {
         }
 
         Ok(positions)
+    }
+
+    /// Whether `file` embeds a `_ducklake_internal_row_id` column (tagged with
+    /// [`ROW_ID_PARQUET_FIELD_ID`]) — i.e. it was rewritten by an UPDATE or
+    /// compaction rather than being insert-only.
+    ///
+    /// [`Self::resolve_positions`] derives delete positions from the physical row
+    /// index, which is only the DuckLake `pos` for insert-only files; a rewritten
+    /// file's surviving rows carry embedded rowids whose physical order need not
+    /// match, so the delete path must refuse such files rather than mis-delete.
+    /// Memoized through the shared `file_read_config_cache`, so calling this right
+    /// before `resolve_positions` costs at most one extra footer read per file.
+    #[cfg(feature = "write")]
+    pub(crate) async fn file_has_embedded_rowid(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<bool> {
+        let cfg = self.build_file_read_config(state, file).await?;
+        Ok(cfg.embedded_rowid_parquet_name.is_some())
     }
 
     /// Build a single execution plan for all files without delete files
@@ -1284,6 +1340,82 @@ impl TableProvider for DuckLakeTable {
             self.table_name.clone(),
             self.schema(),
             write_mode,
+            self.object_store_url.clone(),
+        )))
+    }
+
+    /// Plan a `DELETE FROM <table> [WHERE ...]`.
+    ///
+    /// `filters` are the already-analyzed, unqualified, AND-conjunctive
+    /// predicates over this table's own columns (DataFusion strips qualifiers and
+    /// dedups them). An empty `filters` means no `WHERE` => delete ALL rows.
+    ///
+    /// Returns a [`DuckLakeDeleteExec`] that performs the delete when executed
+    /// (positional-delete files + one atomic metadata commit, or a metadata-only
+    /// truncate for delete-all) and yields a single `count: UInt64` row. All
+    /// mutation happens at execute time, so planning (e.g. `EXPLAIN`) is
+    /// side-effect free.
+    #[cfg(feature = "write")]
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::logical_expr::utils::conjunction;
+
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            DataFusionError::Plan(
+                "Table is read-only. Use DuckLakeCatalog::with_writer() to enable writes."
+                    .to_string(),
+            )
+        })?;
+        let schema_name = self.schema_name.as_ref().ok_or_else(|| {
+            DataFusionError::Internal("Schema name not set for writable table".to_string())
+        })?;
+
+        // Build the physical predicate. Empty `filters` (no WHERE) => delete ALL,
+        // signalled by `None` and handled as a metadata-only truncate. We resolve
+        // column references against the PHYSICAL schema (no synthetic `rowid`):
+        // `resolve_positions` evaluates the predicate index-based against the
+        // physically-read columns in logical order, so the physical expression's
+        // column indices must line up with `physical_schema`. A predicate that
+        // references a column absent from `physical_schema` (e.g. the synthetic
+        // `rowid`) fails here rather than mis-deleting.
+        let predicate = match conjunction(filters) {
+            None => None,
+            Some(expr) => {
+                let df_schema =
+                    datafusion::common::DFSchema::try_from(self.physical_schema.as_ref().clone())?;
+                Some(state.create_physical_expr(expr, &df_schema)?)
+            },
+        };
+
+        // The delete work (positional reads, delete-file writes, atomic commit)
+        // MUST run at execute time — planning a DELETE (e.g. `EXPLAIN`) must not
+        // mutate. `DuckLakeDeleteExec` captures the concrete `SessionState` to
+        // drive the positional reads at execute time (a bare `TaskContext` cannot
+        // build physical exprs / sub-plans), plus a clone of this table for its
+        // reader methods.
+        let session_state = state
+            .as_any()
+            .downcast_ref::<datafusion::execution::SessionState>()
+            .ok_or_else(|| {
+                DataFusionError::NotImplemented(
+                    "DELETE on a DuckLake table requires a DataFusion SessionState session"
+                        .to_string(),
+                )
+            })?
+            .clone();
+
+        Ok(Arc::new(DuckLakeDeleteExec::new(
+            Arc::new(self.clone()),
+            session_state,
+            predicate,
+            Arc::clone(writer),
+            schema_name.clone(),
+            self.table_name.clone(),
+            self.table_id,
+            self.snapshot_id,
             self.object_store_url.clone(),
         )))
     }

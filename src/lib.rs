@@ -65,6 +65,8 @@ pub mod metadata_provider_sqlite;
 
 // Write support (feature-gated)
 #[cfg(feature = "write")]
+pub mod delete_exec;
+#[cfg(feature = "write")]
 pub mod insert_exec;
 #[cfg(feature = "write")]
 pub mod maintenance;
@@ -107,6 +109,8 @@ pub use metadata_provider_postgres::PostgresMetadataProvider;
 pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
+#[cfg(feature = "write")]
+pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
