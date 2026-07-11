@@ -18,6 +18,27 @@
 //! v1 handles insert-only data files. Files rewritten by an UPDATE/compaction
 //! (an embedded row-id column) cannot be resolved by physical position, so the
 //! filtered path cleanly errors on them rather than risk mis-deleting.
+//!
+//! # Session lifecycle (important)
+//!
+//! A [`DuckLakeCatalog`](crate::DuckLakeCatalog) pins its snapshot at creation
+//! and never refreshes it, so a `SessionContext` observes ONE catalog generation
+//! for its whole lifetime. A `DELETE` commits a new snapshot, but the same
+//! session keeps reading the old one. Consequences:
+//!
+//! - A second filtered `DELETE` in the same session that re-touches a data file
+//!   modified by an earlier `DELETE` (in that same session) aborts with a
+//!   [`Conflict`](crate::DuckLakeError::Conflict): it resolves against the pinned
+//!   (pre-delete) view, so its compare-and-swap disagrees with the live catalog.
+//!   This is the SAME guard that (correctly) rejects a genuinely concurrent
+//!   writer — and it is what prevents a stale, non-cumulative delete file from
+//!   resurrecting already-deleted rows.
+//! - A `SELECT` after a `DELETE` (or `INSERT`) in the same session returns the
+//!   pre-mutation rows; a just-inserted row cannot be deleted in the same
+//!   session (it is invisible to the pinned snapshot).
+//!
+//! To perform multiple mutations, re-open the catalog (or create a fresh
+//! `SessionContext`) between statements so it binds to the latest snapshot.
 
 use std::collections::HashSet;
 use std::fmt::{self, Debug};

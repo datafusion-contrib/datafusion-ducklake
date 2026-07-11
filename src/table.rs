@@ -1355,6 +1355,11 @@ impl TableProvider for DuckLakeTable {
     /// truncate for delete-all) and yields a single `count: UInt64` row. All
     /// mutation happens at execute time, so planning (e.g. `EXPLAIN`) is
     /// side-effect free.
+    ///
+    /// The catalog pins its snapshot at creation, so a session sees one
+    /// generation for its lifetime: re-open the catalog between mutating
+    /// statements. See the [`delete_exec`](crate::delete_exec) module docs
+    /// ("Session lifecycle") for why a second in-session `DELETE` can conflict.
     #[cfg(feature = "write")]
     async fn delete_from(
         &self,

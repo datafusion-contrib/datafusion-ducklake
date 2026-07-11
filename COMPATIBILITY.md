@@ -95,6 +95,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | `CREATE TABLE AS SELECT` (SQL DDL; SQLite single-catalog only — not on the PostgreSQL multi-catalog path) | 🟧 |
 | `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
 | Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
+| SQL `DELETE FROM t [WHERE ...]` (positional deletes + metadata-only truncate; SQLite & PostgreSQL) | ✅ |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
@@ -179,6 +180,14 @@ Known edges:
   the snapshot programmatically — `DuckLakeCatalog::with_snapshot(provider, snapshot_id)`
   binds to a specific one, and querying another point in time means creating another
   catalog. What's missing is SQL-level historical querying (`AS OF`) within one handle.
+- **One mutation per session, then re-open the catalog.** Because a catalog pins its
+  snapshot at creation and never refreshes, a `SessionContext` observes a single generation
+  for its lifetime. After a `DELETE` (or `INSERT`) commits, the same session keeps reading
+  the pre-mutation state; a `SELECT` won't see the change, a just-inserted row can't be
+  deleted, and a **second `DELETE` re-touching a file the first modified aborts with a
+  conflict** (the compare-and-swap that also guards genuine concurrency — it is what prevents
+  a stale delete file from resurrecting deleted rows). Re-open the catalog (or create a fresh
+  `SessionContext`) between mutating statements so it binds to the latest snapshot.
 - **No partition-based file pruning** on read.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).

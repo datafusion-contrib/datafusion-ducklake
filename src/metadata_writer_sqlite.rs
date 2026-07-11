@@ -1708,8 +1708,12 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
                 if target_live.is_none() {
                     return Err(crate::DuckLakeError::Conflict(format!(
-                        "delete targets data file {}, which was retired by a concurrent write \
-                         since snapshot {base_snapshot}; retry against the new generation",
+                        "DELETE on data file {} could not commit: the file is no longer live as \
+                         of the catalog's current head (retired since snapshot {base_snapshot}). \
+                         This happens when another writer committed a Replace/compaction, OR when \
+                         an earlier write in THIS session already advanced the catalog (the \
+                         catalog pins its snapshot at creation and does not refresh). Re-open the \
+                         catalog at the latest snapshot and retry.",
                         entry.data_file_id
                     )));
                 }
@@ -1725,8 +1729,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
                 if current_prev != entry.expected_prev_delete_file {
                     return Err(crate::DuckLakeError::Conflict(format!(
-                        "delete on data file {} conflicts with a concurrent delete (expected live \
-                         delete file {:?}, found {current_prev:?}); retry against the new generation",
+                        "DELETE on data file {} could not commit: its live delete file changed \
+                         from {:?} to {current_prev:?} since snapshot {base_snapshot}. Another \
+                         writer committed a delete on this file, OR an earlier DELETE in THIS \
+                         session did (the catalog pins its snapshot at creation and does not \
+                         refresh). Re-open the catalog at the latest snapshot and retry.",
                         entry.data_file_id, entry.expected_prev_delete_file
                     )));
                 }
@@ -1793,6 +1800,23 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Write-lock-first (carry schema_version forward — not DDL).
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+
+            // No-op guard: if the table has no live data file there is nothing to
+            // truncate. Return Ok(0) WITHOUT committing so `tx` (and the snapshot
+            // row insert_snapshot just made) rolls back, leaving no trace — same
+            // as `drop_table`'s idempotent early return. Prevents a content-free
+            // snapshot per repeated `DELETE FROM t` when the catalog's pinned
+            // snapshot still sees already-ended files as live.
+            let has_live_data: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_live_data.is_none() {
+                return Ok(0);
+            }
 
             // Rows removed = gross record_count minus still-live delete counts,
             // computed BEFORE ending anything so it matches what we retire.

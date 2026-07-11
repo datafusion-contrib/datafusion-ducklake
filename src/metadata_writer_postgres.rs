@@ -1584,8 +1584,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
                 if target_live.is_none() {
                     return Err(crate::DuckLakeError::Conflict(format!(
-                        "delete targets data file {}, which was retired by a concurrent write \
-                         since snapshot {base_snapshot}; retry against the new generation",
+                        "DELETE on data file {} could not commit: the file is no longer live as \
+                         of the catalog's current head (retired since snapshot {base_snapshot}). \
+                         This happens when another writer committed a Replace/compaction, OR when \
+                         an earlier write in THIS session already advanced the catalog (the \
+                         catalog pins its snapshot at creation and does not refresh). Re-open the \
+                         catalog at the latest snapshot and retry.",
                         entry.data_file_id
                     )));
                 }
@@ -1600,8 +1604,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
                 if current_prev != entry.expected_prev_delete_file {
                     return Err(crate::DuckLakeError::Conflict(format!(
-                        "delete on data file {} conflicts with a concurrent delete (expected live \
-                         delete file {:?}, found {current_prev:?}); retry against the new generation",
+                        "DELETE on data file {} could not commit: its live delete file changed \
+                         from {:?} to {current_prev:?} since snapshot {base_snapshot}. Another \
+                         writer committed a delete on this file, OR an earlier DELETE in THIS \
+                         session did (the catalog pins its snapshot at creation and does not \
+                         refresh). Re-open the catalog at the latest snapshot and retry.",
                         entry.data_file_id, entry.expected_prev_delete_file
                     )));
                 }
@@ -1667,6 +1674,22 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            // No-op guard: nothing to truncate if the table has no live data file.
+            // Return Ok(0) BEFORE allocating a snapshot, so a repeated
+            // `DELETE FROM t` under a pinned snapshot does not create a
+            // content-free snapshot. lock_catalog above already serializes, so
+            // this read is stable.
+            let has_live_data: Option<i64> = sqlx::query_scalar(
+                "SELECT data_file_id FROM ducklake_data_file
+                 WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_live_data.is_none() {
+                return Ok(0);
+            }
 
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)

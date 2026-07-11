@@ -308,3 +308,81 @@ async fn delete_file_uses_duckdb_field_ids() {
         "must not use Iceberg positional-delete field-ids: {field_ids:?}"
     );
 }
+
+/// A no-op truncate must NOT create a snapshot. The catalog pins its snapshot, so
+/// a second `DELETE FROM t` in the same session still sees the already-ended files
+/// as live (bypassing the caller's emptiness guard); the DB-level guard in
+/// `commit_truncate` must then decline to allocate a spurious empty snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_truncate_repeat_same_ctx_no_spurious_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+
+    let before = snapshot_count(&temp).await;
+    let ctx = writable_ctx(&temp).await;
+
+    let c1 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    assert_eq!(c1, 4, "first truncate removes all rows");
+    let after_first = snapshot_count(&temp).await;
+    assert_eq!(after_first, before + 1, "first truncate commits exactly one snapshot");
+
+    // Second truncate in the SAME (pinned) session: a DB-level no-op.
+    let c2 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    assert_eq!(c2, 0, "nothing left to truncate");
+    assert_eq!(
+        snapshot_count(&temp).await,
+        after_first,
+        "a no-op truncate must not create a snapshot"
+    );
+    assert_eq!(read_ids(&temp).await, Vec::<i32>::new(), "table stays empty");
+}
+
+/// A second filtered DELETE in the SAME session that re-touches a file modified by
+/// the first must abort with a clear conflict (the catalog is pinned to the
+/// pre-delete snapshot) — and, crucially, must NOT resurrect the first delete.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_second_in_session_conflicts_without_resurrection() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+
+    // One session, catalog pinned at the pre-delete snapshot.
+    let ctx = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id = 2").await,
+        1
+    );
+    assert_eq!(read_ids(&temp).await, vec![1, 3, 4], "id 2 deleted");
+
+    // Second DELETE on the SAME session re-touches the same data file. Its
+    // compare-and-swap disagrees with the now-live delete file, so it aborts.
+    let err = ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id = 4")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("second in-session DELETE must conflict, not silently corrupt");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Re-open the catalog") && msg.contains("THIS session"),
+        "conflict message must explain the pinned-snapshot cause, got: {msg}"
+    );
+
+    // The abort must be clean: id 2 stayed deleted, id 4 was NOT deleted, and no
+    // row was resurrected.
+    assert_eq!(
+        read_ids(&temp).await,
+        vec![1, 3, 4],
+        "aborted DELETE must not resurrect id 2 nor delete id 4"
+    );
+}
