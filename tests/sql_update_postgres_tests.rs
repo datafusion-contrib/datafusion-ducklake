@@ -16,8 +16,8 @@ use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, MulticatalogManager, MulticatalogProvider,
-    PostgresMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, MulticatalogManager,
+    MulticatalogProvider, PostgresMetadataWriter,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -47,7 +47,11 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-async fn writer_for(pool: &PgPool, cat: i64, data_path: &std::path::Path) -> Arc<PostgresMetadataWriter> {
+async fn writer_for(
+    pool: &PgPool,
+    cat: i64,
+    data_path: &std::path::Path,
+) -> Arc<PostgresMetadataWriter> {
     let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
         .await
         .unwrap();
@@ -56,9 +60,18 @@ async fn writer_for(pool: &PgPool, cat: i64, data_path: &std::path::Path) -> Arc
 }
 
 /// A writable SessionContext over the multicatalog catalog (provider + writer).
-async fn writable_ctx(pool: &PgPool, cat_name: &str, cat: i64, data: &std::path::Path) -> SessionContext {
-    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name).await.unwrap();
-    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat).await.unwrap();
+async fn writable_ctx(
+    pool: &PgPool,
+    cat_name: &str,
+    cat: i64,
+    data: &std::path::Path,
+) -> SessionContext {
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
     writer.set_data_path(data.to_str().unwrap()).unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
     let ctx = SessionContext::new();
@@ -67,12 +80,18 @@ async fn writable_ctx(pool: &PgPool, cat_name: &str, cat: i64, data: &std::path:
 }
 
 async fn read_rowid_rows(pool: &PgPool, cat_name: &str) -> Vec<(i64, i32, i32)> {
-    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name).await.unwrap();
-    let catalog = DuckLakeCatalog::new(provider).unwrap().with_row_lineage(true);
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider)
+        .unwrap()
+        .with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog(cat_name, Arc::new(catalog));
     let batches = ctx
-        .sql(&format!("SELECT rowid, id, val FROM {cat_name}.public.t ORDER BY id"))
+        .sql(&format!(
+            "SELECT rowid, id, val FROM {cat_name}.public.t ORDER BY id"
+        ))
         .await
         .unwrap()
         .collect()
@@ -130,7 +149,9 @@ async fn update_where_end_to_end_postgres() {
     // UPDATE via SQL through a writable catalog.
     let ctx = writable_ctx(&pool, cat_name, cat, &data).await;
     let batches = ctx
-        .sql(&format!("UPDATE {cat_name}.public.t SET val = val * 10 WHERE id IN (2, 4)"))
+        .sql(&format!(
+            "UPDATE {cat_name}.public.t SET val = val * 10 WHERE id IN (2, 4)"
+        ))
         .await
         .unwrap()
         .collect()

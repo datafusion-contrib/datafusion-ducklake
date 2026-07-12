@@ -465,7 +465,10 @@ async fn update_second_in_session_conflicts_without_corruption() {
         run_dml_count(&ctx, "UPDATE ducklake.main.t SET val = 200 WHERE id = 2").await,
         1
     );
-    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 10), (2, 200), (3, 30), (4, 40)]);
+    assert_eq!(
+        read_pairs(&temp_dir).await,
+        vec![(1, 10), (2, 200), (3, 30), (4, 40)]
+    );
 
     // Second UPDATE (same session, same file) — aborts on the commit CAS.
     let err = ctx
@@ -500,9 +503,17 @@ async fn update_change_feed_mixed_insert_and_update() {
     let before = max_snapshot(&temp_dir).await;
 
     // Snapshot +1: a plain INSERT (no embedded rowid).
-    run_dml_count(&writable_ctx(&temp_dir).await, "INSERT INTO ducklake.main.t VALUES (9, 90)").await;
+    run_dml_count(
+        &writable_ctx(&temp_dir).await,
+        "INSERT INTO ducklake.main.t VALUES (9, 90)",
+    )
+    .await;
     // Snapshot +2: an UPDATE.
-    run_dml_count(&writable_ctx(&temp_dir).await, "UPDATE ducklake.main.t SET val = 100 WHERE id = 1").await;
+    run_dml_count(
+        &writable_ctx(&temp_dir).await,
+        "UPDATE ducklake.main.t SET val = 100 WHERE id = 1",
+    )
+    .await;
     let after = max_snapshot(&temp_dir).await;
 
     let fctx = functions_ctx(&temp_dir).await;
@@ -549,7 +560,11 @@ async fn change_feed_insert_only_range_is_all_inserts() {
     let temp_dir = TempDir::new().unwrap();
     seed_table(&temp_dir, vec![1, 2], vec![10, 20]).await;
     let before = max_snapshot(&temp_dir).await;
-    run_dml_count(&writable_ctx(&temp_dir).await, "INSERT INTO ducklake.main.t VALUES (3, 30)").await;
+    run_dml_count(
+        &writable_ctx(&temp_dir).await,
+        "INSERT INTO ducklake.main.t VALUES (3, 30)",
+    )
+    .await;
     let after = max_snapshot(&temp_dir).await;
 
     let fctx = functions_ctx(&temp_dir).await;
@@ -576,5 +591,9 @@ async fn change_feed_insert_only_range_is_all_inserts() {
             counts.push((c.clone(), n.value(i)));
         }
     }
-    assert_eq!(counts, vec![("insert".to_string(), 1)], "insert-only range yields only inserts");
+    assert_eq!(
+        counts,
+        vec![("insert".to_string(), 1)],
+        "insert-only range yields only inserts"
+    );
 }
