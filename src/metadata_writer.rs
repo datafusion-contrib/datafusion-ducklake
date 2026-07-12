@@ -537,6 +537,67 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Apply positional deletes to one or more existing data files in a SINGLE
+    /// new snapshot, WITHOUT appending any data file — the commit behind a SQL
+    /// `DELETE ... WHERE`. This is [`register_data_file_with_deletes`] minus the
+    /// append: it does not require (and never writes) a new data file, so a pure
+    /// delete does not create a spurious empty data file.
+    ///
+    /// [`register_data_file_with_deletes`]: MetadataWriter::register_data_file_with_deletes
+    ///
+    /// In one transaction: allocate one snapshot (carrying `schema_version`
+    /// forward — a delete is not DDL); then for each [`DeleteFileEntry`] apply the
+    /// same target-file fence + compare-and-swap + retire-prior + insert-cumulative
+    /// as [`set_delete_file`](MetadataWriter::set_delete_file), all stamped with
+    /// that one snapshot; advance the catalog head LAST, so every file's delete
+    /// becomes visible together (atomic multi-file DELETE) — never a half-applied
+    /// state. Aborts with [`crate::DuckLakeError::Conflict`] on the first entry
+    /// whose target data file was retired since `base_snapshot`, or whose live
+    /// delete file no longer matches `expected_prev_delete_file`.
+    ///
+    /// `deletes` must be non-empty (an empty delete is a caller-side no-op that
+    /// must NOT reach here — it would create an empty snapshot); each entry must
+    /// target a distinct `data_file_id`.
+    ///
+    /// Default: unsupported; backends override it.
+    fn commit_positional_deletes(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+        _deletes: &[DeleteFileEntry],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "positional DELETE is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Truncate a table: end EVERY live data file (and its live delete file) in
+    /// one new snapshot and zero the visible stat totals, WITHOUT rewriting any
+    /// data — the commit behind a SQL `DELETE FROM t` with no `WHERE`. Mirrors the
+    /// file-ending drop_table performs, but leaves the table's schema live.
+    /// `next_row_id` is deliberately preserved (rowids stay monotonic).
+    ///
+    /// Returns the number of rows removed (the table's live row count immediately
+    /// before the truncate: gross `record_count` minus still-live delete counts),
+    /// which the SQL `DELETE` reports as rows affected. The count is computed
+    /// inside the same transaction that ends the files, so it is consistent with
+    /// what was removed.
+    ///
+    /// Default: unsupported; backends override it.
+    fn commit_truncate(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+    ) -> Result<u64> {
+        Err(DuckLakeError::InvalidConfig(
+            "DELETE (truncate) is not supported on this metadata backend".to_string(),
+        ))
+    }
+
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
     /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.
     /// See [`MetadataWriter::register_data_file`] for the parameters.

@@ -95,6 +95,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | `CREATE TABLE AS SELECT` (SQL DDL; SQLite single-catalog only — not on the PostgreSQL multi-catalog path) | 🟧 |
 | `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
 | Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
+| SQL `DELETE FROM t [WHERE ...]` (positional deletes + metadata-only truncate; SQLite & PostgreSQL) | ✅ |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; SQLite & PostgreSQL) | ✅ |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |

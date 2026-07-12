@@ -1680,6 +1680,204 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn commit_positional_deletes(
+        &self,
+        table_id: i64,
+        // SQLite created the schema/table at begin; names unused (trait parity).
+        _schema_name: &str,
+        _table_name: &str,
+        base_snapshot: i64,
+        deletes: &[DeleteFileEntry],
+    ) -> Result<CommitIds> {
+        if deletes.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_positional_deletes requires at least one delete entry".to_string(),
+            ));
+        }
+        // A positional delete never retires the data files it targets, so it is
+        // Append-semantics for validation (also enforces distinct data files).
+        validate_delete_entries(WriteMode::Append, deletes)?;
+        block_on(async {
+            // One atomic commit for an N-file positional DELETE with no append.
+            // Mirrors register_data_file_with_deletes' delete loop, but allocates
+            // the snapshot via insert_snapshot (no column generation, no data
+            // file) — a delete carries schema_version forward. The head
+            // (MAX(snapshot_id)) only ever resolves to the fully-applied delete.
+            let mut tx = self.pool.begin().await?;
+
+            // Write-lock-first: the MAX+1 insert takes the SQLite write lock up
+            // front, so concurrent writers can't collide or deadlock.
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+
+            for entry in deletes {
+                // Target-file fence: abort iff the data file is no longer live (a
+                // concurrent Replace/compaction retired it, invalidating the
+                // resolved positions).
+                let target_live: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM ducklake_data_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(entry.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if target_live.is_none() {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "DELETE on data file {} could not commit: the file is no longer live as \
+                         of the catalog's current head (retired since snapshot {base_snapshot}). \
+                         This happens when another writer committed a Replace/compaction, OR when \
+                         an earlier write in THIS session already advanced the catalog (the \
+                         catalog pins its snapshot at creation and does not refresh). Re-open the \
+                         catalog at the latest snapshot and retry.",
+                        entry.data_file_id
+                    )));
+                }
+
+                // Compare-and-swap on the currently-live delete file for this data
+                // file; a concurrent delete on the same file makes it differ.
+                let current_prev: Option<i64> = sqlx::query_scalar(
+                    "SELECT delete_file_id FROM ducklake_delete_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(entry.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if current_prev != entry.expected_prev_delete_file {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "DELETE on data file {} could not commit: its live delete file changed \
+                         from {:?} to {current_prev:?} since snapshot {base_snapshot}. Another \
+                         writer committed a delete on this file, OR an earlier DELETE in THIS \
+                         session did (the catalog pins its snapshot at creation and does not \
+                         refresh). Re-open the catalog at the latest snapshot and retry.",
+                        entry.data_file_id, entry.expected_prev_delete_file
+                    )));
+                }
+
+                // Retire the prior delete file (cumulative: the new file carries
+                // all still-deleted positions, so the old one is superseded).
+                if let Some(prev) = entry.expected_prev_delete_file {
+                    sqlx::query(
+                        "UPDATE ducklake_delete_file SET end_snapshot = ?
+                         WHERE delete_file_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(prev)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+
+                sqlx::query(
+                    "INSERT INTO ducklake_delete_file
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, delete_count, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(entry.data_file_id)
+                .bind(table_id)
+                .bind(&entry.delete.path)
+                .bind(entry.delete.path_is_relative)
+                .bind(entry.delete.file_size_bytes)
+                .bind(entry.delete.footer_size)
+                .bind(entry.delete.delete_count)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn commit_truncate(
+        &self,
+        table_id: i64,
+        // SQLite created the schema/table at begin; names unused (trait parity).
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+    ) -> Result<u64> {
+        block_on(async {
+            // Metadata-only truncate in one snapshot: end every live data file and
+            // its live delete file (as drop_table does) and zero the visible stat
+            // totals; next_row_id is preserved (rowids stay monotonic).
+            let mut tx = self.pool.begin().await?;
+
+            // Write-lock-first (carry schema_version forward — not DDL).
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+
+            // No-op guard: if the table has no live data file there is nothing to
+            // truncate. Return Ok(0) WITHOUT committing so `tx` (and the snapshot
+            // row insert_snapshot just made) rolls back, leaving no trace — same
+            // as `drop_table`'s idempotent early return. Prevents a content-free
+            // snapshot per repeated `DELETE FROM t` when the catalog's pinned
+            // snapshot still sees already-ended files as live.
+            let has_live_data: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_live_data.is_none() {
+                return Ok(0);
+            }
+
+            // Rows removed = gross record_count minus still-live delete counts,
+            // computed BEFORE ending anything so it matches what we retire.
+            let gross: Option<i64> = sqlx::query_scalar(
+                "SELECT COALESCE(record_count, 0) FROM ducklake_table_stats WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let deleted: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(delete_count), 0) FROM ducklake_delete_file
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let live_rows = (gross.unwrap_or(0) - deleted).max(0) as u64;
+
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_delete_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(live_rows)
+        })
+    }
+
     fn publish_snapshot(
         &self,
         table_id: i64,
