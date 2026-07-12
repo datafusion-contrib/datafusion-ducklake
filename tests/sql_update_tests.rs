@@ -450,3 +450,131 @@ async fn update_change_feed_ignores_unrelated_inserts() {
         "only the correlated pair is surfaced"
     );
 }
+
+/// A second UPDATE in the SAME session that re-touches a file the first UPDATE
+/// modified must abort with a clear conflict (the catalog pins its snapshot to
+/// the pre-update generation) — and must NOT corrupt: the first update's result
+/// is preserved and the second row is left unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_second_in_session_conflicts_without_corruption() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2, 3, 4], vec![10, 20, 30, 40]).await;
+
+    let ctx = writable_ctx(&temp_dir).await;
+    assert_eq!(
+        run_dml_count(&ctx, "UPDATE ducklake.main.t SET val = 200 WHERE id = 2").await,
+        1
+    );
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 10), (2, 200), (3, 30), (4, 40)]);
+
+    // Second UPDATE (same session, same file) — aborts on the commit CAS.
+    let err = ctx
+        .sql("UPDATE ducklake.main.t SET val = 300 WHERE id = 3")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("second in-session UPDATE must conflict, not silently corrupt");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Re-open the catalog") && msg.contains("THIS session"),
+        "conflict message must explain the pinned-snapshot cause, got: {msg}"
+    );
+
+    // Clean abort: id=2 stays updated, id=3 unchanged, no row lost/duplicated.
+    assert_eq!(
+        read_pairs(&temp_dir).await,
+        vec![(1, 10), (2, 200), (3, 30), (4, 40)],
+        "aborted UPDATE leaves the first update intact and id=3 unchanged"
+    );
+}
+
+/// CDC over a range that mixes an unrelated plain INSERT with an UPDATE: the
+/// insert must surface as `insert`, and the update as a preimage/postimage pair.
+/// Exercises the correlated path together with a non-embedded insert file (the
+/// `update_change_feed_ignores_unrelated_inserts` test does not actually insert).
+#[tokio::test(flavor = "multi_thread")]
+async fn update_change_feed_mixed_insert_and_update() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2], vec![10, 20]).await;
+    let before = max_snapshot(&temp_dir).await;
+
+    // Snapshot +1: a plain INSERT (no embedded rowid).
+    run_dml_count(&writable_ctx(&temp_dir).await, "INSERT INTO ducklake.main.t VALUES (9, 90)").await;
+    // Snapshot +2: an UPDATE.
+    run_dml_count(&writable_ctx(&temp_dir).await, "UPDATE ducklake.main.t SET val = 100 WHERE id = 1").await;
+    let after = max_snapshot(&temp_dir).await;
+
+    let fctx = functions_ctx(&temp_dir).await;
+    let sql = format!(
+        "SELECT id, val, change_type FROM ducklake_table_changes('main.t', {before}, {after}) \
+         ORDER BY change_type, id"
+    );
+    let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    let mut got: Vec<(i32, i32, String)> = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let vals = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ct = b.column(2);
+        let cts: Vec<String> = ct
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .map(|a| (0..a.len()).map(|i| a.value(i).to_string()).collect())
+            .or_else(|| {
+                ct.as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .map(|a| (0..a.len()).map(|i| a.value(i).to_string()).collect())
+            })
+            .expect("change_type is a string column");
+        for (i, c) in cts.iter().enumerate() {
+            got.push((ids.value(i), vals.value(i), c.clone()));
+        }
+    }
+    assert_eq!(
+        got,
+        vec![
+            (9, 90, "insert".to_string()),
+            (1, 100, "update_postimage".to_string()),
+            (1, 10, "update_preimage".to_string()),
+        ],
+        "unrelated insert stays an insert; the update is a preimage/postimage pair"
+    );
+}
+
+/// CDC over an INSERT-only range (no UPDATE/DELETE): every added row is an
+/// `insert` and nothing is reclassified. Guards the fast path that must NOT do
+/// the correlated delete+insert probing when the range applied no deletes.
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_insert_only_range_is_all_inserts() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2], vec![10, 20]).await;
+    let before = max_snapshot(&temp_dir).await;
+    run_dml_count(&writable_ctx(&temp_dir).await, "INSERT INTO ducklake.main.t VALUES (3, 30)").await;
+    let after = max_snapshot(&temp_dir).await;
+
+    let fctx = functions_ctx(&temp_dir).await;
+    let sql = format!(
+        "SELECT change_type, COUNT(*) AS n FROM ducklake_table_changes('main.t', {before}, {after}) \
+         GROUP BY change_type ORDER BY change_type"
+    );
+    let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for b in &batches {
+        let ct = b.column(0);
+        let cts: Vec<String> = ct
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .map(|a| (0..a.len()).map(|i| a.value(i).to_string()).collect())
+            .or_else(|| {
+                ct.as_any()
+                    .downcast_ref::<arrow::array::StringViewArray>()
+                    .map(|a| (0..a.len()).map(|i| a.value(i).to_string()).collect())
+            })
+            .unwrap();
+        let n = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        for (i, c) in cts.iter().enumerate() {
+            counts.push((c.clone(), n.value(i)));
+        }
+    }
+    assert_eq!(counts, vec![("insert".to_string(), 1)], "insert-only range yields only inserts");
+}

@@ -20,6 +20,27 @@
 //!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
 //! collects matched rows into memory before writing; single partition only.
+//!
+//! # Session lifecycle (important)
+//!
+//! A [`DuckLakeCatalog`](crate::DuckLakeCatalog) pins its snapshot at creation
+//! and never refreshes it, so a `SessionContext` observes ONE catalog generation
+//! for its whole lifetime. An `UPDATE` commits a new snapshot, but the same
+//! session keeps reading the old one. Consequences:
+//!
+//! - A second `UPDATE` in the same session that re-touches a data file modified
+//!   by an earlier `UPDATE` (in that same session) aborts with a
+//!   [`Conflict`](crate::DuckLakeError::Conflict): it resolves against the pinned
+//!   (pre-update) view, so the atomic commit's compare-and-swap disagrees with
+//!   the live catalog. This is the same guard that (correctly) rejects a
+//!   genuinely concurrent writer, so it is safe (the first update is preserved),
+//!   just not retryable in-session.
+//! - A `SELECT` after an `UPDATE`/`INSERT` in the same session returns the
+//!   pre-mutation rows; a just-inserted row cannot be updated in the same
+//!   session (it is invisible to the pinned snapshot).
+//!
+//! To perform multiple mutations, re-open the catalog (or create a fresh
+//! `SessionContext`) between statements so it binds to the latest snapshot.
 
 use std::fmt::{self, Debug};
 use std::sync::Arc;

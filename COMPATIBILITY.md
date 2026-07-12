@@ -95,6 +95,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | `CREATE TABLE AS SELECT` (SQL DDL; SQLite single-catalog only — not on the PostgreSQL multi-catalog path) | 🟧 |
 | `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
 | Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
+| SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; SQLite & PostgreSQL) | ✅ |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
@@ -179,6 +180,19 @@ Known edges:
   the snapshot programmatically — `DuckLakeCatalog::with_snapshot(provider, snapshot_id)`
   binds to a specific one, and querying another point in time means creating another
   catalog. What's missing is SQL-level historical querying (`AS OF`) within one handle.
+- **One mutation per session, then re-open the catalog.** Because a catalog pins its
+  snapshot at creation and never refreshes, a `SessionContext` observes a single generation
+  for its lifetime. After an `UPDATE`/`DELETE`/`INSERT` commits, the same session keeps
+  reading the pre-mutation state; a `SELECT` won't see the change, a just-inserted row can't
+  be updated, and a **second `UPDATE`/`DELETE` re-touching a file the first modified aborts
+  with a conflict** (the compare-and-swap that also guards genuine concurrency — it is what
+  prevents a stale rewrite from resurrecting superseded rows). Re-open the catalog (or create
+  a fresh `SessionContext`) between mutating statements so it binds to the latest snapshot.
+- **`UPDATE` change-feed correlation is not available on encrypted (PME) catalogs.**
+  `ducklake_table_changes` still works on encrypted catalogs, but a range containing an
+  `UPDATE` surfaces its rewritten rows as plain `insert`s rather than being correlated into
+  `update_preimage`/`update_postimage` (the correlation reads parquet footers/rows the
+  change-feed path does not decrypt). Non-encrypted catalogs correlate normally.
 - **No partition-based file pruning** on read.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).

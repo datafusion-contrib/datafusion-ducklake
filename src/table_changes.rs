@@ -815,24 +815,62 @@ impl TableProvider for TableChangesTable {
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
-        // Detect which added data files carry an embedded rowid column: those are
-        // the postimages of an UPDATE / compaction. Only when at least one is
-        // present do we correlate delete+insert pairs — a catalog of plain
-        // INSERTs (no embedded files) stays on the historical insert-only path
-        // below, byte-for-byte unchanged (no delete reads, no reclassification).
-        let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
-        let mut any_embedded = false;
-        for data_file in &data_files {
-            let name = self
-                .detect_embedded_rowid_name(state, &data_file.path, data_file.path_is_relative)
-                .await?;
-            any_embedded |= name.is_some();
-            embedded_names.push(name);
-        }
-        if any_embedded {
-            return self
-                .build_correlated_changes(state, &data_files, &embedded_names, projection)
-                .await;
+        // Decide whether to take the correlated path (pairing an UPDATE's
+        // delete+insert into preimage/postimage). Two guards, BOTH cheap and
+        // metadata-only, keep the common cases off the expensive/unsafe footer
+        // probing that the correlated path needs:
+        //
+        //  1. Deletes-present: an UPDATE (or compaction) ALWAYS adds a positional
+        //     delete, so a range with no added delete files cannot contain an
+        //     UPDATE — there is nothing to correlate. Skipping detection here
+        //     means a plain-INSERT catalog does ZERO per-file parquet footer
+        //     reads at plan time (previously it probed every added file).
+        //  2. Not encrypted: the correlated path reads parquet footers (to detect
+        //     the embedded-rowid postimage) and the source rows of deletes, none
+        //     of which it can decrypt (the delete-side change record carries no
+        //     key). On a PME catalog we therefore stay on the historical
+        //     insert-only path below — which IS encryption-aware — so CDC never
+        //     fails; the tradeoff is that UPDATEs are not correlated into
+        //     preimage/postimage there (they surface as plain inserts). See
+        //     COMPATIBILITY.md.
+        let any_encrypted = {
+            #[cfg(feature = "encryption")]
+            {
+                data_files.iter().any(|d| d.encryption_key.is_some())
+            }
+            #[cfg(not(feature = "encryption"))]
+            {
+                false
+            }
+        };
+        let range_has_deletes = !self
+            .provider
+            .get_delete_files_added_between_snapshots(
+                self.table_id,
+                self.start_snapshot,
+                self.end_snapshot,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .is_empty();
+
+        if range_has_deletes && !any_encrypted {
+            // Detect which added data files carry an embedded rowid column (the
+            // postimages of an UPDATE / compaction). Only probe footers now that
+            // we know a delete exists and the files are readable un-decrypted.
+            let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
+            let mut any_embedded = false;
+            for data_file in &data_files {
+                let name = self
+                    .detect_embedded_rowid_name(state, &data_file.path, data_file.path_is_relative)
+                    .await?;
+                any_embedded |= name.is_some();
+                embedded_names.push(name);
+            }
+            if any_embedded {
+                return self
+                    .build_correlated_changes(state, &data_files, &embedded_names, projection)
+                    .await;
+            }
         }
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
