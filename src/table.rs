@@ -1613,6 +1613,8 @@ impl DuckLakeTable {
             row_lineage: false,
             columns: self.columns.clone(),
             table_files: self.table_files.clone(),
+            table_statistics: self.table_statistics.clone(),
+            file_statistics: self.file_statistics.clone(),
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
