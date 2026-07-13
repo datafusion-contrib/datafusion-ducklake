@@ -107,6 +107,11 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     default_value_dialect VARCHAR
 );
 
+-- `partial_max` (DuckLake v1.0) marks a *partial data file* produced by
+-- `merge_adjacent_files`: it is the maximum origin snapshot id among the file's
+-- merged rows, whose per-row origin is stored in the embedded
+-- `_ducklake_internal_snapshot_id` parquet column. NULL for ordinary files
+-- (single-origin appends, and `rewrite_data_files` outputs).
 CREATE TABLE IF NOT EXISTS ducklake_data_file (
     data_file_id INTEGER PRIMARY KEY,
     table_id INTEGER NOT NULL,
@@ -119,7 +124,21 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     row_id_start INTEGER,
     mapping_id INTEGER,
     begin_snapshot INTEGER NOT NULL,
-    end_snapshot INTEGER
+    end_snapshot INTEGER,
+    partial_max INTEGER
+);
+
+-- Per-snapshot change ledger (DuckLake spec). One row per snapshot recording
+-- what the commit did, as a comma-separated `changes_made` string (e.g.
+-- `compacted_table:<table_id>` for a compaction). Written by the compaction
+-- commit so DuckDB and other spec readers can attribute the snapshot; other
+-- commit paths in this crate do not populate it yet.
+CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+    snapshot_id INTEGER PRIMARY KEY,
+    changes_made VARCHAR NOT NULL,
+    author VARCHAR,
+    commit_message VARCHAR,
+    commit_extra_info VARCHAR
 );
 
 -- Per-table row-lineage counter (DuckLake spec). `next_row_id` is the
@@ -772,6 +791,33 @@ async fn migrate_add_schema_version(pool: &SqlitePool) -> Result<()> {
         )
         .execute(pool)
         .await?;
+    }
+    Ok(())
+}
+
+/// Add `ducklake_data_file.partial_max` to a pre-existing catalog (DuckLake
+/// v1.0). `CREATE TABLE IF NOT EXISTS` only shapes brand-new catalogs, so an
+/// older one needs this `ALTER`.
+///
+/// **Idempotent:** a no-op once the column exists (re-runs on every
+/// `initialize_schema`). **Lossless:** existing data-file rows take the column
+/// `NULL`, which is exactly the "not a partial file" value — every file written
+/// before compaction existed is an ordinary single-origin file.
+async fn migrate_add_partial_max(pool: &SqlitePool) -> Result<()> {
+    let info = sqlx::query("SELECT name FROM pragma_table_info('ducklake_data_file')")
+        .fetch_all(pool)
+        .await?;
+    let mut has_partial_max = false;
+    for row in &info {
+        let name: String = row.try_get("name")?;
+        if name == "partial_max" {
+            has_partial_max = true;
+        }
+    }
+    if !has_partial_max {
+        sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partial_max INTEGER")
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -1798,6 +1844,227 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn commit_compaction(
+        &self,
+        table_id: i64,
+        base_snapshot: i64,
+        sources: &[crate::metadata_writer::CompactionSourceFile],
+        outputs: &[crate::metadata_writer::CompactionOutputFile],
+        retirement: crate::metadata_writer::SourceRetirement,
+    ) -> Result<CommitIds> {
+        use crate::metadata_writer::SourceRetirement;
+        if sources.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_compaction requires at least one source file".to_string(),
+            ));
+        }
+        block_on(async {
+            // One atomic snapshot for the whole compaction. insert_snapshot takes
+            // the SQLite write lock up front (write-lock-first) and carries
+            // schema_version forward — compaction is not DDL. The head
+            // (MAX(snapshot_id)) only ever resolves to the fully-applied layout.
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+
+            // Conflict fence per source: the data file must still be live, and its
+            // live delete file must still match what the caller read the source's
+            // rows against. A concurrent APPEND adds unrelated files and trips
+            // neither (so compaction coexists with it); a concurrent
+            // Replace/compaction that retired the file, or a DELETE/UPDATE that
+            // changed its live rows, DOES — abort before mutating anything so a
+            // retired/deleted row can never be resurrected into an output.
+            for src in sources {
+                let target_live: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM ducklake_data_file
+                     WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(src.data_file_id)
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if target_live.is_none() {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: source data file {} is \
+                         no longer live (retired by a concurrent Replace/compaction since \
+                         snapshot {base_snapshot}). Re-open the catalog at the latest snapshot \
+                         and re-plan.",
+                        src.data_file_id
+                    )));
+                }
+
+                let current_delete: Option<i64> = sqlx::query_scalar(
+                    "SELECT delete_file_id FROM ducklake_delete_file
+                     WHERE data_file_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(src.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if current_delete != src.delete_file_id {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: the live delete file of \
+                         source data file {} changed from {:?} to {current_delete:?} since \
+                         snapshot {base_snapshot} (a concurrent DELETE/UPDATE). Re-open the \
+                         catalog at the latest snapshot and re-plan.",
+                        src.data_file_id, src.delete_file_id
+                    )));
+                }
+            }
+
+            let source_data_ids: Vec<i64> = sources.iter().map(|s| s.data_file_id).collect();
+
+            match retirement {
+                SourceRetirement::Remove => {
+                    // Merge: the partial output serves every snapshot the sources
+                    // did, so the sources are redundant. Schedule their physical
+                    // files for deletion (resolving paths as expire_snapshots
+                    // does) and REMOVE their catalog rows, so no snapshot resolves
+                    // to them (avoids double-counting with the partial file, and
+                    // upholds the invariant that scheduled files are unreachable).
+                    let dead_data = sqlx::query(&format!(
+                        "SELECT df.data_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
+                         FROM ducklake_data_file df
+                         JOIN ducklake_table t ON t.table_id = df.table_id
+                         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                         WHERE df.data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    schedule_files(&mut tx, dead_data).await?;
+
+                    let dead_del = sqlx::query(&format!(
+                        "SELECT df.delete_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
+                         FROM ducklake_delete_file df
+                         JOIN ducklake_table t ON t.table_id = df.table_id
+                         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                         WHERE df.data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    schedule_files(&mut tx, dead_del).await?;
+
+                    sqlx::query(&format!(
+                        "DELETE FROM ducklake_delete_file WHERE data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(&format!(
+                        "DELETE FROM ducklake_data_file WHERE data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                SourceRetirement::Retire => {
+                    // Rewrite: the output only holds currently-live rows, so the
+                    // sources still serve time travel to pre-compaction snapshots.
+                    // Retire them (end_snapshot) but do NOT schedule them — an
+                    // expire_snapshots run schedules them once their snapshots are
+                    // gone, so they are never deleted while still reachable.
+                    sqlx::query(&format!(
+                        "UPDATE ducklake_data_file SET end_snapshot = ?
+                         WHERE data_file_id IN ({}) AND end_snapshot IS NULL",
+                        id_list(&source_data_ids)
+                    ))
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(&format!(
+                        "UPDATE ducklake_delete_file SET end_snapshot = ?
+                         WHERE data_file_id IN ({}) AND end_snapshot IS NULL",
+                        id_list(&source_data_ids)
+                    ))
+                    .bind(snapshot_id)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+
+            // Register each rewritten output. begin_snapshot = the file's min
+            // origin snapshot for a merged partial file (so historical reads see
+            // it, row-filtered by origin), else this compaction snapshot;
+            // row_id_start = NULL (rowids are served from the embedded rowid
+            // column); partial_max marks a merged partial file.
+            for out in outputs {
+                let begin = out.begin_snapshot.unwrap_or(snapshot_id);
+                sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, begin_snapshot, partial_max)
+                     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                )
+                .bind(table_id)
+                .bind(&out.file.path)
+                .bind(out.file.path_is_relative)
+                .bind(out.file.file_size_bytes)
+                .bind(out.file.footer_size)
+                .bind(out.file.record_count)
+                .bind(begin)
+                .bind(out.partial_max)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Recompute the visible stat totals from the surviving files. Robust
+            // for both ops: merge preserves the gross record_count (it refuses
+            // delete-bearing groups), while rewrite lowers it to the live count
+            // (its retired delete file's count drops out at the same time, so the
+            // net live count is unchanged). next_row_id is deliberately NOT
+            // advanced: compaction mints no new logical rows (outputs re-embed
+            // existing rowids), so the monotonic allocator must not move.
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats SET
+                     record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                     FROM ducklake_data_file
+                                     WHERE table_id = ? AND end_snapshot IS NULL),
+                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                        FROM ducklake_data_file
+                                        WHERE table_id = ? AND end_snapshot IS NULL)
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .bind(table_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Attribute the snapshot for spec readers (DuckDB reads this ledger).
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes
+                     (snapshot_id, changes_made, commit_message)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("compacted_table:{table_id}"))
+            .bind("datafusion compaction")
+            .execute(&mut *tx)
+            .await?;
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
     fn commit_truncate(
         &self,
         table_id: i64,
@@ -1994,6 +2261,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Upgrade a pre-existing catalog to track schema_version (add the
             // ducklake_snapshot.schema_version column; idempotent, lossless).
             migrate_add_schema_version(&self.pool).await?;
+            // Upgrade a pre-existing catalog to the v1.0 partial-file marker (add
+            // ducklake_data_file.partial_max; idempotent, lossless — NULL means
+            // "not a partial file", correct for every pre-compaction file).
+            migrate_add_partial_max(&self.pool).await?;
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved in begin_write_transaction and inserted at the commit, so
             // they can't use rowid autoincrement (inserting the ducklake_snapshot

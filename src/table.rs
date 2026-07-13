@@ -13,8 +13,9 @@ use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
 use crate::row_id::{
     FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, ROWID_COLUMN_NAME, RowIdExec,
-    rowid_field,
+    SNAPSHOT_ID_PARQUET_FIELD_ID, rowid_field,
 };
+use crate::snapshot_filter::SnapshotFilterExec;
 use crate::types::{
     build_arrow_schema, build_read_schema_with_field_id_mapping, extract_parquet_field_ids,
 };
@@ -152,6 +153,14 @@ struct FileReadConfig {
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
+    /// `Some(parquet_column_name)` if the file embeds the per-row snapshot-id
+    /// column (tagged with [`SNAPSHOT_ID_PARQUET_FIELD_ID`]) — i.e. it is a
+    /// merged partial file; `None` otherwise. Not added to `read_schema` (that
+    /// would shift the embedded-rowid column off the end, which several call
+    /// sites rely on); the partial-file read path appends it explicitly.
+    ///
+    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`]: crate::row_id::SNAPSHOT_ID_PARQUET_FIELD_ID
+    embedded_snapshot_parquet_name: Option<String>,
     /// Per-row-group starting physical row position (prefix sums of
     /// `row_groups[i].num_rows()`). `row_group_starts[i]` is the 0-based file
     /// position of the first row of row group `i`. Used to build row-group-
@@ -887,6 +896,9 @@ impl DuckLakeTable {
 
         // Detect the embedded rowid column by reserved field-id.
         let embedded_rowid_parquet_name = field_id_map.get(&ROW_ID_PARQUET_FIELD_ID).cloned();
+        // Detect the embedded per-row snapshot-id column (marks a partial file).
+        let embedded_snapshot_parquet_name =
+            field_id_map.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned();
 
         let read_schema = if let Some(ref parquet_name) = embedded_rowid_parquet_name {
             // Append the embedded rowid column to read_schema under its
@@ -912,6 +924,7 @@ impl DuckLakeTable {
             read_schema,
             name_mapping,
             embedded_rowid_parquet_name,
+            embedded_snapshot_parquet_name,
             row_group_starts,
             row_group_count,
         });
@@ -1166,6 +1179,82 @@ impl DuckLakeTable {
         Arc::new(Schema::new(fields))
     }
 
+    /// Whether `table_file` is a merged partial file being read at a snapshot
+    /// BELOW its `partial_max` — i.e. some of its rows originate from snapshots
+    /// newer than the read snapshot and must be dropped per-row. When false (the
+    /// common case: an ordinary file, or a partial file read at or after
+    /// `partial_max`), the file is read by the existing paths with no filtering.
+    fn needs_snapshot_filter(&self, table_file: &DuckLakeTableFile) -> bool {
+        table_file
+            .partial_max
+            .is_some_and(|partial_max| self.snapshot_id < partial_max)
+    }
+
+    /// Build a plan for a single merged **partial file** read at a snapshot below
+    /// its `partial_max`. Reads every column (data + embedded rowid + embedded
+    /// snapshot-id), drops rows whose embedded origin snapshot exceeds the read
+    /// snapshot via [`SnapshotFilterExec`], then presents `output_schema` (which
+    /// also projects away the embedded snapshot-id and any unrequested embedded
+    /// rowid column). Used only on the cold time-travel path, so it reads all
+    /// columns and lets `LIMIT` apply above rather than pushing it into the scan.
+    async fn build_exec_for_partial_file(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        output_schema: SchemaRef,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+        let snap_name = file_cfg
+            .embedded_snapshot_parquet_name
+            .clone()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "partial file \"{}\" is missing its embedded snapshot-id column",
+                    table_file.file.path
+                ))
+            })?;
+
+        // Append the embedded snapshot-id column to the file's read schema so the
+        // scan materializes it. It is deliberately absent from the cached
+        // `read_schema` (that would shift the embedded-rowid column off the end,
+        // which other read paths rely on), so we append it here.
+        let mut fields: Vec<Arc<Field>> = file_cfg.read_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(&snap_name, DataType::Int64, true)));
+        let read_schema = Arc::new(Schema::new(fields));
+        let projection: Vec<usize> = (0..read_schema.fields().len()).collect();
+
+        let resolved_path = self.resolve_file_path(&table_file.file)?;
+        let mut pf = PartitionedFile::new(
+            &resolved_path,
+            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+        );
+        if let Some(footer_size) = table_file.file.footer_size
+            && footer_size > 0
+            && let Ok(hint) = usize::try_from(footer_size)
+        {
+            pf = pf.with_metadata_size_hint(hint);
+        }
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(self.create_parquet_source(read_schema.clone())),
+        )
+        .with_file_group(FileGroup::new(vec![pf]))
+        .with_projection_indices(Some(projection))?;
+        let scan = DataSourceExec::from_data_source(builder.build());
+
+        // Drop rows newer than the read snapshot, then present the catalog schema.
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(SnapshotFilterExec::try_new(
+            scan,
+            snap_name,
+            self.snapshot_id,
+        )?);
+        Ok(Arc::new(ColumnRenameExec::new(
+            filtered,
+            output_schema,
+            file_cfg.name_mapping.clone(),
+        )))
+    }
+
     /// A read-only clone of this table (no writer, no rowid projection, fresh
     /// per-file read-config cache) carrying exactly the metadata a scan needs.
     /// [`DuckLakeUpdateExec`] holds one so it can drive the per-file update
@@ -1201,6 +1290,53 @@ impl DuckLakeTable {
     #[cfg(feature = "write")]
     pub(crate) fn physical_schema(&self) -> SchemaRef {
         self.physical_schema.clone()
+    }
+
+    /// The metadata writer, when this table was opened writable
+    /// (`DuckLakeCatalog::with_writer`). Used by the compaction ops.
+    #[cfg(feature = "write")]
+    pub(crate) fn writer(&self) -> Option<&Arc<dyn MetadataWriter>> {
+        self.writer.as_ref()
+    }
+
+    /// The schema name, when this table was opened writable. Used by the
+    /// compaction ops to author output file paths.
+    #[cfg(feature = "write")]
+    pub(crate) fn schema_name(&self) -> Option<&str> {
+        self.schema_name.as_deref()
+    }
+
+    /// This table's name. Used by the compaction ops for output file paths.
+    #[cfg(feature = "write")]
+    pub(crate) fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// This table's catalog `table_id`. Used by the compaction commit.
+    #[cfg(feature = "write")]
+    pub(crate) fn table_id(&self) -> i64 {
+        self.table_id
+    }
+
+    /// The snapshot this table was opened at — the base the compaction sources
+    /// are read against, threaded to the commit as its conflict base.
+    #[cfg(feature = "write")]
+    pub(crate) fn base_snapshot(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    /// The object store URL for resolving this table's file paths.
+    #[cfg(feature = "write")]
+    pub(crate) fn object_store_url(&self) -> &Arc<ObjectStoreUrl> {
+        &self.object_store_url
+    }
+
+    /// The live columns' catalog `column_id`s in `column_order` — the parquet
+    /// field-ids a compaction output must bake in so its data columns map back
+    /// to the catalog on read.
+    #[cfg(feature = "write")]
+    pub(crate) fn column_ids(&self) -> Vec<i64> {
+        self.columns.iter().map(|c| c.column_id).collect()
     }
 
     /// Build the positional read plan (and the metadata needed to interpret it)
@@ -1581,9 +1717,17 @@ impl TableProvider for DuckLakeTable {
 
             let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
             for tf in &self.table_files {
-                let exec = self
-                    .build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
-                    .await?;
+                // A merged partial file read below its partial_max needs per-row
+                // snapshot filtering; it always embeds its rowid, so the partial
+                // path serves the projected rowid directly.
+                let exec = if self.needs_snapshot_filter(tf) {
+                    let output_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
+                    self.build_exec_for_partial_file(state, tf, output_schema)
+                        .await?
+                } else {
+                    self.build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
+                        .await?
+                };
                 execs.push(exec);
             }
 
@@ -1598,10 +1742,17 @@ impl TableProvider for DuckLakeTable {
 
         // Fast path: rowid not projected. All projection indices refer to
         // physical columns, so the existing logic works untouched.
-        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = self
+        //
+        // First peel off merged partial files being read below their partial_max
+        // — they need per-row snapshot filtering and are handled per file. Every
+        // other file (ordinary, or a partial file at/after its partial_max) takes
+        // the existing grouped/with-deletes paths unchanged.
+        let (needs_filter, rest): (Vec<_>, Vec<_>) = self
             .table_files
             .iter()
-            .partition(|tf| tf.delete_file.is_some());
+            .partition(|tf| self.needs_snapshot_filter(tf));
+        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
+            rest.into_iter().partition(|tf| tf.delete_file.is_some());
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
 
@@ -1622,6 +1773,18 @@ impl TableProvider for DuckLakeTable {
         for table_file in files_with_deletes {
             let exec = self
                 .build_exec_for_file_with_deletes(state, table_file, projection, limit)
+                .await?;
+            execs.push(exec);
+        }
+
+        // Per-file snapshot-filtered execs for partial files read in the past.
+        for table_file in needs_filter {
+            let output_schema = match projection {
+                Some(indices) => Arc::new(self.schema.project(indices)?),
+                None => self.schema.clone(),
+            };
+            let exec = self
+                .build_exec_for_partial_file(state, table_file, output_schema)
                 .await?;
             execs.push(exec);
         }

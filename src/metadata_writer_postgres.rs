@@ -84,7 +84,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         row_id_start BIGINT,
         mapping_id BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        partial_max BIGINT
     )"#,
     // Per-table running counters maintained inside the writer's transaction
     // so concurrent writes hand out non-overlapping rowid ranges. `next_row_id`
@@ -116,6 +117,21 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // another tool may not have schema_version on ducklake_snapshot.
     r#"ALTER TABLE ducklake_snapshot
         ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 0"#,
+    // Idempotent guard: an existing store may predate the v1.0 partial-file
+    // marker. NULL means "not a partial file", correct for every pre-compaction
+    // file.
+    r#"ALTER TABLE ducklake_data_file
+        ADD COLUMN IF NOT EXISTS partial_max BIGINT"#,
+    // Per-snapshot change ledger (DuckLake spec). The compaction commit records
+    // `compacted_table:<table_id>` here so DuckDB and other spec readers can
+    // attribute the snapshot; other commit paths do not populate it yet.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+        snapshot_id BIGINT PRIMARY KEY,
+        changes_made VARCHAR NOT NULL,
+        author VARCHAR,
+        commit_message VARCHAR,
+        commit_extra_info VARCHAR
+    )"#,
 ];
 
 /// Multicatalog scaffolding tables. Always run after the standard tables.
@@ -491,6 +507,48 @@ async fn advance_catalog_head(
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// SQL expression resolving a `df`-aliased file row's path relative to the
+/// catalog `data_path` root (file → table → schema). Mirrors the multicatalog
+/// expire path's `PG_RESOLVED_PATH`; duplicated here (that one is private to
+/// `multicatalog`) so the compaction commit can schedule retired files.
+const COMPACTION_RESOLVED_PATH: &str = "CASE
+    WHEN NOT df.path_is_relative THEN df.path
+    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
+    ELSE s.path || '/' || t.path || '/' || df.path
+END";
+
+/// Companion to [`COMPACTION_RESOLVED_PATH`]: true only when the whole chain is relative.
+const COMPACTION_REL_FLAG: &str =
+    "(df.path_is_relative AND t.path_is_relative AND s.path_is_relative)";
+
+/// Insert `(id, resolved_path, rel)` rows (as produced by
+/// [`COMPACTION_RESOLVED_PATH`] / [`COMPACTION_REL_FLAG`]) into
+/// `ducklake_files_scheduled_for_deletion`, scoped to `catalog_id`. Mirrors the
+/// multicatalog expire path's `schedule_pg_files`.
+async fn schedule_compaction_files(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    catalog_id: i64,
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> Result<()> {
+    for row in rows {
+        let id: i64 = row.try_get(0)?;
+        let path: String = row.try_get(1)?;
+        let rel: bool = row.try_get(2)?;
+        sqlx::query(
+            "INSERT INTO ducklake_files_scheduled_for_deletion
+                 (catalog_id, data_file_id, path, path_is_relative, schedule_start)
+             VALUES ($1, $2, $3, $4, NOW())",
+        )
+        .bind(catalog_id)
+        .bind(id)
+        .bind(&path)
+        .bind(rel)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -1649,6 +1707,232 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            let schema_id: i64 =
+                sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+
+            // advance_catalog_head MUST be the last write before commit.
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn commit_compaction(
+        &self,
+        table_id: i64,
+        base_snapshot: i64,
+        sources: &[crate::metadata_writer::CompactionSourceFile],
+        outputs: &[crate::metadata_writer::CompactionOutputFile],
+        retirement: crate::metadata_writer::SourceRetirement,
+    ) -> Result<CommitIds> {
+        use crate::metadata_writer::SourceRetirement;
+        if sources.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_compaction requires at least one source file".to_string(),
+            ));
+        }
+        block_on(async {
+            // One atomic commit under the catalog lock. Mirrors
+            // commit_positional_deletes' shape (allocate snapshot, carry
+            // schema_version forward, fence + CAS), plus: schedule + retire the
+            // sources (and their delete files), register the outputs, recompute
+            // stats, record the change ledger, and advance_catalog_head LAST.
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            let prev_max: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+                .bind(prev_max.max(1))
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Fence + compare-and-swap per source (see commit_compaction on the
+            // SQLite writer for the rationale): abort — never resurrect rows —
+            // if a source was retired or its live delete file changed since read.
+            for src in sources {
+                let target_live: Option<i64> = sqlx::query_scalar(
+                    "SELECT data_file_id FROM ducklake_data_file
+                     WHERE data_file_id = $1 AND table_id = $2 AND end_snapshot IS NULL",
+                )
+                .bind(src.data_file_id)
+                .bind(table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if target_live.is_none() {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: source data file {} is \
+                         no longer live (retired by a concurrent Replace/compaction since snapshot \
+                         {base_snapshot}). Re-open the catalog at the latest snapshot and re-plan.",
+                        src.data_file_id
+                    )));
+                }
+                let current_delete: Option<i64> = sqlx::query_scalar(
+                    "SELECT delete_file_id FROM ducklake_delete_file
+                     WHERE data_file_id = $1 AND end_snapshot IS NULL",
+                )
+                .bind(src.data_file_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if current_delete != src.delete_file_id {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "compaction of table {table_id} could not commit: the live delete file of \
+                         source data file {} changed from {:?} to {current_delete:?} since snapshot \
+                         {base_snapshot} (a concurrent DELETE/UPDATE). Re-open the catalog at the \
+                         latest snapshot and re-plan.",
+                        src.data_file_id, src.delete_file_id
+                    )));
+                }
+            }
+
+            let source_data_ids: Vec<i64> = sources.iter().map(|s| s.data_file_id).collect();
+
+            match retirement {
+                SourceRetirement::Remove => {
+                    // Merge: the partial output serves every snapshot the sources
+                    // did, so schedule their physical files (resolving paths as the
+                    // multicatalog expire path does) and REMOVE their catalog rows.
+                    let dead_data = sqlx::query(&format!(
+                        "SELECT df.data_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
+                                {COMPACTION_REL_FLAG} AS rel
+                         FROM ducklake_data_file df
+                         JOIN ducklake_table t ON t.table_id = df.table_id
+                         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                         WHERE df.data_file_id = ANY($1)"
+                    ))
+                    .bind(&source_data_ids)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    schedule_compaction_files(&mut tx, self.catalog_id, dead_data).await?;
+
+                    let dead_del = sqlx::query(&format!(
+                        "SELECT df.delete_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
+                                {COMPACTION_REL_FLAG} AS rel
+                         FROM ducklake_delete_file df
+                         JOIN ducklake_table t ON t.table_id = df.table_id
+                         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                         WHERE df.data_file_id = ANY($1)"
+                    ))
+                    .bind(&source_data_ids)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                    schedule_compaction_files(&mut tx, self.catalog_id, dead_del).await?;
+
+                    sqlx::query("DELETE FROM ducklake_delete_file WHERE data_file_id = ANY($1)")
+                        .bind(&source_data_ids)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM ducklake_data_file WHERE data_file_id = ANY($1)")
+                        .bind(&source_data_ids)
+                        .execute(&mut *tx)
+                        .await?;
+                },
+                SourceRetirement::Retire => {
+                    // Rewrite: the sources still serve time travel to pre-compaction
+                    // snapshots, so retire them (end_snapshot) but do NOT schedule
+                    // them; expire_snapshots reclaims them once their snapshots are
+                    // gone.
+                    sqlx::query(
+                        "UPDATE ducklake_data_file SET end_snapshot = $1
+                         WHERE data_file_id = ANY($2) AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "UPDATE ducklake_delete_file SET end_snapshot = $1
+                         WHERE data_file_id = ANY($2) AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+
+            // Register each rewritten output. begin_snapshot = the file's min
+            // origin snapshot for a merged partial file (so historical reads see
+            // it), else this compaction snapshot; row_id_start NULL (rowids come
+            // from the embedded column); partial_max marks a merged partial file.
+            for out in outputs {
+                let begin = out.begin_snapshot.unwrap_or(snapshot_id);
+                sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, begin_snapshot, partial_max)
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)",
+                )
+                .bind(table_id)
+                .bind(&out.file.path)
+                .bind(out.file.path_is_relative)
+                .bind(out.file.file_size_bytes)
+                .bind(out.file.footer_size)
+                .bind(out.file.record_count)
+                .bind(begin)
+                .bind(out.partial_max)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Recompute the visible stat totals from the surviving files (see the
+            // SQLite writer for why this is correct for both merge and rewrite).
+            // next_row_id is deliberately not advanced (no new logical rows).
+            sqlx::query(
+                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES ($1, 0, 0, 0) ON CONFLICT (table_id) DO NOTHING",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats SET
+                     record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                     FROM ducklake_data_file
+                                     WHERE table_id = $1 AND end_snapshot IS NULL),
+                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                        FROM ducklake_data_file
+                                        WHERE table_id = $1 AND end_snapshot IS NULL)
+                 WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made, commit_message)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(snapshot_id)
+            .bind(format!("compacted_table:{table_id}"))
+            .bind("datafusion compaction")
+            .execute(&mut *tx)
+            .await?;
 
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = $1")

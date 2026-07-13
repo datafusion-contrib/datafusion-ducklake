@@ -502,6 +502,22 @@ pub struct DuckLakeTableFile {
     pub row_id_start: Option<i64>,
     /// Snapshot ID when this file was created (reserved for future use)
     pub snapshot_id: Option<i64>,
+    /// The file's own `begin_snapshot` (origin snapshot). Distinct from
+    /// `snapshot_id` (the QUERIED snapshot). Compaction uses it as each row's
+    /// origin for the merged partial file's per-row `_ducklake_internal_snapshot_id`
+    /// column and `partial_max`. `None` when the provider does not surface it.
+    pub begin_snapshot: Option<i64>,
+    /// The catalog `schema_version` in effect at `begin_snapshot`. Compaction
+    /// merges only files sharing one schema version (never across a DDL
+    /// boundary). `None` when the provider does not surface it.
+    pub schema_version: Option<i64>,
+    /// `partial_max` from `ducklake_data_file`: for a merged **partial data
+    /// file**, the maximum origin snapshot id among its rows (their per-row
+    /// origin is embedded in the `_ducklake_internal_snapshot_id` column).
+    /// `None` for ordinary files. When reading at a snapshot below this, the
+    /// read path drops the file's rows whose embedded origin exceeds the read
+    /// snapshot (per-row time-travel visibility).
+    pub partial_max: Option<i64>,
     /// Total rows in this file (`record_count` from the catalog), before any
     /// delete files are applied. Used for synthetic `rowid` generation.
     pub max_row_count: Option<i64>,
@@ -524,6 +540,9 @@ impl DuckLakeTableFile {
             delete_file: None,
             row_id_start: None,
             snapshot_id: None,
+            begin_snapshot: None,
+            schema_version: None,
+            partial_max: None,
             max_row_count: None,
             delete_count: None,
         }

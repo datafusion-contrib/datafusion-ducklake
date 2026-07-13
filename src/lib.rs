@@ -47,6 +47,7 @@ pub mod path_resolver;
 pub(crate) mod positional_source;
 pub mod row_id;
 pub mod schema;
+pub mod snapshot_filter;
 pub mod table;
 pub mod table_changes;
 pub mod table_deletions;
@@ -64,6 +65,8 @@ pub mod metadata_provider_postgres;
 pub mod metadata_provider_sqlite;
 
 // Write support (feature-gated)
+#[cfg(feature = "write")]
+pub mod compaction;
 #[cfg(feature = "write")]
 pub mod delete_exec;
 #[cfg(feature = "write")]
@@ -112,13 +115,16 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
+pub use compaction::{CompactionResult, MergeOptions, RewriteOptions};
+#[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteResult, WriteSetupResult,
+    ColumnDef, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
+    DeleteFileEntry, DeleteFileInfo, MetadataWriter, SourceRetirement, WriteMode, WriteResult,
+    WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

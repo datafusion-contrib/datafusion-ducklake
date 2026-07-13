@@ -233,7 +233,15 @@ impl MetadataProvider for PostgresMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.begin_snapshot::bigint AS data_begin_snapshot,
+                    data.partial_max::bigint AS data_partial_max,
+                    (SELECT sv.schema_version::bigint
+                     FROM ducklake_schema_versions sv
+                     WHERE sv.table_id = data.table_id
+                       AND sv.begin_snapshot <= data.begin_snapshot
+                     ORDER BY sv.begin_snapshot DESC
+                     LIMIT 1) AS data_schema_version
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -288,6 +296,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
+                        begin_snapshot: row.try_get(15)?,
+                        schema_version: row.try_get(17)?,
+                        partial_max: row.try_get(16)?,
                         max_row_count: record_count,
                         delete_count,
                     })
@@ -543,6 +554,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                             delete_file,
                             row_id_start: None,
                             snapshot_id: None,
+                            begin_snapshot: None,
+                            schema_version: None,
+                            partial_max: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
                         },

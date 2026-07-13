@@ -22,7 +22,7 @@ use crate::metadata_writer::{
     WriteResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
-use crate::row_id::embedded_rowid_field;
+use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
 
 /// High-level writer for DuckLake tables.
@@ -389,6 +389,103 @@ impl DuckLakeTableWriter {
             DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
                 .with_footer_size(footer_size),
         )
+    }
+
+    /// Write ONE compacted parquet file to the table's data directory and return
+    /// its [`DataFileInfo`], performing NO catalog work — the compaction commit
+    /// ([`MetadataWriter::commit_compaction`]) registers the file and retires the
+    /// sources atomically.
+    ///
+    /// The output embeds each row's original rowid (field-id
+    /// [`ROW_ID_PARQUET_FIELD_ID`](crate::row_id::ROW_ID_PARQUET_FIELD_ID)) so
+    /// row lineage survives the rewrite, exactly like the `UPDATE` writer; when
+    /// `embed_snapshot_id` is set it ALSO embeds the per-row
+    /// `_ducklake_internal_snapshot_id` column (field-id
+    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`](crate::row_id::SNAPSHOT_ID_PARQUET_FIELD_ID))
+    /// that marks a merged partial file.
+    ///
+    /// `data_schema` describes ONLY the table's data columns (catalog types, no
+    /// rowid/snapshot); `data_column_ids` are their catalog `column_id`s (baked
+    /// in as parquet field-ids so a read maps them back). Each batch in `batches`
+    /// must have the data columns in order, then a trailing `Int64` rowid column,
+    /// and — when `embed_snapshot_id` — a further trailing `Int64` snapshot-id
+    /// column. Streams to a local staging file and multipart-uploads it, so peak
+    /// memory stays bounded regardless of file size.
+    pub async fn write_compacted_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_schema: &Schema,
+        data_column_ids: &[i64],
+        batches: &[RecordBatch],
+        embed_snapshot_id: bool,
+    ) -> Result<DataFileInfo> {
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let object_path_str = join_paths(&table_key, &file_name)?;
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+        // Data columns carry their catalog field-ids; append the reserved-field-id
+        // embedded rowid column, and for a merged partial file the snapshot-id
+        // column. Neither embedded column is a catalog column.
+        let schema_with_ids = {
+            let base = build_schema_with_field_ids(data_schema, data_column_ids);
+            let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+            fields.push(embedded_rowid_field());
+            if embed_snapshot_id {
+                fields.push(embedded_snapshot_id_field());
+            }
+            Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
+        };
+
+        let mut props_builder = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression);
+        if let Some(rows) = self.max_row_group_rows {
+            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
+        }
+        if let Some(bytes) = self.max_row_group_bytes {
+            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
+        }
+        let props = props_builder.build();
+
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+        let mut row_count: i64 = 0;
+        for batch in batches {
+            if batch.num_columns() != schema_with_ids.fields().len() {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "write_compacted_file: batch has {} columns, expected {}",
+                    batch.num_columns(),
+                    schema_with_ids.fields().len()
+                )));
+            }
+            let batch_with_ids =
+                RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
+            writer.write(&batch_with_ids)?;
+            row_count += batch.num_rows() as i64;
+        }
+        let staged = writer.into_inner()?;
+        let mut file = staged
+            .into_inner()
+            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+        let file_size = file.metadata()?.len() as i64;
+        let footer_size = read_footer_size(&mut file)?;
+
+        let local = tokio::fs::File::open(temp.path()).await?;
+        let mut reader = tokio::io::BufReader::new(local);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+            let _ = upload.abort().await;
+            return Err(e.into());
+        }
+
+        Ok(DataFileInfo::new(file_name, file_size, row_count).with_footer_size(footer_size))
     }
 }
 

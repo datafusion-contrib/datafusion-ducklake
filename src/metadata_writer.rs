@@ -312,6 +312,69 @@ pub(crate) fn validate_delete_entries(mode: WriteMode, deletes: &[DeleteFileEntr
     Ok(())
 }
 
+/// One source (data) file being retired by a compaction commit
+/// ([`MetadataWriter::commit_compaction`]).
+///
+/// Its rows have been rewritten into a [`CompactionOutputFile`]; the commit
+/// retires this data file (sets `end_snapshot`) and its live delete file (if
+/// any) and schedules BOTH for physical deletion. `delete_file_id` is a
+/// compare-and-swap guard: the commit aborts if the live delete file for
+/// `data_file_id` no longer matches it (a concurrent DELETE/UPDATE moved the
+/// file's live rows since they were read, which would otherwise resurrect
+/// deleted rows into the rewritten output).
+#[derive(Debug, Clone)]
+pub struct CompactionSourceFile {
+    /// The data file being retired + scheduled for deletion.
+    pub data_file_id: i64,
+    /// The live delete file the caller resolved the source's live rows against
+    /// (retired + scheduled with the data file), or `None` if none was live.
+    pub delete_file_id: Option<i64>,
+}
+
+/// How a compaction commit retires its source files
+/// ([`MetadataWriter::commit_compaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRetirement {
+    /// The outputs fully represent the sources for EVERY snapshot (a merged
+    /// partial file, visible from its min origin snapshot with per-row
+    /// filtering), so the source catalog rows are removed and their physical
+    /// files scheduled for deletion — `cleanup_old_files` may reclaim them at
+    /// once. Used by `merge_adjacent_files`.
+    Remove,
+    /// The outputs only hold currently-live rows (a `rewrite_data_files`
+    /// output), so the sources still serve time travel to pre-compaction
+    /// snapshots: retire them (set `end_snapshot`) but do NOT schedule them.
+    /// `expire_snapshots` schedules them once their snapshots are expired, so
+    /// disk reclamation is deferred but time travel stays correct.
+    Retire,
+}
+
+/// One new file to register in a compaction commit
+/// ([`MetadataWriter::commit_compaction`]).
+///
+/// The parquet has already been written (embedding each row's original rowid,
+/// and for a merged partial file the per-row `_ducklake_internal_snapshot_id`
+/// column); this is the catalog registration. `row_id_start` is stored NULL
+/// because the file's rowids are served from its embedded rowid column, not
+/// synthesized from a start.
+#[derive(Debug, Clone)]
+pub struct CompactionOutputFile {
+    /// The written parquet's location / size / record count.
+    pub file: DataFileInfo,
+    /// `partial_max` for a merged partial file: the maximum origin snapshot id
+    /// among its rows (so a reader knows the file is partial and, below this
+    /// snapshot, filters its rows per-origin). `None` for a rewrite output or a
+    /// merge whose rows all share one origin snapshot.
+    pub partial_max: Option<i64>,
+    /// `begin_snapshot` for this output. For a merged partial file, the MINIMUM
+    /// origin snapshot among its rows, so historical reads back to that point
+    /// see it (row-filtered by origin). `None` means "use the new compaction
+    /// snapshot" — the correct choice for a rewrite output, whose rows are all
+    /// currently-live and whose pre-compaction history is served by the retained
+    /// sources.
+    pub begin_snapshot: Option<i64>,
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {
@@ -570,6 +633,51 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(
             "positional DELETE is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Commit a compaction (`merge_adjacent_files` / `rewrite_data_files`) in
+    /// ONE new snapshot: register the rewritten `outputs`, retire every `source`
+    /// data file AND its live delete file, recompute the table's visible stat
+    /// totals from the surviving files, and record `changes_made =
+    /// compacted_table:<id>` in `ducklake_snapshot_changes`.
+    ///
+    /// `retirement` decides how the sources are retired:
+    /// [`SourceRetirement::Remove`] (merge — the partial output covers every
+    /// snapshot, so remove the source rows AND schedule their files for
+    /// deletion) or [`SourceRetirement::Retire`] (rewrite — the sources still
+    /// serve time travel, so set `end_snapshot` but do NOT schedule them).
+    /// Either way, no file is physically deleted here.
+    ///
+    /// Compaction changes the physical file layout, not the logical rows, so the
+    /// commit is designed NOT to conflict with a concurrent append (which adds
+    /// unrelated files): the only conflict checks are, for each `source`, that
+    /// its data file is still live and that its live delete file still matches
+    /// [`CompactionSourceFile::delete_file_id`] (a compare-and-swap). Either
+    /// mismatch — a concurrent Replace/compaction that retired the file, or a
+    /// concurrent DELETE/UPDATE that changed its live rows since they were read —
+    /// aborts with [`crate::DuckLakeError::Conflict`] so retired rows can never
+    /// be resurrected into an output. The new snapshot carries `schema_version`
+    /// forward (compaction is not DDL). `base_snapshot` is the catalog head the
+    /// sources were read at, used only for the conflict diagnostic.
+    ///
+    /// Each output is registered with `end_snapshot` NULL, `row_id_start` NULL
+    /// (rowids come from the embedded column), its
+    /// [`CompactionOutputFile::partial_max`], and `begin_snapshot` =
+    /// [`CompactionOutputFile::begin_snapshot`] (or the new snapshot when that is
+    /// `None`).
+    ///
+    /// Default: unsupported; the SQLite and Postgres backends override it.
+    fn commit_compaction(
+        &self,
+        _table_id: i64,
+        _base_snapshot: i64,
+        _sources: &[CompactionSourceFile],
+        _outputs: &[CompactionOutputFile],
+        _retirement: SourceRetirement,
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "compaction is not supported on this metadata backend".to_string(),
         ))
     }
 

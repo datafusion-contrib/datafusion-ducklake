@@ -86,6 +86,38 @@ pub fn embedded_rowid_field() -> Field {
     Field::new(EMBEDDED_ROW_ID_COLUMN_NAME, DataType::Int64, true).with_metadata(metadata)
 }
 
+/// Reserved parquet field-id for the per-row snapshot-id column embedded in a
+/// **partial data file** produced by `merge_adjacent_files`. Matches the
+/// DuckLake extension's `_ducklake_internal_snapshot_id` field-id
+/// (`ROW_ID_PARQUET_FIELD_ID - 1`); the two reserved ids sit adjacent below
+/// `i32::MAX` so neither collides with a catalog `column_id` (which are small
+/// positive ints assigned from `next_column_id`).
+pub const SNAPSHOT_ID_PARQUET_FIELD_ID: i32 = 2_147_483_539;
+
+/// Parquet column name our writer uses for the embedded snapshot-id column on
+/// merged partial files. The read path matches the column by its
+/// [`SNAPSHOT_ID_PARQUET_FIELD_ID`] field-id, not this name, so the exact
+/// string is cosmetic; we mirror the DuckLake extension's
+/// `_ducklake_internal_snapshot_id`.
+pub const EMBEDDED_SNAPSHOT_ID_COLUMN_NAME: &str = "_ducklake_internal_snapshot_id";
+
+/// Build the Arrow [`Field`] for the embedded per-row snapshot-id column written
+/// into a merged partial file (`merge_adjacent_files`). Each value is the
+/// snapshot in which that row originally became visible, so time-travel / CDC
+/// can still attribute a merged row to its origin snapshot. Carries the reserved
+/// [`SNAPSHOT_ID_PARQUET_FIELD_ID`] as its `PARQUET:field_id` metadata; because
+/// that id matches no catalog column and is not the rowid id, the standard read
+/// path (which maps parquet columns to catalog columns strictly by field-id)
+/// simply ignores it. Nullable for parity with the other embedded columns.
+pub fn embedded_snapshot_id_field() -> Field {
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "PARQUET:field_id".to_string(),
+        SNAPSHOT_ID_PARQUET_FIELD_ID.to_string(),
+    );
+    Field::new(EMBEDDED_SNAPSHOT_ID_COLUMN_NAME, DataType::Int64, true).with_metadata(metadata)
+}
+
 /// Build the Arrow Field for the rowid column. Nullable so we can emit NULL
 /// for files whose catalog row_id_start is unrecorded (e.g. older catalogs).
 pub fn rowid_field() -> Field {
