@@ -191,6 +191,23 @@ are backend-gated (`write-sqlite` / `write-postgres`). `DROP TABLE` is available
 [`examples/maintenance_demo.rs`](examples/maintenance_demo.rs) and
 [`examples/orphan_cleanup_demo.rs`](examples/orphan_cleanup_demo.rs).
 
+### Compaction
+
+Two explicit, triggered operations on `DuckLakeTable` rewrite a table's data files
+into a better physical layout without changing its logical rows:
+
+- `merge_adjacent_files(state, MergeOptions)` coalesces several small files (of the
+  same schema version) into fewer larger ones. A merged file spanning multiple
+  origin snapshots is written as a DuckLake *partial data file* (preserving each
+  row's original rowid and origin snapshot), so time travel and change feeds are
+  unaffected.
+- `rewrite_data_files(state, RewriteOptions)` rewrites a file whose deleted fraction
+  exceeds a threshold (default `0.95`), dropping its deleted rows.
+
+Both commit atomically in one snapshot and coexist with concurrent appends; superseded
+files are scheduled for deletion and reclaimed later by `cleanup_old_files`. See
+[`examples/compaction_demo.rs`](examples/compaction_demo.rs).
+
 ---
 
 ## Compatibility
