@@ -187,6 +187,12 @@ impl DuckLakeTable {
             .iter()
             .filter(|f| {
                 f.delete_file_id.is_none()
+                    // Never re-merge an existing partial file: its rows carry
+                    // per-row origins in the embedded `_ducklake_internal_snapshot_id`
+                    // column, which the read path used to reconstruct them does NOT
+                    // surface — re-merging would collapse every row onto the file's
+                    // single begin_snapshot and corrupt time travel.
+                    && f.partial_max.is_none()
                     && f.begin_snapshot.is_some()
                     && f.schema_version.is_some()
                     && (f.file.file_size_bytes as u64) >= opts.min_file_size
@@ -232,6 +238,23 @@ impl DuckLakeTable {
         let mut rows_written = 0i64;
 
         for bin in &bins {
+            // Safety: the merged output is written at the table's CURRENT schema,
+            // so a source carrying a column dropped since it was written would
+            // lose that column's data (and its source is then removed). Skip any
+            // such group entirely — those files are left uncompacted rather than
+            // silently losing data. (The common case — files at the current
+            // schema, or an older schema that only ADDED columns — is unaffected.)
+            let mut bin_would_drop_columns = false;
+            for tf in bin {
+                if self.file_drops_current_columns(state, &tf.file).await? {
+                    bin_would_drop_columns = true;
+                    break;
+                }
+            }
+            if bin_would_drop_columns {
+                continue;
+            }
+
             // Read each source's live rows (with original rowids) and its origin.
             let mut per_source: Vec<(Vec<RecordBatch>, i64)> = Vec::with_capacity(bin.len());
             for tf in bin {

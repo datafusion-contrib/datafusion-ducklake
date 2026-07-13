@@ -599,6 +599,123 @@ async fn merge_respects_schema_version_boundary() {
     );
 }
 
+/// A partial file must NEVER be re-merged: the read path that reconstructs a
+/// source's rows does not surface the embedded per-row origin column, so
+/// re-merging would collapse every row onto the file's single begin_snapshot and
+/// corrupt time travel. `merge_adjacent_files` therefore excludes partial files
+/// from its candidates.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_never_remerges_a_partial_file() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await; // snapshot 1
+    append(&temp, vec![2], vec![20]).await; // snapshot 2
+    append(&temp, vec![3], vec![30]).await; // snapshot 3
+
+    // Merge #1 -> partial file P (origins {1,2,3}, begin=1, partial_max=3).
+    let r1 = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(r1.files_created, 1);
+    let p = pool(&temp).await;
+    assert_eq!(
+        opt_i64(
+            &p,
+            "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        Some(3),
+        "merge produced a partial file"
+    );
+
+    append(&temp, vec![4], vec![40]).await; // snapshot 5 (one more small file, D)
+
+    // Merge #2: P is excluded (partial), leaving only D — a single file, so no
+    // group of >= 2 forms and nothing is merged. Crucially, P is not re-merged.
+    let r2 = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(
+        r2.files_processed, 0,
+        "the partial file P is not a candidate; D alone cannot merge"
+    );
+
+    // Time travel to snapshot 2 must still return exactly rows from origins <= 2.
+    // If P had been re-merged, its rows would all carry origin 1 and (3,30) would
+    // wrongly reappear here.
+    assert_eq!(
+        read_rows_at(&temp, 2).await,
+        vec![(1, 10), (2, 20)],
+        "time travel intact: no origins collapsed by a re-merge"
+    );
+    // Current snapshot sees everything.
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+}
+
+/// Merge must not silently drop a column's data. When a column has been dropped
+/// since a file was written, merging that file (output is written at the CURRENT
+/// schema) would lose the column — so `merge_adjacent_files` skips such files.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_skips_files_whose_columns_were_dropped() {
+    let temp = TempDir::new().unwrap();
+    // Two (id, val) files at schema version 1.
+    seed(&temp, vec![1, 2], vec![10, 20]).await; // snapshot 1 (file A)
+    append(&temp, vec![3, 4], vec![30, 40]).await; // snapshot 2 (file B)
+
+    // A DDL that DROPS `val` (append a batch with only `id`) bumps the schema and
+    // ends the `val` column; A and B stay live (Append), now at an older version
+    // whose schema includes a column absent from the current one.
+    {
+        let id_only = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let writer = Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+        let b = batch(id_only, vec![Arc::new(Int32Array::from(vec![5]))]);
+        DuckLakeTableWriter::new(writer, object_store())
+            .unwrap()
+            .append_table("main", "t", &[b])
+            .await
+            .unwrap();
+    }
+
+    let p = pool(&temp).await;
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        3,
+        "three live files (A, B at v1; C at v2)"
+    );
+
+    // Merge: the v1 group {A, B} carries `val`, which the current schema dropped,
+    // so it is skipped (merging would lose `val`); the v2 file is a singleton.
+    let result = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(
+        result.files_processed, 0,
+        "column-dropping files are not merged"
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion"
+        )
+        .await,
+        0,
+        "nothing merged, nothing scheduled"
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        3,
+        "all three files remain live (A, B not removed)"
+    );
+
+    // Time travel to snapshot 1 still returns A's rows WITH `val` intact — proof
+    // that A was not merged into a current-schema (val-less) file and removed.
+    assert_eq!(read_rows_at(&temp, 1).await, vec![(1, 10), (2, 20)]);
+}
+
 /// The durability property: after a merge, physically deleting the retired
 /// source files (via `cleanup_old_files`) must NOT break time travel — the
 /// merged partial file serves every historical snapshot on its own, via per-row

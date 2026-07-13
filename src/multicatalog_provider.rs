@@ -250,7 +250,38 @@ impl MetadataProvider for MulticatalogProvider {
     ) -> Result<Vec<DuckLakeTableFile>> {
         // Files inherit catalog via table_id. No scoping.
         block_on(async {
-            let rows = sqlx::query(
+            // Backward compatibility (mirrors the single-catalog Postgres
+            // provider): degrade `partial_max` / `schema_version` to NULL when a
+            // catalog predates the v1.0 partial-file column or the
+            // `ducklake_schema_versions` ledger. Surfacing these lets compaction
+            // (which pairs its writer with THIS reader) select merge candidates
+            // and lets time-travel reads filter partial files per-row.
+            let has_partial_max: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max')",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let has_schema_versions: bool =
+                sqlx::query_scalar("SELECT to_regclass('ducklake_schema_versions') IS NOT NULL")
+                    .fetch_one(&self.pool)
+                    .await?;
+            let partial_max_expr = if has_partial_max {
+                "data.partial_max::bigint"
+            } else {
+                "NULL::bigint"
+            };
+            let schema_version_expr = if has_schema_versions {
+                "(SELECT sv.schema_version::bigint
+                  FROM ducklake_schema_versions sv
+                  WHERE sv.table_id = data.table_id
+                    AND sv.begin_snapshot <= data.begin_snapshot
+                  ORDER BY sv.begin_snapshot DESC
+                  LIMIT 1)"
+            } else {
+                "NULL::bigint"
+            };
+            let sql = format!(
                 "SELECT
                     data.data_file_id,
                     data.path AS data_file_path,
@@ -266,7 +297,10 @@ impl MetadataProvider for MulticatalogProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.begin_snapshot::bigint AS data_begin_snapshot,
+                    {partial_max_expr} AS data_partial_max,
+                    {schema_version_expr} AS data_schema_version
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -275,16 +309,17 @@ impl MetadataProvider for MulticatalogProvider {
                     AND ($3 < del.end_snapshot OR del.end_snapshot IS NULL)
                 WHERE data.table_id = $4
                   AND $5 >= data.begin_snapshot
-                  AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                  AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)"
+            );
+            let rows = sqlx::query(&sql)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -321,9 +356,9 @@ impl MetadataProvider for MulticatalogProvider {
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
-                        begin_snapshot: None,
-                        schema_version: None,
-                        partial_max: None,
+                        begin_snapshot: row.try_get(15)?,
+                        schema_version: row.try_get(17)?,
+                        partial_max: row.try_get(16)?,
                         max_row_count: record_count,
                         delete_count,
                     })

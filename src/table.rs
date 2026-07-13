@@ -161,6 +161,13 @@ struct FileReadConfig {
     ///
     /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`]: crate::row_id::SNAPSHOT_ID_PARQUET_FIELD_ID
     embedded_snapshot_parquet_name: Option<String>,
+    /// True if the file carries a data column (parquet field-id) that is NOT in
+    /// the table's CURRENT schema — i.e. a column dropped since the file was
+    /// written. Reads null-drop it harmlessly, but compaction must NOT merge such
+    /// a file: merged output is written at the current schema, so the dropped
+    /// column's data would be lost (and its sources removed). `merge_adjacent_files`
+    /// skips any group containing one.
+    drops_current_columns: bool,
     /// Per-row-group starting physical row position (prefix sums of
     /// `row_groups[i].num_rows()`). `row_group_starts[i]` is the 0-based file
     /// position of the first row of row group `i`. Used to build row-group-
@@ -899,6 +906,17 @@ impl DuckLakeTable {
         // Detect the embedded per-row snapshot-id column (marks a partial file).
         let embedded_snapshot_parquet_name =
             field_id_map.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned();
+        // Does the file carry a data column no longer in the current schema? Any
+        // parquet field-id that is neither a reserved embedded column nor one of
+        // the current catalog `column_id`s is a since-dropped column. Compaction
+        // uses this to refuse merging a file whose data would be lost.
+        let current_column_ids: std::collections::HashSet<i32> =
+            self.columns.iter().map(|c| c.column_id as i32).collect();
+        let drops_current_columns = field_id_map.keys().any(|fid| {
+            *fid != ROW_ID_PARQUET_FIELD_ID
+                && *fid != SNAPSHOT_ID_PARQUET_FIELD_ID
+                && !current_column_ids.contains(fid)
+        });
 
         let read_schema = if let Some(ref parquet_name) = embedded_rowid_parquet_name {
             // Append the embedded rowid column to read_schema under its
@@ -925,6 +943,7 @@ impl DuckLakeTable {
             name_mapping,
             embedded_rowid_parquet_name,
             embedded_snapshot_parquet_name,
+            drops_current_columns,
             row_group_starts,
             row_group_count,
         });
@@ -1337,6 +1356,23 @@ impl DuckLakeTable {
     #[cfg(feature = "write")]
     pub(crate) fn column_ids(&self) -> Vec<i64> {
         self.columns.iter().map(|c| c.column_id).collect()
+    }
+
+    /// Whether `file` carries a data column that is no longer in the table's
+    /// current schema (dropped since it was written). `merge_adjacent_files`
+    /// refuses to compact such a file — merged output is written at the current
+    /// schema, which would drop that column's data. Reads the parquet footer
+    /// (memoized in the per-file read-config cache).
+    #[cfg(feature = "write")]
+    pub(crate) async fn file_drops_current_columns(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<bool> {
+        Ok(self
+            .build_file_read_config(state, file)
+            .await?
+            .drops_current_columns)
     }
 
     /// Build the positional read plan (and the metadata needed to interpret it)
