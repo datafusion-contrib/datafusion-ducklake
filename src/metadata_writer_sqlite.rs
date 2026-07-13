@@ -9,8 +9,9 @@ use crate::maintenance::{
 };
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteSetupResult, columns_differ, validate_delete_entries, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
+    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
+    validate_name,
 };
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
@@ -152,6 +153,39 @@ CREATE TABLE IF NOT EXISTS ducklake_table_stats (
     record_count INTEGER NOT NULL DEFAULT 0,
     next_row_id INTEGER NOT NULL DEFAULT 0,
     file_size_bytes INTEGER NOT NULL DEFAULT 0
+);
+
+-- Per-file, per-column statistics (DuckLake spec zone maps). Powers file-level
+-- pruning: min/max are the DuckDB-canonical VARCHAR encoding of the bounds,
+-- value_count is the non-null count, null_count the null count. Column set
+-- mirrors the official extension exactly (no PK, matching upstream). A brand-
+-- new table for pre-existing catalogs: `CREATE TABLE IF NOT EXISTS` (re-run by
+-- initialize_schema on every open) creates it, which is also what lets DuckDB
+-- attach a catalog we wrote (its global-stats query joins the two stats tables).
+CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+    data_file_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    column_size_bytes INTEGER,
+    value_count INTEGER,
+    null_count INTEGER,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    contains_nan BOOLEAN,
+    extra_stats VARCHAR
+);
+
+-- Table-wide per-column roll-up (DuckLake spec). Feeds the query optimizer
+-- (cardinality/column bounds), not file pruning. `contains_null` is a boolean
+-- (any null across the table), not a count; min/max widen across all files.
+CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+    table_id INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    contains_null BOOLEAN,
+    contains_nan BOOLEAN,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    extra_stats VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_delete_file (
@@ -968,6 +1002,122 @@ async fn record_schema_version(
 /// snapshot-scoped), so inserting the new generation at begin would leak it to
 /// concurrent reads during the upload window. `column_ids` are the ids reserved
 /// at begin and already baked into the staged parquet's `field_id` metadata.
+/// Persist the harvested per-column statistics for a just-registered data file.
+///
+/// Writes one `ducklake_file_column_stats` row per [`ColumnStat`] (the zone maps
+/// that drive file pruning), within the caller's commit transaction so the
+/// stats land atomically with the `ducklake_data_file` row. `data_file_id` is
+/// the id of the row just inserted (SQLite `last_insert_rowid()`). A `None`
+/// bound/count is written as SQL `NULL` — spec-safe: a file with NULL stats is
+/// never pruned.
+async fn insert_file_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    data_file_id: i64,
+    column_stats: &[ColumnStat],
+) -> Result<()> {
+    for stat in column_stats {
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes,
+                  value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(stat.column_id)
+        .bind(stat.column_size_bytes)
+        .bind(stat.value_count)
+        .bind(stat.null_count)
+        .bind(stat.min_value.as_deref())
+        .bind(stat.max_value.as_deref())
+        .bind(stat.contains_nan)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Recompute the table-wide `ducklake_table_column_stats` roll-up (optimizer
+/// stats) from the table's currently-live files, and replace the stored rows.
+///
+/// Recomputing from live files (rather than incrementally widening) is correct
+/// for every write mode without special cases: an Append adds a live file;
+/// Replace/compaction retire the prior generation (their files drop out of the
+/// `end_snapshot IS NULL` set); a positional delete leaves the data file live
+/// with unchanged stats — so global bounds widen on insert and never tighten on
+/// delete, matching official DuckLake. Min/max widen with a type-aware compare
+/// ([`crate::stats_encode::stat_cmp`]); `contains_null`/`contains_nan` are OR-reduced.
+async fn recompute_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+) -> Result<()> {
+    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+
+    // Total live files: the completeness denominator. A live file missing from
+    // the per-column rows below (statless) forces the roll-up to UNKNOWN.
+    let live_file_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+
+    let mut per_file: Vec<FileColumnStat> = Vec::new();
+    for row in sqlx::query(
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+         FROM ducklake_file_column_stats s
+         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+         WHERE d.table_id = ? AND d.end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        per_file.push(FileColumnStat {
+            column_id: row.try_get(0)?,
+            min_value: row.try_get(1)?,
+            max_value: row.try_get(2)?,
+            null_count: row.try_get(3)?,
+            contains_nan: row.try_get(4)?,
+        });
+    }
+
+    let numeric_of = |column_id: i64| -> bool {
+        column_ids
+            .iter()
+            .position(|id| *id == column_id)
+            .and_then(|i| columns.get(i))
+            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
+            .unwrap_or(false)
+    };
+    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
+
+    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    for g in globals {
+        sqlx::query(
+            "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(table_id)
+        .bind(g.column_id)
+        .bind(g.contains_null)
+        .bind(g.contains_nan)
+        .bind(g.min_value)
+        .bind(g.max_value)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -1418,6 +1568,17 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            // Persist the file's per-column zone-map stats in the same tx. The
+            // data file is a fresh autoincrement rowid, so `last_insert_rowid()`
+            // (captured before any further INSERT) is its data_file_id.
+            let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get(0)?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            // Refresh the table-wide roll-up from the now-current live file set.
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
             // are never reused, even after end-snapshot.
@@ -1625,6 +1786,16 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+
+            // Persist the new file's per-column zone-map stats before any other
+            // INSERT (delete-file rows below) moves last_insert_rowid.
+            let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
+                .fetch_one(&mut *tx)
+                .await?
+                .try_get(0)?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            // Refresh the table-wide roll-up from the now-current live file set.
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -1956,6 +2127,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     ))
                     .execute(&mut *tx)
                     .await?;
+                    // Hard-delete the removed sources' per-column stats too, as
+                    // official DuckLake does on merge (otherwise they orphan).
+                    sqlx::query(&format!(
+                        "DELETE FROM ducklake_file_column_stats WHERE data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .execute(&mut *tx)
+                    .await?;
                 },
                 SourceRetirement::Retire => {
                     // Rewrite: the output only holds currently-live rows, so the
@@ -2005,6 +2184,15 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(out.partial_max)
                 .execute(&mut *tx)
                 .await?;
+                // Persist the compacted file's harvested zone maps, tying them to
+                // the row just inserted (same tx). Mirrors how official DuckLake
+                // records stats for compaction outputs via the shared write path.
+                let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
+                    .await?;
             }
 
             // Recompute the visible stat totals from the surviving files. Robust
@@ -3057,6 +3245,255 @@ mod tests {
             row.try_get(1).unwrap(),
             row.try_get(2).unwrap(),
         )
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn read_file_column_stats(
+        writer: &SqliteMetadataWriter,
+        path: &str,
+    ) -> Vec<(
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> {
+        sqlx::query(
+            "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.value_count
+             FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             WHERE d.path = ?
+             ORDER BY s.column_id",
+        )
+        .bind(path)
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get(0).unwrap(),
+                row.try_get(1).unwrap(),
+                row.try_get(2).unwrap(),
+                row.try_get(3).unwrap(),
+                row.try_get(4).unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_data_file_persists_column_stats() {
+        // register_data_file must write one ducklake_file_column_stats row per
+        // ColumnStat carried on the DataFileInfo, tied to the new data file's id.
+        let (writer, _temp) = create_test_writer().await;
+        let snap = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap)
+            .unwrap();
+
+        let file = DataFileInfo::new("a.parquet", 100, 3).with_column_stats(vec![
+            ColumnStat {
+                column_id: 1,
+                min_value: Some("1".to_string()),
+                max_value: Some("3".to_string()),
+                null_count: Some(0),
+                value_count: Some(3),
+                contains_nan: None,
+                column_size_bytes: None,
+            },
+            ColumnStat {
+                column_id: 2,
+                min_value: Some("Alice".to_string()),
+                max_value: Some("Bob".to_string()),
+                null_count: Some(1),
+                value_count: Some(2),
+                contains_nan: None,
+                column_size_bytes: None,
+            },
+        ]);
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                snap,
+                &file,
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let rows = read_file_column_stats(&writer, "a.parquet").await;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    Some("1".to_string()),
+                    Some("3".to_string()),
+                    Some(0),
+                    Some(3)
+                ),
+                (
+                    2,
+                    Some("Alice".to_string()),
+                    Some("Bob".to_string()),
+                    Some(1),
+                    Some(2)
+                ),
+            ]
+        );
+    }
+
+    async fn read_table_column_stats(
+        writer: &SqliteMetadataWriter,
+        table_id: i64,
+    ) -> Vec<(i64, Option<bool>, Option<String>, Option<String>)> {
+        sqlx::query(
+            "SELECT column_id, contains_null, min_value, max_value
+             FROM ducklake_table_column_stats WHERE table_id = ? ORDER BY column_id",
+        )
+        .bind(table_id)
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get(0).unwrap(),
+                row.try_get(1).unwrap(),
+                row.try_get(2).unwrap(),
+                row.try_get(3).unwrap(),
+            )
+        })
+        .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_column_stats_widen_numerically_across_files() {
+        // Two appends to a numeric column: global min/max must widen by numeric
+        // value (min "9", max "10"), NOT lexically (which would rank "10" < "9").
+        let (writer, _temp) = create_test_writer().await;
+        let snap1 = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap1)
+            .unwrap();
+        let columns = vec![ColumnDef::new("n", "int32", true).unwrap()];
+        let column_ids = vec![1_i64];
+
+        let stat = |min: &str, max: &str, nulls: i64, vals: i64| {
+            vec![ColumnStat {
+                column_id: 1,
+                min_value: Some(min.to_string()),
+                max_value: Some(max.to_string()),
+                null_count: Some(nulls),
+                value_count: Some(vals),
+                contains_nan: None,
+                column_size_bytes: None,
+            }]
+        };
+
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                snap1,
+                &DataFileInfo::new("a.parquet", 100, 3).with_column_stats(stat("9", "9", 0, 3)),
+                WriteMode::Append,
+                0,
+                &columns,
+                &column_ids,
+            )
+            .unwrap();
+        let snap2 = reserve_snapshot(&writer).await;
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                snap2,
+                &DataFileInfo::new("b.parquet", 100, 2).with_column_stats(stat("10", "10", 1, 1)),
+                WriteMode::Append,
+                0,
+                &columns,
+                &column_ids,
+            )
+            .unwrap();
+
+        // Two files' per-file stats persisted.
+        assert_eq!(read_file_column_stats(&writer, "a.parquet").await.len(), 1);
+        assert_eq!(read_file_column_stats(&writer, "b.parquet").await.len(), 1);
+
+        // Global roll-up widened numerically, and contains_null OR-reduced true.
+        assert_eq!(
+            read_table_column_stats(&writer, table_id).await,
+            vec![(1, Some(true), Some("9".to_string()), Some("10".to_string()))]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_column_stats_null_when_a_live_file_lacks_stats() {
+        // File A has stats (null-free); file B is statless (empty column_stats).
+        // Even though A reports contains_null=false, the roll-up must degrade to
+        // NULL (unknown) — otherwise a reader treats the column as proven
+        // null-free and drops genuine IS NULL rows. (Review finding M1.)
+        let (writer, _temp) = create_test_writer().await;
+        let snap1 = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, snap1)
+            .unwrap();
+        let columns = vec![ColumnDef::new("n", "int32", true).unwrap()];
+        let column_ids = vec![1_i64];
+
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                snap1,
+                &DataFileInfo::new("a.parquet", 100, 3).with_column_stats(vec![ColumnStat {
+                    column_id: 1,
+                    min_value: Some("1".to_string()),
+                    max_value: Some("1".to_string()),
+                    null_count: Some(0),
+                    value_count: Some(3),
+                    contains_nan: None,
+                    column_size_bytes: None,
+                }]),
+                WriteMode::Append,
+                0,
+                &columns,
+                &column_ids,
+            )
+            .unwrap();
+        let snap2 = reserve_snapshot(&writer).await;
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                snap2,
+                // Statless: no per-column stats attached.
+                &DataFileInfo::new("b.parquet", 100, 2),
+                WriteMode::Append,
+                0,
+                &columns,
+                &column_ids,
+            )
+            .unwrap();
+
+        assert_eq!(
+            read_table_column_stats(&writer, table_id).await,
+            vec![(1, None, None, None)],
+            "incomplete coverage (a statless live file) must NULL the roll-up"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

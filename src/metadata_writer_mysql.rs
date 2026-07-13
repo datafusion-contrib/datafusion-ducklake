@@ -34,7 +34,7 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
     columns_differ, validate_name,
 };
 use sqlx::Row;
@@ -130,6 +130,31 @@ const SQL_CREATE_TABLES: &[&str] = &[
         record_count BIGINT NOT NULL DEFAULT 0,
         next_row_id BIGINT NOT NULL DEFAULT 0,
         file_size_bytes BIGINT NOT NULL DEFAULT 0
+    ) ENGINE = InnoDB"#,
+    // Per-file, per-column zone maps (DuckLake spec) — powers file pruning.
+    // min/max use TEXT (bounds can be up to the encoder's length cap). Column
+    // set mirrors the official extension and the other backends.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+        data_file_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        column_size_bytes BIGINT,
+        value_count BIGINT,
+        null_count BIGINT,
+        min_value TEXT,
+        max_value TEXT,
+        contains_nan BOOLEAN,
+        extra_stats TEXT
+    ) ENGINE = InnoDB"#,
+    // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+        table_id BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        contains_null BOOLEAN,
+        contains_nan BOOLEAN,
+        min_value TEXT,
+        max_value TEXT,
+        extra_stats TEXT
     ) ENGINE = InnoDB"#,
     // Created for catalog-shape parity and so the provider's LEFT JOINs resolve;
     // this writer never inserts delete files (`set_delete_file` is unsupported).
@@ -396,6 +421,106 @@ async fn record_schema_version(
 /// generation at begin would leak it to concurrent reads during the upload
 /// window. `column_ids` are the ids reserved at begin and already baked into the
 /// staged parquet's `field_id` metadata.
+/// Persist the harvested per-column stats for a just-registered data file
+/// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
+async fn insert_file_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    data_file_id: i64,
+    column_stats: &[ColumnStat],
+) -> Result<()> {
+    for stat in column_stats {
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes,
+                  value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(stat.column_id)
+        .bind(stat.column_size_bytes)
+        .bind(stat.value_count)
+        .bind(stat.null_count)
+        .bind(stat.min_value.as_deref())
+        .bind(stat.max_value.as_deref())
+        .bind(stat.contains_nan)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Recompute `ducklake_table_column_stats` from the table's live files and
+/// replace the stored rows. See the SQLite writer's equivalent for the rationale.
+async fn recompute_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+) -> Result<()> {
+    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+
+    let live_file_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+
+    let mut per_file: Vec<FileColumnStat> = Vec::new();
+    for row in sqlx::query(
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+         FROM ducklake_file_column_stats s
+         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+         WHERE d.table_id = ? AND d.end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        per_file.push(FileColumnStat {
+            column_id: row.try_get(0)?,
+            min_value: row.try_get(1)?,
+            max_value: row.try_get(2)?,
+            null_count: row.try_get(3)?,
+            contains_nan: row.try_get(4)?,
+        });
+    }
+
+    let numeric_of = |column_id: i64| -> bool {
+        column_ids
+            .iter()
+            .position(|id| *id == column_id)
+            .and_then(|i| columns.get(i))
+            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
+            .unwrap_or(false)
+    };
+    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
+
+    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    for g in globals {
+        sqlx::query(
+            "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(table_id)
+        .bind(g.column_id)
+        .bind(g.contains_null)
+        .bind(g.contains_nan)
+        .bind(g.min_value)
+        .bind(g.max_value)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -712,7 +837,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?
                     .try_get(0)?;
 
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
@@ -728,6 +853,12 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
+
+            // MySQL has no RETURNING: the auto-increment PK is read via
+            // last_insert_id(). Persist the file's zone maps + refresh the roll-up.
+            let data_file_id = inserted.last_insert_id() as i64;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime.

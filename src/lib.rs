@@ -88,6 +88,10 @@ pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
 pub mod multicatalog_provider;
 #[cfg(feature = "write")]
+pub mod stats_collect;
+#[cfg(feature = "write")]
+pub mod stats_encode;
+#[cfg(feature = "write")]
 pub mod table_writer;
 #[cfg(feature = "write")]
 pub mod update_exec;
@@ -122,7 +126,7 @@ pub use delete_exec::DuckLakeDeleteExec;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
+    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
     DeleteFileEntry, DeleteFileInfo, MetadataWriter, SourceRetirement, WriteMode, WriteResult,
     WriteSetupResult,
 };

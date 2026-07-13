@@ -160,6 +160,35 @@ pub(crate) fn columns_differ(existing: &[(String, String, bool)], proposed: &[Co
     false
 }
 
+/// Per-column statistics for one data file, persisted to
+/// `ducklake_file_column_stats` and used for file-level pruning.
+///
+/// Mirrors the official DuckLake row shape. `min_value` / `max_value` are the
+/// DuckDB-canonical `VARCHAR` encoding of the bounds (see
+/// [`crate::stats_encode`]); `None` means SQL `NULL` — DuckLake keeps (never
+/// prunes) a file whose bound is NULL, so `None` is always the safe value for a
+/// type or value we cannot faithfully encode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStat {
+    /// Catalog `column_id` (DuckLake field id) this stat describes.
+    pub column_id: i64,
+    /// Minimum value, DuckDB-canonical `VARCHAR`, or `None` for SQL `NULL`.
+    pub min_value: Option<String>,
+    /// Maximum value, DuckDB-canonical `VARCHAR`, or `None` for SQL `NULL`.
+    pub max_value: Option<String>,
+    /// Number of NULL values in this column across the file.
+    pub null_count: Option<i64>,
+    /// Number of non-NULL values in this column across the file.
+    pub value_count: Option<i64>,
+    /// For `FLOAT`/`DOUBLE` columns: whether any NaN is present. `None` for
+    /// non-floating columns. When `true`, `min_value`/`max_value` are omitted
+    /// (matching DuckLake), so float pruning is only sound when this is `false`.
+    pub contains_nan: Option<bool>,
+    /// Total compressed size of the column in bytes. Currently always `None`
+    /// (deferred; not needed for pruning). See `[[column-size-bytes]]`.
+    pub column_size_bytes: Option<i64>,
+}
+
 /// Information about a data file to register in the catalog.
 ///
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.
@@ -175,6 +204,11 @@ pub struct DataFileInfo {
     pub footer_size: Option<i64>,
     /// Number of records in the file
     pub record_count: i64,
+    /// Per-column statistics (min/max/null counts) to persist to
+    /// `ducklake_file_column_stats`. Empty when stats were not computed (e.g. a
+    /// caller that predates stats support); backends must treat an empty vector
+    /// as "no stats rows for this file", which is spec-safe.
+    pub column_stats: Vec<ColumnStat>,
 }
 
 impl DataFileInfo {
@@ -197,12 +231,19 @@ impl DataFileInfo {
             file_size_bytes,
             footer_size: None,
             record_count,
+            column_stats: Vec::new(),
         }
     }
 
     /// Set the footer size for read optimization.
     pub fn with_footer_size(mut self, footer_size: i64) -> Self {
         self.footer_size = Some(footer_size);
+        self
+    }
+
+    /// Attach per-column statistics to persist to `ducklake_file_column_stats`.
+    pub fn with_column_stats(mut self, column_stats: Vec<ColumnStat>) -> Self {
+        self.column_stats = column_stats;
         self
     }
 

@@ -267,6 +267,7 @@ impl DuckLakeTableWriter {
             path_is_relative,
             mode,
             row_count: 0,
+            nan_flags: Vec::new(),
         })
     }
 
@@ -485,7 +486,30 @@ impl DuckLakeTableWriter {
             return Err(e.into());
         }
 
-        Ok(DataFileInfo::new(file_name, file_size, row_count).with_footer_size(footer_size))
+        // Harvest per-column stats for the compacted file, exactly as a normal
+        // write does — mirroring official DuckLake, whose compaction reuses the
+        // same WRITTEN_FILE_STATISTICS path. `data_column_ids` covers only the
+        // catalog data columns, so the trailing embedded rowid/snapshot columns
+        // are skipped by the harvest. NaN flags are computed from the batches
+        // (the footer carries no NaN signal).
+        let mut nan_flags: Vec<Option<bool>> = Vec::new();
+        for batch in batches {
+            crate::stats_collect::accumulate_nan_flags(
+                &mut nan_flags,
+                batch,
+                data_column_ids.len(),
+            );
+        }
+        let column_stats = crate::stats_collect::collect_column_stats(
+            temp.path(),
+            data_column_ids,
+            row_count,
+            &nan_flags,
+        );
+
+        Ok(DataFileInfo::new(file_name, file_size, row_count)
+            .with_footer_size(footer_size)
+            .with_column_stats(column_stats))
     }
 }
 
@@ -531,6 +555,10 @@ pub struct TableWriteSession {
     /// (for Replace) prior-generation retirement commit atomically with the file.
     mode: WriteMode,
     row_count: i64,
+    /// Per-data-column NaN presence, accumulated across written batches (the
+    /// Parquet footer carries no NaN flag). One entry per catalog data column;
+    /// `None` for non-float columns. Fed into `collect_column_stats` at finish.
+    nan_flags: Vec<Option<bool>>,
 }
 
 impl TableWriteSession {
@@ -544,6 +572,13 @@ impl TableWriteSession {
 
         let batch_with_ids =
             RecordBatch::try_new(self.schema_with_ids.clone(), batch.columns().to_vec())?;
+        // Note float-column NaN presence before the batch streams to disk (the
+        // footer we later harvest has no NaN flag). Only the catalog data columns.
+        crate::stats_collect::accumulate_nan_flags(
+            &mut self.nan_flags,
+            &batch_with_ids,
+            self.column_ids.len(),
+        );
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch_with_ids)?;
         self.row_count += batch.num_rows() as i64;
@@ -687,8 +722,20 @@ impl TableWriteSession {
             return Err(e.into());
         }
 
+        // Harvest per-column statistics from the parquet footer we just wrote
+        // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
+        // attach them for the catalog commit. Best-effort: on failure the file
+        // is registered without stats, which is spec-safe.
+        let column_stats = crate::stats_collect::collect_column_stats(
+            temp.path(),
+            &self.column_ids,
+            self.row_count,
+            &self.nan_flags,
+        );
+
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
-            .with_footer_size(footer_size);
+            .with_footer_size(footer_size)
+            .with_column_stats(column_stats);
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
         }

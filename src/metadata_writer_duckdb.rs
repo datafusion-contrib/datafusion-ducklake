@@ -39,7 +39,7 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
     columns_differ, validate_name,
 };
 use duckdb::{Connection, OptionalExt, Transaction, params};
@@ -139,6 +139,32 @@ CREATE TABLE IF NOT EXISTS ducklake_table_stats (
     record_count BIGINT NOT NULL DEFAULT 0,
     next_row_id BIGINT NOT NULL DEFAULT 0,
     file_size_bytes BIGINT NOT NULL DEFAULT 0
+);
+
+-- Per-file, per-column zone maps (DuckLake spec) — powers file pruning.
+-- Column set mirrors the official extension and the other backends.
+CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+    data_file_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    column_id BIGINT NOT NULL,
+    column_size_bytes BIGINT,
+    value_count BIGINT,
+    null_count BIGINT,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    contains_nan BOOLEAN,
+    extra_stats VARCHAR
+);
+
+-- Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
+CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+    table_id BIGINT NOT NULL,
+    column_id BIGINT NOT NULL,
+    contains_null BOOLEAN,
+    contains_nan BOOLEAN,
+    min_value VARCHAR,
+    max_value VARCHAR,
+    extra_stats VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_delete_file (
@@ -348,6 +374,105 @@ fn retire_prior_generation(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64
 /// `finalize_snapshot`; the only structural change is reading the current
 /// columns into an owned `Vec` (dropping the prepared statement) before issuing
 /// further writes on the same connection.
+/// Persist the harvested per-column stats for a just-registered data file
+/// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
+fn insert_file_column_stats(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    data_file_id: i64,
+    column_stats: &[ColumnStat],
+) -> Result<()> {
+    for stat in column_stats {
+        tx.execute(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes,
+                  value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            params![
+                data_file_id,
+                table_id,
+                stat.column_id,
+                stat.column_size_bytes,
+                stat.value_count,
+                stat.null_count,
+                stat.min_value.as_deref(),
+                stat.max_value.as_deref(),
+                stat.contains_nan,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Recompute `ducklake_table_column_stats` from the table's live files and
+/// replace the stored rows. See the SQLite writer's equivalent for the rationale.
+fn recompute_table_column_stats(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+) -> Result<()> {
+    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+
+    let live_file_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+        params![table_id],
+        |row| row.get(0),
+    )?;
+
+    // Collect first so the prepared statement's borrow of `tx` is released
+    // before we issue the DELETE/INSERT writes below.
+    let per_file: Vec<FileColumnStat> = {
+        let mut stmt = tx.prepare(
+            "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+             FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             WHERE d.table_id = ? AND d.end_snapshot IS NULL",
+        )?;
+        let mapped = stmt.query_map(params![table_id], |row| {
+            Ok(FileColumnStat {
+                column_id: row.get::<_, i64>(0)?,
+                min_value: row.get::<_, Option<String>>(1)?,
+                max_value: row.get::<_, Option<String>>(2)?,
+                null_count: row.get::<_, Option<i64>>(3)?,
+                contains_nan: row.get::<_, Option<bool>>(4)?,
+            })
+        })?;
+        mapped.collect::<duckdb::Result<Vec<_>>>()?
+    };
+
+    let numeric_of = |column_id: i64| -> bool {
+        column_ids
+            .iter()
+            .position(|id| *id == column_id)
+            .and_then(|i| columns.get(i))
+            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
+            .unwrap_or(false)
+    };
+    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
+
+    tx.execute(
+        "DELETE FROM ducklake_table_column_stats WHERE table_id = ?",
+        params![table_id],
+    )?;
+    for g in globals {
+        tx.execute(
+            "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+            params![
+                table_id,
+                g.column_id,
+                g.contains_null,
+                g.contains_nan,
+                g.min_value,
+                g.max_value,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn finalize_snapshot(
     tx: &Transaction<'_>,
     table_id: i64,
@@ -621,11 +746,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
             |row| row.get(0),
         )?;
 
-        tx.execute(
+        // RETURNING gives us the sequence-allocated data_file_id to tie the
+        // per-column stats rows to, in the same transaction.
+        let data_file_id: i64 = tx.query_row(
             "INSERT INTO ducklake_data_file
                  (table_id, path, path_is_relative, file_size_bytes,
                   footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
             params![
                 table_id,
                 file.path.as_str(),
@@ -636,7 +763,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 row_id_start,
                 snapshot_id
             ],
+            |row| row.get(0),
         )?;
+
+        insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
+        recompute_table_column_stats(&tx, table_id, columns, column_ids)?;
 
         // Advance the counter and accumulate stats. next_row_id monotonically
         // increases over the table's lifetime — rowids are never reused.

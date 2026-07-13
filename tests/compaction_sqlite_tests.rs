@@ -214,6 +214,60 @@ async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn merge_harvests_output_stats_and_removes_source_stats() {
+    // Compaction must record fresh per-file column stats for the merged output
+    // (so it stays prunable) and hard-delete the merged-away sources' stats rows
+    // (no orphans) — mirroring official DuckLake.
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+    let p = pool(&temp).await;
+
+    // Two source files, each with per-column stats rows.
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        2
+    );
+    assert!(
+        scalar_i64(&p, "SELECT COUNT(*) FROM ducklake_file_column_stats").await >= 2,
+        "each source file should have stats rows"
+    );
+
+    run_merge(&temp, MergeOptions::default()).await;
+
+    // No orphaned stats rows: every remaining stats row points at a live data
+    // file (the sources' rows were deleted with their data_file rows).
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_file_column_stats s
+             LEFT JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             WHERE d.data_file_id IS NULL",
+        )
+        .await,
+        0,
+        "merge must delete the retired sources' stats rows"
+    );
+    // The merged output carries harvested stats spanning both sources: the `id`
+    // column's bound is now [1, 6].
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             WHERE d.end_snapshot IS NULL AND s.min_value = '1' AND s.max_value = '6'",
+        )
+        .await,
+        1,
+        "merged file's id-column zone map should span the union of the sources"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel() {
     let temp = TempDir::new().unwrap();
     // Three inserts -> three small data files, all at schema version 1.

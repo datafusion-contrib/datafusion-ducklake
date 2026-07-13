@@ -13,8 +13,9 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode,
-    WriteSetupResult, columns_differ, validate_delete_entries, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
+    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
+    validate_name,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -99,6 +100,30 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         record_count BIGINT NOT NULL DEFAULT 0,
         next_row_id BIGINT NOT NULL DEFAULT 0,
         file_size_bytes BIGINT NOT NULL DEFAULT 0
+    )"#,
+    // Per-file, per-column zone maps (DuckLake spec) — powers file pruning.
+    // Column set mirrors the official extension and the SQLite writer.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
+        data_file_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        column_size_bytes BIGINT,
+        value_count BIGINT,
+        null_count BIGINT,
+        min_value VARCHAR,
+        max_value VARCHAR,
+        contains_nan BOOLEAN,
+        extra_stats VARCHAR
+    )"#,
+    // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
+        table_id BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        contains_null BOOLEAN,
+        contains_nan BOOLEAN,
+        min_value VARCHAR,
+        max_value VARCHAR,
+        extra_stats VARCHAR
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_delete_file (
         delete_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -573,6 +598,107 @@ async fn schedule_compaction_files(
 /// from the sequence — because the reserved schema id from begin is not threaded
 /// through the commit (it is never baked into anything; the parquet path encodes
 /// the catalog id, not the schema id).
+/// Persist the harvested per-column stats for a just-registered data file
+/// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
+async fn insert_file_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    data_file_id: i64,
+    column_stats: &[ColumnStat],
+) -> Result<()> {
+    for stat in column_stats {
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes,
+                  value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(stat.column_id)
+        .bind(stat.column_size_bytes)
+        .bind(stat.value_count)
+        .bind(stat.null_count)
+        .bind(stat.min_value.as_deref())
+        .bind(stat.max_value.as_deref())
+        .bind(stat.contains_nan)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Recompute `ducklake_table_column_stats` from the table's live files and
+/// replace the stored rows. See the SQLite writer's equivalent for the rationale
+/// (widen on insert, never tighten on delete; correct for every write mode).
+async fn recompute_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+) -> Result<()> {
+    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+
+    let live_file_count: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+
+    let mut per_file: Vec<FileColumnStat> = Vec::new();
+    for row in sqlx::query(
+        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
+         FROM ducklake_file_column_stats s
+         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+         WHERE d.table_id = $1 AND d.end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        per_file.push(FileColumnStat {
+            column_id: row.try_get(0)?,
+            min_value: row.try_get(1)?,
+            max_value: row.try_get(2)?,
+            null_count: row.try_get(3)?,
+            contains_nan: row.try_get(4)?,
+        });
+    }
+
+    let numeric_of = |column_id: i64| -> bool {
+        column_ids
+            .iter()
+            .position(|id| *id == column_id)
+            .and_then(|i| columns.get(i))
+            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
+            .unwrap_or(false)
+    };
+    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
+
+    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = $1")
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    for g in globals {
+        sqlx::query(
+            "INSERT INTO ducklake_table_column_stats
+                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
+        )
+        .bind(table_id)
+        .bind(g.column_id)
+        .bind(g.contains_null)
+        .bind(g.contains_nan)
+        .bind(g.min_value)
+        .bind(g.max_value)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_snapshot(
     catalog_id: i64,
@@ -1245,7 +1371,12 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
-            let _data_file_id: i64 = inserted.try_get(0)?;
+            let data_file_id: i64 = inserted.try_get(0)?;
+
+            // Persist the file's per-column zone maps + refresh the table roll-up,
+            // in the same commit as the data-file row.
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -1474,11 +1605,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             let row_id_start: i64 = stats_row.try_get(0)?;
 
-            sqlx::query(
+            let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -1488,8 +1619,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            let data_file_id: i64 = inserted.try_get(0)?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -1851,6 +1985,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                         .bind(&source_data_ids)
                         .execute(&mut *tx)
                         .await?;
+                    // Hard-delete the removed sources' per-column stats too, as
+                    // official DuckLake does on merge (otherwise they orphan).
+                    sqlx::query(
+                        "DELETE FROM ducklake_file_column_stats WHERE data_file_id = ANY($1)",
+                    )
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
                 },
                 SourceRetirement::Retire => {
                     // Rewrite: the sources still serve time travel to pre-compaction
@@ -1882,11 +2024,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             // from the embedded column); partial_max marks a merged partial file.
             for out in outputs {
                 let begin = out.begin_snapshot.unwrap_or(snapshot_id);
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8)",
+                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&out.file.path)
@@ -1896,8 +2038,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(out.file.record_count)
                 .bind(begin)
                 .bind(out.partial_max)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
+                // Persist the compacted file's harvested zone maps (same tx),
+                // mirroring official DuckLake's stats-recording for outputs.
+                let data_file_id: i64 = inserted.try_get(0)?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
+                    .await?;
             }
 
             // Recompute the visible stat totals from the surviving files (see the
