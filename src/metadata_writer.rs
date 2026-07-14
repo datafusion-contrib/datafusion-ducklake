@@ -747,6 +747,28 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Register a data file that already carries DuckLake field-ids — e.g. a
+    /// parquet copied verbatim from another catalog — adopting `column_ids` as
+    /// the destination table's column ids so the file's embedded field-ids
+    /// resolve on read. Self-contained (no `begin_write_transaction`): creates
+    /// the table/columns on first write, appends after. `columns[i]` takes
+    /// `column_ids[i]`. Default: unsupported; only multicatalog Postgres, whose
+    /// column ids are reusable across catalogs, implements it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_existing_data_file(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+        _file: &DataFileInfo,
+        _mode: WriteMode,
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "register_existing_data_file is not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
     /// TABLE, zero-row Replace). For `Replace`, retires the prior generation.
     /// See [`MetadataWriter::register_data_file`] for the parameters.

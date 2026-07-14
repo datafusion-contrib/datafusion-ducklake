@@ -1409,6 +1409,103 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn register_existing_data_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        file: &DataFileInfo,
+        mode: WriteMode,
+    ) -> Result<CommitIds> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+
+            // No begin_write_transaction: derive the conflict base (catalog head)
+            // and a table-id hint (used only if the table doesn't exist yet) here.
+            let base_snapshot: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+                 WHERE catalog_id = $1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let table_id_hint = reserve_ids("ducklake_table", "table_id", 1, &mut tx).await?[0];
+
+            // finalize inserts the columns with the adopted `column_ids`
+            // (OVERRIDING SYSTEM VALUE), so the file's field-ids match.
+            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+                self.catalog_id,
+                schema_name,
+                table_name,
+                table_id_hint,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+                &mut tx,
+            )
+            .await?;
+
+            // rowids get a fresh range from the table counter — the source range
+            // isn't preserved (index copy, which would need it, is out of scope).
+            sqlx::query(
+                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES ($1, 0, 0, 0)
+                 ON CONFLICT (table_id) DO NOTHING",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let row_id_start: i64 = sqlx::query_scalar(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(table_id)
+            .bind(&file.path)
+            .bind(file.path_is_relative)
+            .bind(file.file_size_bytes)
+            .bind(file.footer_size)
+            .bind(file.record_count)
+            .bind(row_id_start)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + $1,
+                     record_count    = record_count + $2,
+                     file_size_bytes = file_size_bytes + $3
+                 WHERE table_id = $4",
+            )
+            .bind(file.record_count)
+            .bind(file.record_count)
+            .bind(file.file_size_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn set_delete_file(
         &self,
