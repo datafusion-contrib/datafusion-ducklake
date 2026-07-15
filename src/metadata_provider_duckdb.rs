@@ -13,6 +13,7 @@ use crate::metadata_provider::{
 };
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
@@ -241,6 +242,96 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(files)
     }
 
+    fn get_table_summary_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<DuckLakeStatistics> {
+        let conn = self.connection();
+        let table = match conn.prepare(SQL_GET_TABLE_STATS) {
+            Ok(mut stmt) => {
+                let mut rows = stmt.query([table_id])?;
+                rows.next()?
+                    .map(|row| {
+                        Ok::<_, duckdb::Error>(DuckLakeTableStatistics {
+                            record_count: row.get(0)?,
+                            file_size_bytes: row.get(1)?,
+                        })
+                    })
+                    .transpose()?
+            },
+            Err(error) if is_missing_statistics_table(&error) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let column_sizes: HashMap<i64, i64> = match conn.prepare(
+            "SELECT stats.column_id,
+                    CASE
+                      WHEN COUNT(*) = COUNT(stats.column_size_bytes)
+                       AND COUNT(*) = (
+                         SELECT COUNT(*) FROM ducklake_data_file visible
+                         WHERE visible.table_id = ?
+                           AND ? >= visible.begin_snapshot
+                           AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
+                       )
+                      THEN SUM(stats.column_size_bytes)
+                    END
+             FROM ducklake_file_column_stats stats
+             INNER JOIN ducklake_data_file data
+               ON data.data_file_id = stats.data_file_id
+              AND data.table_id = stats.table_id
+             WHERE stats.table_id = ?
+               AND ? >= data.begin_snapshot
+               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+             GROUP BY stats.column_id",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(
+                    params![table_id, snapshot_id, snapshot_id, table_id, snapshot_id, snapshot_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )?
+                .filter_map(|row| match row {
+                    Ok((column_id, Some(size))) => Some(Ok((column_id, size))),
+                    Ok((_, None)) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<_, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let bounds_are_exact: bool = conn.query_row(
+            "SELECT NOT EXISTS (
+                 SELECT 1 FROM ducklake_delete_file
+                 WHERE table_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)
+             )",
+            params![table_id, snapshot_id, snapshot_id],
+            |row| row.get(0),
+        )?;
+        let columns = match conn.prepare(SQL_GET_TABLE_COLUMN_STATS) {
+            Ok(mut stmt) => stmt
+                .query_map([table_id], |row| {
+                    let column_id = row.get(0)?;
+                    Ok(DuckLakeTableColumnStatistics {
+                        column_id,
+                        contains_null: row.get(1)?,
+                        min_value: row.get(2)?,
+                        max_value: row.get(3)?,
+                        column_size_bytes: column_sizes.get(&column_id).copied(),
+                        bounds_are_exact,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(DuckLakeStatistics {
+            table,
+            columns,
+            files: Vec::new(),
+        })
+    }
+
     fn get_table_statistics(
         &self,
         table_id: i64,
@@ -272,6 +363,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         contains_null: row.get(1)?,
                         min_value: row.get(2)?,
                         max_value: row.get(3)?,
+                        column_size_bytes: None,
+                        bounds_are_exact: false,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,

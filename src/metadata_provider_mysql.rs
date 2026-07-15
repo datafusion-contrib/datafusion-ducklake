@@ -311,6 +311,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                             contains_null: row.try_get(1)?,
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
+                            column_size_bytes: None,
+                            bounds_are_exact: false,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,

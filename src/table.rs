@@ -383,10 +383,23 @@ fn build_datafusion_statistics(
             if raw.contains_null == Some(false) {
                 output.null_count = Precision::Exact(0);
             }
-            output.min_value =
-                scalar_precision(raw.min_value.as_deref(), column, field_type, false);
-            output.max_value =
-                scalar_precision(raw.max_value.as_deref(), column, field_type, false);
+            output.min_value = scalar_precision(
+                raw.min_value.as_deref(),
+                column,
+                field_type,
+                raw.bounds_are_exact,
+            );
+            output.max_value = scalar_precision(
+                raw.max_value.as_deref(),
+                column,
+                field_type,
+                raw.bounds_are_exact,
+            );
+            output.byte_size = raw
+                .column_size_bytes
+                .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
+                .map(Precision::Inexact)
+                .unwrap_or(Precision::Absent);
         }
 
         if !file_metadata_complete {
@@ -2761,6 +2774,14 @@ mod tests {
                     record_count: Some(1_000_000),
                     file_size_bytes: Some(1_000_000),
                 }),
+                columns: vec![DuckLakeTableColumnStatistics {
+                    column_id: 1,
+                    contains_null: Some(false),
+                    min_value: Some("1".to_string()),
+                    max_value: Some("1000000".to_string()),
+                    column_size_bytes: Some(1_000_000),
+                    bounds_are_exact: true,
+                }],
                 ..Default::default()
             })
         }
@@ -2872,6 +2893,20 @@ mod tests {
             String::new(),
         )?;
         assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
+        let statistics = table.statistics().unwrap();
+        assert_eq!(statistics.num_rows, Precision::Exact(1_000_000));
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            statistics.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(1_000_000)))
+        );
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(1_000_000)
+        );
 
         let state = SessionContext::new().state();
         let filters = [col("id").eq(lit(999_999_i64))];
@@ -2915,6 +2950,43 @@ mod tests {
         assert_eq!(provider.max_page.load(Ordering::Relaxed), 64);
         assert_eq!(retained, vec![999_999]);
         assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_bounds_with_live_deletes_remain_inexact() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "id".to_string(), "integer".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+        let (statistics, _) = build_datafusion_statistics(
+            &schema,
+            &columns,
+            &[],
+            DuckLakeStatistics {
+                columns: vec![DuckLakeTableColumnStatistics {
+                    column_id: 1,
+                    contains_null: Some(false),
+                    min_value: Some("0".to_string()),
+                    max_value: Some("9".to_string()),
+                    column_size_bytes: Some(40),
+                    bounds_are_exact: false,
+                }],
+                ..Default::default()
+            },
+            true,
+            false,
+        );
+
+        let column = &statistics.column_statistics[0];
+        assert_eq!(
+            column.min_value,
+            Precision::Inexact(ScalarValue::Int32(Some(0)))
+        );
+        assert_eq!(
+            column.max_value,
+            Precision::Inexact(ScalarValue::Int32(Some(9)))
+        );
+        assert_eq!(column.byte_size, Precision::Inexact(40));
         Ok(())
     }
 

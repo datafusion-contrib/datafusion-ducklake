@@ -510,7 +510,7 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_table_summary_statistics(
         &self,
         table_id: i64,
-        _snapshot_id: i64,
+        snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
         block_on(async {
             let table = match sqlx::query(
@@ -532,6 +532,60 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) if is_missing_statistics_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
+            let column_sizes = match sqlx::query(
+                "SELECT stats.column_id,
+                        CASE
+                          WHEN COUNT(*) = COUNT(stats.column_size_bytes)
+                           AND COUNT(*) = (
+                             SELECT COUNT(*) FROM ducklake_data_file visible
+                             WHERE visible.table_id = $1
+                               AND $2 >= visible.begin_snapshot
+                               AND ($3 < visible.end_snapshot OR visible.end_snapshot IS NULL)
+                           )
+                          THEN SUM(stats.column_size_bytes)
+                        END
+                 FROM ducklake_file_column_stats stats
+                 INNER JOIN ducklake_data_file data
+                   ON data.data_file_id = stats.data_file_id
+                  AND data.table_id = stats.table_id
+                 WHERE stats.table_id = $4
+                   AND $5 >= data.begin_snapshot
+                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
+                 GROUP BY stats.column_id",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|row| match row.try_get::<Option<i64>, _>(1) {
+                        Ok(Some(size)) => Some(row.try_get(0).map(|column_id| (column_id, size))),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
+                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+                Err(error) => return Err(error.into()),
+            };
+            let bounds_are_exact: bool = sqlx::query_scalar(
+                "SELECT NOT EXISTS (
+                     SELECT 1 FROM ducklake_delete_file
+                     WHERE table_id = $1
+                       AND $2 >= begin_snapshot
+                       AND ($3 < end_snapshot OR end_snapshot IS NULL)
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_one(&self.pool)
+            .await?;
             let columns = match sqlx::query(
                 "SELECT column_id, contains_null, min_value, max_value
                  FROM ducklake_table_column_stats WHERE table_id = $1",
@@ -543,11 +597,14 @@ impl MetadataProvider for MulticatalogProvider {
                 Ok(rows) => rows
                     .into_iter()
                     .map(|row| {
+                        let column_id = row.try_get(0)?;
                         Ok(DuckLakeTableColumnStatistics {
-                            column_id: row.try_get(0)?,
+                            column_id,
                             contains_null: row.try_get(1)?,
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
+                            column_size_bytes: column_sizes.get(&column_id).copied(),
+                            bounds_are_exact,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -600,6 +657,8 @@ impl MetadataProvider for MulticatalogProvider {
                             contains_null: row.try_get(1)?,
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
+                            column_size_bytes: None,
+                            bounds_are_exact: false,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,

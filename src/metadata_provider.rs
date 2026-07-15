@@ -582,6 +582,13 @@ pub struct DuckLakeTableColumnStatistics {
     pub contains_null: Option<bool>,
     pub min_value: Option<String>,
     pub max_value: Option<String>,
+    /// Sum of compressed bytes reported by every visible file for this column.
+    pub column_size_bytes: Option<i64>,
+    /// Whether the table-wide bounds are exact for the requested snapshot.
+    ///
+    /// DuckLake's rollup is complete for live data files, but positional
+    /// deletes can remove an extremal value without tightening the rollup.
+    pub bounds_are_exact: bool,
 }
 
 /// A row from `ducklake_file_column_stats` containing the fields DataFusion
