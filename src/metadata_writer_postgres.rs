@@ -1418,6 +1418,22 @@ impl MetadataWriter for PostgresMetadataWriter {
         file: &DataFileInfo,
         mode: WriteMode,
     ) -> Result<CommitIds> {
+        // This method bypasses begin_write_transaction, so it must do begin's
+        // input validation itself. `column_ids[i]` is inserted for `columns[i]`
+        // (finalize_snapshot zips them), so a length mismatch would silently drop
+        // the trailing columns.
+        if columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_existing_data_file requires at least one column".to_string(),
+            ));
+        }
+        if column_ids.len() != columns.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "register_existing_data_file: column_ids (len {}) must be 1:1 with columns (len {})",
+                column_ids.len(),
+                columns.len()
+            )));
+        }
         block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;

@@ -751,9 +751,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// parquet copied verbatim from another catalog — adopting `column_ids` as
     /// the destination table's column ids so the file's embedded field-ids
     /// resolve on read. Self-contained (no `begin_write_transaction`): creates
-    /// the table/columns on first write, appends after. `columns[i]` takes
-    /// `column_ids[i]`. Default: unsupported; only multicatalog Postgres, whose
-    /// column ids are reusable across catalogs, implements it.
+    /// the table/columns on first write, appends after.
+    ///
+    /// `column_ids` must be non-empty and 1:1 with `columns` (`column_ids[i]` is
+    /// the id assigned to `columns[i]`, in column order); a mismatch is rejected
+    /// with [`crate::DuckLakeError::InvalidConfig`]. Rowids are freshly assigned
+    /// (the source `row_id_start` is not preserved), so indexes keyed on the
+    /// source's rowids do not carry over.
+    ///
+    /// Default: unsupported; only multicatalog Postgres, whose column ids are
+    /// reusable across catalogs, implements it.
     #[allow(clippy::too_many_arguments)]
     fn register_existing_data_file(
         &self,

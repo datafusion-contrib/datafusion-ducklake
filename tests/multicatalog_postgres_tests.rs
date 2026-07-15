@@ -4485,3 +4485,137 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
         "all rows present and correct after the race"
     );
 }
+
+/// `register_existing_data_file` adopts the caller's `column_ids` (so a copied
+/// parquet's embedded field-ids resolve), creates the table/file/snapshot, and
+/// advances the catalog head — replace then append, without re-minting ids.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_adopts_column_ids() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_adopt").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // Adopt non-sequential ids: a real IDENTITY-assigned pair would be (1, 2),
+    // so (100, 200) proves the ids come from the caller, not the sequence.
+    let ids = vec![100_i64, 200_i64];
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f1.parquet", 1024, 3),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    assert_eq!(
+        current_head(&pool, cat).await,
+        out.snapshot_id,
+        "head advances to the committed snapshot"
+    );
+
+    let cols_got: Vec<(String, i64)> = sqlx::query(
+        "SELECT column_name, column_id FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY column_order",
+    )
+    .bind(out.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>(0).unwrap(),
+            r.try_get::<i64, _>(1).unwrap(),
+        )
+    })
+    .collect();
+    assert_eq!(
+        cols_got,
+        vec![("id".to_string(), 100), ("name".to_string(), 200)],
+        "columns adopt the caller's ids (== the parquet field-ids)"
+    );
+
+    // Append a second file with the SAME ids — no drift, both files live.
+    let out2 = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f2.parquet", 512, 2),
+            WriteMode::Append,
+        )
+        .unwrap();
+    assert_eq!(out2.table_id, out.table_id, "same table");
+    assert_eq!(current_head(&pool, cat).await, out2.snapshot_id);
+
+    let live_files: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(out.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(live_files, 2, "replace + append -> two live data files");
+
+    let ids_after: Vec<i64> = sqlx::query(
+        "SELECT column_id FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY column_order",
+    )
+    .bind(out.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| r.try_get::<i64, _>(0).unwrap())
+    .collect();
+    assert_eq!(
+        ids_after,
+        vec![100, 200],
+        "append does not re-mint column ids"
+    );
+}
+
+/// `column_ids` must be 1:1 with `columns`; a mismatch is rejected before any
+/// write (otherwise `finalize_snapshot`'s zip would silently drop columns).
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_rejects_mismatched_column_ids() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_adopt_bad").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let res = w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(), // 2 columns
+        &[100],  // 1 id
+        &DataFileInfo::new("f.parquet", 10, 1),
+        WriteMode::Replace,
+    );
+    assert!(
+        matches!(res, Err(DuckLakeError::InvalidConfig(_))),
+        "mismatched column_ids must be rejected"
+    );
+    assert_eq!(
+        current_head(&pool, cat).await,
+        0,
+        "nothing is committed on a validation failure"
+    );
+}
