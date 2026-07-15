@@ -584,7 +584,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                                AND ? >= visible.begin_snapshot
                                AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
                            )
-                          THEN SUM(stats.column_size_bytes)
+                          THEN CAST(SUM(stats.column_size_bytes) AS INTEGER)
                         END
                  FROM ducklake_file_column_stats stats
                  INNER JOIN ducklake_data_file data

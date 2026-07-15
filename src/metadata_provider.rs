@@ -615,7 +615,10 @@ pub struct DuckLakeFileMetadata {
 }
 
 /// Maximum number of file metadata records retained by the planning iterator.
-pub const FILE_METADATA_BATCH_SIZE: usize = 64;
+///
+/// This keeps planning memory bounded while avoiding tens of thousands of
+/// catalog round trips for million-file tables.
+pub const FILE_METADATA_BATCH_SIZE: usize = 4_096;
 
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {

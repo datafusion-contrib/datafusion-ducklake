@@ -2719,6 +2719,7 @@ mod tests {
     struct LazyMillionFileProvider {
         eager_file_reads: AtomicUsize,
         max_page: AtomicUsize,
+        page_calls: AtomicUsize,
     }
 
     impl MetadataProvider for LazyMillionFileProvider {
@@ -2793,6 +2794,7 @@ mod tests {
             after_data_file_id: Option<i64>,
             limit: usize,
         ) -> Result<Vec<DuckLakeFileMetadata>> {
+            self.page_calls.fetch_add(1, Ordering::Relaxed);
             let start = after_data_file_id.unwrap_or(0) + 1;
             let end = (start + i64::try_from(limit).unwrap()).min(1_000_001);
             let page: Vec<_> = (start..end)
@@ -2947,7 +2949,8 @@ mod tests {
             );
         }
 
-        assert_eq!(provider.max_page.load(Ordering::Relaxed), 64);
+        assert_eq!(provider.max_page.load(Ordering::Relaxed), 4_096);
+        assert_eq!(provider.page_calls.load(Ordering::Relaxed), 246);
         assert_eq!(retained, vec![999_999]);
         assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
         Ok(())

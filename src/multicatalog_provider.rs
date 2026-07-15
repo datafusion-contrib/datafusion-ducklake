@@ -542,7 +542,7 @@ impl MetadataProvider for MulticatalogProvider {
                                AND $2 >= visible.begin_snapshot
                                AND ($3 < visible.end_snapshot OR visible.end_snapshot IS NULL)
                            )
-                          THEN SUM(stats.column_size_bytes)
+                          THEN CAST(SUM(stats.column_size_bytes) AS BIGINT)
                         END
                  FROM ducklake_file_column_stats stats
                  INNER JOIN ducklake_data_file data

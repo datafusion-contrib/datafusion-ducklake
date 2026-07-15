@@ -1,10 +1,10 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics,
-    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider,
-    SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
+    MetadataProvider, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
     SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS,
     SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
@@ -273,7 +273,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                            AND ? >= visible.begin_snapshot
                            AND (? < visible.end_snapshot OR visible.end_snapshot IS NULL)
                        )
-                      THEN SUM(stats.column_size_bytes)
+                      THEN CAST(SUM(stats.column_size_bytes) AS BIGINT)
                     END
              FROM ducklake_file_column_stats stats
              INNER JOIN ducklake_data_file data
@@ -330,6 +330,138 @@ impl MetadataProvider for DuckdbMetadataProvider {
             columns,
             files: Vec::new(),
         })
+    }
+
+    fn get_table_file_metadata_page(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+    ) -> crate::Result<Vec<DuckLakeFileMetadata>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
+        })?;
+        let conn = self.connection();
+        let sql = format!(
+            "{SQL_GET_DATA_FILES}
+             AND data.data_file_id > ?
+             ORDER BY data.data_file_id
+             LIMIT ?"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let files = statement
+            .query_map(
+                params![
+                    table_id,
+                    snapshot_id,
+                    snapshot_id,
+                    table_id,
+                    snapshot_id,
+                    snapshot_id,
+                    after_data_file_id.unwrap_or(i64::MIN),
+                    limit
+                ],
+                |row| {
+                    let delete_file_id: Option<i64> = row.get(8)?;
+                    let (delete_file, delete_count) = if delete_file_id.is_some() {
+                        (
+                            Some(DuckLakeFileData {
+                                path: row.get(9)?,
+                                path_is_relative: row.get(10)?,
+                                file_size_bytes: row.get(11)?,
+                                footer_size: row.get(12)?,
+                                encryption_key: row.get(13)?,
+                            }),
+                            row.get(14)?,
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    Ok(DuckLakeTableFile {
+                        data_file_id: row.get(0)?,
+                        file: DuckLakeFileData {
+                            path: row.get(1)?,
+                            path_is_relative: row.get(2)?,
+                            file_size_bytes: row.get(3)?,
+                            footer_size: row.get(4)?,
+                            encryption_key: row.get(5)?,
+                        },
+                        delete_file_id,
+                        delete_file,
+                        row_id_start: row.get(6)?,
+                        snapshot_id: Some(snapshot_id),
+                        begin_snapshot: None,
+                        schema_version: None,
+                        partial_max: None,
+                        max_row_count: row.get(7)?,
+                        delete_count,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
+            return Ok(Vec::new());
+        };
+        let statistics = match conn.prepare(
+            "SELECT stats.data_file_id, stats.column_id,
+                    stats.column_size_bytes, stats.value_count, stats.null_count,
+                    stats.min_value, stats.max_value
+             FROM ducklake_file_column_stats AS stats
+             INNER JOIN ducklake_data_file AS data
+               ON data.data_file_id = stats.data_file_id
+              AND data.table_id = stats.table_id
+             WHERE stats.table_id = ?
+               AND ? >= data.begin_snapshot
+               AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+               AND stats.data_file_id > ?
+               AND stats.data_file_id <= ?
+             ORDER BY stats.data_file_id, stats.column_id",
+        ) {
+            Ok(mut statement) => statement
+                .query_map(
+                    params![
+                        table_id,
+                        snapshot_id,
+                        snapshot_id,
+                        after_data_file_id.unwrap_or(i64::MIN),
+                        last_data_file_id
+                    ],
+                    |row| {
+                        Ok(DuckLakeFileColumnStatistics {
+                            data_file_id: row.get(0)?,
+                            column_id: row.get(1)?,
+                            column_size_bytes: row.get(2)?,
+                            value_count: row.get(3)?,
+                            null_count: row.get(4)?,
+                            min_value: row.get(5)?,
+                            max_value: row.get(6)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
+        for statistic in statistics {
+            statistics_by_file
+                .entry(statistic.data_file_id)
+                .or_default()
+                .push(statistic);
+        }
+        Ok(files
+            .into_iter()
+            .map(|file| DuckLakeFileMetadata {
+                column_statistics: statistics_by_file
+                    .remove(&file.data_file_id)
+                    .unwrap_or_default(),
+                file,
+            })
+            .collect())
     }
 
     fn get_table_statistics(
