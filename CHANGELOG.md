@@ -8,24 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Read DuckDB data inlining (SQLite).** Inlined INSERT rows (`ducklake_inlined_data_*`) are now unioned into scans with snapshot visibility, fixing the silent `SELECT`/`COUNT(*)` undercount. SQLite backend + scalar types; other backends, inlined Parquet-row deletes, and the `rowid` path are follow-ups.
-- **Compaction (`merge_adjacent_files` + `rewrite_data_files`).** Two explicit, triggered maintenance operations on `DuckLakeTable`, each returning a `CompactionResult` (`files_processed` / `files_created` / `rows_written`). `merge_adjacent_files` coalesces several small data files of one table — of the SAME schema version only, never across a DDL boundary — into fewer larger ones; a merged file spanning more than one origin snapshot is written as a DuckLake **partial data file** (embedding each row's original rowid AND a per-row `_ducklake_internal_snapshot_id` column, with `ducklake_data_file.partial_max` recording the max origin), and reads below `partial_max` filter its rows per-origin so time travel and change feeds stay correct. `rewrite_data_files` rewrites a data file whose deleted fraction exceeds a threshold (default `0.95`, configurable), reading only its live rows (delete-aware) and preserving rowids, then retiring both the old data file and its delete file. Both commit atomically in one snapshot (`MetadataWriter::commit_compaction`, SQLite + PostgreSQL), record `compacted_table:<table_id>` in `ducklake_snapshot_changes`, and only *schedule* superseded files for deletion (reclaimed later by `cleanup_old_files`) — the base-snapshot conflict check makes compaction coexist with concurrent appends. Adds the `ducklake_data_file.partial_max` column (v1.0) and the `ducklake_snapshot_changes` table, with in-place idempotent migrations for existing catalogs. See [`examples/compaction_demo.rs`](examples/compaction_demo.rs) (#167).
+- Read DuckDB data inlining (SQLite): inlined INSERT rows (`ducklake_inlined_data_*`) are unioned into scans with snapshot visibility, fixing the silent `SELECT` / `COUNT(*)` undercount (SQLite + scalar types; other backends and the `rowid` path are follow-ups).
+- Compaction (`merge_adjacent_files` + `rewrite_data_files`): two triggered maintenance ops on `DuckLakeTable`, each returning a `CompactionResult`. Merges small same-schema-version data files (multi-origin merges become DuckLake partial data files, read per-origin so time travel stays correct) and rewrites files past a deleted-fraction threshold (default `0.95`), keeping live rows and rowids. Commits atomically (`MetadataWriter::commit_compaction`, SQLite + PostgreSQL) and only schedules superseded files for later `cleanup_old_files`. Adds `ducklake_data_file.partial_max` + `ducklake_snapshot_changes` with in-place migrations; see [`examples/compaction_demo.rs`](examples/compaction_demo.rs) (#167).
 
 ## [0.4.0] - 2026-07-08
 
 ### Added
-- **Positional delete-file authoring (write path).** The crate can now *produce and register* DuckLake positional delete files, not only read them. `DuckLakeTable::resolve_positions` scans a data file and returns the physical row positions matching a predicate (the `pos` values a delete file records); `DuckLakeTableWriter::write_delete_file` writes and uploads the `(file_path, pos)` delete parquet beside the data files it masks; and `MetadataWriter::set_delete_file` (SQLite and PostgreSQL) registers it in a single atomic commit — fenced on the target data file's liveness, compare-and-swapping the currently-live delete file, and keeping at most one live delete file per data file by rewriting it cumulatively. Read providers now surface the catalog `data_file_id` and the live `delete_file_id` on `DuckLakeTableFile`, alongside `DuckLakeTable::files()` and a public `read_delete_file_positions`, so callers can assemble the cumulative (existing ∪ new) position set. This is the write-side primitive for row-level deletes; reads already apply delete files via merge-on-read (#154, #155).
-- **Column type promotion (`MetadataWriter::promote_column_type`).** Explicit, widening-only schema evolution (e.g. `int32 → int64`): it retires the live `ducklake_column` row and inserts a new version with the **same** `column_id` (stable Parquet field-id), so files written before and after both resolve correctly and old narrow values are cast up on read — no data rewrite. Allowed widenings are an explicit, lossless set (`types::is_promotable`). Implemented on the SQLite single-catalog and PostgreSQL multi-catalog write paths.
-- **`schema_version` tracking on the SQLite single-catalog write path** (#151), porting the validated PostgreSQL model. `ducklake_snapshot` now carries `schema_version` and a `ducklake_schema_versions` ledger table records each schema change; a DDL commit (table create, column add/remove/reorder, type promotion) bumps the per-catalog `schema_version` and writes a ledger row, while a pure data write carries the version forward — mirroring upstream's `if (SchemaChangesMade()) schema_version++`. This resolves the `TODO(schema_version)` left in the SQLite `promote_column_type`. Pre-existing catalogs gain the column in place on open (idempotent, lossless). Like the PostgreSQL layout, the SQLite layout deliberately omits upstream's `next_catalog_id` / `next_file_id` snapshot columns (this library allocates ids from its own counters).
+- Positional delete-file authoring: produce & register DuckLake positional delete files (`DuckLakeTable::resolve_positions`, `DuckLakeTableWriter::write_delete_file`, `MetadataWriter::set_delete_file`), keeping one live cumulative delete file per data file via atomic compare-and-swap. Providers now expose `data_file_id` / `delete_file_id` and `read_delete_file_positions` (SQLite + PostgreSQL) (#154, #155).
+- Column type promotion (`MetadataWriter::promote_column_type`): explicit, widening-only schema evolution (e.g. `int32 → int64`) with a stable `column_id` / field-id and no data rewrite (`types::is_promotable`; SQLite + PostgreSQL).
+- `schema_version` tracking on the SQLite write path: `ducklake_snapshot.schema_version` + a `ducklake_schema_versions` ledger, bumped on DDL commits — porting the PostgreSQL model; catalogs migrate in place on open (#151).
 
 ### Changed
-- **Upgrade to DataFusion 54 and Arrow/Parquet 58** (#150), adapting the positional-scan paths to DataFusion 54's datasource API (keeping file groups partition-local and delegating the positional morselizer). No on-disk format or DuckLake spec change.
-- **A column type change on a data write (`Replace`/`Append`) is now rejected** with a clear error pointing at `promote_column_type` — previously a type change on `Replace` was silently dropped (the catalog kept the old type, corrupting reads) and a widening `Append` was silently accepted. Schema evolution must be explicit, mirroring upstream DuckLake's `ALTER`-vs-`INSERT` separation. An alias-only restatement (`bigint` ≡ `int64`) remains a no-op. To adopt a widened source schema, call `promote_column_type` then write under the new type.
-- `ducklake_column` no longer uses a single-row `column_id` primary key, so a column can be versioned (two rows sharing a `column_id`): the SQLite layout matches upstream's bare table (invariants enforced in the writer + tests), the PostgreSQL multi-catalog layout uses a composite PK + a partial unique index. Catalogs written by an earlier version are migrated in place on open (idempotent, lossless).
+- Upgrade to DataFusion 54 and Arrow/Parquet 58 — no on-disk/spec change (#150).
+- Reject implicit column type changes on data writes (`Replace` / `Append`) with an error pointing at `promote_column_type` (previously silently dropped/accepted); alias-only restatements remain no-ops.
+- `ducklake_column` allows column versioning (multiple rows per `column_id`) — bare table on SQLite, composite PK + partial unique index on PostgreSQL; catalogs migrate in place on open.
 
 ### Fixed
-- **Concurrent `WriteMode::Replace` on the experimental PostgreSQL multi-catalog write path could union conflicting generations instead of rejecting one.** Converged the multi-catalog writer onto DuckLake's commit-time model: a snapshot's id is assigned at commit (commit-ordered), and all of its metadata — snapshot, schema/table, columns, data files, and the published head — is written in a single transaction, so committed-but-unpublished rows are never visible to readers or conflict checks. `Replace` now aborts with a `Conflict` error when another writer published a newer generation of the table since the write began. Column field-ids stay stable across a same-schema `Replace`, and an `Append` racing a table creation aborts rather than producing NULL-filled reads. No on-disk format, DuckLake spec, or public API change (#146).
-- **Nested (`List` / struct / map) columns could read back all-NULL.** The read-schema field-id matcher built its `field_id → column` map from Parquet *leaf* columns, but a column's field-id is stamped on its *top-level* field — which for a nested column is the group node, leaving the leaf with no id. The column was therefore treated as absent from the file and null-filled. Field-ids are now read from the top-level fields, so nested columns resolve correctly; scalar columns are unaffected (their top-level field is the leaf). Adds a `List` write→read roundtrip regression test.
+- Concurrent `WriteMode::Replace` on the PostgreSQL multi-catalog path now aborts with `Conflict` instead of unioning generations; converged onto DuckLake's commit-time snapshot model (single-transaction commit, stable field-ids) (#146).
+- Nested (`List` / struct / map) columns no longer read back all-NULL — field-ids are read from top-level fields, not Parquet leaves; adds a `List` roundtrip regression test.
 
 ## [0.3.1] - 2026-06-23
 
@@ -35,19 +35,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - 2026-06-22
 
 ### Added
-- **PostgreSQL multi-catalog support.** Manage and read multiple independent DuckLake catalogs within a single PostgreSQL metadata store, including per-catalog data-file segregation on disk, single-table tombstone drops (`drop_table_in_catalog`), and `row_id_start` projection on reads / population on data-file registration (#117, #120, #121, #124, #132).
-- **Row lineage.** `rowid` virtual column exposing DuckLake row IDs, opt-in via `DuckLakeCatalog::with_row_lineage(true)`. Compatible with files produced by DuckDB's `UPDATE` / compaction (#115).
-- **Maintenance API.** Single-catalog `DROP TABLE`, `expire_snapshots`, and `cleanup_old_files` for reclaiming superseded data, plus `delete_orphaned_files` for storage-scan reclamation of untracked files (#122, #123).
-- **Writer tuning.** Configurable Parquet compression (`DuckLakeTableWriter::with_compression`) and row-group caps by row count and byte size (`with_max_row_group_rows` / `with_max_row_group_bytes`) (#126, #128).
-- `MetadataProvider::get_table_row_count()`, which accounts for delete files (#131).
+- PostgreSQL multi-catalog support: multiple independent catalogs in one metadata store, per-catalog data-file segregation, single-table tombstone drops (`drop_table_in_catalog`), and `row_id_start` projection (#117, #120, #121, #124, #132).
+- Row lineage: `rowid` virtual column, opt-in via `DuckLakeCatalog::with_row_lineage(true)`; compatible with DuckDB `UPDATE` / compaction output (#115).
+- Maintenance API: single-catalog `DROP TABLE`, `expire_snapshots`, `cleanup_old_files`, and `delete_orphaned_files` (#122, #123).
+- Writer tuning: Parquet compression (`with_compression`) and row-group caps (`with_max_row_group_rows` / `with_max_row_group_bytes`) (#126, #128).
+- `MetadataProvider::get_table_row_count()`, accounting for delete files (#131).
 
 ### Changed
-- Writer streams table writes through a staging file with multipart upload instead of buffering in memory, reducing peak memory for large writes (#127).
-- CI: gate the single-catalog backend test suite and fix/quarantine drifted fixtures (#139); run on `ubuntu-latest` instead of `ubuntu-latest-m` (#118).
+- Stream table writes through a staging file with multipart upload instead of buffering in memory, reducing peak memory (#127).
+- CI: gate the single-catalog backend test suite (#139); run on `ubuntu-latest` (#118).
 
 ### Fixed
-- Correct reads across schema evolution and repeated writes, resolving per-file schema mapping for schema-evolving reads (#140, #141).
-- Make `WriteMode::Replace` atomic to close a transient empty-read window, for both the single-catalog SQLite path and the general path (#135, #138).
+- Correct reads across schema evolution and repeated writes, resolving per-file schema mapping (#140, #141).
+- Make `WriteMode::Replace` atomic to close a transient empty-read window (SQLite and general paths) (#135, #138).
 - Truncate the table on a zero-row `INSERT OVERWRITE` / Replace (#142).
 - Require single-partition input in `DuckLakeInsertExec` (#137).
 - Derive `rowid` and delete positions from physical file position (#129).
@@ -58,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.1] - 2026-05-05
 
 ### Added
-- Implement `TableProvider::statistics()` on `DuckLakeTable`, populating `total_byte_size` from per-file metadata cached on the table (#112). Mirrors DuckLake's `ducklake_table_info` aggregate exactly. Marked `Precision::Inexact` since the catalog tracks compressed parquet bytes while DataFusion documents `total_byte_size` as uncompressed Arrow output. Enables cost-based optimisation hints and provides a cheap surface for size-aware consumers (e.g. pre-flight ingest guards).
+- `TableProvider::statistics()` on `DuckLakeTable`: `total_byte_size` from cached per-file metadata (mirrors `ducklake_table_info`), marked `Precision::Inexact` since the catalog tracks compressed parquet bytes vs DataFusion's uncompressed Arrow output (#112).
 
 ### Changed
 - README: revise Discord community link (#111)
