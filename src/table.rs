@@ -2277,7 +2277,7 @@ impl TableProvider for DuckLakeTable {
                 )));
             }
             let next_after = metadata.last().unwrap().file.data_file_id;
-            if after_data_file_id.map_or(false, |after| next_after <= after) {
+            if after_data_file_id.is_some_and(|after| next_after <= after) {
                 return Err(DataFusionError::External(Box::new(
                     crate::DuckLakeError::InvalidConfig(
                         "metadata provider returned a non-advancing file page".to_string(),

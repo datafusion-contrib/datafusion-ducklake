@@ -770,7 +770,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         }
         Ok(files
             .into_iter()
-            .filter(|file| after_data_file_id.map_or(true, |after| file.data_file_id > after))
+            .filter(|file| after_data_file_id.is_none_or(|after| file.data_file_id > after))
             .take(limit)
             .map(|file| DuckLakeFileMetadata {
                 column_statistics: by_file.remove(&file.data_file_id).unwrap_or_default(),
