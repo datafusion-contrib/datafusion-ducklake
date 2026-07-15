@@ -41,7 +41,7 @@ backends and write support are opt-in via feature flags — see
 # Cargo.toml — read PostgreSQL catalogs
 # (for the experimental multi-catalog write path, use features = ["write-postgres"])
 [dependencies]
-datafusion-ducklake = { version = "0.4", features = ["metadata-postgres"] }
+datafusion-ducklake = { version = "0.5", features = ["metadata-postgres"] }
 ```
 
 The examples below also use `datafusion`, `object_store`, and `url` directly — add them
