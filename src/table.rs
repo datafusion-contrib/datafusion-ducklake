@@ -7,8 +7,9 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
-    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableFile, MetadataProvider,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile,
+    FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
@@ -270,6 +271,7 @@ fn build_datafusion_statistics(
     table_files: &[DuckLakeTableFile],
     catalog: DuckLakeStatistics,
     use_current_table_statistics: bool,
+    file_metadata_complete: bool,
 ) -> (Statistics, HashMap<i64, Arc<Statistics>>) {
     let table_column_rows: HashMap<i64, DuckLakeTableColumnStatistics> = catalog
         .columns
@@ -340,7 +342,7 @@ fn build_datafusion_statistics(
             _ => None,
         };
     }
-    table_statistics.num_rows = if let Some(rows) = row_total {
+    table_statistics.num_rows = if file_metadata_complete && let Some(rows) = row_total {
         Precision::Exact(rows)
     } else if use_current_table_statistics {
         catalog
@@ -348,7 +350,7 @@ fn build_datafusion_statistics(
             .as_ref()
             .and_then(|stats| stats.record_count)
             .and_then(|value| statistic_usize(value, "table_stats.record_count"))
-            .map(Precision::Inexact)
+            .map(Precision::Exact)
             .unwrap_or(Precision::Absent)
     } else {
         Precision::Absent
@@ -385,6 +387,10 @@ fn build_datafusion_statistics(
                 scalar_precision(raw.min_value.as_deref(), column, field_type, false);
             output.max_value =
                 scalar_precision(raw.max_value.as_deref(), column, field_type, false);
+        }
+
+        if !file_metadata_complete {
+            continue;
         }
 
         if table_files.is_empty() {
@@ -623,21 +629,17 @@ pub struct DuckLakeTable {
     row_lineage: bool,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
-    /// Table files with paths as stored in metadata (resolved on-the-fly when needed)
-    table_files: Vec<DuckLakeTableFile>,
     /// Table-level statistics for the physical schema.
     table_statistics: Statistics,
-    /// Per-data-file statistics keyed by `data_file_id`.
-    file_statistics: HashMap<i64, Arc<Statistics>>,
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
     /// scans don't re-fetch. `Arc`-wrapped so a cloned table (see `delete_from`)
     /// shares the same memoized configs.
     file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
-    /// Encryption factory for decrypting encrypted Parquet files (when encryption feature is enabled)
+    /// Encryption factory for the metadata page currently being planned.
     #[cfg(feature = "encryption")]
-    encryption_factory: Option<Arc<dyn EncryptionFactory>>,
+    encryption_factory: Arc<std::sync::Mutex<Option<Arc<dyn EncryptionFactory>>>>,
     /// Schema name (needed for write operations)
     #[cfg(feature = "write")]
     schema_name: Option<String>,
@@ -654,7 +656,6 @@ impl std::fmt::Debug for DuckLakeTable {
             .field("table_path", &self.table_path)
             .field("schema", &self.schema)
             .field("columns", &self.columns)
-            .field("table_files", &self.table_files)
             .finish_non_exhaustive()
     }
 }
@@ -669,51 +670,28 @@ impl DuckLakeTable {
         object_store_url: Arc<ObjectStoreUrl>,
         table_path: String,
     ) -> Result<Self> {
-        // Load ALL metadata with this snapshot_id
+        // File metadata is deliberately deferred until scan(), where it can be
+        // consumed and pruned in bounded pages.
         let columns = provider.get_table_structure(table_id, snapshot_id)?;
         let physical_schema = Arc::new(build_arrow_schema(&columns)?);
         let schema = physical_schema.clone();
-        let table_files = provider.get_table_files_for_select(table_id, snapshot_id)?;
-        let catalog_statistics = provider.get_table_statistics(table_id, snapshot_id)?;
+        let catalog_statistics = provider.get_table_summary_statistics(table_id, snapshot_id)?;
         // `ducklake_table_stats` and `ducklake_table_column_stats` describe the
         // current table generation. They must not be applied to an older
         // snapshot if a newer commit landed after the catalog was opened.
         let use_current_table_statistics = provider.get_current_snapshot()? == snapshot_id;
-        let (table_statistics, file_statistics) = build_datafusion_statistics(
+        let (table_statistics, _) = build_datafusion_statistics(
             physical_schema.as_ref(),
             &columns,
-            &table_files,
+            &[],
             catalog_statistics,
             use_current_table_statistics,
+            false,
         );
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
         #[cfg(feature = "encryption")]
-        let encryption_factory = {
-            let mut builder = EncryptionFactoryBuilder::new();
-            for table_file in &table_files {
-                // Resolve the file path for the mapping
-                let resolved_path = resolve_path(
-                    &table_path,
-                    &table_file.file.path,
-                    table_file.file.path_is_relative,
-                )?;
-                builder.add_file(&resolved_path, table_file.file.encryption_key.as_deref());
-
-                // Also add delete file encryption key if present
-                if let Some(ref delete_file) = table_file.delete_file {
-                    let resolved_delete_path =
-                        resolve_path(&table_path, &delete_file.path, delete_file.path_is_relative)?;
-                    builder.add_file(&resolved_delete_path, delete_file.encryption_key.as_deref());
-                }
-            }
-            let factory = builder.build();
-            if factory.has_encrypted_files() {
-                Some(Arc::new(factory) as Arc<dyn EncryptionFactory>)
-            } else {
-                None
-            }
-        };
+        let encryption_factory = Arc::new(std::sync::Mutex::new(None));
 
         Ok(Self {
             table_id,
@@ -726,9 +704,7 @@ impl DuckLakeTable {
             physical_schema,
             row_lineage: false,
             columns,
-            table_files,
             table_statistics,
-            file_statistics,
             #[cfg(feature = "encryption")]
             encryption_factory,
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -767,8 +743,13 @@ impl DuckLakeTable {
     /// each, [`Self::resolve_positions`] finds the rows to delete,
     /// [`Self::read_delete_file_positions`] reads the already-deleted set, and
     /// the union is written back via `set_delete_file` (CAS on `delete_file_id`).
-    pub fn files(&self) -> &[DuckLakeTableFile] {
-        &self.table_files
+    pub fn files(&self) -> Result<Vec<DuckLakeTableFile>> {
+        let files = self
+            .provider
+            .get_table_files_for_select(self.table_id, self.snapshot_id)?;
+        #[cfg(feature = "encryption")]
+        self.configure_encryption_factory(&files)?;
+        Ok(files)
     }
 
     /// Resolve a file path (data or delete file) to its absolute path
@@ -784,6 +765,7 @@ impl DuckLakeTable {
         &self,
         table_file: &DuckLakeTableFile,
         include_rowid: bool,
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> DataFusionResult<PartitionedFile> {
         let resolved_path = self.resolve_file_path(&table_file.file)?;
         let mut file = PartitionedFile::new(
@@ -796,7 +778,7 @@ impl DuckLakeTable {
         {
             file = file.with_metadata_size_hint(hint);
         }
-        if let Some(statistics) = self.file_statistics.get(&table_file.data_file_id) {
+        if let Some(statistics) = file_statistics.get(&table_file.data_file_id) {
             let statistics = if include_rowid {
                 let mut statistics = statistics.as_ref().clone();
                 statistics
@@ -834,19 +816,18 @@ impl DuckLakeTable {
     /// one `Inexact` file suppresses pruning by that column for the whole scan.
     /// Pruning is therefore most effective on append-only / delete-free files.
     fn prune_table_files<'a>(
-        &'a self,
-        state: &dyn Session,
-        filters: &[Expr],
+        &self,
+        pruning: Option<&PruningPredicate>,
+        table_files: &'a [DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> Vec<&'a DuckLakeTableFile> {
-        if filters.is_empty() || self.table_files.is_empty() {
-            return self.table_files.iter().collect();
-        }
-        match self.file_pruning_mask(state, filters) {
+        let Some(pruning) = pruning else {
+            return table_files.iter().collect();
+        };
+        match self.file_pruning_mask(pruning, table_files, file_statistics) {
             Ok(mask) => {
-                // The mask is 1:1 with `table_files` (DataFusion sizes it from
-                // `num_containers`); the zip below relies on that alignment.
-                debug_assert_eq!(mask.len(), self.table_files.len());
-                self.table_files
+                debug_assert_eq!(mask.len(), table_files.len());
+                table_files
                     .iter()
                     .zip(mask)
                     .filter_map(|(tf, keep)| keep.then_some(tf))
@@ -854,9 +835,24 @@ impl DuckLakeTable {
             },
             Err(e) => {
                 tracing::debug!(error = %e, "skipping plan-time file pruning");
-                self.table_files.iter().collect()
+                table_files.iter().collect()
             },
         }
+    }
+
+    fn file_pruning_predicate(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DataFusionResult<Option<PruningPredicate>> {
+        use datafusion::logical_expr::utils::conjunction;
+
+        let Some(expr) = conjunction(filters.iter().cloned()) else {
+            return Ok(None);
+        };
+        let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
+        let predicate = state.create_physical_expr(expr, &df_schema)?;
+        PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema)).map(Some)
     }
 
     /// Build a `PruningPredicate` from `filters` and evaluate it against every
@@ -866,31 +862,17 @@ impl DuckLakeTable {
     /// rowid), matching how `file_statistics` is indexed.
     fn file_pruning_mask(
         &self,
-        state: &dyn Session,
-        filters: &[Expr],
+        pruning: &PruningPredicate,
+        table_files: &[DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> DataFusionResult<Vec<bool>> {
-        use datafusion::logical_expr::utils::conjunction;
-
-        // AND the filters into one predicate and plan it against the physical
-        // schema (no synthetic rowid), so column indices line up with the
-        // per-file statistics. A filter referencing a column absent from
-        // `physical_schema` (e.g. the synthetic rowid) fails here, and the
-        // caller falls back to keeping every file. Mirrors the DELETE path.
-        let Some(expr) = conjunction(filters.iter().cloned()) else {
-            return Ok(vec![true; self.table_files.len()]);
-        };
-        let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        let predicate = state.create_physical_expr(expr, &df_schema)?;
-        let pruning = PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema))?;
-
         // A file lacking recorded statistics (e.g. written before statistics
         // were produced) contributes `new_unknown`, which the predicate treats
         // as "cannot prune" — the file is kept.
-        let per_file: Vec<Arc<Statistics>> = self
-            .table_files
+        let per_file: Vec<Arc<Statistics>> = table_files
             .iter()
             .map(|tf| {
-                self.file_statistics
+                file_statistics
                     .get(&tf.data_file_id)
                     .map(Arc::clone)
                     .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.physical_schema)))
@@ -903,10 +885,36 @@ impl DuckLakeTable {
     /// Create a ParquetSource with encryption support if enabled and needed
     fn create_parquet_source(&self, schema: SchemaRef) -> ParquetSource {
         #[cfg(feature = "encryption")]
-        if let Some(ref factory) = self.encryption_factory {
-            return ParquetSource::new(schema).with_encryption_factory(Arc::clone(factory));
+        if let Some(factory) = self.encryption_factory.lock().unwrap().as_ref().cloned() {
+            return ParquetSource::new(schema).with_encryption_factory(factory);
         }
         ParquetSource::new(schema)
+    }
+
+    #[cfg(feature = "encryption")]
+    fn configure_encryption_factory(&self, table_files: &[DuckLakeTableFile]) -> Result<()> {
+        let mut builder = EncryptionFactoryBuilder::new();
+        for table_file in table_files {
+            let resolved_path = resolve_path(
+                &self.table_path,
+                &table_file.file.path,
+                table_file.file.path_is_relative,
+            )?;
+            builder.add_file(&resolved_path, table_file.file.encryption_key.as_deref());
+            if let Some(delete_file) = &table_file.delete_file {
+                let path = resolve_path(
+                    &self.table_path,
+                    &delete_file.path,
+                    delete_file.path_is_relative,
+                )?;
+                builder.add_file(&path, delete_file.encryption_key.as_deref());
+            }
+        }
+        let factory = builder.build();
+        *self.encryption_factory.lock().unwrap() = factory
+            .has_encrypted_files()
+            .then(|| Arc::new(factory) as Arc<dyn EncryptionFactory>);
+        Ok(())
     }
 
     /// Compute the field_id -> physical-name read schema and rename mapping for a
@@ -1157,6 +1165,7 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         files: &[&DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -1170,7 +1179,7 @@ impl DuckLakeTable {
 
         for table_file in files {
             let mapping = self.file_schema_mapping(state, &table_file.file).await?;
-            let pf = self.partitioned_data_file(table_file, false)?;
+            let pf = self.partitioned_data_file(table_file, false, file_statistics)?;
 
             // Group key: physical field names + types, then the rename mapping.
             let (read_schema, name_mapping) = &mapping;
@@ -1259,6 +1268,7 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -1322,6 +1332,7 @@ impl DuckLakeTable {
             let pf = self.partitioned_data_file(
                 table_file,
                 file_cfg.embedded_rowid_parquet_name.is_some(),
+                file_statistics,
             )?;
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
@@ -1579,6 +1590,7 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
         user_proj: &[usize],
         rowid_idx: usize,
         limit: Option<usize>,
@@ -1672,7 +1684,7 @@ impl DuckLakeTable {
         } else {
             // Embedded rowid, no deletes: legacy plain scan (cardinality-
             // preserving). Keep scan-level limit and reader pruning.
-            let pf = self.partitioned_data_file(table_file, true)?;
+            let pf = self.partitioned_data_file(table_file, true, file_statistics)?;
             let mut builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
                 Arc::new(self.create_parquet_source(file_cfg.read_schema.clone())),
@@ -1811,9 +1823,7 @@ impl DuckLakeTable {
             physical_schema: self.physical_schema.clone(),
             row_lineage: false,
             columns: self.columns.clone(),
-            table_files: self.table_files.clone(),
             table_statistics: self.table_statistics.clone(),
-            file_statistics: self.file_statistics.clone(),
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2227,10 +2237,6 @@ impl TableProvider for DuckLakeTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Plan-time pruning: restrict the files considered below to those whose
-        // statistics admit a match. Empty filters / missing stats keep every file.
-        let table_files = self.prune_table_files(state, filters);
-
         // Row-lineage detour: when the synthetic `rowid` column is projected,
         // every file needs its own scan because each has a distinct
         // `row_id_start`. `projection == None` with row lineage on means "all
@@ -2242,83 +2248,152 @@ impl TableProvider for DuckLakeTable {
             (None, _) => false,
         };
 
-        if rowid_in_proj {
-            let rowid_idx = rowid_idx.unwrap();
-            let user_proj: Vec<usize> = projection
-                .cloned()
-                .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let pruning = match self.file_pruning_predicate(state, filters) {
+            Ok(pruning) => pruning,
+            Err(error) => {
+                tracing::debug!(%error, "skipping plan-time file pruning");
+                None
+            },
+        };
+        let mut after_data_file_id = None;
+        loop {
+            let metadata = self.provider.get_table_file_metadata_page(
+                self.table_id,
+                self.snapshot_id,
+                after_data_file_id,
+                FILE_METADATA_BATCH_SIZE,
+            )?;
+            if metadata.is_empty() {
+                break;
+            }
+            if metadata.len() > FILE_METADATA_BATCH_SIZE {
+                return Err(DataFusionError::External(Box::new(
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "metadata provider returned {} files for a {}-file planning page",
+                        metadata.len(),
+                        FILE_METADATA_BATCH_SIZE
+                    )),
+                )));
+            }
+            let next_after = metadata.last().unwrap().file.data_file_id;
+            if after_data_file_id.map_or(false, |after| next_after <= after) {
+                return Err(DataFusionError::External(Box::new(
+                    crate::DuckLakeError::InvalidConfig(
+                        "metadata provider returned a non-advancing file page".to_string(),
+                    ),
+                )));
+            }
+            after_data_file_id = Some(next_after);
 
-            let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            for tf in table_files.iter().copied() {
-                // A merged partial file read below its partial_max needs per-row
-                // snapshot filtering; it always embeds its rowid, so the partial
-                // path serves the projected rowid directly.
-                let exec = if self.needs_snapshot_filter(tf) {
-                    let output_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
-                    self.build_exec_for_partial_file(state, tf, output_schema)
+            let mut catalog_file_statistics = Vec::new();
+            let mut table_files = Vec::with_capacity(metadata.len());
+            for DuckLakeFileMetadata {
+                file,
+                column_statistics,
+            } in metadata
+            {
+                table_files.push(file);
+                catalog_file_statistics.extend(column_statistics);
+            }
+            let (_, file_statistics) = build_datafusion_statistics(
+                self.physical_schema.as_ref(),
+                &self.columns,
+                &table_files,
+                DuckLakeStatistics {
+                    files: catalog_file_statistics,
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
+            #[cfg(feature = "encryption")]
+            self.configure_encryption_factory(&table_files)?;
+
+            let table_files =
+                self.prune_table_files(pruning.as_ref(), &table_files, &file_statistics);
+
+            if rowid_in_proj {
+                let rowid_idx = rowid_idx.unwrap();
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+                for table_file in table_files {
+                    let exec = if self.needs_snapshot_filter(table_file) {
+                        let output_schema =
+                            self.output_schema_for_projection(&user_proj, rowid_idx);
+                        self.build_exec_for_partial_file(state, table_file, output_schema)
+                            .await?
+                    } else {
+                        self.build_exec_for_file_with_rowid(
+                            state,
+                            table_file,
+                            &file_statistics,
+                            &user_proj,
+                            rowid_idx,
+                            limit,
+                        )
                         .await?
-                } else {
-                    self.build_exec_for_file_with_rowid(state, tf, &user_proj, rowid_idx, limit)
-                        .await?
-                };
-                execs.push(exec);
+                    };
+                    execs.push(exec);
+                }
+                continue;
             }
 
+            let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
+                .into_iter()
+                .partition(|table_file| self.needs_snapshot_filter(table_file));
+            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = rest
+                .into_iter()
+                .partition(|table_file| table_file.delete_file.is_some());
+
+            if !files_without_deletes.is_empty() {
+                execs.push(
+                    self.build_exec_for_files_without_deletes(
+                        state,
+                        &files_without_deletes,
+                        &file_statistics,
+                        projection,
+                        limit,
+                    )
+                    .await?,
+                );
+            }
+            for table_file in files_with_deletes {
+                execs.push(
+                    self.build_exec_for_file_with_deletes(
+                        state,
+                        table_file,
+                        &file_statistics,
+                        projection,
+                        limit,
+                    )
+                    .await?,
+                );
+            }
+            for table_file in needs_filter {
+                let output_schema = match projection {
+                    Some(indices) => Arc::new(self.schema.project(indices)?),
+                    None => self.schema.clone(),
+                };
+                execs.push(
+                    self.build_exec_for_partial_file(state, table_file, output_schema)
+                        .await?,
+                );
+            }
+        }
+
+        if rowid_in_proj {
             if execs.is_empty() {
                 use datafusion::physical_plan::empty::EmptyExec;
-                let projected_schema = self.output_schema_for_projection(&user_proj, rowid_idx);
-                return Ok(Arc::new(EmptyExec::new(projected_schema)));
+                let rowid_idx = rowid_idx.unwrap();
+                let user_proj: Vec<usize> = projection
+                    .cloned()
+                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+                let schema = self.output_schema_for_projection(&user_proj, rowid_idx);
+                return Ok(Arc::new(EmptyExec::new(schema)));
             }
-
             return combine_execution_plans(execs);
-        }
-
-        // Fast path: rowid not projected. All projection indices refer to
-        // physical columns, so the existing logic works untouched.
-        //
-        // First peel off merged partial files being read below their partial_max
-        // — they need per-row snapshot filtering and are handled per file. Every
-        // other file (ordinary, or a partial file at/after its partial_max) takes
-        // the existing grouped/with-deletes paths unchanged.
-        let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
-            .into_iter()
-            .partition(|tf| self.needs_snapshot_filter(tf));
-        let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
-            rest.into_iter().partition(|tf| tf.delete_file.is_some());
-
-        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-
-        // Create single exec for all files without deletes (more efficient)
-        if !files_without_deletes.is_empty() {
-            let exec = self
-                .build_exec_for_files_without_deletes(
-                    state,
-                    &files_without_deletes,
-                    projection,
-                    limit,
-                )
-                .await?;
-            execs.push(exec);
-        }
-
-        // Only create separate execs for files with deletes
-        for table_file in files_with_deletes {
-            let exec = self
-                .build_exec_for_file_with_deletes(state, table_file, projection, limit)
-                .await?;
-            execs.push(exec);
-        }
-
-        // Per-file snapshot-filtered execs for partial files read in the past.
-        for table_file in needs_filter {
-            let output_schema = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
-                None => self.schema.clone(),
-            };
-            let exec = self
-                .build_exec_for_partial_file(state, table_file, output_schema)
-                .await?;
-            execs.push(exec);
         }
 
         // Inlined data: rows DuckDB's data-inlining optimization stored directly
@@ -2455,8 +2530,11 @@ impl TableProvider for DuckLakeTable {
         // `scan()` does — but no data scan and no mutation happen here; the exec
         // collects each scan and performs the rewrite + atomic commit at execute
         // time.
-        let mut scans = Vec::with_capacity(self.table_files.len());
-        for tf in &self.table_files {
+        let table_files = self
+            .files()
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let mut scans = Vec::with_capacity(table_files.len());
+        for tf in &table_files {
             scans.push(self.build_update_scan(state, tf).await?);
         }
 
@@ -2617,6 +2695,228 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_provider::{
+        ColumnWithTable, DataFileChange, DeleteFileChange, FileWithTable, SchemaMetadata,
+        SnapshotMetadata, TableMetadata, TableWithSchema,
+    };
+    use datafusion::prelude::{SessionContext, col, lit};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct LazyMillionFileProvider {
+        eager_file_reads: AtomicUsize,
+        max_page: AtomicUsize,
+    }
+
+    impl MetadataProvider for LazyMillionFileProvider {
+        fn get_current_snapshot(&self) -> Result<i64> {
+            Ok(1)
+        }
+
+        fn get_data_path(&self) -> Result<String> {
+            Ok("memory:///".to_string())
+        }
+
+        fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
+            unimplemented!()
+        }
+
+        fn list_schemas(&self, _snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
+            unimplemented!()
+        }
+
+        fn list_tables(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<TableMetadata>> {
+            unimplemented!()
+        }
+
+        fn get_table_structure(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<Vec<DuckLakeTableColumn>> {
+            Ok(vec![DuckLakeTableColumn::new(
+                1,
+                "id".to_string(),
+                "bigint".to_string(),
+                false,
+            )])
+        }
+
+        fn get_table_files_for_select(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<Vec<DuckLakeTableFile>> {
+            self.eager_file_reads.fetch_add(1, Ordering::Relaxed);
+            panic!("the eager file API must not be used while planning a scan")
+        }
+
+        fn get_table_summary_statistics(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<DuckLakeStatistics> {
+            Ok(DuckLakeStatistics {
+                table: Some(crate::metadata_provider::DuckLakeTableStatistics {
+                    record_count: Some(1_000_000),
+                    file_size_bytes: Some(1_000_000),
+                }),
+                ..Default::default()
+            })
+        }
+
+        fn get_table_file_metadata_page(
+            &self,
+            _table_id: i64,
+            snapshot_id: i64,
+            after_data_file_id: Option<i64>,
+            limit: usize,
+        ) -> Result<Vec<DuckLakeFileMetadata>> {
+            let start = after_data_file_id.unwrap_or(0) + 1;
+            let end = (start + i64::try_from(limit).unwrap()).min(1_000_001);
+            let page: Vec<_> = (start..end)
+                .map(|data_file_id| DuckLakeFileMetadata {
+                    file: DuckLakeTableFile {
+                        data_file_id,
+                        file: DuckLakeFileData::new(
+                            format!("file-{data_file_id}.parquet"),
+                            true,
+                            1,
+                        ),
+                        delete_file_id: None,
+                        delete_file: None,
+                        row_id_start: Some(data_file_id - 1),
+                        snapshot_id: Some(snapshot_id),
+                        begin_snapshot: Some(1),
+                        schema_version: Some(0),
+                        partial_max: None,
+                        max_row_count: Some(1),
+                        delete_count: None,
+                    },
+                    column_statistics: vec![DuckLakeFileColumnStatistics {
+                        data_file_id,
+                        column_id: 1,
+                        column_size_bytes: Some(1),
+                        value_count: Some(1),
+                        null_count: Some(0),
+                        min_value: Some(data_file_id.to_string()),
+                        max_value: Some(data_file_id.to_string()),
+                    }],
+                })
+                .collect();
+            self.max_page.fetch_max(page.len(), Ordering::Relaxed);
+            Ok(page)
+        }
+
+        fn get_schema_by_name(
+            &self,
+            _name: &str,
+            _snapshot_id: i64,
+        ) -> Result<Option<SchemaMetadata>> {
+            unimplemented!()
+        }
+
+        fn get_table_by_name(
+            &self,
+            _schema_id: i64,
+            _name: &str,
+            _snapshot_id: i64,
+        ) -> Result<Option<TableMetadata>> {
+            unimplemented!()
+        }
+
+        fn table_exists(&self, _schema_id: i64, _name: &str, _snapshot_id: i64) -> Result<bool> {
+            unimplemented!()
+        }
+
+        fn list_all_tables(&self, _snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
+            unimplemented!()
+        }
+
+        fn list_all_columns(&self, _snapshot_id: i64) -> Result<Vec<ColumnWithTable>> {
+            unimplemented!()
+        }
+
+        fn list_all_files(&self, _snapshot_id: i64) -> Result<Vec<FileWithTable>> {
+            unimplemented!()
+        }
+
+        fn get_data_files_added_between_snapshots(
+            &self,
+            _table_id: i64,
+            _start_snapshot: i64,
+            _end_snapshot: i64,
+        ) -> Result<Vec<DataFileChange>> {
+            unimplemented!()
+        }
+
+        fn get_delete_files_added_between_snapshots(
+            &self,
+            _table_id: i64,
+            _start_snapshot: i64,
+            _end_snapshot: i64,
+        ) -> Result<Vec<DeleteFileChange>> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn planning_prunes_a_lazy_million_file_fixture_in_bounded_pages() -> Result<()> {
+        let provider = Arc::new(LazyMillionFileProvider::default());
+        let table = DuckLakeTable::new(
+            1,
+            "events",
+            provider.clone(),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )?;
+        assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
+
+        let state = SessionContext::new().state();
+        let filters = [col("id").eq(lit(999_999_i64))];
+        let pruning = table
+            .file_pruning_predicate(&state, &filters)
+            .unwrap()
+            .unwrap();
+        let mut after = None;
+        let mut retained = Vec::new();
+        loop {
+            let metadata =
+                provider.get_table_file_metadata_page(1, 1, after, FILE_METADATA_BATCH_SIZE)?;
+            if metadata.is_empty() {
+                break;
+            }
+            after = metadata.last().map(|entry| entry.file.data_file_id);
+            let files: Vec<_> = metadata.iter().map(|entry| entry.file.clone()).collect();
+            let catalog_statistics = metadata
+                .into_iter()
+                .flat_map(|entry| entry.column_statistics)
+                .collect();
+            let (_, file_statistics) = build_datafusion_statistics(
+                table.physical_schema.as_ref(),
+                &table.columns,
+                &files,
+                DuckLakeStatistics {
+                    files: catalog_statistics,
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
+            retained.extend(
+                table
+                    .prune_table_files(Some(&pruning), &files, &file_statistics)
+                    .into_iter()
+                    .map(|file| file.data_file_id),
+            );
+        }
+
+        assert_eq!(provider.max_page.load(Ordering::Relaxed), 64);
+        assert_eq!(retained, vec![999_999]);
+        assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
 
     #[test]
     fn test_validated_file_size_positive() {

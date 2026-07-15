@@ -1,4 +1,5 @@
 use crate::Result;
+use std::collections::HashMap;
 
 // SQL queries for DuckLake catalog tables
 // These queries are database-agnostic and work with DuckDB, SQLite, PostgreSQL, MySQL
@@ -596,6 +597,19 @@ pub struct DuckLakeFileColumnStatistics {
     pub max_value: Option<String>,
 }
 
+/// One visible data file and its catalog column statistics.
+///
+/// Table scans consume these records in bounded pages so selective predicates
+/// can discard files without first materializing the table's full file set.
+#[derive(Debug, Clone)]
+pub struct DuckLakeFileMetadata {
+    pub file: DuckLakeTableFile,
+    pub column_statistics: Vec<DuckLakeFileColumnStatistics>,
+}
+
+/// Maximum number of file metadata records retained by the planning iterator.
+pub const FILE_METADATA_BATCH_SIZE: usize = 64;
+
 impl DuckLakeTableFile {
     pub fn new(file: DuckLakeFileData) -> Self {
         Self {
@@ -714,6 +728,55 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
         Ok(DuckLakeStatistics::default())
+    }
+
+    /// Load only table- and table-column statistics.
+    ///
+    /// Built-in providers override this to avoid touching per-file statistics
+    /// while constructing a [`crate::DuckLakeTable`]. The default preserves
+    /// compatibility for external providers.
+    fn get_table_summary_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<DuckLakeStatistics> {
+        let mut statistics = self.get_table_statistics(table_id, snapshot_id)?;
+        statistics.files.clear();
+        Ok(statistics)
+    }
+
+    /// Load one keyset-paginated batch of visible files and their statistics.
+    ///
+    /// `after_data_file_id` is exclusive. Implementations must return records
+    /// ordered by `data_file_id` and no more than `limit` records. Built-in SQL
+    /// providers override this with bounded catalog queries; the default keeps
+    /// external providers source-compatible, although it is not memory-bounded.
+    fn get_table_file_metadata_page(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        let mut files = self.get_table_files_for_select(table_id, snapshot_id)?;
+        files.sort_by_key(|file| file.data_file_id);
+        let statistics = self.get_table_statistics(table_id, snapshot_id)?.files;
+        let mut by_file: HashMap<i64, Vec<DuckLakeFileColumnStatistics>> = HashMap::new();
+        for statistic in statistics {
+            by_file
+                .entry(statistic.data_file_id)
+                .or_default()
+                .push(statistic);
+        }
+        Ok(files
+            .into_iter()
+            .filter(|file| after_data_file_id.map_or(true, |after| file.data_file_id > after))
+            .take(limit)
+            .map(|file| DuckLakeFileMetadata {
+                column_statistics: by_file.remove(&file.data_file_id).unwrap_or_default(),
+                file,
+            })
+            .collect())
     }
 
     /// Read rows that DuckDB's *data-inlining* optimization stored directly in

@@ -259,12 +259,15 @@ async fn run_delete(
     base_snapshot: i64,
 ) -> DataFusionResult<u64> {
     let state: &dyn Session = session_state;
+    let table_files = table
+        .files()
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
     // Delete-all (no WHERE): metadata-only truncate — end every live data file in
     // one snapshot. Skip the empty table entirely (no-op, no snapshot).
     let predicate = match predicate {
         None => {
-            if table.files().is_empty() {
+            if table_files.is_empty() {
                 return Ok(0);
             }
             return writer
@@ -285,7 +288,7 @@ async fn run_delete(
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
     let mut total_deleted: u64 = 0;
 
-    for tf in table.files() {
+    for tf in &table_files {
         // v1 refuses files rewritten by an UPDATE/compaction: their surviving
         // rows carry embedded rowids whose physical order need not match the
         // DuckLake `pos` space, so positional resolution could mis-delete. Clean

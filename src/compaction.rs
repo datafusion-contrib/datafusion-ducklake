@@ -182,8 +182,8 @@ impl DuckLakeTable {
         // Candidates: live, delete-free, below-target files with a known origin
         // snapshot + schema version, ordered so adjacency and same-version
         // grouping fall out of the sort.
-        let mut candidates: Vec<&DuckLakeTableFile> = self
-            .files()
+        let table_files = self.files()?;
+        let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
                 f.delete_file_id.is_none()
@@ -386,7 +386,8 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
-        for tf in self.files() {
+        let table_files = self.files()?;
+        for tf in &table_files {
             let record_count = tf.max_row_count.unwrap_or(0);
             let delete_count = tf.delete_count.unwrap_or(0);
             // Only files with a live delete file masking >= threshold of the rows.
