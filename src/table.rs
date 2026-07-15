@@ -50,6 +50,7 @@ use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
 use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -2222,6 +2223,24 @@ impl TableProvider for DuckLakeTable {
             let exec = self
                 .build_exec_for_partial_file(state, table_file, output_schema)
                 .await?;
+            execs.push(exec);
+        }
+
+        // Inlined data: rows DuckDB's data-inlining optimization stored directly
+        // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
+        // include them. Providers without inlined data — or that don't implement
+        // the read — return empty, so this is a no-op for ordinary catalogs.
+        // (Phase 1: applies on this non-rowid read path; only the SQLite provider
+        // surfaces inlined rows today.)
+        let inlined =
+            self.provider
+                .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
+        if inlined.iter().any(|b| b.num_rows() > 0) {
+            let exec = MemorySourceConfig::try_new_exec(
+                &[inlined],
+                self.physical_schema.clone(),
+                projection.cloned(),
+            )?;
             execs.push(exec);
         }
 

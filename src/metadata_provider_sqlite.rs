@@ -8,9 +8,113 @@ use crate::metadata_provider::{
     SnapshotMetadata, TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
     reconstruct_list_columns_with_table,
 };
+use arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    new_null_array,
+};
+use arrow::datatypes::{DataType, SchemaRef};
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::types::chrono::NaiveDateTime;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+/// Quote a SQL identifier for SQLite (double-quote, doubling embedded quotes),
+/// so catalog-supplied inlined-table / column names can't break the query.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Build one Arrow [`RecordBatch`] (in `schema`, the table's physical schema)
+/// from inlined rows fetched out of a `ducklake_inlined_data_*` table. `present`
+/// is the set of the physical table's data-column names; a table column absent
+/// from it (added after this inlined table's schema version) is null-filled.
+/// Errors on a column type not yet supported for inlined reads (loud, never
+/// silent) — inlined values for those types must be flushed to Parquet first.
+fn build_inlined_batch(
+    schema: &SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    present: &HashSet<String>,
+    rows: &[sqlx::sqlite::SqliteRow],
+) -> Result<RecordBatch> {
+    let n = rows.len();
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    for (i, col) in columns.iter().enumerate() {
+        let dt = schema.field(i).data_type();
+        let name = col.column_name.as_str();
+        if !present.contains(name) {
+            arrays.push(new_null_array(dt, n));
+            continue;
+        }
+        // SQLite stores INTEGER as i64 and REAL as f64; read at that width and
+        // narrow/convert to the catalog's declared Arrow type.
+        macro_rules! ints {
+            ($arr:ty, $t:ty) => {{
+                let mut b = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<i64>, _>(name)?.map(|v| v as $t));
+                }
+                Arc::new(<$arr>::from(b)) as ArrayRef
+            }};
+        }
+        let array: ArrayRef = match dt {
+            DataType::Int8 => ints!(Int8Array, i8),
+            DataType::Int16 => ints!(Int16Array, i16),
+            DataType::Int32 => ints!(Int32Array, i32),
+            DataType::Int64 => ints!(Int64Array, i64),
+            DataType::UInt8 => ints!(UInt8Array, u8),
+            DataType::UInt16 => ints!(UInt16Array, u16),
+            DataType::UInt32 => ints!(UInt32Array, u32),
+            DataType::UInt64 => ints!(UInt64Array, u64),
+            DataType::Float32 => {
+                let mut b = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<f64>, _>(name)?.map(|v| v as f32));
+                }
+                Arc::new(Float32Array::from(b)) as ArrayRef
+            },
+            DataType::Float64 => {
+                let mut b = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<f64>, _>(name)?);
+                }
+                Arc::new(Float64Array::from(b)) as ArrayRef
+            },
+            DataType::Utf8 => {
+                let mut b: Vec<Option<String>> = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<String>, _>(name)?);
+                }
+                Arc::new(arrow::array::StringArray::from(b)) as ArrayRef
+            },
+            DataType::Boolean => {
+                let mut b = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<i64>, _>(name)?.map(|v| v != 0));
+                }
+                Arc::new(BooleanArray::from(b)) as ArrayRef
+            },
+            DataType::Binary => {
+                let mut b: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
+                for r in rows {
+                    b.push(r.try_get::<Option<Vec<u8>>, _>(name)?);
+                }
+                Arc::new(BinaryArray::from(
+                    b.iter().map(|o| o.as_deref()).collect::<Vec<_>>(),
+                )) as ArrayRef
+            },
+            other => {
+                return Err(crate::error::DuckLakeError::Unsupported(format!(
+                    "inlined data for column '{name}' of type {other:?} is not yet supported; \
+                     flush inlined data to Parquet (or disable data inlining at write time)"
+                )));
+            },
+        };
+        arrays.push(array);
+    }
+    Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+}
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -399,6 +503,94 @@ impl MetadataProvider for SqliteMetadataProvider {
                 columns,
                 files,
             })
+        })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<RecordBatch>> {
+        block_on(async {
+            // Most catalogs have no inlined data — the registry table is absent.
+            // Detect and return empty so they (and older catalogs) are unaffected.
+            let has_registry: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'ducklake_inlined_data_tables'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if has_registry == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Every physical inlined table for this table (one per schema version).
+            let regs = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if regs.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+            for reg in regs {
+                let phys: String = reg.try_get("table_name")?;
+                // Defensive: only touch tables that look like DuckLake inline tables.
+                if !phys.starts_with("ducklake_inlined_data_")
+                    || !phys.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+
+                // Which of the table's columns this inline table physically has
+                // (its layout matches the schema version it was created for).
+                let info = sqlx::query(&format!(
+                    "SELECT name FROM pragma_table_info({})",
+                    // pragma wants a string literal; single-quote-escape the name.
+                    format_args!("'{}'", phys.replace('\'', "''"))
+                ))
+                .fetch_all(&self.pool)
+                .await?;
+                let present: HashSet<String> = info
+                    .iter()
+                    .filter_map(|r| r.try_get::<String, _>("name").ok())
+                    .collect();
+
+                // Project the table columns this inline table actually has; rows
+                // visible at the snapshot (this predicate also hides inlined-row
+                // deletes, which set end_snapshot). ORDER BY row_id for stability.
+                let projected: Vec<String> = columns
+                    .iter()
+                    .filter(|c| present.contains(c.column_name.as_str()))
+                    .map(|c| quote_ident(&c.column_name))
+                    .collect();
+                let select_list = if projected.is_empty() {
+                    "1".to_string()
+                } else {
+                    projected.join(", ")
+                };
+                let sql = format!(
+                    "SELECT {select_list} FROM {} \
+                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                     ORDER BY row_id",
+                    quote_ident(&phys)
+                );
+                let rows = sqlx::query(&sql)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                batches.push(build_inlined_batch(&schema, columns, &present, &rows)?);
+            }
+            Ok(batches)
         })
     }
 

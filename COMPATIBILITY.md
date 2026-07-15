@@ -197,11 +197,8 @@ Known edges:
 - **No partition-based file pruning** on read.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Data inlining is not read.** DuckDB's ducklake extension inlines small INSERTs
-  (≤ `ducklake_default_data_inlining_row_limit`, default 10 rows) into the catalog
-  rather than Parquet files. This crate only reads `ducklake_data_file` rows, so inlined
-  data is invisible — `SELECT COUNT(*)` will silently undercount. If you write through
-  DuckDB and read through this crate, either disable inlining at write time
-  (`SET ducklake_default_data_inlining_row_limit = 0` on every writer connection) or run
-  `COMPACT` before reading. Catalogs written entirely through this crate's
-  `SqliteMetadataWriter` are unaffected — we never inline.
+- **Data inlining (SQLite backend): now read.** DuckDB inlines small INSERTs into the
+  catalog instead of Parquet; on SQLite these are now unioned into scans (snapshot
+  visibility honored), so `SELECT` / `COUNT(*)` are correct. Not yet on the DuckDB /
+  PostgreSQL / MySQL backends, for inlined *Parquet-row* deletes, the `rowid` path, or
+  non-scalar inlined column types.

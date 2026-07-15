@@ -703,6 +703,35 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(DuckLakeStatistics::default())
     }
 
+    /// Read rows that DuckDB's *data-inlining* optimization stored directly in
+    /// the catalog database (not in Parquet), for `table_id` visible at
+    /// `snapshot_id`, materialized as Arrow batches in `columns`' physical
+    /// schema (same column order as [`get_table_structure`](Self::get_table_structure)).
+    ///
+    /// DuckLake inlines small INSERTs into per-`(table, schema_version)` catalog
+    /// tables `ducklake_inlined_data_<id>_<sv>(row_id, begin_snapshot,
+    /// end_snapshot, <data cols>)`, registered in `ducklake_inlined_data_tables`.
+    /// A row is visible when `snapshot_id >= begin_snapshot AND (end_snapshot IS
+    /// NULL OR snapshot_id < end_snapshot)`; a deleted inlined row simply carries
+    /// `end_snapshot`, so the predicate handles inlined-row deletes.
+    ///
+    /// The default returns empty, so catalogs without inlined data (no
+    /// `ducklake_inlined_data_tables`) and backends that don't implement this are
+    /// unaffected. Implementations that return empty when the registry is absent
+    /// keep older catalogs readable.
+    ///
+    /// NOTE: this surfaces inlined INSERT rows only. Inlined deletions of rows
+    /// that live in Parquet data files (`ducklake_inlined_delete_<id>`) are a
+    /// separate mechanism and are not yet applied here.
+    fn get_inlined_data(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+        Ok(Vec::new())
+    }
+
     /// Net number of live rows in a table at a snapshot, accounting for delete
     /// files: `SUM(record_count) - SUM(delete_count)` over the files visible at
     /// `snapshot_id`. This matches a `SELECT COUNT(*)` against the table at that
