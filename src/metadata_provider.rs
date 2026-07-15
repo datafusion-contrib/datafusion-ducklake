@@ -110,7 +110,8 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
         data.path_is_relative,
         data.file_size_bytes,
         data.footer_size,
-        data.encryption_key
+        data.encryption_key,
+        data.row_id_start
     FROM ducklake_data_file AS data
     WHERE data.table_id = ?
       AND data.begin_snapshot > ?
@@ -626,6 +627,12 @@ pub struct DataFileChange {
     pub file_size_bytes: i64,
     pub footer_size: Option<i64>,
     pub encryption_key: Option<String>,
+    /// First rowid assigned to this file (`row_id_start` in the catalog), or
+    /// `None` when the catalog does not carry one (e.g. an embedded-rowid
+    /// compaction/rewrite output, or an older catalog). Required only to
+    /// synthesize a plain insert's rowid (`row_id_start + physical_position`);
+    /// files with an embedded rowid do not need it.
+    pub row_id_start: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -634,8 +641,14 @@ pub struct DeleteFileChange {
     pub data_file_path: String,
     pub data_file_path_is_relative: bool,
     pub data_file_size_bytes: i64,
-    pub data_file_footer_size: i64,
-    pub data_row_id_start: i64,
+    // Nullable in `ducklake_data_file` (mirrors `DataFileChange::footer_size`);
+    // a data file registered without a footer-size hint has NULL here.
+    pub data_file_footer_size: Option<i64>,
+    // Nullable (mirrors `DataFileChange::row_id_start`): NULL for embedded-rowid
+    // rewrite/compaction outputs. Required only when a deleted row's rowid must
+    // be synthesized as `row_id_start + position` (i.e. the source file has no
+    // embedded rowid).
+    pub data_row_id_start: Option<i64>,
     pub data_record_count: i64,
     pub data_mapping_id: Option<i64>,
 

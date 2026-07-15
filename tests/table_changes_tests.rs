@@ -274,6 +274,10 @@ mod integration_tests {
 
         // CDC metadata columns
         assert!(
+            field_names.contains(&"rowid"),
+            "Schema should contain 'rowid' CDC column"
+        );
+        assert!(
             field_names.contains(&"snapshot_id"),
             "Schema should contain 'snapshot_id' CDC column"
         );
@@ -283,10 +287,10 @@ mod integration_tests {
         );
 
         // Verify column order: table columns first, then CDC columns
-        assert_eq!(field_names.len(), 5, "Should have 5 columns total");
+        assert_eq!(field_names.len(), 6, "Should have 6 columns total");
         assert_eq!(
             field_names,
-            vec!["id", "event_type", "value", "snapshot_id", "change_type"],
+            vec!["id", "event_type", "value", "rowid", "snapshot_id", "change_type"],
             "Columns should be in order: table columns, then CDC columns"
         );
 

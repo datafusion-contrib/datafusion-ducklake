@@ -524,6 +524,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     file_size_bytes: row.get(3)?,
                     footer_size: row.get(4)?,
                     encryption_key: row.get(5)?,
+                    row_id_start: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

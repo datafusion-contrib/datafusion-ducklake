@@ -707,7 +707,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                     data.path_is_relative,
                     data.file_size_bytes,
                     data.footer_size,
-                    data.encryption_key
+                    data.encryption_key,
+                    data.row_id_start
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = $1
                   AND data.begin_snapshot > $2
@@ -729,6 +730,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         file_size_bytes: row.try_get(3)?,
                         footer_size: row.try_get(4)?,
                         encryption_key: row.try_get(5)?,
+                        row_id_start: row.try_get(6)?,
                     })
                 })
                 .collect()
