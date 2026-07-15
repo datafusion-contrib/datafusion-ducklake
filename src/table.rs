@@ -31,14 +31,15 @@ use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::update_exec::DuckLakeUpdateExec;
 #[cfg(feature = "write")]
 use arrow::array::ArrayRef;
-#[cfg(feature = "write")]
 use datafusion::common::DFSchema;
+use datafusion::common::pruning::PrunableStatistics;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::Operator;
 #[cfg(feature = "write")]
 use datafusion::physical_expr::PhysicalExpr;
 #[cfg(feature = "write")]
 use datafusion::physical_expr::expressions::BinaryExpr;
+use datafusion::physical_optimizer::pruning::PruningPredicate;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -808,6 +809,95 @@ impl DuckLakeTable {
             file = file.with_statistics(statistics);
         }
         Ok(file)
+    }
+
+    /// Plan-time file pruning: return the subset of `self.table_files` whose
+    /// catalog column statistics (min/max/null counts) prove they *may* contain
+    /// rows matching `filters`. Files with no recorded statistics are always
+    /// kept.
+    ///
+    /// This complements the parquet opener's execution-time `FilePruner`, which
+    /// applies the same statistics to skip *reading* non-matching files. Pruning
+    /// here shrinks the physical plan itself (file count and the size/row
+    /// estimates aggregated from the surviving files' statistics) so downstream
+    /// join and aggregation planning sees only the relevant files.
+    ///
+    /// Purely an optimisation. Only static predicates are evaluated, so the
+    /// result can only ever be a *superset* of the truly-matching files — it
+    /// never drops a file that could match. On an empty filter set, or any error
+    /// while building the predicate, every file is kept.
+    ///
+    /// Effectiveness note: a file with a live delete file has `Inexact`
+    /// statistics (its recorded min/max may cover already-deleted rows). Because
+    /// `PrunableStatistics` only prunes on `Exact` bounds, such a file is always
+    /// kept — and, since the bounds are aggregated per column across all files,
+    /// one `Inexact` file suppresses pruning by that column for the whole scan.
+    /// Pruning is therefore most effective on append-only / delete-free files.
+    fn prune_table_files<'a>(
+        &'a self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> Vec<&'a DuckLakeTableFile> {
+        if filters.is_empty() || self.table_files.is_empty() {
+            return self.table_files.iter().collect();
+        }
+        match self.file_pruning_mask(state, filters) {
+            Ok(mask) => {
+                // The mask is 1:1 with `table_files` (DataFusion sizes it from
+                // `num_containers`); the zip below relies on that alignment.
+                debug_assert_eq!(mask.len(), self.table_files.len());
+                self.table_files
+                    .iter()
+                    .zip(mask)
+                    .filter_map(|(tf, keep)| keep.then_some(tf))
+                    .collect()
+            },
+            Err(e) => {
+                tracing::debug!(error = %e, "skipping plan-time file pruning");
+                self.table_files.iter().collect()
+            },
+        }
+    }
+
+    /// Build a `PruningPredicate` from `filters` and evaluate it against every
+    /// file's catalog statistics, returning a keep/drop mask 1:1 with
+    /// `self.table_files` (`true` = keep). Filters and statistics are both keyed
+    /// to `physical_schema` (the parquet-backed columns, excluding the synthetic
+    /// rowid), matching how `file_statistics` is indexed.
+    fn file_pruning_mask(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DataFusionResult<Vec<bool>> {
+        use datafusion::logical_expr::utils::conjunction;
+
+        // AND the filters into one predicate and plan it against the physical
+        // schema (no synthetic rowid), so column indices line up with the
+        // per-file statistics. A filter referencing a column absent from
+        // `physical_schema` (e.g. the synthetic rowid) fails here, and the
+        // caller falls back to keeping every file. Mirrors the DELETE path.
+        let Some(expr) = conjunction(filters.iter().cloned()) else {
+            return Ok(vec![true; self.table_files.len()]);
+        };
+        let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
+        let predicate = state.create_physical_expr(expr, &df_schema)?;
+        let pruning = PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema))?;
+
+        // A file lacking recorded statistics (e.g. written before statistics
+        // were produced) contributes `new_unknown`, which the predicate treats
+        // as "cannot prune" — the file is kept.
+        let per_file: Vec<Arc<Statistics>> = self
+            .table_files
+            .iter()
+            .map(|tf| {
+                self.file_statistics
+                    .get(&tf.data_file_id)
+                    .map(Arc::clone)
+                    .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.physical_schema)))
+            })
+            .collect();
+        let stats = PrunableStatistics::new(per_file, Arc::clone(&self.physical_schema));
+        pruning.prune(&stats)
     }
 
     /// Create a ParquetSource with encryption support if enabled and needed
@@ -2128,13 +2218,19 @@ impl TableProvider for DuckLakeTable {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        // Filters are received here for informational purposes. DataFusion's optimizer
-        // automatically pushes them down to the Parquet scanner for row group pruning and
-        // page-level filtering since we declared support via supports_filters_pushdown().
-        // We mark them as Inexact, so DataFusion will reapply them after our scan.
-        _filters: &[Expr],
+        // Filters drive plan-time file pruning below: `prune_table_files` drops
+        // files whose catalog statistics prove they cannot match. They are also
+        // pushed down to the parquet scanner by DataFusion's optimizer for row
+        // group / page-level filtering. We declare them Inexact in
+        // `supports_filters_pushdown`, so DataFusion reapplies them after our
+        // scan — pruning here only ever removes provably non-matching files.
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Plan-time pruning: restrict the files considered below to those whose
+        // statistics admit a match. Empty filters / missing stats keep every file.
+        let table_files = self.prune_table_files(state, filters);
+
         // Row-lineage detour: when the synthetic `rowid` column is projected,
         // every file needs its own scan because each has a distinct
         // `row_id_start`. `projection == None` with row lineage on means "all
@@ -2153,7 +2249,7 @@ impl TableProvider for DuckLakeTable {
                 .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
 
             let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-            for tf in &self.table_files {
+            for tf in table_files.iter().copied() {
                 // A merged partial file read below its partial_max needs per-row
                 // snapshot filtering; it always embeds its rowid, so the partial
                 // path serves the projected rowid directly.
@@ -2184,9 +2280,8 @@ impl TableProvider for DuckLakeTable {
         // — they need per-row snapshot filtering and are handled per file. Every
         // other file (ordinary, or a partial file at/after its partial_max) takes
         // the existing grouped/with-deletes paths unchanged.
-        let (needs_filter, rest): (Vec<_>, Vec<_>) = self
-            .table_files
-            .iter()
+        let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
+            .into_iter()
             .partition(|tf| self.needs_snapshot_filter(tf));
         let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|tf| tf.delete_file.is_some());
