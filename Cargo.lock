@@ -1864,6 +1864,7 @@ dependencies = [
  "object_store",
  "parquet",
  "percent-encoding",
+ "regex",
  "sqllogictest",
  "sqlx",
  "tempfile",

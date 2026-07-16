@@ -17,7 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot at-or-after the timestamp, an end bound to the last at-or-before,
   matching official DuckLake's `AT (TIMESTAMP => ...)` semantics (#179).
 
+### Changed
+- The vendored official sqllogictest suite now binds: the hybrid runner registers
+  the CDC table functions, translates official call forms (catalog-scoped and
+  5-argument), `ORDER BY ALL`, and FROM-first queries, and FAILS the build when
+  any file in its expected-pass ratchet regresses (newly passing files are
+  surfaced so the list grows) (#179).
+
 ### Fixed
+- `SELECT COUNT(*)` over `ducklake_table_changes` no longer errors on the
+  insert-only path (zero-column batches now carry an explicit row count) (#179).
 - CDC feeds now window cumulative (current-spec, 3-column) delete files per row:
   each deleted position carries its own delete snapshot in the file's embedded
   `_ducklake_internal_snapshot_id` column, deletions are reported at those

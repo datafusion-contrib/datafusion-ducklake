@@ -27,8 +27,33 @@ use tempfile::TempDir;
 fn preprocess_test_file(content: &str) -> String {
     let mut output = String::new();
     let mut lines = content.lines().peekable();
+    // Arity of the most recent `query <types>` directive, used to expand
+    // DuckDB's `ORDER BY ALL` (which DataFusion lacks) into `ORDER BY 1, ...`.
+    let mut last_query_arity: usize = 0;
 
     while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+
+        if let Some(types) = trimmed.strip_prefix("query ") {
+            let types = types.split_whitespace().next().unwrap_or("");
+            if !types.is_empty() && types.chars().all(|c| "TIRB".contains(c)) {
+                last_query_arity = types.len();
+            }
+        }
+        let line = if last_query_arity > 0 && line.to_uppercase().contains("ORDER BY ALL") {
+            let cols: Vec<String> = (1..=last_query_arity).map(|i| i.to_string()).collect();
+            let replacement = format!("ORDER BY {}", cols.join(", "));
+            let start = line.to_uppercase().find("ORDER BY ALL").unwrap();
+            format!(
+                "{}{}{}",
+                &line[..start],
+                replacement,
+                &line[start + "ORDER BY ALL".len()..]
+            )
+        } else {
+            line.to_string()
+        };
+        let line = line.as_str();
         let trimmed = line.trim();
 
         // Skip only DuckDB-specific directives that sqllogictest can't parse
@@ -69,6 +94,27 @@ fn preprocess_test_file(content: &str) -> String {
                 skip_query_results(&mut lines);
                 continue;
             }
+        }
+
+        // DuckDB's FROM-first shorthand (`FROM t ...`) plans with zero
+        // projections in DataFusion; rewrite it to `SELECT * FROM`. Only the
+        // FIRST line of a query's SQL qualifies — a continuation line starting
+        // with FROM belongs to an ordinary SELECT.
+        let starts_sql = output
+            .lines()
+            .last()
+            .map(|prev| {
+                let p = prev.trim();
+                p.starts_with("query") || p.starts_with("statement")
+            })
+            .unwrap_or(false);
+        if starts_sql && trimmed.to_uppercase().starts_with("FROM ") {
+            let indent_len = line.len() - line.trim_start().len();
+            output.push_str(&line[..indent_len]);
+            output.push_str("SELECT * ");
+            output.push_str(line.trim_start());
+            output.push('\n');
+            continue;
         }
 
         // Add line as-is (let tests fail naturally on unsupported features)
@@ -138,6 +184,26 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
 // Auto-discovery test runner - runs all .test files
 // ============================================================================
 
+/// Vendored-suite files that MUST pass: the build fails if any regresses.
+/// Newly passing files are reported so this list can grow (a ratchet).
+///
+/// The rest of the vendored suite is informational — most files exercise
+/// DuckDB-specific directives (`loop`, `foreach`, `SET VARIABLE`), types, or
+/// virtual columns (`file_row_number`) the hybrid runner does not translate.
+/// CDC conformance is authoritatively covered by tests/cdc_differential_tests.rs,
+/// which diffs live against the official extension.
+const EXPECTED_PASS: &[&str] = &[
+    "attach/attach_replace.test",
+    "catalog/quoted_identifiers.test",
+    "data_inlining/data_inlining_alter.test",
+    "data_inlining/data_inlining_issue504.test",
+    "data_inlining/data_inlining_table_changes.test",
+    "insert/insert_column_list.test",
+    "partitioning/multi_table_partition.test",
+    "stats/cardinality.test",
+    "stats/filter_pushdown.test",
+];
+
 #[tokio::test]
 async fn run_all_sqllogictests() {
     use std::path::Path;
@@ -167,6 +233,7 @@ async fn run_all_sqllogictests() {
     let mut passed = 0;
     let mut failed = 0;
     let mut failed_tests = Vec::new();
+    let mut passed_tests: Vec<String> = Vec::new();
 
     for test_file in &test_files {
         let test_name = test_file
@@ -179,6 +246,7 @@ async fn run_all_sqllogictests() {
             Ok(_) => {
                 println!("✓ {}", test_name);
                 passed += 1;
+                passed_tests.push(test_name.clone());
             },
             Err(e) => {
                 println!("✗ {}: {}", test_name, e);
@@ -205,4 +273,29 @@ async fn run_all_sqllogictests() {
             }
         }
     }
+
+    // The ratchet: every EXPECTED_PASS file must pass; newly passing files are
+    // surfaced so the list can grow.
+    let regressions: Vec<&(String, String)> = failed_tests
+        .iter()
+        .filter(|(name, _)| EXPECTED_PASS.contains(&name.as_str()))
+        .collect();
+    let newly_passing: Vec<&String> = passed_tests
+        .iter()
+        .filter(|name| !EXPECTED_PASS.contains(&name.as_str()))
+        .collect();
+    if !newly_passing.is_empty() {
+        println!(
+            "\nNewly passing (add to EXPECTED_PASS): {:?}",
+            newly_passing
+        );
+    }
+    assert!(
+        regressions.is_empty(),
+        "sqllogictest regressions in EXPECTED_PASS files: {:?}",
+        regressions
+            .iter()
+            .map(|(name, err)| format!("{name}: {}", err.lines().next().unwrap_or("")))
+            .collect::<Vec<_>>()
+    );
 }

@@ -50,6 +50,7 @@ testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio", "postgres", "mysql"] }
 tempfile = "3.14"
 anyhow = "1.0"
+regex = "1"
 aws-sdk-s3 = "1.75"
 aws-credential-types = "1.2"
 sqllogictest = "0.23"

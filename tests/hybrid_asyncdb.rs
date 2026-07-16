@@ -13,8 +13,8 @@ use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
-use datafusion_ducklake::DuckdbMetadataProvider;
 use datafusion_ducklake::catalog::DuckLakeCatalog;
+use datafusion_ducklake::{DuckdbMetadataProvider, MetadataProvider, register_ducklake_functions};
 use duckdb::Connection;
 use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
 use std::path::PathBuf;
@@ -86,6 +86,9 @@ impl HybridDuckLakeDB {
         let metadata_provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
         ctx.register_catalog("ducklake", catalog);
+        let provider: Arc<dyn MetadataProvider> =
+            Arc::new(DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?);
+        register_ducklake_functions(&ctx, provider);
 
         Ok(Self {
             duckdb_conn: Arc::new(Mutex::new(conn)),
@@ -116,8 +119,36 @@ impl HybridDuckLakeDB {
             || trimmed.starts_with("ROLLBACK ")
     }
 
+    /// Rewrite official CDC function call forms onto this crate's UDTFs:
+    /// the catalog-scoped 3-arg sugar `ducklake.table_changes('t', a, b)` and
+    /// the global 5-arg form `ducklake_table_changes('cat', 'schema', 't', a, b)`
+    /// both become `ducklake_table_changes('schema.t', a, b)`.
+    fn rewrite_cdc_function_calls(sql: &str) -> String {
+        use std::sync::OnceLock;
+        static SCOPED: OnceLock<regex::Regex> = OnceLock::new();
+        static FIVE_ARG: OnceLock<regex::Regex> = OnceLock::new();
+        let scoped = SCOPED.get_or_init(|| {
+            regex::Regex::new(
+                r"ducklake\.(table_changes|table_deletions|table_insertions)\(\s*'([^']+)'",
+            )
+            .unwrap()
+        });
+        let five_arg = FIVE_ARG.get_or_init(|| {
+            regex::Regex::new(
+                r"ducklake_(table_changes|table_deletions|table_insertions)\(\s*'[^']+'\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*,",
+            )
+            .unwrap()
+        });
+        let sql = scoped.replace_all(sql, "ducklake_$1('main.$2'");
+        five_arg
+            .replace_all(&sql, "ducklake_$1('$2.$3',")
+            .into_owned()
+    }
+
     /// Rewrite table references from 2-part to 3-part names
     fn rewrite_table_references(sql: &str) -> String {
+        let sql = Self::rewrite_cdc_function_calls(sql);
+        let sql: &str = sql.as_str();
         // Avoid double-conversion
         if sql.contains("ducklake.main.") {
             return sql.to_string();
@@ -152,6 +183,10 @@ impl HybridDuckLakeDB {
         let metadata_provider = DuckdbMetadataProvider::new(self.catalog_path.to_str().unwrap())?;
         let catalog = Arc::new(DuckLakeCatalog::new(metadata_provider)?);
         new_ctx.register_catalog("ducklake", catalog);
+        let provider: Arc<dyn MetadataProvider> = Arc::new(DuckdbMetadataProvider::new(
+            self.catalog_path.to_str().unwrap(),
+        )?);
+        register_ducklake_functions(&new_ctx, provider);
 
         // Replace the context
         *ctx_guard = new_ctx;

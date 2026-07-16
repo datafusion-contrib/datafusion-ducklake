@@ -313,8 +313,13 @@ impl PrependCDCColumnsStream {
             columns.extend(batch.columns().iter().cloned());
         }
 
-        RecordBatch::try_new(self.output_schema.clone(), columns)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        // A zero-column projection (e.g. `COUNT(*)`) still needs the row count.
+        RecordBatch::try_new_with_options(
+            self.output_schema.clone(),
+            columns,
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(num_rows)),
+        )
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
