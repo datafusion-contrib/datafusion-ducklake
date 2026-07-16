@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `ducklake_table_insertions('schema.table', start, end)`: every row added in the
+  inclusive snapshot window (plain inserts, UPDATE postimages, in-window rows of
+  compaction-merged files), with `(snapshot_id, rowid)` leading and no `change_type`
+  column — the official DuckLake insertions feed (#179).
+- All three CDC table functions accept timestamp strings as snapshot bounds
+  (`'YYYY-MM-DD[ HH:MM:SS[.ffffff]]'`, UTC): a start bound resolves to the first
+  snapshot at-or-after the timestamp, an end bound to the last at-or-before,
+  matching official DuckLake's `AT (TIMESTAMP => ...)` semantics (#179).
+
 ### Fixed
 - CDC feeds now window cumulative (current-spec, 3-column) delete files per row:
   each deleted position carries its own delete snapshot in the file's embedded

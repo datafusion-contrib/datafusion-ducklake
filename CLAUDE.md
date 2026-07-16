@@ -61,7 +61,7 @@ The codebase follows a layered architecture with clear separation of concerns:
 
 4. **Additional capabilities**
    - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)
-   - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`; registered via `register_ducklake_functions()`
+   - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
    - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
    - `column_rename.rs`: reads Parquet files whose physical column names predate a rename

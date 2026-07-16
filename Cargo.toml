@@ -37,7 +37,7 @@ hex = { version = "0.4", optional = true }
 # Write support (optional)
 uuid = { version = "1.0", features = ["v4"], optional = true }
 # Used by the maintenance API (ExpireCriteria/CleanupCriteria OlderThan).
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Staging file for streaming table writes (see table_writer::TableWriteSession).
 tempfile = { version = "3.14", optional = true }
 
@@ -75,7 +75,7 @@ duckdb-bundled = ["metadata-duckdb", "duckdb/bundled"]
 encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64", "dep:hex"]
 
 # Write support
-write = ["dep:uuid", "dep:chrono", "dep:tempfile"]
+write = ["dep:uuid", "dep:tempfile"]
 write-sqlite = ["write", "metadata-sqlite"]
 write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
 write-duckdb = ["write", "metadata-duckdb"]

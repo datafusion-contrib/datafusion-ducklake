@@ -102,7 +102,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
 | Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
 | SQL-queryable `information_schema`                      |   ✅   |
-| Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`) | ✅ |
+| Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`) | ✅ |
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
 | Configurable writer output (compression, row-group sizing) | ✅  |

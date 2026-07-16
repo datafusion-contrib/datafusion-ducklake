@@ -20,8 +20,8 @@
 //!   official's; the deletions list must be official's with `change_type`
 //!   inserted after `(snapshot_id, rowid)`.
 //!
-//! Not yet covered (tracked in #179): TIMESTAMPTZ bounds, encrypted (PME)
-//! catalogs, compaction rewrites, schema evolution between snapshots.
+//! Not yet covered (tracked in #179): encrypted (PME) catalogs, compaction
+//! rewrites, schema evolution between snapshots.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -389,7 +389,7 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
 
     // Official side first, then drop the connection before the crate's
     // provider opens the metadata database.
-    let mut official: Vec<((i64, i64), CanonFeed, CanonFeed)> = Vec::new();
+    let mut official: Vec<((i64, i64), CanonFeed, CanonFeed, CanonFeed)> = Vec::new();
     {
         let conn = official_connection(&path)?;
         for (a, b) in windows(&snapshot_ids(&conn)?) {
@@ -398,22 +398,51 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
                 &format!("SELECT * FROM ducklake_table_changes('c', 'main', '{table}', {a}, {b})"),
                 true,
             )?;
+            // rowid/snapshot_id are virtual on the official deletions and
+            // insertions scans: project them explicitly; neither feed has a
+            // change_type column.
             let deletions = official_feed(
                 &conn,
-                // rowid/snapshot_id are virtual on the official deletions scan:
-                // project them explicitly; there is no change_type column.
                 &format!(
                     "SELECT snapshot_id, rowid, * FROM \
                      ducklake_table_deletions('c', 'main', '{table}', {a}, {b})"
                 ),
                 false,
             )?;
-            official.push(((a, b), changes, deletions));
+            let insertions = official_feed(
+                &conn,
+                &format!(
+                    "SELECT snapshot_id, rowid, * FROM \
+                     ducklake_table_insertions('c', 'main', '{table}', {a}, {b})"
+                ),
+                false,
+            )?;
+            official.push(((a, b), changes, deletions, insertions));
         }
     }
 
     let ctx = crate_context(&path).await?;
-    for ((a, b), official_changes, official_deletions) in official {
+    for ((a, b), official_changes, official_deletions, official_insertions) in official {
+        // The insertions feed has no crate-side surface difference at all:
+        // `SELECT *` must match official's explicit projection VERBATIM.
+        let crate_insertions = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM ducklake_table_insertions('main.{table}', {a}, {b})"),
+            false,
+        )
+        .await?;
+        if !official_insertions.all_columns.is_empty() && !crate_insertions.all_columns.is_empty() {
+            assert_eq!(
+                official_insertions.all_columns, crate_insertions.all_columns,
+                "table_insertions window [{a},{b}]: column list diverges from official"
+            );
+        }
+        assert_feeds_match(
+            &format!("table_insertions window [{a},{b}]"),
+            &official_insertions,
+            &crate_insertions,
+        );
+
         // Bounds are inclusive on both ends, matching official DuckLake.
         let crate_changes = crate_feed(
             &ctx,
@@ -802,5 +831,51 @@ async fn diff_delete_targeting_merged_file() -> DataFusionResult<()> {
     )
     .await?;
     assert_eq!(got.rows, vec![deleted], "deletions feed\n{}", pretty(&got));
+    Ok(())
+}
+
+/// Timestamp bounds: a full-range timestamp window must equal the full-range
+/// integer window, and live-diff against official's TIMESTAMPTZ overloads.
+/// (The crate accepts timestamp STRINGS; snapshot times are UTC.)
+#[tokio::test]
+async fn diff_timestamp_bounds() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("ts.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, val VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'one'), (2, 'two');",
+            "UPDATE c.t SET val = 'TWO' WHERE id = 2;",
+            "DELETE FROM c.t WHERE id = 1;",
+        ],
+    )?;
+    let official = {
+        let conn = official_connection(&path)?;
+        official_feed(
+            &conn,
+            "SELECT * FROM ducklake_table_changes('c', 'main', 't', \
+             TIMESTAMP '1970-01-01 00:00:00+00', TIMESTAMP '2100-01-01 00:00:00+00')",
+            true,
+        )?
+    };
+    let ctx = crate_context(&path).await?;
+    let by_timestamp = crate_feed(
+        &ctx,
+        "SELECT * FROM ducklake_table_changes('main.t', '1970-01-01', '2100-01-01')",
+        true,
+    )
+    .await?;
+    let by_id = crate_feed(
+        &ctx,
+        "SELECT * FROM ducklake_table_changes('main.t', 0, 1000)",
+        true,
+    )
+    .await?;
+    assert_eq!(
+        by_timestamp.rows, by_id.rows,
+        "timestamp window must equal the integer window"
+    );
+    assert_feeds_match("timestamp-bounded table_changes", &official, &by_timestamp);
     Ok(())
 }

@@ -352,6 +352,9 @@ pub struct TableChangesTable {
     table_schema: SchemaRef,
     /// Combined schema: table columns + snapshot_id + change_type
     output_schema: SchemaRef,
+    /// When set, the delete side is never read: every row added in the window
+    /// surfaces as `insert` (the `ducklake_table_insertions` feed).
+    insertions_only: bool,
 }
 
 impl TableChangesTable {
@@ -385,7 +388,17 @@ impl TableChangesTable {
             table_path,
             table_schema,
             output_schema,
+            insertions_only: false,
         }
+    }
+
+    /// Turn this feed into `ducklake_table_insertions`: the delete side is
+    /// never read, so every row added in the window — plain inserts, UPDATE
+    /// postimages, in-window rows of merged partial files — surfaces as
+    /// `insert`, matching official DuckLake's insertions feed.
+    pub fn insertions_only(mut self) -> Self {
+        self.insertions_only = true;
+        self
     }
 
     /// Analyze projection and split into table columns and CDC columns.
@@ -1003,15 +1016,19 @@ impl TableProvider for TableChangesTable {
 
         // Deletes applied in the window surface as `delete` rows (and pair into
         // update preimages), so they participate in both the empty check and
-        // the path decision — a delete-only window is NOT empty.
-        let delete_files = self
-            .provider
-            .get_delete_files_added_between_snapshots(
-                self.table_id,
-                self.start_snapshot,
-                self.end_snapshot,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // the path decision — a delete-only window is NOT empty. The insertions
+        // feed never reads the delete side.
+        let delete_files = if self.insertions_only {
+            Vec::new()
+        } else {
+            self.provider
+                .get_delete_files_added_between_snapshots(
+                    self.table_id,
+                    self.start_snapshot,
+                    self.end_snapshot,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        };
 
         // Handle empty case
         if data_files.is_empty() && delete_files.is_empty() {
@@ -1840,4 +1857,98 @@ fn filter_and_tag(
         change,
         output_schema,
     )?))
+}
+
+// ---------------------------------------------------------------------------
+// ducklake_table_insertions
+// ---------------------------------------------------------------------------
+
+/// `ducklake_table_insertions`: every row added in the snapshot window —
+/// plain inserts, UPDATE postimages, and in-window rows of compaction-merged
+/// partial files — with `(snapshot_id, rowid)` leading and NO `change_type`
+/// column, matching official DuckLake's insertions feed surface (which has
+/// none; it exposes rowid/snapshot_id as virtual columns).
+///
+/// A thin wrapper over the [`TableChangesTable`] machinery with the delete
+/// side disabled: projections are translated to skip the inner feed's
+/// `change_type` column.
+#[derive(Debug)]
+pub struct TableInsertionsTable {
+    inner: TableChangesTable,
+    output_schema: SchemaRef,
+}
+
+impl TableInsertionsTable {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider: Arc<dyn MetadataProvider>,
+        table_id: i64,
+        start_snapshot: i64,
+        end_snapshot: i64,
+        object_store_url: Arc<ObjectStoreUrl>,
+        table_path: String,
+        table_schema: SchemaRef,
+    ) -> Self {
+        let mut fields: Vec<Field> = Vec::with_capacity(table_schema.fields().len() + 2);
+        fields.push(Field::new("snapshot_id", DataType::Int64, false));
+        fields.push(Field::new("rowid", DataType::Int64, true));
+        fields.extend(table_schema.fields().iter().map(|f| f.as_ref().clone()));
+        let output_schema = Arc::new(Schema::new(fields));
+        let inner = TableChangesTable::new(
+            provider,
+            table_id,
+            start_snapshot,
+            end_snapshot,
+            object_store_url,
+            table_path,
+            table_schema,
+        )
+        .insertions_only();
+        Self {
+            inner,
+            output_schema,
+        }
+    }
+
+    /// Map an index of this feed's schema — `(snapshot_id, rowid, table
+    /// columns...)` — onto the inner changes schema, which has `change_type`
+    /// at [`CHANGE_TYPE_IDX`].
+    fn inner_index(outer: usize) -> usize {
+        if outer < CHANGE_TYPE_IDX {
+            outer
+        } else {
+            outer + 1
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for TableInsertionsTable {
+    fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // The inner feed honors arbitrary projections in requested order, so a
+        // translated projection yields exactly this feed's columns.
+        let translated: Vec<usize> = match projection {
+            Some(indices) => indices.iter().map(|&i| Self::inner_index(i)).collect(),
+            None => (0..self.output_schema.fields().len())
+                .map(Self::inner_index)
+                .collect(),
+        };
+        self.inner
+            .scan(state, Some(&translated), filters, limit)
+            .await
+    }
 }
