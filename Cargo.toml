@@ -98,6 +98,10 @@ name = "multicatalog_write"
 required-features = ["write-postgres"]
 
 [[example]]
+name = "compaction_demo"
+required-features = ["write-sqlite"]
+
+[[example]]
 name = "maintenance_demo"
 required-features = ["write-sqlite"]
 
