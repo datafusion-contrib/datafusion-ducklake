@@ -747,6 +747,58 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Roll back a *pure-append* delta committed after `base_snapshot`: end
+    /// (retire) every live data file whose `begin_snapshot > base_snapshot` — the
+    /// files an append added on top of `base_snapshot` — in ONE new snapshot,
+    /// WITHOUT rewriting data, returning the table's live content to exactly what
+    /// it was at `base_snapshot`. This is the commit behind undoing an append that
+    /// committed its DuckLake snapshot but whose post-commit step (e.g. a search
+    /// index build) failed before the higher layer published it: the appended rows
+    /// sit at the catalog head, unreferenced by any published generation, and a
+    /// blind retry would stack a second copy on them. Retiring them here leaves a
+    /// clean base so the retry appends exactly once.
+    ///
+    /// Refuses with [`crate::DuckLakeError::Conflict`] if the delta since
+    /// `base_snapshot` is NOT a pure append — specifically if any of these exist
+    /// for the table: a delete file with `begin_snapshot > base_snapshot`, a data
+    /// file present at/before `base_snapshot` that was ended after it
+    /// (`begin_snapshot <= base_snapshot AND end_snapshot > base_snapshot`), or a
+    /// column version changed after it (`begin_snapshot > base_snapshot OR
+    /// end_snapshot > base_snapshot`). Forward-only file retirement cannot
+    /// faithfully revert a delete / replace / update / schema-promotion, so in
+    /// those cases the caller must keep its read freeze and surface the state
+    /// rather than expose a half-reverted table. The purity checks run BEFORE the
+    /// no-op return, so a delete-only orphan (no appended data file) still yields
+    /// `Conflict`, not a silent no-op.
+    ///
+    /// The guard covers every snapshot-visible change table this crate writes —
+    /// data files, delete files, and columns. This crate's write path produces no
+    /// inlined-data or partition-value rows (those DuckLake-spec tables are not part
+    /// of its schema), so there is nothing else to check. If inlined-data or
+    /// partition write support is ever added, extend the guard to reject a post-base
+    /// row there too, or this could silently treat such a delta as a pure append.
+    ///
+    /// Recomputes the visible stat totals (`record_count`, `file_size_bytes`, and
+    /// the per-column stats) from the surviving live files, and preserves
+    /// `next_row_id` (rowids stay monotonic — retired ranges are never reused).
+    /// Advances the catalog head LAST. Returns the new snapshot id, or `None` if no
+    /// appended files exist (a no-op — no snapshot is created).
+    ///
+    /// # Caller contract
+    /// `base_snapshot` MUST be a real `ducklake_snapshot.snapshot_id` — the table's
+    /// current published generation — because `begin_snapshot > base_snapshot` is
+    /// what distinguishes the orphaned append from published data. The caller MUST
+    /// serialize writes to the table (e.g. a per-table write lock) so no concurrent
+    /// legitimate append has a live file with `begin_snapshot > base_snapshot` that
+    /// this would wrongly retire.
+    ///
+    /// Default: unsupported; the SQLite and Postgres backends override it.
+    fn retire_appends_since(&self, _table_id: i64, _base_snapshot: i64) -> Result<Option<i64>> {
+        Err(DuckLakeError::InvalidConfig(
+            "retire_appends_since is not supported on this metadata backend".to_string(),
+        ))
+    }
+
     /// Register a data file that already carries DuckLake field-ids — e.g. a
     /// parquet copied verbatim from another catalog — adopting `column_ids` as
     /// the destination table's column ids so the file's embedded field-ids

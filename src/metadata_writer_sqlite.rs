@@ -1038,6 +1038,39 @@ async fn insert_file_column_stats(
     Ok(())
 }
 
+/// Read the table's live column generation as `(ColumnDef, column_id)`, ordered
+/// by `column_order`. Used to drive [`recompute_table_column_stats`] from
+/// `retire_appends_since`, which (unlike a normal write) doesn't already hold the
+/// column list. `is_nullable` is irrelevant — recompute only reads the type.
+async fn live_columns_for_stats(
+    table_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(Vec<ColumnDef>, Vec<i64>)> {
+    let mut columns = Vec::new();
+    let mut column_ids = Vec::new();
+    for row in sqlx::query(
+        "SELECT column_id, column_name, column_type
+         FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let column_id: i64 = row.try_get(0)?;
+        let name: String = row.try_get(1)?;
+        let ducklake_type: String = row.try_get(2)?;
+        column_ids.push(column_id);
+        columns.push(ColumnDef {
+            name,
+            ducklake_type,
+            is_nullable: true,
+        });
+    }
+    Ok((columns, column_ids))
+}
+
 /// Recompute the table-wide `ducklake_table_column_stats` roll-up (optimizer
 /// stats) from the table's currently-live files, and replace the stored rows.
 ///
@@ -2250,6 +2283,108 @@ impl MetadataWriter for SqliteMetadataWriter {
                 schema_id,
                 table_id,
             })
+        })
+    }
+
+    fn retire_appends_since(&self, table_id: i64, base_snapshot: i64) -> Result<Option<i64>> {
+        block_on(async {
+            // Metadata-only rollback of a pure-append delta in one snapshot: end
+            // every live data file added after base_snapshot, recompute the visible
+            // stats from the survivors. next_row_id is preserved (rowids never
+            // reused). SQLite is single-catalog — head is implicit MAX(snapshot_id),
+            // so there is no lock_catalog / advance_catalog_head (mirrors truncate).
+            let mut tx = self.pool.begin().await?;
+
+            // Write-lock-first (mirrors `commit_truncate`): allocate the snapshot up
+            // front so the purity proof and no-op check run under SQLite's write lock
+            // even if the caller hasn't externally serialized writes. On a Conflict or
+            // no-op we return WITHOUT committing, so the allocation rolls back — no
+            // snapshot row and no id gap. Non-DDL, so schema_version carries forward.
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+
+            // Purity guard — see the trait doc. A post-base delete file, a base-era
+            // data file ended after base, or a post-base column version means a
+            // non-append mutation we cannot faithfully revert with forward-only
+            // retirement → Conflict.
+            let impure_delete: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_delete_file
+                 WHERE table_id = ? AND begin_snapshot > ? LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let impure_ended: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND begin_snapshot <= ?
+                   AND end_snapshot IS NOT NULL AND end_snapshot > ? LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let impure_column: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_column
+                 WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?) LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if impure_delete.is_some() || impure_ended.is_some() || impure_column.is_some() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "table {table_id}: changes since snapshot {base_snapshot} are not a pure \
+                     append (delete/replace/update or schema change present); refusing to retire"
+                )));
+            }
+
+            // No-op → None (no snapshot) if nothing was appended after base.
+            let has_appended: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ? LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_appended.is_none() {
+                return Ok(None);
+            }
+
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ?",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(base_snapshot)
+            .execute(&mut *tx)
+            .await?;
+
+            // Recompute visible totals from the survivors; next_row_id untouched.
+            sqlx::query(
+                "UPDATE ducklake_table_stats SET
+                     record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                     FROM ducklake_data_file
+                                     WHERE table_id = ? AND end_snapshot IS NULL),
+                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                        FROM ducklake_data_file
+                                        WHERE table_id = ? AND end_snapshot IS NULL)
+                 WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .bind(table_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            let (columns, column_ids) = live_columns_for_stats(table_id, &mut tx).await?;
+            recompute_table_column_stats(&mut tx, table_id, &columns, &column_ids).await?;
+
+            tx.commit().await?;
+            Ok(Some(snapshot_id))
         })
     }
 
@@ -3754,5 +3889,133 @@ mod tests {
         let result =
             writer.begin_write_transaction("main", "bad\ttable", &columns, WriteMode::Replace);
         assert!(result.is_err());
+    }
+
+    async fn read_end_snapshot(writer: &SqliteMetadataWriter, path: &str) -> Option<i64> {
+        sqlx::query("SELECT end_snapshot FROM ducklake_data_file WHERE path = ?")
+            .bind(path)
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap()
+    }
+
+    async fn max_snapshot(writer: &SqliteMetadataWriter) -> i64 {
+        sqlx::query_scalar("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_appends_since_rolls_back_pure_append() {
+        let (writer, _temp) = create_test_writer().await;
+        // Base generation: append file A -> commits the published snapshot.
+        let s0 = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer.get_or_create_schema("main", None, s0).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, s0)
+            .unwrap();
+        let file_a = DataFileInfo::new("a.parquet", 1000, 100).with_footer_size(64);
+        let base = writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                s0,
+                &file_a,
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap()
+            .snapshot_id;
+
+        // Append file B on top (the orphan): begin_snapshot > base.
+        let s1 = reserve_snapshot(&writer).await;
+        let file_b = DataFileInfo::new("b.parquet", 2000, 50).with_footer_size(64);
+        writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                s1,
+                &file_b,
+                WriteMode::Append,
+                base,
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let (rc_before, nri_before, size_before) = read_table_stats(&writer, table_id).await;
+        assert_eq!((rc_before, nri_before, size_before), (150, 150, 3000));
+
+        // Roll back the append delta above base.
+        let new_snap = writer.retire_appends_since(table_id, base).unwrap();
+        assert!(new_snap.is_some(), "expected a compensating snapshot");
+
+        // File A stays live; file B retired.
+        assert!(read_end_snapshot(&writer, "a.parquet").await.is_none());
+        assert!(read_end_snapshot(&writer, "b.parquet").await.is_some());
+
+        // Stats restored to base; next_row_id preserved (rowids never reused).
+        let (rc_after, nri_after, size_after) = read_table_stats(&writer, table_id).await;
+        assert_eq!(rc_after, 100, "record_count back to base");
+        assert_eq!(size_after, 1000, "file_size_bytes back to base");
+        assert_eq!(nri_after, 150, "next_row_id preserved");
+
+        // Idempotent: nothing left above base -> no-op, no content-free snapshot.
+        let head = max_snapshot(&writer).await;
+        assert!(
+            writer
+                .retire_appends_since(table_id, base)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            max_snapshot(&writer).await,
+            head,
+            "no snapshot minted on no-op"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retire_appends_since_refuses_non_append_delta() {
+        let (writer, _temp) = create_test_writer().await;
+        let s0 = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer.get_or_create_schema("main", None, s0).unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "t", None, s0)
+            .unwrap();
+        let file_a = DataFileInfo::new("a.parquet", 1000, 100).with_footer_size(64);
+        let base = writer
+            .register_data_file(
+                table_id,
+                "main",
+                "t",
+                s0,
+                &file_a,
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap()
+            .snapshot_id;
+
+        // A non-append mutation after base: truncate ends file A
+        // (begin_snapshot <= base, end_snapshot > base).
+        writer.commit_truncate(table_id, "main", "t", base).unwrap();
+
+        // The delta since base is no longer a pure append -> Conflict, so the
+        // caller keeps its read freeze rather than exposing a half-reverted table.
+        let err = writer.retire_appends_since(table_id, base).unwrap_err();
+        assert!(
+            matches!(err, crate::DuckLakeError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
     }
 }

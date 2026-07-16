@@ -628,6 +628,42 @@ async fn insert_file_column_stats(
     Ok(())
 }
 
+/// Read the table's live column generation as `(ColumnDef, column_id)`, ordered
+/// by `column_order`. Used to drive [`recompute_table_column_stats`]'s
+/// numeric-vs-not classification when the caller (e.g. `retire_appends_since`)
+/// doesn't already hold the column list the way a normal write does.
+async fn live_columns_for_stats(
+    table_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(Vec<ColumnDef>, Vec<i64>)> {
+    let mut columns = Vec::new();
+    let mut column_ids = Vec::new();
+    for row in sqlx::query(
+        "SELECT column_id, column_name, column_type
+         FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    {
+        let column_id: i64 = row.try_get(0)?;
+        let name: String = row.try_get(1)?;
+        let ducklake_type: String = row.try_get(2)?;
+        column_ids.push(column_id);
+        // Same-crate construction: the type string came from the catalog and is
+        // already valid, so skip ColumnDef::new's re-validation. `is_nullable` is
+        // irrelevant here — recompute_table_column_stats only reads the type.
+        columns.push(ColumnDef {
+            name,
+            ducklake_type,
+            is_nullable: true,
+        });
+    }
+    Ok((columns, column_ids))
+}
+
 /// Recompute `ducklake_table_column_stats` from the table's live files and
 /// replace the stored rows. See the SQLite writer's equivalent for the rationale
 /// (widen on insert, never tighten on delete; correct for every write mode).
@@ -2312,6 +2348,136 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             tx.commit().await?;
             Ok(live_rows)
+        })
+    }
+
+    fn retire_appends_since(&self, table_id: i64, base_snapshot: i64) -> Result<Option<i64>> {
+        block_on(async {
+            // Metadata-only rollback of a pure-append delta, in one snapshot under
+            // the catalog lock: end every live data file added after base_snapshot,
+            // recompute the visible stats from the survivors, advance the head LAST.
+            // next_row_id is preserved (rowids never reused).
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            // Purity guard — the ONLY change since base may be appended data files.
+            // Checked before the no-op return so a delete-only / schema-only orphan
+            // surfaces as Conflict instead of a silent no-op. A post-base delete
+            // file, a base-era data file ended after base (replace/delete/update),
+            // or any post-base column version (schema promotion / add) all mean a
+            // non-append mutation we cannot faithfully revert with forward-only file
+            // retirement — refuse so the caller keeps its read freeze.
+            let impure_delete: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM ducklake_delete_file
+                 WHERE table_id = $1 AND begin_snapshot > $2 LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let impure_ended: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM ducklake_data_file
+                 WHERE table_id = $1 AND begin_snapshot <= $2
+                   AND end_snapshot IS NOT NULL AND end_snapshot > $2 LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let impure_column: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM ducklake_column
+                 WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2) LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if impure_delete.is_some() || impure_ended.is_some() || impure_column.is_some() {
+                return Err(crate::DuckLakeError::Conflict(format!(
+                    "table {table_id}: changes since snapshot {base_snapshot} are not a pure \
+                     append (delete/replace/update or schema change present); refusing to retire"
+                )));
+            }
+
+            // Appended files to retire (live, begin_snapshot > base). No-op → None
+            // BEFORE allocating a snapshot, so repeated reconcile calls on a clean
+            // table never mint a content-free snapshot.
+            let has_appended: Option<i64> = sqlx::query_scalar(
+                "SELECT 1::BIGINT FROM ducklake_data_file
+                 WHERE table_id = $1 AND end_snapshot IS NULL AND begin_snapshot > $2 LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_appended.is_none() {
+                return Ok(None);
+            }
+
+            let snapshot_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+                 VALUES (NOW(), 0) RETURNING snapshot_id",
+            )
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            let prev_max: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+                .bind(prev_max.max(1))
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Retire the appended files (append writes no delete files, so there are
+            // none to end — the purity guard above rejected any delete file > base).
+            sqlx::query(
+                "UPDATE ducklake_data_file SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL AND begin_snapshot > $3",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(base_snapshot)
+            .execute(&mut *tx)
+            .await?;
+
+            // Recompute the visible stat totals from the surviving live files
+            // (mirrors the compaction commit); next_row_id is deliberately not
+            // touched. With the pure-append guarantee, the survivors are exactly
+            // base_snapshot's files, so this restores base_snapshot's stats.
+            sqlx::query(
+                "UPDATE ducklake_table_stats SET
+                     record_count = (SELECT COALESCE(SUM(record_count), 0)
+                                     FROM ducklake_data_file
+                                     WHERE table_id = $1 AND end_snapshot IS NULL),
+                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
+                                        FROM ducklake_data_file
+                                        WHERE table_id = $1 AND end_snapshot IS NULL)
+                 WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Recompute per-column stats from the survivors too (register_data_file
+            // widened them when the appended file landed). Read the live column
+            // generation to drive the numeric-vs-not classification.
+            let (columns, column_ids) = live_columns_for_stats(table_id, &mut tx).await?;
+            recompute_table_column_stats(&mut tx, table_id, &columns, &column_ids).await?;
+
+            // advance_catalog_head MUST be the last write before commit.
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+
+            tx.commit().await?;
+            Ok(Some(snapshot_id))
         })
     }
 
