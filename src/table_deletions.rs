@@ -238,9 +238,8 @@ impl TableDeletionsTable {
         path: &str,
         is_relative: bool,
     ) -> DataFusionResult<Option<String>> {
-        Ok(self
-            .parquet_field_id_name(state, path, is_relative, ROW_ID_PARQUET_FIELD_ID)
-            .await?)
+        self.parquet_field_id_name(state, path, is_relative, ROW_ID_PARQUET_FIELD_ID)
+            .await
     }
 
     /// Read a DELETE file's footer and return the physical name of its embedded
@@ -253,9 +252,8 @@ impl TableDeletionsTable {
         path: &str,
         is_relative: bool,
     ) -> DataFusionResult<Option<String>> {
-        Ok(self
-            .parquet_field_id_name(state, path, is_relative, SNAPSHOT_ID_PARQUET_FIELD_ID)
-            .await?)
+        self.parquet_field_id_name(state, path, is_relative, SNAPSHOT_ID_PARQUET_FIELD_ID)
+            .await
     }
 
     async fn parquet_field_id_name(
