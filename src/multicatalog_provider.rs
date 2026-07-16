@@ -1062,7 +1062,22 @@ impl MetadataProvider for MulticatalogProvider {
         // Same shape as the single-catalog PostgresMetadataProvider — inherits
         // catalog via table_id.
         block_on(async {
-            let rows = sqlx::query(
+            // Cumulative (current-spec) delete files can hold in-window deletions
+            // even when their begin_snapshot predates the window; included via
+            // `ducklake_delete_file.partial_max`. Older catalogs lack the column
+            // (and cumulative delete files); degrade it to NULL there.
+            let has_delete_partial_max: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max')",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let pm = if has_delete_partial_max {
+                "ddf.partial_max::bigint"
+            } else {
+                "NULL::bigint"
+            };
+            let rows = sqlx::query(&format!(
                 r#"
 WITH current_delete AS (
     SELECT
@@ -1075,8 +1090,9 @@ WITH current_delete AS (
         ddf.encryption_key
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
-      AND ddf.begin_snapshot >= $2
       AND ddf.begin_snapshot <= $3
+      AND (ddf.begin_snapshot >= $2
+           OR ({pm} IS NOT NULL AND {pm} >= $2))
 ),
 data_files AS (
     SELECT df.*
@@ -1121,8 +1137,8 @@ LEFT JOIN LATERAL (
 WHERE data.table_id = $1
   AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
-"#,
-            )
+"#
+            ))
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)

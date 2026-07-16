@@ -7,7 +7,7 @@
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -756,6 +756,7 @@ impl TableChangesTable {
         is_relative: bool,
         size_bytes: i64,
         footer_size: i64,
+        snapshot_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -765,9 +766,23 @@ impl TableChangesTable {
         {
             pf = pf.with_metadata_size_hint(hint);
         }
+        // A cumulative (current-spec) delete file embeds each row's delete
+        // snapshot as a third column; read it when present.
+        let schema = match snapshot_name {
+            Some(name) => {
+                let mut fields: Vec<Field> = delete_file_schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                fields.push(Field::new(name, DataType::Int64, true));
+                Arc::new(Schema::new(fields))
+            },
+            None => delete_file_schema(),
+        };
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(delete_file_schema())),
+            Arc::new(ParquetSource::new(schema)),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         Ok(DataSourceExec::from_data_source(builder.build()))
@@ -863,23 +878,52 @@ impl TableChangesTable {
                     dfc.data_file_footer_size.unwrap_or(0),
                     &old_embedded,
                 )?;
+                // A cumulative (current-spec) delete file embeds each row's
+                // delete snapshot; its positions are windowed per row and no
+                // previous-file subtraction applies. Legacy 2-column files keep
+                // the delta-vs-previous model.
+                let snapshot_name = match &dfc.current_delete_path {
+                    Some(p) => {
+                        self.detect_embedded_cdc_names(
+                            state,
+                            p,
+                            dfc.current_delete_path_is_relative.unwrap_or(true),
+                        )
+                        .await?
+                        .snapshot
+                    },
+                    None => None,
+                };
+                if snapshot_name.is_none() && dfc.snapshot_id < self.start_snapshot {
+                    return Err(DataFusionError::External(
+                        format!(
+                            "delete file {:?} begins before the query window but carries no \
+                             embedded per-row snapshot column; its deletions cannot be attributed",
+                            dfc.current_delete_path
+                        )
+                        .into(),
+                    ));
+                }
+                let cumulative = snapshot_name.is_some();
                 let current_delete_scan = match &dfc.current_delete_path {
                     Some(p) => Some(self.build_delete_file_scan(
                         p,
                         dfc.current_delete_path_is_relative.unwrap_or(true),
                         dfc.current_delete_file_size_bytes.unwrap_or(0),
                         dfc.current_delete_footer_size.unwrap_or(0),
+                        &snapshot_name,
                     )?),
                     None => None,
                 };
                 let previous_delete_scan = match &dfc.previous_delete_path {
-                    Some(p) => Some(self.build_delete_file_scan(
+                    Some(p) if !cumulative => Some(self.build_delete_file_scan(
                         p,
                         dfc.previous_delete_path_is_relative.unwrap_or(true),
                         dfc.previous_delete_file_size_bytes.unwrap_or(0),
                         dfc.previous_delete_footer_size.unwrap_or(0),
+                        &None,
                     )?),
-                    None => None,
+                    _ => None,
                 };
                 delete_units.push(DeleteUnit {
                     snapshot_id: dfc.snapshot_id,
@@ -887,6 +931,7 @@ impl TableChangesTable {
                     embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
                     current_delete_scan,
                     previous_delete_scan,
+                    cumulative,
                     record_count: dfc.data_record_count,
                     row_id_start: dfc.data_row_id_start,
                 });
@@ -1132,6 +1177,10 @@ struct DeleteUnit {
     current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
     /// Scan of the delete file this one superseded, if any.
     previous_delete_scan: Option<Arc<dyn ExecutionPlan>>,
+    /// Whether the current delete file is cumulative (carries an embedded
+    /// per-row delete-snapshot column as its third column): positions are then
+    /// windowed per row and each deleted row keys/emits at its own snapshot.
+    cumulative: bool,
     record_count: i64,
     /// First rowid of the source file (`None` if the catalog carries none).
     /// Required only when a deleted row has no embedded rowid.
@@ -1444,7 +1493,24 @@ async fn correlate_changes(
     let preimage_rowids_required = need_rowid || !postimages.is_empty();
     let mut preimages: Vec<KeyedRows> = Vec::new();
     for unit in &delete_units {
-        let current = collect_delete_positions(&unit.current_delete_scan, context.clone()).await?;
+        // Cumulative delete files carry a per-row delete snapshot: only
+        // in-window positions are collected, each remembering its snapshot;
+        // no previous-file subtraction applies (the scan is None then).
+        let (current, position_snapshots): (Option<HashSet<i64>>, HashMap<i64, i64>) =
+            if unit.cumulative {
+                let (set, map) = collect_windowed_delete_positions(
+                    &unit.current_delete_scan,
+                    window,
+                    context.clone(),
+                )
+                .await?;
+                (Some(set), map)
+            } else {
+                (
+                    collect_delete_positions(&unit.current_delete_scan, context.clone()).await?,
+                    HashMap::new(),
+                )
+            };
         let current: HashSet<i64> = match current {
             Some(set) => set,
             None => (0..unit.record_count).collect(),
@@ -1498,44 +1564,54 @@ async fn correlate_changes(
                 None
             };
 
-            let mut keep: Vec<u32> = Vec::new();
-            let mut rowids: Vec<i64> = Vec::new();
+            // Group kept rows by their delete snapshot: constant for legacy
+            // delete files, per-row for cumulative ones. Each group becomes
+            // one KeyedRows so the (snapshot, rowid) pairing sees the right
+            // snapshot for every deleted row.
+            let mut by_snapshot: std::collections::BTreeMap<i64, (Vec<u32>, Vec<i64>)> =
+                std::collections::BTreeMap::new();
             for i in 0..n {
                 let p = pos.value(i);
                 if current.contains(&p) && !previous.contains(&p) {
-                    keep.push(i as u32);
-                    rowids.push(match (embedded, synth_start) {
+                    let rowid = match (embedded, synth_start) {
                         (Some(arr), _) => arr.value(i),
                         (None, Some(start)) => start + p,
                         // Unneeded rowid (not output, nothing to pair with):
                         // a placeholder that update_keys can never contain.
                         (None, None) => 0,
-                    });
+                    };
+                    let snapshot = if unit.cumulative {
+                        *position_snapshots.get(&p).unwrap_or(&unit.snapshot_id)
+                    } else {
+                        unit.snapshot_id
+                    };
+                    let entry = by_snapshot.entry(snapshot).or_default();
+                    entry.0.push(i as u32);
+                    entry.1.push(rowid);
                 }
             }
-            if keep.is_empty() {
-                continue;
+            for (snapshot, (keep, rowids)) in by_snapshot {
+                let indices = UInt32Array::from(keep);
+                let table_cols: Vec<ArrayRef> = (0..table_len)
+                    .map(|c| {
+                        take(b.column(c).as_ref(), &indices, None)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    })
+                    .collect::<DataFusionResult<_>>()?;
+                let table_batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(
+                        (0..table_len)
+                            .map(|c| b.schema().field(c).clone())
+                            .collect::<Vec<_>>(),
+                    )),
+                    table_cols,
+                )?;
+                preimages.push(KeyedRows {
+                    snapshot_id: snapshot,
+                    table_batch,
+                    rowid: Int64Array::from(rowids),
+                });
             }
-            let indices = UInt32Array::from(keep);
-            let table_cols: Vec<ArrayRef> = (0..table_len)
-                .map(|c| {
-                    take(b.column(c).as_ref(), &indices, None)
-                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-                })
-                .collect::<DataFusionResult<_>>()?;
-            let table_batch = RecordBatch::try_new(
-                Arc::new(Schema::new(
-                    (0..table_len)
-                        .map(|c| b.schema().field(c).clone())
-                        .collect::<Vec<_>>(),
-                )),
-                table_cols,
-            )?;
-            preimages.push(KeyedRows {
-                snapshot_id: unit.snapshot_id,
-                table_batch,
-                rowid: Int64Array::from(rowids),
-            });
         }
     }
 
@@ -1619,6 +1695,48 @@ fn int64_column<'a>(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| DataFusionError::Internal(format!("{what} column is not Int64")))
+}
+
+/// Collect the in-window `pos` set AND per-position delete snapshots from a
+/// cumulative delete-file scan (`(file_path, pos, snapshot)` schema). Rows
+/// whose snapshot falls outside the inclusive `window` are skipped.
+async fn collect_windowed_delete_positions(
+    scan: &Option<Arc<dyn ExecutionPlan>>,
+    window: (i64, i64),
+    context: Arc<TaskContext>,
+) -> DataFusionResult<(HashSet<i64>, HashMap<i64, i64>)> {
+    let Some(scan) = scan else {
+        return Ok((HashSet::new(), HashMap::new()));
+    };
+    let batches = datafusion::physical_plan::collect(Arc::clone(scan), context).await?;
+    let mut set = HashSet::new();
+    let mut map = HashMap::new();
+    for b in &batches {
+        if b.num_columns() < 3 {
+            return Err(DataFusionError::Internal(
+                "cumulative delete file batch is missing its snapshot column".to_string(),
+            ));
+        }
+        let pos = int64_column(b, 1, "delete `pos`")?;
+        let snaps = int64_column(b, 2, "delete snapshot")?;
+        for i in 0..pos.len() {
+            if pos.is_null(i) {
+                continue;
+            }
+            if snaps.is_null(i) {
+                return Err(DataFusionError::Internal(
+                    "cumulative delete file has a NULL per-row snapshot".to_string(),
+                ));
+            }
+            let s = snaps.value(i);
+            if s >= window.0 && s <= window.1 {
+                let p = pos.value(i);
+                set.insert(p);
+                map.insert(p, s);
+            }
+        }
+    }
+    Ok((set, map))
 }
 
 /// Collect the `pos` set from a delete-file scan (`None` scan => `None`).

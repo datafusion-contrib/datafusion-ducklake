@@ -921,7 +921,25 @@ impl MetadataProvider for MySqlMetadataProvider {
         block_on(async {
             // MySQL equivalent of DuckDB's SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS
             // Uses LATERAL (supported in MySQL 8.0.14+) for previous delete file lookup
-            let rows = sqlx::query(
+            //
+            // Cumulative (current-spec) delete files can hold in-window deletions
+            // even when their begin_snapshot predates the window; included via
+            // `ducklake_delete_file.partial_max`. Older catalogs lack the column
+            // (and cumulative delete files); degrade it to NULL there.
+            let has_delete_partial_max: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns
+                 WHERE table_schema = DATABASE()
+                   AND table_name = 'ducklake_delete_file'
+                   AND column_name = 'partial_max'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let pm = if has_delete_partial_max > 0 {
+                "ddf.partial_max"
+            } else {
+                "NULL"
+            };
+            let rows = sqlx::query(&format!(
                 r#"
 WITH current_delete AS (
     SELECT
@@ -934,8 +952,9 @@ WITH current_delete AS (
         ddf.encryption_key
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = ?
-      AND ddf.begin_snapshot >= ?
       AND ddf.begin_snapshot <= ?
+      AND (ddf.begin_snapshot >= ?
+           OR ({pm} IS NOT NULL AND {pm} >= ?))
 ),
 
 data_files AS (
@@ -1015,12 +1034,14 @@ LEFT JOIN LATERAL (
 WHERE data.table_id = ?
   AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
-"#,
-            )
-            // Part 1 bindings: table_id (current_delete), start_snapshot, end_snapshot, table_id (data_files), table_id (prev lateral)
+"#
+            ))
+            // Part 1 bindings: table_id (current_delete), end, start (window),
+            // start (partial_max), table_id (data_files), table_id (prev lateral)
             .bind(table_id)
-            .bind(start_snapshot)
             .bind(end_snapshot)
+            .bind(start_snapshot)
+            .bind(start_snapshot)
             .bind(table_id)
             .bind(table_id)
             // Part 2 bindings: table_id (prev lateral), table_id (data), start_snapshot, end_snapshot

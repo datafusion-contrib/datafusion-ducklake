@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- CDC feeds now window cumulative (current-spec, 3-column) delete files per row:
+  each deleted position carries its own delete snapshot in the file's embedded
+  `_ducklake_internal_snapshot_id` column, deletions are reported at those
+  snapshots (never re-reported in later windows), and files beginning before the
+  window are included via `ducklake_delete_file.partial_max`. Legacy per-snapshot
+  delete files keep the delta-vs-previous model. The crate's writer schemas gain
+  the (unpopulated) `partial_max` column on `ducklake_delete_file` for spec
+  parity (#179).
 - CDC feeds missed changes inside compaction-merged files. Windows starting past a
   merged file's `begin_snapshot` now include it via `partial_max`, each merged row
   is attributed to its origin snapshot (from the embedded

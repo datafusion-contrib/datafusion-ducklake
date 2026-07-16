@@ -1174,7 +1174,23 @@ impl MetadataProvider for SqliteMetadataProvider {
             // This query has two parts:
             // 1. Incremental deletes: delete files added in the snapshot range
             // 2. Full file deletes: data files that were completely removed in the snapshot range
-            let rows = sqlx::query(
+            //
+            // Cumulative (current-spec) delete files can hold in-window deletions
+            // even when their begin_snapshot predates the window; they are
+            // included via `ducklake_delete_file.partial_max` (their max embedded
+            // snapshot). Older catalogs lack the column — and cumulative delete
+            // files — so it degrades to NULL there.
+            let has_delete_partial_max: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file') WHERE name = 'partial_max'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let pm = if has_delete_partial_max > 0 {
+                "cd.partial_max"
+            } else {
+                "NULL"
+            };
+            let rows = sqlx::query(&format!(
                 r#"
 -- Part 1: Incremental deletes (delete file added)
 SELECT
@@ -1217,8 +1233,9 @@ SELECT
 FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
 WHERE cd.table_id = ?
-  AND cd.begin_snapshot >= ?
   AND cd.begin_snapshot <= ?
+  AND (cd.begin_snapshot >= ?
+       OR ({pm} IS NOT NULL AND {pm} >= ?))
   AND data.table_id = ?
 
 UNION ALL
@@ -1265,16 +1282,18 @@ FROM ducklake_data_file data
 WHERE data.table_id = ?
   AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
-"#,
-            )
-            // Part 1 bindings: 4x table_id for prev subqueries, table_id for cd, start, end, table_id for data
+"#
+            ))
+            // Part 1 bindings: 4x table_id for prev subqueries, table_id for cd,
+            // end, start (window), start (partial_max), table_id for data
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
-            .bind(start_snapshot)
             .bind(end_snapshot)
+            .bind(start_snapshot)
+            .bind(start_snapshot)
             .bind(table_id)
             // Part 2 bindings: 4x table_id for prev subqueries, table_id for data, start, end
             .bind(table_id)

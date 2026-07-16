@@ -199,7 +199,11 @@ CREATE TABLE IF NOT EXISTS ducklake_delete_file (
     encryption_key VARCHAR,
     delete_count INTEGER,
     begin_snapshot INTEGER NOT NULL,
-    end_snapshot INTEGER
+    end_snapshot INTEGER,
+    -- Max embedded per-row snapshot of a cumulative delete file (current
+    -- DuckLake spec). This crate's writer emits per-snapshot delete files and
+    -- leaves it NULL; readers use it to window cumulative files by row.
+    partial_max INTEGER
 );
 
 -- Files queued for physical deletion by the two-phase vacuum (DuckLake spec).

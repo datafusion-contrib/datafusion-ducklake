@@ -820,7 +820,25 @@ impl MetadataProvider for DuckdbMetadataProvider {
         end_snapshot: i64,
     ) -> crate::Result<Vec<DeleteFileChange>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
+
+        // Cumulative (current-spec) delete files can hold in-window deletions
+        // even when their begin_snapshot predates the window; they are included
+        // via `ducklake_delete_file.partial_max` (their max embedded snapshot).
+        // Older catalogs have no such column — and no cumulative delete files —
+        // so the predicate degrades to NULL there, keeping the plain
+        // begin-snapshot window.
+        let has_delete_partial_max: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('ducklake_delete_file') \
+             WHERE name = 'partial_max'",
+            [],
+            |row| row.get(0),
+        )?;
+        let sql = if has_delete_partial_max {
+            SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.to_string()
+        } else {
+            SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.replace("df.partial_max", "NULL")
+        };
+        let mut stmt = conn.prepare(&sql)?;
 
         let files = stmt
             .query_map(params![table_id, start_snapshot, end_snapshot], |row| {

@@ -136,7 +136,11 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         encryption_key VARCHAR,
         delete_count BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        -- Max embedded per-row snapshot of a cumulative delete file (current
+        -- DuckLake spec). This crate's writer emits per-snapshot delete files
+        -- and leaves it NULL; readers use it to window cumulative files by row.
+        partial_max BIGINT
     )"#,
     // Idempotent guard: an existing single-catalog Postgres catalog populated by
     // another tool may not have schema_version on ducklake_snapshot.

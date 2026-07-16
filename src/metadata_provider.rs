@@ -141,8 +141,9 @@ current_delete AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
-      AND df.begin_snapshot >= p.start_snapshot
       AND df.begin_snapshot <= p.finish_snapshot
+      AND (df.begin_snapshot >= p.start_snapshot
+           OR (df.partial_max IS NOT NULL AND df.partial_max >= p.start_snapshot))
 ),
 
 all_deletes AS (

@@ -743,3 +743,64 @@ async fn diff_compacted_inserts() -> DataFusionResult<()> {
     }
     Ok(())
 }
+
+/// A DELETE targeting a compaction-merged file must be reported at its COMMIT
+/// snapshot with the row's preserved rowid and old values — current official
+/// DuckLake semantics (its delete files carry per-row delete snapshots).
+///
+/// This cannot live-diff: the installed (1.4-era) extension writes delete
+/// files without the per-row snapshot column and resolves the deleted row's
+/// snapshot through the DATA file's embedded origin column instead, so it
+/// mis-reports the delete as an update pair at the row's ORIGIN snapshot —
+/// since fixed upstream. Asserted against current official semantics.
+#[tokio::test]
+async fn diff_delete_targeting_merged_file() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("merged_del.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a');",
+            "INSERT INTO c.t VALUES (2, 'b');",
+            "INSERT INTO c.t VALUES (3, 'c');",
+            "CALL ducklake_merge_adjacent_files('c');",
+            "INSERT INTO c.t VALUES (4, 'd');",
+            "DELETE FROM c.t WHERE id = 2;",
+        ],
+    )?;
+    let ctx = crate_context(&path).await?;
+    // Snapshots: 2/3/4 = inserts (rowids 0/1/2), 5 = merge, 6 = insert, 7 = delete.
+    let deleted = CanonRow {
+        snapshot_id: 7,
+        rowid: Some(1),
+        change_type: Some("delete".to_string()),
+        cells: vec!["2".to_string(), "b".to_string()],
+    };
+    for (a, b) in [(7, 7), (0, 1000), (6, 1000)] {
+        let got = crate_feed(
+            &ctx,
+            &format!(
+                "SELECT * FROM ducklake_table_changes('main.t', {a}, {b}) \
+                 WHERE change_type = 'delete'"
+            ),
+            true,
+        )
+        .await?;
+        assert_eq!(
+            got.rows,
+            vec![deleted.clone()],
+            "window [{a},{b}]: the delete must surface at its commit snapshot\n{}",
+            pretty(&got)
+        );
+    }
+    // And the deletions feed agrees.
+    let got = crate_feed(
+        &ctx,
+        "SELECT * FROM ducklake_table_deletions('main.t', 7, 7)",
+        true,
+    )
+    .await?;
+    assert_eq!(got.rows, vec![deleted], "deletions feed\n{}", pretty(&got));
+    Ok(())
+}
