@@ -738,10 +738,59 @@ impl MetadataProvider for DuckdbMetadataProvider {
         end_snapshot: i64,
     ) -> crate::Result<Vec<DataFileChange>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
 
+        // DuckLake's catalog schema renamed the merged-partial-file marker:
+        // older catalogs (spec 0.2, written by earlier ducklake extensions)
+        // carry `partial_file_info` (a cumulative `snapshot:rowcount|...`
+        // string); current ones carry `partial_max` (BIGINT). Detect which
+        // column this catalog has and query accordingly.
+        let has_partial_max: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('ducklake_data_file') \
+             WHERE name = 'partial_max'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if has_partial_max {
+            let mut stmt = conn.prepare(SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
+            let files = stmt
+                .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
+                    Ok(DataFileChange {
+                        begin_snapshot: row.get(0)?,
+                        path: row.get(1)?,
+                        path_is_relative: row.get(2)?,
+                        file_size_bytes: row.get(3)?,
+                        footer_size: row.get(4)?,
+                        encryption_key: row.get(5)?,
+                        row_id_start: row.get(6)?,
+                        partial_max: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(files);
+        }
+
+        // Old-spec catalog: fetch candidate partial files broadly and apply the
+        // `partial_max >= start` bound in Rust after parsing the info string.
+        let mut stmt = conn.prepare(
+            "SELECT
+                data.begin_snapshot,
+                data.path,
+                data.path_is_relative,
+                data.file_size_bytes,
+                data.footer_size,
+                data.encryption_key,
+                data.row_id_start,
+                data.partial_file_info
+            FROM ducklake_data_file AS data
+            WHERE data.table_id = $1
+              AND data.begin_snapshot <= $3
+              AND (data.begin_snapshot >= $2 OR data.partial_file_info IS NOT NULL)
+            ORDER BY data.begin_snapshot",
+        )?;
         let files = stmt
             .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
+                let info: Option<String> = row.get(7)?;
                 Ok(DataFileChange {
                     begin_snapshot: row.get(0)?,
                     path: row.get(1)?,
@@ -750,9 +799,16 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     footer_size: row.get(4)?,
                     encryption_key: row.get(5)?,
                     row_id_start: row.get(6)?,
+                    partial_max: info.as_deref().and_then(parse_partial_file_info_max),
                 })
             })?
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|f: &DataFileChange| {
+                f.begin_snapshot >= start_snapshot
+                    || f.partial_max.is_some_and(|max| max >= start_snapshot)
+            })
+            .collect();
 
         Ok(files)
     }
@@ -797,5 +853,36 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(files)
+    }
+}
+
+/// Parse the maximum origin snapshot id out of an old-spec `partial_file_info`
+/// string — a `|`-separated list of cumulative `snapshot:rowcount` pairs (e.g.
+/// `"2:1|3:2|4:3"`), whose last pair carries the file's maximum snapshot.
+fn parse_partial_file_info_max(info: &str) -> Option<i64> {
+    info.rsplit('|')
+        .next()
+        .and_then(|pair| pair.split(':').next())
+        .and_then(|snap| snap.trim().parse::<i64>().ok())
+}
+
+#[cfg(test)]
+mod partial_file_info_tests {
+    use super::parse_partial_file_info_max;
+
+    #[test]
+    fn parses_multi_pair_info() {
+        assert_eq!(parse_partial_file_info_max("2:1|3:2|4:3"), Some(4));
+    }
+
+    #[test]
+    fn parses_single_pair_info() {
+        assert_eq!(parse_partial_file_info_max("7:100"), Some(7));
+    }
+
+    #[test]
+    fn malformed_info_is_none() {
+        assert_eq!(parse_partial_file_info_max(""), None);
+        assert_eq!(parse_partial_file_info_max("nonsense"), None);
     }
 }

@@ -42,7 +42,9 @@ use parquet::arrow::async_reader::ParquetObjectReader;
 use crate::metadata_provider::{DataFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
-use crate::row_id::{FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME};
+use crate::row_id::{
+    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID,
+};
 use crate::table::{delete_file_schema, validated_file_size, validated_record_count};
 use crate::types::extract_parquet_field_ids;
 
@@ -85,6 +87,17 @@ impl fmt::Display for ChangeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// Physical names of a data file's embedded CDC columns, when present.
+#[derive(Debug, Clone, Default)]
+struct EmbeddedCdcNames {
+    /// `_ducklake_internal_row_id` under its physical name (field id
+    /// [`ROW_ID_PARQUET_FIELD_ID`]).
+    rowid: Option<String>,
+    /// `_ducklake_internal_snapshot_id` under its physical name (field id
+    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`]).
+    snapshot: Option<String>,
 }
 
 /// Positions of the CDC metadata columns in the feed's output schema. They
@@ -586,15 +599,17 @@ impl TableChangesTable {
         )))
     }
 
-    /// Read a file's parquet footer and return the physical name of its embedded
-    /// row-id column ([`ROW_ID_PARQUET_FIELD_ID`]) when present. A file that
-    /// carries one is the postimage side of an `UPDATE` / compaction.
-    async fn detect_embedded_rowid_name(
+    /// Read a file's parquet footer and return the physical names of its
+    /// embedded CDC columns: the row-id column ([`ROW_ID_PARQUET_FIELD_ID`],
+    /// present on UPDATE / non-adjacent-compaction outputs) and the per-row
+    /// snapshot-id column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`], present on
+    /// compaction-merged partial files).
+    async fn detect_embedded_cdc_names(
         &self,
         state: &dyn Session,
         path: &str,
         is_relative: bool,
-    ) -> DataFusionResult<Option<String>> {
+    ) -> DataFusionResult<EmbeddedCdcNames> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let object_store = state
@@ -605,24 +620,37 @@ impl TableChangesTable {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let field_ids = extract_parquet_field_ids(builder.metadata());
-        Ok(field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned())
+        Ok(EmbeddedCdcNames {
+            rowid: field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
+            snapshot: field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
+        })
     }
 
     /// The read schema for a data file: the table columns, plus the embedded
-    /// rowid column (under its physical name) when `embedded_name` is `Some`.
-    fn read_schema_with_optional_rowid(&self, embedded_name: &Option<String>) -> SchemaRef {
-        match embedded_name {
-            Some(name) => {
+    /// rowid / per-row snapshot columns (under their physical names) when
+    /// present, in that order.
+    fn read_schema_with_embedded(
+        &self,
+        rowid_name: &Option<String>,
+        snapshot_name: &Option<String>,
+    ) -> SchemaRef {
+        match (rowid_name, snapshot_name) {
+            (None, None) => self.table_schema.clone(),
+            (rowid, snapshot) => {
                 let mut fields: Vec<Field> = self
                     .table_schema
                     .fields()
                     .iter()
                     .map(|f| f.as_ref().clone())
                     .collect();
-                fields.push(Field::new(name, DataType::Int64, true));
+                if let Some(name) = rowid {
+                    fields.push(Field::new(name, DataType::Int64, true));
+                }
+                if let Some(name) = snapshot {
+                    fields.push(Field::new(name, DataType::Int64, true));
+                }
                 Arc::new(Schema::new(fields))
             },
-            None => self.table_schema.clone(),
         }
     }
 
@@ -635,8 +663,8 @@ impl TableChangesTable {
     fn build_insert_scan(
         &self,
         data_file: &DataFileChange,
-        embedded_name: &Option<String>,
-        need_rowid: bool,
+        embedded: &EmbeddedCdcNames,
+        need_rowid_resolution: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let resolved = resolve_path(
             &self.table_path,
@@ -654,7 +682,13 @@ impl TableChangesTable {
         {
             pf = pf.with_metadata_size_hint(hint);
         }
-        let read_schema = self.read_schema_with_optional_rowid(embedded_name);
+        // The per-row snapshot column is read only for partial (merged) files.
+        let snapshot_name = if data_file.partial_max.is_some() {
+            embedded.snapshot.clone()
+        } else {
+            None
+        };
+        let read_schema = self.read_schema_with_embedded(&embedded.rowid, &snapshot_name);
         let plain_scan = |pf: PartitionedFile, schema: SchemaRef| {
             let builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
@@ -663,12 +697,14 @@ impl TableChangesTable {
             .with_file_group(FileGroup::new(vec![pf]));
             DataSourceExec::from_data_source(builder.build())
         };
-        match embedded_name {
-            // Postimage / rewrite: rowid IS the embedded column — a plain scan.
+        match &embedded.rowid {
+            // Postimage / rewrite / non-adjacent merge: rowid IS the embedded
+            // column — a plain scan.
             Some(_) => Ok(plain_scan(pf, read_schema)),
-            // Plain insert, rowid requested: scan positionally to synthesize
-            // rowid = row_id_start + physical position.
-            None if need_rowid => {
+            // No embedded rowid but resolution required (rowid projected, or a
+            // partial file whose real rowids feed the update correlation): scan
+            // positionally to synthesize rowid = row_id_start + position.
+            None if need_rowid_resolution => {
                 let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
                 let builder =
                     FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
@@ -677,7 +713,7 @@ impl TableChangesTable {
                 let scan = DataSourceExec::from_data_source(builder.build());
                 Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
             },
-            // Plain insert, rowid not requested: a plain scan, no positions.
+            // Plain insert, rowid not needed: a plain scan, no positions.
             None => Ok(plain_scan(pf, read_schema)),
         }
     }
@@ -703,7 +739,7 @@ impl TableChangesTable {
         {
             pf = pf.with_metadata_size_hint(hint);
         }
-        let read_schema = self.read_schema_with_optional_rowid(embedded_name);
+        let read_schema = self.read_schema_with_embedded(embedded_name, &None);
         let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
         let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
             .with_file_group(FileGroup::new(vec![pf]))
@@ -747,7 +783,7 @@ impl TableChangesTable {
         state: &dyn Session,
         data_files: &[DataFileChange],
         delete_files: &[crate::metadata_provider::DeleteFileChange],
-        embedded_names: &[Option<String>],
+        embedded_names: &[EmbeddedCdcNames],
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let table_len = self.table_schema.fields().len();
@@ -757,20 +793,45 @@ impl TableChangesTable {
         let need_rowid = projection.is_none_or(|idx| idx.contains(&ROWID_IDX));
 
         let mut insert_units = Vec::with_capacity(data_files.len());
-        for (df, name) in data_files.iter().zip(embedded_names.iter()) {
-            // Embedded file: rowid is the trailing embedded column (at `table_len`).
-            // Plain insert (rowid requested): `build_insert_scan` appends a
-            // physical-position column (at `table_len`); rowid = row_id_start + pos.
-            let embedded = name.is_some();
+        for (df, names) in data_files.iter().zip(embedded_names.iter()) {
+            // Column layout of the scan batch after the `table_len` table
+            // columns: [embedded rowid?][embedded snapshot? (partial files
+            // only)][position? (appended by FileRowNumberExec)].
+            let is_partial = df.partial_max.is_some();
+            if is_partial && names.snapshot.is_none() {
+                return Err(DataFusionError::External(
+                    format!(
+                        "data file {} is a merged partial file (partial_max set) but carries \
+                         no embedded per-row snapshot column; cannot attribute its rows to \
+                         snapshots",
+                        df.path
+                    )
+                    .into(),
+                ));
+            }
+            // A partial file's rows carry REAL rowids into the update
+            // correlation (a placeholder could false-pair), so rowid is
+            // resolved for them even when it is not projected.
+            let resolve_rowid = need_rowid || is_partial;
+            let has_embedded_rowid = names.rowid.is_some();
+            let mut next_idx = table_len;
+            let embedded_col_idx = has_embedded_rowid.then(|| {
+                let i = next_idx;
+                next_idx += 1;
+                i
+            });
+            let snapshot_col_idx = (is_partial && names.snapshot.is_some()).then(|| {
+                let i = next_idx;
+                next_idx += 1;
+                i
+            });
+            let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
             insert_units.push(InsertUnit {
                 snapshot_id: df.begin_snapshot,
-                scan: self.build_insert_scan(df, name, need_rowid)?,
-                embedded_col_idx: name.as_ref().map(|_| table_len),
-                pos_col_idx: if !embedded && need_rowid {
-                    Some(table_len)
-                } else {
-                    None
-                },
+                scan: self.build_insert_scan(df, names, resolve_rowid)?,
+                embedded_col_idx,
+                snapshot_col_idx,
+                pos_col_idx,
                 row_id_start: df.row_id_start,
             });
         }
@@ -789,12 +850,13 @@ impl TableChangesTable {
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 let old_embedded = self
-                    .detect_embedded_rowid_name(
+                    .detect_embedded_cdc_names(
                         state,
                         &dfc.data_file_path,
                         dfc.data_file_path_is_relative,
                     )
-                    .await?;
+                    .await?
+                    .rowid;
                 let data_scan = self.build_delete_data_scan(
                     &resolved,
                     dfc.data_file_size_bytes,
@@ -839,6 +901,7 @@ impl TableChangesTable {
             self.output_schema.clone(),
             table_len,
             need_rowid,
+            (self.start_snapshot, self.end_snapshot),
         ));
 
         // The exec emits the full `[snapshot_id, rowid, change_type, table
@@ -911,6 +974,8 @@ impl TableProvider for TableChangesTable {
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
+        let mut data_files = data_files;
+
         // Decide whether to take the correlated path (reading delete sources to
         // emit `delete` rows and pair an UPDATE's delete+insert into
         // preimage/postimage). Guards, all cheap and metadata-only:
@@ -939,11 +1004,28 @@ impl TableProvider for TableChangesTable {
             }
         };
 
-        if (proj_info.need_rowid || !delete_files.is_empty()) && !any_encrypted {
-            let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
+        // Merged partial files whose window overlap comes only from
+        // `partial_max` (begin_snapshot before the window) need per-row
+        // attribution, which the encrypted insert-only path below cannot do
+        // (it cannot read the embedded snapshot column). Drop them there —
+        // matching the pre-partial_max behavior — rather than emitting rows
+        // with wrong snapshots. See COMPATIBILITY.md. When that leaves no
+        // data files at all, the feed is empty (deletes are already
+        // documented-missing on encrypted catalogs), not a planning error.
+        if any_encrypted {
+            data_files.retain(|f| f.begin_snapshot >= self.start_snapshot);
+            if data_files.is_empty() {
+                use datafusion::physical_plan::empty::EmptyExec;
+                return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
+            }
+        }
+        let any_partial = data_files.iter().any(|f| f.partial_max.is_some());
+
+        if (proj_info.need_rowid || !delete_files.is_empty() || any_partial) && !any_encrypted {
+            let mut embedded_names: Vec<EmbeddedCdcNames> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
                 embedded_names.push(
-                    self.detect_embedded_rowid_name(
+                    self.detect_embedded_cdc_names(
                         state,
                         &data_file.path,
                         data_file.path_is_relative,
@@ -1017,10 +1099,16 @@ impl TableProvider for TableChangesTable {
 /// column at `pos_col_idx` and whose rowid is `row_id_start + position`.
 #[derive(Clone)]
 struct InsertUnit {
+    /// The file's `begin_snapshot`: every row's snapshot for an ordinary file;
+    /// for a merged partial file (`snapshot_col_idx` set) it is only the
+    /// minimum, and each row's actual snapshot comes from the embedded column.
     snapshot_id: i64,
     scan: Arc<dyn ExecutionPlan>,
     /// Column index of the embedded rowid, or `None` for a plain insert.
     embedded_col_idx: Option<usize>,
+    /// Column index of the embedded per-row snapshot (merged partial files
+    /// only). Rows outside the query window are filtered out on read.
+    snapshot_col_idx: Option<usize>,
     /// Column index of the physical row-position (plain inserts only).
     pos_col_idx: Option<usize>,
     /// First rowid of the file (`None` if the catalog carries none). Required
@@ -1074,6 +1162,9 @@ pub struct TableChangesExec {
     /// skip rowid synthesis (emitting a placeholder dropped by the projection),
     /// so a non-rowid projection never needs a plain insert's row_id_start.
     need_rowid: bool,
+    /// The query's `[start, end]` snapshot window (inclusive), used to filter
+    /// rows of merged partial files by their embedded per-row snapshot.
+    window: (i64, i64),
     properties: Arc<PlanProperties>,
 }
 
@@ -1096,6 +1187,7 @@ impl std::fmt::Debug for DeleteUnit {
 }
 
 impl TableChangesExec {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         insert_units: Vec<InsertUnit>,
         delete_units: Vec<DeleteUnit>,
@@ -1103,6 +1195,7 @@ impl TableChangesExec {
         output_schema: SchemaRef,
         table_len: usize,
         need_rowid: bool,
+        window: (i64, i64),
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
@@ -1117,6 +1210,7 @@ impl TableChangesExec {
             output_schema,
             table_len,
             need_rowid,
+            window,
             properties,
         }
     }
@@ -1186,6 +1280,7 @@ impl ExecutionPlan for TableChangesExec {
         let output_schema = self.output_schema.clone();
         let table_len = self.table_len;
         let need_rowid = self.need_rowid;
+        let window = self.window;
 
         let fut = async move {
             correlate_changes(
@@ -1194,6 +1289,7 @@ impl ExecutionPlan for TableChangesExec {
                 output_schema,
                 table_len,
                 need_rowid,
+                window,
                 context,
             )
             .await
@@ -1214,13 +1310,17 @@ impl ExecutionPlan for TableChangesExec {
 }
 
 /// Collect the inserted and deleted rows, correlate update pairs by
-/// `(snapshot_id, rowid)`, and produce the tagged output batches.
+/// `(snapshot_id, rowid)`, and produce the tagged output batches. `window` is
+/// the query's inclusive `[start, end]` snapshot range, applied per row to
+/// merged partial files (whose rows span several snapshots).
+#[allow(clippy::too_many_arguments)]
 async fn correlate_changes(
     insert_units: Vec<InsertUnit>,
     delete_units: Vec<DeleteUnit>,
     output_schema: SchemaRef,
     table_len: usize,
     need_rowid: bool,
+    window: (i64, i64),
     context: Arc<TaskContext>,
 ) -> DataFusionResult<Vec<RecordBatch>> {
     // Inserted rows split into postimage candidates (embedded rowid — can pair
@@ -1239,63 +1339,94 @@ async fn correlate_changes(
                 continue;
             }
             let table_batch = b.project(&(0..table_len).collect::<Vec<_>>())?;
-            match unit.embedded_col_idx {
-                // UPDATE / compaction postimage: rowid IS the embedded column.
-                Some(idx) => {
-                    let rowid = b
-                        .column(idx)
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "embedded rowid column is not Int64".to_string(),
-                            )
-                        })?
-                        .clone();
-                    postimages.push(KeyedRows {
-                        snapshot_id: unit.snapshot_id,
-                        table_batch,
-                        rowid,
-                    });
+
+            // Resolve each row's rowid: the embedded column when present, else
+            // row_id_start + physical position (only when actually needed).
+            let embedded_rowid = match unit.embedded_col_idx {
+                Some(idx) => Some(int64_column(&b, idx, "embedded rowid")?.clone()),
+                None => None,
+            };
+            let rowid: Int64Array = match (&embedded_rowid, unit.pos_col_idx) {
+                (Some(arr), _) => (*arr).clone(),
+                (None, Some(pos_idx)) => {
+                    let row_id_start = unit.row_id_start.ok_or_else(|| {
+                        DataFusionError::Internal(
+                            "cannot synthesize rowid: inserted file has neither an embedded \
+                             rowid nor a row_id_start"
+                                .to_string(),
+                        )
+                    })?;
+                    let pos = int64_column(&b, pos_idx, ROW_POS_COLUMN_NAME)?;
+                    Int64Array::from(
+                        (0..n)
+                            .map(|i| row_id_start + pos.value(i))
+                            .collect::<Vec<i64>>(),
+                    )
                 },
-                // Plain insert: rowid = row_id_start + physical position when
-                // requested, else a placeholder dropped by the projection.
-                None => {
-                    let rowid = if need_rowid {
-                        let pos_idx = unit.pos_col_idx.ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "plain insert scan is missing its position column".to_string(),
-                            )
-                        })?;
-                        let row_id_start = unit.row_id_start.ok_or_else(|| {
-                            DataFusionError::Internal(
-                                "cannot synthesize rowid: inserted file has neither an embedded \
-                                 rowid nor a row_id_start"
-                                    .to_string(),
-                            )
-                        })?;
-                        let pos = b
-                            .column(pos_idx)
+                // Rowid neither embedded nor resolved (not requested): a
+                // placeholder dropped by the projection; never pairs.
+                (None, None) => Int64Array::from(vec![0i64; n]),
+            };
+
+            match unit.snapshot_col_idx {
+                // Merged partial file: each row belongs to its embedded origin
+                // snapshot. Filter rows to the query window and split the batch
+                // into one KeyedRows group per snapshot; their rowids are real,
+                // so they participate in update pairing like any insertion.
+                Some(snap_idx) => {
+                    let snaps = int64_column(&b, snap_idx, "embedded snapshot_id")?;
+                    let mut by_snapshot: std::collections::BTreeMap<i64, Vec<u32>> =
+                        std::collections::BTreeMap::new();
+                    for i in 0..n {
+                        if snaps.is_null(i) {
+                            return Err(DataFusionError::Internal(
+                                "embedded snapshot_id column contains NULL".to_string(),
+                            ));
+                        }
+                        let s = snaps.value(i);
+                        if s >= window.0 && s <= window.1 {
+                            by_snapshot.entry(s).or_default().push(i as u32);
+                        }
+                    }
+                    for (snapshot, row_indices) in by_snapshot {
+                        let indices = UInt32Array::from(row_indices);
+                        let cols: Vec<ArrayRef> = table_batch
+                            .columns()
+                            .iter()
+                            .map(|c| {
+                                take(c.as_ref(), &indices, None)
+                                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                            })
+                            .collect::<DataFusionResult<_>>()?;
+                        let group_batch = RecordBatch::try_new(table_batch.schema(), cols)?;
+                        let group_rowid = take(&rowid, &indices, None)
+                            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
                             .as_any()
                             .downcast_ref::<Int64Array>()
-                            .ok_or_else(|| {
-                                DataFusionError::Internal(format!(
-                                    "{ROW_POS_COLUMN_NAME} column is not Int64"
-                                ))
-                            })?;
-                        Int64Array::from(
-                            (0..n)
-                                .map(|i| row_id_start + pos.value(i))
-                                .collect::<Vec<i64>>(),
-                        )
-                    } else {
-                        Int64Array::from(vec![0i64; n])
-                    };
-                    plain_inserts.push(KeyedRows {
+                            .expect("take preserves Int64")
+                            .clone();
+                        postimages.push(KeyedRows {
+                            snapshot_id: snapshot,
+                            table_batch: group_batch,
+                            rowid: group_rowid,
+                        });
+                    }
+                },
+                // Ordinary file: all rows belong to begin_snapshot. Embedded
+                // rowids (UPDATE / rewrite outputs) can pair with deletes;
+                // plain inserts carry fresh (or placeholder) rowids and never
+                // pair.
+                None => {
+                    let keyed = KeyedRows {
                         snapshot_id: unit.snapshot_id,
                         table_batch,
                         rowid,
-                    });
+                    };
+                    if embedded_rowid.is_some() {
+                        postimages.push(keyed);
+                    } else {
+                        plain_inserts.push(keyed);
+                    }
                 },
             }
         }
@@ -1475,6 +1606,19 @@ async fn correlate_changes(
         }
     }
     Ok(out)
+}
+
+/// Downcast a batch column to `Int64Array` with a descriptive error.
+fn int64_column<'a>(
+    batch: &'a RecordBatch,
+    idx: usize,
+    what: &str,
+) -> DataFusionResult<&'a Int64Array> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Internal(format!("{what} column is not Int64")))
 }
 
 /// Collect the `pos` set from a delete-file scan (`None` scan => `None`).

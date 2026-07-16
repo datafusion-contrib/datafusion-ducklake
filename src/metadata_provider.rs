@@ -112,11 +112,13 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
         data.file_size_bytes,
         data.footer_size,
         data.encryption_key,
-        data.row_id_start
+        data.row_id_start,
+        data.partial_max
     FROM ducklake_data_file AS data
-    WHERE data.table_id = ?
-      AND data.begin_snapshot >= ?
-      AND data.begin_snapshot <= ?
+    WHERE data.table_id = $1
+      AND data.begin_snapshot <= $3
+      AND (data.begin_snapshot >= $2
+           OR (data.partial_max IS NOT NULL AND data.partial_max >= $2))
     ORDER BY data.begin_snapshot";
 
 pub const SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
@@ -659,6 +661,13 @@ pub struct DataFileChange {
     /// synthesize a plain insert's rowid (`row_id_start + physical_position`);
     /// files with an embedded rowid do not need it.
     pub row_id_start: Option<i64>,
+    /// For a compaction-merged partial file: the maximum origin snapshot id of
+    /// its rows (`partial_max` in the catalog). `Some` means the file spans
+    /// snapshots `begin_snapshot..=partial_max` and each row's snapshot must be
+    /// read from the embedded `_ducklake_internal_snapshot_id` column, with
+    /// rows outside the query window filtered out. `None` for ordinary files
+    /// (all rows belong to `begin_snapshot`).
+    pub partial_max: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

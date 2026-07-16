@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- CDC feeds missed changes inside compaction-merged files. Windows starting past a
+  merged file's `begin_snapshot` now include it via `partial_max`, each merged row
+  is attributed to its origin snapshot (from the embedded
+  `_ducklake_internal_snapshot_id` column), out-of-window rows are filtered, and a
+  merge itself emits no change events — matching official DuckLake. Catalogs
+  written under the older spec (`partial_file_info`) are handled on the DuckDB
+  backend (#179).
+
 ### Changed
 - **BREAKING**: `ducklake_table_changes` / `ducklake_table_deletions` snapshot bounds
   are now inclusive on both ends, matching official DuckLake: `(t, start, end)` returns

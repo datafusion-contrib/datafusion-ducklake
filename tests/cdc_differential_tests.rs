@@ -637,3 +637,109 @@ async fn diff_update_all_rows() -> DataFusionResult<()> {
     )
     .await
 }
+
+/// Compaction: several small inserts merged into one partial file, then a
+/// post-compaction insert. Official attributes each merged row to its ORIGIN
+/// snapshot in the change feed (via the embedded
+/// `_ducklake_internal_snapshot_id` column); windows starting after the
+/// merged file's begin_snapshot must still see the in-window origin rows, and
+/// the merge itself emits no CDC events.
+///
+/// The INSTALLED (1.4-era) extension has two since-fixed gaps here, so this
+/// scenario cannot live-diff everything against it:
+///  * windows starting past the merged file's begin_snapshot exclude the file
+///    entirely (its CDC predicate predates partial-file inclusion) — those
+///    windows are asserted against CURRENT official semantics (per
+///    `test/sql/compaction/small_insert_compaction.test` upstream);
+///  * deletes targeting a merged file are mis-attributed to origin snapshots
+///    (its delete files lack the per-row snapshot column) — not exercised
+///    here, tracked as a #179 follow-up.
+///
+/// Snapshots: 1 = CREATE TABLE, 2/3/4 = single-row inserts (rowids 0/1/2),
+/// 5 = merge (no CDC events), 6 = insert of (4,'d') (rowid 3).
+#[tokio::test]
+async fn diff_compacted_inserts() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("compact.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a');",
+            "INSERT INTO c.t VALUES (2, 'b');",
+            "INSERT INTO c.t VALUES (3, 'c');",
+            "CALL ducklake_merge_adjacent_files('c');",
+            "INSERT INTO c.t VALUES (4, 'd');",
+        ],
+    )?;
+
+    // Windows whose start does not exceed the merged file's begin_snapshot
+    // (2): the installed extension includes the file and resolves per-row
+    // origin snapshots correctly, so these live-diff against it.
+    let live_windows = [(0, 6), (1, 6), (2, 6), (2, 2), (0, 2), (2, 4)];
+    let mut official: Vec<((i64, i64), CanonFeed)> = Vec::new();
+    {
+        let conn = official_connection(&path)?;
+        for (a, b) in live_windows {
+            let changes = official_feed(
+                &conn,
+                &format!("SELECT * FROM ducklake_table_changes('c', 'main', 't', {a}, {b})"),
+                true,
+            )?;
+            official.push(((a, b), changes));
+        }
+    }
+    let ctx = crate_context(&path).await?;
+    for ((a, b), official_changes) in official {
+        let crate_changes = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM ducklake_table_changes('main.t', {a}, {b})"),
+            true,
+        )
+        .await?;
+        assert_feeds_match(
+            &format!("compacted table_changes window [{a},{b}]"),
+            &official_changes,
+            &crate_changes,
+        );
+    }
+
+    // Windows reachable only through partial_max: asserted against CURRENT
+    // official semantics (each row at its origin snapshot; the merge emits
+    // nothing).
+    let insert_row = |snapshot: i64, rowid: i64, id: &str, name: &str| CanonRow {
+        snapshot_id: snapshot,
+        rowid: Some(rowid),
+        change_type: Some("insert".to_string()),
+        cells: vec![id.to_string(), name.to_string()],
+    };
+    let expectations: [((i64, i64), Vec<CanonRow>); 5] = [
+        ((3, 3), vec![insert_row(3, 1, "2", "b")]),
+        ((4, 4), vec![insert_row(4, 2, "3", "c")]),
+        ((5, 5), vec![]),
+        (
+            (3, 6),
+            vec![
+                insert_row(3, 1, "2", "b"),
+                insert_row(4, 2, "3", "c"),
+                insert_row(6, 3, "4", "d"),
+            ],
+        ),
+        ((4, 5), vec![insert_row(4, 2, "3", "c")]),
+    ];
+    for ((a, b), expected) in expectations {
+        let got = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM ducklake_table_changes('main.t', {a}, {b})"),
+            true,
+        )
+        .await?;
+        assert_eq!(
+            got.rows,
+            expected,
+            "partial-only window [{a},{b}] diverges from current official semantics\n{}",
+            pretty(&got)
+        );
+    }
+    Ok(())
+}

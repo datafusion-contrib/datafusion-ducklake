@@ -831,3 +831,120 @@ async fn merge_partial_file_serves_time_travel_after_sources_are_deleted() {
     // The current snapshot still returns everything.
     assert_eq!(read_rows(&temp).await.len(), 6);
 }
+
+/// CDC over a crate-compacted catalog: `ducklake_table_changes` must attribute
+/// each merged row to its ORIGIN snapshot (via the embedded per-row snapshot
+/// column) and honor windows that reach the merged file only through
+/// `partial_max`, matching official DuckLake.
+#[tokio::test(flavor = "multi_thread")]
+async fn cdc_attributes_merged_rows_to_origin_snapshots() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await;
+    let p = pool(&temp).await;
+    let s1 = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![2], vec![20]).await;
+    let s2 = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![3], vec![30]).await;
+    let s3 = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    run_merge(&temp, MergeOptions::default()).await;
+
+    // The merge produced a single partial file spanning s1..=s3.
+    let live_files = scalar_i64(
+        &p,
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    assert_eq!(live_files, 1, "merge coalesced to one live file");
+    let partial_max = opt_i64(
+        &p,
+        "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    assert_eq!(partial_max, Some(s3), "merged file records partial_max");
+
+    // CDC through the sqlite provider.
+    let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap());
+    let catalog =
+        DuckLakeCatalog::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap()).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    datafusion_ducklake::register_ducklake_functions(&ctx, provider);
+
+    let changes = |a: i64, b: i64| {
+        let ctx = ctx.clone();
+        async move {
+            let batches = ctx
+                .sql(&format!(
+                    "SELECT snapshot_id, rowid, change_type, id, val \
+                     FROM ducklake_table_changes('main.t', {a}, {b}) \
+                     ORDER BY snapshot_id"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut rows: Vec<(i64, i64, String, i32)> = Vec::new();
+            for batch in &batches {
+                let snaps = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let rowids = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let cts = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let ids = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                for r in 0..batch.num_rows() {
+                    rows.push((
+                        snaps.value(r),
+                        rowids.value(r),
+                        cts.value(r).to_string(),
+                        ids.value(r),
+                    ));
+                }
+            }
+            rows
+        }
+    };
+
+    // Full range: every row at its origin snapshot with its original rowid.
+    assert_eq!(
+        changes(0, 1000).await,
+        vec![
+            (s1, 0, "insert".to_string(), 1),
+            (s2, 1, "insert".to_string(), 2),
+            (s3, 2, "insert".to_string(), 3),
+        ],
+        "merged rows attributed to origin snapshots"
+    );
+    // Windows reachable only via partial_max (start past the merged file's
+    // begin_snapshot).
+    assert_eq!(
+        changes(s2, s2).await,
+        vec![(s2, 1, "insert".to_string(), 2)],
+        "single-snapshot window inside the merged file"
+    );
+    assert_eq!(
+        changes(s3, 1000).await,
+        vec![(s3, 2, "insert".to_string(), 3)],
+        "suffix window inside the merged file"
+    );
+    // The merge snapshot itself emits nothing.
+    assert_eq!(
+        changes(s3 + 1, s3 + 1).await,
+        vec![],
+        "merge emits no CDC events"
+    );
+}

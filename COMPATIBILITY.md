@@ -196,8 +196,11 @@ Known edges:
   are missing entirely (the correlated path reads parquet footers/rows the change-feed
   path does not decrypt). A window whose only changes are deletes carries no data file
   to detect encryption from, so it fails at read time on an encrypted catalog rather
-  than returning wrong results. Non-encrypted catalogs emit the full official
-  change-set (inserts, deletes, update pre/postimages).
+  than returning wrong results. Compaction-merged (partial) files whose window overlap
+  comes only from `partial_max` are likewise dropped on encrypted catalogs (their
+  per-row snapshot column cannot be read). Non-encrypted catalogs emit the full
+  official change-set (inserts, deletes, update pre/postimages, merged-file rows at
+  their origin snapshots).
 - **No partition-based file pruning** on read.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).

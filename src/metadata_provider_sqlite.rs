@@ -1110,7 +1110,20 @@ impl MetadataProvider for SqliteMetadataProvider {
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>> {
         block_on(async {
-            let rows = sqlx::query(
+            // Older catalogs predate `partial_max`; degrade it to NULL there
+            // (they cannot contain partial files), matching the probe pattern
+            // used by the scan queries above.
+            let has_partial_max: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partial_max'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let pm = if has_partial_max > 0 {
+                "data.partial_max"
+            } else {
+                "NULL"
+            };
+            let rows = sqlx::query(&format!(
                 "SELECT
                     data.begin_snapshot,
                     data.path,
@@ -1118,13 +1131,15 @@ impl MetadataProvider for SqliteMetadataProvider {
                     data.file_size_bytes,
                     data.footer_size,
                     data.encryption_key,
-                    data.row_id_start
+                    data.row_id_start,
+                    {pm}
                 FROM ducklake_data_file AS data
-                WHERE data.table_id = ?
-                  AND data.begin_snapshot >= ?
-                  AND data.begin_snapshot <= ?
-                ORDER BY data.begin_snapshot",
-            )
+                WHERE data.table_id = ?1
+                  AND data.begin_snapshot <= ?3
+                  AND (data.begin_snapshot >= ?2
+                       OR ({pm} IS NOT NULL AND {pm} >= ?2))
+                ORDER BY data.begin_snapshot"
+            ))
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
@@ -1141,6 +1156,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         footer_size: row.try_get(4)?,
                         encryption_key: row.try_get(5)?,
                         row_id_start: row.try_get(6)?,
+                        partial_max: row.try_get(7)?,
                     })
                 })
                 .collect()
