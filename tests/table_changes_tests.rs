@@ -286,12 +286,13 @@ mod integration_tests {
             "Schema should contain 'change_type' CDC column"
         );
 
-        // Verify column order: table columns first, then CDC columns
+        // Verify column order: CDC columns leading (official DuckLake order),
+        // then table columns.
         assert_eq!(field_names.len(), 6, "Should have 6 columns total");
         assert_eq!(
             field_names,
-            vec!["id", "event_type", "value", "rowid", "snapshot_id", "change_type"],
-            "Columns should be in order: table columns, then CDC columns"
+            vec!["snapshot_id", "rowid", "change_type", "id", "event_type", "value"],
+            "Columns should be in order: CDC columns (official order), then table columns"
         );
 
         Ok(())

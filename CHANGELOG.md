@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes committed in snapshots `start..=end`. Previously the start bound was exclusive.
   Migration: callers paging with `(last, now]` cursors should pass `last + 1` as the new
   start (#179).
+- **BREAKING**: the CDC feeds' column order now matches official DuckLake — the
+  metadata columns `(snapshot_id, rowid, change_type)` lead, followed by the table
+  columns. Previously they trailed. Queries selecting columns by name are unaffected;
+  `SELECT *` consumers and positional readers must adjust (#179).
 
 ### Added
 - Differential CDC conformance suite: runs official DuckDB `ducklake_table_changes` /

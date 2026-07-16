@@ -85,7 +85,16 @@ impl fmt::Display for ChangeType {
     }
 }
 
-/// Custom execution plan that appends CDC columns (snapshot_id, change_type) to each batch
+/// Positions of the CDC metadata columns in the feed's output schema. They
+/// LEAD the table columns, matching official DuckLake's `ducklake_table_changes`
+/// projection (`SELECT snapshot_id, rowid, change_type, ...`).
+const SNAPSHOT_ID_IDX: usize = 0;
+const ROWID_IDX: usize = 1;
+const CHANGE_TYPE_IDX: usize = 2;
+/// Number of CDC metadata columns preceding the table columns.
+const CDC_COLS: usize = 3;
+
+/// Custom execution plan that prepends CDC columns (snapshot_id, rowid, change_type) to each batch
 ///
 /// This plan wraps a ParquetExec and appends CDC metadata columns to each output batch.
 /// It supports projection pushdown by:
@@ -93,7 +102,7 @@ impl fmt::Display for ChangeType {
 /// - Including only requested CDC columns in output
 /// - Optionally skipping input columns entirely when only CDC columns are needed
 #[derive(Debug)]
-pub struct AppendCDCColumnsExec {
+pub struct PrependCDCColumnsExec {
     /// The input execution plan (typically ParquetExec)
     input: Arc<dyn ExecutionPlan>,
     /// Snapshot ID for this file
@@ -116,7 +125,7 @@ pub struct AppendCDCColumnsExec {
     properties: Arc<PlanProperties>,
 }
 
-impl AppendCDCColumnsExec {
+impl PrependCDCColumnsExec {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
@@ -155,7 +164,7 @@ impl AppendCDCColumnsExec {
     }
 }
 
-impl DisplayAs for AppendCDCColumnsExec {
+impl DisplayAs for PrependCDCColumnsExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default
@@ -163,7 +172,7 @@ impl DisplayAs for AppendCDCColumnsExec {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "AppendCDCColumnsExec: snapshot_id={}, change_type={}, \
+                    "PrependCDCColumnsExec: snapshot_id={}, change_type={}, \
                      include_snapshot={}, include_change={}, skip_input={}",
                     self.snapshot_id,
                     self.change_type,
@@ -176,9 +185,9 @@ impl DisplayAs for AppendCDCColumnsExec {
     }
 }
 
-impl ExecutionPlan for AppendCDCColumnsExec {
+impl ExecutionPlan for PrependCDCColumnsExec {
     fn name(&self) -> &str {
-        "AppendCDCColumnsExec"
+        "PrependCDCColumnsExec"
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -195,11 +204,11 @@ impl ExecutionPlan for AppendCDCColumnsExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() != 1 {
             return Err(DataFusionError::Internal(
-                "AppendCDCColumnsExec expects exactly one child".into(),
+                "PrependCDCColumnsExec expects exactly one child".into(),
             ));
         }
 
-        Ok(Arc::new(AppendCDCColumnsExec::new(
+        Ok(Arc::new(PrependCDCColumnsExec::new(
             children[0].clone(),
             self.snapshot_id,
             self.change_type,
@@ -222,7 +231,7 @@ impl ExecutionPlan for AppendCDCColumnsExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
 
-        Ok(Box::pin(AppendCDCColumnsStream {
+        Ok(Box::pin(PrependCDCColumnsStream {
             input: input_stream,
             snapshot_id: self.snapshot_id,
             change_type: self.change_type,
@@ -236,7 +245,7 @@ impl ExecutionPlan for AppendCDCColumnsExec {
 }
 
 /// Stream that appends CDC columns to input batches
-struct AppendCDCColumnsStream {
+struct PrependCDCColumnsStream {
     input: SendableRecordBatchStream,
     snapshot_id: i64,
     change_type: ChangeType,
@@ -247,7 +256,7 @@ struct AppendCDCColumnsStream {
     output_schema: SchemaRef,
 }
 
-impl Stream for AppendCDCColumnsStream {
+impl Stream for PrependCDCColumnsStream {
     type Item = DataFusionResult<RecordBatch>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -263,24 +272,19 @@ impl Stream for AppendCDCColumnsStream {
     }
 }
 
-impl AppendCDCColumnsStream {
+impl PrependCDCColumnsStream {
     fn transform_batch(&self, batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
         let num_rows = batch.num_rows();
         let mut columns: Vec<ArrayRef> = Vec::new();
 
-        // Include input columns unless we're skipping them
-        if !self.skip_input_columns {
-            columns.extend(batch.columns().iter().cloned());
-        }
-
-        // Append requested CDC columns, in the order rowid, snapshot_id,
-        // change_type. rowid is all-NULL here: this insert-only path can't
-        // synthesize it (used for encrypted tables).
-        if self.include_rowid {
-            columns.push(Arc::new(Int64Array::from(vec![None::<i64>; num_rows])));
-        }
+        // Prepend requested CDC columns, in the order snapshot_id, rowid,
+        // change_type (official DuckLake order). rowid is all-NULL here: this
+        // insert-only path can't synthesize it (used for encrypted tables).
         if self.include_snapshot_id {
             columns.push(Arc::new(Int64Array::from(vec![self.snapshot_id; num_rows])));
+        }
+        if self.include_rowid {
+            columns.push(Arc::new(Int64Array::from(vec![None::<i64>; num_rows])));
         }
         if self.include_change_type {
             columns.push(Arc::new(StringArray::from(vec![
@@ -289,12 +293,17 @@ impl AppendCDCColumnsStream {
             ])));
         }
 
+        // Then the input columns, unless we're skipping them
+        if !self.skip_input_columns {
+            columns.extend(batch.columns().iter().cloned());
+        }
+
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-impl RecordBatchStream for AppendCDCColumnsStream {
+impl RecordBatchStream for PrependCDCColumnsStream {
     fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }
@@ -340,18 +349,16 @@ impl TableChangesTable {
         table_path: String,
         table_schema: SchemaRef,
     ) -> Self {
-        // Build output schema: table columns + CDC metadata columns
-        // (rowid, snapshot_id, change_type), in that order.
-        let mut fields: Vec<Field> = table_schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
+        // Build output schema: CDC metadata columns leading — (snapshot_id,
+        // rowid, change_type), official DuckLake's ducklake_table_changes
+        // column order — then the table columns.
+        let mut fields: Vec<Field> = Vec::with_capacity(table_schema.fields().len() + CDC_COLS);
+        fields.push(Field::new("snapshot_id", DataType::Int64, false));
         // rowid is nullable: it is NULL on encrypted (PME) tables, where the
         // correlated feed cannot decrypt footers to resolve rowids.
         fields.push(Field::new("rowid", DataType::Int64, true));
-        fields.push(Field::new("snapshot_id", DataType::Int64, false));
         fields.push(Field::new("change_type", DataType::Utf8, false));
+        fields.extend(table_schema.fields().iter().map(|f| f.as_ref().clone()));
         let output_schema = Arc::new(Schema::new(fields));
 
         Self {
@@ -367,13 +374,10 @@ impl TableChangesTable {
     }
 
     /// Analyze projection and split into table columns and CDC columns.
-    /// CDC columns follow the table columns in the order `rowid`, `snapshot_id`,
-    /// `change_type`.
+    /// CDC columns lead the table columns in the order `snapshot_id`, `rowid`,
+    /// `change_type` (official DuckLake order).
     fn analyze_projection(&self, projection: Option<&Vec<usize>>) -> ProjectionInfo {
         let num_table_cols = self.table_schema.fields().len();
-        let rowid_idx = num_table_cols;
-        let snapshot_id_idx = num_table_cols + 1;
-        let change_type_idx = num_table_cols + 2;
 
         match projection {
             None => {
@@ -394,14 +398,14 @@ impl TableChangesTable {
                 let mut need_change_type = false;
 
                 for &idx in indices {
-                    if idx < num_table_cols {
-                        table_indices.push(idx);
-                    } else if idx == rowid_idx {
-                        need_rowid = true;
-                    } else if idx == snapshot_id_idx {
-                        need_snapshot_id = true;
-                    } else if idx == change_type_idx {
-                        need_change_type = true;
+                    match idx {
+                        SNAPSHOT_ID_IDX => need_snapshot_id = true,
+                        ROWID_IDX => need_rowid = true,
+                        CHANGE_TYPE_IDX => need_change_type = true,
+                        _ if idx < num_table_cols + CDC_COLS => {
+                            table_indices.push(idx - CDC_COLS);
+                        },
+                        _ => {},
                     }
                 }
 
@@ -423,7 +427,7 @@ impl TableChangesTable {
         }
     }
 
-    /// Build the schema that AppendCDCColumnsExec will output. On this
+    /// Build the schema that PrependCDCColumnsExec will output. On this
     /// (encryption-aware, insert-only) path rowid cannot be synthesized, so when
     /// requested it is emitted as a nullable, all-NULL column.
     fn build_cdc_exec_schema(
@@ -433,25 +437,27 @@ impl TableChangesTable {
         need_snapshot_id: bool,
         need_change_type: bool,
     ) -> SchemaRef {
-        let mut fields: Vec<Field> = table_indices
-            .iter()
-            .map(|&i| self.table_schema.field(i).clone())
-            .collect();
+        let mut fields: Vec<Field> = Vec::with_capacity(table_indices.len() + CDC_COLS);
 
-        if need_rowid {
-            fields.push(Field::new("rowid", DataType::Int64, true));
-        }
         if need_snapshot_id {
             fields.push(Field::new("snapshot_id", DataType::Int64, false));
+        }
+        if need_rowid {
+            fields.push(Field::new("rowid", DataType::Int64, true));
         }
         if need_change_type {
             fields.push(Field::new("change_type", DataType::Utf8, false));
         }
+        fields.extend(
+            table_indices
+                .iter()
+                .map(|&i| self.table_schema.field(i).clone()),
+        );
 
         Arc::new(Schema::new(fields))
     }
 
-    /// Build a ParquetExec wrapped with AppendCDCColumnsExec for a single file
+    /// Build a ParquetExec wrapped with PrependCDCColumnsExec for a single file
     #[cfg(feature = "encryption")]
     async fn build_exec_for_file(
         &self,
@@ -470,7 +476,7 @@ impl TableChangesTable {
             .await
     }
 
-    /// Build a ParquetExec wrapped with AppendCDCColumnsExec for a single file
+    /// Build a ParquetExec wrapped with PrependCDCColumnsExec for a single file
     #[cfg(not(feature = "encryption"))]
     async fn build_exec_for_file(
         &self,
@@ -487,7 +493,7 @@ impl TableChangesTable {
         .await
     }
 
-    /// Internal implementation for building a ParquetExec wrapped with AppendCDCColumnsExec
+    /// Internal implementation for building a ParquetExec wrapped with PrependCDCColumnsExec
     async fn build_exec_for_file_impl(
         &self,
         _state: &dyn Session,
@@ -543,15 +549,15 @@ impl TableChangesTable {
         // Determine if we should skip input columns (only CDC columns requested)
         let skip_input_columns = proj_info.table_indices.is_empty();
 
-        // Build output schema for AppendCDCColumnsExec
+        // Build output schema for PrependCDCColumnsExec
         let cdc_exec_schema = if skip_input_columns {
             // Only CDC columns - build schema with just those
             let mut fields = Vec::new();
-            if proj_info.need_rowid {
-                fields.push(Field::new("rowid", DataType::Int64, true));
-            }
             if proj_info.need_snapshot_id {
                 fields.push(Field::new("snapshot_id", DataType::Int64, false));
+            }
+            if proj_info.need_rowid {
+                fields.push(Field::new("rowid", DataType::Int64, true));
             }
             if proj_info.need_change_type {
                 fields.push(Field::new("change_type", DataType::Utf8, false));
@@ -566,7 +572,7 @@ impl TableChangesTable {
             )
         };
 
-        Ok(Arc::new(AppendCDCColumnsExec::new(
+        Ok(Arc::new(PrependCDCColumnsExec::new(
             parquet_exec,
             data_file.begin_snapshot,
             ChangeType::Insert,
@@ -743,10 +749,10 @@ impl TableChangesTable {
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let table_len = self.table_schema.fields().len();
-        // Whether the caller wants the rowid column (it follows the table cols in
-        // the output schema). When it does not, plain inserts skip the positional
-        // scan and rowid synthesis entirely.
-        let need_rowid = projection.is_none_or(|idx| idx.contains(&table_len));
+        // Whether the caller wants the rowid column (at ROWID_IDX among the
+        // leading CDC columns). When it does not, plain inserts skip the
+        // positional scan and rowid synthesis entirely.
+        let need_rowid = projection.is_none_or(|idx| idx.contains(&ROWID_IDX));
 
         let mut insert_units = Vec::with_capacity(data_files.len());
         for (df, name) in data_files.iter().zip(embedded_names.iter()) {
@@ -849,8 +855,9 @@ impl TableChangesTable {
             need_rowid,
         ));
 
-        // The exec emits the full `[table columns, snapshot_id, change_type]`
-        // schema; honor the requested projection with a ProjectionExec on top.
+        // The exec emits the full `[snapshot_id, rowid, change_type, table
+        // columns]` schema; honor the requested projection with a
+        // ProjectionExec on top.
         match projection {
             None => Ok(full),
             Some(indices) => {
@@ -1442,7 +1449,7 @@ async fn correlate_changes(
     let mut out: Vec<RecordBatch> = Vec::new();
     // Plain inserts are always `insert` (they never pair with a delete).
     for k in &plain_inserts {
-        out.push(append_cdc_columns(
+        out.push(prepend_cdc_columns(
             &k.table_batch,
             k.rowid.clone(),
             k.snapshot_id,
@@ -1515,9 +1522,10 @@ async fn collect_delete_positions(
     Ok(Some(set))
 }
 
-/// Append the CDC `rowid` + `snapshot_id` + `change_type` columns to a
-/// table-column batch. `rowid` must have the same length as `table_batch`.
-fn append_cdc_columns(
+/// Prepend the CDC `snapshot_id` + `rowid` + `change_type` columns to a
+/// table-column batch (official DuckLake column order). `rowid` must have the
+/// same length as `table_batch`.
+fn prepend_cdc_columns(
     table_batch: &RecordBatch,
     rowid: Int64Array,
     snapshot_id: i64,
@@ -1525,10 +1533,11 @@ fn append_cdc_columns(
     output_schema: &SchemaRef,
 ) -> DataFusionResult<RecordBatch> {
     let n = table_batch.num_rows();
-    let mut cols: Vec<ArrayRef> = table_batch.columns().to_vec();
-    cols.push(Arc::new(rowid));
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(table_batch.num_columns() + CDC_COLS);
     cols.push(Arc::new(Int64Array::from(vec![snapshot_id; n])));
+    cols.push(Arc::new(rowid));
     cols.push(Arc::new(StringArray::from(vec![change.as_str(); n])));
+    cols.extend(table_batch.columns().iter().cloned());
     RecordBatch::try_new(output_schema.clone(), cols)
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
@@ -1577,7 +1586,7 @@ fn filter_and_tag(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| DataFusionError::Internal("filtered rowid is not Int64".to_string()))?
         .clone();
-    Ok(Some(append_cdc_columns(
+    Ok(Some(prepend_cdc_columns(
         &filtered,
         rowid,
         keyed.snapshot_id,

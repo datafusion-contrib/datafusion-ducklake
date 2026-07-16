@@ -17,11 +17,14 @@
 //!   two halves: crate `table_changes` == official `table_changes` minus its
 //!   'delete' rows, and crate `table_deletions` == official
 //!   `ducklake_table_deletions` (all deleted rows, update preimages included).
-//! * NORMALIZER-COLUMN-PLACEMENT — official leads with
-//!   `(snapshot_id, rowid, change_type)`; the crate appends
-//!   `(rowid, snapshot_id, change_type)` after the table columns. Rows are
-//!   canonicalized by column NAME; the residual table-column name order is
-//!   still asserted equal.
+//! * NORMALIZER-DELETIONS-CHANGE-TYPE — the crate's `ducklake_table_deletions`
+//!   materializes a constant `change_type='delete'` column that official's
+//!   function does not have (official also exposes rowid/snapshot_id as
+//!   virtual columns rather than in `SELECT *` — inherent to DataFusion's
+//!   lack of virtual columns, documented in COMPATIBILITY.md). The
+//!   `table_changes` column list is asserted positionally identical to
+//!   official's; the deletions list must be official's with `change_type`
+//!   inserted after `(snapshot_id, rowid)`.
 //!
 //! Not yet covered (tracked in #179): TIMESTAMPTZ bounds, encrypted (PME)
 //! catalogs, compaction rewrites, schema evolution between snapshots.
@@ -77,18 +80,20 @@ struct CanonRow {
     cells: Vec<String>,
 }
 
-/// One engine's canonicalized feed output: sorted rows + the residual
-/// (non-CDC) column names in their original order.
+/// One engine's canonicalized feed output: sorted rows, the full column-name
+/// list in output order, and the residual (non-CDC) column names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CanonFeed {
+    all_columns: Vec<String>,
     table_columns: Vec<String>,
     rows: Vec<CanonRow>,
 }
 
 impl CanonFeed {
-    fn new(table_columns: Vec<String>, mut rows: Vec<CanonRow>) -> Self {
+    fn new(all_columns: Vec<String>, table_columns: Vec<String>, mut rows: Vec<CanonRow>) -> Self {
         rows.sort();
         Self {
+            all_columns,
             table_columns,
             rows,
         }
@@ -267,10 +272,11 @@ fn official_feed(
     }
     if rows.is_empty() {
         // No rows to derive residual names from; leave empty (callers skip the
-        // name assertion for empty feeds).
+        // name assertions for empty feeds).
         table_columns.clear();
+        return Ok(CanonFeed::new(Vec::new(), table_columns, rows));
     }
-    Ok(CanonFeed::new(table_columns, rows))
+    Ok(CanonFeed::new(names, table_columns, rows))
 }
 
 /// Run `sql` through the crate (DataFusion) and canonicalize.
@@ -282,6 +288,7 @@ async fn crate_feed(
     let batches = ctx.sql(sql).await?.collect().await?;
     let mut rows = Vec::new();
     let mut table_columns = Vec::new();
+    let mut all_columns = Vec::new();
     for batch in &batches {
         let names: Vec<String> = batch
             .schema()
@@ -297,8 +304,12 @@ async fn crate_feed(
             table_columns = cols;
             rows.push(row);
         }
+        all_columns = names;
     }
-    Ok(CanonFeed::new(table_columns, rows))
+    if rows.is_empty() {
+        all_columns.clear();
+    }
+    Ok(CanonFeed::new(all_columns, table_columns, rows))
 }
 
 async fn crate_context(path: &Path) -> DataFusionResult<SessionContext> {
@@ -423,9 +434,20 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
         )
         .await?;
 
+        // Column placement is converged for table_changes: the crate's
+        // `SELECT *` column list must be positionally IDENTICAL to official's
+        // (snapshot_id, rowid, change_type, table columns).
+        if !official_changes.all_columns.is_empty() && !crate_changes.all_columns.is_empty() {
+            assert_eq!(
+                official_changes.all_columns, crate_changes.all_columns,
+                "table_changes window [{a},{b}]: full column list diverges from official"
+            );
+        }
+
         // NORMALIZER-DELETE-ROUTING (half 1): the crate's table_changes must
         // match official's minus its pure-delete rows.
         let official_nondelete = CanonFeed::new(
+            official_changes.all_columns.clone(),
             official_changes.table_columns.clone(),
             official_changes
                 .rows
@@ -440,6 +462,18 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
             &crate_changes,
         );
 
+        // NORMALIZER-DELETIONS-CHANGE-TYPE: the crate's deletions column list
+        // must be official's `(snapshot_id, rowid, <table cols>)` with the
+        // crate's constant change_type column inserted after rowid.
+        if !official_deletions.all_columns.is_empty() && !crate_deletions.all_columns.is_empty() {
+            let mut expected = official_deletions.all_columns.clone();
+            expected.insert(2, "change_type".to_string());
+            assert_eq!(
+                expected, crate_deletions.all_columns,
+                "table_deletions window [{a},{b}]: column list diverges from official + change_type"
+            );
+        }
+
         // NORMALIZER-DELETE-ROUTING (half 2): the crate's table_deletions must
         // match official's ducklake_table_deletions (all deleted rows, update
         // preimages included). The crate adds a constant change_type='delete'
@@ -452,6 +486,7 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
             );
         }
         let crate_deletions_stripped = CanonFeed::new(
+            official_deletions.all_columns.clone(),
             crate_deletions.table_columns.clone(),
             crate_deletions
                 .rows

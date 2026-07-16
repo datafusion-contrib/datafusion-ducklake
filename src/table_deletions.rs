@@ -71,7 +71,7 @@ pub struct TableDeletionsTable {
     table_path: String,
     /// Original table schema (without CDC columns)
     table_schema: SchemaRef,
-    /// Combined schema: table columns + rowid + snapshot_id + change_type
+    /// Combined schema: snapshot_id + rowid + change_type + table columns
     output_schema: SchemaRef,
 }
 
@@ -85,19 +85,17 @@ impl TableDeletionsTable {
         table_path: String,
         table_schema: SchemaRef,
     ) -> Self {
-        // Build output schema: table columns + CDC metadata columns
-        // (rowid, snapshot_id, change_type), in that order.
-        let mut fields: Vec<Field> = table_schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
+        // Build output schema: CDC metadata columns leading — (snapshot_id,
+        // rowid, change_type), matching ducklake_table_changes and official
+        // DuckLake's column order — then the table columns.
+        let mut fields: Vec<Field> = Vec::with_capacity(table_schema.fields().len() + 3);
+        fields.push(Field::new("snapshot_id", DataType::Int64, false));
         // rowid is nullable for symmetry with ducklake_table_changes (where it is
         // NULL on encrypted tables); the deletions path always synthesizes a
         // non-null value for the cases it supports.
         fields.push(Field::new("rowid", DataType::Int64, true));
-        fields.push(Field::new("snapshot_id", DataType::Int64, false));
         fields.push(Field::new("change_type", DataType::Utf8, false));
+        fields.extend(table_schema.fields().iter().map(|f| f.as_ref().clone()));
         let output_schema = Arc::new(Schema::new(fields));
 
         Self {
@@ -338,13 +336,12 @@ impl TableProvider for TableDeletionsTable {
             return Ok(Arc::new(EmptyExec::new(output_schema)));
         }
 
-        // Does the caller actually want `rowid`? It follows the table columns in
-        // the output schema. When it is projected away we skip resolving it (no
+        // Does the caller actually want `rowid`? It sits at index 1 among the
+        // leading CDC columns. When it is projected away we skip resolving it (no
         // footer probe, no synthesis), so a query like `SELECT id, change_type
         // FROM ducklake_table_deletions(...)` never fails on a file whose rowid
         // cannot be synthesized (no embedded rowid and a NULL row_id_start).
-        let rowid_idx = self.table_schema.fields().len();
-        let need_rowid = projection.is_none_or(|indices| indices.contains(&rowid_idx));
+        let need_rowid = projection.is_none_or(|indices| indices.contains(&1));
 
         // Build execution plan for each delete entry
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len());
@@ -362,7 +359,7 @@ impl TableProvider for TableDeletionsTable {
             UnionExec::try_new(execs)?
         };
 
-        // The exec emits the full `[table cols, rowid, snapshot_id, change_type]`
+        // The exec emits the full `[snapshot_id, rowid, change_type, table cols]`
         // schema; honor the requested projection with a ProjectionExec on top.
         match projection {
             None => Ok(full),
@@ -416,7 +413,7 @@ pub struct DeletedRowsExec {
     /// emitted as a placeholder (dropped by the projection above) and neither an
     /// embedded rowid nor a row_id_start is required.
     need_rowid: bool,
-    /// Output schema (table columns + rowid + snapshot_id + change_type)
+    /// Output schema (snapshot_id + rowid + change_type + table columns)
     output_schema: SchemaRef,
     /// Cached plan properties
     properties: Arc<PlanProperties>,
@@ -776,24 +773,24 @@ impl DeletedRowsStream {
             return Ok(None);
         }
 
-        // Select the deleted rows' TABLE columns (excluding the embedded rowid
-        // helper column, if the scan read one), then append the CDC columns.
+        // Emit the CDC columns first — snapshot_id, rowid, change_type, the
+        // official order — then the deleted rows' TABLE columns (excluding the
+        // embedded rowid helper column, if the scan read one).
         let indices = UInt32Array::from(keep_indices.clone());
+        let num_output_rows = keep_indices.len();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.table_len + 3);
+        columns.push(Arc::new(Int64Array::from(vec![
+            self.snapshot_id;
+            num_output_rows
+        ])));
+        columns.push(Arc::new(Int64Array::from(rowids)));
+        columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
+
         for col in batch.columns().iter().take(self.table_len) {
             let filtered = take(col.as_ref(), &indices, None)
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             columns.push(filtered);
         }
-
-        // Append CDC columns: rowid, snapshot_id, change_type.
-        let num_output_rows = keep_indices.len();
-        columns.push(Arc::new(Int64Array::from(rowids)));
-        columns.push(Arc::new(Int64Array::from(vec![
-            self.snapshot_id;
-            num_output_rows
-        ])));
-        columns.push(Arc::new(StringArray::from(vec!["delete"; num_output_rows])));
 
         RecordBatch::try_new(self.output_schema.clone(), columns)
             .map(Some)
