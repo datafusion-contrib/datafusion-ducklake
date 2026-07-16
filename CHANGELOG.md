@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Differential CDC conformance suite: runs official DuckDB `ducklake_table_changes` /
+  `ducklake_table_deletions` and this crate's feeds on identical catalogs and diffs
+  the results, with explicit normalizers for the documented surface differences (#179).
+
+### Fixed
+- DuckDB backend: `ducklake_table_deletions` treated the start snapshot as inclusive
+  (`BETWEEN`) while the insert feed treated it as exclusive, so deletions committed
+  exactly at a window's start snapshot were reported again in the next window.
+  Both positional and full-file delete lookups now follow the documented
+  `(start, end]` contract, matching the SQLite/PostgreSQL/MySQL backends (#179).
+
 ## [0.5.0] - 2026-07-15
 
 ### Added
