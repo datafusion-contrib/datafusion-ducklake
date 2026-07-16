@@ -146,10 +146,13 @@ mod integration_tests {
 
         let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
 
-        // Query all columns including table data + CDC metadata
+        // Query all columns including table data + CDC metadata; the fixture's
+        // final snapshot also deletes id=2, so filter to the insert rows.
         let df = ctx
             .sql(
-                "SELECT id, event_type, value, snapshot_id, change_type FROM ducklake_table_changes('main.events', 0, 10) ORDER BY id",
+                "SELECT id, event_type, value, snapshot_id, change_type \
+                 FROM ducklake_table_changes('main.events', 0, 10) \
+                 WHERE change_type = 'insert' ORDER BY id",
             )
             .await?;
 
@@ -170,22 +173,17 @@ mod integration_tests {
         // All rows should have ids 1-5
         assert_eq!(all_ids, vec![1, 2, 3, 4, 5], "Should have ids 1-5");
 
-        // All changes should be inserts (Phase 2 INSERT-only)
         for change_type in all_change_types {
-            assert_eq!(
-                change_type, "insert",
-                "All changes should be 'insert' in Phase 2"
-            );
+            assert_eq!(change_type, "insert", "filtered to insert rows");
         }
 
         Ok(())
     }
 
-    /// Test that ducklake_table_changes returns delete changes (delete files added)
+    /// Test that ducklake_table_changes returns pure deletes as `delete` rows
+    /// carrying the deleted rows' old values, matching official DuckLake.
     ///
-    /// NOTE: DELETE changes are NOT supported in Phase 2 INSERT-only.
-    /// This test verifies that no delete changes are returned (expected behavior for this phase).
-    /// Future phases will add DELETE support.
+    /// The fixture deletes the row with id=2 ('view', 50) in its final snapshot.
     #[tokio::test]
     async fn test_table_changes_deletes() -> DataFusionResult<()> {
         let temp_dir = TempDir::new().unwrap();
@@ -196,20 +194,25 @@ mod integration_tests {
 
         let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
 
-        // Query only delete changes - in Phase 2, there should be none
         let df = ctx
-            .sql("SELECT snapshot_id, change_type FROM ducklake_table_changes('main.events', 0, 100) WHERE change_type = 'delete'")
+            .sql(
+                "SELECT id, event_type, value FROM \
+                 ducklake_table_changes('main.events', 0, 100) \
+                 WHERE change_type = 'delete'",
+            )
             .await?;
 
         let batches: Vec<RecordBatch> = df.collect().await?;
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "exactly the one deleted row surfaces");
 
-        // Phase 2 INSERT-only: no delete changes expected
-        assert_eq!(
-            total_rows, 0,
-            "Phase 2 INSERT-only: no delete changes expected, got {}",
-            total_rows
-        );
+        let b = batches.iter().find(|b| b.num_rows() > 0).unwrap();
+        let ids = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(ids.value(0), 2, "the delete carries the old row's values");
 
         Ok(())
     }

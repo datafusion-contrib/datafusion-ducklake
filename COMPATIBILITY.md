@@ -189,11 +189,15 @@ Known edges:
   with a conflict** (the compare-and-swap that also guards genuine concurrency — it is what
   prevents a stale rewrite from resurrecting superseded rows). Re-open the catalog (or create
   a fresh `SessionContext`) between mutating statements so it binds to the latest snapshot.
-- **`UPDATE` change-feed correlation is not available on encrypted (PME) catalogs.**
-  `ducklake_table_changes` still works on encrypted catalogs, but a range containing an
-  `UPDATE` surfaces its rewritten rows as plain `insert`s rather than being correlated into
-  `update_preimage`/`update_postimage` (the correlation reads parquet footers/rows the
-  change-feed path does not decrypt). Non-encrypted catalogs correlate normally.
+- **The change feed is degraded on encrypted (PME) catalogs.**
+  `ducklake_table_changes` still works on encrypted catalogs for inserted rows, but a
+  range containing an `UPDATE` surfaces its rewritten rows as plain `insert`s rather
+  than being correlated into `update_preimage`/`update_postimage`, and `delete` rows
+  are missing entirely (the correlated path reads parquet footers/rows the change-feed
+  path does not decrypt). A window whose only changes are deletes carries no data file
+  to detect encryption from, so it fails at read time on an encrypted catalog rather
+  than returning wrong results. Non-encrypted catalogs emit the full official
+  change-set (inserts, deletes, update pre/postimages).
 - **No partition-based file pruning** on read.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).

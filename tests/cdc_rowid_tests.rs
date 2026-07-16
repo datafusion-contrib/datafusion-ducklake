@@ -358,8 +358,8 @@ async fn changes_without_rowid_projection_still_correlates() -> DataFusionResult
 
 /// With rowid projected over a range that has plain inserts AND a pure delete
 /// (no UPDATE / embedded rowid), the changes feed returns the inserts with
-/// correct rowids and drops the pure delete — no postimage exists, so the delete
-/// side is skipped entirely rather than scanned.
+/// correct rowids and the pure delete as a `delete` row that preserves the
+/// rowid the row was inserted with (matching official DuckLake).
 #[tokio::test]
 async fn changes_with_rowid_plain_inserts_and_pure_delete() -> DataFusionResult<()> {
     let tmp = TempDir::new().unwrap();
@@ -375,14 +375,72 @@ async fn changes_with_rowid_plain_inserts_and_pure_delete() -> DataFusionResult<
     let ctx = ctx_for(path.to_str().unwrap()).await?;
     let mut r = rows(
         &ctx,
-        "SELECT id, rowid, change_type FROM ducklake_table_changes('main.t', 0, 1000) ORDER BY rowid",
+        "SELECT id, rowid, change_type FROM ducklake_table_changes('main.t', 0, 1000) \
+         ORDER BY rowid, change_type",
     )
     .await?;
-    r.sort_by_key(|x| x.1);
-    // The three inserted rows with rowids 0,1,2; the pure delete is dropped.
+    r.sort();
+    // The three inserted rows with rowids 0,1,2; the pure delete surfaces with
+    // the same rowid (1) its row was inserted with.
     assert_eq!(
         r,
-        vec![(10, 0, "insert".into()), (20, 1, "insert".into()), (30, 2, "insert".into()),]
+        vec![
+            (10, 0, "insert".into()),
+            (20, 1, "delete".into()),
+            (20, 1, "insert".into()),
+            (30, 2, "insert".into()),
+        ]
+    );
+    Ok(())
+}
+
+/// A non-rowid projection over a delete-only window must succeed even when the
+/// delete's source file has a NULL `row_id_start` (older/foreign catalogs):
+/// with rowid neither output nor pairable (no postimage in range), no rowid is
+/// synthesized — mirroring `ducklake_table_deletions`. Projecting rowid over
+/// the same window still fails, since a real value would be required.
+#[tokio::test]
+async fn pure_delete_without_row_id_start_non_rowid_projection() -> DataFusionResult<()> {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("chg_norowidstart.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (10,'a'),(20,'b');",
+            "DELETE FROM c.t WHERE id = 20;",
+        ],
+    )?;
+    // Simulate an older/foreign catalog that never recorded row_id_start.
+    {
+        let conn = duckdb::Connection::open(&path).map_err(box_err)?;
+        conn.execute("UPDATE ducklake_data_file SET row_id_start = NULL;", [])
+            .map_err(box_err)?;
+    }
+    let ctx = ctx_for(path.to_str().unwrap()).await?;
+
+    // Without rowid: the delete surfaces, no synthesis needed.
+    let batches = ctx
+        .sql(
+            "SELECT id, change_type FROM ducklake_table_changes('main.t', 0, 1000) \
+             WHERE change_type = 'delete'",
+        )
+        .await?
+        .collect()
+        .await?;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "the pure delete surfaces without rowid synthesis");
+
+    // With rowid projected: synthesis is required and must fail loudly rather
+    // than emitting wrong ids.
+    let err = ctx
+        .sql("SELECT rowid, change_type FROM ducklake_table_changes('main.t', 0, 1000)")
+        .await?
+        .collect()
+        .await;
+    assert!(
+        err.is_err(),
+        "rowid projection must error when it cannot be synthesized"
     );
     Ok(())
 }

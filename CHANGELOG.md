@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata columns `(snapshot_id, rowid, change_type)` lead, followed by the table
   columns. Previously they trailed. Queries selecting columns by name are unaffected;
   `SELECT *` consumers and positional readers must adjust (#179).
+- **BREAKING**: `ducklake_table_changes` now emits pure deletes as
+  `change_type='delete'` rows carrying the deleted rows' old values, matching official
+  DuckLake. Previously they were omitted (available only via `ducklake_table_deletions`,
+  which is unchanged). Consumers reading both feeds should de-duplicate deletions or
+  switch to a single feed (#179).
 
 ### Added
 - Differential CDC conformance suite: runs official DuckDB `ducklake_table_changes` /

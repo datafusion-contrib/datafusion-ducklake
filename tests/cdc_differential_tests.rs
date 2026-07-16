@@ -11,12 +11,6 @@
 //! ratchet: when the crate converges on the official behavior, delete the
 //! normalizer and the diff tightens automatically.
 //!
-//! * NORMALIZER-DELETE-ROUTING — official `table_changes` emits pure deletes
-//!   as `change_type='delete'`; the crate routes them to
-//!   `ducklake_table_deletions`. We therefore assert the full change-set in
-//!   two halves: crate `table_changes` == official `table_changes` minus its
-//!   'delete' rows, and crate `table_deletions` == official
-//!   `ducklake_table_deletions` (all deleted rows, update preimages included).
 //! * NORMALIZER-DELETIONS-CHANGE-TYPE — the crate's `ducklake_table_deletions`
 //!   materializes a constant `change_type='delete'` column that official's
 //!   function does not have (official also exposes rowid/snapshot_id as
@@ -444,21 +438,11 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
             );
         }
 
-        // NORMALIZER-DELETE-ROUTING (half 1): the crate's table_changes must
-        // match official's minus its pure-delete rows.
-        let official_nondelete = CanonFeed::new(
-            official_changes.all_columns.clone(),
-            official_changes.table_columns.clone(),
-            official_changes
-                .rows
-                .iter()
-                .filter(|r| r.change_type.as_deref() != Some("delete"))
-                .cloned()
-                .collect(),
-        );
+        // The crate's table_changes must match official's VERBATIM — inserts,
+        // update pre/postimages, and pure deletes included.
         assert_feeds_match(
             &format!("table_changes window [{a},{b}]"),
-            &official_nondelete,
+            &official_changes,
             &crate_changes,
         );
 

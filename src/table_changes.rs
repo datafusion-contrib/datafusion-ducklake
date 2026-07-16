@@ -1,7 +1,9 @@
 //! Table changes (CDC) functionality for DuckLake
 //!
 //! This module provides the `ducklake_table_changes()` table function that returns
-//! actual row data from Parquet files with additional CDC metadata columns.
+//! actual row data from Parquet files with additional CDC metadata columns —
+//! inserts, deletes (with the deleted rows' old values), and UPDATEs correlated
+//! into `update_preimage`/`update_postimage` pairs, matching official DuckLake.
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
@@ -737,14 +739,14 @@ impl TableChangesTable {
 
     /// Build the correlated change feed: pair a same-snapshot delete + insert
     /// that share a rowid into `update_preimage` (old) + `update_postimage`
-    /// (new); surface unmatched inserts as `insert`; and DROP unmatched deletes
-    /// (pure deletes stay out of `ducklake_table_changes`, matching its historical
-    /// insert-oriented behaviour — they remain available via
-    /// `ducklake_table_deletions`).
+    /// (new); surface unmatched inserts as `insert` and unmatched deletes as
+    /// `delete` (carrying the deleted rows' old values), matching official
+    /// DuckLake's `ducklake_table_changes`.
     async fn build_correlated_changes(
         &self,
         state: &dyn Session,
         data_files: &[DataFileChange],
+        delete_files: &[crate::metadata_provider::DeleteFileChange],
         embedded_names: &[Option<String>],
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -773,26 +775,12 @@ impl TableChangesTable {
             });
         }
 
-        // Deletes only matter here as the delete half of an UPDATE, paired with a
-        // postimage — which requires an added file carrying an embedded rowid.
-        // With no embedded file there are no postimages, so every delete in range
-        // is a pure delete (dropped from ducklake_table_changes). Skip fetching
-        // and scanning the delete side entirely: it is cheaper, and it avoids
-        // failing on a delete source (encrypted, NULL row_id_start, unreadable)
-        // whose rows can't affect this insert-only output.
-        let any_embedded = embedded_names.iter().any(|n| n.is_some());
-        let delete_units = if any_embedded {
-            let delete_files = self
-                .provider
-                .get_delete_files_added_between_snapshots(
-                    self.table_id,
-                    self.start_snapshot,
-                    self.end_snapshot,
-                )
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
+        // Every delete in range is read: unmatched ones surface as `delete`
+        // rows, and those sharing a (snapshot_id, rowid) with an embedded-rowid
+        // insert pair into update preimages.
+        let delete_units = {
             let mut delete_units = Vec::with_capacity(delete_files.len());
-            for dfc in &delete_files {
+            for dfc in delete_files {
                 validated_record_count(dfc.data_record_count, &dfc.data_file_path)?;
                 let resolved = resolve_path(
                     &self.table_path,
@@ -842,8 +830,6 @@ impl TableChangesTable {
                 });
             }
             delete_units
-        } else {
-            Vec::new()
         };
 
         let full: Arc<dyn ExecutionPlan> = Arc::new(TableChangesExec::new(
@@ -907,30 +893,41 @@ impl TableProvider for TableChangesTable {
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        // Deletes applied in the window surface as `delete` rows (and pair into
+        // update preimages), so they participate in both the empty check and
+        // the path decision — a delete-only window is NOT empty.
+        let delete_files = self
+            .provider
+            .get_delete_files_added_between_snapshots(
+                self.table_id,
+                self.start_snapshot,
+                self.end_snapshot,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         // Handle empty case
-        if data_files.is_empty() {
+        if data_files.is_empty() && delete_files.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
 
-        // Decide whether to take the correlated path (pairing an UPDATE's
-        // delete+insert into preimage/postimage). Two guards, BOTH cheap and
-        // metadata-only, keep the common cases off the expensive/unsafe footer
-        // probing that the correlated path needs:
+        // Decide whether to take the correlated path (reading delete sources to
+        // emit `delete` rows and pair an UPDATE's delete+insert into
+        // preimage/postimage). Guards, all cheap and metadata-only:
         //
-        //  1. Deletes-present: an UPDATE (or compaction) ALWAYS adds a positional
-        //     delete, so a range with no added delete files cannot contain an
-        //     UPDATE — there is nothing to correlate. Skipping detection here
-        //     means a plain-INSERT catalog does ZERO per-file parquet footer
-        //     reads at plan time (previously it probed every added file).
+        //  1. Deletes-present OR rowid-requested: with neither, the window is
+        //     plain inserts and needs no correlation — a plain-INSERT catalog
+        //     does ZERO per-file parquet footer reads at plan time.
         //  2. Not encrypted: the correlated path reads parquet footers (to detect
         //     the embedded-rowid postimage) and the source rows of deletes, none
         //     of which it can decrypt (the delete-side change record carries no
-        //     key). On a PME catalog we therefore stay on the historical
-        //     insert-only path below — which IS encryption-aware — so CDC never
-        //     fails; the tradeoff is that UPDATEs are not correlated into
-        //     preimage/postimage there (they surface as plain inserts). See
-        //     COMPATIBILITY.md.
+        //     key). On a PME catalog we therefore stay on the insert-only path
+        //     below — which IS encryption-aware — so CDC over inserts never
+        //     fails; the tradeoff is that UPDATEs surface as plain inserts and
+        //     pure deletes are missing there. See COMPATIBILITY.md. (A
+        //     delete-only window carries no data file to detect encryption
+        //     from, so on an encrypted catalog it fails at read rather than
+        //     returning wrong results.)
         let any_encrypted = {
             #[cfg(feature = "encryption")]
             {
@@ -942,13 +939,7 @@ impl TableProvider for TableChangesTable {
             }
         };
 
-        // rowid output requires the correlated (collect-based) path: it derives a
-        // stable per-row rowid — the embedded ROW_ID for UPDATE / compaction
-        // postimages, else `row_id_start + physical position` for plain inserts.
-        // That path reads parquet footers and cannot decrypt, so on encrypted
-        // (PME) catalogs we fall through to the encryption-aware insert-only path
-        // below, which emits rowid as NULL rather than failing the read.
-        if proj_info.need_rowid && !any_encrypted {
+        if (proj_info.need_rowid || !delete_files.is_empty()) && !any_encrypted {
             let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
                 embedded_names.push(
@@ -961,38 +952,14 @@ impl TableProvider for TableChangesTable {
                 );
             }
             return self
-                .build_correlated_changes(state, &data_files, &embedded_names, projection)
+                .build_correlated_changes(
+                    state,
+                    &data_files,
+                    &delete_files,
+                    &embedded_names,
+                    projection,
+                )
                 .await;
-        }
-
-        let range_has_deletes = !self
-            .provider
-            .get_delete_files_added_between_snapshots(
-                self.table_id,
-                self.start_snapshot,
-                self.end_snapshot,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .is_empty();
-
-        if range_has_deletes && !any_encrypted {
-            // Detect which added data files carry an embedded rowid column (the
-            // postimages of an UPDATE / compaction). Only probe footers now that
-            // we know a delete exists and the files are readable un-decrypted.
-            let mut embedded_names: Vec<Option<String>> = Vec::with_capacity(data_files.len());
-            let mut any_embedded = false;
-            for data_file in &data_files {
-                let name = self
-                    .detect_embedded_rowid_name(state, &data_file.path, data_file.path_is_relative)
-                    .await?;
-                any_embedded |= name.is_some();
-                embedded_names.push(name);
-            }
-            if any_embedded {
-                return self
-                    .build_correlated_changes(state, &data_files, &embedded_names, projection)
-                    .await;
-            }
         }
 
         // Build encryption factory from file encryption keys (when encryption feature is enabled)
@@ -1336,7 +1303,14 @@ async fn correlate_changes(
 
     // Deleted rows: the positions newly masked at this snapshot, with each row's
     // rowid (embedded column when the source file has one, else row_id_start +
-    // physical position).
+    // physical position). The rowid is required only when it is output
+    // (`need_rowid`) or when an update pair is possible (some postimage exists
+    // to correlate against); with neither, every delete is a pure delete and
+    // its rowid a placeholder — so a non-rowid projection over a delete-only
+    // window never fails on a source file whose rowid cannot be synthesized
+    // (no embedded rowid and a NULL row_id_start), mirroring
+    // `ducklake_table_deletions`.
+    let preimage_rowids_required = need_rowid || !postimages.is_empty();
     let mut preimages: Vec<KeyedRows> = Vec::new();
     for unit in &delete_units {
         let current = collect_delete_positions(&unit.current_delete_scan, context.clone()).await?;
@@ -1379,8 +1353,9 @@ async fn correlate_changes(
             };
 
             // With no embedded rowid, deleted rowids are row_id_start + position;
-            // require row_id_start in that case rather than emitting wrong ids.
-            let synth_start: Option<i64> = if embedded.is_none() {
+            // require row_id_start in that case rather than emitting wrong ids —
+            // but only when the rowid is actually consumed (output or pairing).
+            let synth_start: Option<i64> = if embedded.is_none() && preimage_rowids_required {
                 Some(unit.row_id_start.ok_or_else(|| {
                     DataFusionError::Internal(
                         "cannot synthesize deleted rowid: source file has neither an embedded \
@@ -1401,8 +1376,9 @@ async fn correlate_changes(
                     rowids.push(match (embedded, synth_start) {
                         (Some(arr), _) => arr.value(i),
                         (None, Some(start)) => start + p,
-                        // synth_start is Some whenever embedded is None (above).
-                        (None, None) => unreachable!("row_id_start resolved above"),
+                        // Unneeded rowid (not output, nothing to pair with):
+                        // a placeholder that update_keys can never contain.
+                        (None, None) => 0,
                     });
                 }
             }
@@ -1478,12 +1454,21 @@ async fn correlate_changes(
         }
     }
     for k in &preimages {
-        // Only rows paired with an insert are surfaced (as preimages); pure
-        // deletes stay out of the changes feed.
+        // Rows paired with an insert surface as update preimages; the rest are
+        // pure deletes, emitted as `delete` rows carrying the old values
+        // (matching official DuckLake's table_changes).
         if let Some(b) = filter_and_tag(
             k,
             &key_mask(k, &update_keys, true),
             ChangeType::UpdatePreimage,
+            &output_schema,
+        )? {
+            out.push(b);
+        }
+        if let Some(b) = filter_and_tag(
+            k,
+            &key_mask(k, &update_keys, false),
+            ChangeType::Delete,
             &output_schema,
         )? {
             out.push(b);
