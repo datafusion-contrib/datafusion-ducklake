@@ -1121,7 +1121,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     data.row_id_start
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = ?
-                  AND data.begin_snapshot > ?
+                  AND data.begin_snapshot >= ?
                   AND data.begin_snapshot <= ?
                 ORDER BY data.begin_snapshot",
             )
@@ -1201,7 +1201,7 @@ SELECT
 FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
 WHERE cd.table_id = ?
-  AND cd.begin_snapshot > ?
+  AND cd.begin_snapshot >= ?
   AND cd.begin_snapshot <= ?
   AND data.table_id = ?
 
@@ -1247,7 +1247,7 @@ SELECT
     data.end_snapshot AS snapshot_id
 FROM ducklake_data_file data
 WHERE data.table_id = ?
-  AND data.end_snapshot > ?
+  AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
 "#,
             )

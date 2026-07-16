@@ -115,7 +115,7 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
         data.row_id_start
     FROM ducklake_data_file AS data
     WHERE data.table_id = ?
-      AND data.begin_snapshot > ?
+      AND data.begin_snapshot >= ?
       AND data.begin_snapshot <= ?
     ORDER BY data.begin_snapshot";
 
@@ -139,7 +139,7 @@ current_delete AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
-      AND df.begin_snapshot > p.start_snapshot
+      AND df.begin_snapshot >= p.start_snapshot
       AND df.begin_snapshot <= p.finish_snapshot
 ),
 
@@ -224,7 +224,7 @@ LEFT JOIN LATERAL (
 ) pd ON true
 CROSS JOIN params p
 WHERE data.table_id = p.table_identifier
-  AND data.end_snapshot > p.start_snapshot
+  AND data.end_snapshot >= p.start_snapshot
   AND data.end_snapshot <= p.finish_snapshot;
 ";
 
@@ -870,8 +870,8 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     // Change tracking methods for table_changes (CDC) functionality
 
-    /// Get data files added between two snapshots (exclusive start, inclusive end)
-    /// Returns files where begin_snapshot > start_snapshot AND begin_snapshot <= end_snapshot
+    /// Get data files added between two snapshots (inclusive on both ends, matching official DuckLake)
+    /// Returns files where begin_snapshot >= start_snapshot AND begin_snapshot <= end_snapshot
     /// These represent INSERT changes - new rows added to the table
     fn get_data_files_added_between_snapshots(
         &self,
@@ -880,8 +880,8 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>>;
 
-    /// Get delete files added between two snapshots (exclusive start, inclusive end)
-    /// Returns delete files where begin_snapshot > start_snapshot AND begin_snapshot <= end_snapshot
+    /// Get delete files added between two snapshots (inclusive on both ends, matching official DuckLake)
+    /// Returns delete files where begin_snapshot >= start_snapshot AND begin_snapshot <= end_snapshot
     /// These represent DELETE changes - rows removed from the table
     fn get_delete_files_added_between_snapshots(
         &self,

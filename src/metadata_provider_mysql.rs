@@ -867,7 +867,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     data.row_id_start
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = ?
-                  AND data.begin_snapshot > ?
+                  AND data.begin_snapshot >= ?
                   AND data.begin_snapshot <= ?
                 ORDER BY data.begin_snapshot",
             )
@@ -915,7 +915,7 @@ WITH current_delete AS (
         ddf.encryption_key
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = ?
-      AND ddf.begin_snapshot > ?
+      AND ddf.begin_snapshot >= ?
       AND ddf.begin_snapshot <= ?
 ),
 
@@ -994,7 +994,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) prev ON true
 WHERE data.table_id = ?
-  AND data.end_snapshot > ?
+  AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
 "#,
             )

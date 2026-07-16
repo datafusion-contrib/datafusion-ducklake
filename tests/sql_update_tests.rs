@@ -354,10 +354,12 @@ async fn update_change_feed_emits_preimage_and_postimage() {
 
     // The change feed over the update snapshot pairs the delete + insert that
     // share rowid 1 into update_preimage (old) + update_postimage (new).
+    // Bounds are inclusive: start at the first post-`before` snapshot.
+    let start = before + 1;
     let fctx = functions_ctx(&temp_dir).await;
     let sql = format!(
         "SELECT id, val, change_type \
-         FROM ducklake_table_changes('main.t', {before}, {after}) \
+         FROM ducklake_table_changes('main.t', {start}, {after}) \
          ORDER BY change_type, id"
     );
     let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();
@@ -411,10 +413,12 @@ async fn update_change_feed_ignores_unrelated_inserts() {
 
     // Exactly one preimage + one postimage for the single updated row; no
     // spurious plain insert/delete rows.
+    // Bounds are inclusive: start at the first post-`before` snapshot.
+    let start = before + 1;
     let fctx = functions_ctx(&temp_dir).await;
     let sql = format!(
         "SELECT change_type, COUNT(*) AS n \
-         FROM ducklake_table_changes('main.t', {before}, {after}) \
+         FROM ducklake_table_changes('main.t', {start}, {after}) \
          GROUP BY change_type ORDER BY change_type"
     );
     let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();
@@ -516,9 +520,11 @@ async fn update_change_feed_mixed_insert_and_update() {
     .await;
     let after = max_snapshot(&temp_dir).await;
 
+    // Bounds are inclusive: start at the first post-`before` snapshot.
+    let start = before + 1;
     let fctx = functions_ctx(&temp_dir).await;
     let sql = format!(
-        "SELECT id, val, change_type FROM ducklake_table_changes('main.t', {before}, {after}) \
+        "SELECT id, val, change_type FROM ducklake_table_changes('main.t', {start}, {after}) \
          ORDER BY change_type, id"
     );
     let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();
@@ -567,9 +573,11 @@ async fn change_feed_insert_only_range_is_all_inserts() {
     .await;
     let after = max_snapshot(&temp_dir).await;
 
+    // Bounds are inclusive: start at the first post-`before` snapshot.
+    let start = before + 1;
     let fctx = functions_ctx(&temp_dir).await;
     let sql = format!(
-        "SELECT change_type, COUNT(*) AS n FROM ducklake_table_changes('main.t', {before}, {after}) \
+        "SELECT change_type, COUNT(*) AS n FROM ducklake_table_changes('main.t', {start}, {after}) \
          GROUP BY change_type ORDER BY change_type"
     );
     let batches = fctx.sql(&sql).await.unwrap().collect().await.unwrap();

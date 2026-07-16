@@ -1010,7 +1010,7 @@ impl MetadataProvider for MulticatalogProvider {
                     data.row_id_start
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = $1
-                  AND data.begin_snapshot > $2
+                  AND data.begin_snapshot >= $2
                   AND data.begin_snapshot <= $3
                 ORDER BY data.begin_snapshot",
             )
@@ -1058,7 +1058,7 @@ WITH current_delete AS (
         ddf.encryption_key
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
-      AND ddf.begin_snapshot > $2
+      AND ddf.begin_snapshot >= $2
       AND ddf.begin_snapshot <= $3
 ),
 data_files AS (
@@ -1102,7 +1102,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) prev ON true
 WHERE data.table_id = $1
-  AND data.end_snapshot > $2
+  AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
 "#,
             )

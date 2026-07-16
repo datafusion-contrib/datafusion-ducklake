@@ -11,9 +11,6 @@
 //! ratchet: when the crate converges on the official behavior, delete the
 //! normalizer and the diff tightens automatically.
 //!
-//! * NORMALIZER-BOUNDS — official snapshot bounds are inclusive on both ends;
-//!   the crate's are exclusive-start / inclusive-end. Official `[a, b]` is
-//!   queried on the crate as `(a-1, b]`.
 //! * NORMALIZER-DELETE-ROUTING — official `table_changes` emits pure deletes
 //!   as `change_type='delete'`; the crate routes them to
 //!   `ducklake_table_deletions`. We therefore assert the full change-set in
@@ -412,17 +409,16 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
 
     let ctx = crate_context(&path).await?;
     for ((a, b), official_changes, official_deletions) in official {
-        // NORMALIZER-BOUNDS: official [a, b] == crate (a-1, b].
-        let (ca, cb) = (a - 1, b);
+        // Bounds are inclusive on both ends, matching official DuckLake.
         let crate_changes = crate_feed(
             &ctx,
-            &format!("SELECT * FROM ducklake_table_changes('main.{table}', {ca}, {cb})"),
+            &format!("SELECT * FROM ducklake_table_changes('main.{table}', {a}, {b})"),
             true,
         )
         .await?;
         let crate_deletions = crate_feed(
             &ctx,
-            &format!("SELECT * FROM ducklake_table_deletions('main.{table}', {ca}, {cb})"),
+            &format!("SELECT * FROM ducklake_table_deletions('main.{table}', {a}, {b})"),
             true,
         )
         .await?;
