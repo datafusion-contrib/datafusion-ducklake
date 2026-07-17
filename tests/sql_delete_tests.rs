@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, UInt64Array};
+use arrow::array::{Array, Int32Array, Int64Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
@@ -87,6 +87,41 @@ async fn read_ids(temp: &TempDir) -> Vec<i32> {
     ids
 }
 
+/// Read `(rowid, id)` through a freshly-opened row-lineage catalog.
+async fn read_rowid_ids(temp: &TempDir) -> Vec<(i64, i32)> {
+    let conn = format!("sqlite:{}", temp.path().join("test.db").display());
+    let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider)
+        .unwrap()
+        .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT rowid, id FROM ducklake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let rowids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((rowids.value(i), ids.value(i)));
+        }
+    }
+    rows
+}
+
 /// Number of snapshots in the catalog (to assert a multi-file DELETE commits in
 /// exactly ONE new snapshot).
 async fn snapshot_count(temp: &TempDir) -> i64 {
@@ -98,10 +133,10 @@ async fn snapshot_count(temp: &TempDir) -> i64 {
         .unwrap()
 }
 
-/// Run a DELETE statement and return the reported rows-affected count.
-async fn run_delete(ctx: &SessionContext, sql: &str) -> u64 {
+/// Run a DML statement and return the reported rows-affected count.
+async fn run_dml_count(ctx: &SessionContext, sql: &str) -> u64 {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    assert_eq!(batches.len(), 1, "DELETE returns a single count batch");
+    assert_eq!(batches.len(), 1, "DML returns a single count batch");
     assert_eq!(batches[0].num_rows(), 1, "count batch has one row");
     batches[0]
         .column(0)
@@ -124,7 +159,7 @@ async fn delete_single_file_predicate() {
     assert_eq!(read_ids(&temp).await, vec![1, 2, 3, 4], "baseline");
 
     let ctx = writable_ctx(&temp).await;
-    let count = run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id = 2").await;
+    let count = run_dml_count(&ctx, "DELETE FROM ducklake.main.t WHERE id = 2").await;
     assert_eq!(count, 1, "one row deleted");
     assert_eq!(read_ids(&temp).await, vec![1, 3, 4], "id 2 gone");
 }
@@ -148,7 +183,7 @@ async fn delete_multi_file_atomic() {
     let before = snapshot_count(&temp).await;
     let ctx = writable_ctx(&temp).await;
     // id 2 lives in file 1; ids 4 and 6 live in file 2.
-    let count = run_delete(
+    let count = run_dml_count(
         &ctx,
         "DELETE FROM ducklake.main.t WHERE id = 2 OR id = 4 OR id = 6",
     )
@@ -168,6 +203,66 @@ async fn delete_multi_file_atomic() {
     );
 }
 
+/// DELETE remains positional after UPDATE rewrites a row into an embedded-rowid
+/// file. Exercise an unrelated delete, the updated row itself, cumulative
+/// deletes on the source file, and one atomic delete spanning rewritten and
+/// insert-only files.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_after_update_rewrite_preserves_positions_and_rowids() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    let tw = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    tw.write_table("main", "t", &[id_batch(&[1, 2, 3])])
+        .await
+        .unwrap();
+    tw.append_table("main", "t", &[id_batch(&[4, 5])])
+        .await
+        .unwrap();
+
+    let update = writable_ctx(&temp).await;
+    assert_eq!(
+        run_dml_count(&update, "UPDATE ducklake.main.t SET id = 20 WHERE id = 2").await,
+        1
+    );
+
+    // This predicate misses the rewritten file, but DELETE must still inspect
+    // it without rejecting the table. The source file already has UPDATE's
+    // position 1 masked, so adding position 0 also proves cumulative deletes.
+    let unrelated_delete = writable_ctx(&temp).await;
+    assert_eq!(
+        run_dml_count(
+            &unrelated_delete,
+            "DELETE FROM ducklake.main.t WHERE id = 1",
+        )
+        .await,
+        1
+    );
+    assert_eq!(read_ids(&temp).await, vec![3, 4, 5, 20]);
+
+    let snapshots_before = snapshot_count(&temp).await;
+    let mixed_delete = writable_ctx(&temp).await;
+    assert_eq!(
+        run_dml_count(
+            &mixed_delete,
+            "DELETE FROM ducklake.main.t WHERE id = 20 OR id = 4",
+        )
+        .await,
+        2,
+        "delete one updated row and one insert-only row"
+    );
+    assert_eq!(
+        snapshot_count(&temp).await,
+        snapshots_before + 1,
+        "the mixed multi-file delete commits atomically"
+    );
+    assert_eq!(read_ids(&temp).await, vec![3, 5]);
+    assert_eq!(
+        read_rowid_ids(&temp).await,
+        vec![(2, 3), (4, 5)],
+        "fresh row-lineage reads preserve the surviving rowids"
+    );
+}
+
 /// `DELETE FROM t` with no WHERE removes ALL rows (metadata-only truncate).
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_all_rows_no_where() {
@@ -180,7 +275,7 @@ async fn delete_all_rows_no_where() {
         .unwrap();
 
     let ctx = writable_ctx(&temp).await;
-    let count = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    let count = run_dml_count(&ctx, "DELETE FROM ducklake.main.t").await;
     assert_eq!(count, 4, "all four rows deleted");
     assert_eq!(read_ids(&temp).await, Vec::<i32>::new(), "table empty");
 }
@@ -200,13 +295,13 @@ async fn delete_after_delete_is_cumulative() {
 
     // First delete: id 2 (physical position 1).
     let ctx1 = writable_ctx(&temp).await;
-    let c1 = run_delete(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await;
+    let c1 = run_dml_count(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await;
     assert_eq!(c1, 1);
     assert_eq!(read_ids(&temp).await, vec![1, 3, 4], "after first delete");
 
     // Second delete (fresh ctx, sees the live delete file): id 4 (position 3).
     let ctx2 = writable_ctx(&temp).await;
-    let c2 = run_delete(&ctx2, "DELETE FROM ducklake.main.t WHERE id = 4").await;
+    let c2 = run_dml_count(&ctx2, "DELETE FROM ducklake.main.t WHERE id = 4").await;
     assert_eq!(c2, 1, "only the newly-matched row counts");
     assert_eq!(
         read_ids(&temp).await,
@@ -229,14 +324,14 @@ async fn delete_already_deleted_is_noop() {
 
     let ctx1 = writable_ctx(&temp).await;
     assert_eq!(
-        run_delete(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await,
+        run_dml_count(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await,
         1
     );
 
     let snaps = snapshot_count(&temp).await;
     // Re-delete the same (now already-deleted) row.
     let ctx2 = writable_ctx(&temp).await;
-    let c = run_delete(&ctx2, "DELETE FROM ducklake.main.t WHERE id = 2").await;
+    let c = run_dml_count(&ctx2, "DELETE FROM ducklake.main.t WHERE id = 2").await;
     assert_eq!(c, 0, "nothing new to delete");
     assert_eq!(
         snapshot_count(&temp).await,
@@ -258,7 +353,7 @@ async fn delete_no_match() {
         .unwrap();
 
     let ctx = writable_ctx(&temp).await;
-    let count = run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id = 999").await;
+    let count = run_dml_count(&ctx, "DELETE FROM ducklake.main.t WHERE id = 999").await;
     assert_eq!(count, 0);
     assert_eq!(read_ids(&temp).await, vec![1, 2, 3], "unchanged");
 }
@@ -326,7 +421,7 @@ async fn delete_truncate_repeat_same_ctx_no_spurious_snapshot() {
     let before = snapshot_count(&temp).await;
     let ctx = writable_ctx(&temp).await;
 
-    let c1 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    let c1 = run_dml_count(&ctx, "DELETE FROM ducklake.main.t").await;
     assert_eq!(c1, 4, "first truncate removes all rows");
     let after_first = snapshot_count(&temp).await;
     assert_eq!(
@@ -336,7 +431,7 @@ async fn delete_truncate_repeat_same_ctx_no_spurious_snapshot() {
     );
 
     // Second truncate in the SAME (pinned) session: a DB-level no-op.
-    let c2 = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    let c2 = run_dml_count(&ctx, "DELETE FROM ducklake.main.t").await;
     assert_eq!(c2, 0, "nothing left to truncate");
     assert_eq!(
         snapshot_count(&temp).await,
@@ -366,7 +461,7 @@ async fn delete_second_in_session_conflicts_without_resurrection() {
     // One session, catalog pinned at the pre-delete snapshot.
     let ctx = writable_ctx(&temp).await;
     assert_eq!(
-        run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id = 2").await,
+        run_dml_count(&ctx, "DELETE FROM ducklake.main.t WHERE id = 2").await,
         1
     );
     assert_eq!(read_ids(&temp).await, vec![1, 3, 4], "id 2 deleted");
