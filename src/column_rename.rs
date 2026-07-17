@@ -12,10 +12,17 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::execution_plan::Boundedness;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildFilterDescription, FilterDescription, FilterPushdownPhase,
+};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -65,6 +72,65 @@ impl ColumnRenameExec {
             properties,
         }
     }
+
+    /// Returns whether this node only renames columns without casting,
+    /// projecting, or synthesizing values.
+    pub fn is_pure_type_preserving_rename(&self) -> bool {
+        let input_schema = self.input.schema();
+        input_schema.fields().len() == self.output_schema.fields().len()
+            && input_schema
+                .fields()
+                .iter()
+                .zip(self.output_schema.fields())
+                .all(|(input, output)| {
+                    input.data_type() == output.data_type()
+                        && self
+                            .reverse_mapping
+                            .get(output.name())
+                            .map(String::as_str)
+                            .unwrap_or(output.name())
+                            == input.name()
+                })
+    }
+
+    /// Remap a predicate over the catalog schema to the physical child schema.
+    ///
+    /// This is intentionally available only for a pure, type-preserving rename:
+    /// pushing predicates through casts can change errors and comparison
+    /// semantics, while projections and synthetic columns need richer mapping.
+    pub fn remap_filter_to_input(
+        &self,
+        filter: Arc<dyn PhysicalExpr>,
+    ) -> DataFusionResult<Option<Arc<dyn PhysicalExpr>>> {
+        if !self.is_pure_type_preserving_rename() {
+            return Ok(None);
+        }
+
+        let input_schema = self.input.schema();
+        let output_schema = Arc::clone(&self.output_schema);
+        let mut valid = true;
+        let transformed = filter.transform_down(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let index = column.index();
+            if output_schema
+                .fields()
+                .get(index)
+                .is_none_or(|field| field.name() != column.name())
+            {
+                valid = false;
+                return Ok(Transformed::complete(expr));
+            }
+
+            Ok(Transformed::yes(Arc::new(Column::new(
+                input_schema.field(index).name(),
+                index,
+            ))))
+        })?;
+
+        Ok(valid.then_some(transformed.data))
+    }
 }
 
 impl DisplayAs for ColumnRenameExec {
@@ -102,6 +168,32 @@ impl ExecutionPlan for ColumnRenameExec {
             Arc::clone(&self.output_schema),
             self.name_mapping.clone(),
         )))
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        self.is_pure_type_preserving_rename()
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DataFusionResult<FilterDescription> {
+        if !self.is_pure_type_preserving_rename() {
+            return Ok(FilterDescription::new()
+                .with_child(ChildFilterDescription::all_unsupported(&parent_filters)));
+        }
+
+        let remapped = parent_filters
+            .iter()
+            .map(|filter| self.remap_filter_to_input(Arc::clone(filter)))
+            .collect::<DataFusionResult<Option<Vec<_>>>>()?;
+        let child = match remapped {
+            Some(remapped) => ChildFilterDescription::from_child(&remapped, &self.input)?,
+            None => ChildFilterDescription::all_unsupported(&parent_filters),
+        };
+        Ok(FilterDescription::new().with_child(child))
     }
 
     fn execute(
@@ -242,6 +334,8 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::physical_plan::EmptyRecordBatchStream;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::filter_pushdown::PushedDown;
 
     #[test]
     fn test_column_rename_stream_schema() {
@@ -268,5 +362,89 @@ mod tests {
 
         // The stream should report the output schema
         assert_eq!(stream.schema().field(0).name(), "new_col");
+    }
+
+    #[test]
+    fn pure_rename_remaps_filters_and_allows_limit_pushdown() {
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "old_col",
+            DataType::Int32,
+            false,
+        )]));
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "new_col",
+            DataType::Int32,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let exec = ColumnRenameExec::new(
+            input,
+            output_schema,
+            HashMap::from([("old_col".to_string(), "new_col".to_string())]),
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(Column::new("new_col", 0));
+
+        assert!(exec.is_pure_type_preserving_rename());
+        assert!(exec.supports_limit_pushdown());
+        let remapped = exec
+            .remap_filter_to_input(Arc::clone(&filter))
+            .unwrap()
+            .unwrap();
+        let column = remapped.downcast_ref::<Column>().unwrap();
+        assert_eq!(column.name(), "old_col");
+        assert_eq!(column.index(), 0);
+
+        let description = exec
+            .gather_filters_for_pushdown(
+                FilterPushdownPhase::Pre,
+                vec![filter],
+                &ConfigOptions::new(),
+            )
+            .unwrap();
+        let pushed = description.parent_filters();
+        assert!(matches!(pushed[0][0].discriminant, PushedDown::Yes));
+        let column = pushed[0][0].predicate.downcast_ref::<Column>().unwrap();
+        assert_eq!(column.name(), "old_col");
+        assert_eq!(column.index(), 0);
+    }
+
+    #[test]
+    fn casts_do_not_allow_filter_or_limit_pushdown() {
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "old_col",
+            DataType::Int32,
+            false,
+        )]));
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "new_col",
+            DataType::Int64,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let exec = ColumnRenameExec::new(
+            input,
+            output_schema,
+            HashMap::from([("old_col".to_string(), "new_col".to_string())]),
+        );
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(Column::new("new_col", 0));
+
+        assert!(!exec.is_pure_type_preserving_rename());
+        assert!(!exec.supports_limit_pushdown());
+        assert!(
+            exec.remap_filter_to_input(Arc::clone(&filter))
+                .unwrap()
+                .is_none()
+        );
+        let description = exec
+            .gather_filters_for_pushdown(
+                FilterPushdownPhase::Pre,
+                vec![filter],
+                &ConfigOptions::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            description.parent_filters()[0][0].discriminant,
+            PushedDown::No
+        ));
     }
 }
