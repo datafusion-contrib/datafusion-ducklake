@@ -24,6 +24,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -71,6 +72,27 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
+/// Optional catalog-schema capabilities probed before scan / CDC queries.
+///
+/// Minimal / pre-v1.0 catalogs may lack the `partial_max` columns and the
+/// `ducklake_schema_versions` ledger; the queries degrade the corresponding
+/// projections to NULL when a capability is absent.
+#[derive(Debug, Clone, Copy)]
+struct SchemaCapabilities {
+    /// `ducklake_data_file.partial_max` exists.
+    data_file_partial_max: bool,
+    /// `ducklake_delete_file.partial_max` exists.
+    delete_file_partial_max: bool,
+    /// The `ducklake_schema_versions` table exists.
+    schema_versions: bool,
+}
+
+impl SchemaCapabilities {
+    fn all(&self) -> bool {
+        self.data_file_partial_max && self.delete_file_partial_max && self.schema_versions
+    }
+}
+
 /// Catalog-scoped Postgres metadata reader.
 ///
 /// Construct with [`Self::with_pool`] (name-keyed; resolves to `catalog_id` once
@@ -79,6 +101,9 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 pub struct MulticatalogProvider {
     pool: PgPool,
     catalog_id: i64,
+    // Positive-only memo of the optional-schema capability probes. `Arc` so
+    // derived `Clone` shares the cache across provider clones.
+    schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
 }
 
 impl MulticatalogProvider {
@@ -106,6 +131,7 @@ impl MulticatalogProvider {
         Ok(Self {
             pool,
             catalog_id,
+            schema_capabilities: Arc::new(OnceLock::new()),
         })
     }
 
@@ -115,11 +141,53 @@ impl MulticatalogProvider {
         Ok(Self {
             pool,
             catalog_id,
+            schema_capabilities: Arc::new(OnceLock::new()),
         })
     }
 
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Whether the schema-capability memo is populated. Exposed for tests.
+    #[doc(hidden)]
+    pub fn schema_capabilities_cached(&self) -> bool {
+        self.schema_capabilities.get().is_some()
+    }
+
+    /// Returns the catalog's optional-schema capabilities, probing at most
+    /// once per provider lifetime on a fully-migrated catalog.
+    ///
+    /// Cache-positive-only: capability existence is monotonic (migrations only
+    /// add columns/tables, never drop them), so an all-`true` answer is an
+    /// immutable fact and safe to memoize. A `false` answer is never cached —
+    /// the next call re-probes, so a mid-flight catalog upgrade is picked up
+    /// on the next call exactly like the previous per-call probing. Concurrent
+    /// first calls may each probe once (one statement each) — harmless; a
+    /// raced `set` is ignored.
+    async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
+        if let Some(caps) = self.schema_capabilities.get() {
+            return Ok(*caps);
+        }
+        let row: (bool, bool, bool) = sqlx::query_as(
+            "SELECT
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
+               to_regclass('ducklake_schema_versions') IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let caps = SchemaCapabilities {
+            data_file_partial_max: row.0,
+            delete_file_partial_max: row.1,
+            schema_versions: row.2,
+        };
+        if caps.all() {
+            let _ = self.schema_capabilities.set(caps);
+        }
+        Ok(caps)
     }
 }
 
@@ -303,22 +371,13 @@ impl MetadataProvider for MulticatalogProvider {
             // `ducklake_schema_versions` ledger. Surfacing these lets compaction
             // (which pairs its writer with THIS reader) select merge candidates
             // and lets time-travel reads filter partial files per-row.
-            let has_partial_max: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max')",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_schema_versions: bool =
-                sqlx::query_scalar("SELECT to_regclass('ducklake_schema_versions') IS NOT NULL")
-                    .fetch_one(&self.pool)
-                    .await?;
-            let partial_max_expr = if has_partial_max {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max::bigint"
             } else {
                 "NULL::bigint"
             };
-            let schema_version_expr = if has_schema_versions {
+            let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version::bigint
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id
@@ -438,22 +497,13 @@ impl MetadataProvider for MulticatalogProvider {
             crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
         })?;
         block_on(async {
-            let has_partial_max: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max')",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_schema_versions: bool =
-                sqlx::query_scalar("SELECT to_regclass('ducklake_schema_versions') IS NOT NULL")
-                    .fetch_one(&self.pool)
-                    .await?;
-            let partial_max_expr = if has_partial_max {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max::bigint"
             } else {
                 "NULL::bigint"
             };
-            let schema_version_expr = if has_schema_versions {
+            let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version::bigint
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id
@@ -1093,13 +1143,7 @@ impl MetadataProvider for MulticatalogProvider {
             // Older catalogs predate `partial_max`; degrade it to NULL there
             // (they cannot contain partial files), matching the probe pattern
             // used by the scan queries above.
-            let has_partial_max: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max')",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_partial_max {
+            let pm = if self.schema_capabilities().await?.data_file_partial_max {
                 "data.partial_max::bigint"
             } else {
                 "NULL::bigint"
@@ -1157,13 +1201,7 @@ impl MetadataProvider for MulticatalogProvider {
             // even when their begin_snapshot predates the window; included via
             // `ducklake_delete_file.partial_max`. Older catalogs lack the column
             // (and cumulative delete files); degrade it to NULL there.
-            let has_delete_partial_max: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns
-                 WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max')",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_delete_partial_max {
+            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
                 "ddf.partial_max::bigint"
             } else {
                 "NULL::bigint"

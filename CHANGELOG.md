@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **BREAKING**: `PostgresMetadataProvider`, `SqliteMetadataProvider`, and
+  `MySqlMetadataProvider` carry a new private field; construct them via `new()`
+  instead of struct literals.
+- Per-call catalog capability probes (`partial_max` columns, the
+  `ducklake_schema_versions` ledger, SQLite's inlined-data registry) on the
+  scan and CDC paths run as one combined statement and are memoized
+  cache-positive-only per provider: a fully-migrated catalog probes once per
+  provider lifetime, while catalogs missing any capability keep re-probing
+  every call (so a mid-flight catalog upgrade is still picked up immediately).
 - **BREAKING**: CDC snapshot bounds are inclusive on both ends, matching official
   DuckLake (was exclusive-start); cursor pagination should pass `last + 1` (#179).
 - **BREAKING**: CDC columns `(snapshot_id, rowid, change_type)` now lead the output,

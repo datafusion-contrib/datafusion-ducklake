@@ -399,3 +399,35 @@ async fn get_table_files_for_select_returns_row_id_start_and_record_count() {
     );
     assert_eq!(f.snapshot_id, Some(sn), "snapshot_id is the query snapshot");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn schema_capability_probe_memoized_after_first_select() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let _ = seed_two_catalogs(&pool).await.unwrap();
+
+    let pa = MulticatalogProvider::with_pool(pool.clone(), "pg_prod")
+        .await
+        .unwrap();
+    let sn = pa.get_current_snapshot().unwrap();
+    let schema = pa.get_schema_by_name("public", sn).unwrap().unwrap();
+    let table = pa
+        .get_table_by_name(schema.schema_id, "users", sn)
+        .unwrap()
+        .unwrap();
+
+    // The multicatalog bootstrap schema is fully migrated, so the first scan
+    // probes once (all capabilities true) and memoizes; the second scan reuses
+    // the memo and must return identical results.
+    assert!(!pa.schema_capabilities_cached());
+    let first = pa.get_table_files_for_select(table.table_id, sn).unwrap();
+    assert!(
+        pa.schema_capabilities_cached(),
+        "an all-true probe result must be cached after the first call"
+    );
+    let second = pa.get_table_files_for_select(table.table_id, sn).unwrap();
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // Clones share the memo (the cell is Arc-shared).
+    assert!(pa.clone().schema_capabilities_cached());
+}

@@ -14,6 +14,7 @@ use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -61,10 +62,32 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
     })
 }
 
+/// Optional catalog-schema capabilities probed before CDC queries.
+///
+/// Older catalogs may lack the `partial_max` columns; the CDC queries degrade
+/// the corresponding projections/predicates to NULL when a capability is
+/// absent.
+#[derive(Debug, Clone, Copy)]
+struct SchemaCapabilities {
+    /// `ducklake_data_file.partial_max` exists.
+    data_file_partial_max: bool,
+    /// `ducklake_delete_file.partial_max` exists.
+    delete_file_partial_max: bool,
+}
+
+impl SchemaCapabilities {
+    fn all(&self) -> bool {
+        self.data_file_partial_max && self.delete_file_partial_max
+    }
+}
+
 /// MySQL-based metadata provider for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct MySqlMetadataProvider {
     pub pool: MySqlPool,
+    // Positive-only memo of the optional-schema capability probes. `Arc` so
+    // derived `Clone` shares the cache across provider clones.
+    schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
 }
 
 impl MySqlMetadataProvider {
@@ -77,7 +100,51 @@ impl MySqlMetadataProvider {
 
         Ok(Self {
             pool,
+            schema_capabilities: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Whether the schema-capability memo is populated. Exposed for tests.
+    #[doc(hidden)]
+    pub fn schema_capabilities_cached(&self) -> bool {
+        self.schema_capabilities.get().is_some()
+    }
+
+    /// Returns the catalog's optional-schema capabilities, probing at most
+    /// once per provider lifetime on a fully-migrated catalog.
+    ///
+    /// Cache-positive-only: capability existence is monotonic (migrations only
+    /// add columns/tables, never drop them), so an all-`true` answer is an
+    /// immutable fact and safe to memoize. A `false` answer is never cached —
+    /// the next call re-probes, so a mid-flight catalog upgrade is picked up
+    /// on the next call exactly like the previous per-call probing. Concurrent
+    /// first calls may each probe once (one statement each) — harmless; a
+    /// raced `set` is ignored.
+    async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
+        if let Some(caps) = self.schema_capabilities.get() {
+            return Ok(*caps);
+        }
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT
+               (SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'ducklake_data_file'
+                  AND column_name = 'partial_max'),
+               (SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'ducklake_delete_file'
+                  AND column_name = 'partial_max')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let caps = SchemaCapabilities {
+            data_file_partial_max: row.0 > 0,
+            delete_file_partial_max: row.1 > 0,
+        };
+        if caps.all() {
+            let _ = self.schema_capabilities.set(caps);
+        }
+        Ok(caps)
     }
 }
 
@@ -938,15 +1005,7 @@ impl MetadataProvider for MySqlMetadataProvider {
         block_on(async {
             // Older catalogs predate `partial_max`; degrade it to NULL there
             // (they cannot contain partial files).
-            let has_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.columns
-                 WHERE table_schema = DATABASE()
-                   AND table_name = 'ducklake_data_file'
-                   AND column_name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_partial_max > 0 {
+            let pm = if self.schema_capabilities().await?.data_file_partial_max {
                 "data.partial_max"
             } else {
                 "NULL"
@@ -1006,15 +1065,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             // even when their begin_snapshot predates the window; included via
             // `ducklake_delete_file.partial_max`. Older catalogs lack the column
             // (and cumulative delete files); degrade it to NULL there.
-            let has_delete_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM information_schema.columns
-                 WHERE table_schema = DATABASE()
-                   AND table_name = 'ducklake_delete_file'
-                   AND column_name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_delete_partial_max > 0 {
+            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
                 "ddf.partial_max"
             } else {
                 "NULL"

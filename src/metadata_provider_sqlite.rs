@@ -20,7 +20,7 @@ use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Quote a SQL identifier for SQLite (double-quote, doubling embedded quotes),
 /// so catalog-supplied inlined-table / column names can't break the query.
@@ -162,10 +162,44 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("no such table") || message.contains("does not exist")
 }
 
+/// Optional catalog-schema capabilities probed before scan / CDC / inlined-data
+/// queries.
+///
+/// Minimal / pre-v1.0 catalogs may lack the `partial_max` / `partition_id`
+/// columns, the `ducklake_schema_versions` ledger, and the inlined-data
+/// registry; the queries degrade the corresponding projections to NULL (or
+/// skip inlined-data reads) when a capability is absent.
+#[derive(Debug, Clone, Copy)]
+struct SchemaCapabilities {
+    /// `ducklake_data_file.partial_max` exists.
+    data_file_partial_max: bool,
+    /// `ducklake_delete_file.partial_max` exists.
+    delete_file_partial_max: bool,
+    /// `ducklake_data_file.partition_id` exists.
+    data_file_partition_id: bool,
+    /// The `ducklake_schema_versions` table exists.
+    schema_versions: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
+}
+
+impl SchemaCapabilities {
+    fn all(&self) -> bool {
+        self.data_file_partial_max
+            && self.delete_file_partial_max
+            && self.data_file_partition_id
+            && self.schema_versions
+            && self.inlined_data_tables
+    }
+}
+
 /// SQLite-based metadata provider for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataProvider {
     pub pool: SqlitePool,
+    // Positive-only memo of the optional-schema capability probes. `Arc` so
+    // derived `Clone` shares the cache across provider clones.
+    schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
 }
 
 impl SqliteMetadataProvider {
@@ -180,7 +214,56 @@ impl SqliteMetadataProvider {
 
         Ok(Self {
             pool,
+            schema_capabilities: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// Whether the schema-capability memo is populated. Exposed for tests.
+    #[doc(hidden)]
+    pub fn schema_capabilities_cached(&self) -> bool {
+        self.schema_capabilities.get().is_some()
+    }
+
+    /// Returns the catalog's optional-schema capabilities, probing at most
+    /// once per provider lifetime on a fully-migrated catalog.
+    ///
+    /// Cache-positive-only: capability existence is monotonic (migrations only
+    /// add columns/tables, never drop them), so an all-`true` answer is an
+    /// immutable fact and safe to memoize. A `false` answer is never cached —
+    /// the next call re-probes, so a mid-flight catalog upgrade is picked up
+    /// on the next call exactly like the previous per-call probing. Concurrent
+    /// first calls may each probe once (one statement each) — harmless; a
+    /// raced `set` is ignored.
+    async fn schema_capabilities(&self) -> Result<SchemaCapabilities> {
+        if let Some(caps) = self.schema_capabilities.get() {
+            return Ok(*caps);
+        }
+        let row: (bool, bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
+                WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
+                WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
+                WHERE name = 'partition_id') > 0,
+               (SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'ducklake_schema_versions') > 0,
+               (SELECT COUNT(*) FROM sqlite_master
+                WHERE type = 'table' AND name = 'ducklake_inlined_data_tables') > 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let caps = SchemaCapabilities {
+            data_file_partial_max: row.0,
+            delete_file_partial_max: row.1,
+            data_file_partition_id: row.2,
+            schema_versions: row.3,
+            inlined_data_tables: row.4,
+        };
+        if caps.all() {
+            let _ = self.schema_capabilities.set(caps);
+        }
+        Ok(caps)
     }
 }
 
@@ -341,23 +424,13 @@ impl MetadataProvider for SqliteMetadataProvider {
             // still work (both are consumed only by compaction; `partial_max`
             // also by time-travel reads of partial files, which such catalogs
             // never contain).
-            let has_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_schema_versions: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'ducklake_schema_versions'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let partial_max_expr = if has_partial_max > 0 {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max"
             } else {
                 "NULL"
             };
-            let schema_version_expr = if has_schema_versions > 0 {
+            let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id
@@ -470,33 +543,18 @@ impl MetadataProvider for SqliteMetadataProvider {
             crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
         })?;
         block_on(async {
-            let has_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_schema_versions: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'ducklake_schema_versions'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let has_partition_id: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partition_id'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let partial_max_expr = if has_partial_max > 0 {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max"
             } else {
                 "NULL"
             };
-            let partition_id_expr = if has_partition_id > 0 {
+            let partition_id_expr = if caps.data_file_partition_id {
                 "data.partition_id"
             } else {
                 "NULL"
             };
-            let schema_version_expr = if has_schema_versions > 0 {
+            let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id
@@ -860,13 +918,7 @@ impl MetadataProvider for SqliteMetadataProvider {
         block_on(async {
             // Most catalogs have no inlined data — the registry table is absent.
             // Detect and return empty so they (and older catalogs) are unaffected.
-            let has_registry: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'ducklake_inlined_data_tables'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            if has_registry == 0 {
+            if !self.schema_capabilities().await?.inlined_data_tables {
                 return Ok(Vec::new());
             }
 
@@ -1209,12 +1261,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             // Older catalogs predate `partial_max`; degrade it to NULL there
             // (they cannot contain partial files), matching the probe pattern
             // used by the scan queries above.
-            let has_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_partial_max > 0 {
+            let pm = if self.schema_capabilities().await?.data_file_partial_max {
                 "data.partial_max"
             } else {
                 "NULL"
@@ -1276,12 +1323,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             // included via `ducklake_delete_file.partial_max` (their max embedded
             // snapshot). Older catalogs lack the column — and cumulative delete
             // files — so it degrades to NULL there.
-            let has_delete_partial_max: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file') WHERE name = 'partial_max'",
-            )
-            .fetch_one(&self.pool)
-            .await?;
-            let pm = if has_delete_partial_max > 0 {
+            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
                 "cd.partial_max"
             } else {
                 "NULL"

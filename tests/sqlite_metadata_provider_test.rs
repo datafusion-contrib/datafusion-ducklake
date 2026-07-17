@@ -996,3 +996,85 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_schema_capability_probe_memoized_positive_only() {
+    let provider = create_sqlite_provider().await.unwrap();
+
+    populate_test_data(&provider)
+        .await
+        .expect("Failed to populate test data");
+
+    // Minimal fixture: every optional capability is absent, so the
+    // positive-only memo must stay empty and repeated calls keep re-probing
+    // (the status quo for legacy catalogs) while returning identical results.
+    assert!(!provider.schema_capabilities_cached());
+    let first = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        !provider.schema_capabilities_cached(),
+        "a negative probe result must not be cached"
+    );
+    let second = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert_eq!(first.len(), 2);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // Upgrade the catalog mid-flight: add every capability the provider
+    // probes. Because false was never cached, the very next call must see
+    // the upgrade and memoize the all-true answer.
+    let pool = &provider.pool;
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partial_max INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_delete_file ADD COLUMN partial_max INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_schema_versions (
+            begin_snapshot INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL,
+            table_id INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_inlined_data_tables (
+            table_id INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            schema_snapshot INTEGER
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let migrated_first = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        provider.schema_capabilities_cached(),
+        "an all-true probe result must be cached after the first call"
+    );
+    let migrated_second = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert_eq!(migrated_first.len(), 2);
+    assert_eq!(
+        format!("{migrated_first:?}"),
+        format!("{migrated_second:?}")
+    );
+
+    // Clones share the memo (the cell is Arc-shared).
+    assert!(provider.clone().schema_capabilities_cached());
+}

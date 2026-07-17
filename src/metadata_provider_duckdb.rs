@@ -16,11 +16,31 @@ use crate::partition::PartitionSpec;
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("does not exist") || message.contains("not found")
+}
+
+/// Optional catalog-schema capabilities probed before CDC queries.
+///
+/// Older catalogs (spec 0.2) may lack the `partial_max` columns; the CDC
+/// queries fall back to the old-spec `partial_file_info` string (data files)
+/// or degrade the predicate to NULL (delete files) when a capability is
+/// absent.
+#[derive(Debug, Clone, Copy)]
+struct SchemaCapabilities {
+    /// `ducklake_data_file.partial_max` exists.
+    data_file_partial_max: bool,
+    /// `ducklake_delete_file.partial_max` exists.
+    delete_file_partial_max: bool,
+}
+
+impl SchemaCapabilities {
+    fn all(&self) -> bool {
+        self.data_file_partial_max && self.delete_file_partial_max
+    }
 }
 
 /// DuckDB metadata provider
@@ -34,6 +54,9 @@ pub struct DuckdbMetadataProvider {
     /// Path to the catalog database, retained for logging/debugging
     #[allow(dead_code)]
     catalog_path: String,
+    /// Positive-only memo of the optional-schema capability probes. `Arc` so
+    /// derived `Clone` shares the cache across provider clones.
+    schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
 }
 
 impl DuckdbMetadataProvider {
@@ -45,12 +68,54 @@ impl DuckdbMetadataProvider {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             catalog_path,
+            schema_capabilities: Arc::new(OnceLock::new()),
         })
     }
 
     /// Get a reference to the shared connection
     fn connection(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("DuckDB connection mutex poisoned")
+    }
+
+    /// Whether the schema-capability memo is populated. Exposed for tests.
+    #[doc(hidden)]
+    pub fn schema_capabilities_cached(&self) -> bool {
+        self.schema_capabilities.get().is_some()
+    }
+
+    /// Returns the catalog's optional-schema capabilities, probing at most
+    /// once per provider lifetime on a fully-migrated catalog. Takes the
+    /// caller's already-locked `&Connection` (the shared mutex is not
+    /// reentrant).
+    ///
+    /// Cache-positive-only: capability existence is monotonic (migrations only
+    /// add columns/tables, never drop them), so an all-`true` answer is an
+    /// immutable fact and safe to memoize. A `false` answer is never cached —
+    /// the next call re-probes, so a mid-flight catalog upgrade is picked up
+    /// on the next call exactly like the previous per-call probing. Concurrent
+    /// first calls may each probe once (one statement each) — harmless; a
+    /// raced `set` is ignored.
+    fn schema_capabilities(&self, conn: &Connection) -> crate::Result<SchemaCapabilities> {
+        if let Some(caps) = self.schema_capabilities.get() {
+            return Ok(*caps);
+        }
+        let (data_file_partial_max, delete_file_partial_max): (bool, bool) = conn.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
+                WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
+                WHERE name = 'partial_max') > 0",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let caps = SchemaCapabilities {
+            data_file_partial_max,
+            delete_file_partial_max,
+        };
+        if caps.all() {
+            let _ = self.schema_capabilities.set(caps);
+        }
+        Ok(caps)
     }
 
     /// Create a new read-only connection to the catalog database
@@ -824,14 +889,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // carry `partial_file_info` (a cumulative `snapshot:rowcount|...`
         // string); current ones carry `partial_max` (BIGINT). Detect which
         // column this catalog has and query accordingly.
-        let has_partial_max: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('ducklake_data_file') \
-             WHERE name = 'partial_max'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        if has_partial_max {
+        if self.schema_capabilities(&conn)?.data_file_partial_max {
             let mut stmt = conn.prepare(SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS)?;
             let files = stmt
                 .query_map(params![table_id, start_snapshot, end_snapshot], |row| {
@@ -907,13 +965,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         // Older catalogs have no such column — and no cumulative delete files —
         // so the predicate degrades to NULL there, keeping the plain
         // begin-snapshot window.
-        let has_delete_partial_max: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM pragma_table_info('ducklake_delete_file') \
-             WHERE name = 'partial_max'",
-            [],
-            |row| row.get(0),
-        )?;
-        let sql = if has_delete_partial_max {
+        let sql = if self.schema_capabilities(&conn)?.delete_file_partial_max {
             SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.to_string()
         } else {
             SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS.replace("df.partial_max", "NULL")

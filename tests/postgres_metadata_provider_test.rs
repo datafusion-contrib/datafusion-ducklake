@@ -1065,3 +1065,71 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");
 }
+
+/// Bring the minimal fixture schema up to a fully-migrated catalog: every
+/// optional capability the provider probes (`partial_max` columns, the
+/// `ducklake_schema_versions` ledger) plus the file columns the scan
+/// projection reads.
+async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "ALTER TABLE ducklake_data_file
+             ADD COLUMN IF NOT EXISTS encryption_key VARCHAR,
+             ADD COLUMN IF NOT EXISTS record_count BIGINT,
+             ADD COLUMN IF NOT EXISTS row_id_start BIGINT,
+             ADD COLUMN IF NOT EXISTS begin_snapshot BIGINT NOT NULL DEFAULT 1,
+             ADD COLUMN IF NOT EXISTS end_snapshot BIGINT,
+             ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE ducklake_delete_file
+             ADD COLUMN IF NOT EXISTS encryption_key VARCHAR,
+             ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
+             begin_snapshot BIGINT NOT NULL,
+             schema_version BIGINT NOT NULL,
+             table_id BIGINT NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_schema_capability_probe_memoized_positive_only() {
+    let (provider, _container) = create_postgres_provider().await.unwrap();
+
+    populate_test_data(&provider)
+        .await
+        .expect("Failed to populate test data");
+    migrate_fixture_to_current_schema(&provider.pool)
+        .await
+        .expect("Failed to migrate fixture schema");
+
+    // Fully-migrated catalog: the first scan probes once (all capabilities
+    // true) and memoizes; the second scan reuses the memo and must return
+    // identical results.
+    assert!(!provider.schema_capabilities_cached());
+    let first = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        provider.schema_capabilities_cached(),
+        "an all-true probe result must be cached after the first call"
+    );
+    let second = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert_eq!(first.len(), 2);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // Clones share the memo (the cell is Arc-shared).
+    assert!(provider.clone().schema_capabilities_cached());
+}
