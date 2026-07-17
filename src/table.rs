@@ -2398,6 +2398,13 @@ impl TableProvider for DuckLakeTable {
                     )),
                 )));
             }
+            // A short page proves the file list is exhausted (pages are keyed
+            // and ordered by data_file_id under a LIMIT), so stop after
+            // processing it rather than paying one more metadata round trip
+            // for the empty terminator page. For tables with fewer files than
+            // the batch size — the common case — this halves the planning
+            // metadata queries.
+            let last_page = metadata.len() < FILE_METADATA_BATCH_SIZE;
             let next_after = metadata.last().unwrap().file.data_file_id;
             if after_data_file_id.is_some_and(|after| next_after <= after) {
                 return Err(DataFusionError::External(Box::new(
@@ -2462,6 +2469,9 @@ impl TableProvider for DuckLakeTable {
                     };
                     execs.push(exec);
                 }
+                if last_page {
+                    break;
+                }
                 continue;
             }
 
@@ -2505,6 +2515,9 @@ impl TableProvider for DuckLakeTable {
                     self.build_exec_for_partial_file(state, table_file, output_schema)
                         .await?,
                 );
+            }
+            if last_page {
+                break;
             }
         }
 
