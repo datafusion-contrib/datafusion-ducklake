@@ -8,6 +8,7 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_provider::block_on;
+use crate::partition::PartitionTransform;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
@@ -126,7 +127,10 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     mapping_id INTEGER,
     begin_snapshot INTEGER NOT NULL,
     end_snapshot INTEGER,
-    partial_max INTEGER
+    partial_max INTEGER,
+    -- References ducklake_partition_info.partition_id: the partition spec this
+    -- file was written under. NULL for files of an unpartitioned table.
+    partition_id INTEGER
 );
 
 -- Per-snapshot change ledger (DuckLake spec). One row per snapshot recording
@@ -218,6 +222,39 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     path VARCHAR NOT NULL,
     path_is_relative BOOLEAN NOT NULL DEFAULT 1,
     schedule_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Partition spec generations (DuckLake spec). One row per version of a table's
+-- partition spec; `end_snapshot` NULL means currently active. Setting or
+-- resetting the spec ends the live row and (for SET) starts a new one, exactly
+-- like column versioning. `partition_id` is a catalog-wide id (this crate
+-- allocates it from the `next_partition_id` metadata counter).
+CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+    partition_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    begin_snapshot INTEGER NOT NULL,
+    end_snapshot INTEGER
+);
+
+-- Partition-key columns for a partition spec (DuckLake spec). One row per key,
+-- ordered by `partition_key_index` (0-based). `transform` is the transform
+-- string (`identity`, `year`, `month`, `day`, `hour`, `bucket(N)`).
+CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+    partition_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    partition_key_index INTEGER NOT NULL,
+    column_id INTEGER NOT NULL,
+    transform VARCHAR NOT NULL
+);
+
+-- Per-file partition values (DuckLake spec). The single transformed value that
+-- every row in `data_file_id` shares for partition key `partition_key_index`,
+-- encoded as a DuckDB-canonical VARCHAR (NULL is a legal partition value).
+CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+    data_file_id INTEGER NOT NULL,
+    table_id INTEGER NOT NULL,
+    partition_key_index INTEGER NOT NULL,
+    partition_value VARCHAR
 );
 "#;
 
@@ -860,6 +897,29 @@ async fn migrate_add_partial_max(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+/// Upgrade a pre-existing catalog to carry `ducklake_data_file.partition_id`
+/// (idempotent, lossless — NULL means "not partitioned", correct for every file
+/// written before partitioning support). `CREATE TABLE IF NOT EXISTS` never
+/// alters an existing table, so this ALTER is required for old catalogs.
+async fn migrate_add_partition_id(pool: &SqlitePool) -> Result<()> {
+    let info = sqlx::query("SELECT name FROM pragma_table_info('ducklake_data_file')")
+        .fetch_all(pool)
+        .await?;
+    let mut has_partition_id = false;
+    for row in &info {
+        let name: String = row.try_get("name")?;
+        if name == "partition_id" {
+            has_partition_id = true;
+        }
+    }
+    if !has_partition_id {
+        sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id INTEGER")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Optimistic-concurrency check for a `Replace` commit (mirrors the Postgres
 /// writer). Run while holding the SQLite write lock, before retiring the prior
 /// generation: if any data file of the table has `begin_snapshot` or
@@ -1006,6 +1066,40 @@ async fn record_schema_version(
 /// snapshot-scoped), so inserting the new generation at begin would leak it to
 /// concurrent reads during the upload window. `column_ids` are the ids reserved
 /// at begin and already baked into the staged parquet's `field_id` metadata.
+/// Persist a partitioned data file's partition metadata within the commit
+/// transaction: set `ducklake_data_file.partition_id` and insert one
+/// `ducklake_file_partition_value` row per partition key. A no-op for an
+/// unpartitioned file (`partition_id` unset and no values), so every commit path
+/// can call it unconditionally.
+async fn insert_partition_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    data_file_id: i64,
+    file: &DataFileInfo,
+) -> Result<()> {
+    if let Some(partition_id) = file.partition_id {
+        sqlx::query("UPDATE ducklake_data_file SET partition_id = ? WHERE data_file_id = ?")
+            .bind(partition_id)
+            .bind(data_file_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    for (key_index, value) in &file.partition_values {
+        sqlx::query(
+            "INSERT INTO ducklake_file_partition_value
+                 (data_file_id, table_id, partition_key_index, partition_value)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(i64::from(*key_index))
+        .bind(value.clone())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Persist the harvested per-column statistics for a just-registered data file.
 ///
 /// Writes one `ducklake_file_column_stats` row per [`ColumnStat`] (the zone maps
@@ -1489,6 +1583,119 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn set_partition_spec(
+        &self,
+        table_id: i64,
+        columns: &[(String, PartitionTransform)],
+    ) -> Result<i64> {
+        if columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_partition_spec: partition spec must have at least one column; \
+                 use reset_partition_spec to remove partitioning"
+                    .to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // Write-lock-first: reserve the new partition id (a metadata-counter
+            // UPDATE) before any read, so a concurrent DDL blocks on the lock.
+            let partition_id = reserve_ids(&mut tx, "next_partition_id", 1).await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+
+            // Resolve each partition-key column NAME to its live column_id.
+            let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
+            for (name, _transform) in columns {
+                let column_id: i64 = sqlx::query_scalar(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "set_partition_spec: no live column '{name}' in table {table_id}"
+                    ))
+                })?;
+                column_ids.push(column_id);
+            }
+
+            // End the currently-live spec generation (if any), then insert the new
+            // one and its per-key columns.
+            sqlx::query(
+                "UPDATE ducklake_partition_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_partition_info
+                     (partition_id, table_id, begin_snapshot, end_snapshot)
+                 VALUES (?, ?, ?, NULL)",
+            )
+            .bind(partition_id)
+            .bind(table_id)
+            .bind(new_snapshot)
+            .execute(&mut *tx)
+            .await?;
+            for (key_index, column_id) in column_ids.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO ducklake_partition_column
+                         (partition_id, table_id, partition_key_index, column_id, transform)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .bind(key_index as i64)
+                .bind(*column_id)
+                .bind(columns[key_index].1.to_catalog_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // Setting a spec is DDL: bump + record schema_version.
+            let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
+            record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
+    fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let ended = sqlx::query(
+                "UPDATE ducklake_partition_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if ended == 0 {
+                // Nothing to reset: roll back the just-allocated snapshot (drop tx)
+                // so a no-op RESET creates no empty snapshot, and report the head.
+                drop(tx);
+                let head: i64 =
+                    sqlx::query_scalar("SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot")
+                        .fetch_one(&self.pool)
+                        .await?;
+                return Ok(head);
+            }
+            // Removing the spec is DDL: bump + record schema_version.
+            let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
+            record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
     fn set_columns(
         &self,
         table_id: i64,
@@ -1613,6 +1820,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?
                 .try_get(0)?;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             // Refresh the table-wide roll-up from the now-current live file set.
             recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
@@ -1640,6 +1848,106 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?
                     .try_get(0)?;
 
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        if files.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_data_files: files must be non-empty".to_string(),
+            ));
+        }
+        block_on(async {
+            // One atomic snapshot for all N partition files: finalize the snapshot +
+            // (Replace) retire the prior generation ONCE, then insert every file with
+            // a distinct row_id_start from the advancing row-lineage counter.
+            let mut tx = self.pool.begin().await?;
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let mut next_row_id: i64 =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+            let mut total_records: i64 = 0;
+            let mut total_bytes: i64 = 0;
+            for file in files {
+                sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(next_row_id)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+                let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
+                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+                next_row_id += file.record_count;
+                total_records += file.record_count;
+                total_bytes += file.file_size_bytes;
+            }
+            // Refresh the table-wide roll-up once, from the now-current live file set.
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + ?,
+                     record_count    = record_count + ?,
+                     file_size_bytes = file_size_bytes + ?
+                 WHERE table_id = ?",
+            )
+            .bind(total_records)
+            .bind(total_records)
+            .bind(total_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let schema_id: i64 =
+                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
             tx.commit().await?;
             Ok(CommitIds {
                 snapshot_id,
@@ -1831,6 +2139,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?
                 .try_get(0)?;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             // Refresh the table-wide roll-up from the now-current live file set.
             recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
@@ -2172,6 +2481,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                     ))
                     .execute(&mut *tx)
                     .await?;
+                    // Likewise the removed sources' per-file partition values.
+                    sqlx::query(&format!(
+                        "DELETE FROM ducklake_file_partition_value WHERE data_file_id IN ({})",
+                        id_list(&source_data_ids)
+                    ))
+                    .execute(&mut *tx)
+                    .await?;
                 },
                 SourceRetirement::Retire => {
                     // Rewrite: the output only holds currently-live rows, so the
@@ -2230,6 +2546,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .try_get(0)?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
+                insert_partition_metadata(&mut tx, table_id, data_file_id, &out.file).await?;
             }
 
             // Recompute the visible stat totals from the surviving files. Robust
@@ -2337,10 +2654,28 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(base_snapshot)
             .fetch_optional(&mut *tx)
             .await?;
-            if impure_delete.is_some() || impure_ended.is_some() || impure_column.is_some() {
+            // A partition-spec change (SET/RESET PARTITIONED BY) after base is DDL,
+            // not a pure append, and forward-only file retirement cannot revert it.
+            // (A pure append's per-file `ducklake_file_partition_value` rows are
+            // fine — they belong to the appended files we retire, and are ignored
+            // on read once those files are gone, exactly like file_column_stats.)
+            let impure_partition: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_partition_info
+                 WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?) LIMIT 1",
+            )
+            .bind(table_id)
+            .bind(base_snapshot)
+            .bind(base_snapshot)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if impure_delete.is_some()
+                || impure_ended.is_some()
+                || impure_column.is_some()
+                || impure_partition.is_some()
+            {
                 return Err(crate::DuckLakeError::Conflict(format!(
                     "table {table_id}: changes since snapshot {base_snapshot} are not a pure \
-                     append (delete/replace/update or schema change present); refusing to retire"
+                     append (delete/replace/update or schema/partition change present); refusing to retire"
                 )));
             }
 
@@ -2592,6 +2927,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             // ducklake_data_file.partial_max; idempotent, lossless — NULL means
             // "not a partial file", correct for every pre-compaction file).
             migrate_add_partial_max(&self.pool).await?;
+            // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
+            // (idempotent, lossless — NULL means "not partitioned").
+            migrate_add_partition_id(&self.pool).await?;
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved in begin_write_transaction and inserted at the commit, so
             // they can't use rowid autoincrement (inserting the ducklake_snapshot
@@ -2606,6 +2944,20 @@ impl MetadataWriter for SqliteMetadataWriter {
                         NULL
                  WHERE NOT EXISTS (
                      SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
+                 )",
+            )
+            .execute(&self.pool)
+            .await?;
+            // Seed the partition-id allocator (mirrors next_column_id). Reserved via
+            // reserve_ids at set_partition_spec time. Seeded from the current MAX so a
+            // pre-existing catalog continues without reusing partition ids.
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope)
+                 SELECT 'next_partition_id',
+                        CAST(COALESCE((SELECT MAX(partition_id) FROM ducklake_partition_info), 0) AS TEXT),
+                        NULL
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_metadata WHERE key = 'next_partition_id' AND scope IS NULL
                  )",
             )
             .execute(&self.pool)

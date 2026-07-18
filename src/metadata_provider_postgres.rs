@@ -8,6 +8,7 @@ use crate::metadata_provider::{
     MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
     reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
+use crate::partition::PartitionSpec;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
@@ -52,6 +53,8 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
         partial_max: row.try_get(16)?,
         max_row_count: row.try_get(7)?,
         delete_count,
+        partition_id: None,
+        partition_values: Vec::new(),
     })
 }
 
@@ -338,6 +341,58 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn get_partition_spec(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Option<PartitionSpec>> {
+        block_on(async {
+            // Safety guard: only prune with exactly one partition-spec generation
+            // (see the DuckDB provider for the rationale).
+            let generation_count: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_one(&self.pool)
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if generation_count != 1 {
+                return Ok(None);
+            }
+            let rows = sqlx::query(
+                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+                 FROM ducklake_partition_info AS pi
+                 JOIN ducklake_partition_column AS pc
+                   ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+                 WHERE pi.table_id = $1
+                   AND $2 >= pi.begin_snapshot
+                   AND ($3 < pi.end_snapshot OR pi.end_snapshot IS NULL)
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<i64, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PartitionSpec::from_rows(parsed))
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,
@@ -462,13 +517,49 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .or_default()
                     .push(statistic);
             }
+
+            // Enrich with per-file partition values (for pruning), scoped to the
+            // page's data_file_id range. Missing partition table => no enrichment.
+            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+            match sqlx::query(
+                "SELECT data_file_id, partition_key_index, partition_value
+                 FROM ducklake_file_partition_value
+                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3",
+            )
+            .bind(table_id)
+            .bind(after_data_file_id.unwrap_or(i64::MIN))
+            .bind(last_data_file_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        let data_file_id: i64 = row.try_get(0)?;
+                        let key_index: i32 =
+                            i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let value: Option<String> = row.try_get(2)?;
+                        values_by_file
+                            .entry(data_file_id)
+                            .or_default()
+                            .push((key_index, value));
+                    }
+                },
+                Err(error) if is_missing_statistics_table(&error) => {},
+                Err(error) => return Err(error.into()),
+            }
+
             Ok(files
                 .into_iter()
-                .map(|file| DuckLakeFileMetadata {
-                    column_statistics: statistics_by_file
-                        .remove(&file.data_file_id)
-                        .unwrap_or_default(),
-                    file,
+                .map(|mut file| {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                    DuckLakeFileMetadata {
+                        column_statistics: statistics_by_file
+                            .remove(&file.data_file_id)
+                            .unwrap_or_default(),
+                        file,
+                    }
                 })
                 .collect())
         })
@@ -934,6 +1025,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                             partial_max: None,
                             max_row_count: row.try_get(14)?,
                             delete_count: None,
+                            partition_id: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 })

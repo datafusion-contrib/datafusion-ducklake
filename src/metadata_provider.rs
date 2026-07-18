@@ -53,6 +53,30 @@ pub const SQL_GET_DATA_FILES: &str = "
       AND ? >= data.begin_snapshot
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
 
+/// Read a table's active partition spec (partition_info joined to its key
+/// columns) visible at a snapshot. `?` placeholders (duckdb/sqlite/mysql style):
+/// `table_id, snapshot_id, snapshot_id`. Postgres builds a `$N` variant inline.
+pub const SQL_GET_PARTITION_SPEC: &str = "
+    SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+    FROM ducklake_partition_info AS pi
+    JOIN ducklake_partition_column AS pc
+        ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+    WHERE pi.table_id = ?
+      AND ? >= pi.begin_snapshot
+      AND (? < pi.end_snapshot OR pi.end_snapshot IS NULL)
+    ORDER BY pc.partition_key_index";
+
+/// Read per-file partition values for a `data_file_id` range (the planning page
+/// window). `?` placeholders: `table_id, after_data_file_id (exclusive),
+/// last_data_file_id (inclusive)`. Rows for files outside the page are harmless
+/// (grouped by id and matched only to files actually in the page).
+pub const SQL_GET_FILE_PARTITION_VALUES: &str = "
+    SELECT data_file_id, partition_key_index, partition_value
+    FROM ducklake_file_partition_value
+    WHERE table_id = ?
+      AND data_file_id > ?
+      AND data_file_id <= ?";
+
 pub const SQL_GET_TABLE_STATS: &str =
     "SELECT record_count, file_size_bytes FROM ducklake_table_stats WHERE table_id = ?";
 
@@ -558,6 +582,18 @@ pub struct DuckLakeTableFile {
     /// when there is no visible delete file. Net live rows for this file are
     /// `max_row_count - delete_count`.
     pub delete_count: Option<i64>,
+    /// `partition_id` from `ducklake_data_file`: the partition spec generation
+    /// this file was written under, or `None` for a file of an unpartitioned
+    /// table (or a catalog without partition support). Used to associate the
+    /// file with a [`crate::partition::PartitionSpec`] and by the write path's
+    /// GC / conflict checks.
+    pub partition_id: Option<i64>,
+    /// The file's partition values, one per partition key, as `(partition_key_index,
+    /// value)` where `value` is the DuckDB-canonical VARCHAR every row in the file
+    /// shares for that key (`None` == SQL NULL). Populated only on the read/planning
+    /// path (`get_table_file_metadata_page`); left empty by `get_table_files_for_select`
+    /// (the write/delete path does not need it). Drives partition pruning.
+    pub partition_values: Vec<(i32, Option<String>)>,
 }
 
 /// Statistics cached for a table in the DuckLake catalog.
@@ -642,6 +678,8 @@ impl DuckLakeTableFile {
             partial_max: None,
             max_row_count: None,
             delete_count: None,
+            partition_id: None,
+            partition_values: Vec::new(),
         }
     }
 }
@@ -739,6 +777,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableFile>>;
     //     todo: support select with file pruning
+
+    /// Read the table's active partition spec visible at `snapshot_id`
+    /// (`ducklake_partition_info` + `ducklake_partition_column`), or `None` if
+    /// the table is unpartitioned or the catalog has no partition tables. Drives
+    /// partition pruning together with each file's `partition_values`.
+    ///
+    /// The default returns `None`, so external providers and catalogs without
+    /// partition support are unaffected. Built-in providers override this.
+    fn get_partition_spec(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
+        Ok(None)
+    }
 
     /// Load table-, column-, and file-level statistics from the DuckLake
     /// catalog. Implementations should return unknown statistics when the

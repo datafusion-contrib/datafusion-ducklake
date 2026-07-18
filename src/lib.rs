@@ -43,6 +43,7 @@ pub mod encryption;
 pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
+pub mod partition;
 pub mod path_resolver;
 pub(crate) mod positional_source;
 pub mod row_id;
@@ -88,6 +89,8 @@ pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
 pub mod multicatalog_provider;
 #[cfg(feature = "write")]
+pub mod sql;
+#[cfg(feature = "write")]
 pub mod stats_collect;
 #[cfg(feature = "write")]
 pub mod stats_encode;
@@ -103,6 +106,7 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{DuckLakeFileData, DuckLakeTableFile, MetadataProvider};
+pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
@@ -142,6 +146,8 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 pub use multicatalog::{MulticatalogManager, initialize_multicatalog_schema};
 #[cfg(feature = "multicatalog-postgres")]
 pub use multicatalog_provider::MulticatalogProvider;
+#[cfg(feature = "write")]
+pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
 #[cfg(feature = "write")]

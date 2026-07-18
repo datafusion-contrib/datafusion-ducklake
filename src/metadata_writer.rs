@@ -209,6 +209,15 @@ pub struct DataFileInfo {
     /// caller that predates stats support); backends must treat an empty vector
     /// as "no stats rows for this file", which is spec-safe.
     pub column_stats: Vec<ColumnStat>,
+    /// The partition spec generation (`ducklake_partition_info.partition_id`) this
+    /// file was written under, or `None` for a file of an unpartitioned table.
+    /// When set, the backend stores it on the `ducklake_data_file` row.
+    pub partition_id: Option<i64>,
+    /// The file's partition values as `(partition_key_index, value)` — the single
+    /// transformed value every row in the file shares for each partition key,
+    /// DuckDB-canonical VARCHAR (`None` == SQL NULL). Persisted to
+    /// `ducklake_file_partition_value`. Empty for an unpartitioned file.
+    pub partition_values: Vec<(i32, Option<String>)>,
 }
 
 impl DataFileInfo {
@@ -232,6 +241,8 @@ impl DataFileInfo {
             footer_size: None,
             record_count,
             column_stats: Vec::new(),
+            partition_id: None,
+            partition_values: Vec::new(),
         }
     }
 
@@ -244,6 +255,19 @@ impl DataFileInfo {
     /// Attach per-column statistics to persist to `ducklake_file_column_stats`.
     pub fn with_column_stats(mut self, column_stats: Vec<ColumnStat>) -> Self {
         self.column_stats = column_stats;
+        self
+    }
+
+    /// Attach the partition spec generation and per-key partition values for this
+    /// file (persisted to `ducklake_data_file.partition_id` and
+    /// `ducklake_file_partition_value`). Values are `(partition_key_index, value)`.
+    pub fn with_partition(
+        mut self,
+        partition_id: i64,
+        partition_values: Vec<(i32, Option<String>)>,
+    ) -> Self {
+        self.partition_id = Some(partition_id);
+        self.partition_values = partition_values;
         self
     }
 
@@ -531,6 +555,48 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Set (or replace) the table's partition spec — DuckLake partitioning DDL,
+    /// the commit behind `ALTER TABLE … SET PARTITIONED BY (…)`.
+    ///
+    /// In one transaction: create a new snapshot; end the currently-live
+    /// `ducklake_partition_info` row (and its `ducklake_partition_column` rows) if
+    /// one exists; insert a new generation with a fresh `partition_id` and one
+    /// `ducklake_partition_column` row per `(column_name, transform)` in order
+    /// (each column NAME resolved to the table's live `column_id`); and
+    /// bump/record `schema_version` (setting a spec is DDL). Existing data files
+    /// are left untouched. `columns` must be non-empty (use
+    /// [`reset_partition_spec`](MetadataWriter::reset_partition_spec) to remove a
+    /// spec) and each column must exist; otherwise
+    /// [`crate::DuckLakeError::InvalidConfig`]. Returns the new snapshot id.
+    ///
+    /// Default: unsupported; writable backends override it.
+    fn set_partition_spec(
+        &self,
+        _table_id: i64,
+        _columns: &[(String, crate::partition::PartitionTransform)],
+    ) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "SET PARTITIONED BY is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Remove the table's partition spec — the commit behind `ALTER TABLE …
+    /// RESET PARTITIONED BY`.
+    ///
+    /// In one transaction: create a new snapshot, end the currently-live
+    /// `ducklake_partition_info` row (a no-op if none is live), and bump/record
+    /// `schema_version`. Existing partitioned data files keep their `partition_id`
+    /// and values (they stay readable); only subsequent writes are unpartitioned.
+    /// Returns the new snapshot id (or the current head if there was nothing to
+    /// reset).
+    ///
+    /// Default: unsupported; writable backends override it.
+    fn reset_partition_spec(&self, _table_id: i64) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "RESET PARTITIONED BY is not supported on this metadata backend".to_string(),
+        ))
+    }
+
     /// Register a new data file and publish its snapshot as the catalog head,
     /// atomically. For `Replace`, retires the prior generation in the same
     /// transaction. Returns the committed snapshot id: assigned at this commit
@@ -570,6 +636,52 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds>;
+
+    /// Register MULTIPLE new data files in ONE snapshot — the atomic commit behind
+    /// a partitioned INSERT / CTAS, which writes one file per partition. Like
+    /// [`register_data_file`](MetadataWriter::register_data_file) but commits all
+    /// `files` together: `Replace` retires the prior generation once, then every
+    /// file is added; `Append` just adds them. Each file is assigned a distinct
+    /// `row_id_start` from the advancing row-lineage counter, and its
+    /// `partition_id` / `partition_values` (when set) are persisted. `files` must
+    /// be non-empty. Returns the committed ids.
+    ///
+    /// Default: falls back to a single [`register_data_file`] when exactly one file
+    /// is given (so a non-partitioned write works everywhere), and otherwise errors
+    /// — backends that support partitioned writes override this to commit N files
+    /// atomically in one snapshot.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        match files {
+            [file] => self.register_data_file(
+                table_id,
+                schema_name,
+                table_name,
+                snapshot_id,
+                file,
+                mode,
+                base_snapshot,
+                columns,
+                column_ids,
+            ),
+            _ => Err(DuckLakeError::InvalidConfig(
+                "register_data_files (atomic multi-file / partitioned write) is not \
+                 supported on this metadata backend"
+                    .to_string(),
+            )),
+        }
+    }
 
     /// Register a positional delete file for a single data file, superseding any
     /// prior live delete file for it (at most one is live per data file).

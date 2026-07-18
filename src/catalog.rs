@@ -154,6 +154,17 @@ impl DuckLakeCatalog {
     pub fn provider(&self) -> Arc<dyn MetadataProvider> {
         self.provider.clone()
     }
+
+    /// The metadata writer this catalog was configured with, if any (i.e. it was
+    /// built via [`DuckLakeCatalog::with_writer`]). Used by
+    /// [`crate::execute_ducklake_sql`] to run partition DDL. Returns `None` for a
+    /// read-only catalog.
+    #[cfg(feature = "write")]
+    pub fn writer(&self) -> Option<Arc<dyn MetadataWriter>> {
+        self.write_config
+            .as_ref()
+            .map(|config| Arc::clone(&config.writer))
+    }
 }
 
 impl CatalogProvider for DuckLakeCatalog {

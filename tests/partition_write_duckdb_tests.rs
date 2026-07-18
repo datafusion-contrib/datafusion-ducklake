@@ -1,0 +1,113 @@
+//! Partitioned write validation for the DuckDB backend.
+//!
+//! Exercises the DuckDB writer's partition path directly (`set_partition_spec` +
+//! atomic `register_data_files` with per-file partition values), then reads it
+//! back through the DuckDB provider. The DataFusion INSERT splitting itself is
+//! backend-agnostic and covered by the SQLite tests; this pins the
+//! DuckDB-specific catalog SQL (sequence-allocated `partition_id`, `RETURNING`).
+
+#![cfg(all(feature = "write-duckdb", feature = "metadata-duckdb"))]
+
+use datafusion_ducklake::metadata_provider::MetadataProvider;
+use datafusion_ducklake::partition::PartitionTransform;
+use datafusion_ducklake::{
+    ColumnDef, DataFileInfo, DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataWriter, WriteMode,
+};
+use tempfile::TempDir;
+
+#[test]
+fn duckdb_set_spec_and_register_partition_files() {
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+
+    let table_id;
+    {
+        let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+
+        let cols = vec![
+            ColumnDef::new("id", "int64", false).unwrap(),
+            ColumnDef::new("region", "varchar", true).unwrap(),
+        ];
+        // Create the empty table.
+        let setup = writer
+            .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                setup.table_id,
+                "main",
+                "events",
+                setup.snapshot_id,
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &cols,
+                &setup.column_ids,
+            )
+            .unwrap();
+        table_id = setup.table_id;
+
+        // Partition by region (identity). Fresh catalog → the sequence assigns
+        // partition_id = 1.
+        writer
+            .set_partition_spec(table_id, &[("region".to_string(), PartitionTransform::Identity)])
+            .unwrap();
+
+        // Register two partition files atomically in one snapshot.
+        let files = vec![
+            DataFileInfo::new("region=us/a.parquet", 100, 2)
+                .with_partition(1, vec![(0, Some("us".to_string()))]),
+            DataFileInfo::new("region=eu/b.parquet", 100, 3)
+                .with_partition(1, vec![(0, Some("eu".to_string()))]),
+        ];
+        let setup2 = writer
+            .begin_write_transaction("main", "events", &cols, WriteMode::Append)
+            .unwrap();
+        writer
+            .register_data_files(
+                setup2.table_id,
+                "main",
+                "events",
+                setup2.snapshot_id,
+                &files,
+                WriteMode::Append,
+                setup2.base_snapshot_id,
+                &cols,
+                &setup2.column_ids,
+            )
+            .unwrap();
+        // Writer (and its lock on the DuckDB file) dropped here.
+    }
+
+    let provider = DuckdbMetadataProvider::new(&db_str).unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+
+    let spec = provider
+        .get_partition_spec(table_id, snap)
+        .unwrap()
+        .expect("partition spec present");
+    assert_eq!(spec.columns.len(), 1);
+    assert_eq!(spec.columns[0].transform, PartitionTransform::Identity);
+
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), 2, "two partition files");
+    let mut regions: Vec<String> = page
+        .iter()
+        .filter_map(|m| {
+            m.file
+                .partition_values
+                .iter()
+                .find(|(k, _)| *k == 0)
+                .and_then(|(_, v)| v.clone())
+        })
+        .collect();
+    regions.sort();
+    assert_eq!(regions, vec!["eu".to_string(), "us".to_string()]);
+
+    // Row count = 2 + 3 across the two partition files.
+    assert_eq!(provider.get_table_row_count(table_id, snap).unwrap(), 5);
+}

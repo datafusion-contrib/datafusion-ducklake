@@ -511,6 +511,192 @@ impl DuckLakeTableWriter {
             .with_footer_size(footer_size)
             .with_column_stats(column_stats))
     }
+
+    /// Write a partitioned dataset: each group is written to its own parquet file
+    /// (Hive-style `col=value/…` subpath under the table dir), then ALL files are
+    /// registered in ONE snapshot via
+    /// [`MetadataWriter::register_data_files`](crate::metadata_writer::MetadataWriter::register_data_files).
+    ///
+    /// `arrow_schema` is the table's data columns (no rowid). `partition_id` is the
+    /// active spec generation; `key_names` are the partition-key column names in key
+    /// order (used only to build the readable Hive path — the catalog is
+    /// authoritative). Each group is `(values, batches)` where `values[i]` is the
+    /// DuckDB-canonical partition value (or `None` for NULL) for key `i`, shared by
+    /// every row in `batches`. Groups must be non-empty.
+    pub async fn write_partitioned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        partition_id: i64,
+        key_names: &[String],
+        groups: Vec<(Vec<Option<String>>, Vec<RecordBatch>)>,
+    ) -> Result<WriteResult> {
+        if groups.is_empty() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "write_partitioned: no partition groups".to_string(),
+            ));
+        }
+        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let setup =
+            self.metadata
+                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let schema_with_ids = Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+
+        let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
+        let mut records_written: i64 = 0;
+        for (values, batches) in &groups {
+            // Readable Hive-style relative subpath (catalog is authoritative, so
+            // the encoded value is sanitized for the filesystem without affecting
+            // correctness). Files land under the table dir, registered relative.
+            let mut rel = String::new();
+            for (i, value) in values.iter().enumerate() {
+                let name = key_names.get(i).map(String::as_str).unwrap_or("key");
+                let encoded = match value {
+                    Some(v) => sanitize_partition_path(v),
+                    None => "__HIVE_DEFAULT_PARTITION__".to_string(),
+                };
+                rel = if rel.is_empty() {
+                    format!("{name}={encoded}")
+                } else {
+                    format!("{rel}/{name}={encoded}")
+                };
+            }
+            let file_name = format!("{}.parquet", Uuid::new_v4());
+            let catalog_path = if rel.is_empty() {
+                file_name.clone()
+            } else {
+                format!("{rel}/{file_name}")
+            };
+            let object_path_str = join_paths(&table_key, &catalog_path)?;
+            let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+
+            let mut info = self
+                .write_one_file(
+                    object_path,
+                    schema_with_ids.clone(),
+                    &setup.column_ids,
+                    batches,
+                )
+                .await?;
+            info.path = catalog_path;
+            info.path_is_relative = true;
+            let partition_values: Vec<(i32, Option<String>)> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as i32, v.clone()))
+                .collect();
+            info = info.with_partition(partition_id, partition_values);
+            records_written += info.record_count;
+            file_infos.push(info);
+        }
+
+        let committed = self.metadata.register_data_files(
+            setup.table_id,
+            schema_name,
+            table_name,
+            setup.snapshot_id,
+            &file_infos,
+            mode,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )?;
+
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: file_infos.len(),
+            records_written,
+        })
+    }
+
+    /// Write ONE parquet file (data columns with catalog field-ids, no embedded
+    /// rowid) to `object_path`, streaming through a local staging file, and return
+    /// its [`DataFileInfo`] (path is the object key's basename placeholder — the
+    /// caller overwrites `path`/`path_is_relative`). Harvests per-column stats.
+    async fn write_one_file(
+        &self,
+        object_path: ObjectPath,
+        schema_with_ids: SchemaRef,
+        column_ids: &[i64],
+        batches: &[RecordBatch],
+    ) -> Result<DataFileInfo> {
+        let mut props_builder = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression);
+        if let Some(rows) = self.max_row_group_rows {
+            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
+        }
+        if let Some(bytes) = self.max_row_group_bytes {
+            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
+        }
+        let props = props_builder.build();
+
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+        let mut row_count: i64 = 0;
+        let mut nan_flags: Vec<Option<bool>> = Vec::new();
+        for batch in batches {
+            let batch_with_ids =
+                RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
+            crate::stats_collect::accumulate_nan_flags(
+                &mut nan_flags,
+                &batch_with_ids,
+                column_ids.len(),
+            );
+            writer.write(&batch_with_ids)?;
+            row_count += batch.num_rows() as i64;
+        }
+        let staged = writer.into_inner()?;
+        let mut file = staged
+            .into_inner()
+            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+        let file_size = file.metadata()?.len() as i64;
+        let footer_size = read_footer_size(&mut file)?;
+
+        let local = tokio::fs::File::open(temp.path()).await?;
+        let mut reader = tokio::io::BufReader::new(local);
+        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
+        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+            let _ = upload.abort().await;
+            return Err(e.into());
+        }
+
+        let column_stats =
+            crate::stats_collect::collect_column_stats(temp.path(), column_ids, row_count, &nan_flags);
+
+        Ok(DataFileInfo::new(String::new(), file_size, row_count)
+            .with_footer_size(footer_size)
+            .with_column_stats(column_stats))
+    }
+}
+
+/// Sanitize a partition value for use in a Hive-style directory name. The catalog
+/// (`ducklake_file_partition_value`) is the authoritative source for pruning, so
+/// this only needs to yield a stable, filesystem-safe segment; collisions between
+/// distinct values are harmless (files carry distinct UUID names and distinct
+/// catalog values).
+fn sanitize_partition_path(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Streaming write session. Batches stream to a local staging file; the

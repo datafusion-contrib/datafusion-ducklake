@@ -42,6 +42,7 @@ use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
     columns_differ, validate_name,
 };
+use crate::partition::PartitionTransform;
 use duckdb::{Connection, OptionalExt, Transaction, params};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -59,6 +60,7 @@ CREATE SEQUENCE IF NOT EXISTS ducklake_schema_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_table_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_data_file_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_delete_file_id_seq START 1;
+CREATE SEQUENCE IF NOT EXISTS ducklake_partition_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
@@ -131,7 +133,9 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
     row_id_start BIGINT,
     mapping_id BIGINT,
     begin_snapshot BIGINT NOT NULL,
-    end_snapshot BIGINT
+    end_snapshot BIGINT,
+    -- References ducklake_partition_info.partition_id; NULL when unpartitioned.
+    partition_id BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_table_stats (
@@ -186,6 +190,32 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     path VARCHAR NOT NULL,
     path_is_relative BOOLEAN NOT NULL DEFAULT true,
     schedule_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Partition spec generations (DuckLake spec); end_snapshot NULL == active.
+CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+    partition_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    begin_snapshot BIGINT NOT NULL,
+    end_snapshot BIGINT
+);
+
+-- Partition-key columns for a spec (DuckLake spec), ordered by partition_key_index.
+CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+    partition_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    partition_key_index BIGINT NOT NULL,
+    column_id BIGINT NOT NULL,
+    transform VARCHAR NOT NULL
+);
+
+-- Per-file partition values (DuckLake spec): the value every row in the file
+-- shares for a partition key, DuckDB-canonical VARCHAR (NULL is legal).
+CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+    data_file_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    partition_key_index BIGINT NOT NULL,
+    partition_value VARCHAR
 );
 "#;
 
@@ -399,6 +429,33 @@ fn insert_file_column_stats(
                 stat.max_value.as_deref(),
                 stat.contains_nan,
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Persist a partitioned data file's partition metadata within the commit
+/// transaction: set `ducklake_data_file.partition_id` and insert one
+/// `ducklake_file_partition_value` row per partition key. A no-op for an
+/// unpartitioned file.
+fn insert_partition_metadata(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    data_file_id: i64,
+    file: &DataFileInfo,
+) -> Result<()> {
+    if let Some(partition_id) = file.partition_id {
+        tx.execute(
+            "UPDATE ducklake_data_file SET partition_id = ? WHERE data_file_id = ?",
+            params![partition_id, data_file_id],
+        )?;
+    }
+    for (key_index, value) in &file.partition_values {
+        tx.execute(
+            "INSERT INTO ducklake_file_partition_value
+                 (data_file_id, table_id, partition_key_index, partition_value)
+             VALUES (?, ?, ?, ?)",
+            params![data_file_id, table_id, i64::from(*key_index), value.as_deref()],
         )?;
     }
     Ok(())
@@ -767,6 +824,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         )?;
 
         insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
+        insert_partition_metadata(&tx, table_id, data_file_id, file)?;
         recompute_table_column_stats(&tx, table_id, columns, column_ids)?;
 
         // Advance the counter and accumulate stats. next_row_id monotonically
@@ -792,6 +850,178 @@ impl MetadataWriter for DuckdbMetadataWriter {
             schema_id,
             table_id,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        if files.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_data_files: files must be non-empty".to_string(),
+            ));
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        // One atomic snapshot for all N partition files.
+        let snapshot_id = finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        seed_stats_if_missing(&tx, table_id)?;
+        let mut next_row_id: i64 = tx.query_row(
+            "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        let mut total_records: i64 = 0;
+        let mut total_bytes: i64 = 0;
+        for file in files {
+            let data_file_id: i64 = tx.query_row(
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes,
+                      footer_size, record_count, row_id_start, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING data_file_id",
+                params![
+                    table_id,
+                    file.path.as_str(),
+                    file.path_is_relative,
+                    file.file_size_bytes,
+                    file.footer_size,
+                    file.record_count,
+                    next_row_id,
+                    snapshot_id
+                ],
+                |row| row.get(0),
+            )?;
+            insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
+            insert_partition_metadata(&tx, table_id, data_file_id, file)?;
+            next_row_id += file.record_count;
+            total_records += file.record_count;
+            total_bytes += file.file_size_bytes;
+        }
+        recompute_table_column_stats(&tx, table_id, columns, column_ids)?;
+        tx.execute(
+            "UPDATE ducklake_table_stats
+             SET next_row_id     = next_row_id + ?,
+                 record_count    = record_count + ?,
+                 file_size_bytes = file_size_bytes + ?
+             WHERE table_id = ?",
+            params![total_records, total_records, total_bytes, table_id],
+        )?;
+        let schema_id: i64 = tx.query_row(
+            "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CommitIds {
+            snapshot_id,
+            schema_id,
+            table_id,
+        })
+    }
+
+    fn set_partition_spec(
+        &self,
+        table_id: i64,
+        columns: &[(String, PartitionTransform)],
+    ) -> Result<i64> {
+        if columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_partition_spec: partition spec must have at least one column; \
+                 use reset_partition_spec to remove partitioning"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let partition_id: i64 =
+            tx.query_row("SELECT nextval('ducklake_partition_id_seq')", [], |row| {
+                row.get(0)
+            })?;
+        let (new_snapshot, _carried) = insert_snapshot(&tx)?;
+
+        // Resolve each partition-key column NAME to its live column_id.
+        let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
+        for (name, _transform) in columns {
+            let column_id: i64 = tx
+                .query_row(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                    params![table_id, name.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "set_partition_spec: no live column '{name}' in table {table_id}"
+                    ))
+                })?;
+            column_ids.push(column_id);
+        }
+
+        tx.execute(
+            "UPDATE ducklake_partition_info SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![new_snapshot, table_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_partition_info
+                 (partition_id, table_id, begin_snapshot, end_snapshot)
+             VALUES (?, ?, ?, NULL)",
+            params![partition_id, table_id, new_snapshot],
+        )?;
+        for (key_index, column_id) in column_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO ducklake_partition_column
+                     (partition_id, table_id, partition_key_index, column_id, transform)
+                 VALUES (?, ?, ?, ?, ?)",
+                params![
+                    partition_id,
+                    table_id,
+                    key_index as i64,
+                    *column_id,
+                    columns[key_index].1.to_catalog_string()
+                ],
+            )?;
+        }
+
+        let new_schema_version = bump_schema_version(&tx, new_snapshot)?;
+        record_schema_version(&tx, new_snapshot, new_schema_version, table_id)?;
+        tx.commit()?;
+        Ok(new_snapshot)
+    }
+
+    fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (new_snapshot, _carried) = insert_snapshot(&tx)?;
+        let ended = tx.execute(
+            "UPDATE ducklake_partition_info SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![new_snapshot, table_id],
+        )?;
+        if ended == 0 {
+            // Nothing to reset: roll back the snapshot and report the head.
+            drop(tx);
+            let head: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+                [],
+                |row| row.get(0),
+            )?;
+            return Ok(head);
+        }
+        let new_schema_version = bump_schema_version(&tx, new_snapshot)?;
+        record_schema_version(&tx, new_snapshot, new_schema_version, table_id)?;
+        tx.commit()?;
+        Ok(new_snapshot)
     }
 
     fn publish_snapshot(
@@ -887,6 +1117,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn initialize_schema(&self) -> Result<()> {
         let conn = self.connection();
         conn.execute_batch(SQL_CREATE_SCHEMA)?;
+        // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
+        // (CREATE TABLE IF NOT EXISTS never alters an existing table). DuckDB supports
+        // ADD COLUMN IF NOT EXISTS, so this is idempotent and lossless (NULL means
+        // "not partitioned").
+        conn.execute_batch(
+            "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
+        )?;
         // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, and
         // schema/table/data_file/delete_file ids use sequences, so none of those
         // need a counter). Idempotent on re-open, and seeded from the current MAX

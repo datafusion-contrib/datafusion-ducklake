@@ -5,12 +5,14 @@ use crate::metadata_provider::{
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     MetadataProvider, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
     SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
-    SQL_GET_LATEST_SNAPSHOT, SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
+    SQL_GET_SCHEMA_BY_NAME, SQL_GET_TABLE_BY_NAME,
     SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS,
     SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
     SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
     reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
+use crate::partition::PartitionSpec;
 use duckdb::AccessMode::ReadOnly;
 use duckdb::{Config, Connection, params};
 use std::collections::HashMap;
@@ -234,12 +236,50 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         partial_max: None,
                         max_row_count: record_count,
                         delete_count,
+                        partition_id: None,
+                        partition_values: Vec::new(),
                     })
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(files)
+    }
+
+    fn get_partition_spec(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<PartitionSpec>> {
+        let conn = self.connection();
+        // Safety guard: only prune when the table has exactly one partition-spec
+        // generation ever (the common "set once, never re-partition" case). If the
+        // spec was changed, live files may carry values under a retired generation
+        // whose key order differs, so we conservatively disable partition pruning.
+        let generation_count: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        ) {
+            Ok(count) => count,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if generation_count != 1 {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(SQL_GET_PARTITION_SPEC)?;
+        let rows = stmt
+            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PartitionSpec::from_rows(rows))
     }
 
     fn get_table_summary_statistics(
@@ -399,6 +439,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         partial_max: None,
                         max_row_count: row.get(7)?,
                         delete_count,
+                        partition_id: None,
+                        partition_values: Vec::new(),
                     })
                 },
             )?
@@ -453,13 +495,47 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 .or_default()
                 .push(statistic);
         }
+
+        // Enrich with per-file partition values (for pruning), scoped to the page's
+        // data_file_id range. Rows for files outside the page (e.g. retired at this
+        // snapshot but in-range) are harmless — matched only to files in the page.
+        let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+        match conn.prepare(SQL_GET_FILE_PARTITION_VALUES) {
+            Ok(mut stmt) => {
+                let rows = stmt.query_map(
+                    params![table_id, after_data_file_id.unwrap_or(i64::MIN), last_data_file_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )?;
+                for row in rows {
+                    let (data_file_id, key_index, value) = row?;
+                    values_by_file
+                        .entry(data_file_id)
+                        .or_default()
+                        .push((key_index, value));
+                }
+            },
+            Err(error) if is_missing_statistics_table(&error) => {},
+            Err(error) => return Err(error.into()),
+        }
+
         Ok(files
             .into_iter()
-            .map(|file| DuckLakeFileMetadata {
-                column_statistics: statistics_by_file
-                    .remove(&file.data_file_id)
-                    .unwrap_or_default(),
-                file,
+            .map(|mut file| {
+                if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                    file.partition_values = values;
+                }
+                DuckLakeFileMetadata {
+                    column_statistics: statistics_by_file
+                        .remove(&file.data_file_id)
+                        .unwrap_or_default(),
+                    file,
+                }
             })
             .collect())
     }
@@ -722,6 +798,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             partial_max: None,
                             max_row_count,
                             delete_count: None,
+                            partition_id: None,
+                            partition_values: Vec::new(),
                         },
                     })
                 },

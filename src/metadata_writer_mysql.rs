@@ -33,6 +33,7 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
+use crate::partition::PartitionTransform;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
     columns_differ, validate_name,
@@ -120,7 +121,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
         row_id_start BIGINT,
         mapping_id BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        partition_id BIGINT
     ) ENGINE = InnoDB"#,
     // Per-table row-lineage + running totals. `next_row_id` allocates rowids
     // monotonically over the table's lifetime; `record_count`/`file_size_bytes`
@@ -176,6 +178,29 @@ const SQL_CREATE_TABLES: &[&str] = &[
         path TEXT NOT NULL,
         path_is_relative TINYINT(1) NOT NULL DEFAULT 1,
         schedule_start DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6)
+    ) ENGINE = InnoDB"#,
+    // Partition spec generations (DuckLake spec); end_snapshot NULL == active.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_partition_info (
+        partition_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT
+    ) ENGINE = InnoDB"#,
+    // Partition-key columns for a spec (DuckLake spec), ordered by partition_key_index.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_partition_column (
+        partition_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        partition_key_index BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        transform VARCHAR(1024) NOT NULL
+    ) ENGINE = InnoDB"#,
+    // Per-file partition values (DuckLake spec): the value every row in the file
+    // shares for a partition key, DuckDB-canonical VARCHAR (NULL is legal).
+    r#"CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
+        data_file_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        partition_key_index BIGINT NOT NULL,
+        partition_value TEXT
     ) ENGINE = InnoDB"#,
 ];
 
@@ -453,6 +478,39 @@ async fn insert_file_column_stats(
 
 /// Recompute `ducklake_table_column_stats` from the table's live files and
 /// replace the stored rows. See the SQLite writer's equivalent for the rationale.
+/// Persist a partitioned data file's partition metadata within the commit
+/// transaction: set `ducklake_data_file.partition_id` and insert one
+/// `ducklake_file_partition_value` row per partition key. A no-op for an
+/// unpartitioned file.
+async fn insert_partition_metadata(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    data_file_id: i64,
+    file: &DataFileInfo,
+) -> Result<()> {
+    if let Some(partition_id) = file.partition_id {
+        sqlx::query("UPDATE ducklake_data_file SET partition_id = ? WHERE data_file_id = ?")
+            .bind(partition_id)
+            .bind(data_file_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    for (key_index, value) in &file.partition_values {
+        sqlx::query(
+            "INSERT INTO ducklake_file_partition_value
+                 (data_file_id, table_id, partition_key_index, partition_value)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(i64::from(*key_index))
+        .bind(value.clone())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn recompute_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -858,6 +916,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // last_insert_id(). Persist the file's zone maps + refresh the roll-up.
             let data_file_id = inserted.last_insert_id() as i64;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             // Advance the counter and accumulate stats. `next_row_id`
@@ -889,6 +948,203 @@ impl MetadataWriter for MySqlMetadataWriter {
                 schema_id,
                 table_id,
             })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files(
+        &self,
+        table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        if files.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_data_files: files must be non-empty".to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let snapshot_id =
+                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
+                    .await?;
+            sqlx::query(
+                "INSERT IGNORE INTO ducklake_table_stats
+                     (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES (?, 0, 0, 0)",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let mut next_row_id: i64 =
+                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+            let mut total_records: i64 = 0;
+            let mut total_bytes: i64 = 0;
+            for file in files {
+                let inserted = sqlx::query(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(next_row_id)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+                let data_file_id = inserted.last_insert_id() as i64;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
+                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+                next_row_id += file.record_count;
+                total_records += file.record_count;
+                total_bytes += file.file_size_bytes;
+            }
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            sqlx::query(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id     = next_row_id + ?,
+                     record_count    = record_count + ?,
+                     file_size_bytes = file_size_bytes + ?
+                 WHERE table_id = ?",
+            )
+            .bind(total_records)
+            .bind(total_records)
+            .bind(total_bytes)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let schema_id: i64 =
+                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                    .try_get(0)?;
+            tx.commit().await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
+    fn set_partition_spec(
+        &self,
+        table_id: i64,
+        columns: &[(String, PartitionTransform)],
+    ) -> Result<i64> {
+        if columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_partition_spec: partition spec must have at least one column; \
+                 use reset_partition_spec to remove partitioning"
+                    .to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let partition_id = reserve_ids(&mut tx, "next_partition_id", 1).await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+
+            let mut column_ids: Vec<i64> = Vec::with_capacity(columns.len());
+            for (name, _transform) in columns {
+                let column_id: i64 = sqlx::query_scalar(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| {
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "set_partition_spec: no live column '{name}' in table {table_id}"
+                    ))
+                })?;
+                column_ids.push(column_id);
+            }
+
+            sqlx::query(
+                "UPDATE ducklake_partition_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_partition_info
+                     (partition_id, table_id, begin_snapshot, end_snapshot)
+                 VALUES (?, ?, ?, NULL)",
+            )
+            .bind(partition_id)
+            .bind(table_id)
+            .bind(new_snapshot)
+            .execute(&mut *tx)
+            .await?;
+            for (key_index, column_id) in column_ids.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO ducklake_partition_column
+                         (partition_id, table_id, partition_key_index, column_id, transform)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .bind(key_index as i64)
+                .bind(*column_id)
+                .bind(columns[key_index].1.to_catalog_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
+            record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
+    fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let ended = sqlx::query(
+                "UPDATE ducklake_partition_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if ended == 0 {
+                drop(tx);
+                let head: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+                )
+                .fetch_one(&self.pool)
+                .await?;
+                return Ok(head);
+            }
+            let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
+            record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            tx.commit().await?;
+            Ok(new_snapshot)
         })
     }
 
@@ -1005,6 +1261,22 @@ impl MetadataWriter for MySqlMetadataWriter {
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(ddl).execute(&self.pool).await?;
             }
+            // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
+            // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first
+            // (idempotent, lossless — NULL means "not partitioned").
+            let has_partition_id: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'ducklake_data_file' \
+                   AND column_name = 'partition_id'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if has_partition_id == 0 {
+                sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id BIGINT")
+                    .execute(&self.pool)
+                    .await?;
+            }
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved inside a transaction and read back (no RETURNING and no
             // auto-increment for these), so they live in ducklake_metadata. Seeded
@@ -1020,6 +1292,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                 &self.pool,
                 "next_snapshot_id",
                 "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+            )
+            .await?;
+            seed_counter(
+                &self.pool,
+                "next_partition_id",
+                "SELECT COALESCE(MAX(partition_id), 0) FROM ducklake_partition_info",
             )
             .await?;
             Ok(())

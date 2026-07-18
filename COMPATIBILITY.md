@@ -106,6 +106,8 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
 | Configurable writer output (compression, row-group sizing) | ✅  |
+| Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned) | ✅ |
+| Partitioned writes — split into per-partition files in one snapshot (SQLite; DuckDB/Postgres/MySQL not yet wired), via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`) | 🟧 |
 | Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec) | ✅ |
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and

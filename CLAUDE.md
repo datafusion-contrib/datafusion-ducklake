@@ -228,7 +228,11 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - No `UPDATE` / `DELETE` operations yet (delete files are read but not written)
 - No SQL-level time travel (`AS OF`); a catalog binds to one snapshot, selectable programmatically via `DuckLakeCatalog::with_snapshot`
 - Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
-- No partition-based file pruning on read
+- Partitioning (`identity` + temporal `year`/`month`/`day`/`hour`) is supported: read + pruning on
+  all backends, and partitioned writes on SQLite (via `set_partition_spec`/`reset_partition_spec`
+  or the `ALTER TABLE … SET/RESET PARTITIONED BY` SQL hook `execute_ducklake_sql`). `bucket(N)` is
+  tolerated on read but not pruned or produced; partitioned writes for DuckDB/Postgres/MySQL are
+  not yet wired. See `src/partition.rs`.
 - DuckDB-encrypted (non-PME) Parquet files are not supported
 - Data inlining is not read (see `COMPATIBILITY.md` for the `COUNT(*)` undercount caveat)
 - No optional metadata caching layer (all lookups are dynamic)

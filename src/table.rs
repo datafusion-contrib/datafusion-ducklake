@@ -11,6 +11,7 @@ use crate::metadata_provider::{
     DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile,
     FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
+use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
 use crate::row_id::{
@@ -644,6 +645,12 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Table-level statistics for the physical schema.
     table_statistics: Statistics,
+    /// The table's active partition spec at `snapshot_id`, if any. Loaded once at
+    /// construction and used by `scan()` to synthesize per-file min/max bounds
+    /// (from each file's partition values) for partition pruning. `None` for an
+    /// unpartitioned table, a catalog without partition support, or a table whose
+    /// spec has changed (the provider returns `None` in that case to stay safe).
+    partition_spec: Option<PartitionSpec>,
     /// Per-file row-lineage read config, populated lazily on the rowid scan
     /// path. Each file requires its own parquet metadata read to detect an
     /// embedded `_ducklake_internal_row_id` column; we memoize so repeated
@@ -686,6 +693,9 @@ impl DuckLakeTable {
         // File metadata is deliberately deferred until scan(), where it can be
         // consumed and pruned in bounded pages.
         let columns = provider.get_table_structure(table_id, snapshot_id)?;
+        // Active partition spec (if any) for pruning. Loaded once at the bound
+        // snapshot; `None` for unpartitioned tables or catalogs without partitions.
+        let partition_spec = provider.get_partition_spec(table_id, snapshot_id)?;
         let physical_schema = Arc::new(build_arrow_schema(&columns)?);
         let schema = physical_schema.clone();
         let catalog_statistics = provider.get_table_summary_statistics(table_id, snapshot_id)?;
@@ -718,6 +728,7 @@ impl DuckLakeTable {
             row_lineage: false,
             columns,
             table_statistics,
+            partition_spec,
             #[cfg(feature = "encryption")]
             encryption_factory,
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -828,6 +839,75 @@ impl DuckLakeTable {
     /// kept — and, since the bounds are aggregated per column across all files,
     /// one `Inexact` file suppresses pruning by that column for the whole scan.
     /// Pruning is therefore most effective on append-only / delete-free files.
+    /// Inject partition-derived min/max bounds into per-file statistics so the
+    /// existing pruning path ([`Self::prune_table_files`]) can drop partition files
+    /// that cannot match a predicate on a partition column.
+    ///
+    /// For each file's `partition_values`, map the value through the active spec to
+    /// a source-column min/max envelope ([`crate::partition::PartitionTransform::source_bounds`]
+    /// — `identity` exact, `year` a range; other transforms contribute nothing and
+    /// the file is kept). Only fills a column bound the catalog left `Absent`, so
+    /// real parquet-derived statistics (tighter, and already prunable) are always
+    /// preserved. A NULL partition value or an unmappable column is skipped. The
+    /// synthesized bounds are valid envelopes (`min <= every row <= max`), so
+    /// marking them `Exact` is safe for pruning — a file is never wrongly dropped.
+    fn apply_partition_bounds(
+        &self,
+        table_files: &[DuckLakeTableFile],
+        file_statistics: &mut HashMap<i64, Arc<Statistics>>,
+    ) {
+        let Some(spec) = self.partition_spec.as_ref() else {
+            return;
+        };
+        for file in table_files {
+            if file.partition_values.is_empty() {
+                continue;
+            }
+            let mut updates: Vec<(usize, ScalarValue, ScalarValue)> = Vec::new();
+            for (key_index, value) in &file.partition_values {
+                let Some(value) = value.as_deref() else {
+                    continue; // NULL partition value: cannot bound, keep the file.
+                };
+                let Some(column) = spec
+                    .columns
+                    .iter()
+                    .find(|c| c.partition_key_index == *key_index)
+                else {
+                    continue;
+                };
+                let Some(index) = self
+                    .columns
+                    .iter()
+                    .position(|c| c.column_id == column.column_id)
+                else {
+                    continue;
+                };
+                let data_type = self.physical_schema.field(index).data_type();
+                if let Some((min, max)) = column.transform.source_bounds(value, data_type) {
+                    updates.push((index, min, max));
+                }
+            }
+            if updates.is_empty() {
+                continue;
+            }
+            let Some(stats) = file_statistics.get_mut(&file.data_file_id) else {
+                continue;
+            };
+            let stats = Arc::make_mut(stats);
+            for (index, min, max) in updates {
+                let Some(column_statistics) = stats.column_statistics.get_mut(index) else {
+                    continue;
+                };
+                if matches!(column_statistics.min_value, Precision::Absent) {
+                    column_statistics.min_value = Precision::Exact(min);
+                }
+                if matches!(column_statistics.max_value, Precision::Absent) {
+                    column_statistics.max_value = Precision::Exact(max);
+                }
+            }
+        }
+    }
+
     fn prune_table_files<'a>(
         &self,
         pruning: Option<&PruningPredicate>,
@@ -1837,6 +1917,7 @@ impl DuckLakeTable {
             row_lineage: false,
             columns: self.columns.clone(),
             table_statistics: self.table_statistics.clone(),
+            partition_spec: self.partition_spec.clone(),
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2309,7 +2390,7 @@ impl TableProvider for DuckLakeTable {
                 table_files.push(file);
                 catalog_file_statistics.extend(column_statistics);
             }
-            let (_, file_statistics) = build_datafusion_statistics(
+            let (_, mut file_statistics) = build_datafusion_statistics(
                 self.physical_schema.as_ref(),
                 &self.columns,
                 &table_files,
@@ -2320,6 +2401,9 @@ impl TableProvider for DuckLakeTable {
                 false,
                 true,
             );
+            // Synthesize per-file bounds from partition values so partition columns
+            // prune even when a file carries no parquet-derived column statistics.
+            self.apply_partition_bounds(&table_files, &mut file_statistics);
             #[cfg(feature = "encryption")]
             self.configure_encryption_factory(&table_files)?;
 
@@ -2464,6 +2548,45 @@ impl TableProvider for DuckLakeTable {
             InsertOp::Overwrite | InsertOp::Replace => WriteMode::Replace,
         };
 
+        // Resolve the active partition spec (if any) into the write-side form so
+        // the insert exec splits rows into per-partition files. A spec whose
+        // transform we cannot PRODUCE (bucket/unknown) makes a partitioned INSERT
+        // unsupported — reject rather than silently writing unpartitioned files
+        // that would violate the spec.
+        let partition = match self.partition_spec.as_ref() {
+            None => None,
+            Some(spec) => {
+                let mut keys = Vec::with_capacity(spec.columns.len());
+                for column in &spec.columns {
+                    if !column.transform.is_producible() {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "INSERT into a table partitioned by '{}' is not supported",
+                            column.transform.to_catalog_string()
+                        )));
+                    }
+                    let index = self
+                        .columns
+                        .iter()
+                        .position(|c| c.column_id == column.column_id)
+                        .ok_or_else(|| {
+                            DataFusionError::Internal(format!(
+                                "partition column_id {} not found in table schema",
+                                column.column_id
+                            ))
+                        })?;
+                    keys.push(crate::insert_exec::PartitionWriteKey {
+                        input_index: index,
+                        name: self.physical_schema.field(index).name().to_string(),
+                        transform: column.transform.clone(),
+                    });
+                }
+                Some(crate::insert_exec::PartitionWriteSpec {
+                    partition_id: spec.partition_id,
+                    keys,
+                })
+            },
+        };
+
         Ok(Arc::new(DuckLakeInsertExec::new(
             input,
             Arc::clone(writer),
@@ -2472,6 +2595,7 @@ impl TableProvider for DuckLakeTable {
             self.schema(),
             write_mode,
             self.object_store_url.clone(),
+            partition,
         )))
     }
 
@@ -2815,6 +2939,8 @@ mod tests {
                         partial_max: None,
                         max_row_count: Some(1),
                         delete_count: None,
+                        partition_id: None,
+                        partition_values: Vec::new(),
                     },
                     column_statistics: vec![DuckLakeFileColumnStatistics {
                         data_file_id,
