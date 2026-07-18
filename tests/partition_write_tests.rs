@@ -35,7 +35,9 @@ async fn setup() -> Env {
     std::fs::create_dir_all(&data_path).unwrap();
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
@@ -229,7 +231,9 @@ async fn create_events_table_no_spec() -> (String, i64, TempDir) {
     std::fs::create_dir_all(&data_path).unwrap();
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
 
-    let writer = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
     let cols = vec![
@@ -258,7 +262,8 @@ async fn create_events_table_no_spec() -> (String, i64, TempDir) {
 async fn writable_catalog(conn_str: &str) -> (SessionContext, Arc<DuckLakeCatalog>) {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
-    let catalog = Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap());
+    let catalog =
+        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap());
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "ducklake",
@@ -345,10 +350,15 @@ async fn insert_stays_partitioned_after_repartition() {
     // make subsequent INSERTs write unpartitioned files under the live spec.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
     {
-        let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
-        // Two generations: region (identity) then year(ts).
-        w.set_partition_spec(table_id, &[("region".to_string(), PartitionTransform::Identity)])
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
             .unwrap();
+        // Two generations: region (identity) then year(ts).
+        w.set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
         w.set_partition_spec(table_id, &[("ts".to_string(), PartitionTransform::Year)])
             .unwrap();
     }

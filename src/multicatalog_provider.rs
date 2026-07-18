@@ -374,11 +374,7 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
-    fn get_partition_spec(
-        &self,
-        table_id: i64,
-        snapshot_id: i64,
-    ) -> Result<Option<PartitionSpec>> {
+    fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         // Keyed by the globally-unique table_id, so no catalog scoping is needed.
         block_on(async {
             let generation_count: i64 = match sqlx::query_scalar(
@@ -571,8 +567,7 @@ impl MetadataProvider for MulticatalogProvider {
                 Ok(rows) => {
                     for row in rows {
                         let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 =
-                            i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
                         let value: Option<String> = row.try_get(2)?;
                         values_by_file
                             .entry(data_file_id)

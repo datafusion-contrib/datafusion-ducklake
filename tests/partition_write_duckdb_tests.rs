@@ -11,7 +11,8 @@
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
-    ColumnDef, DataFileInfo, DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataWriter, WriteMode,
+    ColumnDef, DataFileInfo, DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataWriter,
+    WriteMode,
 };
 use tempfile::TempDir;
 
@@ -52,7 +53,10 @@ fn duckdb_set_spec_and_register_partition_files() {
         // Partition by region (identity). Fresh catalog → the sequence assigns
         // partition_id = 1.
         writer
-            .set_partition_spec(table_id, &[("region".to_string(), PartitionTransform::Identity)])
+            .set_partition_spec(
+                table_id,
+                &[("region".to_string(), PartitionTransform::Identity)],
+            )
             .unwrap();
 
         // Register two partition files atomically in one snapshot.

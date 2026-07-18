@@ -129,7 +129,10 @@ fn parse_partition_ddl(sql: &str) -> DataFusionResult<Option<PartitionDdl>> {
         parser.expect_token(&Token::RParen).map_err(parse_err)?;
         let transforms = parse_transforms(exprs)?;
         expect_statement_end(&mut parser)?;
-        Ok(Some(PartitionDdl::Set { table, transforms }))
+        Ok(Some(PartitionDdl::Set {
+            table,
+            transforms,
+        }))
     } else if parser.parse_keyword(Keyword::RESET) {
         if !parser.parse_keyword(Keyword::PARTITIONED) {
             return Ok(None);
@@ -140,7 +143,9 @@ fn parse_partition_ddl(sql: &str) -> DataFusionResult<Option<PartitionDdl>> {
             ));
         }
         expect_statement_end(&mut parser)?;
-        Ok(Some(PartitionDdl::Reset { table }))
+        Ok(Some(PartitionDdl::Reset {
+            table,
+        }))
     } else {
         Ok(None)
     }
@@ -268,11 +273,18 @@ async fn apply_partition_ddl(
     let provider = catalog.provider();
     // Partition DDL targets the catalog head (writes commit on top of it), so
     // resolve the table at the current snapshot rather than any pinned one.
-    let snapshot = provider.get_current_snapshot().map_err(DataFusionError::from)?;
+    let snapshot = provider
+        .get_current_snapshot()
+        .map_err(DataFusionError::from)?;
 
     let (parts, transforms) = match ddl {
-        PartitionDdl::Set { table, transforms } => (table, Some(transforms)),
-        PartitionDdl::Reset { table } => (table, None),
+        PartitionDdl::Set {
+            table,
+            transforms,
+        } => (table, Some(transforms)),
+        PartitionDdl::Reset {
+            table,
+        } => (table, None),
     };
     let (schema_name, table_name) = resolve_schema_table(&parts)?;
 

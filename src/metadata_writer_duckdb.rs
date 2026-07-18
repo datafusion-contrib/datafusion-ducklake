@@ -873,7 +873,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         // One atomic snapshot for all N partition files.
-        let snapshot_id = finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        let snapshot_id =
+            finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
         seed_stats_if_missing(&tx, table_id)?;
         let mut next_row_id: i64 = tx.query_row(
             "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",

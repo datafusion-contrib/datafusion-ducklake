@@ -275,11 +275,7 @@ impl MetadataProvider for MySqlMetadataProvider {
         })
     }
 
-    fn get_partition_spec(
-        &self,
-        table_id: i64,
-        snapshot_id: i64,
-    ) -> Result<Option<PartitionSpec>> {
+    fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         block_on(async {
             // Pruning is only safe with exactly one spec generation ever (see
             // PartitionSpec::prune_safe); the live spec is returned regardless so
@@ -434,8 +430,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 Ok(rows) => {
                     for row in rows {
                         let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 =
-                            i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
                         let value: Option<String> = row.try_get(2)?;
                         values_by_file
                             .entry(data_file_id)

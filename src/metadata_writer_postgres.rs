@@ -12,12 +12,12 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
-use crate::partition::PartitionTransform;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
     validate_name,
 };
+use crate::partition::PartitionTransform;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -1583,7 +1583,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .fetch_one(&mut *tx)
                 .await?;
                 let data_file_id: i64 = inserted.try_get(0)?;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 next_row_id += file.record_count;
                 total_records += file.record_count;

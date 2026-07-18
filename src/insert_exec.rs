@@ -233,8 +233,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 let output_schema_ref: SchemaRef = Arc::new(schema_without_metadata.clone());
                 let groups = split_batches_by_partition(&output_schema_ref, &batches, spec)?;
                 if !groups.is_empty() {
-                    let key_names: Vec<String> =
-                        spec.keys.iter().map(|k| k.name.clone()).collect();
+                    let key_names: Vec<String> = spec.keys.iter().map(|k| k.name.clone()).collect();
                     let result = table_writer
                         .write_partitioned(
                             &schema_name,
@@ -334,7 +333,10 @@ fn split_batches_by_partition(
     // Transform each partition-key column once for the whole dataset.
     let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
     for key in &spec.keys {
-        transformed.push(transform_array(&key.transform, combined.column(key.input_index))?);
+        transformed.push(transform_array(
+            &key.transform,
+            combined.column(key.input_index),
+        )?);
     }
 
     // Group row indices by the encoded partition-value tuple.
@@ -409,16 +411,22 @@ mod tests {
 
     #[test]
     fn split_groups_by_identity_and_keeps_null_partition() {
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, true)]));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(StringArray::from(vec![Some("us"), None, Some("us")])) as ArrayRef],
         )
         .unwrap();
-        let groups =
-            split_batches_by_partition(&schema, std::slice::from_ref(&batch), &identity_region_spec())
-                .unwrap();
+        let groups = split_batches_by_partition(
+            &schema,
+            std::slice::from_ref(&batch),
+            &identity_region_spec(),
+        )
+        .unwrap();
         // "us" (2 rows) and a legitimate NULL partition (1 row).
         assert_eq!(groups.len(), 2);
         let total: usize = groups
@@ -434,8 +442,11 @@ mod tests {
 
     #[test]
     fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
-        let schema: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, true)]));
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
         // A NUL byte makes the value unencodable (encode_scalar returns None) but it
         // is NOT null — it must error, not silently collapse into a NULL partition
         // and commingle with genuinely-null rows.
@@ -444,9 +455,12 @@ mod tests {
             vec![Arc::new(StringArray::from(vec![Some("a\u{0}b")])) as ArrayRef],
         )
         .unwrap();
-        let err =
-            split_batches_by_partition(&schema, std::slice::from_ref(&batch), &identity_region_spec())
-                .unwrap_err();
+        let err = split_batches_by_partition(
+            &schema,
+            std::slice::from_ref(&batch),
+            &identity_region_spec(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string().to_lowercase().contains("encode"),
             "expected an encode error, got: {err}"

@@ -548,7 +548,8 @@ impl DuckLakeTableWriter {
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-        let schema_with_ids = Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
 
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
@@ -678,8 +679,12 @@ impl DuckLakeTableWriter {
             return Err(e.into());
         }
 
-        let column_stats =
-            crate::stats_collect::collect_column_stats(temp.path(), column_ids, row_count, &nan_flags);
+        let column_stats = crate::stats_collect::collect_column_stats(
+            temp.path(),
+            column_ids,
+            row_count,
+            &nan_flags,
+        );
 
         Ok(DataFileInfo::new(String::new(), file_size, row_count)
             .with_footer_size(footer_size)

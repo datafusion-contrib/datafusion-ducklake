@@ -214,7 +214,10 @@ impl PartitionSpec {
     /// (unpartitioned). `prune_safe` records whether pruning may use this mapping
     /// (see [`PartitionSpec::prune_safe`]). Every row is expected to carry the same
     /// `partition_id`; the first row's id is used.
-    pub fn from_rows(rows: Vec<(i64, i32, i64, String)>, prune_safe: bool) -> Option<PartitionSpec> {
+    pub fn from_rows(
+        rows: Vec<(i64, i32, i64, String)>,
+        prune_safe: bool,
+    ) -> Option<PartitionSpec> {
         let partition_id = rows.first()?.0;
         let columns = rows
             .into_iter()
@@ -308,7 +311,11 @@ mod tests {
         assert_eq!(PartitionTransform::Year.source_bounds("2023", &tz), None);
         // Naive timestamps and dates still get an envelope.
         let naive = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
-        assert!(PartitionTransform::Year.source_bounds("2023", &naive).is_some());
+        assert!(
+            PartitionTransform::Year
+                .source_bounds("2023", &naive)
+                .is_some()
+        );
     }
 
     #[test]
