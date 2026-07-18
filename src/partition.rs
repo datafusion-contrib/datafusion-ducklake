@@ -139,7 +139,11 @@ fn year_bounds(year: i64, data_type: &DataType) -> Option<(ScalarValue, ScalarVa
         DataType::Date32 | DataType::Date64 => {
             (format!("{year}-01-01"), format!("{}-01-01", year + 1))
         },
-        DataType::Timestamp(_, _) => (
+        // Only time-zone-NAIVE timestamps: DuckDB computes `year(timestamptz)` in
+        // the session time zone, so a UTC-anchored envelope could exclude real
+        // rows near the year boundary. For tz-aware timestamps we derive no
+        // envelope (temporal pruning then relies on real column zone-maps).
+        DataType::Timestamp(_, None) => (
             format!("{year}-01-01 00:00:00"),
             format!("{}-01-01 00:00:00", year + 1),
         ),
@@ -181,6 +185,17 @@ pub struct PartitionSpec {
     pub partition_id: i64,
     /// Partition-key columns, ordered by `partition_key_index`.
     pub columns: Vec<PartitionSpecColumn>,
+    /// Whether this spec's `partition_key_index → column` mapping may safely be
+    /// used to PRUNE arbitrary live files by their stored partition values.
+    ///
+    /// True only when the table has exactly one partition-spec generation ever, so
+    /// every live file's values were written under this same mapping. After a
+    /// re-partition (`SET`→`SET`, or `SET`→`RESET`→`SET`) a live file could carry
+    /// values from a RETIRED generation whose key order differs, so mapping them
+    /// through this spec could mis-prune — pruning is therefore disabled
+    /// (`false`). It does NOT affect the write path: a write always targets the
+    /// single live generation, which is unambiguous regardless of history.
+    pub prune_safe: bool,
 }
 
 impl PartitionSpec {
@@ -194,11 +209,12 @@ impl PartitionSpec {
 
     /// Build a spec from catalog rows `(partition_id, partition_key_index,
     /// column_id, transform)` (the join of `ducklake_partition_info` and
-    /// `ducklake_partition_column`, ordered by `partition_key_index`). Returns
-    /// `None` when there are no rows (unpartitioned). Every row is expected to
-    /// carry the same `partition_id` (the single active generation); the first
-    /// row's id is used.
-    pub fn from_rows(rows: Vec<(i64, i32, i64, String)>) -> Option<PartitionSpec> {
+    /// `ducklake_partition_column`, ordered by `partition_key_index`) for the
+    /// single LIVE generation. Returns `None` when there are no rows
+    /// (unpartitioned). `prune_safe` records whether pruning may use this mapping
+    /// (see [`PartitionSpec::prune_safe`]). Every row is expected to carry the same
+    /// `partition_id`; the first row's id is used.
+    pub fn from_rows(rows: Vec<(i64, i32, i64, String)>, prune_safe: bool) -> Option<PartitionSpec> {
         let partition_id = rows.first()?.0;
         let columns = rows
             .into_iter()
@@ -213,6 +229,7 @@ impl PartitionSpec {
         Some(PartitionSpec {
             partition_id,
             columns,
+            prune_safe,
         })
     }
 }
@@ -281,6 +298,17 @@ mod tests {
             ScalarValue::try_from_string("2024-01-01".to_string(), &DataType::Date32).unwrap();
         assert_eq!(min, expected_min);
         assert_eq!(max, expected_max);
+    }
+
+    #[test]
+    fn year_on_tz_aware_timestamp_has_no_bounds() {
+        // year(timestamptz) is session-tz-dependent; deriving a UTC envelope could
+        // wrongly drop rows near the year boundary, so we produce no bounds.
+        let tz = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()));
+        assert_eq!(PartitionTransform::Year.source_bounds("2023", &tz), None);
+        // Naive timestamps and dates still get an envelope.
+        let naive = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+        assert!(PartitionTransform::Year.source_bounds("2023", &naive).is_some());
     }
 
     #[test]

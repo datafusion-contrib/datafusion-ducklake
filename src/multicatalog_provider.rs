@@ -392,10 +392,8 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) if is_missing_statistics_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            if generation_count != 1 {
-                return Ok(None);
-            }
-            let rows = sqlx::query(
+            let prune_safe = generation_count == 1;
+            let rows = match sqlx::query(
                 "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
                  JOIN ducklake_partition_column AS pc
@@ -409,7 +407,12 @@ impl MetadataProvider for MulticatalogProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
             let parsed = rows
                 .iter()
                 .map(|row| {
@@ -421,7 +424,7 @@ impl MetadataProvider for MulticatalogProvider {
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(PartitionSpec::from_rows(parsed))
+            Ok(PartitionSpec::from_rows(parsed, prune_safe))
         })
     }
 

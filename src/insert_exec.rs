@@ -343,7 +343,27 @@ fn split_batches_by_partition(
         let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
         for array in &transformed {
             let scalar = ScalarValue::try_from_array(array, row)?;
-            values.push(crate::stats_encode::encode_scalar(&scalar));
+            // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
+            // non-null value of a type it cannot encode. Those must not be
+            // conflated: silently mapping an unencodable non-null value to `None`
+            // would group every distinct such value into one file with a NULL
+            // partition value (data corruption). A NULL is a legitimate partition
+            // value; an unencodable non-null value is a hard error.
+            let encoded = if scalar.is_null() {
+                None
+            } else {
+                match crate::stats_encode::encode_scalar(&scalar) {
+                    Some(encoded) => Some(encoded),
+                    None => {
+                        return Err(DataFusionError::NotImplemented(format!(
+                            "partitioned write: partition-key value of type {} cannot be \
+                             encoded; partitioning by this column type is not supported",
+                            array.data_type()
+                        )));
+                    },
+                }
+            };
+            values.push(encoded);
         }
         groups.entry(values).or_default().push(row as u32);
     }
@@ -366,6 +386,7 @@ fn split_batches_by_partition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StringArray;
 
     #[test]
     fn test_insert_count_schema() {
@@ -373,5 +394,62 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "count");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
+    }
+
+    fn identity_region_spec() -> PartitionWriteSpec {
+        PartitionWriteSpec {
+            partition_id: 1,
+            keys: vec![PartitionWriteKey {
+                input_index: 0,
+                name: "region".to_string(),
+                transform: PartitionTransform::Identity,
+            }],
+        }
+    }
+
+    #[test]
+    fn split_groups_by_identity_and_keeps_null_partition() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("us"), None, Some("us")])) as ArrayRef],
+        )
+        .unwrap();
+        let groups =
+            split_batches_by_partition(&schema, std::slice::from_ref(&batch), &identity_region_spec())
+                .unwrap();
+        // "us" (2 rows) and a legitimate NULL partition (1 row).
+        assert_eq!(groups.len(), 2);
+        let total: usize = groups
+            .iter()
+            .flat_map(|(_, b)| b)
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 3);
+        let mut values: Vec<Option<String>> = groups.iter().map(|(v, _)| v[0].clone()).collect();
+        values.sort();
+        assert_eq!(values, vec![None, Some("us".to_string())]);
+    }
+
+    #[test]
+    fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("region", DataType::Utf8, true)]));
+        // A NUL byte makes the value unencodable (encode_scalar returns None) but it
+        // is NOT null — it must error, not silently collapse into a NULL partition
+        // and commingle with genuinely-null rows.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("a\u{0}b")])) as ArrayRef],
+        )
+        .unwrap();
+        let err =
+            split_batches_by_partition(&schema, std::slice::from_ref(&batch), &identity_region_spec())
+                .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("encode"),
+            "expected an encode error, got: {err}"
+        );
     }
 }

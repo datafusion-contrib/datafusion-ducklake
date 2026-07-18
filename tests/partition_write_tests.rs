@@ -338,3 +338,46 @@ async fn sql_hook_delegates_non_partition_sql() {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_stays_partitioned_after_repartition() {
+    // Regression: a SECOND partition-spec change (re-partition) must not silently
+    // make subsequent INSERTs write unpartitioned files under the live spec.
+    let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
+    {
+        let w = SqliteMetadataWriter::new_with_init(&conn_str).await.unwrap();
+        // Two generations: region (identity) then year(ts).
+        w.set_partition_spec(table_id, &[("region".to_string(), PartitionTransform::Identity)])
+            .unwrap();
+        w.set_partition_spec(table_id, &[("ts".to_string(), PartitionTransform::Year)])
+            .unwrap();
+    }
+
+    write_ctx(&conn_str)
+        .await
+        .sql(INSERT_SQL)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // The INSERT must partition by the LIVE spec (year(ts)) → one file per year,
+    // not a single unpartitioned file.
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snapshot, None, 4096)
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        2,
+        "re-partitioned INSERT must produce one file per year, not one unpartitioned file"
+    );
+    let mut years: Vec<String> = page
+        .iter()
+        .filter_map(|m| m.file.partition_values.first().and_then(|(_, v)| v.clone()))
+        .collect();
+    years.sort();
+    assert_eq!(years, vec!["2023".to_string(), "2024".to_string()]);
+}

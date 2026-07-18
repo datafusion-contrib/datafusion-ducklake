@@ -252,10 +252,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
         snapshot_id: i64,
     ) -> crate::Result<Option<PartitionSpec>> {
         let conn = self.connection();
-        // Safety guard: only prune when the table has exactly one partition-spec
-        // generation ever (the common "set once, never re-partition" case). If the
-        // spec was changed, live files may carry values under a retired generation
-        // whose key order differs, so we conservatively disable partition pruning.
+        // Pruning is only safe with exactly one spec generation ever (the common
+        // "set once" case); after a re-partition a live file may carry values under
+        // a retired generation whose key order differs (see PartitionSpec::prune_safe).
+        // The live spec is returned regardless so the write path always targets the
+        // current generation.
         let generation_count: i64 = match conn.query_row(
             "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ?",
             params![table_id],
@@ -265,21 +266,22 @@ impl MetadataProvider for DuckdbMetadataProvider {
             Err(error) if is_missing_statistics_table(&error) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if generation_count != 1 {
-            return Ok(None);
-        }
-        let mut stmt = conn.prepare(SQL_GET_PARTITION_SPEC)?;
-        let rows = stmt
-            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(PartitionSpec::from_rows(rows))
+        let prune_safe = generation_count == 1;
+        let rows = match conn.prepare(SQL_GET_PARTITION_SPEC) {
+            Ok(mut stmt) => stmt
+                .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(PartitionSpec::from_rows(rows, prune_safe))
     }
 
     fn get_table_summary_statistics(

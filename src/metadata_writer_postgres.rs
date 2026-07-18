@@ -2507,6 +2507,14 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .bind(&source_data_ids)
                     .execute(&mut *tx)
                     .await?;
+                    // Likewise the removed sources' per-file partition values
+                    // (mirrors the SQLite compaction path).
+                    sqlx::query(
+                        "DELETE FROM ducklake_file_partition_value WHERE data_file_id = ANY($1)",
+                    )
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
                 },
                 SourceRetirement::Retire => {
                     // Rewrite: the sources still serve time travel to pre-compaction

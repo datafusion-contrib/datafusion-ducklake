@@ -848,9 +848,11 @@ impl DuckLakeTable {
     /// — `identity` exact, `year` a range; other transforms contribute nothing and
     /// the file is kept). Only fills a column bound the catalog left `Absent`, so
     /// real parquet-derived statistics (tighter, and already prunable) are always
-    /// preserved. A NULL partition value or an unmappable column is skipped. The
-    /// synthesized bounds are valid envelopes (`min <= every row <= max`), so
-    /// marking them `Exact` is safe for pruning — a file is never wrongly dropped.
+    /// preserved. A NULL partition value or an unmappable column is skipped. A bound
+    /// is marked `Exact` only when `min == max` (a genuine single-value extreme);
+    /// a widened envelope stays `Inexact` so it can never corrupt MIN/MAX-from-
+    /// statistics. Either way the envelope satisfies `min <= every row <= max`, so a
+    /// file is never wrongly dropped.
     fn apply_partition_bounds(
         &self,
         table_files: &[DuckLakeTableFile],
@@ -859,6 +861,14 @@ impl DuckLakeTable {
         let Some(spec) = self.partition_spec.as_ref() else {
             return;
         };
+        // Only prune when the spec's key→column mapping is known to apply to every
+        // live file (a single spec generation ever). After a re-partition a file's
+        // values could belong to a retired generation with a different key order,
+        // so mapping them through the current spec could mis-prune — skip pruning
+        // then (the write path still uses the live spec via `insert_into`).
+        if !spec.prune_safe {
+            return;
+        }
         for file in table_files {
             if file.partition_values.is_empty() {
                 continue;
@@ -898,11 +908,29 @@ impl DuckLakeTable {
                 let Some(column_statistics) = stats.column_statistics.get_mut(index) else {
                     continue;
                 };
+                // Mark the bound `Exact` ONLY when the file holds a single value for
+                // the column (`min == max`, e.g. `identity` or an integer `year`
+                // column) — then min/max ARE the true extremes, safe both for pruning
+                // (`PrunableStatistics` prunes only on `Exact`) and for MIN/MAX-from-
+                // statistics. A widened envelope (e.g. `year` on a timestamp) is
+                // `Inexact`: it must never be treated as the exact extreme, or
+                // `SELECT max(ts)` could be answered from the year boundary. `Inexact`
+                // does not prune, so widened partition bounds rely on real column
+                // statistics (which DuckLake writers produce) for pruning.
+                let exact = min == max;
                 if matches!(column_statistics.min_value, Precision::Absent) {
-                    column_statistics.min_value = Precision::Exact(min);
+                    column_statistics.min_value = if exact {
+                        Precision::Exact(min)
+                    } else {
+                        Precision::Inexact(min)
+                    };
                 }
                 if matches!(column_statistics.max_value, Precision::Absent) {
-                    column_statistics.max_value = Precision::Exact(max);
+                    column_statistics.max_value = if exact {
+                        Precision::Exact(max)
+                    } else {
+                        Precision::Inexact(max)
+                    };
                 }
             }
         }

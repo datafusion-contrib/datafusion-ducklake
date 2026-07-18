@@ -76,6 +76,20 @@ fn parse_err(error: ParserError) -> DataFusionError {
     DataFusionError::Plan(format!("partition DDL parse error: {error}"))
 }
 
+/// After a recognized partition-DDL statement, reject any trailing input (a lone
+/// terminating `;` is allowed) so e.g. `… SET PARTITIONED BY (a) DROP TABLE x` is
+/// an error rather than a silently-applied `SET (a)`.
+fn expect_statement_end(parser: &mut Parser) -> DataFusionResult<()> {
+    let _ = parser.consume_token(&Token::SemiColon);
+    let next = parser.peek_token().token;
+    if next != Token::EOF {
+        return Err(DataFusionError::Plan(format!(
+            "unexpected trailing input after partition DDL near '{next}'"
+        )));
+    }
+    Ok(())
+}
+
 /// Recognize `ALTER TABLE <name> {SET|RESET} PARTITIONED BY [...]`. Returns
 /// `Ok(None)` when the statement is not partition DDL (so the caller delegates to
 /// `ctx.sql`), `Ok(Some(_))` when it is well-formed, and `Err` when it is clearly
@@ -114,6 +128,7 @@ fn parse_partition_ddl(sql: &str) -> DataFusionResult<Option<PartitionDdl>> {
             .map_err(parse_err)?;
         parser.expect_token(&Token::RParen).map_err(parse_err)?;
         let transforms = parse_transforms(exprs)?;
+        expect_statement_end(&mut parser)?;
         Ok(Some(PartitionDdl::Set { table, transforms }))
     } else if parser.parse_keyword(Keyword::RESET) {
         if !parser.parse_keyword(Keyword::PARTITIONED) {
@@ -124,6 +139,7 @@ fn parse_partition_ddl(sql: &str) -> DataFusionResult<Option<PartitionDdl>> {
                 "expected BY after RESET PARTITIONED".to_string(),
             ));
         }
+        expect_statement_end(&mut parser)?;
         Ok(Some(PartitionDdl::Reset { table }))
     } else {
         Ok(None)

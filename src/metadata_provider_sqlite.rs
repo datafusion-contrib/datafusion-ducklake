@@ -419,8 +419,9 @@ impl MetadataProvider for SqliteMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Option<PartitionSpec>> {
         block_on(async {
-            // Safety guard: only prune when the table has exactly one partition-spec
-            // generation ever (see the DuckDB provider for the rationale).
+            // Pruning is only safe with exactly one spec generation ever (see
+            // PartitionSpec::prune_safe); the live spec is returned regardless so
+            // the write path always targets the current generation.
             let generation_count: i64 = match sqlx::query_scalar(
                 "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ?",
             )
@@ -432,15 +433,18 @@ impl MetadataProvider for SqliteMetadataProvider {
                 Err(error) if is_missing_statistics_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            if generation_count != 1 {
-                return Ok(None);
-            }
-            let rows = sqlx::query(SQL_GET_PARTITION_SPEC)
+            let prune_safe = generation_count == 1;
+            let rows = match sqlx::query(SQL_GET_PARTITION_SPEC)
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
                 .fetch_all(&self.pool)
-                .await?;
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
             let parsed = rows
                 .iter()
                 .map(|row| {
@@ -452,7 +456,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(PartitionSpec::from_rows(parsed))
+            Ok(PartitionSpec::from_rows(parsed, prune_safe))
         })
     }
 
