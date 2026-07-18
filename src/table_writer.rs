@@ -25,6 +25,11 @@ use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
 
+/// One partition group for a partitioned write: the per-key partition values
+/// every row in the group shares (`values[i]` for partition key `i`, `None` ==
+/// SQL NULL), and the row batches for that partition.
+pub type PartitionGroup = (Vec<Option<String>>, Vec<RecordBatch>);
+
 /// High-level writer for DuckLake tables.
 #[derive(Debug)]
 pub struct DuckLakeTableWriter {
@@ -523,6 +528,7 @@ impl DuckLakeTableWriter {
     /// authoritative). Each group is `(values, batches)` where `values[i]` is the
     /// DuckDB-canonical partition value (or `None` for NULL) for key `i`, shared by
     /// every row in `batches`. Groups must be non-empty.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_partitioned(
         &self,
         schema_name: &str,
@@ -531,7 +537,7 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         partition_id: i64,
         key_names: &[String],
-        groups: Vec<(Vec<Option<String>>, Vec<RecordBatch>)>,
+        groups: Vec<PartitionGroup>,
     ) -> Result<WriteResult> {
         if groups.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(

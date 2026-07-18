@@ -20,7 +20,7 @@ use futures::stream::{self, TryStreamExt};
 
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::partition::PartitionTransform;
-use crate::table_writer::DuckLakeTableWriter;
+use crate::table_writer::{DuckLakeTableWriter, PartitionGroup};
 
 /// Resolved partition spec for the write path: how `DuckLakeInsertExec` splits
 /// incoming rows into per-partition files. Built by `DuckLakeTable::insert_into`
@@ -317,7 +317,7 @@ fn split_batches_by_partition(
     output_schema: &SchemaRef,
     batches: &[RecordBatch],
     spec: &PartitionWriteSpec,
-) -> DataFusionResult<Vec<(Vec<Option<String>>, Vec<RecordBatch>)>> {
+) -> DataFusionResult<Vec<PartitionGroup>> {
     use arrow::compute::{concat_batches, take};
     use std::collections::HashMap;
 
