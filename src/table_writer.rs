@@ -520,7 +520,7 @@ impl DuckLakeTableWriter {
     /// Write a partitioned dataset: each group is written to its own parquet file
     /// (Hive-style `col=value/…` subpath under the table dir), then ALL files are
     /// registered in ONE snapshot via
-    /// [`MetadataWriter::register_data_files`](crate::metadata_writer::MetadataWriter::register_data_files).
+    /// [`MetadataWriter::register_data_files`].
     ///
     /// `arrow_schema` is the table's data columns (no rowid). `partition_id` is the
     /// active spec generation; `key_names` are the partition-key column names in key

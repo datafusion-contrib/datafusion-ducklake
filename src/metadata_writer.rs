@@ -646,7 +646,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// `partition_id` / `partition_values` (when set) are persisted. `files` must
     /// be non-empty. Returns the committed ids.
     ///
-    /// Default: falls back to a single [`register_data_file`] when exactly one file
+    /// Default: falls back to a single [`register_data_file`](MetadataWriter::register_data_file) when exactly one file
     /// is given (so a non-partitioned write works everywhere), and otherwise errors
     /// — backends that support partitioned writes override this to commit N files
     /// atomically in one snapshot.
