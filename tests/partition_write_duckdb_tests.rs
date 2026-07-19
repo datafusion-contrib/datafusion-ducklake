@@ -115,3 +115,83 @@ fn duckdb_set_spec_and_register_partition_files() {
     // Row count = 2 + 3 across the two partition files.
     assert_eq!(provider.get_table_row_count(table_id, snap).unwrap(), 5);
 }
+
+#[test]
+fn duckdb_register_files_with_retired_partition_id_conflicts() {
+    // Concurrency fence: registering files stamped with a partition_id whose spec
+    // generation was retired (by a concurrent RESET/SET) must abort with Conflict,
+    // never commit a file pointing at a retired partition_id.
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+
+    let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let cols = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("region", "varchar", true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+
+    // Set spec (region) → partition_id 1, then RESET → retire generation 1.
+    writer
+        .set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    writer.reset_partition_spec(table_id).unwrap();
+
+    // Register a file stamped with the now-retired partition_id 1.
+    let files = vec![
+        DataFileInfo::new("region=us/a.parquet", 100, 2)
+            .with_partition(1, vec![(0, Some("us".to_string()))]),
+    ];
+    let setup2 = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Append)
+        .unwrap();
+    let result = writer.register_data_files(
+        setup2.table_id,
+        "main",
+        "events",
+        setup2.snapshot_id,
+        &files,
+        WriteMode::Append,
+        setup2.base_snapshot_id,
+        &cols,
+        &setup2.column_ids,
+    );
+    let err = result.expect_err("registering a retired partition_id must conflict");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("partition spec") || msg.contains("concurrent"),
+        "expected a partition-spec conflict, got: {err}"
+    );
+
+    // Nothing committed: the table still has no data files.
+    let provider = DuckdbMetadataProvider::new(&db_str).unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a conflicting register must not commit files"
+    );
+}

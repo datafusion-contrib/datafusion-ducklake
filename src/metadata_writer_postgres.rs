@@ -1549,6 +1549,29 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            // Concurrency fence (see the SQLite writer for the full rationale): a
+            // partition spec retired by a concurrent RESET/SET PARTITIONED BY after
+            // the plan-time spec read must not be stamped into these files. Runs
+            // inside the lock_catalog-serialized tx; abort (roll back) so the INSERT
+            // is retried against the current spec. table_ids are global across the
+            // multicatalog store, so ducklake_partition_info scopes by table_id alone.
+            if let Some(partition_id) = files.iter().find_map(|file| file.partition_id) {
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ducklake_partition_info
+                     WHERE partition_id = $1 AND table_id = $2 AND end_snapshot IS NULL",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if live == 0 {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "partition spec (partition_id {partition_id}) for table {table_id} was \
+                         changed by a concurrent SET/RESET PARTITIONED BY during this INSERT; \
+                         re-open the catalog and retry"
+                    )));
+                }
+            }
             sqlx::query(
                 "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
                  VALUES ($1, 0, 0, 0)

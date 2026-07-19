@@ -181,6 +181,10 @@ Known edges:
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
   rejected by a unique index, surfacing as a raw database unique-violation rather than a
   clean `Conflict`. A `DROP` racing a write can likewise surface as a raw unique-violation.
+- A partitioned `INSERT` reads the live partition spec at plan time and, at commit time,
+  fences on that spec still being live: if a concurrent `SET`/`RESET PARTITIONED BY` retires
+  it between planning and commit, the `INSERT` aborts with `Conflict` (re-open the catalog and
+  retry) rather than committing files stamped with a retired `partition_id`.
 
 ---
 

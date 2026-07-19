@@ -974,6 +974,27 @@ impl MetadataWriter for MySqlMetadataWriter {
             let snapshot_id =
                 finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                     .await?;
+            // Concurrency fence (see the SQLite writer for the full rationale): a
+            // partition spec retired by a concurrent RESET/SET PARTITIONED BY after
+            // the plan-time spec read must not be stamped into these files. Abort
+            // (tx rolls back) so the INSERT is retried against the current spec.
+            if let Some(partition_id) = files.iter().find_map(|file| file.partition_id) {
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ducklake_partition_info
+                     WHERE partition_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if live == 0 {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "partition spec (partition_id {partition_id}) for table {table_id} was \
+                         changed by a concurrent SET/RESET PARTITIONED BY during this INSERT; \
+                         re-open the catalog and retry"
+                    )));
+                }
+            }
             sqlx::query(
                 "INSERT IGNORE INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)

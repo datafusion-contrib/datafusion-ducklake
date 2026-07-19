@@ -1884,6 +1884,34 @@ impl MetadataWriter for SqliteMetadataWriter {
             let snapshot_id =
                 finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                     .await?;
+            // Concurrency fence: if these files target a partition spec, that spec
+            // must still be live at commit time. All files in one partitioned append
+            // share a single partition_id (the generation read at plan time by
+            // DuckLakeTable::insert_into). A concurrent RESET/SET PARTITIONED BY that
+            // committed after that read retires the generation (sets its
+            // ducklake_partition_info.end_snapshot); stamping the now-retired
+            // partition_id would produce a file whose begin_snapshot is past the
+            // spec's end_snapshot. Detect that here and abort so the INSERT is retried
+            // against the current spec — the Append path is otherwise unfenced
+            // (finalize_snapshot only conflict-checks Replace). The tx (incl. the
+            // snapshot just allocated) rolls back on this early return.
+            if let Some(partition_id) = files.iter().find_map(|file| file.partition_id) {
+                let live: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM ducklake_partition_info
+                     WHERE partition_id = ? AND table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(partition_id)
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if live == 0 {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "partition spec (partition_id {partition_id}) for table {table_id} was \
+                         changed by a concurrent SET/RESET PARTITIONED BY during this INSERT; \
+                         re-open the catalog and retry"
+                    )));
+                }
+            }
             sqlx::query(
                 "INSERT OR IGNORE INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)

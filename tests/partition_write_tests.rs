@@ -483,3 +483,55 @@ async fn reset_partitioned_then_insert_same_session_is_unpartitioned() {
     );
     assert!(page[0].file.partition_values.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_reset_during_insert_conflicts() {
+    // P1 (concurrency): a partition spec retired by a concurrent RESET/SET *after*
+    // the insert plan captured it but *before* the insert commits must abort at the
+    // commit-time fence — never stamp a retired partition_id into a committed file.
+    let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
+    {
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+        w.set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    }
+    let (ctx, _catalog) = writable_catalog(&conn_str).await;
+    // Build the physical plan now: insert_into captures the LIVE spec (region).
+    let plan = ctx
+        .sql(INSERT_SQL)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    // Concurrently retire that spec before the captured plan executes.
+    {
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+        w.reset_partition_spec(table_id).unwrap();
+    }
+    // Executing the captured plan must hit the fence and abort with a conflict.
+    let result = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await;
+    let err = result.expect_err("insert against a concurrently-retired spec must conflict");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("partition spec") || msg.contains("concurrent"),
+        "expected a partition-spec conflict, got: {err}"
+    );
+    // Nothing committed: the tx rolled back, so no data files exist.
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a conflicting insert must not commit any data files"
+    );
+}
