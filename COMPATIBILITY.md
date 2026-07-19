@@ -164,10 +164,18 @@ Known edges:
   on a schema change (table create, column add/remove/reorder, type promotion) and carried
   forward on a pure data write — matching upstream's `if (SchemaChangesMade()) schema_version++`.
   Both deliberately omit upstream's `next_catalog_id` / `next_file_id` snapshot columns (this
-  library allocates ids from its own counters, never from the snapshot row). Because of that
-  omission a SQLite catalog is DuckLake-*design*-faithful but **not yet a drop-in DuckDB
-  catalog** — DuckDB's writer expects those allocator columns. Full DuckDB write-compat is a
-  tracked follow-up.
+  library allocates ids from its own counters, never from the snapshot row). This applies to
+  **partition ids** too: `ducklake_partition_info.partition_id` is allocated from a
+  library-owned counter (`next_partition_id` on SQLite/MySQL, an autoincrement/sequence on
+  DuckDB, an IDENTITY on Postgres), *not* from `next_catalog_id` as the current spec assigns
+  it. The ids are internally consistent (`ducklake_partition_info` ↔ `ducklake_partition_column`
+  ↔ `ducklake_data_file.partition_id` ↔ `ducklake_file_partition_value`), so any reader resolves
+  a partitioned table correctly; the caveat is only that a DuckLake/DuckDB *writer* that later
+  allocates ids from `next_catalog_id` on the same catalog could collide with these. Because of
+  that omission a SQLite catalog is DuckLake-*design*-faithful but **not yet a drop-in DuckDB
+  catalog** — DuckDB's writer expects those allocator columns. Full DuckDB write-compat
+  (adopting the snapshot allocators uniformly for all ids, partitions included) is a tracked
+  follow-up.
 - A single `Replace` is assumed to register **one** data file (the current writer path); the
   conflict check is not designed for multiple `register_data_file` calls sharing one base.
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
@@ -203,7 +211,9 @@ Known edges:
   per-row snapshot column cannot be read). Non-encrypted catalogs emit the full
   official change-set (inserts, deletes, update pre/postimages, merged-file rows at
   their origin snapshots).
-- **No partition-based file pruning** on read.
+- **Partition pruning covers `identity` + `year` only.** `month`/`day`/`hour`/`bucket(N)`
+  partition transforms are read correctly but fail open (files are always kept, never
+  mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
 - **Data inlining (SQLite backend): now read.** DuckDB inlines small INSERTs into the

@@ -481,8 +481,18 @@ impl MetadataProvider for SqliteMetadataProvider {
             )
             .fetch_one(&self.pool)
             .await?;
+            let has_partition_id: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file') WHERE name = 'partition_id'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
             let partial_max_expr = if has_partial_max > 0 {
                 "data.partial_max"
+            } else {
+                "NULL"
+            };
+            let partition_id_expr = if has_partition_id > 0 {
+                "data.partition_id"
             } else {
                 "NULL"
             };
@@ -504,7 +514,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     del.delete_file_id, del.path, del.path_is_relative,
                     del.file_size_bytes, del.footer_size, del.encryption_key,
                     del.delete_count, data.begin_snapshot,
-                    {partial_max_expr}, {schema_version_expr}
+                    {partial_max_expr}, {schema_version_expr}, {partition_id_expr}
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -531,7 +541,13 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .await?;
             let files = rows
                 .iter()
-                .map(|row| decode_table_file(row, snapshot_id))
+                .map(|row| {
+                    let mut file = decode_table_file(row, snapshot_id)?;
+                    // partition_id projected as the trailing column (index 18); NULL
+                    // (→ None) on unpartitioned files or pre-migration catalogs.
+                    file.partition_id = row.try_get(18)?;
+                    Ok(file)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
                 return Ok(Vec::new());

@@ -217,9 +217,12 @@ async fn partitioned_insert_reads_back_correctly_and_prunes() {
         .indent(true)
         .to_string();
     let files = display.matches(".parquet").count();
-    assert!(
-        files <= 2,
-        "pruning should keep at most the 2 'us' files, got {files}:\n{display}"
+    // The table is partitioned by (region, year(ts)) → 4 files (us/eu × 2023/2024).
+    // Filtering region='us' must prune the two 'eu' files via the identity bound,
+    // keeping exactly the two 'us' files (not all 4, and never fewer than 2).
+    assert_eq!(
+        files, 2,
+        "region='us' must prune the two 'eu' partition files, keeping exactly the two 'us' files; got {files}:\n{display}"
     );
 }
 
@@ -390,4 +393,93 @@ async fn insert_stays_partitioned_after_repartition() {
         .collect();
     years.sort();
     assert_eq!(years, vec!["2023".to_string(), "2024".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_partitioned_then_insert_same_session_partitions() {
+    // P1 regression: SET PARTITIONED BY via the SQL hook, then INSERT in the SAME
+    // session (the catalog was pinned BEFORE the spec existed) must still partition
+    // — the write path resolves the spec at the current head, not the pinned snapshot.
+    let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
+    let (ctx, catalog) = writable_catalog(&conn_str).await; // pins the pre-spec snapshot
+    execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "ALTER TABLE ducklake.main.events SET PARTITIONED BY (region)",
+    )
+    .await
+    .unwrap();
+    ctx.sql(INSERT_SQL).await.unwrap().collect().await.unwrap();
+
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        2,
+        "same-session SET then INSERT must partition by region (one file per region)"
+    );
+    let live_pid = provider
+        .get_partition_spec(table_id, snap)
+        .unwrap()
+        .expect("live spec present")
+        .partition_id;
+    for m in &page {
+        assert_eq!(
+            m.file.partition_id,
+            Some(live_pid),
+            "file must be stamped with the LIVE partition_id, never a retired one"
+        );
+        assert_eq!(m.file.partition_values.len(), 1);
+    }
+    let mut regions: Vec<String> = page
+        .iter()
+        .filter_map(|m| m.file.partition_values.first().and_then(|(_, v)| v.clone()))
+        .collect();
+    regions.sort();
+    assert_eq!(regions, vec!["eu".to_string(), "us".to_string()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_partitioned_then_insert_same_session_is_unpartitioned() {
+    // P1 regression: after RESET, a same-session INSERT must write ONE unpartitioned
+    // file with NO partition_id — never a retired partition id from the pinned spec.
+    let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
+    {
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+        w.set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    }
+    let (ctx, catalog) = writable_catalog(&conn_str).await; // pinned where region-spec is live
+    execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "ALTER TABLE ducklake.main.events RESET PARTITIONED BY",
+    )
+    .await
+    .unwrap();
+    ctx.sql(INSERT_SQL).await.unwrap().collect().await.unwrap();
+
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(
+        page.len(),
+        1,
+        "after RESET, a same-session INSERT is unpartitioned"
+    );
+    assert!(
+        page[0].file.partition_id.is_none(),
+        "must not stamp a retired partition_id after RESET"
+    );
+    assert!(page[0].file.partition_values.is_empty());
 }

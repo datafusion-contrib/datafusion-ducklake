@@ -2576,12 +2576,27 @@ impl TableProvider for DuckLakeTable {
             InsertOp::Overwrite | InsertOp::Replace => WriteMode::Replace,
         };
 
-        // Resolve the active partition spec (if any) into the write-side form so
-        // the insert exec splits rows into per-partition files. A spec whose
-        // transform we cannot PRODUCE (bucket/unknown) makes a partitioned INSERT
-        // unsupported — reject rather than silently writing unpartitioned files
-        // that would violate the spec.
-        let partition = match self.partition_spec.as_ref() {
+        // Resolve the partition spec at the CURRENT catalog head, NOT the snapshot
+        // this table provider was pinned to when it was opened. A write always
+        // commits at the head, so it must honor the spec live there; using the
+        // pinned `self.partition_spec` would ignore a spec set/reset applied after
+        // this provider was created (e.g. `execute_ducklake_sql(SET PARTITIONED BY)`
+        // then `INSERT` in the same session) and could stamp a retired partition_id.
+        // (`self.partition_spec`, pinned, is still used for read pruning, which is
+        // snapshot-bound.)
+        //
+        // A transform we cannot PRODUCE (bucket/unknown) makes a partitioned INSERT
+        // unsupported — reject rather than silently writing unpartitioned files that
+        // would violate the spec.
+        let head_snapshot = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let live_spec = self
+            .provider
+            .get_partition_spec(self.table_id, head_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let partition = match live_spec.as_ref() {
             None => None,
             Some(spec) => {
                 let mut keys = Vec::with_capacity(spec.columns.len());
