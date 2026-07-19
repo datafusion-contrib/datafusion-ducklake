@@ -7,3 +7,8 @@ target
 # Benchmark data and results
 benchmark/data/
 benchmark/results/
+
+# sqllogictest litter: a .test ATTACH with DATA_PATH '${DATA_PATH}/...' can leave
+# a directory literally named ${DATA_PATH} in the repo root when the runner does
+# not substitute the variable.
+${DATA_PATH}/
