@@ -195,3 +195,203 @@ fn duckdb_register_files_with_retired_partition_id_conflicts() {
         "a conflicting register must not commit files"
     );
 }
+
+#[test]
+fn duckdb_register_unpartitioned_file_into_partitioned_table_conflicts() {
+    // Inverse fence: registering an unpartitioned file (no partition_id) into a table
+    // that has a live partition spec must conflict — never leave a partition_id-less
+    // file in a partitioned table.
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+
+    let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let cols = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("region", "varchar", true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+
+    // Make the table partitioned.
+    writer
+        .set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    // Register an UNPARTITIONED file (no partition_id) → must conflict.
+    let file = DataFileInfo::new("plain.parquet", 100, 2);
+    let setup2 = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Append)
+        .unwrap();
+    let result = writer.register_data_file(
+        setup2.table_id,
+        "main",
+        "events",
+        setup2.snapshot_id,
+        &file,
+        WriteMode::Append,
+        setup2.base_snapshot_id,
+        &cols,
+        &setup2.column_ids,
+    );
+    let err = result.expect_err("unpartitioned file into a partitioned table must conflict");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("partition spec") || msg.contains("concurrent"),
+        "expected a partition-spec conflict, got: {err}"
+    );
+}
+
+#[test]
+fn duckdb_empty_replace_on_partitioned_table_does_not_conflict() {
+    // A 0-row Replace (empty overwrite truncate) on a partitioned table must NOT trip
+    // the inverse fence — a 0-row file carries no partition data, so exempting it
+    // preserves the empty-overwrite truncate behavior.
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+
+    let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let cols = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("region", "varchar", true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+
+    writer
+        .set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    // 0-row Replace (truncate marker) → must succeed, not conflict.
+    let file = DataFileInfo::new("empty-marker.parquet", 0, 0);
+    let setup2 = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+        .unwrap();
+    let result = writer.register_data_file(
+        setup2.table_id,
+        "main",
+        "events",
+        setup2.snapshot_id,
+        &file,
+        WriteMode::Replace,
+        setup2.base_snapshot_id,
+        &cols,
+        &setup2.column_ids,
+    );
+    assert!(
+        result.is_ok(),
+        "0-row Replace on a partitioned table must not conflict (truncate): {result:?}"
+    );
+
+    let provider = DuckdbMetadataProvider::new(&db_str).unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    assert_eq!(
+        provider.get_table_row_count(table_id, snap).unwrap(),
+        0,
+        "truncate marker leaves zero live rows"
+    );
+}
+
+#[test]
+fn duckdb_register_multiple_unpartitioned_files_into_partitioned_table_conflicts() {
+    // P2 (public multi-file API): register_data_files with NON-EMPTY partition_id-less
+    // files into a partitioned table must conflict — the multi-file path fences the
+    // unpartitioned direction too, not just the retired-partition_id case.
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+
+    let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let cols = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("region", "varchar", true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+    writer
+        .set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    // Two non-empty files with NO partition_id (DataFileInfo::new default).
+    let files =
+        vec![DataFileInfo::new("a.parquet", 100, 2), DataFileInfo::new("b.parquet", 100, 3)];
+    let setup2 = writer
+        .begin_write_transaction("main", "events", &cols, WriteMode::Append)
+        .unwrap();
+    let result = writer.register_data_files(
+        setup2.table_id,
+        "main",
+        "events",
+        setup2.snapshot_id,
+        &files,
+        WriteMode::Append,
+        setup2.base_snapshot_id,
+        &cols,
+        &setup2.column_ids,
+    );
+    let err =
+        result.expect_err("non-empty unpartitioned files into a partitioned table must conflict");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("partition spec") || msg.contains("concurrent"),
+        "expected a partition-spec conflict, got: {err}"
+    );
+}

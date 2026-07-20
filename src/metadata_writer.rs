@@ -278,6 +278,43 @@ impl DataFileInfo {
     }
 }
 
+/// Enforce the partition-spec invariant for one file being committed, given the
+/// table's currently-live partition generation (`live_partition_id`, `None` when
+/// the table has no live spec). Every backend's `register_data_file` /
+/// `register_data_files` commit path calls this to fence the partition DDL race in
+/// BOTH directions:
+///
+/// - a file carrying a `partition_id` must reference the generation live *now* — a
+///   concurrent `RESET`/`SET PARTITIONED BY` that retired it (or replaced it with a
+///   new generation) since the write was planned makes the stamped id stale; and
+/// - a *non-empty* file WITHOUT a `partition_id` must not land in a table that now
+///   has a live spec (an unpartitioned write planned before a concurrent
+///   `SET PARTITIONED BY`).
+///
+/// A 0-row file is exempt: an empty `Replace`/`Overwrite` truncate marker carries
+/// no partitioned data, so it violates neither direction. Returns
+/// [`DuckLakeError::Conflict`] on a violation so the caller aborts (rolls back) the
+/// commit and the write is retried against the current spec.
+pub(crate) fn enforce_partition_fence(
+    table_id: i64,
+    live_partition_id: Option<i64>,
+    file: &DataFileInfo,
+) -> Result<()> {
+    match file.partition_id {
+        Some(pid) if live_partition_id != Some(pid) => Err(DuckLakeError::Conflict(format!(
+            "partition spec (partition_id {pid}) for table {table_id} was changed by a concurrent \
+             SET/RESET PARTITIONED BY during this commit; re-open the catalog and retry"
+        ))),
+        None if file.record_count > 0 && live_partition_id.is_some() => {
+            Err(DuckLakeError::Conflict(format!(
+                "table {table_id} gained a partition spec (concurrent SET PARTITIONED BY) after this \
+                 unpartitioned write was planned; re-open the catalog and retry"
+            )))
+        },
+        _ => Ok(()),
+    }
+}
+
 /// A positional delete file to register via [`MetadataWriter::set_delete_file`].
 /// Mirrors [`DataFileInfo`]; the parquet has the standard `(file_path, pos)`
 /// schema. Must be cumulative for its data file (all still-deleted positions),

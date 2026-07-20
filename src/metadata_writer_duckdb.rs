@@ -793,6 +793,18 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let snapshot_id =
             finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
 
+        // Partition-spec fence: this file must be consistent with the table's live
+        // partition generation at commit time (both directions — see
+        // enforce_partition_fence). The scalar subquery yields NULL (→ None) when the
+        // table is unpartitioned; the tx rolls back on a Conflict.
+        let live_partition_id: Option<i64> = tx.query_row(
+            "SELECT (SELECT partition_id FROM ducklake_partition_info
+                     WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1)",
+            params![table_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+
         // Seed the stats row for the Append path (Replace already seeded it in
         // finalize_snapshot); a no-op if it exists.
         seed_stats_if_missing(&tx, table_id)?;
@@ -875,26 +887,18 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // One atomic snapshot for all N partition files.
         let snapshot_id =
             finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
-        // Concurrency fence (see the SQLite writer for the full rationale): if these
-        // files target a partition spec, it must still be live at commit time. A
-        // concurrent RESET/SET PARTITIONED BY that committed after the plan-time spec
-        // read retires that generation; stamping its now-retired partition_id would
-        // create a file whose begin_snapshot is past the spec's end_snapshot. Abort
-        // (tx rolls back) so the INSERT is retried against the current spec.
-        if let Some(partition_id) = files.iter().find_map(|file| file.partition_id) {
-            let live: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM ducklake_partition_info
-                 WHERE partition_id = ? AND table_id = ? AND end_snapshot IS NULL",
-                params![partition_id, table_id],
-                |row| row.get(0),
-            )?;
-            if live == 0 {
-                return Err(crate::DuckLakeError::Conflict(format!(
-                    "partition spec (partition_id {partition_id}) for table {table_id} was \
-                     changed by a concurrent SET/RESET PARTITIONED BY during this INSERT; \
-                     re-open the catalog and retry"
-                )));
-            }
+        // Partition-spec fence (both directions, every file): each file must be
+        // consistent with the table's live partition generation at commit time. The
+        // scalar subquery yields NULL (→ None) when unpartitioned; the tx rolls back
+        // on a Conflict.
+        let live_partition_id: Option<i64> = tx.query_row(
+            "SELECT (SELECT partition_id FROM ducklake_partition_info
+                     WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1)",
+            params![table_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        for file in files {
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
         }
         seed_stats_if_missing(&tx, table_id)?;
         let mut next_row_id: i64 = tx.query_row(

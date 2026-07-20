@@ -535,3 +535,93 @@ async fn concurrent_reset_during_insert_conflicts() {
         "a conflicting insert must not commit any data files"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_set_during_unpartitioned_insert_conflicts() {
+    // Inverse P1: an unpartitioned INSERT plan captured while the table had NO spec,
+    // then a concurrent SET PARTITIONED BY makes it partitioned before the plan
+    // commits. The commit must abort — never leave a partition_id-less file in a
+    // now-partitioned table.
+    let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
+    let (ctx, _catalog) = writable_catalog(&conn_str).await;
+    // Build the plan now: table is unpartitioned → partition = None.
+    let plan = ctx
+        .sql(INSERT_SQL)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    // Concurrently make the table partitioned.
+    {
+        let w = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+        w.set_partition_spec(
+            table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    }
+    // Executing the stale unpartitioned plan must hit the singular-commit fence.
+    let result = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await;
+    let err = result.expect_err("unpartitioned insert into a now-partitioned table must conflict");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("partition spec") || msg.contains("concurrent"),
+        "expected a partition-spec conflict, got: {err}"
+    );
+    // Nothing committed.
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert!(
+        page.is_empty(),
+        "a conflicting unpartitioned insert must not commit any data files"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_overwrite_truncates_partitioned_table() {
+    // Regression: an empty INSERT OVERWRITE (0 rows) on a PARTITIONED table must
+    // truncate (retire the prior generation) via the single-file path — it must NOT
+    // trip the inverse fence. The 0-row truncate marker carries no partition_id, but
+    // it also carries no data, so it cannot violate the live-spec invariant.
+    let env = setup().await; // partitioned by (region, year(ts))
+    write_ctx(&env.conn_str)
+        .await
+        .sql(INSERT_SQL)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    // Sanity: 4 rows live across the partitions.
+    {
+        let p = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+        let s = p.get_current_snapshot().unwrap();
+        assert_eq!(p.get_table_row_count(env.table_id, s).unwrap(), 4);
+    }
+    // Empty INSERT OVERWRITE (WHERE 1=2 → 0 rows) must truncate, not conflict.
+    let ctx = write_ctx(&env.conn_str).await;
+    ctx.sql(
+        "INSERT OVERWRITE ducklake.main.events \
+         SELECT * FROM (VALUES (1, 'us', TIMESTAMP '2023-01-15 10:00:00')) AS t(id, region, ts) \
+         WHERE 1 = 2",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    // After truncate: 0 live rows.
+    let p = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let s = p.get_current_snapshot().unwrap();
+    assert_eq!(
+        p.get_table_row_count(env.table_id, s).unwrap(),
+        0,
+        "empty INSERT OVERWRITE must truncate the partitioned table, not conflict"
+    );
+}
