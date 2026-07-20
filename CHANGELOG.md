@@ -7,40 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **BREAKING**: `PostgresMetadataProvider`, `SqliteMetadataProvider`, and
-  `MySqlMetadataProvider` carry a new private field; construct them via `new()`
-  — or the new `from_pool()`, which adopts an existing connection pool —
-  instead of struct literals.
-- Per-call catalog capability probes (`partial_max` columns, the
-  `ducklake_schema_versions` ledger, SQLite's inlined-data registry) on the
-  scan and CDC paths run as one combined statement and are memoized
-  cache-positive-only per provider: a fully-migrated catalog probes once per
-  provider lifetime, while catalogs missing any capability keep re-probing
-  every call (so a mid-flight catalog upgrade is still picked up immediately).
-- **BREAKING**: CDC snapshot bounds are inclusive on both ends, matching official
-  DuckLake (was exclusive-start); cursor pagination should pass `last + 1` (#179).
-- **BREAKING**: CDC columns `(snapshot_id, rowid, change_type)` now lead the output,
-  matching official DuckLake (they trailed before) (#179).
-- **BREAKING**: `ducklake_table_changes` emits pure deletes as `change_type='delete'`
-  rows with the old values, matching official DuckLake (#179).
+## [0.6.0] - 2026-07-20
 
 ### Added
-- Differential CDC conformance suite: diffs both feeds live against the official
-  extension on identical catalogs (#179).
+- Table partitioning: `SET`/`RESET PARTITIONED BY` (`identity`/`year`/`month`/`day`/`hour`); per-partition files on write (SQLite), file pruning on read (all backends) (#191).
 - `ducklake_table_insertions()` — the official insertions feed (#179).
-- CDC snapshot bounds accept timestamp strings (official `AT (TIMESTAMP => ...)`
-  semantics) (#179).
-- The vendored sqllogictest suite binds (CDC UDTFs + dialect translation) and fails
-  the build on expected-pass regressions (#179).
+- CDC snapshot bounds accept timestamp strings (#179).
+- `retire_appends_since` to roll back a pure-append delta (#182).
+- `rowid` emitted by `ducklake_table_changes` / `ducklake_table_deletions` (#180).
+- Differential CDC conformance suite vs the official extension (#179).
+
+### Changed
+- **BREAKING**: CDC snapshot bounds are inclusive on both ends; paginate with `last + 1` (#179).
+- **BREAKING**: CDC output leads with `(snapshot_id, rowid, change_type)` (#179).
+- **BREAKING**: `ducklake_table_changes` emits pure deletes as `change_type='delete'` rows (#179).
+- **BREAKING**: metadata providers gained a private field — construct via `new()`/`from_pool()`, not struct literals (#192).
+- Filters push through pure column renames (#188).
+- Scan planning streams file metadata, memoizes capability probes, and stops at a short page (#181, #192).
 
 ### Fixed
-- DuckDB backend: delete-file window off-by-one double-reported boundary deletions (#179).
-- CDC missed changes inside compaction-merged files: `partial_max` windows + per-row
-  origin snapshots (#179).
-- Cumulative (3-column) delete files are windowed per row, each deletion at its own
-  delete snapshot (#179).
-- `SELECT COUNT(*)` over `ducklake_table_changes` errored on the insert-only path (#179).
+- DuckDB delete-file window off-by-one double-reported boundary deletions (#179).
+- CDC missed changes in compaction-merged files (`partial_max` windows) (#179).
+- Cumulative delete files windowed per row, each deletion at its own snapshot (#179).
+- `SELECT COUNT(*)` over `ducklake_table_changes` on the insert-only path (#179).
 
 ## [0.5.0] - 2026-07-15
 

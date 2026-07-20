@@ -3,7 +3,7 @@ members = [".", "benchmark"]
 
 [package]
 name = "datafusion-ducklake"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["zac@hotdata.dev", "shefeek@hotdata.dev", "anoop@hotdata.dev"]
 description = "DuckLake query engine for rust, built with datafusion."

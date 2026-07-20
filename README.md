@@ -158,6 +158,31 @@ writer options.
 
 ---
 
+## Partitioning
+
+Partition a table by one or more columns (optionally through a transform) so that queries
+filtering on a partition column skip whole files:
+
+```rust
+// Declare the partition scheme *before* loading data, then INSERT as usual.
+execute_ducklake_sql(
+    &ctx,
+    &catalog,
+    "ALTER TABLE ducklake.main.sales SET PARTITIONED BY (region, year(sale_date))",
+)
+.await?;
+```
+
+Writes split rows into one Parquet file per partition value; reads then prune non-matching
+files automatically. Supported transforms are `identity` (the raw value) and
+`year`/`month`/`day`/`hour`; pruning currently applies to `identity` and `year`
+(`month`/`day`/`hour` are recorded but not yet used to skip files). Partitioned **writes**
+are supported on **SQLite** today; **read + pruning** work on all backends. `RESET
+PARTITIONED BY` turns it off. See [COMPATIBILITY.md](COMPATIBILITY.md) and
+[`tests/partition_write_tests.rs`](tests/partition_write_tests.rs).
+
+---
+
 ## Multi-catalog (PostgreSQL, experimental)
 
 A single PostgreSQL metadata store can host **multiple independent DuckLake catalogs** —
@@ -220,7 +245,8 @@ A few highlights worth knowing up front:
 - Reads work on DuckDB, SQLite, PostgreSQL, and MySQL; **writes are SQLite/PostgreSQL only**.
 - Object stores: local filesystem and S3-compatible (S3, MinIO).
 - Snapshots can be selected programmatically (`DuckLakeCatalog::with_snapshot`), but there
-  is no SQL-level time travel (`AS OF`) yet, and no partition-based file pruning.
+  is no SQL-level time travel (`AS OF`) yet.
+- Table partitioning: read + file pruning on all backends; partitioned writes on SQLite.
 - Data inlined by DuckDB's ducklake extension is **not read** — see COMPATIBILITY.md for
   the `COUNT(*)` undercount caveat and how to avoid it.
 
