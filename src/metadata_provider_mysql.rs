@@ -104,6 +104,16 @@ impl MySqlMetadataProvider {
         })
     }
 
+    /// Creates a provider over an existing connection pool. Replaces
+    /// struct-literal construction, which stopped compiling when the
+    /// schema-capability memo field was added.
+    pub fn from_pool(pool: MySqlPool) -> Self {
+        Self {
+            pool,
+            schema_capabilities: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// Whether the schema-capability memo is populated. Exposed for tests.
     #[doc(hidden)]
     pub fn schema_capabilities_cached(&self) -> bool {

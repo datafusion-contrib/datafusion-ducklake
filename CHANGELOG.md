@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **BREAKING**: `PostgresMetadataProvider`, `SqliteMetadataProvider`, and
   `MySqlMetadataProvider` carry a new private field; construct them via `new()`
+  — or the new `from_pool()`, which adopts an existing connection pool —
   instead of struct literals.
 - Per-call catalog capability probes (`partial_max` columns, the
   `ducklake_schema_versions` ledger, SQLite's inlined-data registry) on the
