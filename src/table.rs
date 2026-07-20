@@ -1113,8 +1113,8 @@ impl DuckLakeTable {
     /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
     /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
-    /// is a possible optimization. Only valid for insert-only files, where
-    /// `position = rowid - row_id_start`.
+    /// is a possible optimization. The position is the physical index in the
+    /// current file, independent of whether rowids are synthesized or embedded.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -1131,8 +1131,8 @@ impl DuckLakeTable {
         // (column index i = the i-th logical/data field); `Column::evaluate` is
         // index-based, so it resolves against the read batch regardless of any
         // physical rename. `ROW_POS_COLUMN_NAME` is appended last and is never
-        // referenced by the predicate. Valid for insert-only files, where the
-        // physical position equals `rowid - row_id_start`.
+        // referenced by the predicate. The physical position is the delete-file
+        // `pos` for both insert-only and rewritten files.
         let file_cfg = self.build_file_read_config(state, data_file).await?;
 
         // Row-group-aligned partitions + a non-repartition, non-pruning source so
@@ -1256,26 +1256,6 @@ impl DuckLakeTable {
         }
 
         Ok(positions)
-    }
-
-    /// Whether `file` embeds a `_ducklake_internal_row_id` column (tagged with
-    /// [`ROW_ID_PARQUET_FIELD_ID`]) — i.e. it was rewritten by an UPDATE or
-    /// compaction rather than being insert-only.
-    ///
-    /// [`Self::resolve_positions`] derives delete positions from the physical row
-    /// index, which is only the DuckLake `pos` for insert-only files; a rewritten
-    /// file's surviving rows carry embedded rowids whose physical order need not
-    /// match, so the delete path must refuse such files rather than mis-delete.
-    /// Memoized through the shared `file_read_config_cache`, so calling this right
-    /// before `resolve_positions` costs at most one extra footer read per file.
-    #[cfg(feature = "write")]
-    pub(crate) async fn file_has_embedded_rowid(
-        &self,
-        state: &dyn Session,
-        file: &DuckLakeFileData,
-    ) -> DataFusionResult<bool> {
-        let cfg = self.build_file_read_config(state, file).await?;
-        Ok(cfg.embedded_rowid_parquet_name.is_some())
     }
 
     /// Build a single execution plan for all files without delete files
