@@ -14,7 +14,7 @@
 //! internal and executed directly — the delete files are fully collected (the
 //! position set must be complete before any data row can be classified), then
 //! the data file is streamed batch-by-batch through the filter. Deleted rows
-//! are matched by TRUE physical file position ([`PositionalFileSource`] +
+//! are matched by TRUE physical file position (`PositionalFileSource` +
 //! [`FileRowNumberExec`]) rather than stream arrival order. Exposing the scans
 //! as children lets the optimizer repartition them (round-robin or byte-range
 //! splits), which desynchronizes the delete-position set from the data rows —
