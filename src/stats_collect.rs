@@ -168,6 +168,20 @@ fn try_collect(
             (min_scalar, max_scalar)
         };
 
+        // Compressed on-disk size of this column: sum the column chunk's
+        // compressed size across row groups. Mirrors official DuckLake, which
+        // records the parquet `total_compressed_size` per column
+        // (`ducklake_add_data_files.cpp`). Read from the footer we already
+        // parsed, no extra I/O. `None` only if the footer omits the chunk.
+        let column_size_bytes: Option<i64> = {
+            let sum: i64 = row_groups
+                .iter()
+                .filter_map(|rg| rg.columns().get(idx))
+                .map(|chunk| chunk.compressed_size())
+                .sum();
+            Some(sum)
+        };
+
         out.push(ColumnStat {
             column_id,
             min_value: min_scalar.as_ref().and_then(stats_encode::encode_scalar),
@@ -175,8 +189,7 @@ fn try_collect(
             null_count,
             value_count,
             contains_nan,
-            // Deferred; not used for pruning. See `[[column-size-bytes]]`.
-            column_size_bytes: None,
+            column_size_bytes,
         });
     }
 
