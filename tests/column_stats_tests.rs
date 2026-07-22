@@ -120,16 +120,19 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
     // parquet footer like official DuckLake. Present and positive for every
     // written column. Sizes are data-dependent, so assert presence + positivity
     // rather than exact bytes.
-    let sizes: Vec<Option<i64>> = sqlx::query(
-        "SELECT column_size_bytes FROM ducklake_file_column_stats ORDER BY column_id",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|r| r.try_get(0).unwrap())
-    .collect();
-    assert_eq!(sizes.len(), 3, "one column_size_bytes row per written column");
+    let sizes: Vec<Option<i64>> =
+        sqlx::query("SELECT column_size_bytes FROM ducklake_file_column_stats ORDER BY column_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get(0).unwrap())
+            .collect();
+    assert_eq!(
+        sizes.len(),
+        3,
+        "one column_size_bytes row per written column"
+    );
     for (i, s) in sizes.iter().enumerate() {
         assert!(
             matches!(s, Some(n) if *n > 0),

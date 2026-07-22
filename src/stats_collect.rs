@@ -16,11 +16,12 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use arrow::array::{Array, ArrayRef, Float32Array, Float64Array};
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::metadata_writer::ColumnStat;
 use crate::stats_encode;
@@ -109,6 +110,35 @@ fn try_collect(
     // field-id metadata mismatch a hand-built write schema would trigger).
     let arrow_schema = builder.schema().clone();
     let metadata = builder.metadata().clone();
+    Ok(compute_column_stats(
+        &arrow_schema,
+        &metadata,
+        column_ids,
+        row_count,
+        contains_nan_flags,
+    ))
+}
+
+/// Compute per-column statistics from an already-parsed parquet footer.
+///
+/// The shared core behind both harvest paths: the write-through path opens a
+/// local staging file for the footer (see [`collect_column_stats`]), while a
+/// register-by-reference path (e.g. a server-side-copy load) reads the footer
+/// from the object store. Both feed the exact same computation here so the
+/// stats are identical regardless of how the file arrived.
+///
+/// `arrow_schema` must be the schema reconstructed from `metadata` (as a parquet
+/// reader builder produces), so `StatisticsConverter`'s name/type match agrees.
+/// `column_ids[i]` labels file column `i`. `contains_nan_flags` is empty when the
+/// caller could not scan the data for NaN (footer-only paths): min/max are then
+/// kept, and only NaN-suppression is skipped.
+pub fn compute_column_stats(
+    arrow_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    column_ids: &[i64],
+    row_count: i64,
+    contains_nan_flags: &[Option<bool>],
+) -> Vec<ColumnStat> {
     let parquet_schema = metadata.file_metadata().schema_descr();
     let row_groups = metadata.row_groups();
 
@@ -120,7 +150,7 @@ fn try_collect(
         let field = &fields[idx];
         let name = field.name();
 
-        let converter = match StatisticsConverter::try_new(name, &arrow_schema, parquet_schema) {
+        let converter = match StatisticsConverter::try_new(name, arrow_schema, parquet_schema) {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(column = name, error = %e, "no statistics converter for column");
@@ -168,18 +198,39 @@ fn try_collect(
             (min_scalar, max_scalar)
         };
 
-        // Compressed on-disk size of this column: sum the column chunk's
-        // compressed size across row groups. Mirrors official DuckLake, which
-        // records the parquet `total_compressed_size` per column
-        // (`ducklake_add_data_files.cpp`). Read from the footer we already
-        // parsed, no extra I/O. `None` only if the footer omits the chunk.
+        // Compressed on-disk size of this column: sum the compressed size of
+        // every parquet *leaf* column belonging to this top-level field, across
+        // all row groups. Mirrors official DuckLake, which records the parquet
+        // `total_compressed_size` per column (`ducklake_add_data_files.cpp`).
+        // Read from the footer we already parsed, no extra I/O.
+        //
+        // Parquet column chunks are leaf columns, so a nested field (struct/map)
+        // spans several — map each leaf back to its root field via the schema
+        // descriptor rather than assuming leaf index == field index. Uses
+        // checked addition and rejects a negative chunk size, so a corrupt or
+        // adversarial footer yields `None` (no stat) instead of a panic or a
+        // wrapped/bogus value. `None` also when the field has no leaf chunks.
         let column_size_bytes: Option<i64> = {
-            let sum: i64 = row_groups
-                .iter()
-                .filter_map(|rg| rg.columns().get(idx))
-                .map(|chunk| chunk.compressed_size())
-                .sum();
-            Some(sum)
+            let mut sum: i64 = 0;
+            let mut seen = false;
+            let mut ok = true;
+            'rows: for rg in row_groups.iter() {
+                for (leaf, chunk) in rg.columns().iter().enumerate() {
+                    if parquet_schema.get_column_root_idx(leaf) != idx {
+                        continue;
+                    }
+                    seen = true;
+                    let cs = chunk.compressed_size();
+                    match (cs >= 0).then(|| sum.checked_add(cs)).flatten() {
+                        Some(v) => sum = v,
+                        None => {
+                            ok = false;
+                            break 'rows;
+                        },
+                    }
+                }
+            }
+            (ok && seen).then_some(sum)
         };
 
         out.push(ColumnStat {
@@ -193,7 +244,7 @@ fn try_collect(
         });
     }
 
-    Ok(out)
+    out
 }
 
 /// Reduce a per-row-group statistics array to a single bound: the smallest
