@@ -8,11 +8,18 @@
 //! 2. Subtract positions from previous delete file (if exists)
 //! 3. Read the data file and return only the rows at the newly deleted positions
 //! 4. Append CDC columns (snapshot_id, change_type='delete')
+//!
+//! Like [`TableChangesExec`](crate::table_changes), [`DeletedRowsExec`] is a
+//! single-partition plan with no DataFusion children: its per-file scans are
+//! internal and executed directly via `collect()`, and deleted rows are matched
+//! by TRUE physical file position ([`PositionalFileSource`] +
+//! [`FileRowNumberExec`]) rather than stream arrival order. Exposing the scans
+//! as children lets the optimizer repartition them (round-robin or byte-range
+//! splits), which desynchronizes the delete-position set from the data rows —
+//! deletions were silently missed or mis-attributed (issue #178).
 
-use std::collections::HashSet;
-use std::pin::Pin;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array};
 use arrow::compute::take;
@@ -27,22 +34,27 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::object_store::ObjectStoreUrl;
-use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, collect,
 };
-use futures::Stream;
+use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
 
 use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::row_id::{ROW_ID_PARQUET_FIELD_ID, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::positional_source::PositionalFileSource;
+use crate::row_id::{
+    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID,
+};
 use crate::table::{validated_file_size, validated_record_count};
 use crate::types::extract_parquet_field_ids;
 
@@ -200,6 +212,9 @@ impl TableDeletionsTable {
             None
         };
         let embedded_col_idx = embedded_name.as_ref().map(|_| table_len);
+        // The positional scan appends the physical-position column after the
+        // table columns and the optional embedded rowid.
+        let pos_col_idx = table_len + usize::from(embedded_name.is_some());
 
         // Create scan for data file (with the embedded rowid column when present)
         let data_file_exec = self.build_data_file_scan(
@@ -213,20 +228,21 @@ impl TableDeletionsTable {
         // would cause incorrect behavior (e.g., empty ranges in full-file deletes).
         validated_record_count(delete_file.data_record_count, &delete_file.data_file_path)?;
 
-        Ok(Arc::new(DeletedRowsExec::new(
-            current_delete_exec,
-            previous_delete_exec,
-            data_file_exec,
-            delete_file.data_record_count,
-            delete_file.snapshot_id,
-            delete_file.data_row_id_start,
+        Ok(Arc::new(DeletedRowsExec::new(DeletionUnit {
+            current_delete_scan: current_delete_exec,
+            previous_delete_scan: previous_delete_exec,
+            data_file_scan: data_file_exec,
+            record_count: delete_file.data_record_count,
+            snapshot_id: delete_file.snapshot_id,
+            row_id_start: delete_file.data_row_id_start,
             table_len,
             embedded_col_idx,
+            pos_col_idx,
             need_rowid,
-            snapshot_name.is_some(),
-            (self.start_snapshot, self.end_snapshot),
-            self.output_schema.clone(),
-        )))
+            cumulative: snapshot_name.is_some(),
+            window: (self.start_snapshot, self.end_snapshot),
+            output_schema: self.output_schema.clone(),
+        })))
     }
 
     /// Read the source file's footer and return the physical name of its embedded
@@ -320,14 +336,12 @@ impl TableDeletionsTable {
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
 
-    /// Build a scan of the source data file: table columns, plus the embedded
-    /// rowid column when `embedded_name` is `Some`.
-    ///
-    /// NOTE: positions come from the stream's `row_offset` (arrival order), which
-    /// is the file's physical position only for a non-repartitioned scan. Under
-    /// file-scan repartitioning this exec is unsound (deletes missed / wrong
-    /// rowids) — a pre-existing limitation tracked in
-    /// <https://github.com/datafusion-contrib/datafusion-ducklake/issues/178>.
+    /// Positional scan of the source data file: table columns, the embedded
+    /// rowid column when `embedded_name` is `Some`, and the internal
+    /// physical-position column ([`ROW_POS_COLUMN_NAME`]). [`PositionalFileSource`]
+    /// and [`FileRowNumberExec`] guarantee true physical positions, so deleted
+    /// rows are matched to the delete file's `pos` set regardless of how the
+    /// file is read (issue #178).
     fn build_data_file_scan(
         &self,
         path: &str,
@@ -356,13 +370,12 @@ impl TableDeletionsTable {
             None => self.table_schema.clone(),
         };
 
-        let builder = FileScanConfigBuilder::new(
-            self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(read_schema)),
-        )
-        .with_file_group(FileGroup::new(vec![pf]));
-
-        Ok(DataSourceExec::from_data_source(builder.build()))
+        let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
+        let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
+            .with_file_group(FileGroup::new(vec![pf]))
+            .with_partitioned_by_file_group(true);
+        let scan = DataSourceExec::from_data_source(builder.build());
+        Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
     }
 }
 
@@ -453,20 +466,15 @@ impl TableProvider for TableDeletionsTable {
     }
 }
 
-/// Execution plan that reads deleted rows from a data file
-///
-/// 1. Reads current delete file to get deleted positions
-/// 2. Reads previous delete file to get previously deleted positions (if exists)
-/// 3. Computes delta: positions in current but not in previous
-/// 4. Reads data file and filters to only include rows at deleted positions
-/// 5. Appends CDC columns (snapshot_id, change_type='delete')
-#[derive(Debug)]
-pub struct DeletedRowsExec {
+/// The internal scans and parameters needed to extract one delete entry's
+/// deleted rows. Cloned into the async extraction on execute.
+#[derive(Debug, Clone)]
+struct DeletionUnit {
     /// Scan of current delete file (None for full file deletes)
     current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-    /// Scan of previous delete file (if exists)
+    /// Scan of previous delete file (if exists; legacy delta mode only)
     previous_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-    /// Scan of data file
+    /// Positional scan of the data file (appends [`ROW_POS_COLUMN_NAME`])
     data_file_scan: Arc<dyn ExecutionPlan>,
     /// Total record count in data file (used for full file deletes)
     record_count: i64,
@@ -476,12 +484,13 @@ pub struct DeletedRowsExec {
     /// to synthesize a deleted row's rowid as `row_id_start + physical position`
     /// when the source file has no embedded rowid.
     row_id_start: Option<i64>,
-    /// Number of leading table columns in the data-file batch (the rest are the
-    /// optional embedded rowid column).
+    /// Number of leading table columns in the data-file batch.
     table_len: usize,
     /// Column index of the embedded rowid in the data-file batch, if present (an
     /// UPDATE / compaction output); its value IS the deleted row's rowid.
     embedded_col_idx: Option<usize>,
+    /// Column index of the physical-position column in the data-file batch.
+    pos_col_idx: usize,
     /// Whether the rowid column is actually requested. When false, rowid is
     /// emitted as a placeholder (dropped by the projection above) and neither an
     /// embedded rowid nor a row_id_start is required.
@@ -494,47 +503,37 @@ pub struct DeletedRowsExec {
     window: (i64, i64),
     /// Output schema (snapshot_id + rowid + change_type + table columns)
     output_schema: SchemaRef,
+}
+
+/// Execution plan that reads deleted rows from a data file
+///
+/// 1. Reads current delete file to get deleted positions
+/// 2. Reads previous delete file to get previously deleted positions (if exists)
+/// 3. Computes delta: positions in current but not in previous
+/// 4. Reads data file and filters to only include rows at deleted positions
+/// 5. Appends CDC columns (snapshot_id, change_type='delete')
+///
+/// Single partition, no DataFusion children: the delete-position set is global
+/// to the data file, so the optimizer must not repartition or split the
+/// internal scans (issue #178). Rows are matched by the true physical position
+/// appended by the positional data scan, never by arrival order.
+#[derive(Debug)]
+pub struct DeletedRowsExec {
+    unit: DeletionUnit,
     /// Cached plan properties
     properties: Arc<PlanProperties>,
 }
 
 impl DeletedRowsExec {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-        previous_delete_scan: Option<Arc<dyn ExecutionPlan>>,
-        data_file_scan: Arc<dyn ExecutionPlan>,
-        record_count: i64,
-        snapshot_id: i64,
-        row_id_start: Option<i64>,
-        table_len: usize,
-        embedded_col_idx: Option<usize>,
-        need_rowid: bool,
-        cumulative: bool,
-        window: (i64, i64),
-        output_schema: SchemaRef,
-    ) -> Self {
-        let eq_properties = EquivalenceProperties::new(output_schema.clone());
+    fn new(unit: DeletionUnit) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            eq_properties,
-            data_file_scan.output_partitioning().clone(),
-            data_file_scan.pipeline_behavior(),
-            data_file_scan.boundedness(),
+            EquivalenceProperties::new(unit.output_schema.clone()),
+            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
         ));
-
         Self {
-            current_delete_scan,
-            previous_delete_scan,
-            data_file_scan,
-            record_count,
-            snapshot_id,
-            row_id_start,
-            table_len,
-            embedded_col_idx,
-            need_rowid,
-            cumulative,
-            window,
-            output_schema,
+            unit,
             properties,
         }
     }
@@ -549,9 +548,9 @@ impl DisplayAs for DeletedRowsExec {
                 write!(
                     f,
                     "DeletedRowsExec: snapshot_id={}, full_delete={}, has_previous={}",
-                    self.snapshot_id,
-                    self.current_delete_scan.is_none(),
-                    self.previous_delete_scan.is_some()
+                    self.unit.snapshot_id,
+                    self.unit.current_delete_scan.is_none(),
+                    self.unit.previous_delete_scan.is_some()
                 )
             },
         }
@@ -567,65 +566,22 @@ impl ExecutionPlan for DeletedRowsExec {
         &self.properties
     }
 
+    /// No DataFusion children: the per-file scans are internal and executed
+    /// directly, so the optimizer never rewrites them.
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        let mut children = Vec::new();
-        if let Some(ref curr) = self.current_delete_scan {
-            children.push(curr);
-        }
-        if let Some(ref prev) = self.previous_delete_scan {
-            children.push(prev);
-        }
-        children.push(&self.data_file_scan);
-        children
+        vec![]
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut idx = 0;
-
-        let current = if self.current_delete_scan.is_some() {
-            let c = children
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| DataFusionError::Internal("Missing current delete child".into()))?;
-            idx += 1;
-            Some(c)
-        } else {
-            None
-        };
-
-        let previous = if self.previous_delete_scan.is_some() {
-            let p = children
-                .get(idx)
-                .cloned()
-                .ok_or_else(|| DataFusionError::Internal("Missing previous delete child".into()))?;
-            idx += 1;
-            Some(p)
-        } else {
-            None
-        };
-
-        let data = children
-            .get(idx)
-            .cloned()
-            .ok_or_else(|| DataFusionError::Internal("Missing data file child".into()))?;
-
-        Ok(Arc::new(DeletedRowsExec::new(
-            current,
-            previous,
-            data,
-            self.record_count,
-            self.snapshot_id,
-            self.row_id_start,
-            self.table_len,
-            self.embedded_col_idx,
-            self.need_rowid,
-            self.cumulative,
-            self.window,
-            self.output_schema.clone(),
-        )))
+        if !children.is_empty() {
+            return Err(DataFusionError::Internal(
+                "DeletedRowsExec has no children".to_string(),
+            ));
+        }
+        Ok(self)
     }
 
     fn execute(
@@ -633,397 +589,256 @@ impl ExecutionPlan for DeletedRowsExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let current_stream = self
-            .current_delete_scan
-            .as_ref()
-            .map(|p| p.execute(partition, context.clone()))
-            .transpose()?;
-        let previous_stream = self
-            .previous_delete_scan
-            .as_ref()
-            .map(|p| p.execute(partition, context.clone()))
-            .transpose()?;
-        let data_stream = self.data_file_scan.execute(partition, context)?;
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "DeletedRowsExec only supports partition 0, got {partition}"
+            )));
+        }
 
-        Ok(Box::pin(DeletedRowsStream::new(
-            current_stream,
-            previous_stream,
-            data_stream,
-            self.record_count,
-            self.snapshot_id,
-            self.row_id_start,
-            self.table_len,
-            self.embedded_col_idx,
-            self.need_rowid,
-            self.cumulative,
-            self.window,
-            self.output_schema.clone(),
-        )))
+        let unit = self.unit.clone();
+        let schema = self.unit.output_schema.clone();
+        let stream = futures::stream::once(extract_deleted_rows(unit, context))
+            .map(|res: DataFusionResult<Vec<RecordBatch>>| match res {
+                Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
+                Err(e) => futures::stream::iter(std::iter::once(Err(e))).boxed(),
+            })
+            .flatten();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 
     fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+        self.unit.output_schema.clone()
     }
 }
 
-/// Stream state machine
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamState {
-    /// Reading current delete file
-    ReadingCurrentDelete,
-    /// Reading previous delete file
-    ReadingPreviousDelete,
-    /// Reading data file and filtering
-    ReadingData,
-    /// Done
-    Done,
+/// Collect the deleted position set and filter the data file to those rows,
+/// matching by the true physical position appended by the positional scan.
+async fn extract_deleted_rows(
+    unit: DeletionUnit,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<Vec<RecordBatch>> {
+    // 1. Deleted positions, from the current delete file (windowed per row in
+    //    cumulative mode) or every position for a full-file delete.
+    let mut position_snapshots: HashMap<i64, i64> = HashMap::new();
+    let current_positions: HashSet<i64> = match &unit.current_delete_scan {
+        Some(scan) => {
+            let batches = collect(Arc::clone(scan), context.clone()).await?;
+            let mut positions = HashSet::new();
+            for batch in &batches {
+                if unit.cumulative {
+                    extract_windowed_positions(
+                        batch,
+                        unit.window,
+                        &mut positions,
+                        &mut position_snapshots,
+                    )?;
+                } else {
+                    positions.extend(extract_positions(batch)?);
+                }
+            }
+            positions
+        },
+        None => (0..unit.record_count).collect(),
+    };
+
+    // 2. Subtract the previous delete file's positions (legacy delta mode; the
+    //    per-row window filter replaces this in cumulative mode).
+    let deleted_positions: HashSet<i64> = match &unit.previous_delete_scan {
+        Some(scan) => {
+            let batches = collect(Arc::clone(scan), context.clone()).await?;
+            let mut previous = HashSet::new();
+            for batch in &batches {
+                previous.extend(extract_positions(batch)?);
+            }
+            current_positions
+                .into_iter()
+                .filter(|pos| !previous.contains(pos))
+                .collect()
+        },
+        None => current_positions,
+    };
+    if deleted_positions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 3. Read the data file and keep the rows whose PHYSICAL position is in the
+    //    deleted set. `collect()` reads every partition of the internal scan, so
+    //    no row can end up out of reach of the position set.
+    let batches = collect(Arc::clone(&unit.data_file_scan), context).await?;
+    let mut out = Vec::new();
+    for batch in &batches {
+        if let Some(filtered) = filter_batch(&unit, batch, &deleted_positions, &position_snapshots)?
+        {
+            out.push(filtered);
+        }
+    }
+    Ok(out)
 }
 
-/// Stream that reads deleted rows from a data file
-struct DeletedRowsStream {
-    /// Current delete file stream (None for full file delete)
-    current_delete_stream: Option<SendableRecordBatchStream>,
-    /// Previous delete file stream (if exists)
-    previous_delete_stream: Option<SendableRecordBatchStream>,
-    /// Data file stream
-    data_stream: SendableRecordBatchStream,
-    /// Snapshot ID for CDC column
-    snapshot_id: i64,
-    /// First rowid of the data file (`None` if absent); used to synthesize a
-    /// deleted row's rowid as `row_id_start + physical position` when there is
-    /// no embedded rowid.
-    row_id_start: Option<i64>,
-    /// Number of leading table columns in each data-file batch.
-    table_len: usize,
-    /// Column index of the embedded rowid in the data-file batch, if present;
-    /// its value IS the deleted row's rowid.
-    embedded_col_idx: Option<usize>,
-    /// Whether rowid is requested; when false it is emitted as a placeholder.
-    need_rowid: bool,
-    /// Whether the current delete file is cumulative (third column = per-row
-    /// delete snapshot); positions are then windowed per row on extraction.
-    cumulative: bool,
-    /// The query's inclusive `[start, end]` snapshot window (cumulative mode).
+/// Extract positions from a delete file batch (`(file_path, pos)` schema).
+fn extract_positions(batch: &RecordBatch) -> DataFusionResult<Vec<i64>> {
+    if batch.num_columns() < 2 {
+        return Ok(Vec::new());
+    }
+    let pos_array = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Internal("delete `pos` column is not Int64".to_string()))?;
+    Ok(pos_array.values().iter().copied().collect())
+}
+
+/// Extract in-window positions AND their per-row delete snapshots from a
+/// cumulative delete file batch (`(file_path, pos, snapshot)` schema),
+/// recording each kept position's snapshot in `position_snapshots`.
+fn extract_windowed_positions(
+    batch: &RecordBatch,
     window: (i64, i64),
-    /// Per-position delete snapshots (cumulative mode; in-window rows only).
-    position_snapshots: std::collections::HashMap<i64, i64>,
-    /// Output schema
-    output_schema: SchemaRef,
-    /// Collected current positions (or all positions for full delete)
-    current_positions: HashSet<i64>,
-    /// Collected previous positions
-    previous_positions: HashSet<i64>,
-    /// Computed delta positions (sorted)
-    deleted_positions: Option<Vec<i64>>,
-    /// Current row offset in data file (arrival order; see issue #178)
-    row_offset: i64,
-    /// State machine
-    state: StreamState,
-}
-
-impl DeletedRowsStream {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        current_delete_stream: Option<SendableRecordBatchStream>,
-        previous_delete_stream: Option<SendableRecordBatchStream>,
-        data_stream: SendableRecordBatchStream,
-        record_count: i64,
-        snapshot_id: i64,
-        row_id_start: Option<i64>,
-        table_len: usize,
-        embedded_col_idx: Option<usize>,
-        need_rowid: bool,
-        cumulative: bool,
-        window: (i64, i64),
-        output_schema: SchemaRef,
-    ) -> Self {
-        // Determine initial state and compute positions if needed
-        let (initial_state, current_positions, deleted_positions) =
-            if current_delete_stream.is_some() {
-                (StreamState::ReadingCurrentDelete, HashSet::new(), None)
-            } else if previous_delete_stream.is_some() {
-                // Full file delete but has previous - need to subtract previous positions
-                let current: HashSet<i64> = (0..record_count).collect();
-                (StreamState::ReadingPreviousDelete, current, None)
-            } else {
-                // Full file delete with no previous - all positions are deleted
-                let positions: Vec<i64> = (0..record_count).collect();
-                (
-                    StreamState::ReadingData,
-                    HashSet::new(),
-                    Some(positions), // Pre-computed sorted positions
-                )
-            };
-
-        Self {
-            current_delete_stream,
-            previous_delete_stream,
-            data_stream,
-            snapshot_id,
-            row_id_start,
-            table_len,
-            embedded_col_idx,
-            need_rowid,
-            cumulative,
-            window,
-            position_snapshots: std::collections::HashMap::new(),
-            output_schema,
-            current_positions,
-            previous_positions: HashSet::new(),
-            deleted_positions,
-            row_offset: 0,
-            state: initial_state,
-        }
+    positions: &mut HashSet<i64>,
+    position_snapshots: &mut HashMap<i64, i64>,
+) -> DataFusionResult<()> {
+    if batch.num_columns() < 3 {
+        return Err(DataFusionError::Internal(
+            "cumulative delete file batch is missing its snapshot column".to_string(),
+        ));
     }
-
-    /// Extract positions from a delete file batch
-    fn extract_positions(batch: &RecordBatch) -> HashSet<i64> {
-        if batch.num_columns() < 2 {
-            return HashSet::new();
-        }
-
-        let pos_array = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("pos column should be Int64");
-
-        pos_array.values().iter().copied().collect()
-    }
-
-    /// Extract in-window positions AND their per-row delete snapshots from a
-    /// cumulative delete file batch (`(file_path, pos, snapshot)` schema),
-    /// recording each kept position's snapshot in `position_snapshots`.
-    fn extract_windowed_positions(
-        &mut self,
-        batch: &RecordBatch,
-    ) -> DataFusionResult<HashSet<i64>> {
-        if batch.num_columns() < 3 {
+    let pos = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| DataFusionError::Internal("delete `pos` column is not Int64".to_string()))?;
+    let snaps = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal("delete snapshot column is not Int64".to_string())
+        })?;
+    for i in 0..batch.num_rows() {
+        if snaps.is_null(i) {
             return Err(DataFusionError::Internal(
-                "cumulative delete file batch is missing its snapshot column".to_string(),
+                "cumulative delete file has a NULL per-row snapshot".to_string(),
             ));
         }
-        let pos = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("delete `pos` column is not Int64".to_string())
-            })?;
-        let snaps = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| {
-                DataFusionError::Internal("delete snapshot column is not Int64".to_string())
-            })?;
-        let mut kept = HashSet::new();
-        for i in 0..batch.num_rows() {
-            if snaps.is_null(i) {
-                return Err(DataFusionError::Internal(
-                    "cumulative delete file has a NULL per-row snapshot".to_string(),
-                ));
-            }
-            let s = snaps.value(i);
-            if s >= self.window.0 && s <= self.window.1 {
-                let p = pos.value(i);
-                kept.insert(p);
-                self.position_snapshots.insert(p, s);
-            }
+        let s = snaps.value(i);
+        if s >= window.0 && s <= window.1 {
+            let p = pos.value(i);
+            positions.insert(p);
+            position_snapshots.insert(p, s);
         }
-        Ok(kept)
     }
-
-    /// Compute the delta and sort it
-    fn compute_deleted_positions(&mut self) {
-        let mut delta: Vec<i64> = self
-            .current_positions
-            .iter()
-            .filter(|pos| !self.previous_positions.contains(pos))
-            .copied()
-            .collect();
-        delta.sort_unstable();
-        self.deleted_positions = Some(delta);
-    }
-
-    /// Filter batch to only include deleted rows and append CDC columns
-    fn filter_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<Option<RecordBatch>> {
-        let deleted_positions = self.deleted_positions.as_ref().unwrap();
-        let num_rows = batch.num_rows();
-
-        // Resolve each deleted row's rowid: the embedded rowid column when the
-        // source file has one (an UPDATE / compaction output), else
-        // `row_id_start + physical position`.
-        let embedded = match self.embedded_col_idx {
-            Some(idx) => Some(
-                batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| {
-                        DataFusionError::Internal("embedded rowid column is not Int64".to_string())
-                    })?,
-            ),
-            None => None,
-        };
-        // Require a row_id_start only when a rowid is actually needed and there
-        // is no embedded rowid to read.
-        let synth_start: Option<i64> = if self.need_rowid && embedded.is_none() {
-            Some(self.row_id_start.ok_or_else(|| {
-                DataFusionError::Internal(
-                    "cannot synthesize deleted rowid: source file has neither an embedded \
-                     rowid nor a row_id_start"
-                        .to_string(),
-                )
-            })?)
-        } else {
-            None
-        };
-
-        // Find which rows in this batch are deleted, capturing each one's rowid
-        // and delete snapshot (per-row in cumulative mode, constant otherwise).
-        // `global_pos` is the stream's `row_offset` (arrival order) — the file's
-        // physical position for a non-repartitioned scan. See issue #178 for the
-        // repartitioning limitation this shares with the delete-position match.
-        let mut keep_indices: Vec<u32> = Vec::new();
-        let mut rowids: Vec<i64> = Vec::new();
-        let mut snapshots: Vec<i64> = Vec::new();
-        for i in 0..num_rows {
-            let global_pos = self.row_offset + i as i64;
-            if deleted_positions.binary_search(&global_pos).is_ok() {
-                keep_indices.push(i as u32);
-                // When rowid is projected away, emit a placeholder (dropped by
-                // the ProjectionExec above) so no rowid needs synthesizing.
-                let rowid = if !self.need_rowid {
-                    0
-                } else {
-                    match (embedded, synth_start) {
-                        (Some(arr), _) => arr.value(i),
-                        (None, Some(start)) => start + global_pos,
-                        // synth_start is Some whenever rowid is needed and there
-                        // is no embedded rowid (resolved above).
-                        (None, None) => unreachable!("row_id_start resolved above"),
-                    }
-                };
-                rowids.push(rowid);
-                snapshots.push(if self.cumulative {
-                    // Kept positions come from the windowed extraction, so the
-                    // map always holds them.
-                    *self
-                        .position_snapshots
-                        .get(&global_pos)
-                        .unwrap_or(&self.snapshot_id)
-                } else {
-                    self.snapshot_id
-                });
-            }
-        }
-
-        // Update row offset for next batch.
-        self.row_offset += num_rows as i64;
-
-        // If no deleted rows in this batch, return None
-        if keep_indices.is_empty() {
-            return Ok(None);
-        }
-
-        // Emit the CDC columns first — snapshot_id, rowid, change_type, the
-        // official order — then the deleted rows' TABLE columns (excluding the
-        // embedded rowid helper column, if the scan read one).
-        let indices = UInt32Array::from(keep_indices.clone());
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.table_len + 3);
-        columns.push(Arc::new(Int64Array::from(snapshots)));
-        columns.push(Arc::new(Int64Array::from(rowids)));
-        columns.push(Arc::new(StringArray::from(vec![
-            "delete";
-            keep_indices.len()
-        ])));
-
-        for col in batch.columns().iter().take(self.table_len) {
-            let filtered = take(col.as_ref(), &indices, None)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-            columns.push(filtered);
-        }
-
-        RecordBatch::try_new(self.output_schema.clone(), columns)
-            .map(Some)
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-    }
+    Ok(())
 }
 
-impl Stream for DeletedRowsStream {
-    type Item = DataFusionResult<RecordBatch>;
+/// Filter a data-file batch to its deleted rows and append the CDC columns.
+fn filter_batch(
+    unit: &DeletionUnit,
+    batch: &RecordBatch,
+    deleted_positions: &HashSet<i64>,
+    position_snapshots: &HashMap<i64, i64>,
+) -> DataFusionResult<Option<RecordBatch>> {
+    let num_rows = batch.num_rows();
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            match self.state {
-                StreamState::ReadingCurrentDelete => {
-                    let current = self.current_delete_stream.as_mut().unwrap();
-                    match Pin::new(current).poll_next(cx) {
-                        Poll::Ready(Some(Ok(batch))) => {
-                            let positions = if self.cumulative {
-                                match self.extract_windowed_positions(&batch) {
-                                    Ok(p) => p,
-                                    Err(e) => return Poll::Ready(Some(Err(e))),
-                                }
-                            } else {
-                                Self::extract_positions(&batch)
-                            };
-                            self.current_positions.extend(positions);
-                        },
-                        Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                        Poll::Ready(None) => {
-                            if self.previous_delete_stream.is_some() {
-                                self.state = StreamState::ReadingPreviousDelete;
-                            } else {
-                                self.compute_deleted_positions();
-                                self.state = StreamState::ReadingData;
-                            }
-                        },
-                        Poll::Pending => return Poll::Pending,
-                    }
-                },
-                StreamState::ReadingPreviousDelete => {
-                    let prev = self.previous_delete_stream.as_mut().unwrap();
-                    match Pin::new(prev).poll_next(cx) {
-                        Poll::Ready(Some(Ok(batch))) => {
-                            let positions = Self::extract_positions(&batch);
-                            self.previous_positions.extend(positions);
-                        },
-                        Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                        Poll::Ready(None) => {
-                            self.compute_deleted_positions();
-                            self.state = StreamState::ReadingData;
-                        },
-                        Poll::Pending => return Poll::Pending,
-                    }
-                },
-                StreamState::ReadingData => {
-                    match Pin::new(&mut self.data_stream).poll_next(cx) {
-                        Poll::Ready(Some(Ok(batch))) => {
-                            match self.filter_batch(&batch)? {
-                                Some(filtered) => return Poll::Ready(Some(Ok(filtered))),
-                                None => continue, // No deleted rows in this batch
-                            }
-                        },
-                        Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
-                        Poll::Ready(None) => {
-                            self.state = StreamState::Done;
-                            return Poll::Ready(None);
-                        },
-                        Poll::Pending => return Poll::Pending,
-                    }
-                },
-                StreamState::Done => {
-                    return Poll::Ready(None);
-                },
-            }
+    // The physical position of each row, appended by the positional scan.
+    let pos = batch
+        .column(unit.pos_col_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "physical-position column {ROW_POS_COLUMN_NAME} is missing or not Int64"
+            ))
+        })?;
+
+    // Resolve each deleted row's rowid: the embedded rowid column when the
+    // source file has one (an UPDATE / compaction output), else
+    // `row_id_start + physical position`.
+    let embedded = match unit.embedded_col_idx {
+        Some(idx) => Some(
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("embedded rowid column is not Int64".to_string())
+                })?,
+        ),
+        None => None,
+    };
+    // Require a row_id_start only when a rowid is actually needed and there
+    // is no embedded rowid to read.
+    let synth_start: Option<i64> = if unit.need_rowid && embedded.is_none() {
+        Some(unit.row_id_start.ok_or_else(|| {
+            DataFusionError::Internal(
+                "cannot synthesize deleted rowid: source file has neither an embedded \
+                 rowid nor a row_id_start"
+                    .to_string(),
+            )
+        })?)
+    } else {
+        None
+    };
+
+    // Find which rows in this batch are deleted, capturing each one's rowid
+    // and delete snapshot (per-row in cumulative mode, constant otherwise).
+    let mut keep_indices: Vec<u32> = Vec::new();
+    let mut rowids: Vec<i64> = Vec::new();
+    let mut snapshots: Vec<i64> = Vec::new();
+    for i in 0..num_rows {
+        let physical_pos = pos.value(i);
+        if deleted_positions.contains(&physical_pos) {
+            keep_indices.push(i as u32);
+            // When rowid is projected away, emit a placeholder (dropped by
+            // the ProjectionExec above) so no rowid needs synthesizing.
+            let rowid = if !unit.need_rowid {
+                0
+            } else {
+                match (embedded, synth_start) {
+                    (Some(arr), _) => arr.value(i),
+                    (None, Some(start)) => start + physical_pos,
+                    // synth_start is Some whenever rowid is needed and there
+                    // is no embedded rowid (resolved above).
+                    (None, None) => unreachable!("row_id_start resolved above"),
+                }
+            };
+            rowids.push(rowid);
+            snapshots.push(if unit.cumulative {
+                // Kept positions come from the windowed extraction, so the
+                // map always holds them.
+                *position_snapshots
+                    .get(&physical_pos)
+                    .unwrap_or(&unit.snapshot_id)
+            } else {
+                unit.snapshot_id
+            });
         }
     }
-}
 
-impl RecordBatchStream for DeletedRowsStream {
-    fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+    // If no deleted rows in this batch, return None
+    if keep_indices.is_empty() {
+        return Ok(None);
     }
+
+    // Emit the CDC columns first — snapshot_id, rowid, change_type, the
+    // official order — then the deleted rows' TABLE columns (excluding the
+    // embedded rowid and position helper columns the scan read).
+    let indices = UInt32Array::from(keep_indices.clone());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(unit.table_len + 3);
+    columns.push(Arc::new(Int64Array::from(snapshots)));
+    columns.push(Arc::new(Int64Array::from(rowids)));
+    columns.push(Arc::new(StringArray::from(vec![
+        "delete";
+        keep_indices.len()
+    ])));
+
+    for col in batch.columns().iter().take(unit.table_len) {
+        let filtered = take(col.as_ref(), &indices, None)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        columns.push(filtered);
+    }
+
+    RecordBatch::try_new(unit.output_schema.clone(), columns)
+        .map(Some)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
