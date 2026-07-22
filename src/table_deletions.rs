@@ -11,8 +11,10 @@
 //!
 //! Like [`TableChangesExec`](crate::table_changes), [`DeletedRowsExec`] is a
 //! single-partition plan with no DataFusion children: its per-file scans are
-//! internal and executed directly via `collect()`, and deleted rows are matched
-//! by TRUE physical file position ([`PositionalFileSource`] +
+//! internal and executed directly — the delete files are fully collected (the
+//! position set must be complete before any data row can be classified), then
+//! the data file is streamed batch-by-batch through the filter. Deleted rows
+//! are matched by TRUE physical file position ([`PositionalFileSource`] +
 //! [`FileRowNumberExec`]) rather than stream arrival order. Exposing the scans
 //! as children lets the optimizer repartition them (round-robin or byte-range
 //! splits), which desynchronizes the delete-position set from the data rows —
@@ -44,7 +46,8 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, collect,
 };
-use futures::StreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -597,12 +600,7 @@ impl ExecutionPlan for DeletedRowsExec {
 
         let unit = self.unit.clone();
         let schema = self.unit.output_schema.clone();
-        let stream = futures::stream::once(extract_deleted_rows(unit, context))
-            .map(|res: DataFusionResult<Vec<RecordBatch>>| match res {
-                Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
-                Err(e) => futures::stream::iter(std::iter::once(Err(e))).boxed(),
-            })
-            .flatten();
+        let stream = futures::stream::once(deleted_rows_stream(unit, context)).try_flatten();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
@@ -612,12 +610,15 @@ impl ExecutionPlan for DeletedRowsExec {
     }
 }
 
-/// Collect the deleted position set and filter the data file to those rows,
-/// matching by the true physical position appended by the positional scan.
-async fn extract_deleted_rows(
+/// Collect the deleted position set (the delete files must be read fully
+/// before any data row can be classified), then return the data file's
+/// batches filtered to the deleted rows, matching by the true physical
+/// position appended by the positional scan. The data file itself is
+/// streamed batch-by-batch, never materialized whole.
+async fn deleted_rows_stream(
     unit: DeletionUnit,
     context: Arc<TaskContext>,
-) -> DataFusionResult<Vec<RecordBatch>> {
+) -> DataFusionResult<BoxStream<'static, DataFusionResult<RecordBatch>>> {
     // 1. Deleted positions, from the current delete file (windowed per row in
     //    cumulative mode) or every position for a full-file delete.
     let mut position_snapshots: HashMap<i64, i64> = HashMap::new();
@@ -659,21 +660,23 @@ async fn extract_deleted_rows(
         None => current_positions,
     };
     if deleted_positions.is_empty() {
-        return Ok(Vec::new());
+        return Ok(futures::stream::empty().boxed());
     }
 
-    // 3. Read the data file and keep the rows whose PHYSICAL position is in the
-    //    deleted set. `collect()` reads every partition of the internal scan, so
-    //    no row can end up out of reach of the position set.
-    let batches = collect(Arc::clone(&unit.data_file_scan), context).await?;
-    let mut out = Vec::new();
-    for batch in &batches {
-        if let Some(filtered) = filter_batch(&unit, batch, &deleted_positions, &position_snapshots)?
-        {
-            out.push(filtered);
-        }
-    }
-    Ok(out)
+    // 3. Stream the data file and keep the rows whose PHYSICAL position is in
+    //    the deleted set. The positional scan is a single partition covering
+    //    the whole file, so no row can end up out of reach of the position set.
+    let data_stream = unit.data_file_scan.execute(0, context)?;
+    Ok(data_stream
+        .try_filter_map(move |batch| {
+            futures::future::ready(filter_batch(
+                &unit,
+                &batch,
+                &deleted_positions,
+                &position_snapshots,
+            ))
+        })
+        .boxed())
 }
 
 /// Extract positions from a delete file batch (`(file_path, pos)` schema).
