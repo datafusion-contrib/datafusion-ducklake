@@ -1,6 +1,6 @@
 //! Type mapping from DuckLake types to Arrow types
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::metadata_provider::DuckLakeTableColumn;
@@ -212,6 +212,18 @@ fn validate_decimal_precision_scale(precision: u8, scale: i8, type_str: &str) ->
     Ok(())
 }
 
+/// Pick the Arrow decimal width for a validated `(precision, scale)`. Arrow
+/// caps `Decimal128` at precision 38 and requires `Decimal256` above that, so
+/// both the `decimal(P)` and `decimal(P, S)` paths must switch on `> 38` — a
+/// single helper keeps them from diverging.
+fn decimal_data_type(precision: u8, scale: i8) -> DataType {
+    if precision > 38 {
+        DataType::Decimal256(precision, scale)
+    } else {
+        DataType::Decimal128(precision, scale)
+    }
+}
+
 /// Parse decimal type with precision and scale
 /// Format: "decimal(precision, scale)" or "decimal(precision)"
 ///
@@ -244,7 +256,7 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
                 ))
             })?;
             validate_decimal_precision_scale(precision, 0, type_str)?;
-            Ok(Some(DataType::Decimal128(precision, 0)))
+            Ok(Some(decimal_data_type(precision, 0)))
         },
         2 => {
             let precision: u8 = parts[0].parse().map_err(|_| {
@@ -260,11 +272,7 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
                 ))
             })?;
             validate_decimal_precision_scale(precision, scale, type_str)?;
-            if precision > 38 {
-                Ok(Some(DataType::Decimal256(precision, scale)))
-            } else {
-                Ok(Some(DataType::Decimal128(precision, scale)))
-            }
+            Ok(Some(decimal_data_type(precision, scale)))
         },
         n => Err(DuckLakeError::UnsupportedType(format!(
             "Invalid decimal type: expected at most 2 parameters (precision, scale), got {} in type '{}'",
@@ -475,8 +483,6 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
 /// DuckLake column_id == Parquet field_id, enabling column matching after renames.
 pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, String> {
     let schema_descr = metadata.file_metadata().schema_descr();
-    let mut field_id_map = HashMap::new();
-
     // DuckLake assigns one field_id per *top-level* column (`column_id` == the
     // top-level field's field_id), so read ids off the top-level fields — the
     // root group's direct children — NOT the Parquet leaf columns.
@@ -488,14 +494,44 @@ pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, Str
     // (`num_columns()`) misses `v`'s id entirely, so the matcher treats the column
     // as absent and null-fills it. Walking top-level fields finds the id where it
     // actually sits.
-    for field in schema_descr.root_schema().get_fields() {
-        let basic_info = field.get_basic_info();
-        if basic_info.has_id() {
-            field_id_map.insert(basic_info.id(), field.name().to_string());
+    let entries = schema_descr
+        .root_schema()
+        .get_fields()
+        .iter()
+        .filter_map(|field| {
+            let basic_info = field.get_basic_info();
+            basic_info
+                .has_id()
+                .then(|| (basic_info.id(), field.name().to_string()))
+        });
+    field_ids_dropping_duplicates(entries)
+}
+
+/// Collect a `field_id -> name` map, dropping any `field_id` shared by more than
+/// one top-level column. DuckLake assigns exactly one field_id per top-level
+/// column, so a collision is malformed/adversarial parquet; binding the catalog
+/// column with that id to either physical column risks reading the wrong data.
+/// Dropping the id makes the reader null-fill that column (via its "field_id
+/// absent" path) instead of silently substituting the wrong one.
+fn field_ids_dropping_duplicates(
+    entries: impl Iterator<Item = (i32, String)>,
+) -> HashMap<i32, String> {
+    let mut map: HashMap<i32, String> = HashMap::new();
+    let mut duplicates: HashSet<i32> = HashSet::new();
+    for (id, name) in entries {
+        if map.insert(id, name).is_some() {
+            duplicates.insert(id);
         }
     }
-
-    field_id_map
+    for id in duplicates {
+        map.remove(&id);
+        tracing::warn!(
+            field_id = id,
+            "parquet file has multiple top-level columns sharing this field_id; \
+             ignoring it — the affected column will read as NULL"
+        );
+    }
+    map
 }
 
 /// Build a schema for reading Parquet files across schema evolution.
@@ -842,6 +878,49 @@ mod tests {
             ducklake_to_arrow_type("decimal(38, 10)").unwrap(),
             DataType::Decimal128(38, 10)
         );
+    }
+
+    #[test]
+    fn test_decimal_single_param_over_38_uses_decimal256() {
+        // A single-parameter `decimal(P)` with P > 38 must widen to Decimal256,
+        // like the two-parameter path — not build an invalid Decimal128 (Arrow
+        // caps Decimal128 precision at 38).
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(50)").unwrap(),
+            DataType::Decimal256(50, 0)
+        );
+        // At/under 38 stays Decimal128 on the single-parameter path.
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(38)").unwrap(),
+            DataType::Decimal128(38, 0)
+        );
+        // The two-parameter path keeps switching on > 38 too.
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(50, 10)").unwrap(),
+            DataType::Decimal256(50, 10)
+        );
+    }
+
+    #[test]
+    fn test_field_ids_dropping_duplicates() {
+        // Unique field_ids are kept as-is.
+        let unique =
+            field_ids_dropping_duplicates([(1, "a".to_string()), (2, "b".to_string())].into_iter());
+        assert_eq!(unique.get(&1), Some(&"a".to_string()));
+        assert_eq!(unique.get(&2), Some(&"b".to_string()));
+
+        // A field_id shared by two columns is dropped entirely (neither name
+        // wins), so the reader null-fills that column instead of binding the
+        // wrong one. Other ids are unaffected.
+        let with_dup = field_ids_dropping_duplicates(
+            [(3, "a".to_string()), (3, "b".to_string()), (4, "c".to_string())].into_iter(),
+        );
+        assert_eq!(
+            with_dup.get(&3),
+            None,
+            "a duplicated field_id must not map to either column"
+        );
+        assert_eq!(with_dup.get(&4), Some(&"c".to_string()));
     }
 
     #[test]
