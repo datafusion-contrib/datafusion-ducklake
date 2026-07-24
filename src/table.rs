@@ -2093,6 +2093,16 @@ impl DuckLakeTable {
         &self.object_store_url
     }
 
+    /// The table's live sort spec at the current catalog head, if any. The write
+    /// and compaction paths use it to order rows before writing (tightening
+    /// per-file min/max). Read at the head, not the pinned read snapshot, so a
+    /// `SET SORTED BY` applied after this provider was opened is honored.
+    #[cfg(feature = "write")]
+    pub(crate) fn live_sort_spec(&self) -> crate::Result<Option<crate::sort::SortSpec>> {
+        let head = self.provider.get_current_snapshot()?;
+        self.provider.get_sort_spec(self.table_id, head)
+    }
+
     /// The live columns' catalog `column_id`s in `column_order` — the parquet
     /// field-ids a compaction output must bake in so its data columns map back
     /// to the catalog on read.
