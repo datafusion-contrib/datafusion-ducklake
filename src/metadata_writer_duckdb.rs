@@ -61,6 +61,7 @@ CREATE SEQUENCE IF NOT EXISTS ducklake_table_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_data_file_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_delete_file_id_seq START 1;
 CREATE SEQUENCE IF NOT EXISTS ducklake_partition_id_seq START 1;
+CREATE SEQUENCE IF NOT EXISTS ducklake_sort_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
@@ -216,6 +217,28 @@ CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
     table_id BIGINT NOT NULL,
     partition_key_index BIGINT NOT NULL,
     partition_value VARCHAR
+);
+
+-- Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id is
+-- allocated from the next_sort_id counter (like partition_id).
+CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+    sort_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    begin_snapshot BIGINT NOT NULL,
+    end_snapshot BIGINT
+);
+
+-- Sort-key expressions for a spec (DuckLake spec), ordered by sort_key_index.
+-- expression is a sort expression in `dialect` (this crate produces bare column
+-- names under `duckdb`); sort_direction ASC/DESC; null_order NULLS_FIRST/LAST.
+CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+    sort_id BIGINT NOT NULL,
+    table_id BIGINT NOT NULL,
+    sort_key_index BIGINT NOT NULL,
+    expression VARCHAR NOT NULL,
+    dialect VARCHAR NOT NULL,
+    sort_direction VARCHAR NOT NULL,
+    null_order VARCHAR NOT NULL
 );
 "#;
 
@@ -1046,6 +1069,103 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let new_schema_version = bump_schema_version(&tx, new_snapshot)?;
         record_schema_version(&tx, new_snapshot, new_schema_version, table_id)?;
+        tx.commit()?;
+        Ok(new_snapshot)
+    }
+
+    fn set_sort_spec(&self, table_id: i64, fields: &[crate::sort::SortField]) -> Result<i64> {
+        if fields.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_sort_spec: at least one sort key is required (use reset_sort_spec to clear)"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let sort_id: i64 =
+            tx.query_row("SELECT nextval('ducklake_sort_id_seq')", [], |row| row.get(0))?;
+        let (new_snapshot, _carried) = insert_snapshot(&tx)?;
+
+        // Validate every sort key resolves to a live column (v1 supports bare column
+        // keys only), so a bad SET fails here rather than silently producing
+        // unsorted writes later.
+        for field in fields {
+            let column = field.column_candidate().ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "set_sort_spec: sort key '{}' is not a bare column; only column \
+                     sort keys are supported",
+                    field.expression
+                ))
+            })?;
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                    params![table_id, column.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "set_sort_spec: no live column '{column}' in table {table_id}"
+                )));
+            }
+        }
+
+        tx.execute(
+            "UPDATE ducklake_sort_info SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![new_snapshot, table_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_sort_info
+                 (sort_id, table_id, begin_snapshot, end_snapshot)
+             VALUES (?, ?, ?, NULL)",
+            params![sort_id, table_id, new_snapshot],
+        )?;
+        for field in fields {
+            tx.execute(
+                "INSERT INTO ducklake_sort_expression
+                     (sort_id, table_id, sort_key_index, expression, dialect,
+                      sort_direction, null_order)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    sort_id,
+                    table_id,
+                    field.sort_key_index as i64,
+                    field.expression.as_str(),
+                    field.dialect.as_str(),
+                    field.direction.to_catalog_string(),
+                    field.null_order.to_catalog_string()
+                ],
+            )?;
+        }
+
+        // A sort-order change does NOT bump schema_version.
+        tx.commit()?;
+        Ok(new_snapshot)
+    }
+
+    fn reset_sort_spec(&self, table_id: i64) -> Result<i64> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let (new_snapshot, _carried) = insert_snapshot(&tx)?;
+        let ended = tx.execute(
+            "UPDATE ducklake_sort_info SET end_snapshot = ?
+             WHERE table_id = ? AND end_snapshot IS NULL",
+            params![new_snapshot, table_id],
+        )?;
+        if ended == 0 {
+            // Nothing to reset: roll back the snapshot and report the head.
+            drop(tx);
+            let head: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+                [],
+                |row| row.get(0),
+            )?;
+            return Ok(head);
+        }
+        // A sort-order change does NOT bump schema_version.
         tx.commit()?;
         Ok(new_snapshot)
     }

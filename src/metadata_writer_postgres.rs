@@ -193,6 +193,26 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         partition_key_index BIGINT NOT NULL,
         partition_value VARCHAR
     )"#,
+    // Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id
+    // is IDENTITY so set_sort_spec allocates it via RETURNING (like partition_id).
+    r#"CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+        sort_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        table_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT
+    )"#,
+    // Sort-key expressions for a spec (DuckLake spec), ordered by sort_key_index.
+    // expression is a sort expression in `dialect` (this crate produces bare column
+    // names under `duckdb`); sort_direction ASC/DESC; null_order NULLS_FIRST/LAST.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+        sort_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        sort_key_index BIGINT NOT NULL,
+        expression VARCHAR NOT NULL,
+        dialect VARCHAR NOT NULL,
+        sort_direction VARCHAR NOT NULL,
+        null_order VARCHAR NOT NULL
+    )"#,
 ];
 
 /// Multicatalog scaffolding tables. Always run after the standard tables.
@@ -427,6 +447,47 @@ async fn assert_table_in_catalog(
             }
         },
     }
+}
+
+/// Create a new snapshot for a sort-spec DDL change and advance this catalog's
+/// head, carrying the current `schema_version` FORWARD unchanged. Unlike a
+/// partition-spec change, a sort-spec change does not bump `schema_version` or write
+/// a `ducklake_schema_versions` ledger row — sort order does not alter the logical
+/// schema. Returns the new snapshot id.
+async fn insert_sort_snapshot(
+    catalog_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64> {
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+         VALUES (NOW(), 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    sqlx::query("INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)")
+        .bind(catalog_id)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    // Carry the live schema_version forward (no bump) so reads at the new head see
+    // the same schema as before the sort change.
+    let carried: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+         WHERE m.catalog_id = $1 AND s.snapshot_id <> $2",
+    )
+    .bind(catalog_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+        .bind(carried)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(snapshot_id)
 }
 
 /// Reject only a `table_id` hint that exists and belongs to ANOTHER catalog. A
@@ -1827,6 +1888,128 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             sqlx::query(
                 "UPDATE ducklake_partition_info SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn set_sort_spec(&self, table_id: i64, fields: &[crate::sort::SortField]) -> Result<i64> {
+        if fields.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_sort_spec: at least one sort key is required (use reset_sort_spec to clear)"
+                    .to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            let snapshot_id = insert_sort_snapshot(self.catalog_id, &mut tx).await?;
+
+            // Validate every sort key resolves to a live column (v1 supports bare
+            // column keys only), so a bad SET fails here rather than silently
+            // producing unsorted writes later.
+            for field in fields {
+                let column = field.column_candidate().ok_or_else(|| {
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "set_sort_spec: sort key '{}' is not a bare column; only column \
+                         sort keys are supported",
+                        field.expression
+                    ))
+                })?;
+                let exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .bind(&column)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if exists.is_none() {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "set_sort_spec: no live column '{column}' in table {table_id}"
+                    )));
+                }
+            }
+
+            // End the currently-live spec generation (if any), then insert the new
+            // one (sort_id is IDENTITY → RETURNING) and its per-key expressions.
+            sqlx::query(
+                "UPDATE ducklake_sort_info SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let sort_id: i64 = sqlx::query(
+                "INSERT INTO ducklake_sort_info (table_id, begin_snapshot, end_snapshot)
+                 VALUES ($1, $2, NULL) RETURNING sort_id",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            for field in fields {
+                sqlx::query(
+                    "INSERT INTO ducklake_sort_expression
+                         (sort_id, table_id, sort_key_index, expression, dialect,
+                          sort_direction, null_order)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(sort_id)
+                .bind(table_id)
+                .bind(field.sort_key_index as i64)
+                .bind(&field.expression)
+                .bind(&field.dialect)
+                .bind(field.direction.to_catalog_string())
+                .bind(field.null_order.to_catalog_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn reset_sort_spec(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+
+            // Nothing to reset → report the current head without a new snapshot.
+            let has_live: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM ducklake_sort_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if has_live.is_none() {
+                let head: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+                     WHERE catalog_id = $1",
+                )
+                .bind(self.catalog_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                return Ok(head);
+            }
+
+            let snapshot_id = insert_sort_snapshot(self.catalog_id, &mut tx).await?;
+            sqlx::query(
+                "UPDATE ducklake_sort_info SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)

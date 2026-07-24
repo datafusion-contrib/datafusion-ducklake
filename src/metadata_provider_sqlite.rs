@@ -5,11 +5,12 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, block_on, reconstruct_list_columns,
-    reconstruct_list_columns_with_table,
+    MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
+    reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use crate::partition::PartitionSpec;
+use crate::sort::SortSpec;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -536,6 +537,36 @@ impl MetadataProvider for SqliteMetadataProvider {
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(PartitionSpec::from_rows(parsed, prune_safe))
+        })
+    }
+
+    fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
+        block_on(async {
+            let rows = match sqlx::query(SQL_GET_SORT_SPEC)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<String, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                        row.try_get::<String, _>(4)?,
+                        row.try_get::<String, _>(5)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SortSpec::from_rows(parsed))
         })
     }
 
