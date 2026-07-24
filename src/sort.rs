@@ -159,7 +159,10 @@ fn parse_bare_column(expr: &str) -> Option<String> {
     if !(first.is_ascii_alphabetic() || first == '_') {
         return None;
     }
-    if trimmed.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         Some(trimmed.to_string())
     } else {
         None
@@ -211,7 +214,10 @@ impl SortSpec {
                 },
             )
             .collect();
-        Some(SortSpec { sort_id, fields })
+        Some(SortSpec {
+            sort_id,
+            fields,
+        })
     }
 }
 
@@ -246,7 +252,10 @@ mod tests {
     #[test]
     fn bare_column_expressions_are_producible() {
         assert_eq!(parse_bare_column("ts"), Some("ts".to_string()));
-        assert_eq!(parse_bare_column("  device_id "), Some("device_id".to_string()));
+        assert_eq!(
+            parse_bare_column("  device_id "),
+            Some("device_id".to_string())
+        );
         assert_eq!(parse_bare_column("_x1"), Some("_x1".to_string()));
         // double-quoted identifier with spaces
         assert_eq!(parse_bare_column("\"My Col\""), Some("My Col".to_string()));
@@ -254,16 +263,12 @@ mod tests {
 
     #[test]
     fn non_column_expressions_are_not_producible() {
-        for expr in [
-            "",
-            "date_trunc('day', ts)",
-            "a + b",
-            "t.ts",
-            "1",
-            "ts, device_id",
-            "\"\"",
-        ] {
-            assert_eq!(parse_bare_column(expr), None, "expr {expr:?} should not be a bare column");
+        for expr in ["", "date_trunc('day', ts)", "a + b", "t.ts", "1", "ts, device_id", "\"\""] {
+            assert_eq!(
+                parse_bare_column(expr),
+                None,
+                "expr {expr:?} should not be a bare column"
+            );
         }
     }
 
@@ -280,7 +285,11 @@ mod tests {
         assert_eq!(
             ok.producible_columns().unwrap(),
             vec![
-                ("device_id".to_string(), SortDirection::Asc, NullOrder::NullsLast),
+                (
+                    "device_id".to_string(),
+                    SortDirection::Asc,
+                    NullOrder::NullsLast
+                ),
                 ("ts".to_string(), SortDirection::Desc, NullOrder::NullsFirst),
             ]
         );

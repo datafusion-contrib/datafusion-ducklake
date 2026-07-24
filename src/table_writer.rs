@@ -656,7 +656,11 @@ impl DuckLakeTableWriter {
             }
             // A group may roll over into several files (each a contiguous slice of
             // the group's rows); every file shares this group's partition values.
-            let rel_prefix = if rel.is_empty() { None } else { Some(rel.as_str()) };
+            let rel_prefix = if rel.is_empty() {
+                None
+            } else {
+                Some(rel.as_str())
+            };
             let group_files = self
                 .write_rolled_files(
                     &table_key,
@@ -733,7 +737,13 @@ impl DuckLakeTableWriter {
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
         let file_infos = self
-            .write_rolled_files(&table_key, None, schema_with_ids, &setup.column_ids, batches)
+            .write_rolled_files(
+                &table_key,
+                None,
+                schema_with_ids,
+                &setup.column_ids,
+                batches,
+            )
             .await?;
         if file_infos.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(

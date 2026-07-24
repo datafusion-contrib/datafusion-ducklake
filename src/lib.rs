@@ -109,8 +109,8 @@ pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{DuckLakeFileData, DuckLakeTableFile, MetadataProvider};
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
-pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use schema::DuckLakeSchema;
+pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
 

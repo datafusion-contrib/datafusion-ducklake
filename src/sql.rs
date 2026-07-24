@@ -182,7 +182,9 @@ fn expect_by(parser: &mut Parser, context: &str) -> DataFusionResult<()> {
     if parser.parse_keyword(Keyword::BY) {
         Ok(())
     } else {
-        Err(DataFusionError::Plan(format!("expected BY after {context}")))
+        Err(DataFusionError::Plan(format!(
+            "expected BY after {context}"
+        )))
     }
 }
 
@@ -369,10 +371,20 @@ async fn apply_ducklake_ddl(
         .map_err(DataFusionError::from)?;
 
     let parts = match &ddl {
-        DuckLakeDdl::SetPartition { table, .. }
-        | DuckLakeDdl::ResetPartition { table }
-        | DuckLakeDdl::SetSort { table, .. }
-        | DuckLakeDdl::ResetSort { table } => table,
+        DuckLakeDdl::SetPartition {
+            table,
+            ..
+        }
+        | DuckLakeDdl::ResetPartition {
+            table,
+        }
+        | DuckLakeDdl::SetSort {
+            table,
+            ..
+        }
+        | DuckLakeDdl::ResetSort {
+            table,
+        } => table,
     };
     let (schema_name, table_name) = resolve_schema_table(parts)?;
 
@@ -386,22 +398,32 @@ async fn apply_ducklake_ddl(
         .ok_or_else(|| DataFusionError::Plan(format!("table '{table_name}' not found")))?;
 
     match ddl {
-        DuckLakeDdl::SetPartition { transforms, .. } => {
+        DuckLakeDdl::SetPartition {
+            transforms,
+            ..
+        } => {
             writer
                 .set_partition_spec(table.table_id, &transforms)
                 .map_err(DataFusionError::from)?;
         },
-        DuckLakeDdl::ResetPartition { .. } => {
+        DuckLakeDdl::ResetPartition {
+            ..
+        } => {
             writer
                 .reset_partition_spec(table.table_id)
                 .map_err(DataFusionError::from)?;
         },
-        DuckLakeDdl::SetSort { fields, .. } => {
+        DuckLakeDdl::SetSort {
+            fields,
+            ..
+        } => {
             writer
                 .set_sort_spec(table.table_id, &fields)
                 .map_err(DataFusionError::from)?;
         },
-        DuckLakeDdl::ResetSort { .. } => {
+        DuckLakeDdl::ResetSort {
+            ..
+        } => {
             writer
                 .reset_sort_spec(table.table_id)
                 .map_err(DataFusionError::from)?;

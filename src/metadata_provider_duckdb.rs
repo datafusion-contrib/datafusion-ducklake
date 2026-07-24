@@ -350,11 +350,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(PartitionSpec::from_rows(rows, prune_safe))
     }
 
-    fn get_sort_spec(
-        &self,
-        table_id: i64,
-        snapshot_id: i64,
-    ) -> crate::Result<Option<SortSpec>> {
+    fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> crate::Result<Option<SortSpec>> {
         let conn = self.connection();
         let rows = match conn.prepare(SQL_GET_SORT_SPEC) {
             Ok(mut stmt) => stmt

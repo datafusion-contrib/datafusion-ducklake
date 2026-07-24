@@ -69,6 +69,10 @@ pub struct DuckLakeInsertExec {
     /// Write-layout options applied to the DuckLakeTableWriter built at execute
     /// time (compression, row-group caps, file-rollover target).
     write_options: crate::table_writer::DuckLakeWriteOptions,
+    /// The sort order this insert requires of its input (the table's live sort
+    /// spec). Declared via `required_input_ordering` so DataFusion's EnforceSorting
+    /// keeps the input sorted instead of pruning the SortExec as unused.
+    required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     cache: Arc<PlanProperties>,
 }
 
@@ -85,6 +89,7 @@ impl DuckLakeInsertExec {
         object_store_url: Arc<ObjectStoreUrl>,
         partition: Option<PartitionWriteSpec>,
         write_options: crate::table_writer::DuckLakeWriteOptions,
+        required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -97,6 +102,7 @@ impl DuckLakeInsertExec {
             object_store_url,
             partition,
             write_options,
+            required_ordering,
             cache,
         }
     }
@@ -161,6 +167,18 @@ impl ExecutionPlan for DuckLakeInsertExec {
         vec![datafusion::physical_expr::Distribution::SinglePartition]
     }
 
+    /// Require the input sorted by the table's live sort order (when one exists),
+    /// so rows are laid out sorted within each written file. Declaring it as a hard
+    /// requirement stops EnforceSorting from pruning the SortExec `insert_into`
+    /// added (a sort with no downstream requirement is otherwise removed).
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr_common::sort_expr::OrderingRequirements>> {
+        vec![self.required_ordering.clone().map(|ordering| {
+            datafusion::physical_expr_common::sort_expr::OrderingRequirements::from(ordering)
+        })]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -180,6 +198,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
             self.object_store_url.clone(),
             self.partition.clone(),
             self.write_options.clone(),
+            self.required_ordering.clone(),
         )))
     }
 

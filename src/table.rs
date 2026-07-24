@@ -2774,7 +2774,17 @@ impl TableProvider for DuckLakeTable {
             .provider
             .get_sort_spec(self.table_id, head_snapshot)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let input = maybe_sort_input(input, live_sort.as_ref());
+        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref());
+        // Wrap the input in a SortExec now AND declare the same requirement on
+        // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
+        // (a plain SortExec with no downstream ordering requirement would be
+        // optimized away, silently dropping the sort).
+        let input = match ordering.clone() {
+            Some(ordering) => Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+                ordering, input,
+            )) as Arc<dyn ExecutionPlan>,
+            None => input,
+        };
 
         Ok(Arc::new(DuckLakeInsertExec::new(
             input,
@@ -2786,6 +2796,7 @@ impl TableProvider for DuckLakeTable {
             self.object_store_url.clone(),
             partition,
             self.write_options.clone(),
+            ordering,
         )))
     }
 
@@ -3019,46 +3030,36 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
     false
 }
 
-/// Wrap `input` in a global `SortExec` for the table's live sort spec, or return it
-/// unchanged when there is no producible sort order. Used by the write path so rows
-/// are ordered before they are split into partition files and written, tightening
-/// per-file min/max statistics. A sort key absent from the write schema (e.g. a
-/// column dropped after `SET SORTED BY`) disables sorting rather than failing the
-/// write — correctness never depends on the ordering.
+/// The `LexOrdering` for a table's live sort spec against `schema`, or `None` when
+/// there is no producible sort order or a sort key is absent from the write schema
+/// (a column dropped after `SET SORTED BY` — sorting is skipped rather than failing
+/// the write, since correctness never depends on the ordering).
 #[cfg(feature = "write")]
-fn maybe_sort_input(
-    input: Arc<dyn ExecutionPlan>,
+fn sort_ordering_for(
+    schema: &arrow::datatypes::Schema,
     sort_spec: Option<&crate::sort::SortSpec>,
-) -> Arc<dyn ExecutionPlan> {
-    let Some(keys) = sort_spec.and_then(|spec| spec.producible_columns()) else {
-        return input;
-    };
+) -> Option<datafusion::physical_expr::LexOrdering> {
+    let keys = sort_spec.and_then(|spec| spec.producible_columns())?;
     if keys.is_empty() {
-        return input;
+        return None;
     }
-    let schema = input.schema();
     let mut sort_exprs = Vec::with_capacity(keys.len());
     for (name, direction, null_order) in &keys {
-        let Ok(index) = schema.index_of(name) else {
-            // A sort column not in the write schema: skip sorting entirely rather
-            // than partially ordering (correctness is unaffected).
-            return input;
-        };
-        let column = Arc::new(datafusion::physical_expr::expressions::Column::new(name, index));
-        sort_exprs.push(datafusion::physical_expr_common::sort_expr::PhysicalSortExpr::new(
-            column,
-            arrow::compute::SortOptions {
-                descending: matches!(direction, crate::sort::SortDirection::Desc),
-                nulls_first: null_order.nulls_first(),
-            },
+        let index = schema.index_of(name).ok()?;
+        let column = Arc::new(datafusion::physical_expr::expressions::Column::new(
+            name, index,
         ));
+        sort_exprs.push(
+            datafusion::physical_expr_common::sort_expr::PhysicalSortExpr::new(
+                column,
+                arrow::compute::SortOptions {
+                    descending: matches!(direction, crate::sort::SortDirection::Desc),
+                    nulls_first: null_order.nulls_first(),
+                },
+            ),
+        );
     }
-    match datafusion::physical_expr::LexOrdering::new(sort_exprs) {
-        Some(ordering) => {
-            Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(ordering, input))
-        },
-        None => input,
-    }
+    datafusion::physical_expr::LexOrdering::new(sort_exprs)
 }
 
 #[cfg(test)]

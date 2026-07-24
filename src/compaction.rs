@@ -363,7 +363,8 @@ impl DuckLakeTable {
             if merged.is_empty() {
                 continue;
             }
-            let merged = sort_compaction_output(merged, physical_schema.as_ref(), sort_spec.as_ref())?;
+            let merged =
+                sort_compaction_output(merged, physical_schema.as_ref(), sort_spec.as_ref())?;
             let file = table_writer
                 .write_compacted_file(
                     schema_name,
@@ -474,8 +475,11 @@ impl DuckLakeTable {
 
             let live_rows = out.matched_count;
             if live_rows > 0 {
-                let sorted =
-                    sort_compaction_output(out.updated_batches, physical_schema.as_ref(), sort_spec.as_ref())?;
+                let sorted = sort_compaction_output(
+                    out.updated_batches,
+                    physical_schema.as_ref(),
+                    sort_spec.as_ref(),
+                )?;
                 let file = table_writer
                     .write_compacted_file(
                         schema_name,

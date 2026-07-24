@@ -465,11 +465,13 @@ async fn insert_sort_snapshot(
     .fetch_one(&mut **tx)
     .await?
     .try_get(0)?;
-    sqlx::query("INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)")
-        .bind(catalog_id)
-        .bind(snapshot_id)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)",
+    )
+    .bind(catalog_id)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
     // Carry the live schema_version forward (no bump) so reads at the new head see
     // the same schema as before the sort change.
     let carried: i64 = sqlx::query(

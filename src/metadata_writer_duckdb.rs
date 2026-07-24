@@ -1082,8 +1082,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let mut conn = self.connection();
         let tx = conn.transaction()?;
-        let sort_id: i64 =
-            tx.query_row("SELECT nextval('ducklake_sort_id_seq')", [], |row| row.get(0))?;
+        let sort_id: i64 = tx.query_row("SELECT nextval('ducklake_sort_id_seq')", [], |row| {
+            row.get(0)
+        })?;
         let (new_snapshot, _carried) = insert_snapshot(&tx)?;
 
         // Validate every sort key resolves to a live column (v1 supports bare column
