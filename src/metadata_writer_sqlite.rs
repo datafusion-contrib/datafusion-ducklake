@@ -1178,7 +1178,8 @@ async fn live_columns_for_stats(
 /// `end_snapshot IS NULL` set); a positional delete leaves the data file live
 /// with unchanged stats — so global bounds widen on insert and never tighten on
 /// delete, matching official DuckLake. Min/max widen with a type-aware compare
-/// ([`crate::stats_encode::stat_cmp`]); `contains_null`/`contains_nan` are OR-reduced.
+/// ([`crate::stats_encode::stat_cmp`]); `contains_null`/`contains_nan` are
+/// OR-reduced when every live file reported them, else NULL/unknown.
 async fn recompute_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,

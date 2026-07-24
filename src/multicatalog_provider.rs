@@ -554,7 +554,7 @@ impl MetadataProvider for MulticatalogProvider {
             let statistics = match sqlx::query(
                 "SELECT stats.data_file_id, stats.column_id,
                         stats.column_size_bytes, stats.value_count, stats.null_count,
-                        stats.min_value, stats.max_value
+                        stats.min_value, stats.max_value, stats.contains_nan
                  FROM ducklake_file_column_stats AS stats
                  INNER JOIN ducklake_data_file AS data
                    ON data.data_file_id = stats.data_file_id
@@ -585,6 +585,7 @@ impl MetadataProvider for MulticatalogProvider {
                             null_count: row.try_get(4)?,
                             min_value: row.try_get(5)?,
                             max_value: row.try_get(6)?,
+                            contains_nan: row.try_get(7)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -726,7 +727,7 @@ impl MetadataProvider for MulticatalogProvider {
             .fetch_one(&self.pool)
             .await?;
             let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value
+                "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
             )
             .bind(table_id)
@@ -742,6 +743,7 @@ impl MetadataProvider for MulticatalogProvider {
                             contains_null: row.try_get(1)?,
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
+                            contains_nan: row.try_get(4)?,
                             column_size_bytes: column_sizes.get(&column_id).copied(),
                             bounds_are_exact,
                         })
@@ -781,7 +783,7 @@ impl MetadataProvider for MulticatalogProvider {
             };
 
             let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value
+                "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
             )
             .bind(table_id)
@@ -796,6 +798,7 @@ impl MetadataProvider for MulticatalogProvider {
                             contains_null: row.try_get(1)?,
                             min_value: row.try_get(2)?,
                             max_value: row.try_get(3)?,
+                            contains_nan: row.try_get(4)?,
                             column_size_bytes: None,
                             bounds_are_exact: false,
                         })
@@ -813,7 +816,8 @@ impl MetadataProvider for MulticatalogProvider {
                     stats.value_count,
                     stats.null_count,
                     stats.min_value,
-                    stats.max_value
+                    stats.max_value,
+                    stats.contains_nan
                  FROM ducklake_file_column_stats AS stats
                  INNER JOIN ducklake_data_file AS data
                     ON data.data_file_id = stats.data_file_id
@@ -839,6 +843,7 @@ impl MetadataProvider for MulticatalogProvider {
                             null_count: row.try_get(4)?,
                             min_value: row.try_get(5)?,
                             max_value: row.try_get(6)?,
+                            contains_nan: row.try_get(7)?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,

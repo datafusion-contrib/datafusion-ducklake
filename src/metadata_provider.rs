@@ -81,7 +81,7 @@ pub const SQL_GET_TABLE_STATS: &str =
     "SELECT record_count, file_size_bytes FROM ducklake_table_stats WHERE table_id = ?";
 
 pub const SQL_GET_TABLE_COLUMN_STATS: &str = "
-    SELECT column_id, contains_null, min_value, max_value
+    SELECT column_id, contains_null, min_value, max_value, contains_nan
     FROM ducklake_table_column_stats
     WHERE table_id = ?";
 
@@ -93,7 +93,8 @@ pub const SQL_GET_FILE_COLUMN_STATS: &str = "
         stats.value_count,
         stats.null_count,
         stats.min_value,
-        stats.max_value
+        stats.max_value,
+        stats.contains_nan
     FROM ducklake_file_column_stats AS stats
     INNER JOIN ducklake_data_file AS data
         ON data.data_file_id = stats.data_file_id
@@ -623,6 +624,13 @@ pub struct DuckLakeTableColumnStatistics {
     pub contains_null: Option<bool>,
     pub min_value: Option<String>,
     pub max_value: Option<String>,
+    /// Tri-state NaN flag for float columns: `Some(false)` = known NaN-free,
+    /// `Some(true)` = contains NaN, `None` = unknown (e.g. register-by-reference
+    /// loads, where the parquet footer carries no NaN signal). Stored min/max
+    /// exclude NaN, and NaN sorts above every value in both DuckDB and
+    /// DataFusion — so a float `max_value` is only a true upper bound when this
+    /// is `Some(false)`. `min_value` is unaffected (NaN can never lower it).
+    pub contains_nan: Option<bool>,
     /// Sum of compressed bytes reported by every visible file for this column.
     pub column_size_bytes: Option<i64>,
     /// Whether the table-wide bounds are exact for the requested snapshot.
@@ -643,6 +651,8 @@ pub struct DuckLakeFileColumnStatistics {
     pub null_count: Option<i64>,
     pub min_value: Option<String>,
     pub max_value: Option<String>,
+    /// Tri-state NaN flag; see [`DuckLakeTableColumnStatistics::contains_nan`].
+    pub contains_nan: Option<bool>,
 }
 
 /// One visible data file and its catalog column statistics.

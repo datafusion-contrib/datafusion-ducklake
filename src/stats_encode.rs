@@ -262,6 +262,7 @@ pub fn aggregate_global_column_stats(
         min_present: i64,
         max_present: i64,
         nullcount_present: i64,
+        nan_present: i64,
         has_null: bool,
         has_nan: bool,
         numeric: bool,
@@ -275,6 +276,7 @@ pub fn aggregate_global_column_stats(
             min_present: 0,
             max_present: 0,
             nullcount_present: 0,
+            nan_present: 0,
             has_null: false,
             has_nan: false,
             numeric: numeric(f.column_id),
@@ -299,8 +301,11 @@ pub fn aggregate_global_column_stats(
                 agg.has_null = true;
             }
         }
-        if f.contains_nan == Some(true) {
-            agg.has_nan = true;
+        if let Some(nan) = f.contains_nan {
+            agg.nan_present += 1;
+            if nan {
+                agg.has_nan = true;
+            }
         }
     }
 
@@ -315,10 +320,13 @@ pub fn aggregate_global_column_stats(
                 .then_some(a.max)
                 .flatten(),
             contains_null: (a.nullcount_present == live_file_count).then_some(a.has_null),
-            // Surface a table-level NaN flag only when NaN is actually present
-            // (Some(true)); otherwise leave it NULL/unknown — matching official
-            // DuckLake, which never records a definite table-level `false`.
-            contains_nan: a.has_nan.then_some(true),
+            // Tri-state, same coverage rule as the other fields and the same
+            // semantics as official DuckLake's MergeStats: known (OR-reduced)
+            // only when EVERY live file reported a NaN flag, else NULL/unknown.
+            // A definite `false` is what lets readers trust a float max as an
+            // upper bound (NaN would sort above it), so it must never be
+            // claimed while any file's NaN state is unknown.
+            contains_nan: (a.nan_present == live_file_count).then_some(a.has_nan),
         })
         .collect();
     out.sort_by_key(|g| g.column_id);
@@ -718,6 +726,40 @@ mod tests {
             null_count,
             contains_nan: None,
         }
+    }
+
+    fn fcs_nan(contains_nan: Option<bool>) -> FileColumnStat {
+        FileColumnStat {
+            contains_nan,
+            ..fcs(1, Some("1.0"), Some("2.0"), Some(0))
+        }
+    }
+
+    #[test]
+    fn global_rollup_contains_nan_tristate() {
+        // All live files known NaN-free ⇒ definite false (what lets readers
+        // trust the float max as an upper bound).
+        let out =
+            aggregate_global_column_stats(&[fcs_nan(Some(false)), fcs_nan(Some(false))], 2, |_| {
+                true
+            });
+        assert_eq!(out[0].contains_nan, Some(false));
+
+        // Full coverage with any NaN ⇒ definite true.
+        let out =
+            aggregate_global_column_stats(&[fcs_nan(Some(false)), fcs_nan(Some(true))], 2, |_| {
+                true
+            });
+        assert_eq!(out[0].contains_nan, Some(true));
+
+        // One file's NaN state unknown ⇒ unknown, even though the other file
+        // reported one — same coverage rule as official DuckLake's MergeStats.
+        let out = aggregate_global_column_stats(&[fcs_nan(Some(true)), fcs_nan(None)], 2, |_| true);
+        assert_eq!(out[0].contains_nan, None);
+
+        // A statless live file also degrades the flag to unknown.
+        let out = aggregate_global_column_stats(&[fcs_nan(Some(false))], 2, |_| true);
+        assert_eq!(out[0].contains_nan, None);
     }
 
     #[test]

@@ -226,6 +226,23 @@ fn parse_statistic_scalar(
     parsed
 }
 
+/// Whether a stored float `max_value` is a usable upper bound.
+///
+/// Catalog min/max exclude NaN, and NaN sorts above every value in both DuckDB
+/// and DataFusion (IEEE 754 totalOrder) — so a float column whose NaN state is
+/// unknown (`None`, e.g. register-by-reference loads) or positive (`Some(true)`,
+/// e.g. stats written by official DuckLake's INSERT) may hold values above its
+/// recorded max, and pruning `x > C` on that max would wrongly drop rows. The
+/// recorded min needs no such gate: NaN can never sit below it, so `min <= v`
+/// holds for every value including NaN. Mirrors official DuckLake, which ORs
+/// `contains_nan` into its greater-than filter SQL.
+fn float_max_is_bound(data_type: &DataType, contains_nan: Option<bool>) -> bool {
+    !matches!(
+        data_type,
+        DataType::Float16 | DataType::Float32 | DataType::Float64
+    ) || contains_nan == Some(false)
+}
+
 fn scalar_precision(
     value: Option<&str>,
     column: &DuckLakeTableColumn,
@@ -319,8 +336,11 @@ fn build_datafusion_statistics(
                 .unwrap_or(Precision::Absent);
             column_statistics.min_value =
                 scalar_precision(raw.min_value.as_deref(), column, field_type, exact);
-            column_statistics.max_value =
-                scalar_precision(raw.max_value.as_deref(), column, field_type, exact);
+            column_statistics.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+                scalar_precision(raw.max_value.as_deref(), column, field_type, exact)
+            } else {
+                Precision::Absent
+            };
             column_statistics.byte_size = raw
                 .column_size_bytes
                 .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
@@ -390,12 +410,16 @@ fn build_datafusion_statistics(
                 field_type,
                 raw.bounds_are_exact,
             );
-            output.max_value = scalar_precision(
-                raw.max_value.as_deref(),
-                column,
-                field_type,
-                raw.bounds_are_exact,
-            );
+            output.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+                scalar_precision(
+                    raw.max_value.as_deref(),
+                    column,
+                    field_type,
+                    raw.bounds_are_exact,
+                )
+            } else {
+                Precision::Absent
+            };
             output.byte_size = raw
                 .column_size_bytes
                 .and_then(|value| statistic_usize(value, "file_column_stats.column_size_bytes"))
@@ -473,11 +497,14 @@ fn build_datafusion_statistics(
                 None if all_null => {},
                 None => min_complete = false,
             }
-            match raw
+            // An unusable float max (NaN state unknown/positive) is treated as
+            // absent: with `all_null` it contributes nothing, otherwise it
+            // poisons `max_complete` so the aggregate max degrades to unknown.
+            let usable_max = raw
                 .max_value
                 .as_deref()
-                .and_then(|value| parse_statistic_scalar(value, column, field_type))
-            {
+                .filter(|_| float_max_is_bound(field_type, raw.contains_nan));
+            match usable_max.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     max_value = match max_value {
                         Some(current) => current.partial_cmp(&value).map(|ordering| {
@@ -2960,6 +2987,7 @@ mod tests {
                     contains_null: Some(false),
                     min_value: Some("1".to_string()),
                     max_value: Some("1000000".to_string()),
+                    contains_nan: None,
                     column_size_bytes: Some(1_000_000),
                     bounds_are_exact: true,
                 }],
@@ -3006,6 +3034,7 @@ mod tests {
                         null_count: Some(0),
                         min_value: Some(data_file_id.to_string()),
                         max_value: Some(data_file_id.to_string()),
+                        contains_nan: None,
                     }],
                 })
                 .collect();
@@ -3153,6 +3182,7 @@ mod tests {
                     contains_null: Some(false),
                     min_value: Some("0".to_string()),
                     max_value: Some("9".to_string()),
+                    contains_nan: None,
                     column_size_bytes: Some(40),
                     bounds_are_exact: false,
                 }],
@@ -3172,6 +3202,117 @@ mod tests {
             Precision::Inexact(ScalarValue::Int32(Some(9)))
         );
         assert_eq!(column.byte_size, Precision::Inexact(40));
+        Ok(())
+    }
+
+    #[test]
+    fn float_file_max_gated_by_contains_nan() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+        let mut file =
+            DuckLakeTableFile::new(DuckLakeFileData::new("f.parquet".to_string(), true, 1));
+        file.data_file_id = 7;
+
+        for (contains_nan, max_usable) in [(None, false), (Some(true), false), (Some(false), true)]
+        {
+            let (table_stats, file_stats) = build_datafusion_statistics(
+                &schema,
+                &columns,
+                std::slice::from_ref(&file),
+                DuckLakeStatistics {
+                    files: vec![DuckLakeFileColumnStatistics {
+                        data_file_id: 7,
+                        column_id: 1,
+                        column_size_bytes: Some(16),
+                        value_count: Some(2),
+                        null_count: Some(0),
+                        min_value: Some("1.0".to_string()),
+                        max_value: Some("2.0".to_string()),
+                        contains_nan,
+                    }],
+                    ..Default::default()
+                },
+                false,
+                true,
+            );
+
+            // min is a valid lower bound regardless of NaN state — NaN sorts
+            // above every value, so it can never undercut the recorded min.
+            let per_file = &file_stats[&7].column_statistics[0];
+            let table_col = &table_stats.column_statistics[0];
+            assert_eq!(
+                per_file.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+            assert_eq!(
+                table_col.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+
+            let expected_max = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(2.0)))
+            } else {
+                Precision::Absent
+            };
+            assert_eq!(
+                per_file.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+            assert_eq!(
+                table_col.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn float_rollup_max_gated_by_contains_nan() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+
+        for (contains_nan, max_usable) in [(None, false), (Some(true), false), (Some(false), true)]
+        {
+            let (statistics, _) = build_datafusion_statistics(
+                &schema,
+                &columns,
+                &[],
+                DuckLakeStatistics {
+                    columns: vec![DuckLakeTableColumnStatistics {
+                        column_id: 1,
+                        contains_null: Some(false),
+                        min_value: Some("1.0".to_string()),
+                        max_value: Some("2.0".to_string()),
+                        contains_nan,
+                        column_size_bytes: Some(16),
+                        bounds_are_exact: true,
+                    }],
+                    ..Default::default()
+                },
+                true,
+                false,
+            );
+
+            let column = &statistics.column_statistics[0];
+            assert_eq!(
+                column.min_value,
+                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                "contains_nan={contains_nan:?}"
+            );
+            let expected_max = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(2.0)))
+            } else {
+                Precision::Absent
+            };
+            assert_eq!(
+                column.max_value, expected_max,
+                "contains_nan={contains_nan:?}"
+            );
+        }
         Ok(())
     }
 

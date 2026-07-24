@@ -424,6 +424,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         contains_null: row.get(1)?,
                         min_value: row.get(2)?,
                         max_value: row.get(3)?,
+                        contains_nan: row.get(4)?,
                         column_size_bytes: column_sizes.get(&column_id).copied(),
                         bounds_are_exact,
                     })
@@ -518,7 +519,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let statistics = match conn.prepare(
             "SELECT stats.data_file_id, stats.column_id,
                     stats.column_size_bytes, stats.value_count, stats.null_count,
-                    stats.min_value, stats.max_value
+                    stats.min_value, stats.max_value, stats.contains_nan
              FROM ducklake_file_column_stats AS stats
              INNER JOIN ducklake_data_file AS data
                ON data.data_file_id = stats.data_file_id
@@ -548,6 +549,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             null_count: row.get(4)?,
                             min_value: row.get(5)?,
                             max_value: row.get(6)?,
+                            contains_nan: row.get(7)?,
                         })
                     },
                 )?
@@ -638,6 +640,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         contains_null: row.get(1)?,
                         min_value: row.get(2)?,
                         max_value: row.get(3)?,
+                        contains_nan: row.get(4)?,
                         column_size_bytes: None,
                         bounds_are_exact: false,
                     })
@@ -658,6 +661,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         null_count: row.get(4)?,
                         min_value: row.get(5)?,
                         max_value: row.get(6)?,
+                        contains_nan: row.get(7)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,

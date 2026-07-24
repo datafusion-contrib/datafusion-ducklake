@@ -181,11 +181,14 @@ pub struct ColumnStat {
     /// Number of non-NULL values in this column across the file.
     pub value_count: Option<i64>,
     /// For `FLOAT`/`DOUBLE` columns: whether any NaN is present. `None` for
-    /// non-floating columns. When `true`, `min_value`/`max_value` are omitted
-    /// (matching DuckLake), so float pruning is only sound when this is `false`.
+    /// non-floating columns, and for float columns whose NaN state is unknown
+    /// (footer-only harvests — the parquet footer carries no NaN signal). When
+    /// `true`, `min_value`/`max_value` are omitted (matching DuckLake); readers
+    /// may only trust a float `max_value` as an upper bound when this is
+    /// `false`, since NaN sorts above every value.
     pub contains_nan: Option<bool>,
-    /// Total compressed size of the column in bytes. Currently always `None`
-    /// (deferred; not needed for pruning). See `[[column-size-bytes]]`.
+    /// Total compressed size of the column in bytes, summed over the file's
+    /// column chunks (parquet `total_compressed_size`).
     pub column_size_bytes: Option<i64>,
 }
 
