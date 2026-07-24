@@ -694,6 +694,10 @@ pub struct DuckLakeTable {
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
+    /// Write-layout options (compression, row-group caps, file-rollover target)
+    /// applied to the writer built for an INSERT into this table.
+    #[cfg(feature = "write")]
+    write_options: crate::table_writer::DuckLakeWriteOptions,
 }
 
 impl std::fmt::Debug for DuckLakeTable {
@@ -764,6 +768,8 @@ impl DuckLakeTable {
             schema_name: None,
             #[cfg(feature = "write")]
             writer: None,
+            #[cfg(feature = "write")]
+            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         })
     }
 
@@ -1460,6 +1466,18 @@ impl DuckLakeTable {
         self
     }
 
+    /// Set the write-layout options applied to this table's INSERT path
+    /// (compression, row-group caps, file-rollover target). Propagated from the
+    /// catalog's [`with_write_options`](crate::DuckLakeCatalog::with_write_options).
+    #[cfg(feature = "write")]
+    pub fn with_write_options(
+        mut self,
+        options: crate::table_writer::DuckLakeWriteOptions,
+    ) -> Self {
+        self.write_options = options;
+        self
+    }
+
     /// Build an execution plan for a single file with delete filtering
     ///
     /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
@@ -2043,6 +2061,7 @@ impl DuckLakeTable {
             encryption_factory: self.encryption_factory.clone(),
             schema_name: None,
             writer: None,
+            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         }
     }
 
@@ -2766,6 +2785,7 @@ impl TableProvider for DuckLakeTable {
             write_mode,
             self.object_store_url.clone(),
             partition,
+            self.write_options.clone(),
         )))
     }
 

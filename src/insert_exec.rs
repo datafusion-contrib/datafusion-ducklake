@@ -66,6 +66,9 @@ pub struct DuckLakeInsertExec {
     /// transformed partition key into one file per partition, all committed in a
     /// single snapshot. `None` for an unpartitioned table (single-file write).
     partition: Option<PartitionWriteSpec>,
+    /// Write-layout options applied to the DuckLakeTableWriter built at execute
+    /// time (compression, row-group caps, file-rollover target).
+    write_options: crate::table_writer::DuckLakeWriteOptions,
     cache: Arc<PlanProperties>,
 }
 
@@ -81,6 +84,7 @@ impl DuckLakeInsertExec {
         write_mode: WriteMode,
         object_store_url: Arc<ObjectStoreUrl>,
         partition: Option<PartitionWriteSpec>,
+        write_options: crate::table_writer::DuckLakeWriteOptions,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -92,6 +96,7 @@ impl DuckLakeInsertExec {
             write_mode,
             object_store_url,
             partition,
+            write_options,
             cache,
         }
     }
@@ -174,6 +179,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
             self.write_mode,
             self.object_store_url.clone(),
             self.partition.clone(),
+            self.write_options.clone(),
         )))
     }
 
@@ -197,6 +203,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let write_mode = self.write_mode;
         let object_store_url = self.object_store_url.clone();
         let partition = self.partition.clone();
+        let write_options = self.write_options.clone();
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -219,7 +226,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 .object_store(object_store_url.as_ref())?;
 
             let table_writer = DuckLakeTableWriter::new(writer, object_store)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .with_options(&write_options);
 
             let schema_without_metadata =
                 Schema::new(arrow_schema.fields().iter().cloned().collect::<Vec<_>>());

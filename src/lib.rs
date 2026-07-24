@@ -152,6 +152,6 @@ pub use multicatalog_provider::MulticatalogProvider;
 #[cfg(feature = "write")]
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+pub use table_writer::{DuckLakeTableWriter, DuckLakeWriteOptions, TableWriteSession};
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;

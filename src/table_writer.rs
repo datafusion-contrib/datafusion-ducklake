@@ -30,6 +30,23 @@ use crate::table::delete_file_schema;
 /// SQL NULL), and the row batches for that partition.
 pub type PartitionGroup = (Vec<Option<String>>, Vec<RecordBatch>);
 
+/// Write-layout options carried from the catalog down to the insert path, so a
+/// SQL `INSERT` builds its [`DuckLakeTableWriter`] with the same compression,
+/// row-group caps, and file-rollover target the embedding engine configured.
+/// All `None` reproduces the historical defaults (uncompressed, parquet-default
+/// row groups, one file per write).
+#[derive(Debug, Clone, Default)]
+pub struct DuckLakeWriteOptions {
+    /// Parquet compression codec; `None` = uncompressed.
+    pub compression: Option<Compression>,
+    /// Max rows per row group; `None` = parquet default.
+    pub max_row_group_rows: Option<usize>,
+    /// Max uncompressed bytes per row group; `None` = parquet default.
+    pub max_row_group_bytes: Option<usize>,
+    /// Target file size for rollover (approx encoded bytes); `None` = one file.
+    pub target_file_bytes: Option<usize>,
+}
+
 /// High-level writer for DuckLake tables.
 #[derive(Debug)]
 pub struct DuckLakeTableWriter {
@@ -120,6 +137,24 @@ impl DuckLakeTableWriter {
     /// to choose the rolled multi-file write path over a single-file session.
     pub fn target_file_bytes(&self) -> Option<usize> {
         self.target_file_bytes
+    }
+
+    /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
+    /// target). Each field overrides the corresponding setting only when present.
+    pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
+        if let Some(compression) = options.compression {
+            self.compression = compression;
+        }
+        if let Some(rows) = options.max_row_group_rows {
+            self.max_row_group_rows = Some(rows);
+        }
+        if let Some(bytes) = options.max_row_group_bytes {
+            self.max_row_group_bytes = Some(bytes);
+        }
+        if let Some(bytes) = options.target_file_bytes {
+            self.target_file_bytes = Some(bytes);
+        }
+        self
     }
 
     /// Build the parquet [`WriterProperties`] shared by every write path from this

@@ -19,6 +19,9 @@ use crate::metadata_writer::MetadataWriter;
 struct WriteConfig {
     /// Metadata writer for catalog operations
     writer: Arc<dyn MetadataWriter>,
+    /// Write-layout options (compression, row-group caps, file-rollover target)
+    /// applied to the writer built for each INSERT.
+    options: crate::table_writer::DuckLakeWriteOptions,
 }
 
 /// DuckLake catalog provider
@@ -131,8 +134,25 @@ impl DuckLakeCatalog {
             row_lineage: false,
             write_config: Some(WriteConfig {
                 writer,
+                options: crate::table_writer::DuckLakeWriteOptions::default(),
             }),
         })
+    }
+
+    /// Set the write-layout options (compression, row-group caps, file-rollover
+    /// target) applied to every `INSERT` through this catalog. No-op on a
+    /// read-only catalog. Enables file-level pruning: with a sort order plus a
+    /// `target_file_bytes`, each INSERT writes several files each covering a
+    /// contiguous value range.
+    #[cfg(feature = "write")]
+    pub fn with_write_options(
+        mut self,
+        options: crate::table_writer::DuckLakeWriteOptions,
+    ) -> Self {
+        if let Some(config) = self.write_config.as_mut() {
+            config.options = options;
+        }
+        self
     }
 
     /// Enable the DuckLake row-lineage feature: every table will expose a
@@ -235,7 +255,9 @@ impl CatalogProvider for DuckLakeCatalog {
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]
                 let schema = if let Some(ref config) = self.write_config {
-                    schema.with_writer(Arc::clone(&config.writer))
+                    schema
+                        .with_writer(Arc::clone(&config.writer))
+                        .with_write_options(config.options.clone())
                 } else {
                     schema
                 };
