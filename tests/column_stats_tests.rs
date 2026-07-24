@@ -375,3 +375,81 @@ async fn float_with_nan_suppresses_minmax() {
     assert_eq!(nan, Some(true), "contains_nan must be true");
     assert_eq!(vc, Some(3), "NaN counts as a non-null value");
 }
+
+/// NaN rows must survive a filtered scan end-to-end. Parquet footer float
+/// bounds exclude NaN while DataFusion evaluates `NaN > C` as true (IEEE
+/// totalOrder), so a float `>` predicate pushed into the parquet reader can
+/// row-group-prune the group holding the NaN row. `NanPruningBarrierExec`
+/// keeps such predicates out of the scan whenever the file's NaN state isn't
+/// known false — this asserts the query results, not just the plan shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_rows_survive_filtered_scan() {
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, SqliteMetadataProvider};
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("stats.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Float64Array::from(vec![f64::NAN, 1.0, 2.0]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(catalog));
+
+    let count = |sql: &str| {
+        let ctx = ctx.clone();
+        let sql = sql.to_string();
+        async move {
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            batches.iter().map(|b| b.num_rows()).sum::<usize>()
+        }
+    };
+
+    // NaN sorts above every value, so it matches any `>` bound the finite
+    // values fail; the footer max (2.0) must not prune it away.
+    assert_eq!(
+        count("SELECT x FROM test.main.t WHERE x > 100").await,
+        1,
+        "the NaN row must not be pruned by footer max"
+    );
+    assert_eq!(count("SELECT x FROM test.main.t WHERE x > 1.5").await, 2);
+    // `<` predicates never match NaN; finite semantics unchanged.
+    assert_eq!(count("SELECT x FROM test.main.t WHERE x < 1.5").await, 1);
+    assert_eq!(count("SELECT x FROM test.main.t").await, 3);
+
+    // The barrier must be present in the plan for the NaN-unsafe column.
+    let explain = ctx
+        .sql("EXPLAIN SELECT x FROM test.main.t WHERE x > 100")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&explain)
+        .unwrap()
+        .to_string();
+    assert!(
+        plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
+        "expected NaN pruning barrier in plan:\n{plan}"
+    );
+}

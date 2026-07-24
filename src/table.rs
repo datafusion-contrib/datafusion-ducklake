@@ -11,6 +11,7 @@ use crate::metadata_provider::{
     DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile,
     FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
+use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
@@ -1140,8 +1141,10 @@ impl DuckLakeTable {
     /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
     /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
-    /// is a possible optimization. Only valid for insert-only files, where
-    /// `position = rowid - row_id_start`.
+    /// is a possible optimization — but any such pushdown must exclude float
+    /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
+    /// see [`NanPruningBarrierExec`]), or a DELETE/UPDATE could miss NaN rows.
+    /// Only valid for insert-only files, where `position = rowid - row_id_start`.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -1361,6 +1364,11 @@ impl DuckLakeTable {
             None => self.schema.clone(),
         };
 
+        // Float columns whose NaN state isn't known false for every scanned
+        // file: predicates on them must not reach the parquet reader's
+        // row-group/page pruning (footer bounds exclude NaN).
+        let nan_unsafe_columns = self.nan_unsafe_float_columns(files, file_statistics);
+
         // Build one scan per physical-schema group; ColumnRenameExec coerces each
         // group to the catalog schema (renamed columns or a differing Arrow type).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
@@ -1379,7 +1387,7 @@ impl DuckLakeTable {
             let parquet_exec: Arc<dyn ExecutionPlan> =
                 DataSourceExec::from_data_source(builder.build());
 
-            let exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
+            let mut exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
                 Arc::new(ColumnRenameExec::new(
                     parquet_exec,
                     output_schema.clone(),
@@ -1388,10 +1396,53 @@ impl DuckLakeTable {
             } else {
                 parquet_exec
             };
+            if !nan_unsafe_columns.is_empty() {
+                exec = Arc::new(NanPruningBarrierExec::new(
+                    exec,
+                    Arc::clone(&nan_unsafe_columns),
+                ));
+            }
             execs.push(exec);
         }
 
         combine_execution_plans(execs)
+    }
+
+    /// Float columns whose stored max is unusable for at least one of `files`
+    /// — the NaN state is unknown or positive, so parquet footer bounds (which
+    /// exclude NaN) must not drive row-group/page pruning for predicates on
+    /// them. Detected via the already-gated per-file statistics: a float
+    /// column with an `Absent` max is exactly one whose `contains_nan` isn't
+    /// known false (see `float_max_is_bound`); a file with no statistics entry
+    /// is unknown across the board.
+    fn nan_unsafe_float_columns(
+        &self,
+        files: &[&DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> Arc<HashSet<String>> {
+        let mut unsafe_columns = HashSet::new();
+        for (index, field) in self.physical_schema.fields().iter().enumerate() {
+            if !matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                continue;
+            }
+            let any_unsafe = files.iter().any(|file| {
+                file_statistics
+                    .get(&file.data_file_id)
+                    .is_none_or(|statistics| {
+                        matches!(
+                            statistics.column_statistics[index].max_value,
+                            Precision::Absent
+                        )
+                    })
+            });
+            if any_unsafe {
+                unsafe_columns.insert(field.name().clone());
+            }
+        }
+        Arc::new(unsafe_columns)
     }
 
     /// Configure this table for write operations.
@@ -1851,15 +1902,27 @@ impl DuckLakeTable {
         // FixedSizeList vs the catalog's List). Coerces each column to
         // `output_schema`.
         let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
-        if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
-            Ok(Arc::new(ColumnRenameExec::new(
-                after_deletes,
-                output_schema,
-                file_cfg.name_mapping.clone(),
-            )))
-        } else {
-            Ok(after_deletes)
+        let mut exec =
+            if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
+                Arc::new(ColumnRenameExec::new(
+                    after_deletes,
+                    output_schema,
+                    file_cfg.name_mapping.clone(),
+                )) as Arc<dyn ExecutionPlan>
+            } else {
+                after_deletes
+            };
+        // The positional path already refuses all filter pushdown
+        // (PositionalFileSource); only the legacy plain scan lets predicates
+        // reach the parquet reader's pruning, so only it needs the NaN barrier.
+        if !needs_position {
+            let nan_unsafe_columns =
+                self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
+            if !nan_unsafe_columns.is_empty() {
+                exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
+            }
         }
+        Ok(exec)
     }
 
     /// Output schema for the rowid-projected per-file plan: physical fields
