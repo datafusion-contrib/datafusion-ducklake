@@ -3380,6 +3380,67 @@ mod tests {
     }
 
     #[test]
+    fn float_table_aggregate_max_needs_all_files_nan_free() -> Result<()> {
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "x".to_string(), "double".to_string(), false)];
+        let schema = build_arrow_schema(&columns)?;
+        let mut file_a =
+            DuckLakeTableFile::new(DuckLakeFileData::new("a.parquet".to_string(), true, 1));
+        file_a.data_file_id = 1;
+        let mut file_b =
+            DuckLakeTableFile::new(DuckLakeFileData::new("b.parquet".to_string(), true, 1));
+        file_b.data_file_id = 2;
+        let table_files = vec![file_a, file_b];
+
+        let stat =
+            |data_file_id, min: &str, max: &str, contains_nan| DuckLakeFileColumnStatistics {
+                data_file_id,
+                column_id: 1,
+                column_size_bytes: Some(16),
+                value_count: Some(2),
+                null_count: Some(0),
+                min_value: Some(min.to_string()),
+                max_value: Some(max.to_string()),
+                contains_nan,
+            };
+        let build = |nan_b| {
+            build_datafusion_statistics(
+                &schema,
+                &columns,
+                &table_files,
+                DuckLakeStatistics {
+                    files: vec![stat(1, "1.0", "2.0", Some(false)), stat(2, "0.5", "3.0", nan_b)],
+                    ..Default::default()
+                },
+                false,
+                true,
+            )
+            .0
+        };
+
+        // Both files known NaN-free: bounds fold across the files.
+        let statistics = build(Some(false));
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Float64(Some(0.5)))
+        );
+        assert_eq!(
+            statistics.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Float64(Some(3.0)))
+        );
+
+        // One file NaN-unknown: its max is untrusted, so the aggregate max
+        // degrades to unknown; the min still folds from both files.
+        let statistics = build(None);
+        assert_eq!(
+            statistics.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Float64(Some(0.5)))
+        );
+        assert_eq!(statistics.column_statistics[0].max_value, Precision::Absent);
+        Ok(())
+    }
+
+    #[test]
     fn test_validated_file_size_positive() {
         assert_eq!(validated_file_size(0, "test.parquet").unwrap(), 0);
         assert_eq!(validated_file_size(1024, "test.parquet").unwrap(), 1024);

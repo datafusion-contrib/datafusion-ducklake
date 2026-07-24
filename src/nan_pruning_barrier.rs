@@ -19,12 +19,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
 };
@@ -124,6 +127,39 @@ impl ExecutionPlan for NanPruningBarrierExec {
             &self.input,
         )?;
         Ok(FilterDescription::new().with_child(child))
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        // Sort pushdown can reorder files/row groups from their statistics —
+        // the same NaN-blind stats the filter barrier exists for — so only
+        // delegate when no sort key touches an unsafe float column.
+        let references_unsafe = order.iter().any(|sort| {
+            let mut found = false;
+            sort.expr
+                .apply(|expr| {
+                    if let Some(column) = expr.downcast_ref::<Column>()
+                        && self.unsafe_columns.contains(column.name())
+                    {
+                        found = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("column scan over a sort expression cannot fail");
+            found
+        });
+        if references_unsafe {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        Ok(self.input.try_pushdown_sort(order)?.map(|inner| {
+            Arc::new(NanPruningBarrierExec::new(
+                inner,
+                Arc::clone(&self.unsafe_columns),
+            )) as Arc<dyn ExecutionPlan>
+        }))
     }
 
     fn execute(

@@ -376,14 +376,25 @@ async fn float_with_nan_suppresses_minmax() {
     assert_eq!(vc, Some(3), "NaN counts as a non-null value");
 }
 
-/// NaN rows must survive a filtered scan end-to-end. Parquet footer float
-/// bounds exclude NaN while DataFusion evaluates `NaN > C` as true (IEEE
-/// totalOrder), so a float `>` predicate pushed into the parquet reader can
-/// row-group-prune the group holding the NaN row. `NanPruningBarrierExec`
-/// keeps such predicates out of the scan whenever the file's NaN state isn't
-/// known false — this asserts the query results, not just the plan shape.
-#[tokio::test(flavor = "multi_thread")]
-async fn nan_rows_survive_filtered_scan() {
+// ---------------------------------------------------------------------------
+// NaN pruning-safety scenarios
+//
+// Parquet footer float bounds exclude NaN while DataFusion evaluates `NaN > C`
+// as true (IEEE totalOrder), so any pruning that trusts a NaN-blind max can
+// silently drop NaN rows. Two guards exist: the catalog gate (`contains_nan`
+// must be false for a float max to drive plan-time file pruning) and
+// `NanPruningBarrierExec` (float predicates must not reach the parquet
+// reader's row-group pruning unless every scanned file is known NaN-free).
+// These tests pin the behavior for each writer/NaN combination end-to-end,
+// asserting query RESULTS first and plan shape second.
+// ---------------------------------------------------------------------------
+
+/// Write `t(id INT, x DOUBLE)` with one data file per `files` element (first
+/// is a Replace, the rest Append) and return the query context. The returned
+/// sqlite path allows tests to doctor catalog stats before querying.
+async fn setup_float_table(
+    files: &[(Vec<i32>, Vec<f64>)],
+) -> (TempDir, String, datafusion::prelude::SessionContext) {
     use datafusion::prelude::SessionContext;
     use datafusion_ducklake::{DuckLakeCatalog, SqliteMetadataProvider};
 
@@ -397,59 +408,255 @@ async fn nan_rows_survive_filtered_scan() {
         .unwrap();
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
-    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(Float64Array::from(vec![f64::NAN, 1.0, 2.0]))],
-    )
-    .unwrap();
-    DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new()))
-        .unwrap()
-        .write_table("main", "t", &[batch])
-        .await
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("x", DataType::Float64, true),
+    ]));
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    for (index, (ids, xs)) in files.iter().enumerate() {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids.clone())), Arc::new(Float64Array::from(xs.clone()))],
+        )
         .unwrap();
+        if index == 0 {
+            table_writer
+                .write_table("main", "t", &[batch])
+                .await
+                .unwrap();
+        } else {
+            table_writer
+                .append_table("main", "t", &[batch])
+                .await
+                .unwrap();
+        }
+    }
 
-    let provider = SqliteMetadataProvider::new(&format!("sqlite:{}", db_path.display()))
-        .await
-        .unwrap();
+    let db_url = format!("sqlite:{}", db_path.display());
+    let provider = SqliteMetadataProvider::new(&db_url).await.unwrap();
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("test", Arc::new(catalog));
+    (temp, db_url, ctx)
+}
 
-    let count = |sql: &str| {
-        let ctx = ctx.clone();
-        let sql = sql.to_string();
-        async move {
-            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
-            batches.iter().map(|b| b.num_rows()).sum::<usize>()
-        }
-    };
+async fn row_count(ctx: &datafusion::prelude::SessionContext, sql: &str) -> usize {
+    ctx.sql(sql)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum()
+}
 
-    // NaN sorts above every value, so it matches any `>` bound the finite
-    // values fail; the footer max (2.0) must not prune it away.
-    assert_eq!(
-        count("SELECT x FROM test.main.t WHERE x > 100").await,
-        1,
-        "the NaN row must not be pruned by footer max"
-    );
-    assert_eq!(count("SELECT x FROM test.main.t WHERE x > 1.5").await, 2);
-    // `<` predicates never match NaN; finite semantics unchanged.
-    assert_eq!(count("SELECT x FROM test.main.t WHERE x < 1.5").await, 1);
-    assert_eq!(count("SELECT x FROM test.main.t").await, 3);
-
-    // The barrier must be present in the plan for the NaN-unsafe column.
-    let explain = ctx
-        .sql("EXPLAIN SELECT x FROM test.main.t WHERE x > 100")
+async fn physical_plan(ctx: &datafusion::prelude::SessionContext, sql: &str) -> String {
+    let batches = ctx
+        .sql(&format!("EXPLAIN {sql}"))
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-    let plan = datafusion::arrow::util::pretty::pretty_format_batches(&explain)
+    datafusion::arrow::util::pretty::pretty_format_batches(&batches)
         .unwrap()
-        .to_string();
+        .to_string()
+}
+
+/// The original wrong-results repro: a write-through file containing NaN.
+/// NaN rows must survive filtered scans — the footer max must not row-group-
+/// prune them away.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_rows_survive_filtered_scan() {
+    let (_temp, _db, ctx) = setup_float_table(&[(vec![7, 8, 9], vec![f64::NAN, 1.0, 2.0])]).await;
+
+    // NaN sorts above every value, so it matches any `>` bound the finite
+    // values fail; the footer max (2.0) must not prune it away.
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await,
+        1,
+        "the NaN row must not be pruned by footer max"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 1.5").await,
+        2
+    );
+    // Equality probes for NaN itself: min <= NaN always holds, so the file
+    // must be kept and the row found.
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT x FROM test.main.t WHERE x = CAST('NaN' AS DOUBLE)"
+        )
+        .await,
+        1
+    );
+    // `<` predicates never match NaN; finite semantics unchanged.
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x < 1.5").await,
+        1
+    );
+    assert_eq!(row_count(&ctx, "SELECT x FROM test.main.t").await, 3);
+
+    // The barrier must be present in the plan for the NaN-unsafe column.
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await;
     assert!(
         plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
         "expected NaN pruning barrier in plan:\n{plan}"
+    );
+}
+
+/// NaN-free floats must keep BOTH pruning levels — the fix must not tax the
+/// common case. File-level: a `>` predicate above the max prunes the file
+/// outright. Row-group level: an in-range predicate is pushed into the
+/// parquet scan, with no barrier in the plan.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_free_floats_keep_full_pruning() {
+    let (_temp, _db, ctx) = setup_float_table(&[(vec![1, 2], vec![1.0, 2.0])]).await;
+
+    // contains_nan = false was recorded, so the catalog float max is trusted
+    // and the single file is pruned at plan time.
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await;
+    assert!(
+        plan.contains("EmptyExec"),
+        "NaN-free file should be pruned via its float max:\n{plan}"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await,
+        0
+    );
+
+    // An in-range predicate keeps the file but reaches the parquet reader
+    // unimpeded: no barrier, predicate attached to the scan.
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x >= 1.5").await;
+    assert!(
+        !plan.contains("NanPruningBarrierExec"),
+        "no barrier expected for a NaN-free file:\n{plan}"
+    );
+    assert!(
+        plan.contains("predicate="),
+        "float predicate should be pushed into the parquet scan:\n{plan}"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x >= 1.5").await,
+        1
+    );
+}
+
+/// The barrier is per-column: predicates on non-float columns keep full
+/// parquet pushdown even when a float column in the same file is NaN-unsafe.
+#[tokio::test(flavor = "multi_thread")]
+async fn barrier_blocks_only_float_predicates() {
+    let (_temp, _db, ctx) = setup_float_table(&[(vec![7, 8, 9], vec![f64::NAN, 1.0, 2.0])]).await;
+
+    // Integer predicate: barrier present (x is unsafe) but the predicate
+    // passes through it into the scan.
+    let plan = physical_plan(&ctx, "SELECT id FROM test.main.t WHERE id >= 8").await;
+    assert!(
+        plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
+        "barrier expected while x is NaN-unsafe:\n{plan}"
+    );
+    assert!(
+        plan.contains("predicate="),
+        "integer predicate should pass the barrier into the scan:\n{plan}"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM test.main.t WHERE id >= 8").await,
+        2
+    );
+
+    // Float predicate: rejected by the barrier — no predicate on the scan.
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await;
+    assert!(
+        !plan.contains("predicate="),
+        "float predicate must not reach the parquet scan:\n{plan}"
+    );
+
+    // Mixed conjunction still finds the NaN row (id 7).
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM test.main.t WHERE id >= 0 AND x > 100").await,
+        1
+    );
+}
+
+/// Catalog rows shaped like official DuckLake's `ducklake_add_data_files`
+/// (register-by-reference): float min/max present, contains_nan NULL. The max
+/// must not be trusted at either pruning level, while the min still prunes —
+/// NaN can only hide above the max, never below the min.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_unknown_bounds_prune_only_below_min() {
+    let (_temp, db_url, ctx) =
+        setup_float_table(&[(vec![7, 8, 9], vec![f64::NAN, 1.0, 2.0])]).await;
+
+    // The crate's write path blanked the bounds and set contains_nan = true.
+    // Rewrite the row to the official add_data_files shape: footer bounds
+    // present (they exclude the NaN), NaN state unknown.
+    let pool = SqlitePool::connect(&db_url).await.unwrap();
+    sqlx::query(
+        "UPDATE ducklake_file_column_stats
+         SET min_value = '1.0', max_value = '2.0', contains_nan = NULL
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'x')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // max present but NaN unknown: `x > 100` must keep the file AND keep the
+    // predicate away from the parquet reader — the NaN row survives.
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await,
+        1,
+        "catalog max with unknown NaN state must not prune the NaN row"
+    );
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await;
+    assert!(
+        plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
+        "barrier expected while NaN state is unknown:\n{plan}"
+    );
+
+    // min stays trustworthy: a predicate strictly below it prunes the file
+    // outright (EmptyExec), NaN notwithstanding.
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x < 0.5").await;
+    assert!(
+        plan.contains("EmptyExec"),
+        "file should be pruned via its float min even with NaN unknown:\n{plan}"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x < 0.5").await,
+        0
+    );
+}
+
+/// One NaN-unsafe file poisons float pushdown for the whole multi-file scan
+/// group (the unsafe set is a union), and NaN rows still surface from the
+/// unsafe file while finite rows come from both.
+#[tokio::test(flavor = "multi_thread")]
+async fn nan_multi_file_scan_blocks_float_pruning() {
+    let (_temp, _db, ctx) =
+        setup_float_table(&[(vec![1, 2], vec![1.0, 2.0]), (vec![3, 4], vec![f64::NAN, 5.0])]).await;
+
+    assert_eq!(row_count(&ctx, "SELECT x FROM test.main.t").await, 4);
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await,
+        1,
+        "the NaN row in the second file must survive"
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 4").await,
+        2
+    );
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x < 1.5").await,
+        1
+    );
+
+    let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x > 100").await;
+    assert!(
+        plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
+        "one unsafe file must make x unsafe for the scan group:\n{plan}"
     );
 }
