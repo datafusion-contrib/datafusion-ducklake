@@ -2733,6 +2733,20 @@ impl TableProvider for DuckLakeTable {
             },
         };
 
+        // Resolve the live sort spec (also at the head, for the same reason as the
+        // partition spec). When it is producible — every key is a bare column
+        // present in the write schema — wrap the input in a global SortExec so each
+        // written file's rows are ordered, tightening per-file min/max statistics
+        // for range pruning. Sorting is applied before the partition split, so each
+        // per-partition file remains a sorted subsequence. sort_on_insert defaults
+        // to true; a non-producible or absent spec leaves the input unsorted, which
+        // is always correct (only pruning effectiveness is affected).
+        let live_sort = self
+            .provider
+            .get_sort_spec(self.table_id, head_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let input = maybe_sort_input(input, live_sort.as_ref());
+
         Ok(Arc::new(DuckLakeInsertExec::new(
             input,
             Arc::clone(writer),
@@ -2973,6 +2987,48 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
         source = e.source();
     }
     false
+}
+
+/// Wrap `input` in a global `SortExec` for the table's live sort spec, or return it
+/// unchanged when there is no producible sort order. Used by the write path so rows
+/// are ordered before they are split into partition files and written, tightening
+/// per-file min/max statistics. A sort key absent from the write schema (e.g. a
+/// column dropped after `SET SORTED BY`) disables sorting rather than failing the
+/// write — correctness never depends on the ordering.
+#[cfg(feature = "write")]
+fn maybe_sort_input(
+    input: Arc<dyn ExecutionPlan>,
+    sort_spec: Option<&crate::sort::SortSpec>,
+) -> Arc<dyn ExecutionPlan> {
+    let Some(keys) = sort_spec.and_then(|spec| spec.producible_columns()) else {
+        return input;
+    };
+    if keys.is_empty() {
+        return input;
+    }
+    let schema = input.schema();
+    let mut sort_exprs = Vec::with_capacity(keys.len());
+    for (name, direction, null_order) in &keys {
+        let Ok(index) = schema.index_of(name) else {
+            // A sort column not in the write schema: skip sorting entirely rather
+            // than partially ordering (correctness is unaffected).
+            return input;
+        };
+        let column = Arc::new(datafusion::physical_expr::expressions::Column::new(name, index));
+        sort_exprs.push(datafusion::physical_expr_common::sort_expr::PhysicalSortExpr::new(
+            column,
+            arrow::compute::SortOptions {
+                descending: matches!(direction, crate::sort::SortDirection::Desc),
+                nulls_first: null_order.nulls_first(),
+            },
+        ));
+    }
+    match datafusion::physical_expr::LexOrdering::new(sort_exprs) {
+        Some(ordering) => {
+            Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(ordering, input))
+        },
+        None => input,
+    }
 }
 
 #[cfg(test)]
