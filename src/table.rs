@@ -1143,7 +1143,7 @@ impl DuckLakeTable {
     /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
     /// is a possible optimization — but any such pushdown must exclude float
     /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
-    /// see [`NanPruningBarrierExec`]), or a DELETE/UPDATE could miss NaN rows.
+    /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
     /// Only valid for insert-only files, where `position = rowid - row_id_start`.
     pub async fn resolve_positions(
         &self,
