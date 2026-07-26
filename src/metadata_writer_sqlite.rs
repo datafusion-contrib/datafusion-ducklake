@@ -14,6 +14,7 @@ use crate::metadata_writer::{
     validate_name,
 };
 use crate::partition::PartitionTransform;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
@@ -344,10 +345,10 @@ impl SqliteMetadataWriter {
             for child in
                 ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
             {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {child} SET end_snapshot = ?
                      WHERE table_id = ? AND end_snapshot IS NULL"
-                ))
+                )))
                 .bind(drop_snapshot)
                 .bind(table_id)
                 .execute(&mut *tx)
@@ -401,11 +402,11 @@ impl SqliteMetadataWriter {
                         tx.commit().await?;
                         return Ok(Vec::new());
                     }
-                    let rows = sqlx::query(&format!(
+                    let rows = sqlx::query(AssertSqlSafe(format!(
                         "SELECT snapshot_id, snapshot_time FROM ducklake_snapshot
                          WHERE snapshot_id IN ({}) ORDER BY snapshot_id",
                         id_list(&ids)
-                    ))
+                    )))
                     .fetch_all(&mut *tx)
                     .await?;
                     rows_to_snapshots(rows)?
@@ -429,10 +430,10 @@ impl SqliteMetadataWriter {
             let expire_ids: Vec<i64> = candidates.iter().map(|s| s.snapshot_id).collect();
 
             // 2. Delete the snapshot rows themselves.
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM ducklake_snapshot WHERE snapshot_id IN ({})",
                 id_list(&expire_ids)
-            ))
+            )))
             .execute(&mut *tx)
             .await?;
 
@@ -464,7 +465,7 @@ impl SqliteMetadataWriter {
 
             // 4. Data files no longer referenced by any surviving snapshot (or belonging
             //    to a dead table): schedule their physical paths, then drop the rows.
-            let dead_data_files = sqlx::query(&format!(
+            let dead_data_files = sqlx::query(AssertSqlSafe(format!(
                 "SELECT df.data_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
                  FROM ducklake_data_file df
                  JOIN ducklake_table t ON t.table_id = df.table_id
@@ -472,15 +473,15 @@ impl SqliteMetadataWriter {
                  WHERE ({dead_table_filter}) OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
                      SELECT 1 FROM ducklake_snapshot
                      WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
-            ))
+            )))
             .fetch_all(&mut *tx)
             .await?;
             let data_file_ids = schedule_files(&mut tx, dead_data_files).await?;
             if !data_file_ids.is_empty() {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "DELETE FROM ducklake_data_file WHERE data_file_id IN ({})",
                     id_list(&data_file_ids)
-                ))
+                )))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -498,7 +499,7 @@ impl SqliteMetadataWriter {
             } else {
                 format!("df.table_id IN ({})", id_list(&dead_tables))
             };
-            let dead_delete_files = sqlx::query(&format!(
+            let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
                 "SELECT df.delete_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
                  FROM ducklake_delete_file df
                  JOIN ducklake_table t ON t.table_id = df.table_id
@@ -507,15 +508,15 @@ impl SqliteMetadataWriter {
                     OR (df.end_snapshot IS NOT NULL AND NOT EXISTS (
                         SELECT 1 FROM ducklake_snapshot
                         WHERE snapshot_id >= df.begin_snapshot AND snapshot_id < df.end_snapshot))"
-            ))
+            )))
             .fetch_all(&mut *tx)
             .await?;
             let delete_file_ids = schedule_files(&mut tx, dead_delete_files).await?;
             if !delete_file_ids.is_empty() {
-                sqlx::query(&format!(
+                sqlx::query(AssertSqlSafe(format!(
                     "DELETE FROM ducklake_delete_file WHERE delete_file_id IN ({})",
                     id_list(&delete_file_ids)
-                ))
+                )))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -535,9 +536,11 @@ impl SqliteMetadataWriter {
                     "ducklake_column",
                     "ducklake_schema_versions",
                 ] {
-                    sqlx::query(&format!("DELETE FROM {table} WHERE table_id IN ({dead})"))
-                        .execute(&mut *tx)
-                        .await?;
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {table} WHERE table_id IN ({dead})"
+                    )))
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
 
@@ -601,10 +604,10 @@ impl SqliteMetadataWriter {
             return Ok(());
         }
         block_on(async {
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM ducklake_files_scheduled_for_deletion WHERE data_file_id IN ({})",
                 id_list(ids)
-            ))
+            )))
             .execute(&self.pool)
             .await?;
             Ok(())
@@ -636,7 +639,9 @@ impl SqliteMetadataWriter {
                  SELECT path AS p, CAST(path_is_relative AS INTEGER) AS rel
                  FROM ducklake_files_scheduled_for_deletion"
             );
-            let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
+            let rows = sqlx::query(AssertSqlSafe(q.as_str()))
+                .fetch_all(&self.pool)
+                .await?;
             rows.into_iter()
                 .map(|r| {
                     let p: String = r.try_get(0)?;
@@ -819,10 +824,10 @@ async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
     )
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "INSERT INTO ducklake_column__migrate ({insert_list}) \
          SELECT {select_list} FROM ducklake_column"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     sqlx::query("DROP TABLE ducklake_column")
@@ -2468,55 +2473,55 @@ impl MetadataWriter for SqliteMetadataWriter {
                     // does) and REMOVE their catalog rows, so no snapshot resolves
                     // to them (avoids double-counting with the partial file, and
                     // upholds the invariant that scheduled files are unreachable).
-                    let dead_data = sqlx::query(&format!(
+                    let dead_data = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.data_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
                          FROM ducklake_data_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
                          WHERE df.data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .fetch_all(&mut *tx)
                     .await?;
                     schedule_files(&mut tx, dead_data).await?;
 
-                    let dead_del = sqlx::query(&format!(
+                    let dead_del = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.delete_file_id, {RESOLVED_PATH} AS resolved_path, {REL_FLAG} AS rel
                          FROM ducklake_delete_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
                          WHERE df.data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .fetch_all(&mut *tx)
                     .await?;
                     schedule_files(&mut tx, dead_del).await?;
 
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM ducklake_delete_file WHERE data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .execute(&mut *tx)
                     .await?;
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM ducklake_data_file WHERE data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .execute(&mut *tx)
                     .await?;
                     // Hard-delete the removed sources' per-column stats too, as
                     // official DuckLake does on merge (otherwise they orphan).
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM ducklake_file_column_stats WHERE data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .execute(&mut *tx)
                     .await?;
                     // Likewise the removed sources' per-file partition values.
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM ducklake_file_partition_value WHERE data_file_id IN ({})",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .execute(&mut *tx)
                     .await?;
                 },
@@ -2526,19 +2531,19 @@ impl MetadataWriter for SqliteMetadataWriter {
                     // Retire them (end_snapshot) but do NOT schedule them — an
                     // expire_snapshots run schedules them once their snapshots are
                     // gone, so they are never deleted while still reachable.
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "UPDATE ducklake_data_file SET end_snapshot = ?
                          WHERE data_file_id IN ({}) AND end_snapshot IS NULL",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;
-                    sqlx::query(&format!(
+                    sqlx::query(AssertSqlSafe(format!(
                         "UPDATE ducklake_delete_file SET end_snapshot = ?
                          WHERE data_file_id IN ({}) AND end_snapshot IS NULL",
                         id_list(&source_data_ids)
-                    ))
+                    )))
                     .bind(snapshot_id)
                     .execute(&mut *tx)
                     .await?;

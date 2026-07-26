@@ -19,6 +19,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
+use sqlx::AssertSqlSafe;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
@@ -106,10 +107,10 @@ async fn seed_inlined(
     .await
     .unwrap();
     let phys = format!("ducklake_inlined_data_{table_id}_1");
-    sqlx::query(&format!(
+    sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE IF NOT EXISTS {phys}
              (row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, id INTEGER, val INTEGER)"
-    ))
+    )))
     .execute(pool)
     .await
     .unwrap();
@@ -123,9 +124,9 @@ async fn seed_inlined(
     .await
     .unwrap();
     for (row_id, begin, end, id, val) in rows {
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {phys} (row_id, begin_snapshot, end_snapshot, id, val) VALUES (?,?,?,?,?)"
-        ))
+        )))
         .bind(row_id)
         .bind(begin)
         .bind(*end)

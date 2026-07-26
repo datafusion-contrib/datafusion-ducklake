@@ -14,6 +14,7 @@ use datafusion_ducklake::{
     DuckLakeError, DuckLakeTableWriter, MulticatalogManager, PostgresMetadataWriter,
     TypeChangeOperation, TypeChangeWriteMode, initialize_multicatalog_schema,
 };
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use testcontainers::ContainerAsync;
@@ -1651,7 +1652,7 @@ async fn drop_catalog_removes_populated_catalog() {
         "ducklake_delete_file",
         "ducklake_schema_versions",
     ] {
-        let n: i64 = sqlx::query(&format!("SELECT COUNT(*) FROM {}", table))
+        let n: i64 = sqlx::query(AssertSqlSafe(format!("SELECT COUNT(*) FROM {}", table)))
             .fetch_one(&pool)
             .await
             .unwrap()
@@ -1938,10 +1939,10 @@ async fn drop_table_in_catalog_tombstones_table_and_children() {
 
     // All currently-live child rows for this table now carry the drop snapshot.
     for child_table in ["ducklake_column", "ducklake_data_file"] {
-        let live: i64 = sqlx::query(&format!(
+        let live: i64 = sqlx::query(AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {} WHERE table_id = $1 AND end_snapshot IS NULL",
             child_table
-        ))
+        )))
         .bind(s.table_id)
         .fetch_one(&pool)
         .await
@@ -1950,10 +1951,10 @@ async fn drop_table_in_catalog_tombstones_table_and_children() {
         .unwrap();
         assert_eq!(live, 0, "no live rows left in {} after drop", child_table);
 
-        let tombstoned: i64 = sqlx::query(&format!(
+        let tombstoned: i64 = sqlx::query(AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {} WHERE table_id = $1 AND end_snapshot = $2",
             child_table
-        ))
+        )))
         .bind(s.table_id)
         .bind(snap_after_drop)
         .fetch_one(&pool)
@@ -2948,13 +2949,15 @@ async fn expire_in_catalog_full_after_drop_removes_table_metadata() {
     for tbl in
         ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_schema_versions"]
     {
-        let cnt: i64 = sqlx::query(&format!("SELECT COUNT(*) FROM {tbl} WHERE table_id = $1"))
-            .bind(s.table_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .try_get(0)
-            .unwrap();
+        let cnt: i64 = sqlx::query(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {tbl} WHERE table_id = $1"
+        )))
+        .bind(s.table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
         assert_eq!(cnt, 0, "{tbl} fully reclaimed after expire");
     }
     let scheduled: i64 = sqlx::query(

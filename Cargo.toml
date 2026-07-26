@@ -5,6 +5,8 @@ members = [".", "benchmark"]
 name = "datafusion-ducklake"
 version = "0.6.0"
 edition = "2024"
+# Floor set by sqlx 0.9, which requires 1.94.
+rust-version = "1.94.0"
 authors = ["zac@hotdata.dev", "shefeek@hotdata.dev", "anoop@hotdata.dev"]
 description = "DuckLake query engine for rust, built with datafusion."
 license = "Apache-2.0"
@@ -43,7 +45,7 @@ tempfile = { version = "3.14", optional = true }
 
 # Metadata providers (optional)
 duckdb = { version = "1.4.1", optional = true }
-sqlx = { version = "0.8", features = ["runtime-tokio"], optional = true }
+sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
 
 [dev-dependencies]
 testcontainers = "0.23"
@@ -64,7 +66,10 @@ skip-tests-with-docker = []
 # Metadata provider backends
 metadata-duckdb = ["dep:duckdb"]
 metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/tls-rustls-ring"]
-metadata-mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/chrono"]
+# `mysql-rsa` keeps non-TLS `caching_sha2_password`/`sha256_password` auth working
+# (MySQL 8's default). sqlx bundled RSA unconditionally through 0.8; 0.9 split it
+# into an opt-in feature, and without it those connections fail at connect time.
+metadata-mysql = ["dep:sqlx", "sqlx/mysql", "sqlx/mysql-rsa", "sqlx/chrono"]
 metadata-sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono"]
 
 # Compile DuckDB C++ from source and statically bundle it. Enabled by default.

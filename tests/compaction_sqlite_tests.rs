@@ -16,6 +16,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
@@ -92,7 +93,7 @@ async fn pool(temp: &TempDir) -> SqlitePool {
 }
 
 async fn scalar_i64(p: &SqlitePool, sql: &str) -> i64 {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_one(p)
         .await
         .unwrap()
@@ -101,7 +102,7 @@ async fn scalar_i64(p: &SqlitePool, sql: &str) -> i64 {
 }
 
 async fn opt_i64(p: &SqlitePool, sql: &str) -> Option<i64> {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_one(p)
         .await
         .unwrap()
@@ -365,9 +366,9 @@ async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel()
     assert_eq!(scheduled, 3, "three source files scheduled for deletion");
 
     // changes_made records the compaction.
-    let changes: String = sqlx::query(&format!(
+    let changes: String = sqlx::query(AssertSqlSafe(format!(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = {new_snapshot}"
-    ))
+    )))
     .fetch_one(&p)
     .await
     .unwrap()
@@ -534,9 +535,9 @@ async fn rewrite_drops_deleted_rows_and_retires_data_and_delete_files() {
     );
 
     // changes_made records the compaction.
-    let changes: String = sqlx::query(&format!(
+    let changes: String = sqlx::query(AssertSqlSafe(format!(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = {new_snapshot}"
-    ))
+    )))
     .fetch_one(&p)
     .await
     .unwrap()

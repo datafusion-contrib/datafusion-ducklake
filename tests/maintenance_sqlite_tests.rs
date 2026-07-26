@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
@@ -63,7 +64,7 @@ async fn pool(h: &Harness) -> SqlitePool {
 }
 
 async fn scalar_i64(pool: &SqlitePool, sql: &str) -> i64 {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .fetch_one(pool)
         .await
         .unwrap()
