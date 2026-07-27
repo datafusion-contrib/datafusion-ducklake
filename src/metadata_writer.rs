@@ -637,6 +637,45 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Set the table's sort spec — the commit behind `ALTER TABLE … SET SORTED BY
+    /// (…)`.
+    ///
+    /// In one transaction: create a new snapshot; end the currently-live
+    /// `ducklake_sort_info` row if one exists; insert a new generation with a fresh
+    /// `sort_id` and one `ducklake_sort_expression` row per `SortField` in order.
+    /// `fields` must be non-empty (use
+    /// [`reset_sort_spec`](MetadataWriter::reset_sort_spec) to remove a spec).
+    ///
+    /// Unlike [`set_partition_spec`](MetadataWriter::set_partition_spec), this does
+    /// **not** bump `schema_version`: DuckLake treats a sort-order change as
+    /// metadata that does not alter the logical schema (existing readers are
+    /// unaffected — sort order only influences how *future* writes are laid out).
+    /// Existing data files are left untouched. Returns the new snapshot id.
+    ///
+    /// Default: unsupported; writable backends override it.
+    fn set_sort_spec(&self, _table_id: i64, _fields: &[crate::sort::SortField]) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "SET SORTED BY is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Remove the table's sort spec — the commit behind `ALTER TABLE … RESET SORTED
+    /// BY`.
+    ///
+    /// In one transaction: create a new snapshot and end the currently-live
+    /// `ducklake_sort_info` row (a no-op if none is live). Does not bump
+    /// `schema_version` (see [`set_sort_spec`](MetadataWriter::set_sort_spec)).
+    /// Existing data files keep whatever order they were written in; only
+    /// subsequent writes are unsorted. Returns the new snapshot id (or the current
+    /// head if there was nothing to reset).
+    ///
+    /// Default: unsupported; writable backends override it.
+    fn reset_sort_spec(&self, _table_id: i64) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "RESET SORTED BY is not supported on this metadata backend".to_string(),
+        ))
+    }
+
     /// Register a new data file and publish its snapshot as the catalog head,
     /// atomically. For `Replace`, retires the prior generation in the same
     /// transaction. Returns the committed snapshot id: assigned at this commit

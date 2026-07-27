@@ -66,6 +66,13 @@ pub struct DuckLakeInsertExec {
     /// transformed partition key into one file per partition, all committed in a
     /// single snapshot. `None` for an unpartitioned table (single-file write).
     partition: Option<PartitionWriteSpec>,
+    /// Write-layout options applied to the DuckLakeTableWriter built at execute
+    /// time (compression, row-group caps, file-rollover target).
+    write_options: crate::table_writer::DuckLakeWriteOptions,
+    /// The sort order this insert requires of its input (the table's live sort
+    /// spec). Declared via `required_input_ordering` so DataFusion's EnforceSorting
+    /// keeps the input sorted instead of pruning the SortExec as unused.
+    required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     cache: Arc<PlanProperties>,
 }
 
@@ -81,6 +88,8 @@ impl DuckLakeInsertExec {
         write_mode: WriteMode,
         object_store_url: Arc<ObjectStoreUrl>,
         partition: Option<PartitionWriteSpec>,
+        write_options: crate::table_writer::DuckLakeWriteOptions,
+        required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -92,6 +101,8 @@ impl DuckLakeInsertExec {
             write_mode,
             object_store_url,
             partition,
+            write_options,
+            required_ordering,
             cache,
         }
     }
@@ -156,6 +167,18 @@ impl ExecutionPlan for DuckLakeInsertExec {
         vec![datafusion::physical_expr::Distribution::SinglePartition]
     }
 
+    /// Require the input sorted by the table's live sort order (when one exists),
+    /// so rows are laid out sorted within each written file. Declaring it as a hard
+    /// requirement stops EnforceSorting from pruning the SortExec `insert_into`
+    /// added (a sort with no downstream requirement is otherwise removed).
+    fn required_input_ordering(
+        &self,
+    ) -> Vec<Option<datafusion::physical_expr_common::sort_expr::OrderingRequirements>> {
+        vec![self.required_ordering.clone().map(|ordering| {
+            datafusion::physical_expr_common::sort_expr::OrderingRequirements::from(ordering)
+        })]
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -174,6 +197,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
             self.write_mode,
             self.object_store_url.clone(),
             self.partition.clone(),
+            self.write_options.clone(),
+            self.required_ordering.clone(),
         )))
     }
 
@@ -197,6 +222,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let write_mode = self.write_mode;
         let object_store_url = self.object_store_url.clone();
         let partition = self.partition.clone();
+        let write_options = self.write_options.clone();
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -219,7 +245,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 .object_store(object_store_url.as_ref())?;
 
             let table_writer = DuckLakeTableWriter::new(writer, object_store)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+                .with_options(&write_options);
 
             let schema_without_metadata =
                 Schema::new(arrow_schema.fields().iter().cloned().collect::<Vec<_>>());
@@ -250,6 +277,28 @@ impl ExecutionPlan for DuckLakeInsertExec {
                         Arc::new(UInt64Array::from(vec![result.records_written as u64]));
                     return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
                 }
+            }
+
+            // Write the (already sorted, if the table has a sort order) rows through
+            // the size-rolling writer: it produces one file per target_file_size and
+            // commits them in one snapshot. Only for non-empty input — an empty
+            // Replace still needs the single-file truncate marker below, and empty
+            // Append already returned above.
+            let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if total_rows > 0 {
+                let result = table_writer
+                    .write_rows(
+                        &schema_name,
+                        &table_name,
+                        &schema_without_metadata,
+                        write_mode,
+                        &batches,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let count_array: ArrayRef =
+                    Arc::new(UInt64Array::from(vec![result.records_written as u64]));
+                return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
             }
 
             let mut session = table_writer

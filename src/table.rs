@@ -694,6 +694,10 @@ pub struct DuckLakeTable {
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
+    /// Write-layout options (compression, row-group caps, file-rollover target)
+    /// applied to the writer built for an INSERT into this table.
+    #[cfg(feature = "write")]
+    write_options: crate::table_writer::DuckLakeWriteOptions,
 }
 
 impl std::fmt::Debug for DuckLakeTable {
@@ -764,6 +768,8 @@ impl DuckLakeTable {
             schema_name: None,
             #[cfg(feature = "write")]
             writer: None,
+            #[cfg(feature = "write")]
+            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         })
     }
 
@@ -1460,6 +1466,18 @@ impl DuckLakeTable {
         self
     }
 
+    /// Set the write-layout options applied to this table's INSERT path
+    /// (compression, row-group caps, file-rollover target). Propagated from the
+    /// catalog's [`with_write_options`](crate::DuckLakeCatalog::with_write_options).
+    #[cfg(feature = "write")]
+    pub fn with_write_options(
+        mut self,
+        options: crate::table_writer::DuckLakeWriteOptions,
+    ) -> Self {
+        self.write_options = options;
+        self
+    }
+
     /// Build an execution plan for a single file with delete filtering
     ///
     /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
@@ -2043,6 +2061,7 @@ impl DuckLakeTable {
             encryption_factory: self.encryption_factory.clone(),
             schema_name: None,
             writer: None,
+            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         }
     }
 
@@ -2091,6 +2110,16 @@ impl DuckLakeTable {
     #[cfg(feature = "write")]
     pub(crate) fn object_store_url(&self) -> &Arc<ObjectStoreUrl> {
         &self.object_store_url
+    }
+
+    /// The table's live sort spec at the current catalog head, if any. The write
+    /// and compaction paths use it to order rows before writing (tightening
+    /// per-file min/max). Read at the head, not the pinned read snapshot, so a
+    /// `SET SORTED BY` applied after this provider was opened is honored.
+    #[cfg(feature = "write")]
+    pub(crate) fn live_sort_spec(&self) -> crate::Result<Option<crate::sort::SortSpec>> {
+        let head = self.provider.get_current_snapshot()?;
+        self.provider.get_sort_spec(self.table_id, head)
     }
 
     /// The live columns' catalog `column_id`s in `column_order` — the parquet
@@ -2733,6 +2762,30 @@ impl TableProvider for DuckLakeTable {
             },
         };
 
+        // Resolve the live sort spec (also at the head, for the same reason as the
+        // partition spec). When it is producible — every key is a bare column
+        // present in the write schema — wrap the input in a global SortExec so each
+        // written file's rows are ordered, tightening per-file min/max statistics
+        // for range pruning. Sorting is applied before the partition split, so each
+        // per-partition file remains a sorted subsequence. sort_on_insert defaults
+        // to true; a non-producible or absent spec leaves the input unsorted, which
+        // is always correct (only pruning effectiveness is affected).
+        let live_sort = self
+            .provider
+            .get_sort_spec(self.table_id, head_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref());
+        // Wrap the input in a SortExec now AND declare the same requirement on
+        // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
+        // (a plain SortExec with no downstream ordering requirement would be
+        // optimized away, silently dropping the sort).
+        let input = match ordering.clone() {
+            Some(ordering) => Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+                ordering, input,
+            )) as Arc<dyn ExecutionPlan>,
+            None => input,
+        };
+
         Ok(Arc::new(DuckLakeInsertExec::new(
             input,
             Arc::clone(writer),
@@ -2742,6 +2795,8 @@ impl TableProvider for DuckLakeTable {
             write_mode,
             self.object_store_url.clone(),
             partition,
+            self.write_options.clone(),
+            ordering,
         )))
     }
 
@@ -2973,6 +3028,38 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
         source = e.source();
     }
     false
+}
+
+/// The `LexOrdering` for a table's live sort spec against `schema`, or `None` when
+/// there is no producible sort order or a sort key is absent from the write schema
+/// (a column dropped after `SET SORTED BY` — sorting is skipped rather than failing
+/// the write, since correctness never depends on the ordering).
+#[cfg(feature = "write")]
+fn sort_ordering_for(
+    schema: &arrow::datatypes::Schema,
+    sort_spec: Option<&crate::sort::SortSpec>,
+) -> Option<datafusion::physical_expr::LexOrdering> {
+    let keys = sort_spec.and_then(|spec| spec.producible_columns())?;
+    if keys.is_empty() {
+        return None;
+    }
+    let mut sort_exprs = Vec::with_capacity(keys.len());
+    for (name, direction, null_order) in &keys {
+        let index = schema.index_of(name).ok()?;
+        let column = Arc::new(datafusion::physical_expr::expressions::Column::new(
+            name, index,
+        ));
+        sort_exprs.push(
+            datafusion::physical_expr_common::sort_expr::PhysicalSortExpr::new(
+                column,
+                arrow::compute::SortOptions {
+                    descending: matches!(direction, crate::sort::SortDirection::Desc),
+                    nulls_first: null_order.nulls_first(),
+                },
+            ),
+        );
+    }
+    datafusion::physical_expr::LexOrdering::new(sort_exprs)
 }
 
 #[cfg(test)]

@@ -66,6 +66,20 @@ pub const SQL_GET_PARTITION_SPEC: &str = "
       AND (? < pi.end_snapshot OR pi.end_snapshot IS NULL)
     ORDER BY pc.partition_key_index";
 
+/// Read a table's active sort spec (sort_info joined to its expressions) visible at
+/// a snapshot. `?` placeholders (duckdb/sqlite/mysql style): `table_id, snapshot_id,
+/// snapshot_id`. Postgres builds a `$N` variant inline.
+pub const SQL_GET_SORT_SPEC: &str = "
+    SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+           se.sort_direction, se.null_order
+    FROM ducklake_sort_info AS si
+    JOIN ducklake_sort_expression AS se
+        ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+    WHERE si.table_id = ?
+      AND ? >= si.begin_snapshot
+      AND (? < si.end_snapshot OR si.end_snapshot IS NULL)
+    ORDER BY se.sort_key_index";
+
 /// Read per-file partition values for a `data_file_id` range (the planning page
 /// window). `?` placeholders: `table_id, after_data_file_id (exclusive),
 /// last_data_file_id (inclusive)`. Rows for files outside the page are harmless
@@ -800,6 +814,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _table_id: i64,
         _snapshot_id: i64,
     ) -> Result<Option<crate::partition::PartitionSpec>> {
+        Ok(None)
+    }
+
+    /// Read the table's active sort spec visible at `snapshot_id`
+    /// (`ducklake_sort_info` + `ducklake_sort_expression`), or `None` if the table
+    /// is unsorted or the catalog has no sort tables. The write path uses this to
+    /// order rows within each data file; it does not affect read correctness.
+    ///
+    /// The default returns `None`, so external providers and catalogs without sort
+    /// support are unaffected. Built-in providers override this.
+    fn get_sort_spec(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Option<crate::sort::SortSpec>> {
         Ok(None)
     }
 

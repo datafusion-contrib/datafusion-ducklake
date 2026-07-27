@@ -50,6 +50,7 @@ pub(crate) mod positional_source;
 pub mod row_id;
 pub mod schema;
 pub mod snapshot_filter;
+pub mod sort;
 pub mod table;
 pub mod table_changes;
 pub mod table_deletions;
@@ -109,6 +110,7 @@ pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{DuckLakeFileData, DuckLakeTableFile, MetadataProvider};
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;
+pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;
 
@@ -150,6 +152,6 @@ pub use multicatalog_provider::MulticatalogProvider;
 #[cfg(feature = "write")]
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
-pub use table_writer::{DuckLakeTableWriter, TableWriteSession};
+pub use table_writer::{DuckLakeTableWriter, DuckLakeWriteOptions, TableWriteSession};
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;

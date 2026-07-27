@@ -202,6 +202,26 @@ const SQL_CREATE_TABLES: &[&str] = &[
         partition_key_index BIGINT NOT NULL,
         partition_value TEXT
     ) ENGINE = InnoDB"#,
+    // Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id
+    // is allocated from the next_sort_id counter (like partition_id).
+    r#"CREATE TABLE IF NOT EXISTS ducklake_sort_info (
+        sort_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT
+    ) ENGINE = InnoDB"#,
+    // Sort-key expressions for a spec (DuckLake spec), ordered by sort_key_index.
+    // expression is a sort expression in `dialect` (this crate produces bare column
+    // names under `duckdb`); sort_direction ASC/DESC; null_order NULLS_FIRST/LAST.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
+        sort_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        sort_key_index BIGINT NOT NULL,
+        expression VARCHAR(1024) NOT NULL,
+        dialect VARCHAR(256) NOT NULL,
+        sort_direction VARCHAR(16) NOT NULL,
+        null_order VARCHAR(16) NOT NULL
+    ) ENGINE = InnoDB"#,
 ];
 
 /// MySQL-based metadata writer for DuckLake catalogs.
@@ -1173,6 +1193,114 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn set_sort_spec(&self, table_id: i64, fields: &[crate::sort::SortField]) -> Result<i64> {
+        if fields.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "set_sort_spec: at least one sort key is required (use reset_sort_spec to clear)"
+                    .to_string(),
+            ));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let sort_id = reserve_ids(&mut tx, "next_sort_id", 1).await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+
+            // Validate every sort key resolves to a live column (v1 supports bare
+            // column keys only), so a bad SET fails here rather than silently
+            // producing unsorted writes later.
+            for field in fields {
+                let column = field.column_candidate().ok_or_else(|| {
+                    crate::DuckLakeError::InvalidConfig(format!(
+                        "set_sort_spec: sort key '{}' is not a bare column; only column \
+                         sort keys are supported",
+                        field.expression
+                    ))
+                })?;
+                let exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT column_id FROM ducklake_column
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .bind(&column)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if exists.is_none() {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "set_sort_spec: no live column '{column}' in table {table_id}"
+                    )));
+                }
+            }
+
+            sqlx::query(
+                "UPDATE ducklake_sort_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_sort_info
+                     (sort_id, table_id, begin_snapshot, end_snapshot)
+                 VALUES (?, ?, ?, NULL)",
+            )
+            .bind(sort_id)
+            .bind(table_id)
+            .bind(new_snapshot)
+            .execute(&mut *tx)
+            .await?;
+            for field in fields {
+                sqlx::query(
+                    "INSERT INTO ducklake_sort_expression
+                         (sort_id, table_id, sort_key_index, expression, dialect,
+                          sort_direction, null_order)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(sort_id)
+                .bind(table_id)
+                .bind(field.sort_key_index as i64)
+                .bind(&field.expression)
+                .bind(&field.dialect)
+                .bind(field.direction.to_catalog_string())
+                .bind(field.null_order.to_catalog_string())
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            // A sort-order change does NOT bump schema_version.
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
+    fn reset_sort_spec(&self, table_id: i64) -> Result<i64> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            let ended = sqlx::query(
+                "UPDATE ducklake_sort_info SET end_snapshot = ?
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(new_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if ended == 0 {
+                drop(tx);
+                let head: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
+                )
+                .fetch_one(&self.pool)
+                .await?;
+                return Ok(head);
+            }
+            // A sort-order change does NOT bump schema_version.
+            tx.commit().await?;
+            Ok(new_snapshot)
+        })
+    }
+
     fn publish_snapshot(
         &self,
         table_id: i64,
@@ -1323,6 +1451,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                 &self.pool,
                 "next_partition_id",
                 "SELECT COALESCE(MAX(partition_id), 0) FROM ducklake_partition_info",
+            )
+            .await?;
+            seed_counter(
+                &self.pool,
+                "next_sort_id",
+                "SELECT COALESCE(MAX(sort_id), 0) FROM ducklake_sort_info",
             )
             .await?;
             Ok(())

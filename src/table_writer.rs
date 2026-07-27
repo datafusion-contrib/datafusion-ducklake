@@ -30,6 +30,30 @@ use crate::table::delete_file_schema;
 /// SQL NULL), and the row batches for that partition.
 pub type PartitionGroup = (Vec<Option<String>>, Vec<RecordBatch>);
 
+/// Default target data file size: 512 MiB, matching official DuckLake's
+/// `target_file_size` default (`1 << 29`). A write rolls over to a new file once
+/// it reaches this size, so no single write can produce a file too large for
+/// later compaction to reorganize (DuckLake compaction merges, never splits).
+pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
+
+/// Write-layout options carried from the catalog down to the insert path, so a
+/// SQL `INSERT` builds its [`DuckLakeTableWriter`] with the same compression,
+/// row-group caps, and file-rollover target the embedding engine configured.
+/// A `None` field leaves the writer's default for that setting (uncompressed,
+/// parquet-default row groups, [`DEFAULT_TARGET_FILE_SIZE`] rollover).
+#[derive(Debug, Clone, Default)]
+pub struct DuckLakeWriteOptions {
+    /// Parquet compression codec; `None` = uncompressed.
+    pub compression: Option<Compression>,
+    /// Max rows per row group; `None` = parquet default.
+    pub max_row_group_rows: Option<usize>,
+    /// Max uncompressed bytes per row group; `None` = parquet default.
+    pub max_row_group_bytes: Option<usize>,
+    /// Target data file size for rollover (approx encoded bytes); `None` leaves
+    /// the writer default ([`DEFAULT_TARGET_FILE_SIZE`]).
+    pub target_file_size: Option<usize>,
+}
+
 /// High-level writer for DuckLake tables.
 #[derive(Debug)]
 pub struct DuckLakeTableWriter {
@@ -49,6 +73,14 @@ pub struct DuckLakeTableWriter {
     /// once, so a byte cap bounds reader memory for wide schemas (e.g. large
     /// vector columns). Set via [`DuckLakeTableWriter::with_max_row_group_bytes`].
     max_row_group_bytes: Option<usize>,
+    /// Target data file size in approximate encoded bytes. A write rolls over to a
+    /// new file once the current file's estimated encoded size reaches this, so a
+    /// large write produces several files instead of one. Paired with a sort order,
+    /// each file then covers a contiguous, non-overlapping value range — which is
+    /// what lets DuckLake skip whole files by their min/max at query time. Defaults
+    /// to [`DEFAULT_TARGET_FILE_SIZE`] (matching official DuckLake); override via
+    /// [`DuckLakeTableWriter::with_target_file_size`].
+    target_file_size: usize,
 }
 
 impl DuckLakeTableWriter {
@@ -66,6 +98,7 @@ impl DuckLakeTableWriter {
             compression: Compression::UNCOMPRESSED,
             max_row_group_rows: None,
             max_row_group_bytes: None,
+            target_file_size: DEFAULT_TARGET_FILE_SIZE,
         })
     }
 
@@ -92,6 +125,55 @@ impl DuckLakeTableWriter {
     pub fn with_max_row_group_bytes(mut self, bytes: usize) -> Self {
         self.max_row_group_bytes = Some(bytes);
         self
+    }
+
+    /// Override the target data file size (approx encoded bytes) at which a write
+    /// rolls over to a new file, estimated from the writer's flushed + in-progress
+    /// size and checked at batch boundaries. Combined with a sort order, each file
+    /// holds a contiguous value range with a tight min/max, enabling file-level
+    /// pruning. Defaults to [`DEFAULT_TARGET_FILE_SIZE`].
+    pub fn with_target_file_size(mut self, bytes: usize) -> Self {
+        self.target_file_size = bytes;
+        self
+    }
+
+    /// The target file size at which writes roll over (see
+    /// [`with_target_file_size`](Self::with_target_file_size)).
+    pub fn target_file_size(&self) -> usize {
+        self.target_file_size
+    }
+
+    /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
+    /// target). Each field overrides the corresponding setting only when present.
+    pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
+        if let Some(compression) = options.compression {
+            self.compression = compression;
+        }
+        if let Some(rows) = options.max_row_group_rows {
+            self.max_row_group_rows = Some(rows);
+        }
+        if let Some(bytes) = options.max_row_group_bytes {
+            self.max_row_group_bytes = Some(bytes);
+        }
+        if let Some(bytes) = options.target_file_size {
+            self.target_file_size = bytes;
+        }
+        self
+    }
+
+    /// Build the parquet [`WriterProperties`] shared by every write path from this
+    /// writer's configured compression and row-group caps.
+    fn build_writer_props(&self) -> WriterProperties {
+        let mut builder = WriterProperties::builder()
+            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_compression(self.compression);
+        if let Some(rows) = self.max_row_group_rows {
+            builder = builder.set_max_row_group_row_count(Some(rows));
+        }
+        if let Some(bytes) = self.max_row_group_bytes {
+            builder = builder.set_max_row_group_bytes(Some(bytes));
+        }
+        builder.build()
     }
 
     /// Begin a streaming write session.
@@ -576,33 +658,38 @@ impl DuckLakeTableWriter {
                     format!("{rel}/{name}={encoded}")
                 };
             }
-            let file_name = format!("{}.parquet", Uuid::new_v4());
-            let catalog_path = if rel.is_empty() {
-                file_name.clone()
+            // A group may roll over into several files (each a contiguous slice of
+            // the group's rows); every file shares this group's partition values.
+            let rel_prefix = if rel.is_empty() {
+                None
             } else {
-                format!("{rel}/{file_name}")
+                Some(rel.as_str())
             };
-            let object_path_str = join_paths(&table_key, &catalog_path)?;
-            let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
-
-            let mut info = self
-                .write_one_file(
-                    object_path,
+            let group_files = self
+                .write_rolled_files(
+                    &table_key,
+                    rel_prefix,
                     schema_with_ids.clone(),
                     &setup.column_ids,
                     batches,
                 )
                 .await?;
-            info.path = catalog_path;
-            info.path_is_relative = true;
             let partition_values: Vec<(i32, Option<String>)> = values
                 .iter()
                 .enumerate()
                 .map(|(i, v)| (i as i32, v.clone()))
                 .collect();
-            info = info.with_partition(partition_id, partition_values);
-            records_written += info.record_count;
-            file_infos.push(info);
+            for info in group_files {
+                let info = info.with_partition(partition_id, partition_values.clone());
+                records_written += info.record_count;
+                file_infos.push(info);
+            }
+        }
+
+        if file_infos.is_empty() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "write_partitioned: partition groups produced no rows".to_string(),
+            ));
         }
 
         let committed = self.metadata.register_data_files(
@@ -626,34 +713,121 @@ impl DuckLakeTableWriter {
         })
     }
 
-    /// Write ONE parquet file (data columns with catalog field-ids, no embedded
-    /// rowid) to `object_path`, streaming through a local staging file, and return
-    /// its [`DataFileInfo`] (path is the object key's basename placeholder — the
-    /// caller overwrites `path`/`path_is_relative`). Harvests per-column stats.
-    async fn write_one_file(
+    /// Write `batches` to an unpartitioned table as ONE OR MORE data files
+    /// (rolling over by [`target_file_size`](Self::with_target_file_size)) and
+    /// commit them in one snapshot via [`MetadataWriter::register_data_files`].
+    /// Used by the insert path; `batches` must hold
+    /// at least one row (the caller keeps the single-file session path for empty
+    /// Replace truncation). `arrow_schema` is the table's data columns (no rowid).
+    pub async fn write_rows(
         &self,
-        object_path: ObjectPath,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let setup =
+            self.metadata
+                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let schema_with_ids =
+            Arc::new(build_schema_with_field_ids(arrow_schema, &setup.column_ids));
+
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+
+        let file_infos = self
+            .write_rolled_files(
+                &table_key,
+                None,
+                schema_with_ids,
+                &setup.column_ids,
+                batches,
+            )
+            .await?;
+        if file_infos.is_empty() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(
+                "write_rows: input produced no rows".to_string(),
+            ));
+        }
+        let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
+
+        let committed = self.metadata.register_data_files(
+            setup.table_id,
+            schema_name,
+            table_name,
+            setup.snapshot_id,
+            &file_infos,
+            mode,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )?;
+
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: file_infos.len(),
+            records_written,
+        })
+    }
+
+    /// Write `batches` into ONE OR MORE parquet files under `table_key` (data
+    /// columns with catalog field-ids, no embedded rowid), rolling over to a new
+    /// file whenever the current file's estimated encoded size reaches
+    /// `target_file_size`. `rel_prefix`, when set, is a Hive-style subpath (a
+    /// partition group) each file is placed under. Rollover is checked at batch
+    /// boundaries, so a file always holds a whole number of batches — preserving
+    /// any input ordering *across* files (file N's rows all precede file N+1's).
+    /// Returns one [`DataFileInfo`] per file (relative catalog path set, stats and
+    /// footer harvested); empty rows produce no file. A write smaller than
+    /// `target_file_size` yields exactly one file.
+    async fn write_rolled_files(
+        &self,
+        table_key: &str,
+        rel_prefix: Option<&str>,
         schema_with_ids: SchemaRef,
         column_ids: &[i64],
         batches: &[RecordBatch],
-    ) -> Result<DataFileInfo> {
-        let mut props_builder = WriterProperties::builder()
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
-            .set_compression(self.compression);
-        if let Some(rows) = self.max_row_group_rows {
-            props_builder = props_builder.set_max_row_group_row_count(Some(rows));
-        }
-        if let Some(bytes) = self.max_row_group_bytes {
-            props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
-        }
-        let props = props_builder.build();
-
-        let temp = NamedTempFile::new()?;
-        let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+    ) -> Result<Vec<DataFileInfo>> {
+        let mut files: Vec<DataFileInfo> = Vec::new();
+        // In-progress file (None between files / before the first row).
+        let mut writer: Option<ArrowWriter<std::io::BufWriter<std::fs::File>>> = None;
+        let mut temp: Option<NamedTempFile> = None;
+        let mut catalog_path = String::new();
+        let mut object_path = ObjectPath::from("");
         let mut row_count: i64 = 0;
         let mut nan_flags: Vec<Option<bool>> = Vec::new();
+
         for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if writer.is_none() {
+                let file_name = format!("{}.parquet", Uuid::new_v4());
+                catalog_path = match rel_prefix {
+                    Some(prefix) if !prefix.is_empty() => format!("{prefix}/{file_name}"),
+                    _ => file_name.clone(),
+                };
+                let object_path_str = join_paths(table_key, &catalog_path)?;
+                object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+                let temp_file = NamedTempFile::new()?;
+                let staging = std::io::BufWriter::new(temp_file.reopen()?);
+                writer = Some(ArrowWriter::try_new(
+                    staging,
+                    schema_with_ids.clone(),
+                    Some(self.build_writer_props()),
+                )?);
+                temp = Some(temp_file);
+                row_count = 0;
+                nan_flags = Vec::new();
+            }
+
             let batch_with_ids =
                 RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
             crate::stats_collect::accumulate_nan_flags(
@@ -661,35 +835,83 @@ impl DuckLakeTableWriter {
                 &batch_with_ids,
                 column_ids.len(),
             );
-            writer.write(&batch_with_ids)?;
+            let active = writer.as_mut().unwrap();
+            active.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
+
+            // Roll over at the batch boundary once the estimated encoded size
+            // (finished row groups + the in-progress one) reaches the target.
+            if active.bytes_written() + active.in_progress_size() >= self.target_file_size {
+                let info = finalize_and_upload_file(
+                    writer.take().unwrap(),
+                    temp.take().unwrap(),
+                    &self.object_store,
+                    &object_path,
+                    &catalog_path,
+                    column_ids,
+                    row_count,
+                    &nan_flags,
+                )
+                .await?;
+                files.push(info);
+            }
         }
-        let staged = writer.into_inner()?;
-        let mut file = staged
-            .into_inner()
-            .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
-        let file_size = file.metadata()?.len() as i64;
-        let footer_size = read_footer_size(&mut file)?;
 
-        let local = tokio::fs::File::open(temp.path()).await?;
-        let mut reader = tokio::io::BufReader::new(local);
-        let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
-        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-            let _ = upload.abort().await;
-            return Err(e.into());
+        // Finalize the trailing (or only) file.
+        if let Some(active) = writer.take() {
+            let info = finalize_and_upload_file(
+                active,
+                temp.take().unwrap(),
+                &self.object_store,
+                &object_path,
+                &catalog_path,
+                column_ids,
+                row_count,
+                &nan_flags,
+            )
+            .await?;
+            files.push(info);
         }
 
-        let column_stats = crate::stats_collect::collect_column_stats(
-            temp.path(),
-            column_ids,
-            row_count,
-            &nan_flags,
-        );
-
-        Ok(DataFileInfo::new(String::new(), file_size, row_count)
-            .with_footer_size(footer_size)
-            .with_column_stats(column_stats))
+        Ok(files)
     }
+}
+
+/// Finalize the parquet footer of a staged file, stream it to object storage, and
+/// harvest per-column stats — returning the [`DataFileInfo`] for the catalog
+/// commit (relative `catalog_path`). Shared by every multi-file write path.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_and_upload_file(
+    writer: ArrowWriter<std::io::BufWriter<std::fs::File>>,
+    temp: NamedTempFile,
+    object_store: &Arc<dyn ObjectStore>,
+    object_path: &ObjectPath,
+    catalog_path: &str,
+    column_ids: &[i64],
+    row_count: i64,
+    nan_flags: &[Option<bool>],
+) -> Result<DataFileInfo> {
+    let staged = writer.into_inner()?;
+    let mut file = staged
+        .into_inner()
+        .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    let file_size = file.metadata()?.len() as i64;
+    let footer_size = read_footer_size(&mut file)?;
+
+    let local = tokio::fs::File::open(temp.path()).await?;
+    let mut reader = tokio::io::BufReader::new(local);
+    let mut upload = ObjectBufWriter::new(Arc::clone(object_store), object_path.clone());
+    if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+        let _ = upload.abort().await;
+        return Err(e.into());
+    }
+
+    let column_stats =
+        crate::stats_collect::collect_column_stats(temp.path(), column_ids, row_count, nan_flags);
+
+    Ok(DataFileInfo::new(catalog_path, file_size, row_count)
+        .with_footer_size(footer_size)
+        .with_column_stats(column_stats))
 }
 
 /// Sanitize a partition value for use in a Hive-style directory name. The catalog

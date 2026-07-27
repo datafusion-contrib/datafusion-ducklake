@@ -62,6 +62,9 @@ pub struct DuckLakeSchema {
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
+    /// Write-layout options propagated from the catalog to each table's INSERT.
+    #[cfg(feature = "write")]
+    write_options: crate::table_writer::DuckLakeWriteOptions,
 }
 
 impl DuckLakeSchema {
@@ -84,6 +87,8 @@ impl DuckLakeSchema {
             row_lineage: false,
             #[cfg(feature = "write")]
             writer: None,
+            #[cfg(feature = "write")]
+            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         }
     }
 
@@ -104,6 +109,16 @@ impl DuckLakeSchema {
     #[cfg(feature = "write")]
     pub fn with_writer(mut self, writer: Arc<dyn MetadataWriter>) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    /// Set the write-layout options propagated to each table's INSERT path.
+    #[cfg(feature = "write")]
+    pub fn with_write_options(
+        mut self,
+        options: crate::table_writer::DuckLakeWriteOptions,
+    ) -> Self {
+        self.write_options = options;
         self
     }
 }
@@ -155,7 +170,9 @@ impl SchemaProvider for DuckLakeSchema {
                 // Configure writer if this schema is writable
                 #[cfg(feature = "write")]
                 let table = if let Some(writer) = self.writer.as_ref() {
-                    table.with_writer(self.schema_name.clone(), Arc::clone(writer))
+                    table
+                        .with_writer(self.schema_name.clone(), Arc::clone(writer))
+                        .with_write_options(self.write_options.clone())
                 } else {
                     table
                 };
@@ -242,7 +259,8 @@ impl SchemaProvider for DuckLakeSchema {
             table_path,
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?
-        .with_writer(self.schema_name.clone(), Arc::clone(writer));
+        .with_writer(self.schema_name.clone(), Arc::clone(writer))
+        .with_write_options(self.write_options.clone());
 
         Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))
     }

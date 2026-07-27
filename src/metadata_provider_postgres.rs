@@ -9,6 +9,7 @@ use crate::metadata_provider::{
     reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use crate::partition::PartitionSpec;
+use crate::sort::SortSpec;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -459,6 +460,46 @@ impl MetadataProvider for PostgresMetadataProvider {
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(PartitionSpec::from_rows(parsed, prune_safe))
+        })
+    }
+
+    fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
+        block_on(async {
+            let rows = match sqlx::query(
+                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+                        se.sort_direction, se.null_order
+                 FROM ducklake_sort_info AS si
+                 JOIN ducklake_sort_expression AS se
+                   ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+                 WHERE si.table_id = $1
+                   AND $2 >= si.begin_snapshot
+                   AND ($3 < si.end_snapshot OR si.end_snapshot IS NULL)
+                 ORDER BY se.sort_key_index",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<String, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                        row.try_get::<String, _>(4)?,
+                        row.try_get::<String, _>(5)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(SortSpec::from_rows(parsed))
         })
     }
 
