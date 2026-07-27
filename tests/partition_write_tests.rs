@@ -537,11 +537,16 @@ async fn concurrent_reset_during_insert_conflicts() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_set_during_unpartitioned_insert_conflicts() {
+async fn concurrent_set_during_unpartitioned_insert_partitions_at_write_time() {
     // Inverse P1: an unpartitioned INSERT plan captured while the table had NO spec,
     // then a concurrent SET PARTITIONED BY makes it partitioned before the plan
-    // commits. The commit must abort — never leave a partition_id-less file in a
-    // now-partitioned table.
+    // commits.
+    //
+    // The write resolves the live spec inside the write transaction (not at plan
+    // time), so the stale plan lays its rows out per the NEW spec and commits — no
+    // partition_id-less file ever reaches a partitioned table, and the caller needs
+    // no retry. The commit fence still backs this for a spec change that lands after
+    // the resolve.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
     let (ctx, _catalog) = writable_catalog(&conn_str).await;
     // Build the plan now: table is unpartitioned → partition = None.
@@ -563,24 +568,33 @@ async fn concurrent_set_during_unpartitioned_insert_conflicts() {
         )
         .unwrap();
     }
-    // Executing the stale unpartitioned plan must hit the singular-commit fence.
-    let result = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await;
-    let err = result.expect_err("unpartitioned insert into a now-partitioned table must conflict");
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("partition spec") || msg.contains("concurrent"),
-        "expected a partition-spec conflict, got: {err}"
-    );
-    // Nothing committed.
+    datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .expect("the stale plan must partition at write time, not conflict");
+
+    // Every committed file carries the now-live partition generation and a value.
     let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
     let snap = provider.get_current_snapshot().unwrap();
+    let live_spec = provider
+        .get_partition_spec(table_id, snap)
+        .unwrap()
+        .expect("table is partitioned");
     let page = provider
         .get_table_file_metadata_page(table_id, snap, None, 4096)
         .unwrap();
-    assert!(
-        page.is_empty(),
-        "a conflicting unpartitioned insert must not commit any data files"
-    );
+    assert!(!page.is_empty(), "the insert must commit data files");
+    for meta in &page {
+        assert_eq!(
+            meta.file.partition_id,
+            Some(live_spec.partition_id),
+            "every committed file must carry the live partition generation"
+        );
+        assert_eq!(
+            meta.file.partition_values.len(),
+            1,
+            "every committed file must carry a value for the single partition key"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1164,6 +1164,35 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn live_partition_spec(&self, table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+                 FROM ducklake_partition_info AS pi
+                 JOIN ducklake_partition_column AS pc
+                   ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+                 WHERE pi.table_id = ? AND pi.end_snapshot IS NULL
+                 ORDER BY pc.partition_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<i64, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // prune_safe = false: this spec is for laying out a write, never pruning.
+            Ok(crate::partition::PartitionSpec::from_rows(parsed, false))
+        })
+    }
+
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;

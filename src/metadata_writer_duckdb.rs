@@ -1048,6 +1048,30 @@ impl MetadataWriter for DuckdbMetadataWriter {
         Ok(new_snapshot)
     }
 
+    fn live_partition_spec(&self, table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+             FROM ducklake_partition_info AS pi
+             JOIN ducklake_partition_column AS pc
+               ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
+             WHERE pi.table_id = ? AND pi.end_snapshot IS NULL
+             ORDER BY pc.partition_key_index",
+        )?;
+        let rows = stmt
+            .query_map(duckdb::params![table_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        // prune_safe = false: this spec is for laying out a write, never pruning.
+        Ok(crate::partition::PartitionSpec::from_rows(rows, false))
+    }
+
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
         let mut conn = self.connection();
         let tx = conn.transaction()?;

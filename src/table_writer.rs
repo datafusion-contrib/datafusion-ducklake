@@ -357,35 +357,47 @@ impl DuckLakeTableWriter {
     }
 
     /// Write batches to a table, replacing any existing data.
+    ///
+    /// Goes through [`Self::write_rows`], so a partitioned target is split into one
+    /// file per partition and large inputs roll over by
+    /// [`target_file_size`](Self::with_target_file_size).
     pub async fn write_table(
         &self,
         schema_name: &str,
         table_name: &str,
         batches: &[RecordBatch],
     ) -> Result<WriteResult> {
-        if batches.is_empty() {
-            return Err(crate::error::DuckLakeError::InvalidConfig(
-                "No batches to write".to_string(),
-            ));
-        }
-
-        let arrow_schema = batches[0].schema();
-        let mut session =
-            self.begin_write(schema_name, table_name, &arrow_schema, WriteMode::Replace)?;
-
-        for batch in batches {
-            session.write_batch(batch)?;
-        }
-
-        session.finish().await
+        self.write_all(schema_name, table_name, batches, WriteMode::Replace)
+            .await
     }
 
     /// Write batches to a table, appending to existing data.
+    ///
+    /// Goes through [`Self::write_rows`], so a partitioned target is split into one
+    /// file per partition and large inputs roll over by
+    /// [`target_file_size`](Self::with_target_file_size).
     pub async fn append_table(
         &self,
         schema_name: &str,
         table_name: &str,
         batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.write_all(schema_name, table_name, batches, WriteMode::Append)
+            .await
+    }
+
+    /// Shared body of [`Self::write_table`] / [`Self::append_table`].
+    ///
+    /// A row-bearing input goes through the layout-aware [`Self::write_rows`]. An
+    /// input of only empty batches keeps the single-file session path: `write_rows`
+    /// produces no file at all, which for `Replace` would skip the truncation of the
+    /// prior generation, whereas the session registers the 0-row file that carries it.
+    async fn write_all(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        batches: &[RecordBatch],
+        mode: WriteMode,
     ) -> Result<WriteResult> {
         if batches.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -394,13 +406,17 @@ impl DuckLakeTableWriter {
         }
 
         let arrow_schema = batches[0].schema();
-        let mut session =
-            self.begin_write(schema_name, table_name, &arrow_schema, WriteMode::Append)?;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if total_rows > 0 {
+            return self
+                .write_rows(schema_name, table_name, &arrow_schema, mode, batches)
+                .await;
+        }
 
+        let mut session = self.begin_write(schema_name, table_name, &arrow_schema, mode)?;
         for batch in batches {
             session.write_batch(batch)?;
         }
-
         session.finish().await
     }
 
@@ -647,39 +663,17 @@ impl DuckLakeTableWriter {
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
-        let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
-        let mut records_written: i64 = 0;
-        for (values, batches) in &groups {
-            // Readable Hive-style relative subpath; files land under the table dir
-            // and are registered relative to it.
-            let rel = crate::partition::hive_subpath(key_names, values);
-            // A group may roll over into several files (each a contiguous slice of
-            // the group's rows); every file shares this group's partition values.
-            let rel_prefix = if rel.is_empty() {
-                None
-            } else {
-                Some(rel.as_str())
-            };
-            let group_files = self
-                .write_rolled_files(
-                    &table_key,
-                    rel_prefix,
-                    schema_with_ids.clone(),
-                    &setup.column_ids,
-                    batches,
-                )
-                .await?;
-            let partition_values: Vec<(i32, Option<String>)> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i32, v.clone()))
-                .collect();
-            for info in group_files {
-                let info = info.with_partition(partition_id, partition_values.clone());
-                records_written += info.record_count;
-                file_infos.push(info);
-            }
-        }
+        let file_infos = self
+            .write_partition_groups(
+                &table_key,
+                schema_with_ids,
+                &setup.column_ids,
+                partition_id,
+                key_names,
+                &groups,
+            )
+            .await?;
+        let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
 
         if file_infos.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -708,12 +702,24 @@ impl DuckLakeTableWriter {
         })
     }
 
-    /// Write `batches` to an unpartitioned table as ONE OR MORE data files
-    /// (rolling over by [`target_file_size`](Self::with_target_file_size)) and
-    /// commit them in one snapshot via [`MetadataWriter::register_data_files`].
-    /// Used by the insert path; `batches` must hold
-    /// at least one row (the caller keeps the single-file session path for empty
-    /// Replace truncation). `arrow_schema` is the table's data columns (no rowid).
+    /// Write `batches` to a table as ONE OR MORE data files (rolling over by
+    /// [`target_file_size`](Self::with_target_file_size)) and commit them in one
+    /// snapshot via [`MetadataWriter::register_data_files`].
+    ///
+    /// **Layout-aware**: the table's live partition spec is resolved here, so a
+    /// partitioned target splits `batches` into one Hive directory per partition and
+    /// stamps each file's `partition_id` + values — exactly as SQL `INSERT` does.
+    /// This is what keeps a direct caller (no SQL, no
+    /// [`crate::metadata_provider::MetadataProvider`]) from writing files the
+    /// partition fence would reject.
+    ///
+    /// The spec is read after the write transaction opens, so it reflects the table
+    /// as of this write rather than as of some earlier planning step; a spec change
+    /// racing the commit is still caught by the fence.
+    ///
+    /// `batches` must hold at least one row (the caller keeps the single-file session
+    /// path for empty Replace truncation). `arrow_schema` is the table's data columns
+    /// (no rowid).
     pub async fn write_rows(
         &self,
         schema_name: &str,
@@ -735,15 +741,33 @@ impl DuckLakeTableWriter {
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
-        let file_infos = self
-            .write_rolled_files(
-                &table_key,
-                None,
-                schema_with_ids,
-                &setup.column_ids,
-                batches,
-            )
-            .await?;
+        let partition = self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?;
+        let file_infos = match partition.as_ref() {
+            Some(spec) => {
+                let output_schema: SchemaRef = Arc::new(arrow_schema.clone());
+                let groups =
+                    crate::partition::split_batches_by_partition(&output_schema, batches, spec)?;
+                self.write_partition_groups(
+                    &table_key,
+                    schema_with_ids,
+                    &setup.column_ids,
+                    spec.partition_id,
+                    &spec.key_names(),
+                    &groups,
+                )
+                .await?
+            },
+            None => {
+                self.write_rolled_files(
+                    &table_key,
+                    None,
+                    schema_with_ids,
+                    &setup.column_ids,
+                    batches,
+                )
+                .await?
+            },
+        };
         if file_infos.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "write_rows: input produced no rows".to_string(),
@@ -770,6 +794,74 @@ impl DuckLakeTableWriter {
             files_written: file_infos.len(),
             records_written,
         })
+    }
+
+    /// Resolve the table's live partition spec against the columns this write is
+    /// about to produce, or `None` when the table is unpartitioned.
+    ///
+    /// `column_ids[i]` is the catalog id of `arrow_schema` field `i` (the pairing
+    /// `begin_write_transaction` returns). Errors on a spec this crate cannot
+    /// produce (`bucket`/unknown) rather than writing files that violate it.
+    fn resolve_partition(
+        &self,
+        table_id: i64,
+        column_ids: &[i64],
+        arrow_schema: &Schema,
+    ) -> Result<Option<crate::partition::PartitionWriteSpec>> {
+        match self.metadata.live_partition_spec(table_id)? {
+            None => Ok(None),
+            Some(spec) => Ok(Some(crate::partition::PartitionWriteSpec::resolve(
+                &spec,
+                column_ids,
+                arrow_schema,
+            )?)),
+        }
+    }
+
+    /// Write each partition group to its own Hive directory under `table_key`,
+    /// stamping `partition_id` and the group's values on every file produced.
+    ///
+    /// A group may roll over into several files (each a contiguous slice of the
+    /// group's rows); all of them share that group's partition values, so the
+    /// catalog records one partition per file as the spec requires.
+    async fn write_partition_groups(
+        &self,
+        table_key: &str,
+        schema_with_ids: SchemaRef,
+        column_ids: &[i64],
+        partition_id: i64,
+        key_names: &[String],
+        groups: &[PartitionGroup],
+    ) -> Result<Vec<DataFileInfo>> {
+        let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
+        for (values, batches) in groups {
+            // Readable Hive-style relative subpath; files land under the table dir
+            // and are registered relative to it.
+            let rel = crate::partition::hive_subpath(key_names, values);
+            let rel_prefix = if rel.is_empty() {
+                None
+            } else {
+                Some(rel.as_str())
+            };
+            let group_files = self
+                .write_rolled_files(
+                    table_key,
+                    rel_prefix,
+                    schema_with_ids.clone(),
+                    column_ids,
+                    batches,
+                )
+                .await?;
+            let partition_values: Vec<(i32, Option<String>)> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as i32, v.clone()))
+                .collect();
+            for info in group_files {
+                file_infos.push(info.with_partition(partition_id, partition_values.clone()));
+            }
+        }
+        Ok(file_infos)
     }
 
     /// Write `batches` into ONE OR MORE parquet files under `table_key` (data

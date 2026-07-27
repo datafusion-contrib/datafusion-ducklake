@@ -620,6 +620,30 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The table's currently-live partition spec (`ducklake_partition_info` with
+    /// `end_snapshot IS NULL`, joined to its key columns), or `None` when the table
+    /// is unpartitioned.
+    ///
+    /// The write paths need this from the *writer* side: a caller reaching
+    /// [`crate::table_writer::DuckLakeTableWriter`] directly (rather than through SQL
+    /// `INSERT`) has no [`crate::metadata_provider::MetadataProvider`] to ask, but
+    /// still must lay its files out per the spec and stamp the right `partition_id` —
+    /// otherwise [`enforce_partition_fence`] rejects the commit. Resolved against the
+    /// write schema by [`crate::partition::PartitionWriteSpec::resolve`].
+    ///
+    /// The returned spec is for WRITING only: `prune_safe` is always `false`, since
+    /// deciding whether a mapping may prune arbitrary live files needs the full
+    /// generation history that the read path loads.
+    ///
+    /// Reading it at write-planning time is inherently racy against a concurrent
+    /// `SET`/`RESET PARTITIONED BY` — [`enforce_partition_fence`] is what makes the
+    /// commit safe, by re-checking the live generation inside the commit transaction.
+    ///
+    /// Default: `None` (backends without partition support are never partitioned).
+    fn live_partition_spec(&self, _table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+        Ok(None)
+    }
+
     /// Remove the table's partition spec — the commit behind `ALTER TABLE …
     /// RESET PARTITIONED BY`.
     ///
