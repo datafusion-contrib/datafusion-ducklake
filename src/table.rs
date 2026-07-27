@@ -2759,14 +2759,14 @@ impl TableProvider for DuckLakeTable {
         // present in the write schema — wrap the input in a global SortExec so each
         // written file's rows are ordered, tightening per-file min/max statistics
         // for range pruning. Sorting is applied before the partition split, so each
-        // per-partition file remains a sorted subsequence. sort_on_insert defaults
-        // to true; a non-producible or absent spec leaves the input unsorted, which
-        // is always correct (only pruning effectiveness is affected).
+        // per-partition file remains a sorted subsequence. An unsupported expression
+        // or missing sort column is rejected before execution rather than silently
+        // producing files that violate the active sort contract.
         let live_sort = self
             .provider
             .get_sort_spec(self.table_id, head_snapshot)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref());
+        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref())?;
         // Wrap the input in a SortExec now AND declare the same requirement on
         // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
         // (a plain SortExec with no downstream ordering requirement would be
@@ -3023,21 +3023,33 @@ fn is_object_store_not_found(err: &DataFusionError) -> bool {
 }
 
 /// The `LexOrdering` for a table's live sort spec against `schema`, or `None` when
-/// there is no producible sort order or a sort key is absent from the write schema
-/// (a column dropped after `SET SORTED BY` — sorting is skipped rather than failing
-/// the write, since correctness never depends on the ordering).
+/// the table has no sort order. Unsupported expressions and missing sort columns
+/// fail the write before data is committed.
 #[cfg(feature = "write")]
 fn sort_ordering_for(
     schema: &arrow::datatypes::Schema,
     sort_spec: Option<&crate::sort::SortSpec>,
-) -> Option<datafusion::physical_expr::LexOrdering> {
-    let keys = sort_spec.and_then(|spec| spec.producible_columns())?;
+) -> datafusion::common::Result<Option<datafusion::physical_expr::LexOrdering>> {
+    let Some(sort_spec) = sort_spec else {
+        return Ok(None);
+    };
+    let keys = sort_spec.producible_columns().ok_or_else(|| {
+        DataFusionError::NotImplemented(format!(
+            "DuckLake sort order {} contains an unsupported expression; \
+             datafusion-ducklake can write only bare-column sort keys",
+            sort_spec.sort_id
+        ))
+    })?;
     if keys.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut sort_exprs = Vec::with_capacity(keys.len());
     for (name, direction, null_order) in &keys {
-        let index = schema.index_of(name).ok()?;
+        let index = schema.index_of(name).map_err(|_| {
+            DataFusionError::Plan(format!(
+                "DuckLake sort key '{name}' is not present in the write schema"
+            ))
+        })?;
         let column = Arc::new(datafusion::physical_expr::expressions::Column::new(
             name, index,
         ));
@@ -3051,7 +3063,7 @@ fn sort_ordering_for(
             ),
         );
     }
-    datafusion::physical_expr::LexOrdering::new(sort_exprs)
+    Ok(datafusion::physical_expr::LexOrdering::new(sort_exprs))
 }
 
 #[cfg(test)]
@@ -3627,6 +3639,29 @@ mod tests {
         assert_eq!(
             parse_statistic_scalar("123.45", &decimal, &DataType::Decimal128(10, 2)),
             Some(ScalarValue::Decimal128(Some(12_345), 10, 2))
+        );
+    }
+
+    #[test]
+    fn sort_ordering_rejects_expression_sort_key() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let sort_spec = crate::sort::SortSpec {
+            sort_id: 9,
+            fields: vec![crate::sort::SortField {
+                sort_key_index: 0,
+                expression: "lower(id)".to_string(),
+                dialect: crate::sort::DUCKDB_DIALECT.to_string(),
+                direction: crate::sort::SortDirection::Asc,
+                null_order: crate::sort::NullOrder::NullsLast,
+            }],
+        };
+
+        let err = sort_ordering_for(&schema, Some(&sort_spec)).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "This feature is not implemented: DuckLake sort order 9 contains an unsupported \
+             expression; datafusion-ducklake can write only bare-column sort keys",
         );
     }
 }

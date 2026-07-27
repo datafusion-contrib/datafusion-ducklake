@@ -15,11 +15,10 @@
 //!
 //! Scope note: this crate *produces* sort orders only for **bare column references**
 //! (`SORTED BY (device_id, ts DESC)`). A spec whose expression is anything more
-//! complex is *tolerated on read* (round-tripped verbatim) but never applied on our
-//! writes — we simply write unsorted, which is always correct (only the min/max
-//! locality, i.e. pruning effectiveness, is affected). This mirrors how
-//! [`crate::partition`] tolerates `bucket`/unknown transforms on read but never
-//! produces them.
+//! complex is *tolerated on read* and round-tripped verbatim. Any operation that
+//! would write or rewrite data rejects the unsupported expression before committing,
+//! because silently producing unsorted files would violate the table's active sort
+//! contract.
 
 /// A sort key's direction. Serializes to the catalog `sort_direction` string
 /// (`"ASC"` / `"DESC"`), matching DuckLake's on-disk form.
@@ -93,7 +92,7 @@ pub const DUCKDB_DIALECT: &str = "duckdb";
 /// `column_id` — DuckLake sort keys are expression-based. For a spec this crate
 /// produced, `expression` is a bare column name; for a spec written by DuckDB it may
 /// be any expression, in which case [`SortField::column_candidate`] returns `None`
-/// and the write path skips sorting.
+/// and the write path rejects the unsupported sort contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SortField {
     /// 0-based position of this key within the sort order.
@@ -130,8 +129,7 @@ impl SortField {
     /// column name if it is one. A bare column is either an unquoted simple
     /// identifier (`ts`, `device_id`) or a double-quoted identifier (`"My Col"`,
     /// unquoted here). Anything else — function calls, arithmetic, qualified names,
-    /// multiple tokens — yields `None`, so the write path leaves such files unsorted
-    /// rather than guessing.
+    /// multiple tokens — yields `None`.
     pub fn column_candidate(&self) -> Option<String> {
         parse_bare_column(&self.expression)
     }
@@ -181,7 +179,7 @@ pub struct SortSpec {
 impl SortSpec {
     /// Whether this crate can *apply* this sort on write: true only when every key
     /// is a bare column reference. A spec containing any non-column expression is
-    /// not producible (we tolerate it on read but write such files unsorted).
+    /// not producible and must be rejected by data-writing operations.
     pub fn is_producible(&self) -> bool {
         !self.fields.is_empty() && self.fields.iter().all(|f| f.column_candidate().is_some())
     }

@@ -135,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 &state,
                 RewriteOptions {
                     delete_threshold: 0.5,
+                    ..RewriteOptions::default()
                 },
             )
             .await

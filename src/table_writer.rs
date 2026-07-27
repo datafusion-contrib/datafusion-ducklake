@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
@@ -624,6 +628,52 @@ impl DuckLakeTableWriter {
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
+        let stream_schema = batches.first().map_or_else(
+            || {
+                let mut fields: Vec<Field> = data_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect();
+                fields.push(embedded_rowid_field());
+                if embed_snapshot_id {
+                    fields.push(embedded_snapshot_id_field());
+                }
+                Arc::new(Schema::new(fields))
+            },
+            RecordBatch::schema,
+        );
+        let batches = batches.to_vec();
+        let stream =
+            futures::stream::iter(batches.into_iter().map(Ok::<RecordBatch, DataFusionError>));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(stream_schema, stream));
+        self.write_compacted_file_stream(
+            schema_name,
+            table_name,
+            data_schema,
+            data_column_ids,
+            stream,
+            embed_snapshot_id,
+            partition_subpath,
+        )
+        .await
+    }
+
+    /// Write one compacted parquet file from a record-batch stream.
+    ///
+    /// This lets compaction feed a spilling DataFusion sort directly into
+    /// Parquet without retaining the sorted output in memory.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn write_compacted_file_stream(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_schema: &Schema,
+        data_column_ids: &[i64],
+        mut batches: SendableRecordBatchStream,
+        embed_snapshot_id: bool,
+        partition_subpath: Option<&str>,
+    ) -> Result<DataFileInfo> {
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
@@ -669,7 +719,9 @@ impl DuckLakeTableWriter {
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
         let mut row_count: i64 = 0;
-        for batch in batches {
+        let mut nan_flags: Vec<Option<bool>> = Vec::new();
+        while let Some(batch) = batches.next().await {
+            let batch = batch?;
             if batch.num_columns() != schema_with_ids.fields().len() {
                 return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                     "write_compacted_file: batch has {} columns, expected {}",
@@ -679,6 +731,11 @@ impl DuckLakeTableWriter {
             }
             let batch_with_ids =
                 RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
+            crate::stats_collect::accumulate_nan_flags(
+                &mut nan_flags,
+                &batch,
+                data_column_ids.len(),
+            );
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
@@ -697,20 +754,8 @@ impl DuckLakeTableWriter {
             return Err(e.into());
         }
 
-        // Harvest per-column stats for the compacted file, exactly as a normal
-        // write does — mirroring official DuckLake, whose compaction reuses the
-        // same WRITTEN_FILE_STATISTICS path. `data_column_ids` covers only the
-        // catalog data columns, so the trailing embedded rowid/snapshot columns
-        // are skipped by the harvest. NaN flags are computed from the batches
-        // (the footer carries no NaN signal).
-        let mut nan_flags: Vec<Option<bool>> = Vec::new();
-        for batch in batches {
-            crate::stats_collect::accumulate_nan_flags(
-                &mut nan_flags,
-                batch,
-                data_column_ids.len(),
-            );
-        }
+        // Collect stats for catalog columns only. Track NaN values while
+        // consuming the stream because the Parquet footer omits that signal.
         let column_stats = crate::stats_collect::collect_column_stats(
             temp.path(),
             data_column_ids,

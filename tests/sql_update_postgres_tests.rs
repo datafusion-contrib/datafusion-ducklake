@@ -16,10 +16,11 @@ use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, MulticatalogManager,
-    MulticatalogProvider, PostgresMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, MulticatalogManager,
+    MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection, SortField,
 };
 use object_store::local::LocalFileSystem;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
@@ -170,5 +171,90 @@ async fn update_where_end_to_end_postgres() {
         read_rowid_rows(&pool, cat_name).await,
         vec![(0, 1, 10), (1, 2, 200), (2, 3, 30), (3, 4, 400)],
         "values updated in place; rowids 1 and 3 preserved across the rewrite"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn update_applies_postgres_sort_order() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog_name = "cat";
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog(catalog_name)
+        .await
+        .unwrap();
+    let writer = writer_for(&pool, catalog_id, &data).await;
+    let metadata: Arc<dyn MetadataWriter> = writer.clone();
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 1])),
+            Arc::new(Int32Array::from(vec![30, 10, 20])),
+        ],
+    )
+    .unwrap();
+    let created = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("public", "t", &[batch])
+        .await
+        .unwrap();
+    writer
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+
+    let ctx = writable_ctx(&pool, catalog_name, catalog_id, &data).await;
+    let batches = ctx
+        .sql(&format!(
+            "UPDATE {catalog_name}.public.t SET val = val + 1 WHERE id = 1"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    let provider = MulticatalogProvider::with_pool(pool.clone(), catalog_name)
+        .await
+        .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let mut files = provider
+        .get_table_file_metadata_page(created.table_id, snapshot, None, 16)
+        .unwrap();
+    files.sort_by_key(|metadata| metadata.file.data_file_id);
+    let output = files.last().unwrap();
+    let path = data
+        .join(format!("cat_{catalog_id}"))
+        .join("public/t")
+        .join(&output.file.file.path);
+    let file = std::fs::File::open(path).unwrap();
+    let output_batch = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let values = output_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    assert_eq!(count, 3);
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        values.values().iter().copied().collect::<Vec<_>>(),
+        vec![11, 21, 31],
     );
 }

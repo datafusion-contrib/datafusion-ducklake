@@ -15,9 +15,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
+use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
     SqliteMetadataWriter, register_ducklake_functions,
@@ -209,6 +211,80 @@ async fn live_data_file_count(temp_dir: &TempDir) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_applies_sort_order() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 1, 1], vec![30, 10, 20]).await;
+    let writer = Arc::new(make_writer(&temp_dir).await);
+    let provider = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", snapshot)
+        .unwrap()
+        .unwrap();
+    writer
+        .set_sort_spec(
+            table.table_id,
+            &[SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+
+    let ctx = writable_ctx(&temp_dir).await;
+    assert_eq!(
+        run_dml_count(
+            &ctx,
+            "UPDATE ducklake.main.t SET val = val + 1 WHERE id = 1"
+        )
+        .await,
+        3,
+    );
+
+    let provider = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let mut files = provider
+        .get_table_file_metadata_page(table.table_id, snapshot, None, 16)
+        .unwrap();
+    files.sort_by_key(|metadata| metadata.file.data_file_id);
+    let output = files.last().unwrap();
+    let path = temp_dir
+        .path()
+        .join("data/main/t")
+        .join(&output.file.file.path);
+    let file = std::fs::File::open(path).unwrap();
+    let batch = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(
+        values.values().iter().copied().collect::<Vec<_>>(),
+        vec![11, 21, 31],
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_sets_value_where_id() {

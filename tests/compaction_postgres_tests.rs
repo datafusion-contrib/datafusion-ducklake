@@ -18,10 +18,11 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
     CompactionResult, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MergeOptions,
-    MetadataProvider, MetadataWriter, MulticatalogManager, MulticatalogProvider,
-    PostgresMetadataWriter, RewriteOptions,
+    MetadataProvider, MetadataWriter, MulticatalogManager, MulticatalogProvider, NullOrder,
+    PostgresMetadataWriter, RewriteOptions, SortDirection, SortField,
 };
 use object_store::local::LocalFileSystem;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -122,6 +123,33 @@ async fn live_files(pool: &PgPool, cat_name: &str) -> Vec<datafusion_ducklake::D
         .unwrap()
 }
 
+fn file_values(data: &std::path::Path, catalog_id: i64, path: &str) -> Vec<i32> {
+    let file = std::fs::File::open(
+        data.join(format!("cat_{catalog_id}"))
+            .join("public")
+            .join("t")
+            .join(path),
+    )
+    .unwrap();
+    ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+        .map(|batch| {
+            let batch = batch.unwrap();
+            batch
+                .column_by_name("val")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>()
+        .concat()
+}
+
 async fn scalar_i64(pool: &PgPool, sql: &str, cat: i64) -> i64 {
     sqlx::query(AssertSqlSafe(sql))
         .bind(cat)
@@ -182,7 +210,7 @@ async fn merge_adjacent_files_postgres() {
         .unwrap();
 
     // Three INSERTs -> three small data files at three origin snapshots.
-    DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
+    let created = DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
         .unwrap()
         .write_table("public", "t", &[batch(vec![1, 2], vec![10, 20])])
         .await
@@ -207,6 +235,13 @@ async fn merge_adjacent_files_postgres() {
     assert_eq!(live_files(&pool, cat_name).await.len(), 3, "three files");
     let rows_before = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
     assert_eq!(read_rows(&pool, cat_name, None).await, rows_before);
+    writer_for(&pool, cat, &data)
+        .await
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
+        )
+        .unwrap();
 
     // Merge: the multicatalog reader must surface begin_snapshot/schema_version
     // (else this silently no-ops), then commit_compaction removes the sources.
@@ -223,6 +258,10 @@ async fn merge_adjacent_files_postgres() {
         files[0].partial_max,
         Some(pre_merge),
         "partial_max = max origin snapshot"
+    );
+    assert_eq!(
+        file_values(&data, cat, &files[0].file.path),
+        vec![60, 50, 40, 30, 20, 10],
     );
     // Sources removed from the catalog and scheduled for deletion (catalog-scoped).
     assert_eq!(
@@ -264,7 +303,7 @@ async fn rewrite_data_files_postgres() {
         .unwrap();
 
     // One file of ten rows.
-    DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
+    let created = DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
         .unwrap()
         .write_table(
             "public",
@@ -272,6 +311,13 @@ async fn rewrite_data_files_postgres() {
             &[batch((1..=10).collect(), (1..=10).map(|v| v * 10).collect())],
         )
         .await
+        .unwrap();
+    writer_for(&pool, cat, &data)
+        .await
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
+        )
         .unwrap();
 
     // Delete eight of ten rows via SQL (a positional delete file).
@@ -301,6 +347,7 @@ async fn rewrite_data_files_postgres() {
             &s,
             RewriteOptions {
                 delete_threshold: 0.5,
+                ..RewriteOptions::default()
             },
         )
         .await
@@ -318,8 +365,89 @@ async fn rewrite_data_files_postgres() {
         "a rewrite output is not partial"
     );
     assert_eq!(files[0].delete_file_id, None, "no live delete file");
+    assert_eq!(file_values(&data, cat, &files[0].file.path), vec![100, 90]);
     assert_eq!(
         read_rows(&pool, cat_name, None).await,
         vec![(9, 90), (10, 100)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn rewrite_targets_explicit_postgres_data_files() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store: ObjStore = Arc::new(LocalFileSystem::new());
+    let catalog_name = "cat";
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog(catalog_name)
+        .await
+        .unwrap();
+    let writer = writer_for(&pool, catalog_id, &data).await;
+    let metadata: Arc<dyn MetadataWriter> = writer.clone();
+    let created = DuckLakeTableWriter::new(Arc::clone(&metadata), Arc::clone(&store))
+        .unwrap()
+        .write_table("public", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    DuckLakeTableWriter::new(metadata, store)
+        .unwrap()
+        .append_table("public", "t", &[batch(vec![3, 4], vec![30, 40])])
+        .await
+        .unwrap();
+    writer
+        .set_sort_spec(
+            created.table_id,
+            &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    let mut before = live_files(&pool, catalog_name).await;
+    before.sort_by_key(|file| file.data_file_id);
+    let selected_id = before[0].data_file_id;
+    let unaffected_path = before[1].file.path.clone();
+
+    let result = with_writable_table(
+        &pool,
+        catalog_id,
+        catalog_name,
+        &data,
+        |table, state| async move {
+            table
+                .rewrite_data_files(
+                    &state,
+                    RewriteOptions {
+                        data_file_ids: Some(vec![selected_id]),
+                        ..RewriteOptions::default()
+                    },
+                )
+                .await
+        },
+    )
+    .await;
+
+    let after = live_files(&pool, catalog_name).await;
+    let rewritten = after
+        .iter()
+        .find(|file| file.file.path != unaffected_path)
+        .unwrap();
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: 1,
+            files_created: 1,
+            rows_written: 2,
+        },
+    );
+    assert_eq!(after.len(), 2);
+    assert!(after.iter().any(|file| file.file.path == unaffected_path),);
+    assert_eq!(
+        file_values(&data, catalog_id, &rewritten.file.path),
+        vec![20, 10],
+    );
+    assert_eq!(
+        read_rows(&pool, catalog_name, None).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)],
     );
 }

@@ -55,6 +55,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 
+use crate::compaction::sorted_rewrite_output;
 use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
 use crate::table_writer::DuckLakeTableWriter;
@@ -265,6 +266,16 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // Append the rewritten rows (embedding their original rowids) AND
             // apply every positional delete in ONE snapshot.
             let physical_schema = table.physical_schema();
+            let sort_spec = table
+                .live_sort_spec()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut updated_batches = sorted_rewrite_output(
+                Arc::clone(&context),
+                updated_batches,
+                physical_schema.as_ref(),
+                sort_spec.as_ref(),
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let mut session = table_writer
                 .begin_write_with_embedded_rowid(
                     &schema_name,
@@ -273,9 +284,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     WriteMode::Append,
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            for batch in &updated_batches {
+            while let Some(batch) = updated_batches.try_next().await? {
                 session
-                    .write_batch(batch)
+                    .write_batch(&batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
             session
