@@ -20,6 +20,8 @@
 //!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
 //! collects matched rows into memory before writing; single partition only.
+//! Assignments to an active partition column are rejected during planning, before
+//! any object or metadata write, because rewritten rows would require repartitioning.
 //!
 //! # Session lifecycle (important)
 //!
@@ -223,6 +225,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             let mut delete_entries: Vec<DeleteFileEntry> = Vec::new();
             let mut total_updated: u64 = 0;
+            let mut output_partition: Option<(Option<i64>, Vec<(i32, Option<String>)>)> = None;
 
             for scan in &scans {
                 let batches =
@@ -236,6 +239,17 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 )?;
                 if out.matched_count == 0 {
                     continue;
+                }
+                let partition = (scan.partition_id, scan.partition_values.clone());
+                if let Some(existing) = &output_partition {
+                    if existing != &partition {
+                        return Err(DataFusionError::NotImplemented(
+                            "UPDATE cannot atomically write rows from more than one partition"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    output_partition = Some(partition);
                 }
                 total_updated += out.matched_count as u64;
                 updated_batches.extend(out.updated_batches);
@@ -273,6 +287,19 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     WriteMode::Append,
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if let Some((partition_id, partition_values)) = output_partition {
+                match partition_id {
+                    Some(partition_id) => {
+                        session = session.with_partition_values(partition_id, partition_values);
+                    },
+                    None if !partition_values.is_empty() => {
+                        return Err(DataFusionError::Internal(
+                            "unpartitioned UPDATE source has partition values".to_string(),
+                        ));
+                    },
+                    None => {},
+                }
+            }
             for batch in &updated_batches {
                 session
                     .write_batch(batch)

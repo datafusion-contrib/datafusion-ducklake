@@ -17,8 +17,9 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
-    reconstruct_list_columns, reconstruct_list_columns_with_table,
+    decode_key_index, reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
+use crate::metadata_provider_postgres::load_file_partition_values;
 use crate::partition::PartitionSpec;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -26,7 +27,7 @@ use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
+fn is_missing_optional_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("does not exist") || message.contains("undefined table")
 }
@@ -81,6 +82,8 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
+    /// `ducklake_data_file.partition_id` exists.
+    data_file_partition_id: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
     /// The `ducklake_schema_versions` table exists.
@@ -89,7 +92,10 @@ struct SchemaCapabilities {
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max && self.schema_versions
+        self.data_file_partial_max
+            && self.data_file_partition_id
+            && self.delete_file_partial_max
+            && self.schema_versions
     }
 }
 
@@ -169,10 +175,12 @@ impl MulticatalogProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
                to_regclass('ducklake_schema_versions') IS NOT NULL",
@@ -181,8 +189,9 @@ impl MulticatalogProvider {
         .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.0,
-            delete_file_partial_max: row.1,
-            schema_versions: row.2,
+            data_file_partition_id: row.1,
+            delete_file_partial_max: row.2,
+            schema_versions: row.3,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -377,6 +386,11 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id::bigint"
+            } else {
+                "NULL::bigint"
+            };
             let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version::bigint
                   FROM ducklake_schema_versions sv
@@ -406,7 +420,8 @@ impl MetadataProvider for MulticatalogProvider {
                     del.delete_count,
                     data.begin_snapshot::bigint AS data_begin_snapshot,
                     {partial_max_expr} AS data_partial_max,
-                    {schema_version_expr} AS data_schema_version
+                    {schema_version_expr} AS data_schema_version,
+                    {partition_id_expr} AS data_partition_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -428,7 +443,11 @@ impl MetadataProvider for MulticatalogProvider {
                 .await?;
 
             rows.iter()
-                .map(|row| decode_table_file(row, snapshot_id))
+                .map(|row| {
+                    let mut file = decode_table_file(row, snapshot_id)?;
+                    file.partition_id = row.try_get(18)?;
+                    Ok(file)
+                })
                 .collect()
         })
     }
@@ -444,7 +463,7 @@ impl MetadataProvider for MulticatalogProvider {
             .await
             {
                 Ok(count) => count,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) if is_missing_optional_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let prune_safe = generation_count == 1;
@@ -465,7 +484,7 @@ impl MetadataProvider for MulticatalogProvider {
             .await
             {
                 Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) if is_missing_optional_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let parsed = rows
@@ -473,7 +492,7 @@ impl MetadataProvider for MulticatalogProvider {
                 .map(|row| {
                     Ok::<_, crate::DuckLakeError>((
                         row.try_get::<i64, _>(0)?,
-                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        decode_key_index(row.try_get(1)?, "partition")?,
                         row.try_get::<i64, _>(2)?,
                         row.try_get::<String, _>(3)?,
                     ))
@@ -483,6 +502,19 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
+    fn get_file_partition_values(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        data_file_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<(i32, Option<String>)>>> {
+        block_on(load_file_partition_values(
+            &self.pool,
+            table_id,
+            snapshot_id,
+            data_file_ids,
+        ))
+    }
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,
@@ -503,6 +535,11 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id::bigint"
+            } else {
+                "NULL::bigint"
+            };
             let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version::bigint
                   FROM ducklake_schema_versions sv
@@ -519,7 +556,7 @@ impl MetadataProvider for MulticatalogProvider {
                         del.delete_file_id, del.path, del.path_is_relative,
                         del.file_size_bytes, del.footer_size, del.encryption_key,
                         del.delete_count, data.begin_snapshot::bigint,
-                        {partial_max_expr}, {schema_version_expr}
+                        {partial_max_expr}, {schema_version_expr}, {partition_id_expr}
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -546,7 +583,11 @@ impl MetadataProvider for MulticatalogProvider {
                 .await?;
             let files = rows
                 .iter()
-                .map(|row| decode_table_file(row, snapshot_id))
+                .map(|row| {
+                    let mut file = decode_table_file(row, snapshot_id)?;
+                    file.partition_id = row.try_get(18)?;
+                    Ok(file)
+                })
                 .collect::<Result<Vec<_>>>()?;
             let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
                 return Ok(Vec::new());
@@ -589,7 +630,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
             let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
@@ -600,35 +641,12 @@ impl MetadataProvider for MulticatalogProvider {
                     .push(statistic);
             }
 
-            // Enrich with per-file partition values (for pruning), scoped to the
-            // page's data_file_id range. Keyed by globally-unique ids; no catalog
-            // scoping. Missing partition table => no enrichment.
-            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-            match sqlx::query(
-                "SELECT data_file_id, partition_key_index, partition_value
-                 FROM ducklake_file_partition_value
-                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3",
-            )
-            .bind(table_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(last_data_file_id)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => {
-                    for row in rows {
-                        let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                        let value: Option<String> = row.try_get(2)?;
-                        values_by_file
-                            .entry(data_file_id)
-                            .or_default()
-                            .push((key_index, value));
-                    }
-                },
-                Err(error) if is_missing_statistics_table(&error) => {},
-                Err(error) => return Err(error.into()),
-            }
+            let ids = files
+                .iter()
+                .map(|file| file.data_file_id)
+                .collect::<Vec<_>>();
+            let mut values_by_file =
+                load_file_partition_values(&self.pool, table_id, snapshot_id, &ids).await?;
 
             Ok(files
                 .into_iter()
@@ -669,7 +687,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
+                Err(error) if is_missing_optional_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
             let column_sizes = match sqlx::query(
@@ -710,7 +728,7 @@ impl MetadataProvider for MulticatalogProvider {
                         Err(error) => Some(Err(error)),
                     })
                     .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+                Err(error) if is_missing_optional_table(&error) => HashMap::new(),
                 Err(error) => return Err(error.into()),
             };
             let bounds_are_exact: bool = sqlx::query_scalar(
@@ -749,7 +767,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
             Ok(DuckLakeStatistics {
@@ -778,7 +796,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
+                Err(error) if is_missing_optional_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
 
@@ -804,7 +822,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
 
@@ -847,7 +865,7 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
 

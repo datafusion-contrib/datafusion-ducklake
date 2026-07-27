@@ -810,6 +810,30 @@ impl DuckLakeTable {
         Ok(files)
     }
 
+    pub(crate) fn files_with_partitions(&self) -> Result<Vec<DuckLakeTableFile>> {
+        let mut files = Vec::new();
+        let mut after_data_file_id = None;
+        while let Some(metadata) = self.next_file_metadata_page(&mut after_data_file_id)? {
+            let last_page = metadata.len() < FILE_METADATA_BATCH_SIZE;
+            for metadata in metadata {
+                if metadata.file.partition_id.is_some() && metadata.file.partition_values.is_empty()
+                {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "metadata provider omitted partition values for partitioned data file {}",
+                        metadata.file.data_file_id,
+                    )));
+                }
+                files.push(metadata.file);
+            }
+            if last_page {
+                break;
+            }
+        }
+        #[cfg(feature = "encryption")]
+        self.configure_encryption_factory(&files)?;
+        Ok(files)
+    }
+
     /// Resolve a file path (data or delete file) to its absolute path
     fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
@@ -2231,6 +2255,8 @@ impl DuckLakeTable {
             data_file_id: table_file.data_file_id,
             delete_file_id: table_file.delete_file_id,
             source_path: table_file.file.path.clone(),
+            partition_id: table_file.partition_id,
+            partition_values: table_file.partition_values.clone(),
         })
     }
 
@@ -2413,6 +2439,10 @@ pub(crate) struct UpdateSourceScan {
     pub(crate) delete_file_id: Option<i64>,
     /// The source data file's catalog path (records the delete's provenance).
     pub(crate) source_path: String,
+    /// Partition generation of the source file, when the table is partitioned.
+    pub(crate) partition_id: Option<i64>,
+    /// Partition values of the source file in partition-key order.
+    pub(crate) partition_values: Vec<(i32, Option<String>)>,
 }
 
 /// The rewrite produced for one source data file by
@@ -2498,25 +2528,7 @@ impl TableProvider for DuckLakeTable {
             },
         };
         let mut after_data_file_id = None;
-        loop {
-            let metadata = self.provider.get_table_file_metadata_page(
-                self.table_id,
-                self.snapshot_id,
-                after_data_file_id,
-                FILE_METADATA_BATCH_SIZE,
-            )?;
-            if metadata.is_empty() {
-                break;
-            }
-            if metadata.len() > FILE_METADATA_BATCH_SIZE {
-                return Err(DataFusionError::External(Box::new(
-                    crate::DuckLakeError::InvalidConfig(format!(
-                        "metadata provider returned {} files for a {}-file planning page",
-                        metadata.len(),
-                        FILE_METADATA_BATCH_SIZE
-                    )),
-                )));
-            }
+        while let Some(metadata) = self.next_file_metadata_page(&mut after_data_file_id)? {
             // A short page proves the file list is exhausted (pages are keyed
             // and ordered by data_file_id under a LIMIT), so stop after
             // processing it rather than paying one more metadata round trip
@@ -2524,15 +2536,6 @@ impl TableProvider for DuckLakeTable {
             // the batch size — the common case — this halves the planning
             // metadata queries.
             let last_page = metadata.len() < FILE_METADATA_BATCH_SIZE;
-            let next_after = metadata.last().unwrap().file.data_file_id;
-            if after_data_file_id.is_some_and(|after| next_after <= after) {
-                return Err(DataFusionError::External(Box::new(
-                    crate::DuckLakeError::InvalidConfig(
-                        "metadata provider returned a non-advancing file page".to_string(),
-                    ),
-                )));
-            }
-            after_data_file_id = Some(next_after);
 
             let mut catalog_file_statistics = Vec::new();
             let mut table_files = Vec::with_capacity(metadata.len());
@@ -2834,6 +2837,40 @@ impl TableProvider for DuckLakeTable {
             ));
         }
 
+        let head_snapshot = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let live_partition_spec = self
+            .provider
+            .get_partition_spec(self.table_id, head_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        if let Some(spec) = live_partition_spec {
+            let mut partition_columns = HashSet::with_capacity(spec.columns.len());
+            for partition_column in spec.columns {
+                let column = self
+                    .columns
+                    .iter()
+                    .find(|column| column.column_id == partition_column.column_id)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "partition column_id {} not found in table schema",
+                            partition_column.column_id
+                        ))
+                    })?;
+                partition_columns.insert(column.column_name.as_str());
+            }
+            if let Some((column_name, _)) = assignments
+                .iter()
+                .find(|(column_name, _)| partition_columns.contains(column_name.as_str()))
+            {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "UPDATE of partition column '{column_name}' is not supported; \
+                     rewrite the table under a new partition spec instead"
+                )));
+            }
+        }
+
         // Assignment / filter expressions reference the table's DATA columns
         // (unqualified), never the synthetic `rowid`. Plan them against the
         // physical schema so column indices line up with the scanned batches.
@@ -2869,7 +2906,7 @@ impl TableProvider for DuckLakeTable {
         // collects each scan and performs the rewrite + atomic commit at execute
         // time.
         let table_files = self
-            .files()
+            .files_with_partitions()
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let mut scans = Vec::with_capacity(table_files.len());
         for tf in &table_files {
@@ -2967,6 +3004,45 @@ impl TableProvider for DuckLakeTable {
             self.snapshot_id,
             self.object_store_url.clone(),
         )))
+    }
+}
+
+impl DuckLakeTable {
+    fn next_file_metadata_page(
+        &self,
+        after_data_file_id: &mut Option<i64>,
+    ) -> Result<Option<Vec<DuckLakeFileMetadata>>> {
+        let metadata = self.provider.get_table_file_metadata_page(
+            self.table_id,
+            self.snapshot_id,
+            *after_data_file_id,
+            FILE_METADATA_BATCH_SIZE,
+        )?;
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        if metadata.len() > FILE_METADATA_BATCH_SIZE {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "metadata provider returned {} files for a {}-file page",
+                metadata.len(),
+                FILE_METADATA_BATCH_SIZE
+            )));
+        }
+        let next_after = metadata
+            .last()
+            .map(|entry| entry.file.data_file_id)
+            .ok_or_else(|| {
+                crate::DuckLakeError::Internal(
+                    "non-empty metadata page had no final file".to_string(),
+                )
+            })?;
+        if after_data_file_id.is_some_and(|after| next_after <= after) {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "metadata provider returned a non-advancing file page".to_string(),
+            ));
+        }
+        *after_data_file_id = Some(next_after);
+        Ok(Some(metadata))
     }
 }
 

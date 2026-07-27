@@ -49,13 +49,14 @@ use crate::{DuckLakeError, Result};
 /// Options for [`DuckLakeTable::merge_adjacent_files`].
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
-    /// Bin-pack adjacent small files (in `(schema_version, data_file_id)` order)
+    /// Bin-pack adjacent small files (in
+    /// `(schema_version, partition_id, partition_values, data_file_id)` order)
     /// until a bin reaches this many bytes, then emit it as one merged file.
     /// Files already at or above this size are left alone.
     pub target_file_size: u64,
     /// Cap on the number of source files considered in one call, to bound the
     /// memory and I/O of a single merge (candidates are taken in
-    /// `(schema_version, data_file_id)` order).
+    /// `(schema_version, partition_id, partition_values, data_file_id)` order).
     pub max_merged_files: usize,
     /// Skip files smaller than this many bytes. `0` makes every below-target file
     /// a candidate.
@@ -199,11 +200,11 @@ impl DuckLakeTable {
     ///
     /// Candidates are the table's live files that have no live delete file, whose
     /// size is in `[min_file_size, target_file_size)`, and whose origin snapshot
-    /// and schema version are known. They are grouped by schema version (so a DDL
-    /// boundary is never crossed) and, within a group, bin-packed in
-    /// `data_file_id` order until a bin reaches `target_file_size`; only bins of
-    /// two or more files are merged. Delete-bearing files are deliberately left
-    /// to [`rewrite_data_files`](Self::rewrite_data_files).
+    /// and schema version are known. They are grouped by schema version and
+    /// partition, so neither boundary is crossed, then bin-packed in
+    /// `data_file_id` order until a bin reaches `target_file_size`. Only bins
+    /// of two or more files are merged. Delete-bearing files are left to
+    /// [`rewrite_data_files`](Self::rewrite_data_files).
     ///
     /// Each source file's live rows are read with their original rowids
     /// preserved; a merged file that spans more than one origin snapshot is
@@ -229,10 +230,7 @@ impl DuckLakeTable {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
 
-        // Candidates: live, delete-free, below-target files with a known origin
-        // snapshot + schema version, ordered so adjacency and same-version
-        // grouping fall out of the sort.
-        let table_files = self.files()?;
+        let table_files = self.files_with_partitions()?;
         let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
@@ -249,17 +247,28 @@ impl DuckLakeTable {
                     && (f.file.file_size_bytes as u64) < opts.target_file_size
             })
             .collect();
-        candidates.sort_by_key(|f| (f.schema_version.unwrap_or(0), f.data_file_id));
+        candidates.sort_by(|a, b| {
+            a.schema_version
+                .cmp(&b.schema_version)
+                .then_with(|| a.partition_id.cmp(&b.partition_id))
+                .then_with(|| a.partition_values.cmp(&b.partition_values))
+                .then_with(|| a.data_file_id.cmp(&b.data_file_id))
+        });
         candidates.truncate(opts.max_merged_files);
 
-        // Bin-pack within each schema-version run; only bins of >= 2 files merge.
         let mut bins: Vec<Vec<&DuckLakeTableFile>> = Vec::new();
         let mut i = 0;
         while i < candidates.len() {
             let version = candidates[i].schema_version;
+            let partition_id = candidates[i].partition_id;
+            let partition_values = &candidates[i].partition_values;
             let mut running: u64 = 0;
             let mut bin: Vec<&DuckLakeTableFile> = Vec::new();
-            while i < candidates.len() && candidates[i].schema_version == version {
+            while i < candidates.len()
+                && candidates[i].schema_version == version
+                && candidates[i].partition_id == partition_id
+                && &candidates[i].partition_values == partition_values
+            {
                 bin.push(candidates[i]);
                 running += candidates[i].file.file_size_bytes as u64;
                 i += 1;
@@ -376,6 +385,7 @@ impl DuckLakeTable {
                     partial,
                 )
                 .await?;
+            let file = partitioned_output(file, bin[0]);
             outputs.push(CompactionOutputFile {
                 file,
                 partial_max,
@@ -449,7 +459,7 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
-        let table_files = self.files()?;
+        let table_files = self.files_with_partitions()?;
         for tf in &table_files {
             let record_count = tf.max_row_count.unwrap_or(0);
             let delete_count = tf.delete_count.unwrap_or(0);
@@ -491,6 +501,7 @@ impl DuckLakeTable {
                         false,
                     )
                     .await?;
+                let file = partitioned_output(file, tf);
                 rows_written += live_rows as i64;
                 // A rewrite output holds only currently-live rows and begins at
                 // the compaction snapshot (begin_snapshot = None); its
@@ -520,5 +531,15 @@ impl DuckLakeTable {
             files_created: outputs.len(),
             rows_written,
         })
+    }
+}
+
+fn partitioned_output(
+    file: crate::metadata_writer::DataFileInfo,
+    source: &DuckLakeTableFile,
+) -> crate::metadata_writer::DataFileInfo {
+    match source.partition_id {
+        Some(partition_id) => file.with_partition(partition_id, source.partition_values.clone()),
+        None => file,
     }
 }

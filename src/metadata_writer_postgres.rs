@@ -2313,6 +2313,15 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .await?;
 
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+
             // Register the new data file (the inserted row versions), exactly as
             // register_data_file: seed stats, draw the row-id range, insert, and
             // accumulate. Deletes are accounted at read time (delete_count), so the
@@ -2351,6 +2360,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             let data_file_id: i64 = inserted.try_get(0)?;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             sqlx::query(
@@ -2781,6 +2791,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let data_file_id: i64 = inserted.try_get(0)?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
+                insert_partition_metadata(&mut tx, table_id, data_file_id, &out.file).await?;
             }
 
             // Recompute the visible stat totals from the surviving files (see the

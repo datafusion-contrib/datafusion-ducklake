@@ -9,8 +9,8 @@ use crate::metadata_provider::{
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
     SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
     SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, reconstruct_list_columns,
-    reconstruct_list_columns_with_table,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, decode_key_index,
+    reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -19,7 +19,7 @@ use duckdb::{Config, Connection, params};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-fn is_missing_statistics_table(error: &duckdb::Error) -> bool {
+fn is_missing_optional_table(error: &duckdb::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("does not exist") || message.contains("not found")
 }
@@ -329,7 +329,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             |row| row.get(0),
         ) {
             Ok(count) => count,
-            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) if is_missing_optional_table(&error) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
         let prune_safe = generation_count == 1;
@@ -338,15 +338,26 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) if is_missing_optional_table(&error) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let rows = rows
+            .into_iter()
+            .map(|(partition_id, key_index, column_id, transform)| {
+                Ok((
+                    partition_id,
+                    decode_key_index(key_index, "partition")?,
+                    column_id,
+                    transform,
+                ))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         Ok(PartitionSpec::from_rows(rows, prune_safe))
     }
 
@@ -357,7 +368,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
@@ -365,9 +376,24 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) if is_missing_optional_table(&error) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let rows = rows
+            .into_iter()
+            .map(
+                |(sort_id, key_index, expression, dialect, direction, null_order)| {
+                    Ok((
+                        sort_id,
+                        decode_key_index(key_index, "sort")?,
+                        expression,
+                        dialect,
+                        direction,
+                        null_order,
+                    ))
+                },
+            )
+            .collect::<crate::Result<Vec<_>>>()?;
         Ok(SortSpec::from_rows(rows))
     }
 
@@ -389,7 +415,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     })
                     .transpose()?
             },
-            Err(error) if is_missing_statistics_table(&error) => None,
+            Err(error) if is_missing_optional_table(&error) => None,
             Err(error) => return Err(error.into()),
         };
         let column_sizes: HashMap<i64, i64> = match conn.prepare(
@@ -424,7 +450,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     Err(error) => Some(Err(error)),
                 })
                 .collect::<Result<_, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+            Err(error) if is_missing_optional_table(&error) => HashMap::new(),
             Err(error) => return Err(error.into()),
         };
         let bounds_are_exact: bool = conn.query_row(
@@ -452,7 +478,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) if is_missing_optional_table(&error) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
         Ok(DuckLakeStatistics {
@@ -576,7 +602,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     },
                 )?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) if is_missing_optional_table(&error) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
         let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
@@ -598,20 +624,21 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
-                            i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                            row.get::<_, i64>(1)?,
                             row.get::<_, Option<String>>(2)?,
                         ))
                     },
                 )?;
                 for row in rows {
                     let (data_file_id, key_index, value) = row?;
+                    let key_index = decode_key_index(key_index, "partition")?;
                     values_by_file
                         .entry(data_file_id)
                         .or_default()
                         .push((key_index, value));
                 }
             },
-            Err(error) if is_missing_statistics_table(&error) => {},
+            Err(error) if is_missing_optional_table(&error) => {},
             Err(error) => return Err(error.into()),
         }
 
@@ -650,7 +677,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     })
                     .transpose()?
             },
-            Err(error) if is_missing_statistics_table(&error) => None,
+            Err(error) if is_missing_optional_table(&error) => None,
             Err(error) => return Err(error.into()),
         };
 
@@ -668,7 +695,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) if is_missing_optional_table(&error) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
 
@@ -687,7 +714,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,
-            Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+            Err(error) if is_missing_optional_table(&error) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
 

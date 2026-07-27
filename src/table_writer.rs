@@ -352,6 +352,7 @@ impl DuckLakeTableWriter {
             temp: Some(temp),
             catalog_path,
             path_is_relative,
+            partition: None,
             mode,
             row_count: 0,
             nan_flags: Vec::new(),
@@ -970,6 +971,8 @@ pub struct TableWriteSession {
     catalog_path: String,
     /// Whether the catalog_path is relative to table path
     path_is_relative: bool,
+    /// Optional partition generation and per-key values registered with the file.
+    partition: Option<(i64, Vec<(i32, Option<String>)>)>,
     /// Replace vs Append; passed to `register_data_file` so the head advance and
     /// (for Replace) prior-generation retirement commit atomically with the file.
     mode: WriteMode,
@@ -981,6 +984,19 @@ pub struct TableWriteSession {
 }
 
 impl TableWriteSession {
+    /// Attaches partition values to the data file committed by this session.
+    ///
+    /// This supports combined append and positional-delete commits where the
+    /// appended file belongs to an existing partitioned table.
+    #[must_use]
+    pub fn with_partition_values(
+        mut self,
+        partition_id: i64,
+        values: Vec<(i32, Option<String>)>,
+    ) -> Self {
+        self.partition = Some((partition_id, values));
+        self
+    }
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         if self.writer.is_none() {
             return Err(crate::error::DuckLakeError::Internal(
@@ -1157,6 +1173,9 @@ impl TableWriteSession {
             .with_column_stats(column_stats);
         if !self.path_is_relative {
             file_info = file_info.with_absolute_path();
+        }
+        if let Some((partition_id, values)) = &self.partition {
+            file_info = file_info.with_partition(*partition_id, values.clone());
         }
         Ok(file_info)
     }

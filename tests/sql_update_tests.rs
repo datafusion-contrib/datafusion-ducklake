@@ -18,9 +18,10 @@ use object_store::local::LocalFileSystem;
 use sqlx::sqlite::SqlitePool;
 use tempfile::TempDir;
 
+use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, register_ducklake_functions,
+    ColumnDef, DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode, register_ducklake_functions,
 };
 
 /// The `(id, val)` schema used throughout.
@@ -209,6 +210,134 @@ async fn live_data_file_count(temp_dir: &TempDir) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_preserves_single_partition() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp_dir).await);
+    let columns = table_schema()
+        .fields()
+        .iter()
+        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let partition_id = provider
+        .get_partition_spec(setup.table_id, snapshot)
+        .unwrap()
+        .unwrap()
+        .partition_id;
+    let batch = RecordBatch::try_new(
+        table_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 1])),
+            Arc::new(Int32Array::from(vec![30, 10, 20])),
+        ],
+    )
+    .unwrap();
+    let mut session = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .begin_write("main", "t", table_schema().as_ref(), WriteMode::Append)
+        .unwrap()
+        .with_partition_values(partition_id, vec![(0, Some("1".to_string()))]);
+    session.write_batch(&batch).unwrap();
+    session.finish().await.unwrap();
+
+    let ctx = writable_ctx(&temp_dir).await;
+    let snapshot_before = provider.get_current_snapshot().unwrap();
+    let err = ctx
+        .sql("UPDATE ducklake.main.t SET id = 2 WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "UPDATE operation on table 'ducklake.main.t'\ncaused by\n\
+         This feature is not implemented: UPDATE of partition column 'id' is not supported; \
+         rewrite the table under a new partition spec instead",
+    );
+    let provider_after_rejection = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        provider_after_rejection.get_current_snapshot().unwrap(),
+        snapshot_before,
+    );
+    assert_eq!(
+        provider_after_rejection
+            .get_table_file_metadata_page(setup.table_id, snapshot_before, None, 16)
+            .unwrap()
+            .len(),
+        1,
+    );
+    let mut pairs_after_rejection = read_pairs(&temp_dir).await;
+    pairs_after_rejection.sort();
+    assert_eq!(pairs_after_rejection, vec![(1, 10), (1, 20), (1, 30)]);
+
+    assert_eq!(
+        run_dml_count(
+            &ctx,
+            "UPDATE ducklake.main.t SET val = val + 1 WHERE id = 1"
+        )
+        .await,
+        3,
+    );
+
+    let provider = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let mut files = provider
+        .get_table_file_metadata_page(setup.table_id, snapshot, None, 16)
+        .unwrap();
+    files.sort_by_key(|metadata| metadata.file.data_file_id);
+    let output = files.last().unwrap();
+    let mut pairs = read_pairs(&temp_dir).await;
+    pairs.sort();
+
+    assert_eq!(files.len(), 2);
+    assert_eq!(output.file.partition_id, Some(partition_id));
+    assert_eq!(
+        output.file.partition_values,
+        vec![(0, Some("1".to_string()))],
+    );
+    assert_eq!(pairs, vec![(1, 11), (1, 21), (1, 31)]);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn update_sets_value_where_id() {

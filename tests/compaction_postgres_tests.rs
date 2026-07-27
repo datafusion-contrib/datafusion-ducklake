@@ -17,9 +17,9 @@ use arrow::array::{Array, Int32Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    CompactionResult, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MergeOptions,
+    ColumnDef, CompactionResult, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MergeOptions,
     MetadataProvider, MetadataWriter, MulticatalogManager, MulticatalogProvider,
-    PostgresMetadataWriter, RewriteOptions,
+    PartitionTransform, PostgresMetadataWriter, RewriteOptions, WriteMode,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::Row;
@@ -320,5 +320,106 @@ async fn rewrite_data_files_postgres() {
     assert_eq!(
         read_rows(&pool, cat_name, None).await,
         vec![(9, 90), (10, 100)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn compaction_preserves_postgres_partition_values() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let cat_name = "cat";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+    let writer = writer_for(&pool, cat, &data).await;
+    let columns = schema()
+        .fields()
+        .iter()
+        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("public", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let partition_id = scalar_i64(
+        &pool,
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+        setup.table_id,
+    )
+    .await;
+
+    for (id, values) in [(1, vec![10, 20]), (1, vec![30, 40]), (2, vec![50])] {
+        let rows = vec![id; values.len()];
+        let mut session =
+            DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+                .unwrap()
+                .begin_write("public", "t", schema().as_ref(), WriteMode::Append)
+                .unwrap()
+                .with_partition_values(partition_id, vec![(0, Some(id.to_string()))]);
+        session.write_batch(&batch(rows, values)).unwrap();
+        session.finish().await.unwrap();
+    }
+
+    let result = with_writable_table(&pool, cat, cat_name, &data, |table, state| async move {
+        table
+            .merge_adjacent_files(&state, MergeOptions::default())
+            .await
+    })
+    .await;
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: 2,
+            files_created: 1,
+            rows_written: 4,
+        }
+    );
+
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(setup.table_id, snapshot, None, 10)
+        .unwrap();
+    let mut partitions = page
+        .iter()
+        .map(|metadata| {
+            (
+                metadata.file.partition_id,
+                metadata.file.partition_values.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    partitions.sort();
+    assert_eq!(
+        partitions,
+        vec![
+            (Some(partition_id), vec![(0, Some("1".to_string()))]),
+            (Some(partition_id), vec![(0, Some("2".to_string()))]),
+        ],
     );
 }

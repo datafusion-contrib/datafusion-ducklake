@@ -6,7 +6,7 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on, decode_key_index,
     reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use crate::partition::PartitionSpec;
@@ -158,7 +158,7 @@ fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
 }
 
-fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
+fn is_missing_optional_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("no such table") || message.contains("does not exist")
 }
@@ -510,7 +510,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             .await
             {
                 Ok(count) => count,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) if is_missing_optional_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let prune_safe = generation_count == 1;
@@ -522,7 +522,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .await
             {
                 Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) if is_missing_optional_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let parsed = rows
@@ -530,7 +530,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .map(|row| {
                     Ok::<_, crate::DuckLakeError>((
                         row.try_get::<i64, _>(0)?,
-                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        decode_key_index(row.try_get(1)?, "partition")?,
                         row.try_get::<i64, _>(2)?,
                         row.try_get::<String, _>(3)?,
                     ))
@@ -550,7 +550,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .await
             {
                 Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+                Err(error) if is_missing_optional_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let parsed = rows
@@ -558,7 +558,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .map(|row| {
                     Ok::<_, crate::DuckLakeError>((
                         row.try_get::<i64, _>(0)?,
-                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        decode_key_index(row.try_get(1)?, "sort")?,
                         row.try_get::<String, _>(2)?,
                         row.try_get::<String, _>(3)?,
                         row.try_get::<String, _>(4)?,
@@ -690,7 +690,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
             let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
@@ -714,7 +714,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 Ok(rows) => {
                     for row in rows {
                         let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let key_index = decode_key_index(row.try_get(1)?, "partition")?;
                         let value: Option<String> = row.try_get(2)?;
                         values_by_file
                             .entry(data_file_id)
@@ -722,7 +722,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                             .push((key_index, value));
                     }
                 },
-                Err(error) if is_missing_statistics_table(&error) => {},
+                Err(error) if is_missing_optional_table(&error) => {},
                 Err(error) => return Err(error.into()),
             }
 
@@ -765,7 +765,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
+                Err(error) if is_missing_optional_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
             let column_sizes = match sqlx::query(
@@ -806,7 +806,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         Err(error) => Some(Err(error)),
                     })
                     .collect::<std::result::Result<HashMap<i64, i64>, _>>()?,
-                Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
+                Err(error) if is_missing_optional_table(&error) => HashMap::new(),
                 Err(error) => return Err(error.into()),
             };
             let bounds_are_exact: bool = sqlx::query_scalar(
@@ -845,7 +845,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
             Ok(DuckLakeStatistics {
@@ -874,7 +874,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .transpose()?,
-                Err(error) if is_missing_statistics_table(&error) => None,
+                Err(error) if is_missing_optional_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
 
@@ -900,7 +900,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
 
@@ -943,7 +943,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) if is_missing_optional_table(&error) => Vec::new(),
                 Err(error) => return Err(error.into()),
             };
 

@@ -1,5 +1,13 @@
-use crate::Result;
+use crate::{DuckLakeError, Result};
 use std::collections::HashMap;
+
+pub(crate) fn decode_key_index(value: i64, kind: &str) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        DuckLakeError::InvalidConfig(format!(
+            "{kind} key index {value} is outside the supported i32 range"
+        ))
+    })
+}
 
 // SQL queries for DuckLake catalog tables
 // These queries are database-agnostic and work with DuckDB, SQLite, PostgreSQL, MySQL
@@ -832,6 +840,20 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Load partition values for a bounded set of data files.
+    ///
+    /// The default paged metadata implementation calls this when
+    /// [`Self::get_table_files_for_select`] omits partition values. External
+    /// providers can implement this smaller query instead of replacing paging.
+    fn get_file_partition_values(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _data_file_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<(i32, Option<String>)>>> {
+        Ok(HashMap::new())
+    }
+
     /// Load table-, column-, and file-level statistics from the DuckLake
     /// catalog. Implementations should return unknown statistics when the
     /// optional statistics tables do not exist (for compatibility with older
@@ -882,13 +904,29 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
                 .or_default()
                 .push(statistic);
         }
-        Ok(files
+        let mut files = files
             .into_iter()
             .filter(|file| after_data_file_id.is_none_or(|after| file.data_file_id > after))
             .take(limit)
-            .map(|file| DuckLakeFileMetadata {
-                column_statistics: by_file.remove(&file.data_file_id).unwrap_or_default(),
-                file,
+            .collect::<Vec<_>>();
+        let ids = files
+            .iter()
+            .filter(|file| file.partition_id.is_some() && file.partition_values.is_empty())
+            .map(|file| file.data_file_id)
+            .collect::<Vec<_>>();
+        let mut partition_values = self.get_file_partition_values(table_id, snapshot_id, &ids)?;
+        Ok(files
+            .drain(..)
+            .map(|mut file| {
+                if file.partition_values.is_empty()
+                    && let Some(values) = partition_values.remove(&file.data_file_id)
+                {
+                    file.partition_values = values;
+                }
+                DuckLakeFileMetadata {
+                    column_statistics: by_file.remove(&file.data_file_id).unwrap_or_default(),
+                    file,
+                }
             })
             .collect())
     }

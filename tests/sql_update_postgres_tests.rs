@@ -16,8 +16,9 @@ use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, MulticatalogManager,
-    MulticatalogProvider, PostgresMetadataWriter,
+    ColumnDef, DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
+    MulticatalogManager, MulticatalogProvider, PartitionTransform, PostgresMetadataWriter,
+    WriteMode,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -171,4 +172,108 @@ async fn update_where_end_to_end_postgres() {
         vec![(0, 1, 10), (1, 2, 200), (2, 3, 30), (3, 4, 400)],
         "values updated in place; rowids 1 and 3 preserved across the rewrite"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn update_preserves_postgres_partition_values() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let catalog_name = "cat";
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog(catalog_name)
+        .await
+        .unwrap();
+    let writer = writer_for(&pool, catalog_id, &data).await;
+    let metadata: Arc<dyn MetadataWriter> = writer.clone();
+    let columns = schema()
+        .fields()
+        .iter()
+        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("public", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let provider = MulticatalogProvider::with_pool(pool.clone(), catalog_name)
+        .await
+        .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let partition_id = provider
+        .get_partition_spec(setup.table_id, snapshot)
+        .unwrap()
+        .unwrap()
+        .partition_id;
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 1, 1])),
+            Arc::new(Int32Array::from(vec![30, 10, 20])),
+        ],
+    )
+    .unwrap();
+    let mut session = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .begin_write("public", "t", schema().as_ref(), WriteMode::Append)
+        .unwrap()
+        .with_partition_values(partition_id, vec![(0, Some("1".to_string()))]);
+    session.write_batch(&batch).unwrap();
+    session.finish().await.unwrap();
+
+    let ctx = writable_ctx(&pool, catalog_name, catalog_id, &data).await;
+    let batches = ctx
+        .sql(&format!(
+            "UPDATE {catalog_name}.public.t SET val = val + 1 WHERE id = 1"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap()
+        .value(0);
+    let provider = MulticatalogProvider::with_pool(pool.clone(), catalog_name)
+        .await
+        .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let mut files = provider
+        .get_table_file_metadata_page(setup.table_id, snapshot, None, 16)
+        .unwrap();
+    files.sort_by_key(|metadata| metadata.file.data_file_id);
+    let output = files.last().unwrap();
+    let mut rows = read_rowid_rows(&pool, catalog_name).await;
+    rows.sort();
+
+    assert_eq!(count, 3);
+    assert_eq!(files.len(), 2);
+    assert_eq!(output.file.partition_id, Some(partition_id));
+    assert_eq!(
+        output.file.partition_values,
+        vec![(0, Some("1".to_string()))],
+    );
+    assert_eq!(rows, vec![(0, 1, 31), (1, 1, 11), (2, 1, 21)]);
 }
