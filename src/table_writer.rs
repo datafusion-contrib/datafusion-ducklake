@@ -25,10 +25,8 @@ use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
 
-/// One partition group for a partitioned write: the per-key partition values
-/// every row in the group shares (`values[i]` for partition key `i`, `None` ==
-/// SQL NULL), and the row batches for that partition.
-pub type PartitionGroup = (Vec<Option<String>>, Vec<RecordBatch>);
+// The partition-group shape is shared with the split logic in `partition`.
+pub use crate::partition::PartitionGroup;
 
 /// Default target data file size: 512 MiB, matching official DuckLake's
 /// `target_file_size` default (`1 << 29`). A write rolls over to a new file once
@@ -499,6 +497,7 @@ impl DuckLakeTableWriter {
     /// and — when `embed_snapshot_id` — a further trailing `Int64` snapshot-id
     /// column. Streams to a local staging file and multipart-uploads it, so peak
     /// memory stays bounded regardless of file size.
+    #[allow(clippy::too_many_arguments)]
     pub async fn write_compacted_file(
         &self,
         schema_name: &str,
@@ -507,13 +506,22 @@ impl DuckLakeTableWriter {
         data_column_ids: &[i64],
         batches: &[RecordBatch],
         embed_snapshot_id: bool,
+        partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
-        let file_name = format!("{}.parquet", Uuid::new_v4());
+        // A compacted file of a partitioned table lands in its partition's Hive
+        // directory, like every other write of that partition; the returned
+        // `DataFileInfo.path` is relative to the table dir either way.
+        let file_name = match partition_subpath {
+            Some(prefix) if !prefix.is_empty() => {
+                format!("{prefix}/{}.parquet", Uuid::new_v4())
+            },
+            _ => format!("{}.parquet", Uuid::new_v4()),
+        };
         let object_path_str = join_paths(&table_key, &file_name)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
@@ -642,22 +650,9 @@ impl DuckLakeTableWriter {
         let mut file_infos: Vec<DataFileInfo> = Vec::with_capacity(groups.len());
         let mut records_written: i64 = 0;
         for (values, batches) in &groups {
-            // Readable Hive-style relative subpath (catalog is authoritative, so
-            // the encoded value is sanitized for the filesystem without affecting
-            // correctness). Files land under the table dir, registered relative.
-            let mut rel = String::new();
-            for (i, value) in values.iter().enumerate() {
-                let name = key_names.get(i).map(String::as_str).unwrap_or("key");
-                let encoded = match value {
-                    Some(v) => sanitize_partition_path(v),
-                    None => "__HIVE_DEFAULT_PARTITION__".to_string(),
-                };
-                rel = if rel.is_empty() {
-                    format!("{name}={encoded}")
-                } else {
-                    format!("{rel}/{name}={encoded}")
-                };
-            }
+            // Readable Hive-style relative subpath; files land under the table dir
+            // and are registered relative to it.
+            let rel = crate::partition::hive_subpath(key_names, values);
             // A group may roll over into several files (each a contiguous slice of
             // the group's rows); every file shares this group's partition values.
             let rel_prefix = if rel.is_empty() {
@@ -912,24 +907,6 @@ async fn finalize_and_upload_file(
     Ok(DataFileInfo::new(catalog_path, file_size, row_count)
         .with_footer_size(footer_size)
         .with_column_stats(column_stats))
-}
-
-/// Sanitize a partition value for use in a Hive-style directory name. The catalog
-/// (`ducklake_file_partition_value`) is the authoritative source for pruning, so
-/// this only needs to yield a stable, filesystem-safe segment; collisions between
-/// distinct values are harmless (files carry distinct UUID names and distinct
-/// catalog values).
-fn sanitize_partition_path(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 /// Streaming write session. Batches stream to a local staging file; the

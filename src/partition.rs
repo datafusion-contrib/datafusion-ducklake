@@ -167,6 +167,250 @@ fn year_bounds(year: i64, data_type: &DataType) -> Option<(ScalarValue, ScalarVa
     Some((min, max))
 }
 
+/// A partition spec resolved against a concrete write schema: how a write path
+/// splits incoming rows into per-partition files.
+///
+/// Built by [`PartitionWriteSpec::resolve`] from the table's live
+/// [`PartitionSpec`]. Every write path that produces NEW rows for a partitioned
+/// table goes through this — SQL `INSERT` ([`crate::insert_exec::DuckLakeInsertExec`]),
+/// the low-level writer entry points, and the UPDATE rewrite — so all of them lay
+/// files out the same way and stamp the same `partition_id`.
+#[derive(Debug, Clone)]
+pub struct PartitionWriteSpec {
+    /// The active spec generation (`ducklake_partition_info.partition_id`).
+    pub partition_id: i64,
+    /// Partition keys, in key order.
+    pub keys: Vec<PartitionWriteKey>,
+}
+
+/// One partition key resolved for the write path.
+#[derive(Debug, Clone)]
+pub struct PartitionWriteKey {
+    /// Column index in the write input schema.
+    pub input_index: usize,
+    /// Column name (used only for the readable Hive-style path).
+    pub name: String,
+    /// Transform applied to the column value to form the partition value.
+    pub transform: PartitionTransform,
+}
+
+impl PartitionWriteSpec {
+    /// Resolve `spec` against the columns a write is about to produce:
+    /// `column_ids[i]` is the catalog `column_id` of `schema` field `i` (the 1:1
+    /// pairing every write path already has).
+    ///
+    /// Errors with [`crate::DuckLakeError::Unsupported`] on a transform this crate
+    /// cannot PRODUCE (`bucket`/unknown) — writing unpartitioned files into a table
+    /// whose spec demands them would violate the spec, so a partitioned write must
+    /// fail loudly rather than silently degrade. Errors with
+    /// [`crate::DuckLakeError::Internal`] if a partition key names a column absent
+    /// from the write schema (the catalog and the write disagree).
+    pub fn resolve(
+        spec: &PartitionSpec,
+        column_ids: &[i64],
+        schema: &arrow::datatypes::Schema,
+    ) -> crate::Result<PartitionWriteSpec> {
+        let mut keys = Vec::with_capacity(spec.columns.len());
+        for column in &spec.columns {
+            if !column.transform.is_producible() {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "writing to a table partitioned by '{}' is not supported",
+                    column.transform.to_catalog_string()
+                )));
+            }
+            let index = column_ids
+                .iter()
+                .position(|id| *id == column.column_id)
+                .ok_or_else(|| {
+                    crate::DuckLakeError::Internal(format!(
+                        "partition column_id {} not found in table schema",
+                        column.column_id
+                    ))
+                })?;
+            let name = schema
+                .fields()
+                .get(index)
+                .map(|f| f.name().to_string())
+                .ok_or_else(|| {
+                    crate::DuckLakeError::Internal(format!(
+                        "partition column index {index} out of range for write schema"
+                    ))
+                })?;
+            keys.push(PartitionWriteKey {
+                input_index: index,
+                name,
+                transform: column.transform.clone(),
+            });
+        }
+        Ok(PartitionWriteSpec {
+            partition_id: spec.partition_id,
+            keys,
+        })
+    }
+
+    /// The partition-key column names in key order — the input to
+    /// [`hive_subpath`].
+    pub(crate) fn key_names(&self) -> Vec<String> {
+        self.keys.iter().map(|k| k.name.clone()).collect()
+    }
+}
+
+/// The Hive-style relative subpath (`key=value/…`) a file carrying `values` is
+/// placed under, given the partition-key column names in key order. Returns an
+/// empty string when there are no keys (an unpartitioned file lives directly
+/// under the table directory).
+///
+/// A `None` value (SQL NULL) uses DuckDB's `__HIVE_DEFAULT_PARTITION__` sentinel,
+/// matching official DuckLake's on-disk layout. The catalog
+/// (`ducklake_file_partition_value`) is the authoritative source for pruning, so
+/// this path is for human readability and interop only — values are sanitized for
+/// the filesystem without affecting correctness, and a sanitization collision
+/// between two distinct values is harmless (files carry distinct UUID names and
+/// distinct catalog values).
+pub(crate) fn hive_subpath(key_names: &[String], values: &[Option<String>]) -> String {
+    let mut rel = String::new();
+    for (i, value) in values.iter().enumerate() {
+        let name = key_names.get(i).map(String::as_str).unwrap_or("key");
+        let encoded = match value {
+            Some(v) => sanitize_partition_path(v),
+            None => "__HIVE_DEFAULT_PARTITION__".to_string(),
+        };
+        if rel.is_empty() {
+            rel = format!("{name}={encoded}");
+        } else {
+            rel = format!("{rel}/{name}={encoded}");
+        }
+    }
+    rel
+}
+
+/// Sanitize a partition value for use in a Hive-style directory name — see
+/// [`hive_subpath`] for why a lossy mapping is safe here.
+fn sanitize_partition_path(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// One partition group of a partitioned write: the per-key partition values every
+/// row in the group shares (`values[i]` for partition key `i`, `None` == SQL NULL),
+/// and the row batches for that partition.
+pub type PartitionGroup = (Vec<Option<String>>, Vec<arrow::record_batch::RecordBatch>);
+
+/// Apply a partition transform to a whole column array: identity returns the
+/// column unchanged; the temporal transforms return an `Int32` calendar component
+/// (year/month/day/hour) via Arrow's `date_part`. Only producible transforms are
+/// valid here — [`PartitionWriteSpec::resolve`] rejects `bucket`/unknown up front.
+fn transform_array(
+    transform: &PartitionTransform,
+    array: &arrow::array::ArrayRef,
+) -> crate::Result<arrow::array::ArrayRef> {
+    use arrow::compute::{DatePart, date_part};
+    let part = match transform {
+        PartitionTransform::Identity => return Ok(std::sync::Arc::clone(array)),
+        PartitionTransform::Year => DatePart::Year,
+        PartitionTransform::Month => DatePart::Month,
+        PartitionTransform::Day => DatePart::Day,
+        PartitionTransform::Hour => DatePart::Hour,
+        other => {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "partitioned write with transform '{}' is not supported",
+                other.to_catalog_string()
+            )));
+        },
+    };
+    Ok(date_part(array, part)?)
+}
+
+/// Split rows into groups keyed by the tuple of transformed, DuckDB-canonical
+/// partition values — one group per distinct key. Returns `(values, batches)` per
+/// group, where `values[i]` is the encoded value for partition key `i` (`None` for
+/// SQL NULL). Rows sharing a key land in the same group regardless of which input
+/// batch they came from.
+///
+/// `output_schema` is the schema the returned batches carry (the table's clean data
+/// columns); `batches` must already match it positionally.
+pub(crate) fn split_batches_by_partition(
+    output_schema: &arrow::datatypes::SchemaRef,
+    batches: &[arrow::record_batch::RecordBatch],
+    spec: &PartitionWriteSpec,
+) -> crate::Result<Vec<PartitionGroup>> {
+    use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
+    use arrow::compute::{concat_batches, take};
+    use std::collections::HashMap;
+
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let input_schema = batches[0].schema();
+    let combined = concat_batches(&input_schema, batches)?;
+    let num_rows = combined.num_rows();
+    if num_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Transform each partition-key column once for the whole dataset.
+    let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
+    for key in &spec.keys {
+        transformed.push(transform_array(
+            &key.transform,
+            combined.column(key.input_index),
+        )?);
+    }
+
+    // Group row indices by the encoded partition-value tuple.
+    let mut groups: HashMap<Vec<Option<String>>, Vec<u32>> = HashMap::new();
+    for row in 0..num_rows {
+        let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
+        for array in &transformed {
+            let scalar = ScalarValue::try_from_array(array, row)?;
+            // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
+            // non-null value of a type it cannot encode. Those must not be
+            // conflated: silently mapping an unencodable non-null value to `None`
+            // would group every distinct such value into one file with a NULL
+            // partition value (data corruption). A NULL is a legitimate partition
+            // value; an unencodable non-null value is a hard error.
+            let encoded = if scalar.is_null() {
+                None
+            } else {
+                match crate::stats_encode::encode_scalar(&scalar) {
+                    Some(encoded) => Some(encoded),
+                    None => {
+                        return Err(crate::DuckLakeError::Unsupported(format!(
+                            "partitioned write: partition-key value of type {} cannot be \
+                             encoded; partitioning by this column type is not supported",
+                            array.data_type()
+                        )));
+                    },
+                }
+            };
+            values.push(encoded);
+        }
+        groups.entry(values).or_default().push(row as u32);
+    }
+
+    // Materialize one batch per group via `take` (output uses the clean schema).
+    let mut result = Vec::with_capacity(groups.len());
+    for (values, indices) in groups {
+        let index_array = UInt32Array::from(indices);
+        let columns = combined
+            .columns()
+            .iter()
+            .map(|c| take(c, &index_array, None))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
+        result.push((values, vec![batch]));
+    }
+    Ok(result)
+}
+
 /// One column of a partition spec: which table column, and how it is transformed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionSpecColumn {
@@ -240,6 +484,160 @@ impl PartitionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{ArrayRef, RecordBatch, StringArray};
+    use arrow::datatypes::{Field, Schema, SchemaRef};
+    use std::sync::Arc;
+
+    fn identity_region_spec() -> PartitionWriteSpec {
+        PartitionWriteSpec {
+            partition_id: 1,
+            keys: vec![PartitionWriteKey {
+                input_index: 0,
+                name: "region".to_string(),
+                transform: PartitionTransform::Identity,
+            }],
+        }
+    }
+
+    #[test]
+    fn split_groups_by_identity_and_keeps_null_partition() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("us"), None, Some("us")])) as ArrayRef],
+        )
+        .unwrap();
+        let groups = split_batches_by_partition(
+            &schema,
+            std::slice::from_ref(&batch),
+            &identity_region_spec(),
+        )
+        .unwrap();
+        // "us" (2 rows) and a legitimate NULL partition (1 row).
+        assert_eq!(groups.len(), 2);
+        let total: usize = groups
+            .iter()
+            .flat_map(|(_, b)| b)
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(total, 3);
+        let mut values: Vec<Option<String>> = groups.iter().map(|(v, _)| v[0].clone()).collect();
+        values.sort();
+        assert_eq!(values, vec![None, Some("us".to_string())]);
+    }
+
+    #[test]
+    fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "region",
+            DataType::Utf8,
+            true,
+        )]));
+        // A NUL byte makes the value unencodable (encode_scalar returns None) but it
+        // is NOT null — it must error, not silently collapse into a NULL partition
+        // and commingle with genuinely-null rows.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![Some("a\u{0}b")])) as ArrayRef],
+        )
+        .unwrap();
+        let err = split_batches_by_partition(
+            &schema,
+            std::slice::from_ref(&batch),
+            &identity_region_spec(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("encode"),
+            "expected an encode error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn hive_subpath_encodes_keys_values_and_nulls() {
+        let keys = vec!["region".to_string(), "day".to_string()];
+        assert_eq!(
+            hive_subpath(&keys, &[Some("us".into()), Some("3".into())]),
+            "region=us/day=3"
+        );
+        // A NULL partition value uses DuckDB's sentinel directory name.
+        assert_eq!(
+            hive_subpath(&keys, &[None, Some("3".into())]),
+            "region=__HIVE_DEFAULT_PARTITION__/day=3"
+        );
+        // Path separators in a value can never escape the partition directory.
+        assert_eq!(
+            hive_subpath(&keys[..1], &[Some("a/../b".into())]),
+            "region=a_.._b"
+        );
+        // No keys: the file lives directly under the table directory.
+        assert_eq!(hive_subpath(&[], &[]), "");
+    }
+
+    #[test]
+    fn resolve_maps_column_ids_to_write_schema_indices() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+        let spec = PartitionSpec {
+            partition_id: 7,
+            columns: vec![PartitionSpecColumn {
+                partition_key_index: 0,
+                column_id: 20,
+                transform: PartitionTransform::Identity,
+            }],
+            prune_safe: true,
+        };
+        // column_ids[i] is the catalog id of schema field i, so column_id 20 is
+        // field 1 ("region") — not key index 0.
+        let resolved = PartitionWriteSpec::resolve(&spec, &[10, 20], &schema).unwrap();
+        assert_eq!(resolved.partition_id, 7);
+        assert_eq!(resolved.keys.len(), 1);
+        assert_eq!(resolved.keys[0].input_index, 1);
+        assert_eq!(resolved.keys[0].name, "region");
+        assert_eq!(resolved.key_names(), vec!["region".to_string()]);
+    }
+
+    #[test]
+    fn resolve_rejects_non_producible_transform() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let spec = PartitionSpec {
+            partition_id: 1,
+            columns: vec![PartitionSpecColumn {
+                partition_key_index: 0,
+                column_id: 10,
+                transform: PartitionTransform::Bucket(8),
+            }],
+            prune_safe: true,
+        };
+        // `bucket` is readable but not producible: a partitioned write must fail
+        // rather than silently emit unpartitioned files the spec forbids.
+        let err = PartitionWriteSpec::resolve(&spec, &[10], &schema).unwrap_err();
+        assert!(
+            err.to_string().contains("bucket(8)"),
+            "expected the transform in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_errors_when_partition_column_absent_from_write_schema() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let spec = PartitionSpec {
+            partition_id: 1,
+            columns: vec![PartitionSpecColumn {
+                partition_key_index: 0,
+                column_id: 99,
+                transform: PartitionTransform::Identity,
+            }],
+            prune_safe: true,
+        };
+        assert!(PartitionWriteSpec::resolve(&spec, &[10], &schema).is_err());
+    }
 
     #[test]
     fn parse_and_roundtrip() {

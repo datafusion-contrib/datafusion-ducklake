@@ -7,9 +7,8 @@
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, UInt32Array, UInt64Array};
+use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -19,30 +18,12 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{self, TryStreamExt};
 
 use crate::metadata_writer::{MetadataWriter, WriteMode};
-use crate::partition::PartitionTransform;
-use crate::table_writer::{DuckLakeTableWriter, PartitionGroup};
+use crate::table_writer::DuckLakeTableWriter;
 
-/// Resolved partition spec for the write path: how `DuckLakeInsertExec` splits
-/// incoming rows into per-partition files. Built by `DuckLakeTable::insert_into`
-/// from the table's active [`crate::partition::PartitionSpec`].
-#[derive(Debug, Clone)]
-pub struct PartitionWriteSpec {
-    /// The active spec generation (`ducklake_partition_info.partition_id`).
-    pub partition_id: i64,
-    /// Partition keys, in key order.
-    pub keys: Vec<PartitionWriteKey>,
-}
-
-/// One partition key resolved for the write path.
-#[derive(Debug, Clone)]
-pub struct PartitionWriteKey {
-    /// Column index in the INSERT input schema.
-    pub input_index: usize,
-    /// Column name (used only for the readable Hive-style path).
-    pub name: String,
-    /// Transform applied to the column value to form the partition value.
-    pub transform: PartitionTransform,
-}
+// The resolved write-side partition spec lives in `partition` (it is shared with
+// the low-level writer paths and the UPDATE rewrite); re-exported here because
+// `DuckLakeInsertExec::new` takes it.
+pub use crate::partition::{PartitionWriteKey, PartitionWriteSpec};
 
 /// Schema for the output of insert operations (count of rows inserted)
 fn make_insert_count_schema() -> SchemaRef {
@@ -258,7 +239,12 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 && !batches.is_empty()
             {
                 let output_schema_ref: SchemaRef = Arc::new(schema_without_metadata.clone());
-                let groups = split_batches_by_partition(&output_schema_ref, &batches, spec)?;
+                let groups = crate::partition::split_batches_by_partition(
+                    &output_schema_ref,
+                    &batches,
+                    spec,
+                )
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 if !groups.is_empty() {
                     let key_names: Vec<String> = spec.keys.iter().map(|k| k.name.clone()).collect();
                     let result = table_writer
@@ -334,110 +320,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
     }
 }
 
-/// Apply a partition transform to a whole column array: identity returns the
-/// column unchanged; the temporal transforms return an `Int32` calendar component
-/// (year/month/day/hour) via Arrow's `date_part`. Only producible transforms are
-/// valid here — `DuckLakeTable::insert_into` rejects `bucket`/unknown up front.
-fn transform_array(transform: &PartitionTransform, array: &ArrayRef) -> DataFusionResult<ArrayRef> {
-    use arrow::compute::{DatePart, date_part};
-    let part = match transform {
-        PartitionTransform::Identity => return Ok(Arc::clone(array)),
-        PartitionTransform::Year => DatePart::Year,
-        PartitionTransform::Month => DatePart::Month,
-        PartitionTransform::Day => DatePart::Day,
-        PartitionTransform::Hour => DatePart::Hour,
-        other => {
-            return Err(DataFusionError::NotImplemented(format!(
-                "partitioned write with transform '{}' is not supported",
-                other.to_catalog_string()
-            )));
-        },
-    };
-    Ok(date_part(array, part)?)
-}
-
-/// Split the input into groups keyed by the tuple of transformed, DuckDB-canonical
-/// partition values — one group (one output file) per distinct key. Returns
-/// `(values, batches)` per group, where `values[i]` is the encoded value for
-/// partition key `i` (`None` for SQL NULL). Rows sharing a key land in the same
-/// group regardless of which input batch they came from.
-fn split_batches_by_partition(
-    output_schema: &SchemaRef,
-    batches: &[RecordBatch],
-    spec: &PartitionWriteSpec,
-) -> DataFusionResult<Vec<PartitionGroup>> {
-    use arrow::compute::{concat_batches, take};
-    use std::collections::HashMap;
-
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let input_schema = batches[0].schema();
-    let combined = concat_batches(&input_schema, batches)?;
-    let num_rows = combined.num_rows();
-    if num_rows == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Transform each partition-key column once for the whole dataset.
-    let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
-    for key in &spec.keys {
-        transformed.push(transform_array(
-            &key.transform,
-            combined.column(key.input_index),
-        )?);
-    }
-
-    // Group row indices by the encoded partition-value tuple.
-    let mut groups: HashMap<Vec<Option<String>>, Vec<u32>> = HashMap::new();
-    for row in 0..num_rows {
-        let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
-        for array in &transformed {
-            let scalar = ScalarValue::try_from_array(array, row)?;
-            // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
-            // non-null value of a type it cannot encode. Those must not be
-            // conflated: silently mapping an unencodable non-null value to `None`
-            // would group every distinct such value into one file with a NULL
-            // partition value (data corruption). A NULL is a legitimate partition
-            // value; an unencodable non-null value is a hard error.
-            let encoded = if scalar.is_null() {
-                None
-            } else {
-                match crate::stats_encode::encode_scalar(&scalar) {
-                    Some(encoded) => Some(encoded),
-                    None => {
-                        return Err(DataFusionError::NotImplemented(format!(
-                            "partitioned write: partition-key value of type {} cannot be \
-                             encoded; partitioning by this column type is not supported",
-                            array.data_type()
-                        )));
-                    },
-                }
-            };
-            values.push(encoded);
-        }
-        groups.entry(values).or_default().push(row as u32);
-    }
-
-    // Materialize one batch per group via `take` (output uses the clean schema).
-    let mut result = Vec::with_capacity(groups.len());
-    for (values, indices) in groups {
-        let index_array = UInt32Array::from(indices);
-        let columns = combined
-            .columns()
-            .iter()
-            .map(|c| take(c, &index_array, None))
-            .collect::<Result<Vec<_>, _>>()?;
-        let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
-        result.push((values, vec![batch]));
-    }
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
 
     #[test]
     fn test_insert_count_schema() {
@@ -445,74 +330,5 @@ mod tests {
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "count");
         assert_eq!(schema.field(0).data_type(), &DataType::UInt64);
-    }
-
-    fn identity_region_spec() -> PartitionWriteSpec {
-        PartitionWriteSpec {
-            partition_id: 1,
-            keys: vec![PartitionWriteKey {
-                input_index: 0,
-                name: "region".to_string(),
-                transform: PartitionTransform::Identity,
-            }],
-        }
-    }
-
-    #[test]
-    fn split_groups_by_identity_and_keeps_null_partition() {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "region",
-            DataType::Utf8,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from(vec![Some("us"), None, Some("us")])) as ArrayRef],
-        )
-        .unwrap();
-        let groups = split_batches_by_partition(
-            &schema,
-            std::slice::from_ref(&batch),
-            &identity_region_spec(),
-        )
-        .unwrap();
-        // "us" (2 rows) and a legitimate NULL partition (1 row).
-        assert_eq!(groups.len(), 2);
-        let total: usize = groups
-            .iter()
-            .flat_map(|(_, b)| b)
-            .map(|b| b.num_rows())
-            .sum();
-        assert_eq!(total, 3);
-        let mut values: Vec<Option<String>> = groups.iter().map(|(v, _)| v[0].clone()).collect();
-        values.sort();
-        assert_eq!(values, vec![None, Some("us".to_string())]);
-    }
-
-    #[test]
-    fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "region",
-            DataType::Utf8,
-            true,
-        )]));
-        // A NUL byte makes the value unencodable (encode_scalar returns None) but it
-        // is NOT null — it must error, not silently collapse into a NULL partition
-        // and commingle with genuinely-null rows.
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(StringArray::from(vec![Some("a\u{0}b")])) as ArrayRef],
-        )
-        .unwrap();
-        let err = split_batches_by_partition(
-            &schema,
-            std::slice::from_ref(&batch),
-            &identity_region_spec(),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("encode"),
-            "expected an encode error, got: {err}"
-        );
     }
 }

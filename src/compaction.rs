@@ -41,6 +41,7 @@ use datafusion::catalog::Session;
 
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceRetirement};
+use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
@@ -193,17 +194,80 @@ fn sort_compaction_output(
     Ok(vec![RecordBatch::try_new(full_schema, sorted_columns)?])
 }
 
+/// A file's partition identity, normalized for grouping and comparison: the spec
+/// generation it was written under (`None` for an unpartitioned file) and its
+/// per-key values ordered by `partition_key_index`.
+///
+/// Two files may be merged only when this matches exactly. Ordering by it also
+/// clusters same-partition files together, so bin-packing needs no extra pass.
+fn partition_key(file: &DuckLakeTableFile) -> (Option<i64>, Vec<Option<String>>) {
+    let mut values = file.partition_values.clone();
+    values.sort_by_key(|(index, _)| *index);
+    (
+        file.partition_id,
+        values.into_iter().map(|(_, value)| value).collect(),
+    )
+}
+
+/// Re-key normalized partition values back to the `(partition_key_index, value)`
+/// pairs [`DataFileInfo::with_partition`] persists.
+fn partition_value_pairs(values: &[Option<String>]) -> Vec<(i32, Option<String>)> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as i32, value.clone()))
+        .collect()
+}
+
 impl DuckLakeTable {
+    /// The live partition spec's key column names in key order, used only to build
+    /// the readable Hive directory of a compaction output.
+    ///
+    /// Empty when the table is unpartitioned, when `partition_id` is a *retired*
+    /// generation (whose key order may differ from the live one, so live names would
+    /// mislabel the directory), or when a key's column has since been dropped. The
+    /// catalog is the authoritative source of partition values, so degrading to
+    /// positional `key=…` naming costs readability only — never correctness.
+    #[cfg(feature = "write")]
+    fn partition_path_names(
+        &self,
+        live: Option<&PartitionSpec>,
+        partition_id: i64,
+        column_ids: &[i64],
+    ) -> Vec<String> {
+        let Some(spec) = live.filter(|spec| spec.partition_id == partition_id) else {
+            return Vec::new();
+        };
+        let schema = self.physical_schema();
+        let names: Option<Vec<String>> = spec
+            .columns
+            .iter()
+            .map(|column| {
+                let index = column_ids.iter().position(|id| *id == column.column_id)?;
+                Some(schema.field(index).name().to_string())
+            })
+            .collect();
+        names.unwrap_or_default()
+    }
+
     /// Merge several small adjacent data files of this table into fewer larger
     /// ones, committing the new layout in ONE snapshot.
     ///
     /// Candidates are the table's live files that have no live delete file, whose
     /// size is in `[min_file_size, target_file_size)`, and whose origin snapshot
     /// and schema version are known. They are grouped by schema version (so a DDL
-    /// boundary is never crossed) and, within a group, bin-packed in
-    /// `data_file_id` order until a bin reaches `target_file_size`; only bins of
-    /// two or more files are merged. Delete-bearing files are deliberately left
-    /// to [`rewrite_data_files`](Self::rewrite_data_files).
+    /// boundary is never crossed) AND by partition identity — matching official
+    /// DuckLake, which merges only *within* a partition — and, within a group,
+    /// bin-packed in `data_file_id` order until a bin reaches `target_file_size`;
+    /// only bins of two or more files are merged. Delete-bearing files are
+    /// deliberately left to [`rewrite_data_files`](Self::rewrite_data_files).
+    ///
+    /// A merged file inherits its sources' `partition_id` and partition values and
+    /// lands in their Hive directory: every file in a bin shares one partition, so
+    /// the output belongs to exactly that partition. The inherited generation may be
+    /// a *retired* one (files written before a `SET`/`RESET PARTITIONED BY`); that is
+    /// correct — the merged rows really do have that generation's layout, and
+    /// preserving it keeps them prunable exactly as before.
     ///
     /// Each source file's live rows are read with their original rowids
     /// preserved; a merged file that spans more than one origin snapshot is
@@ -249,17 +313,28 @@ impl DuckLakeTable {
                     && (f.file.file_size_bytes as u64) < opts.target_file_size
             })
             .collect();
-        candidates.sort_by_key(|f| (f.schema_version.unwrap_or(0), f.data_file_id));
+        // Sort by (schema_version, partition identity, data_file_id) so both the
+        // DDL boundary and the partition boundary fall out of the sort, and files
+        // stay in data_file_id order (adjacency) within a partition.
+        candidates
+            .sort_by_key(|f| (f.schema_version.unwrap_or(0), partition_key(f), f.data_file_id));
         candidates.truncate(opts.max_merged_files);
 
-        // Bin-pack within each schema-version run; only bins of >= 2 files merge.
+        // Bin-pack within each (schema-version, partition) run; only bins of >= 2
+        // files merge. Merging across partitions would produce a file that belongs
+        // to no single partition — unprunable, and unrepresentable in
+        // `ducklake_file_partition_value`.
         let mut bins: Vec<Vec<&DuckLakeTableFile>> = Vec::new();
         let mut i = 0;
         while i < candidates.len() {
             let version = candidates[i].schema_version;
+            let partition = partition_key(candidates[i]);
             let mut running: u64 = 0;
             let mut bin: Vec<&DuckLakeTableFile> = Vec::new();
-            while i < candidates.len() && candidates[i].schema_version == version {
+            while i < candidates.len()
+                && candidates[i].schema_version == version
+                && partition_key(candidates[i]) == partition
+            {
                 bin.push(candidates[i]);
                 running += candidates[i].file.file_size_bytes as u64;
                 i += 1;
@@ -288,6 +363,9 @@ impl DuckLakeTable {
         // bounds each output near target_file_size, so no extra file rollover is
         // needed here.
         let sort_spec = self.live_sort_spec()?;
+        // Only for naming the output's Hive directory; the partition identity a
+        // merged file carries comes from its sources, not from this.
+        let live_partition_spec = self.live_partition_spec()?;
 
         let mut sources: Vec<CompactionSourceFile> = Vec::new();
         let mut outputs: Vec<CompactionOutputFile> = Vec::new();
@@ -366,6 +444,18 @@ impl DuckLakeTable {
             }
             let merged =
                 sort_compaction_output(merged, physical_schema.as_ref(), sort_spec.as_ref())?;
+            // Every file in the bin shares one partition identity (that is the
+            // grouping key), so the merged output inherits it: same Hive directory,
+            // same `partition_id` + values in the catalog.
+            let (partition_id, partition_values) = partition_key(bin[0]);
+            let subpath = partition_id.map(|pid| {
+                let names = self.partition_path_names(
+                    live_partition_spec.as_ref(),
+                    pid,
+                    &column_ids,
+                );
+                crate::partition::hive_subpath(&names, &partition_values)
+            });
             let file = table_writer
                 .write_compacted_file(
                     schema_name,
@@ -374,8 +464,13 @@ impl DuckLakeTable {
                     &column_ids,
                     &merged,
                     partial,
+                    subpath.as_deref(),
                 )
                 .await?;
+            let file = match partition_id {
+                Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
+                None => file,
+            };
             outputs.push(CompactionOutputFile {
                 file,
                 partial_max,
@@ -443,6 +538,9 @@ impl DuckLakeTable {
         // Re-apply the table's live sort order to each rewritten file so its rows
         // stay ordered (tight min/max) after the delete-driven rewrite.
         let sort_spec = self.live_sort_spec()?;
+        // Only for naming the output's Hive directory (see `partition_path_names`);
+        // a rewritten file inherits its partition identity from the file it replaces.
+        let live_partition_spec = self.live_partition_spec()?;
 
         let mut sources: Vec<CompactionSourceFile> = Vec::new();
         let mut outputs: Vec<CompactionOutputFile> = Vec::new();
@@ -481,6 +579,18 @@ impl DuckLakeTable {
                     physical_schema.as_ref(),
                     sort_spec.as_ref(),
                 )?;
+                // The rewrite drops deleted rows from ONE source file, so the output
+                // holds a subset of that file's rows and therefore its exact
+                // partition: inherit the identity and the Hive directory.
+                let (partition_id, partition_values) = partition_key(tf);
+                let subpath = partition_id.map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
                 let file = table_writer
                     .write_compacted_file(
                         schema_name,
@@ -489,8 +599,13 @@ impl DuckLakeTable {
                         &column_ids,
                         &sorted,
                         false,
+                        subpath.as_deref(),
                     )
                     .await?;
+                let file = match partition_id {
+                    Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
+                    None => file,
+                };
                 rows_written += live_rows as i64;
                 // A rewrite output holds only currently-live rows and begins at
                 // the compaction snapshot (begin_snapshot = None); its

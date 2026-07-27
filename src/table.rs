@@ -2122,6 +2122,17 @@ impl DuckLakeTable {
         self.provider.get_sort_spec(self.table_id, head)
     }
 
+    /// The table's partition spec live at the CURRENT catalog head (not the
+    /// snapshot this provider is pinned to) — the generation any write committing
+    /// now must agree with. Mirrors [`Self::live_sort_spec`]; the pinned
+    /// `self.partition_spec` remains the one used for read pruning, which is
+    /// snapshot-bound.
+    #[cfg(feature = "write")]
+    pub(crate) fn live_partition_spec(&self) -> crate::Result<Option<PartitionSpec>> {
+        let head = self.provider.get_current_snapshot()?;
+        self.provider.get_partition_spec(self.table_id, head)
+    }
+
     /// The live columns' catalog `column_id`s in `column_order` — the parquet
     /// field-ids a compaction output must bake in so its data columns map back
     /// to the catalog on read.
@@ -2731,34 +2742,15 @@ impl TableProvider for DuckLakeTable {
         let partition = match live_spec.as_ref() {
             None => None,
             Some(spec) => {
-                let mut keys = Vec::with_capacity(spec.columns.len());
-                for column in &spec.columns {
-                    if !column.transform.is_producible() {
-                        return Err(DataFusionError::NotImplemented(format!(
-                            "INSERT into a table partitioned by '{}' is not supported",
-                            column.transform.to_catalog_string()
-                        )));
-                    }
-                    let index = self
-                        .columns
-                        .iter()
-                        .position(|c| c.column_id == column.column_id)
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "partition column_id {} not found in table schema",
-                                column.column_id
-                            ))
-                        })?;
-                    keys.push(crate::insert_exec::PartitionWriteKey {
-                        input_index: index,
-                        name: self.physical_schema.field(index).name().to_string(),
-                        transform: column.transform.clone(),
-                    });
-                }
-                Some(crate::insert_exec::PartitionWriteSpec {
-                    partition_id: spec.partition_id,
-                    keys,
-                })
+                let column_ids: Vec<i64> = self.columns.iter().map(|c| c.column_id).collect();
+                Some(
+                    crate::partition::PartitionWriteSpec::resolve(
+                        spec,
+                        &column_ids,
+                        self.physical_schema.as_ref(),
+                    )
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                )
             },
         };
 
