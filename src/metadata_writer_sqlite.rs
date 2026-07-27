@@ -2299,6 +2299,18 @@ impl MetadataWriter for SqliteMetadataWriter {
                 finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                     .await?;
 
+            // Partition-spec fence: the new row versions are a NEW write, so they
+            // must agree with the table's live partition generation exactly as
+            // register_data_file's do.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+
             // Register the new data file (inserted row versions), as in
             // register_data_file. Deletes are accounted at read time
             // (delete_count), so record_count stays gross — no adjustment for them.

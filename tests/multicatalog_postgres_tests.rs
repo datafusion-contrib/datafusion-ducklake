@@ -4586,6 +4586,114 @@ async fn register_existing_data_file_adopts_column_ids() {
     );
 }
 
+/// Promoting a byte-copied parquet into a PARTITIONED table persists the caller's
+/// partition assignment, so the file is prunable exactly like one this crate wrote.
+/// Nothing is rewritten, so the values can only be carried, never derived.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_persists_partition_assignment() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_promote_part").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    // Create the table first (unpartitioned), then partition it by `name`.
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f1.parquet", 1024, 3),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    w.set_partition_spec(
+        out.table_id,
+        &[("name".to_string(), PartitionTransform::Identity)],
+    )
+    .unwrap();
+    let spec = w.live_partition_spec(out.table_id).unwrap().unwrap();
+
+    // Promote a single-partition file, declaring the partition it holds.
+    let promoted = DataFileInfo::new("name=us/f2.parquet", 512, 2)
+        .with_partition(spec.partition_id, vec![(0, Some("us".to_string()))]);
+    w.register_existing_data_file("public", "orders", &cols(), &ids, &promoted, WriteMode::Append)
+        .unwrap();
+
+    let (file_partition_id, value): (Option<i64>, Option<String>) = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.path = 'name=us/f2.parquet'",
+    )
+    .bind(out.table_id)
+    .fetch_one(&pool)
+    .await
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        file_partition_id,
+        Some(spec.partition_id),
+        "a promoted file must carry the live partition generation"
+    );
+    assert_eq!(
+        value,
+        Some("us".to_string()),
+        "a promoted file must carry its partition value so it stays prunable"
+    );
+
+    // An unpartitioned promote into a now-partitioned table is refused: such a file
+    // cannot satisfy the spec, and silently accepting it would make the table's
+    // partition layout a lie.
+    let unpartitioned = DataFileInfo::new("f3.parquet", 256, 1);
+    let err = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &unpartitioned,
+            WriteMode::Append,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "expected a partition-fence conflict, got: {err}"
+    );
+
+    // A value count that disagrees with the live spec is refused too.
+    let wrong_arity = DataFileInfo::new("f4.parquet", 256, 1).with_partition(
+        spec.partition_id,
+        vec![(0, Some("us".to_string())), (1, Some("2024".to_string()))],
+    );
+    assert!(
+        w.register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &wrong_arity,
+            WriteMode::Append,
+        )
+        .is_err(),
+        "two values for a one-key spec must be rejected"
+    );
+}
+
 /// `column_ids` must be 1:1 with `columns`; a mismatch is rejected before any
 /// write (otherwise `finalize_snapshot`'s zip would silently drop columns).
 #[tokio::test(flavor = "multi_thread")]

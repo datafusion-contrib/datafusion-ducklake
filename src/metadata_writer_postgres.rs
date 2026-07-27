@@ -2128,11 +2128,42 @@ impl MetadataWriter for PostgresMetadataWriter {
             .fetch_one(&mut *tx)
             .await?;
 
-            sqlx::query(
+            // Partition-spec fence + validation. A promoted file is registered
+            // as-is, so the caller is asserting it already holds rows of exactly one
+            // partition (official DuckLake's ducklake_add_data_files makes the same
+            // assumption, deriving the values from the file's Hive path). We check
+            // everything checkable without reading the data: the file agrees with the
+            // live generation, and its values fit that generation's keys.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+            if let Some(partition_id) = live_partition_id.filter(|_| file.partition_id.is_some()) {
+                let transforms: Vec<String> = sqlx::query_scalar(
+                    "SELECT transform FROM ducklake_partition_column
+                     WHERE table_id = $1 AND partition_id = $2
+                     ORDER BY partition_key_index",
+                )
+                .bind(table_id)
+                .bind(partition_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                crate::metadata_writer::validate_promoted_partition_values(
+                    table_id,
+                    &transforms,
+                    file,
+                )?;
+            }
+
+            let data_file_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -2142,8 +2173,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_id_start)
             .bind(snapshot_id)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
+            // Persist the caller-supplied partition assignment. Without this a
+            // promoted file lands with no partition_id and no
+            // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
+            // with the table's spec.
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -2344,6 +2380,18 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+
+            // Partition-spec fence: the new row versions are a NEW write, so they
+            // must agree with the table's live partition generation exactly as
+            // register_data_file's do.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
 
             // Register the new data file (the inserted row versions), exactly as
             // register_data_file: seed stats, draw the row-id range, insert, and

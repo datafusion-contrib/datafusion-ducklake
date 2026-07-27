@@ -318,6 +318,75 @@ pub(crate) fn enforce_partition_fence(
     }
 }
 
+/// Validate the partition values a caller attached to a file it is *promoting*
+/// (registering an already-written parquet, rather than one this crate wrote)
+/// against the live spec's `transforms`, in key order.
+///
+/// A promoted file is registered byte-for-byte, so whether its rows really do all
+/// share these values cannot be established from the catalog — that is the caller's
+/// assertion. Official DuckLake makes the same assumption, taking the values from
+/// the file's Hive path and validating only their shape
+/// (`IsValidTransformedHivePartitionValue` checks bucket range; `MapHiveColumn`
+/// checks castability). This mirrors that, checking what the catalog can prove:
+///
+/// - one value per partition key, no more and no fewer;
+/// - key indices exactly `0..n-1`, each once (a duplicated or out-of-range index
+///   would silently drop or mis-assign a key on read);
+/// - for `bucket(N)`, a non-NULL value that parses as an integer in `0..N`.
+///
+/// Values for `identity` and the temporal transforms are opaque strings here: the
+/// column type they must cast to is not part of the spec, so type checking belongs
+/// to whoever produced them. A caller that cannot vouch for the file's contents
+/// should verify against the parquet footer's per-column min/max before promoting —
+/// for `identity`, `min == max == value` proves the file is single-partition.
+pub(crate) fn validate_promoted_partition_values(
+    table_id: i64,
+    transforms: &[String],
+    file: &DataFileInfo,
+) -> Result<()> {
+    use crate::partition::PartitionTransform;
+
+    if file.partition_values.len() != transforms.len() {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "promoted file for table {table_id} carries {} partition value(s) but the table's \
+             live partition spec has {} key(s)",
+            file.partition_values.len(),
+            transforms.len()
+        )));
+    }
+    let mut seen = vec![false; transforms.len()];
+    for (key_index, value) in &file.partition_values {
+        let index = usize::try_from(*key_index).ok().filter(|i| *i < seen.len());
+        let Some(index) = index else {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "promoted file for table {table_id} has partition_key_index {key_index}, outside \
+                 the live spec's 0..{} keys",
+                transforms.len()
+            )));
+        };
+        if seen[index] {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "promoted file for table {table_id} repeats partition_key_index {key_index}"
+            )));
+        }
+        seen[index] = true;
+
+        if let PartitionTransform::Bucket(buckets) = PartitionTransform::parse(&transforms[index]) {
+            let valid = value
+                .as_deref()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .is_some_and(|b| b >= 0 && b < i64::from(buckets));
+            if !valid {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "promoted file for table {table_id} has partition value {value:?} for \
+                     bucket({buckets}) key {key_index}; expected an integer in 0..{buckets}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// A positional delete file to register via [`MetadataWriter::set_delete_file`].
 /// Mirrors [`DataFileInfo`]; the parquet has the standard `(file_path, pos)`
 /// schema. Must be cumulative for its data file (all still-deleted positions),
@@ -989,12 +1058,20 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// no-op return, so a delete-only orphan (no appended data file) still yields
     /// `Conflict`, not a silent no-op.
     ///
-    /// The guard covers every snapshot-visible change table this crate writes —
-    /// data files, delete files, and columns. This crate's write path produces no
-    /// inlined-data or partition-value rows (those DuckLake-spec tables are not part
-    /// of its schema), so there is nothing else to check. If inlined-data or
-    /// partition write support is ever added, extend the guard to reject a post-base
-    /// row there too, or this could silently treat such a delta as a pure append.
+    /// The guard covers the snapshot-visible change tables that can make a delta
+    /// non-append: data files, delete files, and columns. Per-file partition values
+    /// need no check — they hang off `data_file_id`, so retiring a file leaves its
+    /// values attached exactly as any other retired file's are. This crate writes no
+    /// inlined-data rows, so there is nothing else to check; if inlined-data support
+    /// is added, extend the guard to reject a post-base row there too.
+    ///
+    /// Not covered: a `SET`/`RESET PARTITIONED BY` committed after `base_snapshot`.
+    /// It changes no column, so the delta still reads as a pure append and the
+    /// appended files are retired — leaving the new spec in place with no data under
+    /// it. That is a consistent state (the retry re-appends under the live spec), but
+    /// it is not a *revert* to `base_snapshot`; a caller needing exact reversion must
+    /// serialize partition DDL against this, as the contract below already requires
+    /// for writes.
     ///
     /// Recomputes the visible stat totals (`record_count`, `file_size_bytes`, and
     /// the per-column stats) from the surviving live files, and preserves
@@ -1028,6 +1105,28 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// with [`crate::DuckLakeError::InvalidConfig`]. Rowids are freshly assigned
     /// (the source `row_id_start` is not preserved), so indexes keyed on the
     /// source's rowids do not carry over.
+    ///
+    /// # Partitioning
+    ///
+    /// Nothing is rewritten here, so a partition assignment can only be *carried*,
+    /// not derived: set it with [`DataFileInfo::with_partition`] and it is persisted
+    /// (`ducklake_data_file.partition_id` + `ducklake_file_partition_value`).
+    /// Promoting into a partitioned table without it is refused by the partition
+    /// fence — an unpartitioned file cannot satisfy a live spec.
+    ///
+    /// The caller asserts the file holds rows of exactly ONE partition; only that
+    /// caller can know, since the values are not checked against the file's contents.
+    /// Official DuckLake's `ducklake_add_data_files` works the same way, reading the
+    /// values from the file's Hive path and validating only their shape. What IS
+    /// checked here is the shape against the live spec (see
+    /// [`validate_promoted_partition_values`]).
+    ///
+    /// Two ways to satisfy the contract safely: copy the values from the source
+    /// catalog when promoting files that a partitioned DuckLake table already wrote
+    /// (they are single-partition by construction), or, for a file of unknown
+    /// provenance, check the parquet footer's per-column min/max first — for an
+    /// `identity` key, `min == max == value` proves the file is single-partition
+    /// without reading a row.
     ///
     /// Default: unsupported; only multicatalog Postgres, whose column ids are
     /// reusable across catalogs, implements it.
@@ -1125,6 +1224,113 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 mod tests {
     use super::*;
     use crate::DuckLakeError;
+
+    fn promoted(values: Vec<(i32, Option<String>)>) -> DataFileInfo {
+        DataFileInfo::new("f.parquet", 1024, 10).with_partition(7, values)
+    }
+
+    #[test]
+    fn promoted_values_must_match_the_live_key_count() {
+        let transforms = vec!["identity".to_string(), "year".to_string()];
+        // One value for a two-key spec: the second key would silently have none.
+        let err = validate_promoted_partition_values(
+            1,
+            &transforms,
+            &promoted(vec![(0, Some("us".into()))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DuckLakeError::InvalidConfig(_)), "got {err}");
+        // Correct count passes.
+        assert!(
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &promoted(vec![(0, Some("us".into())), (1, Some("2024".into()))]),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn promoted_values_reject_duplicate_or_out_of_range_key_index() {
+        let transforms = vec!["identity".to_string(), "year".to_string()];
+        // Same key twice: one spec key ends up unassigned.
+        assert!(
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &promoted(vec![(0, Some("us".into())), (0, Some("eu".into()))]),
+            )
+            .is_err()
+        );
+        // Index past the end of the spec.
+        assert!(
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &promoted(vec![(0, Some("us".into())), (5, Some("2024".into()))]),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn promoted_bucket_values_must_be_in_range() {
+        let transforms = vec!["bucket(8)".to_string()];
+        assert!(
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &promoted(vec![(0, Some("3".into()))])
+            )
+            .is_ok()
+        );
+        for bad in ["8", "-1", "abc"] {
+            assert!(
+                validate_promoted_partition_values(
+                    1,
+                    &transforms,
+                    &promoted(vec![(0, Some(bad.to_string()))]),
+                )
+                .is_err(),
+                "bucket value {bad} must be rejected"
+            );
+        }
+        // NULL is not a valid bucket either — a bucket transform always yields one.
+        assert!(
+            validate_promoted_partition_values(1, &transforms, &promoted(vec![(0, None)])).is_err()
+        );
+    }
+
+    #[test]
+    fn promoted_null_value_is_legal_for_identity() {
+        // A NULL partition value is a legitimate partition (DuckDB's
+        // __HIVE_DEFAULT_PARTITION__), so it must pass for a non-bucket key.
+        let transforms = vec!["identity".to_string()];
+        assert!(
+            validate_promoted_partition_values(1, &transforms, &promoted(vec![(0, None)])).is_ok()
+        );
+    }
+
+    #[test]
+    fn fence_exempts_empty_file_but_rejects_rows_without_partition() {
+        // A 0-row Replace truncate marker carries no partitioned data.
+        let empty = DataFileInfo::new("empty.parquet", 0, 0);
+        assert!(enforce_partition_fence(1, Some(7), &empty).is_ok());
+        // A row-bearing file with no partition cannot live in a partitioned table.
+        let rows = DataFileInfo::new("f.parquet", 1024, 10);
+        assert!(matches!(
+            enforce_partition_fence(1, Some(7), &rows),
+            Err(DuckLakeError::Conflict(_))
+        ));
+        // ...but is fine when the table has no live spec.
+        assert!(enforce_partition_fence(1, None, &rows).is_ok());
+        // A file stamped with a retired generation is rejected.
+        assert!(matches!(
+            enforce_partition_fence(1, Some(9), &promoted(vec![(0, Some("us".into()))])),
+            Err(DuckLakeError::Conflict(_))
+        ));
+    }
 
     #[test]
     fn test_column_def_new() {
