@@ -107,7 +107,8 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
 | Configurable writer output (compression, row-group sizing) | ✅  |
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned) | ✅ |
-| Partitioned writes — split into per-partition files in one snapshot (SQLite; DuckDB/Postgres/MySQL not yet wired), via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`) | 🟧 |
+| Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅ |
+| Partitioned `UPDATE` / upsert — the append+delete commit registers one data file, but the new row versions span one file per partition | ❌ |
 | Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec) | ✅ |
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
@@ -181,12 +182,16 @@ Known edges:
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
   rejected by a unique index, surfacing as a raw database unique-violation rather than a
   clean `Conflict`. A `DROP` racing a write can likewise surface as a raw unique-violation.
-- An `INSERT` reads the table's partition state at plan time and fences on it at commit time,
-  in both directions: if a concurrent `SET`/`RESET PARTITIONED BY` changes that state between
-  planning and commit, the `INSERT` aborts with `Conflict` (re-open the catalog and retry)
-  rather than committing files inconsistent with the live spec — never a file stamped with a
-  retired `partition_id` (spec retired mid-flight), and never a `partition_id`-less file in a
-  table that became partitioned mid-flight.
+- A write resolves the table's partition spec inside its write transaction and fences on it at
+  commit time, so a file inconsistent with the live spec is never committed — never one stamped
+  with a retired `partition_id`, and never a `partition_id`-less file in a partitioned table.
+  A `SET PARTITIONED BY` landing after an unpartitioned write was *planned* is absorbed: the
+  write lays its rows out per the new spec instead of failing. A spec change landing after the
+  resolve, or a `RESET` that retires the generation a pre-split write already targeted, aborts
+  with `Conflict` (re-open the catalog and retry).
+- Compaction merges only *within* a partition and carries each output's `partition_id` and values
+  over from its sources, including a retired generation — those rows really do have that
+  generation's layout, so preserving it keeps them prunable exactly as before.
 
 ---
 

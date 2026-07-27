@@ -229,10 +229,21 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - No SQL-level time travel (`AS OF`); a catalog binds to one snapshot, selectable programmatically via `DuckLakeCatalog::with_snapshot`
 - Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
 - Partitioning (`identity` + temporal `year`/`month`/`day`/`hour`) is supported: read + pruning on
-  all backends, and partitioned writes on SQLite (via `set_partition_spec`/`reset_partition_spec`
-  or the `ALTER TABLE … SET/RESET PARTITIONED BY` SQL hook `execute_ducklake_sql`). `bucket(N)` is
-  tolerated on read but not pruned or produced; partitioned writes for DuckDB/Postgres/MySQL are
-  not yet wired. See `src/partition.rs`.
+  all backends, and partitioned writes on every writable backend, declared via
+  `set_partition_spec`/`reset_partition_spec` or the `ALTER TABLE … SET/RESET PARTITIONED BY` SQL
+  hook `execute_ducklake_sql`. `bucket(N)` is tolerated on read but not pruned or produced (a
+  partitioned write to a `bucket` spec is refused rather than silently unpartitioned).
+  Every write path honours the spec: SQL `INSERT`, the low-level `write_rows`/`write_table`/
+  `append_table`, the streaming `begin_write` session (one open file per partition, capped by
+  `max_open_partitions`), compaction (merges only within a partition, preserving each output's
+  generation), and promote (`register_existing_data_file`, which carries caller-supplied values —
+  see its docs for the contract). `enforce_partition_fence` guards every commit path, so a file
+  can never land inconsistent with the table's live spec. See `src/partition.rs`.
+  Not yet supported: `UPDATE`/upsert on a partitioned table — the new row versions span one file
+  per partition, but the atomic append+delete commit registers a single data file; the session's
+  `finish_with_deletes` refuses it with a typed error. Likewise
+  `begin_write_with_embedded_rowid` and `begin_write_to_path`, which write to one
+  caller-determined file.
 - DuckDB-encrypted (non-PME) Parquet files are not supported
 - Data inlining is not read (see `COMPATIBILITY.md` for the `COUNT(*)` undercount caveat)
 - No optional metadata caching layer (all lookups are dynamic)
