@@ -8,6 +8,7 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_writer_postgres::execute_ddl_statements;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
 
@@ -204,14 +205,14 @@ impl MulticatalogManager {
             "ducklake_column",
             "ducklake_schema_versions",
         ] {
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {} WHERE table_id IN (
                     SELECT t.table_id FROM ducklake_table t
                     JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
                     WHERE m.catalog_id = $1
                 )",
                 child_table
-            ))
+            )))
             .bind(catalog_id)
             .execute(&mut *tx)
             .await?;
@@ -445,11 +446,11 @@ impl MulticatalogManager {
         for child_table in
             ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
         {
-            sqlx::query(&format!(
+            sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {} SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
                 child_table
-            ))
+            )))
             .bind(drop_snapshot)
             .bind(table_id)
             .execute(&mut *tx)
@@ -635,7 +636,7 @@ impl MulticatalogManager {
 
         // 4. Data files orphaned (in this catalog): schedule paths, then drop the rows.
         //    `= ANY($2)` with an empty array is simply false — no special-casing needed.
-        let dead_data_files = sqlx::query(&format!(
+        let dead_data_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
@@ -647,7 +648,7 @@ impl MulticatalogManager {
                  JOIN ducklake_catalog_snapshot_map m
                    ON m.snapshot_id = ss.snapshot_id AND m.catalog_id = $1
                  WHERE ss.snapshot_id >= df.begin_snapshot AND ss.snapshot_id < df.end_snapshot))"
-        ))
+        )))
         .bind(catalog_id)
         .bind(&dead_tables)
         .fetch_all(&mut *tx)
@@ -660,7 +661,7 @@ impl MulticatalogManager {
 
         // 5. Delete files orphaned by the data files above, a dead table, or no surviving
         //    snapshot. (Our writer does not emit delete files yet — no-op for our catalogs.)
-        let dead_delete_files = sqlx::query(&format!(
+        let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
@@ -673,7 +674,7 @@ impl MulticatalogManager {
                     JOIN ducklake_catalog_snapshot_map m
                       ON m.snapshot_id = ss.snapshot_id AND m.catalog_id = $1
                     WHERE ss.snapshot_id >= df.begin_snapshot AND ss.snapshot_id < df.end_snapshot))"
-        ))
+        )))
         .bind(catalog_id)
         .bind(&data_file_ids)
         .bind(&dead_tables)
@@ -688,10 +689,12 @@ impl MulticatalogManager {
         // 6. Reclaim per-table metadata for fully-expired tables. (No ducklake_table_stats
         //    on Postgres — that table is maintained only by the SQLite writer.)
         for table in ["ducklake_table", "ducklake_column", "ducklake_schema_versions"] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE table_id = ANY($1)"))
-                .bind(&dead_tables)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE table_id = ANY($1)"
+            )))
+            .bind(&dead_tables)
+            .execute(&mut *tx)
+            .await?;
         }
 
         // 7. Reclaim schemas no longer covered by a surviving snapshot of this catalog,
@@ -819,7 +822,9 @@ impl MulticatalogManager {
              SELECT path AS p, path_is_relative AS rel
              FROM ducklake_files_scheduled_for_deletion"
         );
-        let rows = sqlx::query(&q).fetch_all(&self.pool).await?;
+        let rows = sqlx::query(AssertSqlSafe(q.as_str()))
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|r| Ok((r.try_get::<String, _>(0)?, r.try_get::<bool, _>(1)?)))
             .collect()

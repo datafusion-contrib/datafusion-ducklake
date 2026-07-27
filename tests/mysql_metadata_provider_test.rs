@@ -1031,3 +1031,52 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(0), "Charlie");
     assert_eq!(name_col.value(1), "Diana");
 }
+
+/// Connecting as a password-protected `caching_sha2_password` user over a
+/// non-TLS channel must succeed.
+///
+/// This is MySQL 8's default auth plugin. On the first connection for a user the
+/// server's fast-auth cache is cold, so it demands full authentication; over an
+/// insecure channel the client must fetch the server's RSA public key and send
+/// the password encrypted. sqlx bundled that RSA backend unconditionally through
+/// 0.8, but 0.9 moved it behind the `mysql-rsa` feature and substitutes a stub
+/// that fails at connect time with "RSA auth backend disabled". Nothing catches
+/// that at compile time, and the rest of this suite connects as passwordless
+/// `root` (an empty password skips the RSA exchange entirely), so this test is
+/// what pins `sqlx/mysql-rsa` into the `metadata-mysql` feature.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn test_connect_caching_sha2_password_without_tls() {
+    let container = Mysql::default()
+        .with_init_sql(
+            "CREATE USER 'rsauser'@'%' IDENTIFIED WITH caching_sha2_password BY 'secret-pw';
+             GRANT ALL PRIVILEGES ON test.* TO 'rsauser'@'%';"
+                .to_string()
+                .into_bytes(),
+        )
+        .start()
+        .await
+        .expect("Failed to start MySQL");
+
+    let port = container
+        .get_host_port_ipv4(3306)
+        .await
+        .expect("Failed to get port");
+    let conn_str = format!("mysql://rsauser:secret-pw@127.0.0.1:{}/test", port);
+
+    let provider = MySqlMetadataProvider::new(&conn_str)
+        .await
+        .expect("should connect as a caching_sha2_password user over a non-TLS channel");
+
+    // Prove the connection is actually usable, not merely constructed.
+    init_schema(&provider.pool)
+        .await
+        .expect("should run DDL over the authenticated connection");
+    let snapshots = provider
+        .list_snapshots()
+        .expect("should query over the authenticated connection");
+    assert!(
+        snapshots.is_empty(),
+        "freshly initialized catalog should have no snapshots"
+    );
+}

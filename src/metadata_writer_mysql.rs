@@ -299,7 +299,7 @@ async fn reserve_ids(
 /// allocating without reuse. Done as check-then-insert (two statements) rather
 /// than `INSERT … SELECT … WHERE NOT EXISTS`, because that self-referential
 /// `INSERT … SELECT` against `ducklake_metadata` is rejected by MySQL (1093).
-async fn seed_counter(pool: &MySqlPool, key: &str, max_sql: &str) -> Result<()> {
+async fn seed_counter(pool: &MySqlPool, key: &str, max_sql: &'static str) -> Result<()> {
     let exists: i64 =
         sqlx::query("SELECT COUNT(*) FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL")
             .bind(key)
@@ -1412,7 +1412,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // sqlx runs each query() as a single prepared statement on MySQL, so
             // create each table separately (see SQL_CREATE_TABLES).
             for ddl in SQL_CREATE_TABLES {
-                sqlx::query(ddl).execute(&self.pool).await?;
+                sqlx::query(*ddl).execute(&self.pool).await?;
             }
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
             // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first

@@ -219,7 +219,7 @@ async fn read_rows(
     Ok(rows)
 }
 
-async fn scalar(pool: &SqlitePool, sql: &str, table: &str) -> anyhow::Result<i64> {
+async fn scalar(pool: &SqlitePool, sql: &'static str, table: &str) -> anyhow::Result<i64> {
     Ok(sqlx::query(sql)
         .bind(table)
         .fetch_one(pool)

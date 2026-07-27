@@ -22,6 +22,7 @@ use datafusion_ducklake::{
     PostgresMetadataWriter, RewriteOptions,
 };
 use object_store::local::LocalFileSystem;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use tempfile::TempDir;
@@ -122,7 +123,7 @@ async fn live_files(pool: &PgPool, cat_name: &str) -> Vec<datafusion_ducklake::D
 }
 
 async fn scalar_i64(pool: &PgPool, sql: &str, cat: i64) -> i64 {
-    sqlx::query(sql)
+    sqlx::query(AssertSqlSafe(sql))
         .bind(cat)
         .fetch_one(pool)
         .await

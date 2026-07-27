@@ -20,6 +20,7 @@ use crate::metadata_provider::{
     reconstruct_list_columns, reconstruct_list_columns_with_table,
 };
 use crate::partition::PartitionSpec;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
@@ -417,7 +418,7 @@ impl MetadataProvider for MulticatalogProvider {
                   AND $5 >= data.begin_snapshot
                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
@@ -533,7 +534,7 @@ impl MetadataProvider for MulticatalogProvider {
                  ORDER BY data.data_file_id
                  LIMIT $8"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
@@ -1153,7 +1154,7 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT
                     data.begin_snapshot,
                     data.path,
@@ -1169,7 +1170,7 @@ impl MetadataProvider for MulticatalogProvider {
                   AND (data.begin_snapshot >= $2
                        OR ({pm} IS NOT NULL AND {pm} >= $2))
                 ORDER BY data.begin_snapshot"
-            ))
+            )))
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
@@ -1211,7 +1212,7 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 r#"
 WITH current_delete AS (
     SELECT
@@ -1272,7 +1273,7 @@ WHERE data.table_id = $1
   AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
 "#
-            ))
+            )))
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)

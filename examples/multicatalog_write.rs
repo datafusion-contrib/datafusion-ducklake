@@ -308,7 +308,7 @@ fn build_orders_batch() -> RecordBatch {
 async fn dump_query(
     pool: &sqlx::PgPool,
     label: &str,
-    sql: &str,
+    sql: &'static str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n  -- {} --", label);
     let rows = sqlx::query(sql).fetch_all(pool).await?;

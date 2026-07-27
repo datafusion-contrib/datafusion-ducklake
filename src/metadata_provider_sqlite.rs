@@ -17,6 +17,7 @@ use arrow::array::{
     new_null_array,
 };
 use arrow::datatypes::{DataType, SchemaRef};
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::types::chrono::NaiveDateTime;
@@ -481,7 +482,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                   AND ? >= data.begin_snapshot
                   AND (? < data.end_snapshot OR data.end_snapshot IS NULL)"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
@@ -627,7 +628,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                  ORDER BY data.data_file_id
                  LIMIT ?"
             );
-            let rows = sqlx::query(&sql)
+            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(table_id)
                 .bind(snapshot_id)
                 .bind(snapshot_id)
@@ -992,11 +993,11 @@ impl MetadataProvider for SqliteMetadataProvider {
 
                 // Which of the table's columns this inline table physically has
                 // (its layout matches the schema version it was created for).
-                let info = sqlx::query(&format!(
+                let info = sqlx::query(AssertSqlSafe(format!(
                     "SELECT name FROM pragma_table_info({})",
                     // pragma wants a string literal; single-quote-escape the name.
                     format_args!("'{}'", phys.replace('\'', "''"))
-                ))
+                )))
                 .fetch_all(&self.pool)
                 .await?;
                 let present: HashSet<String> = info
@@ -1023,7 +1024,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                      ORDER BY row_id",
                     quote_ident(&phys)
                 );
-                let rows = sqlx::query(&sql)
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
                     .bind(snapshot_id)
                     .bind(snapshot_id)
                     .fetch_all(&self.pool)
@@ -1312,7 +1313,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             } else {
                 "NULL"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT
                     data.begin_snapshot,
                     data.path,
@@ -1328,7 +1329,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                   AND (data.begin_snapshot >= ?2
                        OR ({pm} IS NOT NULL AND {pm} >= ?2))
                 ORDER BY data.begin_snapshot"
-            ))
+            )))
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
@@ -1374,7 +1375,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             } else {
                 "NULL"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 r#"
 -- Part 1: Incremental deletes (delete file added)
 SELECT
@@ -1467,7 +1468,7 @@ WHERE data.table_id = ?
   AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
 "#
-            ))
+            )))
             // Part 1 bindings: 4x table_id for prev subqueries, table_id for cd,
             // end, start (window), start (partial_max), table_id for data
             .bind(table_id)

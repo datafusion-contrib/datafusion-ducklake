@@ -11,6 +11,7 @@ use crate::metadata_provider::{
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::types::chrono::NaiveDateTime;
@@ -1056,7 +1057,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             } else {
                 "NULL"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 "SELECT
                     data.begin_snapshot,
                     data.path,
@@ -1072,7 +1073,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                   AND (data.begin_snapshot >= ?
                        OR ({pm} IS NOT NULL AND {pm} >= ?))
                 ORDER BY data.begin_snapshot"
-            ))
+            )))
             .bind(table_id)
             .bind(end_snapshot)
             .bind(start_snapshot)
@@ -1116,7 +1117,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             } else {
                 "NULL"
             };
-            let rows = sqlx::query(&format!(
+            let rows = sqlx::query(AssertSqlSafe(format!(
                 r#"
 WITH current_delete AS (
     SELECT
@@ -1212,7 +1213,7 @@ WHERE data.table_id = ?
   AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
 "#
-            ))
+            )))
             // Part 1 bindings: table_id (current_delete), end, start (window),
             // start (partial_max), table_id (data_files), table_id (prev lateral)
             .bind(table_id)

@@ -18,6 +18,7 @@ use crate::metadata_writer::{
     validate_name,
 };
 use crate::partition::PartitionTransform;
+use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -277,9 +278,12 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
 ];
 
 /// Run a slice of DDL statements against the pool. Each statement executes independently.
-pub(crate) async fn execute_ddl_statements(pool: &PgPool, statements: &[&str]) -> Result<()> {
+pub(crate) async fn execute_ddl_statements(
+    pool: &PgPool,
+    statements: &[&'static str],
+) -> Result<()> {
     for stmt in statements {
-        sqlx::query(stmt).execute(pool).await?;
+        sqlx::query(*stmt).execute(pool).await?;
     }
     Ok(())
 }
@@ -377,9 +381,12 @@ async fn lock_catalog(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<()> {
     if lock_timeout_ms > 0 {
-        sqlx::query(&format!("SET LOCAL lock_timeout = {}", lock_timeout_ms))
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "SET LOCAL lock_timeout = {}",
+            lock_timeout_ms
+        )))
+        .execute(&mut **tx)
+        .await?;
     }
     let row =
         sqlx::query("SELECT catalog_id FROM ducklake_catalog WHERE catalog_id = $1 FOR UPDATE")
@@ -2679,27 +2686,27 @@ impl MetadataWriter for PostgresMetadataWriter {
                     // Merge: the partial output serves every snapshot the sources
                     // did, so schedule their physical files (resolving paths as the
                     // multicatalog expire path does) and REMOVE their catalog rows.
-                    let dead_data = sqlx::query(&format!(
+                    let dead_data = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.data_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
                                 {COMPACTION_REL_FLAG} AS rel
                          FROM ducklake_data_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
                          WHERE df.data_file_id = ANY($1)"
-                    ))
+                    )))
                     .bind(&source_data_ids)
                     .fetch_all(&mut *tx)
                     .await?;
                     schedule_compaction_files(&mut tx, self.catalog_id, dead_data).await?;
 
-                    let dead_del = sqlx::query(&format!(
+                    let dead_del = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.delete_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
                                 {COMPACTION_REL_FLAG} AS rel
                          FROM ducklake_delete_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
                          WHERE df.data_file_id = ANY($1)"
-                    ))
+                    )))
                     .bind(&source_data_ids)
                     .fetch_all(&mut *tx)
                     .await?;
