@@ -332,7 +332,11 @@ pub(crate) fn enforce_partition_fence(
 /// - one value per partition key, no more and no fewer;
 /// - key indices exactly `0..n-1`, each once (a duplicated or out-of-range index
 ///   would silently drop or mis-assign a key on read);
-/// - for `bucket(N)`, a non-NULL value that parses as an integer in `0..N`.
+/// - for `bucket(N)`, a value that parses as an integer in `0..N`, or SQL NULL.
+///   NULL is legal for every transform — a NULL input yields a NULL partition value,
+///   which is a partition in its own right (DuckDB's `__HIVE_DEFAULT_PARTITION__`).
+///   Official agrees: `IsValidTransformedHivePartitionValue` returns early for a NULL
+///   hive value before its bucket-range check.
 ///
 /// Values for `identity` and the temporal transforms are opaque strings here: the
 /// column type they must cast to is not part of the spec, so type checking belongs
@@ -342,6 +346,7 @@ pub(crate) fn enforce_partition_fence(
 pub(crate) fn validate_promoted_partition_values(
     table_id: i64,
     transforms: &[String],
+    key_column_types: &[Option<DataType>],
     file: &DataFileInfo,
 ) -> Result<()> {
     use crate::partition::PartitionTransform;
@@ -371,17 +376,24 @@ pub(crate) fn validate_promoted_partition_values(
         }
         seen[index] = true;
 
-        if let PartitionTransform::Bucket(buckets) = PartitionTransform::parse(&transforms[index]) {
-            let valid = value
-                .as_deref()
-                .and_then(|v| v.trim().parse::<i64>().ok())
-                .is_some_and(|b| b >= 0 && b < i64::from(buckets));
-            if !valid {
-                return Err(DuckLakeError::InvalidConfig(format!(
-                    "promoted file for table {table_id} has partition value {value:?} for \
-                     bucket({buckets}) key {key_index}; expected an integer in 0..{buckets}"
-                )));
-            }
+        // Check the value is well-formed for the transform and, for `identity`, that
+        // it casts to the key column's type — official does the same
+        // (`MapHiveColumn` errors when the Hive value will not cast). A NULL value is
+        // legitimate under any transform and always passes. An unknown column type
+        // (a key column absent from the promoted schema) skips the type check rather
+        // than guessing.
+        let transform = PartitionTransform::parse(&transforms[index]);
+        let column_type = key_column_types
+            .get(index)
+            .and_then(|t| t.clone())
+            .unwrap_or(DataType::Utf8);
+        if !transform.value_is_well_formed(value.as_deref(), &column_type) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "promoted file for table {table_id} has partition value {value:?} for key \
+                 {key_index} with transform '{}' on a {column_type} column; the value is not \
+                 valid for that key",
+                transform.to_catalog_string()
+            )));
         }
     }
     Ok(())
@@ -1229,6 +1241,12 @@ mod tests {
         DataFileInfo::new("f.parquet", 1024, 10).with_partition(7, values)
     }
 
+    /// Key column types for a spec whose keys are all string-typed — the permissive
+    /// case, so these tests exercise arity/index/transform rules in isolation.
+    fn utf8_types(n: usize) -> Vec<Option<DataType>> {
+        vec![Some(DataType::Utf8); n]
+    }
+
     #[test]
     fn promoted_values_must_match_the_live_key_count() {
         let transforms = vec!["identity".to_string(), "year".to_string()];
@@ -1236,6 +1254,7 @@ mod tests {
         let err = validate_promoted_partition_values(
             1,
             &transforms,
+            &utf8_types(transforms.len()),
             &promoted(vec![(0, Some("us".into()))]),
         )
         .unwrap_err();
@@ -1245,6 +1264,7 @@ mod tests {
             validate_promoted_partition_values(
                 1,
                 &transforms,
+                &utf8_types(transforms.len()),
                 &promoted(vec![(0, Some("us".into())), (1, Some("2024".into()))]),
             )
             .is_ok()
@@ -1259,6 +1279,7 @@ mod tests {
             validate_promoted_partition_values(
                 1,
                 &transforms,
+                &utf8_types(transforms.len()),
                 &promoted(vec![(0, Some("us".into())), (0, Some("eu".into()))]),
             )
             .is_err()
@@ -1268,6 +1289,7 @@ mod tests {
             validate_promoted_partition_values(
                 1,
                 &transforms,
+                &utf8_types(transforms.len()),
                 &promoted(vec![(0, Some("us".into())), (5, Some("2024".into()))]),
             )
             .is_err()
@@ -1281,6 +1303,7 @@ mod tests {
             validate_promoted_partition_values(
                 1,
                 &transforms,
+                &utf8_types(transforms.len()),
                 &promoted(vec![(0, Some("3".into()))])
             )
             .is_ok()
@@ -1290,15 +1313,81 @@ mod tests {
                 validate_promoted_partition_values(
                     1,
                     &transforms,
+                    &utf8_types(transforms.len()),
                     &promoted(vec![(0, Some(bad.to_string()))]),
                 )
                 .is_err(),
                 "bucket value {bad} must be rejected"
             );
         }
-        // NULL is not a valid bucket either — a bucket transform always yields one.
+        // NULL IS valid for a bucket key: a NULL input yields a NULL partition
+        // value, which official accepts too (IsValidTransformedHivePartitionValue
+        // returns early on a NULL hive value, before its range check).
         assert!(
-            validate_promoted_partition_values(1, &transforms, &promoted(vec![(0, None)])).is_err()
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &utf8_types(transforms.len()),
+                &promoted(vec![(0, None)])
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn promoted_identity_value_must_cast_to_the_key_column_type() {
+        let transforms = vec!["identity".to_string()];
+        let int_key = vec![Some(DataType::Int32)];
+        // A value that cannot be an Int32 partition key is impossible for the file to
+        // hold, and would be persisted then used as an EXACT pruning bound.
+        let err = validate_promoted_partition_values(
+            1,
+            &transforms,
+            &int_key,
+            &promoted(vec![(0, Some("abc".into()))]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DuckLakeError::InvalidConfig(_)), "got {err}");
+        // A well-formed integer passes, as does NULL.
+        for value in [Some("42".to_string()), None] {
+            assert!(
+                validate_promoted_partition_values(
+                    1,
+                    &transforms,
+                    &int_key,
+                    &promoted(vec![(0, value.clone())]),
+                )
+                .is_ok(),
+                "value {value:?} must be accepted for an Int32 identity key"
+            );
+        }
+    }
+
+    #[test]
+    fn promoted_temporal_value_must_be_its_calendar_component() {
+        // A `month` key's value is 1..=12; 13 or a date string is not a month.
+        let transforms = vec!["month".to_string()];
+        let date_key = vec![Some(DataType::Date32)];
+        for bad in ["13", "0", "2024-06"] {
+            assert!(
+                validate_promoted_partition_values(
+                    1,
+                    &transforms,
+                    &date_key,
+                    &promoted(vec![(0, Some(bad.to_string()))]),
+                )
+                .is_err(),
+                "month value {bad} must be rejected"
+            );
+        }
+        assert!(
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &date_key,
+                &promoted(vec![(0, Some("6".into()))]),
+            )
+            .is_ok()
         );
     }
 
@@ -1308,7 +1397,13 @@ mod tests {
         // __HIVE_DEFAULT_PARTITION__), so it must pass for a non-bucket key.
         let transforms = vec!["identity".to_string()];
         assert!(
-            validate_promoted_partition_values(1, &transforms, &promoted(vec![(0, None)])).is_ok()
+            validate_promoted_partition_values(
+                1,
+                &transforms,
+                &utf8_types(transforms.len()),
+                &promoted(vec![(0, None)])
+            )
+            .is_ok()
         );
     }
 

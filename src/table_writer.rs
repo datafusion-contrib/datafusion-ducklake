@@ -749,6 +749,27 @@ impl DuckLakeTableWriter {
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
+        // Validate the caller's assignment against the live spec BEFORE writing
+        // anything, so a bad one costs no uploads. A wrong arity or an unparseable
+        // value would otherwise be persisted and then used as an exact pruning
+        // bound, silently dropping rows from later reads. (Whether each group's rows
+        // really carry its values is the caller's assertion — as in official
+        // DuckLake's add_data_files, that cannot be checked without reading data.)
+        if let Some(spec) =
+            self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
+        {
+            if spec.partition_id != partition_id {
+                return Err(crate::error::DuckLakeError::Conflict(format!(
+                    "write_partitioned targets partition spec {partition_id} but the table's live \
+                     generation is {}; re-resolve the spec and retry",
+                    spec.partition_id
+                )));
+            }
+            for (values, _) in &groups {
+                spec.validate_values(arrow_schema, values)?;
+            }
+        }
+
         let file_infos = self
             .write_partition_groups(
                 &table_key,
@@ -1123,10 +1144,17 @@ struct OpenPartitionFile {
 /// respect the open-file cap) but uploads them all in `finish`. Finalizing is
 /// synchronous, which is what lets [`TableWriteSession::write_batch`] stay
 /// synchronous; uploading is async and belongs to the one `finish` await point.
+///
+/// Holds a [`TempPath`], not a `NamedTempFile`: the staged file is not touched again
+/// until upload, so keeping its descriptor open would make the session's open-fd
+/// count grow with the TOTAL number of files written rather than staying bounded by
+/// `max_open` — a high-cardinality partition key would exhaust descriptors even
+/// though only `max_open` writers are live. `TempPath` keeps the file on disk (and
+/// still deletes it on drop) with no descriptor held.
 #[derive(Debug)]
 struct StagedPartitionFile {
     values: Vec<Option<String>>,
-    temp: NamedTempFile,
+    temp: tempfile::TempPath,
     catalog_path: String,
     object_path: ObjectPath,
     row_count: i64,
@@ -1276,12 +1304,16 @@ impl PartitionSink {
 /// await.
 fn finalize_open_file(file: OpenPartitionFile) -> Result<StagedPartitionFile> {
     let staged = file.writer.into_inner()?;
+    // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
+    // returned handle closes that descriptor. Converting the NamedTempFile to a
+    // TempPath releases its descriptor too, leaving only the on-disk file (still
+    // deleted on drop) so staged files cost no descriptors while they wait.
     staged
         .into_inner()
         .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
     Ok(StagedPartitionFile {
         values: file.values,
-        temp: file.temp,
+        temp: file.temp.into_temp_path(),
         catalog_path: file.catalog_path,
         object_path: file.object_path,
         row_count: file.row_count,
@@ -1296,11 +1328,12 @@ async fn upload_staged_file(
     object_store: &Arc<dyn ObjectStore>,
     column_ids: &[i64],
 ) -> Result<DataFileInfo> {
-    let mut file = std::fs::File::open(staged.temp.path())?;
+    // Reopen the staged file (its descriptor was released at finalize time).
+    let mut file = std::fs::File::open(&staged.temp)?;
     let file_size = file.metadata()?.len() as i64;
     let footer_size = read_footer_size(&mut file)?;
 
-    let local = tokio::fs::File::open(staged.temp.path()).await?;
+    let local = tokio::fs::File::open(&staged.temp).await?;
     let mut reader = tokio::io::BufReader::new(local);
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
@@ -1309,7 +1342,7 @@ async fn upload_staged_file(
     }
 
     let column_stats = crate::stats_collect::collect_column_stats(
-        staged.temp.path(),
+        &staged.temp,
         column_ids,
         staged.row_count,
         &staged.nan_flags,

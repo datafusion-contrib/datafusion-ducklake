@@ -2143,8 +2143,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
             if let Some(partition_id) = live_partition_id.filter(|_| file.partition_id.is_some()) {
-                let transforms: Vec<String> = sqlx::query_scalar(
-                    "SELECT transform FROM ducklake_partition_column
+                let key_rows = sqlx::query(
+                    "SELECT transform, column_id FROM ducklake_partition_column
                      WHERE table_id = $1 AND partition_id = $2
                      ORDER BY partition_key_index",
                 )
@@ -2152,9 +2152,28 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(partition_id)
                 .fetch_all(&mut *tx)
                 .await?;
+                let mut transforms = Vec::with_capacity(key_rows.len());
+                let mut key_column_types = Vec::with_capacity(key_rows.len());
+                for row in &key_rows {
+                    transforms.push(row.try_get::<String, _>(0)?);
+                    // Resolve each key's column_id to the Arrow type of the matching
+                    // promoted column, so an `identity` value can be cast-checked the
+                    // way official's MapHiveColumn does.
+                    let column_id: i64 = row.try_get(1)?;
+                    key_column_types.push(
+                        column_ids
+                            .iter()
+                            .position(|id| *id == column_id)
+                            .and_then(|index| columns.get(index))
+                            .and_then(|column| {
+                                crate::types::ducklake_to_arrow_type(column.ducklake_type()).ok()
+                            }),
+                    );
+                }
                 crate::metadata_writer::validate_promoted_partition_values(
                     table_id,
                     &transforms,
+                    &key_column_types,
                     file,
                 )?;
             }

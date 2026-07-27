@@ -63,7 +63,11 @@ fn decode_table_file(row: &SqliteRow, snapshot_id: i64) -> Result<DuckLakeTableF
         partial_max: row.try_get(16)?,
         max_row_count: row.try_get(7)?,
         delete_count,
-        partition_id: None,
+        // Column 18 is present on the select-path query (which projects
+        // `data.partition_id`) and absent on callers that share this decoder
+        // without it; `try_get` failing there degrades to `None`, matching the
+        // pre-partition behaviour. Per-key values are filled in by the caller.
+        partition_id: row.try_get(18).unwrap_or(None),
         partition_values: Vec::new(),
     })
 }
@@ -430,14 +434,20 @@ impl MetadataProvider for SqliteMetadataProvider {
     ) -> Result<Vec<DuckLakeTableFile>> {
         block_on(async {
             // Backward compatibility: minimal / pre-v1.0 catalogs may lack the
-            // `partial_max` column and the `ducklake_schema_versions` ledger.
-            // Detect both and degrade those projections to NULL so plain reads
-            // still work (both are consumed only by compaction; `partial_max`
-            // also by time-travel reads of partial files, which such catalogs
-            // never contain).
+            // `partial_max` and `partition_id` columns and the
+            // `ducklake_schema_versions` ledger. Detect each and degrade those
+            // projections to NULL so plain reads still work (all are consumed only
+            // by compaction; `partial_max` also by time-travel reads of partial
+            // files, which such catalogs never contain).
             let caps = self.schema_capabilities().await?;
             let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max"
+            } else {
+                "NULL"
+            };
+            // Such a catalog holds no partitioned files either, so NULL is exact.
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id"
             } else {
                 "NULL"
             };
@@ -470,7 +480,8 @@ impl MetadataProvider for SqliteMetadataProvider {
                     del.delete_count,
                     data.begin_snapshot AS data_begin_snapshot,
                     {partial_max_expr} AS data_partial_max,
-                    {schema_version_expr} AS data_schema_version
+                    {schema_version_expr} AS data_schema_version,
+                    {partition_id_expr} AS data_partition_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -491,9 +502,50 @@ impl MetadataProvider for SqliteMetadataProvider {
                 .fetch_all(&self.pool)
                 .await?;
 
-            rows.iter()
+            let mut files: Vec<DuckLakeTableFile> = rows
+                .iter()
                 .map(|row| decode_table_file(row, snapshot_id))
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+
+            // Enrich with per-file partition values. Compaction reads its candidates
+            // through this path and must group by, and preserve, each file's exact
+            // partition — without the values it would merge across partitions and
+            // strip the assignment. Scoped by the fetched id range; a catalog
+            // predating partition support simply yields no rows.
+            if let (Some(min), Some(max)) = (
+                files.iter().map(|f| f.data_file_id).min(),
+                files.iter().map(|f| f.data_file_id).max(),
+            ) {
+                let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+                match sqlx::query(SQL_GET_FILE_PARTITION_VALUES)
+                    .bind(table_id)
+                    .bind(min - 1)
+                    .bind(max)
+                    .fetch_all(&self.pool)
+                    .await
+                {
+                    Ok(rows) => {
+                        for row in rows {
+                            let data_file_id: i64 = row.try_get(0)?;
+                            let key_index: i32 =
+                                i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                            let value: Option<String> = row.try_get(2)?;
+                            values_by_file
+                                .entry(data_file_id)
+                                .or_default()
+                                .push((key_index, value));
+                        }
+                    },
+                    Err(error) if is_missing_statistics_table(&error) => {},
+                    Err(error) => return Err(error.into()),
+                }
+                for file in &mut files {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                }
+            }
+            Ok(files)
         })
     }
 

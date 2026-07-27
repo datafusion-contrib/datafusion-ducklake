@@ -4625,8 +4625,15 @@ async fn register_existing_data_file_persists_partition_assignment() {
     // Promote a single-partition file, declaring the partition it holds.
     let promoted = DataFileInfo::new("name=us/f2.parquet", 512, 2)
         .with_partition(spec.partition_id, vec![(0, Some("us".to_string()))]);
-    w.register_existing_data_file("public", "orders", &cols(), &ids, &promoted, WriteMode::Append)
-        .unwrap();
+    w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(),
+        &ids,
+        &promoted,
+        WriteMode::Append,
+    )
+    .unwrap();
 
     let (file_partition_id, value): (Option<i64>, Option<String>) = sqlx::query(
         "SELECT df.partition_id, fpv.partition_value

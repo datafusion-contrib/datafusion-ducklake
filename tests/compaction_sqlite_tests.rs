@@ -213,6 +213,121 @@ async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
     .await
 }
 
+/// Compaction of a PARTITIONED table must merge only within a partition and carry
+/// each output's partition assignment over from its sources — official DuckLake
+/// groups merge candidates by (schema_version, partition_id, partition_values).
+/// Merging across partitions would produce a file belonging to no single partition:
+/// unprunable, and unrepresentable in `ducklake_file_partition_value`.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_only_within_a_partition_and_preserves_assignment() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, MetadataWriter, WriteMode};
+
+    let temp = TempDir::new().unwrap();
+    // Create `main.t(id, val)` and partition it by `val` before writing any data.
+    let writer = Arc::new(make_writer(&temp).await);
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let table_id = {
+        let s = writer
+            .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                s.table_id,
+                "main",
+                "t",
+                s.snapshot_id,
+                WriteMode::Replace,
+                s.base_snapshot_id,
+                &cols,
+                &s.column_ids,
+            )
+            .unwrap();
+        writer
+            .set_partition_spec(
+                s.table_id,
+                &[("val".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        s.table_id
+    };
+
+    // Four small appends: two rows in partition val=1, two in val=2. Each append is
+    // its own snapshot, and each writes one file per partition it touches.
+    for id in [1, 2] {
+        append(&temp, vec![id, id + 10], vec![1, 2]).await;
+    }
+
+    let p = pool(&temp).await;
+    let live_before = scalar_i64(
+        &p,
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    assert_eq!(live_before, 4, "two appends x two partitions = four files");
+
+    // Merge with a target large enough to bin everything that is legal to bin.
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: 1 << 30,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+    assert!(result.did_work(), "the small files must be compacted");
+
+    // Two outputs (one per partition), never one merged across both.
+    let live_after: Vec<(Option<i64>, Option<String>)> = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = ? AND df.end_snapshot IS NULL
+         ORDER BY fpv.partition_value",
+    )
+    .bind(table_id)
+    .fetch_all(&p)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .collect();
+
+    assert_eq!(
+        live_after.len(),
+        2,
+        "one merged file per partition, not one across partitions: {live_after:?}"
+    );
+    let values: Vec<Option<String>> = live_after.iter().map(|(_, v)| v.clone()).collect();
+    assert_eq!(
+        values,
+        vec![Some("1".to_string()), Some("2".to_string())],
+        "each merged file keeps its partition value"
+    );
+    for (partition_id, _) in &live_after {
+        assert!(
+            partition_id.is_some(),
+            "a merged file of a partitioned table must keep its partition_id"
+        );
+    }
+
+    // And the rows survive intact, still prunable by the partition column.
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 1), (2, 1), (11, 2), (12, 2)]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn merge_harvests_output_stats_and_removes_source_stats() {
     // Compaction must record fresh per-file column stats for the merged output

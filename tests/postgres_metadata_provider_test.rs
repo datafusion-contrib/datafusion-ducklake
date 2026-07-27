@@ -1078,7 +1078,8 @@ async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> 
              ADD COLUMN IF NOT EXISTS row_id_start BIGINT,
              ADD COLUMN IF NOT EXISTS begin_snapshot BIGINT NOT NULL DEFAULT 1,
              ADD COLUMN IF NOT EXISTS end_snapshot BIGINT,
-             ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+             ADD COLUMN IF NOT EXISTS partial_max BIGINT,
+             ADD COLUMN IF NOT EXISTS partition_id BIGINT",
     )
     .execute(pool)
     .await?;

@@ -55,7 +55,11 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
         partial_max: row.try_get(16)?,
         max_row_count: row.try_get(7)?,
         delete_count,
-        partition_id: None,
+        // Column 18 is present on the select-path query (which projects
+        // `data.partition_id`) and absent on callers that share this decoder
+        // without it; `try_get` failing there degrades to `None`, matching the
+        // pre-partition behaviour. Per-key values are filled in by the caller.
+        partition_id: row.try_get(18).unwrap_or(None),
         partition_values: Vec::new(),
     })
 }
@@ -108,11 +112,16 @@ struct SchemaCapabilities {
     delete_file_partial_max: bool,
     /// The `ducklake_schema_versions` table exists.
     schema_versions: bool,
+    /// `ducklake_data_file.partition_id` exists.
+    data_file_partition_id: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max && self.schema_versions
+        self.data_file_partial_max
+            && self.delete_file_partial_max
+            && self.schema_versions
+            && self.data_file_partition_id
     }
 }
 
@@ -169,13 +178,15 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
-               to_regclass('ducklake_schema_versions') IS NOT NULL",
+               to_regclass('ducklake_schema_versions') IS NOT NULL,
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -183,6 +194,7 @@ impl PostgresMetadataProvider {
             data_file_partial_max: row.0,
             delete_file_partial_max: row.1,
             schema_versions: row.2,
+            data_file_partition_id: row.3,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -354,6 +366,13 @@ impl MetadataProvider for PostgresMetadataProvider {
             } else {
                 "NULL::bigint"
             };
+            // A catalog predating partition support has no `partition_id` column;
+            // such a catalog holds no partitioned files either, so NULL is exact.
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id::bigint"
+            } else {
+                "NULL::bigint"
+            };
             let schema_version_expr = if caps.schema_versions {
                 "(SELECT sv.schema_version::bigint
                   FROM ducklake_schema_versions sv
@@ -383,7 +402,8 @@ impl MetadataProvider for PostgresMetadataProvider {
                     del.delete_count,
                     data.begin_snapshot::bigint AS data_begin_snapshot,
                     {partial_max_expr} AS data_partial_max,
-                    {schema_version_expr} AS data_schema_version
+                    {schema_version_expr} AS data_schema_version,
+                    {partition_id_expr} AS data_partition_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -404,9 +424,54 @@ impl MetadataProvider for PostgresMetadataProvider {
                 .fetch_all(&self.pool)
                 .await?;
 
-            rows.iter()
+            let mut files: Vec<DuckLakeTableFile> = rows
+                .iter()
                 .map(|row| decode_table_file(row, snapshot_id))
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+
+            // Enrich with per-file partition values. Compaction reads its candidates
+            // through this path and must group by, and preserve, each file's exact
+            // partition — without the values it would merge across partitions and
+            // strip the assignment. Scoped by the fetched id range; a catalog
+            // predating partition support simply yields no rows.
+            if let (Some(min), Some(max)) = (
+                files.iter().map(|f| f.data_file_id).min(),
+                files.iter().map(|f| f.data_file_id).max(),
+            ) {
+                let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+                match sqlx::query(
+                    "SELECT data_file_id, partition_key_index, partition_value
+                     FROM ducklake_file_partition_value
+                     WHERE table_id = $1 AND data_file_id >= $2 AND data_file_id <= $3",
+                )
+                .bind(table_id)
+                .bind(min)
+                .bind(max)
+                .fetch_all(&self.pool)
+                .await
+                {
+                    Ok(rows) => {
+                        for row in rows {
+                            let data_file_id: i64 = row.try_get(0)?;
+                            let key_index: i32 =
+                                i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                            let value: Option<String> = row.try_get(2)?;
+                            values_by_file
+                                .entry(data_file_id)
+                                .or_default()
+                                .push((key_index, value));
+                        }
+                    },
+                    Err(error) if is_missing_statistics_table(&error) => {},
+                    Err(error) => return Err(error.into()),
+                }
+                for file in &mut files {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                }
+            }
+            Ok(files)
         })
     }
 
