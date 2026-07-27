@@ -745,6 +745,42 @@ async fn partitioned_insert_reads_back_correctly_and_prunes() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_pruning_enables_range_pruning_on_remaining_files() {
+    let env = setup().await;
+    let ctx = write_ctx(&env.conn_str).await;
+    ctx.sql(
+        "INSERT INTO ducklake.main.events VALUES
+            (1, 'data', TIMESTAMP '2023-01-15 10:00:00'),
+            (2, 'data', TIMESTAMP '2024-06-20 12:00:00'),
+            (3, 'metadata', NULL)",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let rctx = read_ctx(&env.conn_str).await;
+    let query = "SELECT id FROM ducklake.main.events
+        WHERE region = 'data'
+          AND ts >= TIMESTAMP '2023-01-01 00:00:00'
+          AND ts < TIMESTAMP '2024-01-01 00:00:00'";
+    let plan = rctx
+        .sql(query)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    let rows = rctx.sql(query).await.unwrap().collect().await.unwrap();
+
+    assert_eq!(display.matches(".parquet").count(), 1, "{display}");
+    assert_eq!(rows.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+}
+
 /// Create the `events` table (no partition spec) and return `(conn_str, table_id, temp)`.
 async fn create_events_table_no_spec() -> (String, i64, TempDir) {
     let temp = TempDir::new().unwrap();

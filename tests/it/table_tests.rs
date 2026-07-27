@@ -538,9 +538,9 @@ async fn test_scan_prunes_files_by_statistics() -> DataFusionResult<()> {
 /// Pruning composes correctly with the with-deletes scan path: a table where
 /// one file carries a live delete returns correct, delete-applied results under
 /// a selective filter. (A file with a live delete has inexact statistics and is
-/// intentionally never pruned — and its presence suppresses pruning by that
-/// column for the whole scan — so this asserts correctness, not a file-count
-/// reduction. See `prune_table_files`.)
+/// intentionally never pruned, and its presence suppresses pruning by that
+/// column for the current pass, so this asserts correctness, not a file-count
+/// reduction. See `prune_table_files_iteratively`.)
 #[tokio::test]
 async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
     let temp_dir =
