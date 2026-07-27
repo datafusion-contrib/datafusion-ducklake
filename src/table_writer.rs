@@ -28,6 +28,15 @@ use crate::table::delete_file_schema;
 // The partition-group shape is shared with the split logic in `partition`.
 pub use crate::partition::PartitionGroup;
 
+/// Default cap on parquet files a partitioned streaming write keeps open at once,
+/// matching DuckDB's `partition_write_max_open_files`. A streaming write cannot
+/// know how many partitions its rows will touch, so it holds one open writer per
+/// partition seen and, on reaching this cap, finalizes the least-recently-opened
+/// file to make room (that partition simply gets another file if more of its rows
+/// arrive). Without a cap, a high-cardinality partition key would exhaust file
+/// descriptors and memory.
+pub const DEFAULT_MAX_OPEN_PARTITIONS: usize = 100;
+
 /// Default target data file size: 512 MiB, matching official DuckLake's
 /// `target_file_size` default (`1 << 29`). A write rolls over to a new file once
 /// it reaches this size, so no single write can produce a file too large for
@@ -50,6 +59,9 @@ pub struct DuckLakeWriteOptions {
     /// Target data file size for rollover (approx encoded bytes); `None` leaves
     /// the writer default ([`DEFAULT_TARGET_FILE_SIZE`]).
     pub target_file_size: Option<usize>,
+    /// Max parquet files a partitioned streaming write keeps open at once; `None`
+    /// leaves the writer default ([`DEFAULT_MAX_OPEN_PARTITIONS`]).
+    pub max_open_partitions: Option<usize>,
 }
 
 /// High-level writer for DuckLake tables.
@@ -79,6 +91,10 @@ pub struct DuckLakeTableWriter {
     /// to [`DEFAULT_TARGET_FILE_SIZE`] (matching official DuckLake); override via
     /// [`DuckLakeTableWriter::with_target_file_size`].
     target_file_size: usize,
+    /// Max parquet files a partitioned streaming write keeps open concurrently.
+    /// Defaults to [`DEFAULT_MAX_OPEN_PARTITIONS`]; override via
+    /// [`DuckLakeTableWriter::with_max_open_partitions`].
+    max_open_partitions: usize,
 }
 
 impl DuckLakeTableWriter {
@@ -97,6 +113,7 @@ impl DuckLakeTableWriter {
             max_row_group_rows: None,
             max_row_group_bytes: None,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
+            max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
         })
     }
 
@@ -141,8 +158,16 @@ impl DuckLakeTableWriter {
         self.target_file_size
     }
 
+    /// Cap the number of parquet files a partitioned streaming write keeps open at
+    /// once. Defaults to [`DEFAULT_MAX_OPEN_PARTITIONS`]. Clamped to at least 1.
+    pub fn with_max_open_partitions(mut self, files: usize) -> Self {
+        self.max_open_partitions = files.max(1);
+        self
+    }
+
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
-    /// target). Each field overrides the corresponding setting only when present.
+    /// target, open-partition cap). Each field overrides the corresponding setting
+    /// only when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
         if let Some(compression) = options.compression {
             self.compression = compression;
@@ -155,6 +180,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(bytes) = options.target_file_size {
             self.target_file_size = bytes;
+        }
+        if let Some(files) = options.max_open_partitions {
+            self.max_open_partitions = files.max(1);
         }
         self
     }
@@ -176,6 +204,15 @@ impl DuckLakeTableWriter {
 
     /// Begin a streaming write session.
     /// If mode is `WriteMode::Replace`, ends existing files.
+    ///
+    /// **Layout-aware**: when the target table is partitioned, the session splits
+    /// each batch by the transformed partition key and keeps one open parquet per
+    /// partition (up to
+    /// [`max_open_partitions`](Self::with_max_open_partitions), finalizing the
+    /// least-recently-opened file beyond that), rolling each over at
+    /// [`target_file_size`](Self::with_target_file_size). Every file produced is
+    /// committed in ONE snapshot by [`TableWriteSession::finish`], so a partitioned
+    /// streaming write stays as atomic as an unpartitioned one.
     pub fn begin_write(
         &self,
         schema_name: &str,
@@ -206,6 +243,7 @@ impl DuckLakeTableWriter {
             true,
             false,
             mode,
+            StreamPartitionMode::Split,
         )
     }
 
@@ -248,6 +286,9 @@ impl DuckLakeTableWriter {
             true,
             true,
             mode,
+            StreamPartitionMode::Reject {
+                entry_point: "begin_write_with_embedded_rowid",
+            },
         )
     }
 
@@ -272,6 +313,9 @@ impl DuckLakeTableWriter {
             false,
             false,
             mode,
+            StreamPartitionMode::Reject {
+                entry_point: "begin_write_to_path",
+            },
         )
     }
 
@@ -287,6 +331,7 @@ impl DuckLakeTableWriter {
         path_is_relative: bool,
         embed_rowid: bool,
         mode: WriteMode,
+        partition_mode: StreamPartitionMode,
     ) -> Result<TableWriteSession> {
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
@@ -334,6 +379,46 @@ impl DuckLakeTableWriter {
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
 
+        // A partitioned target routes rows through a per-partition sink. The
+        // single-file writer above is still created: with zero rows the sink
+        // produces no file, and a Replace then needs that 0-row marker to retire the
+        // prior generation.
+        let partition_sink =
+            match self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)? {
+                None => None,
+                Some(spec) => match partition_mode {
+                    StreamPartitionMode::Reject {
+                        entry_point,
+                    } => {
+                        return Err(crate::error::DuckLakeError::Unsupported(format!(
+                            "{entry_point} does not support a partitioned table: it writes to one \
+                         caller-determined file, but the table's partition spec requires rows \
+                         to be split across one file per partition"
+                        )));
+                    },
+                    StreamPartitionMode::Split => {
+                        let scoped_base = match self.metadata.catalog_id() {
+                            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+                            None => self.base_key_path.clone(),
+                        };
+                        let table_key =
+                            join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+                        Some(PartitionSink {
+                            key_names: spec.key_names(),
+                            spec,
+                            table_key,
+                            schema_with_ids: schema_with_ids.clone(),
+                            column_ids: setup.column_ids.clone(),
+                            props: self.build_writer_props(),
+                            target_file_size: self.target_file_size,
+                            max_open: self.max_open_partitions,
+                            open: Vec::new(),
+                            staged: Vec::new(),
+                        })
+                    },
+                },
+            };
+
         Ok(TableWriteSession {
             metadata: Arc::clone(&self.metadata),
             object_store: Arc::clone(&self.object_store),
@@ -353,6 +438,7 @@ impl DuckLakeTableWriter {
             mode,
             row_count: 0,
             nan_flags: Vec::new(),
+            partition_sink,
         })
     }
 
@@ -1001,6 +1087,240 @@ async fn finalize_and_upload_file(
         .with_column_stats(column_stats))
 }
 
+/// How a streaming write session handles a partitioned target.
+#[derive(Debug, Clone, Copy)]
+enum StreamPartitionMode {
+    /// Split rows across one file per partition (a [`PartitionSink`]).
+    Split,
+    /// Refuse: this entry point writes to a single file the caller chose (a custom
+    /// path, or a file carrying embedded row lineage), which cannot also satisfy a
+    /// partition spec. Errors with the entry point named, rather than letting the
+    /// commit fail later with a partition-fence conflict that reads as a concurrent
+    /// DDL change.
+    Reject {
+        entry_point: &'static str,
+    },
+}
+
+/// One parquet file a [`PartitionSink`] is currently writing rows into.
+#[derive(Debug)]
+struct OpenPartitionFile {
+    /// The partition values every row in this file shares, in key order.
+    values: Vec<Option<String>>,
+    writer: ArrowWriter<std::io::BufWriter<std::fs::File>>,
+    temp: NamedTempFile,
+    /// Path relative to the table directory (includes the Hive subpath).
+    catalog_path: String,
+    object_path: ObjectPath,
+    row_count: i64,
+    nan_flags: Vec<Option<bool>>,
+}
+
+/// A parquet file whose footer is written and whose staging file is complete, but
+/// which has not been uploaded yet.
+///
+/// A streaming session finalizes files as it goes (on rollover, or when evicting to
+/// respect the open-file cap) but uploads them all in `finish`. Finalizing is
+/// synchronous, which is what lets [`TableWriteSession::write_batch`] stay
+/// synchronous; uploading is async and belongs to the one `finish` await point.
+#[derive(Debug)]
+struct StagedPartitionFile {
+    values: Vec<Option<String>>,
+    temp: NamedTempFile,
+    catalog_path: String,
+    object_path: ObjectPath,
+    row_count: i64,
+    nan_flags: Vec<Option<bool>>,
+}
+
+/// Routes a streaming write's rows into one parquet file per partition.
+///
+/// Mirrors DuckDB's partitioned COPY sink (which is how official DuckLake writes a
+/// partitioned table): keep a writer open per partition seen, roll a file over at
+/// `target_file_size`, and finalize the least-recently-opened file when the number
+/// of open files would exceed `max_open`. All files produced are committed in ONE
+/// snapshot, so a partitioned streaming write is as atomic as an unpartitioned one.
+#[derive(Debug)]
+struct PartitionSink {
+    spec: crate::partition::PartitionWriteSpec,
+    key_names: Vec<String>,
+    /// Object-store key prefix of the table directory; Hive subpaths hang off it.
+    table_key: String,
+    /// Field-id-tagged schema every written batch carries.
+    schema_with_ids: SchemaRef,
+    column_ids: Vec<i64>,
+    props: WriterProperties,
+    target_file_size: usize,
+    max_open: usize,
+    /// Open writers, oldest first (eviction takes from the front).
+    open: Vec<OpenPartitionFile>,
+    /// Finalized files awaiting upload at `finish`.
+    staged: Vec<StagedPartitionFile>,
+}
+
+impl PartitionSink {
+    /// Split `batch` by partition and write each group to that partition's open
+    /// file, opening and rolling files as needed.
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Group by the transformed partition key. The group batches are built with
+        // the field-id-tagged schema, so they are ready to write as-is.
+        let groups = crate::partition::split_batches_by_partition(
+            &self.schema_with_ids,
+            std::slice::from_ref(batch),
+            &self.spec,
+        )?;
+        for (values, batches) in groups {
+            for group_batch in batches {
+                if group_batch.num_rows() == 0 {
+                    continue;
+                }
+                self.write_group_batch(&values, &group_batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append one partition's rows to that partition's open file (opening it, and
+    /// evicting another partition's file if at the cap), then roll the file over if
+    /// it has reached the target size.
+    fn write_group_batch(&mut self, values: &[Option<String>], batch: &RecordBatch) -> Result<()> {
+        let index = match self.open.iter().position(|f| f.values == values) {
+            Some(index) => index,
+            None => {
+                if self.open.len() >= self.max_open {
+                    // Evict the least-recently-opened file: finalize it locally so
+                    // it is complete on disk, and upload it at finish.
+                    let evicted = self.open.remove(0);
+                    let staged = finalize_open_file(evicted)?;
+                    self.staged.push(staged);
+                }
+                self.open.push(self.open_file(values.to_vec())?);
+                self.open.len() - 1
+            },
+        };
+
+        let file = &mut self.open[index];
+        crate::stats_collect::accumulate_nan_flags(
+            &mut file.nan_flags,
+            batch,
+            self.column_ids.len(),
+        );
+        file.writer.write(batch)?;
+        file.row_count += batch.num_rows() as i64;
+
+        // Roll over at the batch boundary once the estimated encoded size
+        // (finished row groups + the in-progress one) reaches the target.
+        if file.writer.bytes_written() + file.writer.in_progress_size() >= self.target_file_size {
+            let rolled = self.open.remove(index);
+            let staged = finalize_open_file(rolled)?;
+            self.staged.push(staged);
+        }
+        Ok(())
+    }
+
+    /// Open a new staging parquet for `values` under that partition's Hive subpath.
+    fn open_file(&self, values: Vec<Option<String>>) -> Result<OpenPartitionFile> {
+        let rel = crate::partition::hive_subpath(&self.key_names, &values);
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        let catalog_path = if rel.is_empty() {
+            file_name
+        } else {
+            format!("{rel}/{file_name}")
+        };
+        let object_path_str = join_paths(&self.table_key, &catalog_path)?;
+        let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
+        let temp = NamedTempFile::new()?;
+        let staging = std::io::BufWriter::new(temp.reopen()?);
+        let writer = ArrowWriter::try_new(
+            staging,
+            self.schema_with_ids.clone(),
+            Some(self.props.clone()),
+        )?;
+        Ok(OpenPartitionFile {
+            values,
+            writer,
+            temp,
+            catalog_path,
+            object_path,
+            row_count: 0,
+            nan_flags: Vec::new(),
+        })
+    }
+
+    /// Finalize every open file and upload all staged files, returning the
+    /// [`DataFileInfo`]s to commit — each stamped with its partition.
+    async fn into_file_infos(
+        mut self,
+        object_store: &Arc<dyn ObjectStore>,
+    ) -> Result<Vec<DataFileInfo>> {
+        for file in std::mem::take(&mut self.open) {
+            self.staged.push(finalize_open_file(file)?);
+        }
+        let mut infos = Vec::with_capacity(self.staged.len());
+        for staged in std::mem::take(&mut self.staged) {
+            let partition_values: Vec<(i32, Option<String>)> = staged
+                .values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as i32, v.clone()))
+                .collect();
+            let info = upload_staged_file(staged, object_store, &self.column_ids).await?;
+            infos.push(info.with_partition(self.spec.partition_id, partition_values));
+        }
+        Ok(infos)
+    }
+}
+
+/// Write the parquet footer of an open file and flush its staging file to disk,
+/// leaving it ready to upload. Synchronous, so the streaming write path needs no
+/// await.
+fn finalize_open_file(file: OpenPartitionFile) -> Result<StagedPartitionFile> {
+    let staged = file.writer.into_inner()?;
+    staged
+        .into_inner()
+        .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    Ok(StagedPartitionFile {
+        values: file.values,
+        temp: file.temp,
+        catalog_path: file.catalog_path,
+        object_path: file.object_path,
+        row_count: file.row_count,
+        nan_flags: file.nan_flags,
+    })
+}
+
+/// Upload a finalized staging file and harvest its stats, returning the
+/// [`DataFileInfo`] to register (relative path; the caller stamps the partition).
+async fn upload_staged_file(
+    staged: StagedPartitionFile,
+    object_store: &Arc<dyn ObjectStore>,
+    column_ids: &[i64],
+) -> Result<DataFileInfo> {
+    let mut file = std::fs::File::open(staged.temp.path())?;
+    let file_size = file.metadata()?.len() as i64;
+    let footer_size = read_footer_size(&mut file)?;
+
+    let local = tokio::fs::File::open(staged.temp.path()).await?;
+    let mut reader = tokio::io::BufReader::new(local);
+    let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
+    if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
+        let _ = upload.abort().await;
+        return Err(e.into());
+    }
+
+    let column_stats = crate::stats_collect::collect_column_stats(
+        staged.temp.path(),
+        column_ids,
+        staged.row_count,
+        &staged.nan_flags,
+    );
+    Ok(
+        DataFileInfo::new(&staged.catalog_path, file_size, staged.row_count)
+            .with_footer_size(footer_size)
+            .with_column_stats(column_stats),
+    )
+}
+
 /// Streaming write session. Batches stream to a local staging file; the
 /// finished parquet is uploaded in `finish()`. If the session is dropped
 /// without finishing, the staging file is removed and nothing is uploaded.
@@ -1047,10 +1367,25 @@ pub struct TableWriteSession {
     /// Parquet footer carries no NaN flag). One entry per catalog data column;
     /// `None` for non-float columns. Fed into `collect_column_stats` at finish.
     nan_flags: Vec<Option<bool>>,
+    /// Set when the target table is partitioned: batches are routed here, one file
+    /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
+    /// every file the sink produced in a single snapshot.
+    partition_sink: Option<PartitionSink>,
 }
 
 impl TableWriteSession {
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.partition_sink.is_some() {
+            self.validate_batch_schema(batch)?;
+            let rows = batch.num_rows() as i64;
+            // `is_some` checked above.
+            self.partition_sink
+                .as_mut()
+                .expect("partition sink present")
+                .write_batch(batch)?;
+            self.row_count += rows;
+            return Ok(());
+        }
         if self.writer.is_none() {
             return Err(crate::error::DuckLakeError::Internal(
                 "Writer already closed".to_string(),
@@ -1111,12 +1446,52 @@ impl TableWriteSession {
         self.snapshot_id
     }
 
-    /// Returns the object path that will be written to
+    /// The object path this session writes to.
+    ///
+    /// For a partitioned session there is no single output file (one file per
+    /// partition, plus rollovers), so this returns the table directory the partition
+    /// subpaths hang off.
     pub fn file_path(&self) -> &str {
         self.object_path.as_ref()
     }
 
     pub async fn finish(mut self) -> Result<WriteResult> {
+        // Partitioned: commit every file the sink produced in ONE snapshot, so a
+        // partitioned streaming write is as atomic as an unpartitioned one.
+        if let Some(sink) = self.partition_sink.take() {
+            let file_infos = sink.into_file_infos(&self.object_store).await?;
+            if file_infos.is_empty() {
+                // No rows reached any partition. Fall through to the single-file
+                // path, which registers the 0-row marker that carries a Replace
+                // truncation (and is exempt from the partition fence).
+                return self.finish_single_file().await;
+            }
+            let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
+            let committed = self.metadata.register_data_files(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &file_infos,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.column_ids,
+            )?;
+            return Ok(WriteResult {
+                snapshot_id: committed.snapshot_id,
+                table_id: committed.table_id,
+                schema_id: committed.schema_id,
+                files_written: file_infos.len(),
+                records_written,
+            });
+        }
+        self.finish_single_file().await
+    }
+
+    /// Commit this session's single staged file (the unpartitioned path, and the
+    /// 0-row truncate marker of a partitioned Replace).
+    async fn finish_single_file(mut self) -> Result<WriteResult> {
         let file_info = self.upload_staged().await?;
         // register_data_file returns the ids actually committed (snapshot id
         // assigned at commit; real schema/table ids, which may differ from the
@@ -1152,6 +1527,14 @@ impl TableWriteSession {
         // Reject an unsupported combination before uploading the staged parquet,
         // so a misuse leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
+        if self.partition_sink.is_some() {
+            return Err(crate::error::DuckLakeError::Unsupported(
+                "an update/upsert on a partitioned table is not supported yet: the new row \
+                 versions span one file per partition, and the atomic append+delete commit \
+                 currently registers a single data file"
+                    .to_string(),
+            ));
+        }
         let file_info = self.upload_staged().await?;
         let committed = self.metadata.register_data_file_with_deletes(
             self.table_id,

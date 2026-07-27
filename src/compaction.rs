@@ -316,8 +316,13 @@ impl DuckLakeTable {
         // Sort by (schema_version, partition identity, data_file_id) so both the
         // DDL boundary and the partition boundary fall out of the sort, and files
         // stay in data_file_id order (adjacency) within a partition.
-        candidates
-            .sort_by_key(|f| (f.schema_version.unwrap_or(0), partition_key(f), f.data_file_id));
+        candidates.sort_by_key(|f| {
+            (
+                f.schema_version.unwrap_or(0),
+                partition_key(f),
+                f.data_file_id,
+            )
+        });
         candidates.truncate(opts.max_merged_files);
 
         // Bin-pack within each (schema-version, partition) run; only bins of >= 2
@@ -449,11 +454,8 @@ impl DuckLakeTable {
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
             let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &column_ids,
-                );
+                let names =
+                    self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
                 crate::partition::hive_subpath(&names, &partition_values)
             });
             let file = table_writer
@@ -584,11 +586,8 @@ impl DuckLakeTable {
                 // partition: inherit the identity and the Hive directory.
                 let (partition_id, partition_values) = partition_key(tf);
                 let subpath = partition_id.map(|pid| {
-                    let names = self.partition_path_names(
-                        live_partition_spec.as_ref(),
-                        pid,
-                        &column_ids,
-                    );
+                    let names =
+                        self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
                     crate::partition::hive_subpath(&names, &partition_values)
                 });
                 let file = table_writer

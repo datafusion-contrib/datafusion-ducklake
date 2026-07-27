@@ -640,7 +640,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// commit safe, by re-checking the live generation inside the commit transaction.
     ///
     /// Default: `None` (backends without partition support are never partitioned).
-    fn live_partition_spec(&self, _table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+    fn live_partition_spec(
+        &self,
+        _table_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
         Ok(None)
     }
 

@@ -1691,7 +1691,10 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
-    fn live_partition_spec(&self, table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+    fn live_partition_spec(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
         block_on(async {
             let rows = sqlx::query(
                 "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform

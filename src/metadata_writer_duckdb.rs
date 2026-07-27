@@ -1048,7 +1048,10 @@ impl MetadataWriter for DuckdbMetadataWriter {
         Ok(new_snapshot)
     }
 
-    fn live_partition_spec(&self, table_id: i64) -> Result<Option<crate::partition::PartitionSpec>> {
+    fn live_partition_spec(
+        &self,
+        table_id: i64,
+    ) -> Result<Option<crate::partition::PartitionSpec>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(
             "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
