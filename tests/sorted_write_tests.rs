@@ -68,14 +68,14 @@ async fn setup() -> Env {
     }
 }
 
-/// A writable context whose writer rolls over at `target_file_bytes` and whose
+/// A writable context whose writer rolls over at `target_file_size` and whose
 /// scans emit small batches (so a single INSERT yields several batches → several
 /// rolled files).
-async fn write_ctx(conn_str: &str, target_file_bytes: usize, batch_size: usize) -> SessionContext {
+async fn write_ctx(conn_str: &str, target_file_size: usize, batch_size: usize) -> SessionContext {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
     let options = DuckLakeWriteOptions {
-        target_file_bytes: Some(target_file_bytes),
+        target_file_size: Some(target_file_size),
         ..Default::default()
     };
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))

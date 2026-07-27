@@ -30,11 +30,17 @@ use crate::table::delete_file_schema;
 /// SQL NULL), and the row batches for that partition.
 pub type PartitionGroup = (Vec<Option<String>>, Vec<RecordBatch>);
 
+/// Default target data file size: 512 MiB, matching official DuckLake's
+/// `target_file_size` default (`1 << 29`). A write rolls over to a new file once
+/// it reaches this size, so no single write can produce a file too large for
+/// later compaction to reorganize (DuckLake compaction merges, never splits).
+pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
+
 /// Write-layout options carried from the catalog down to the insert path, so a
 /// SQL `INSERT` builds its [`DuckLakeTableWriter`] with the same compression,
 /// row-group caps, and file-rollover target the embedding engine configured.
-/// All `None` reproduces the historical defaults (uncompressed, parquet-default
-/// row groups, one file per write).
+/// A `None` field leaves the writer's default for that setting (uncompressed,
+/// parquet-default row groups, [`DEFAULT_TARGET_FILE_SIZE`] rollover).
 #[derive(Debug, Clone, Default)]
 pub struct DuckLakeWriteOptions {
     /// Parquet compression codec; `None` = uncompressed.
@@ -43,8 +49,9 @@ pub struct DuckLakeWriteOptions {
     pub max_row_group_rows: Option<usize>,
     /// Max uncompressed bytes per row group; `None` = parquet default.
     pub max_row_group_bytes: Option<usize>,
-    /// Target file size for rollover (approx encoded bytes); `None` = one file.
-    pub target_file_bytes: Option<usize>,
+    /// Target data file size for rollover (approx encoded bytes); `None` leaves
+    /// the writer default ([`DEFAULT_TARGET_FILE_SIZE`]).
+    pub target_file_size: Option<usize>,
 }
 
 /// High-level writer for DuckLake tables.
@@ -66,15 +73,14 @@ pub struct DuckLakeTableWriter {
     /// once, so a byte cap bounds reader memory for wide schemas (e.g. large
     /// vector columns). Set via [`DuckLakeTableWriter::with_max_row_group_bytes`].
     max_row_group_bytes: Option<usize>,
-    /// Optional target file size (approximate encoded bytes). When set, a write
-    /// rolls over to a new data file once the current file's estimated encoded
-    /// size reaches this threshold, so a large write produces several files
-    /// instead of one. Paired with a sort order, each file then covers a
-    /// contiguous, non-overlapping value range — which is what lets DuckLake skip
-    /// whole files by their min/max at query time. `None` writes one file per
-    /// write (per partition group). Set via
-    /// [`DuckLakeTableWriter::with_target_file_bytes`].
-    target_file_bytes: Option<usize>,
+    /// Target data file size in approximate encoded bytes. A write rolls over to a
+    /// new file once the current file's estimated encoded size reaches this, so a
+    /// large write produces several files instead of one. Paired with a sort order,
+    /// each file then covers a contiguous, non-overlapping value range — which is
+    /// what lets DuckLake skip whole files by their min/max at query time. Defaults
+    /// to [`DEFAULT_TARGET_FILE_SIZE`] (matching official DuckLake); override via
+    /// [`DuckLakeTableWriter::with_target_file_size`].
+    target_file_size: usize,
 }
 
 impl DuckLakeTableWriter {
@@ -92,7 +98,7 @@ impl DuckLakeTableWriter {
             compression: Compression::UNCOMPRESSED,
             max_row_group_rows: None,
             max_row_group_bytes: None,
-            target_file_bytes: None,
+            target_file_size: DEFAULT_TARGET_FILE_SIZE,
         })
     }
 
@@ -121,22 +127,20 @@ impl DuckLakeTableWriter {
         self
     }
 
-    /// Roll over to a new data file once the current file reaches approximately
-    /// `bytes` of encoded parquet (estimated from the writer's flushed +
-    /// in-progress size, checked at batch boundaries). A large write then produces
-    /// several files; combined with a sort order each file holds a contiguous
-    /// value range with a tight min/max, enabling file-level pruning. Leaves the
-    /// one-file-per-write behavior when unset.
-    pub fn with_target_file_bytes(mut self, bytes: usize) -> Self {
-        self.target_file_bytes = Some(bytes);
+    /// Override the target data file size (approx encoded bytes) at which a write
+    /// rolls over to a new file, estimated from the writer's flushed + in-progress
+    /// size and checked at batch boundaries. Combined with a sort order, each file
+    /// holds a contiguous value range with a tight min/max, enabling file-level
+    /// pruning. Defaults to [`DEFAULT_TARGET_FILE_SIZE`].
+    pub fn with_target_file_size(mut self, bytes: usize) -> Self {
+        self.target_file_size = bytes;
         self
     }
 
-    /// The configured target file size, if any (see
-    /// [`with_target_file_bytes`](Self::with_target_file_bytes)). Callers use this
-    /// to choose the rolled multi-file write path over a single-file session.
-    pub fn target_file_bytes(&self) -> Option<usize> {
-        self.target_file_bytes
+    /// The target file size at which writes roll over (see
+    /// [`with_target_file_size`](Self::with_target_file_size)).
+    pub fn target_file_size(&self) -> usize {
+        self.target_file_size
     }
 
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
@@ -151,8 +155,8 @@ impl DuckLakeTableWriter {
         if let Some(bytes) = options.max_row_group_bytes {
             self.max_row_group_bytes = Some(bytes);
         }
-        if let Some(bytes) = options.target_file_bytes {
-            self.target_file_bytes = Some(bytes);
+        if let Some(bytes) = options.target_file_size {
+            self.target_file_size = bytes;
         }
         self
     }
@@ -710,9 +714,9 @@ impl DuckLakeTableWriter {
     }
 
     /// Write `batches` to an unpartitioned table as ONE OR MORE data files
-    /// (rolling over by [`target_file_bytes`](Self::with_target_file_bytes)) and
+    /// (rolling over by [`target_file_size`](Self::with_target_file_size)) and
     /// commit them in one snapshot via [`MetadataWriter::register_data_files`].
-    /// Used by the insert path when file rollover is enabled; `batches` must hold
+    /// Used by the insert path; `batches` must hold
     /// at least one row (the caller keeps the single-file session path for empty
     /// Replace truncation). `arrow_schema` is the table's data columns (no rowid).
     pub async fn write_rows(
@@ -776,13 +780,13 @@ impl DuckLakeTableWriter {
     /// Write `batches` into ONE OR MORE parquet files under `table_key` (data
     /// columns with catalog field-ids, no embedded rowid), rolling over to a new
     /// file whenever the current file's estimated encoded size reaches
-    /// `target_file_bytes`. `rel_prefix`, when set, is a Hive-style subpath (a
+    /// `target_file_size`. `rel_prefix`, when set, is a Hive-style subpath (a
     /// partition group) each file is placed under. Rollover is checked at batch
     /// boundaries, so a file always holds a whole number of batches — preserving
     /// any input ordering *across* files (file N's rows all precede file N+1's).
     /// Returns one [`DataFileInfo`] per file (relative catalog path set, stats and
-    /// footer harvested); empty rows produce no file. With `target_file_bytes`
-    /// unset, this writes exactly one file (the historical behavior).
+    /// footer harvested); empty rows produce no file. A write smaller than
+    /// `target_file_size` yields exactly one file.
     async fn write_rolled_files(
         &self,
         table_key: &str,
@@ -837,9 +841,7 @@ impl DuckLakeTableWriter {
 
             // Roll over at the batch boundary once the estimated encoded size
             // (finished row groups + the in-progress one) reaches the target.
-            if let Some(target) = self.target_file_bytes
-                && active.bytes_written() + active.in_progress_size() >= target
-            {
+            if active.bytes_written() + active.in_progress_size() >= self.target_file_size {
                 let info = finalize_and_upload_file(
                     writer.take().unwrap(),
                     temp.take().unwrap(),

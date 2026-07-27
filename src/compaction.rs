@@ -65,9 +65,10 @@ pub struct MergeOptions {
 impl Default for MergeOptions {
     fn default() -> Self {
         Self {
-            // 256 MiB: large enough to coalesce many small files into one, while
-            // staying a reasonable single-file target.
-            target_file_size: 256 * 1024 * 1024,
+            // 512 MiB, matching official DuckLake's target_file_size default and
+            // the write-path rollover default (DEFAULT_TARGET_FILE_SIZE), so merge
+            // and insert target the same file size.
+            target_file_size: crate::table_writer::DEFAULT_TARGET_FILE_SIZE as u64,
             max_merged_files: 1024,
             min_file_size: 0,
         }

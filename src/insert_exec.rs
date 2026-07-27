@@ -279,13 +279,13 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 }
             }
 
-            // Rollover path: when a target file size is configured, split the
-            // (already sorted, if the table has a sort order) rows into several
-            // size-bounded files committed in one snapshot. Only for non-empty
-            // input — an empty Replace still needs the single-file truncate marker
-            // below. Empty Append already returned above.
+            // Write the (already sorted, if the table has a sort order) rows through
+            // the size-rolling writer: it produces one file per target_file_size and
+            // commits them in one snapshot. Only for non-empty input — an empty
+            // Replace still needs the single-file truncate marker below, and empty
+            // Append already returned above.
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-            if table_writer.target_file_bytes().is_some() && total_rows > 0 {
+            if total_rows > 0 {
                 let result = table_writer
                     .write_rows(
                         &schema_name,

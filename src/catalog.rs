@@ -141,9 +141,9 @@ impl DuckLakeCatalog {
 
     /// Set the write-layout options (compression, row-group caps, file-rollover
     /// target) applied to every `INSERT` through this catalog. No-op on a
-    /// read-only catalog. Enables file-level pruning: with a sort order plus a
-    /// `target_file_bytes`, each INSERT writes several files each covering a
-    /// contiguous value range.
+    /// read-only catalog. Writes roll over at `target_file_size` by default, so
+    /// with a sort order each INSERT lands as several files each covering a
+    /// contiguous value range — enabling file-level pruning.
     #[cfg(feature = "write")]
     pub fn with_write_options(
         mut self,

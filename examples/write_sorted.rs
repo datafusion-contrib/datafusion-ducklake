@@ -71,7 +71,7 @@ async fn main() {
     let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
     let iwriter = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
     let options = DuckLakeWriteOptions {
-        target_file_bytes: Some(target_bytes),
+        target_file_size: Some(target_bytes),
         ..Default::default()
     };
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(iwriter))
