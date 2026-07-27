@@ -34,8 +34,9 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
-    columns_differ, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, SnapshotCommitMetadata,
+    WriteMode, WriteSetupResult, columns_differ, quote_snapshot_name, quote_snapshot_table,
+    table_write_changes, validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::Row;
@@ -65,6 +66,13 @@ const SQL_CREATE_TABLES: &[&str] = &[
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
         snapshot_time DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6),
         schema_version BIGINT NOT NULL DEFAULT 0
+    ) ENGINE = InnoDB"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+        snapshot_id BIGINT NOT NULL PRIMARY KEY,
+        changes_made TEXT,
+        author TEXT,
+        commit_message TEXT,
+        commit_extra_info TEXT
     ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
         begin_snapshot BIGINT NOT NULL,
@@ -408,7 +416,111 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<
     .bind(schema_version)
     .execute(&mut **tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+         VALUES (?, NULL)",
+    )
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
     Ok((snapshot_id, schema_version))
+}
+
+async fn record_snapshot_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    snapshot_id: i64,
+    changes_made: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let changes_made = (!changes_made.is_empty()).then_some(changes_made);
+    sqlx::query(
+        "UPDATE ducklake_snapshot_changes
+         SET changes_made = CASE
+                 WHEN changes_made IS NULL THEN ?
+                 WHEN ? IS NULL THEN changes_made
+                 ELSE CONCAT(changes_made, ',', ?)
+             END,
+             author = ?,
+             commit_message = ?,
+             commit_extra_info = ?
+         WHERE snapshot_id = ?",
+    )
+    .bind(changes_made)
+    .bind(changes_made)
+    .bind(changes_made)
+    .bind(commit_metadata.author())
+    .bind(commit_metadata.message())
+    .bind(commit_metadata.extra_info())
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn record_table_write_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    mode: WriteMode,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT s.begin_snapshot AS schema_begin_snapshot,
+                t.begin_snapshot AS table_begin_snapshot
+         FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let schema_begin_snapshot: i64 = row.try_get("schema_begin_snapshot")?;
+    let table_begin_snapshot: i64 = row.try_get("table_begin_snapshot")?;
+    let altered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_schema_versions
+            WHERE table_id = ? AND begin_snapshot = ?
+         )",
+    )
+    .bind(table_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let replaced_existing_data: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_data_file
+            WHERE table_id = ? AND end_snapshot = ?
+         )",
+    )
+    .bind(table_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let mut changes = Vec::new();
+    if schema_begin_snapshot == snapshot_id {
+        changes.push(format!(
+            "created_schema:{}",
+            quote_snapshot_name(schema_name)
+        ));
+    }
+    if table_begin_snapshot == snapshot_id {
+        changes.push(format!(
+            "created_table:{}",
+            quote_snapshot_table(schema_name, table_name)
+        ));
+    } else if altered {
+        changes.push(format!("altered_table:{table_id}"));
+    }
+    changes.push(table_write_changes(
+        table_id,
+        mode,
+        false,
+        replaced_existing_data,
+    ));
+    record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -751,15 +863,17 @@ impl MetadataWriter for MySqlMetadataWriter {
     ) -> Result<(i64, bool)> {
         validate_name(name, "Schema")?;
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ? AND end_snapshot IS NULL",
             )
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
+                tx.commit().await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -772,9 +886,17 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(name)
             .bind(schema_path)
             .bind(snapshot_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("created_schema:{}", quote_snapshot_name(name)),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
             Ok((result.last_insert_id() as i64, true))
         })
     }
@@ -788,18 +910,26 @@ impl MetadataWriter for MySqlMetadataWriter {
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
                  WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
             )
             .bind(schema_id)
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
+                tx.commit().await?;
                 return Ok((row.try_get(0)?, false));
             }
+
+            let schema_name: String =
+                sqlx::query_scalar("SELECT schema_name FROM ducklake_schema WHERE schema_id = ?")
+                    .bind(schema_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
 
             let table_path = path.unwrap_or(name);
             let result = sqlx::query(
@@ -810,9 +940,17 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(name)
             .bind(table_path)
             .bind(snapshot_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!("created_table:{}", quote_snapshot_table(&schema_name, name)),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
             Ok((result.last_insert_id() as i64, true))
         })
     }
@@ -866,6 +1004,20 @@ impl MetadataWriter for MySqlMetadataWriter {
                 column_ids.push(column_id);
             }
 
+            let table_begin_snapshot: i64 =
+                sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if table_begin_snapshot != snapshot_id {
+                record_snapshot_changes(
+                    &mut tx,
+                    snapshot_id,
+                    &format!("altered_table:{table_id}"),
+                    &SnapshotCommitMetadata::default(),
+                )
+                .await?;
+            }
             tx.commit().await?;
             Ok(column_ids)
         })
@@ -874,17 +1026,49 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
-        // MySQL created the schema/table at begin, so the names are unused here;
-        // accepted only to satisfy the trait shared with multicatalog Postgres.
-        _schema_name: &str,
-        _table_name: &str,
-        _snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
+        self.register_data_file_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "conditional writes are not supported by the MySQL metadata writer".to_string(),
+            ));
+        }
         block_on(async {
             // Single atomic commit: insert the deferred snapshot row + finalize the
             // column generation + retire the prior generation (Replace), then
@@ -967,6 +1151,16 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            record_table_write_changes(
+                &mut tx,
+                snapshot_id,
+                table_id,
+                schema_name,
+                table_name,
+                mode,
+                commit_metadata,
+            )
+            .await?;
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -987,15 +1181,50 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn register_data_files(
         &self,
         table_id: i64,
-        _schema_name: &str,
-        _table_name: &str,
-        _snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
         files: &[DataFileInfo],
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
+        self.register_data_files_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "conditional multi-file writes are not supported by the MySQL metadata writer"
+                    .to_string(),
+            ));
+        }
         if files.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "register_data_files: files must be non-empty".to_string(),
@@ -1073,6 +1302,16 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(total_bytes)
             .bind(table_id)
             .execute(&mut *tx)
+            .await?;
+            record_table_write_changes(
+                &mut tx,
+                snapshot_id,
+                table_id,
+                schema_name,
+                table_name,
+                mode,
+                commit_metadata,
+            )
             .await?;
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
@@ -1159,6 +1398,13 @@ impl MetadataWriter for MySqlMetadataWriter {
 
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1220,6 +1466,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             }
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1331,6 +1584,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             }
 
             // A sort-order change does NOT bump schema_version.
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1359,6 +1619,13 @@ impl MetadataWriter for MySqlMetadataWriter {
                 return Ok(head);
             }
             // A sort-order change does NOT bump schema_version.
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1367,9 +1634,8 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn publish_snapshot(
         &self,
         table_id: i64,
-        // MySQL created the schema/table at begin; names unused (trait parity).
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         mode: WriteMode,
         base_snapshot: i64,
@@ -1386,6 +1652,16 @@ impl MetadataWriter for MySqlMetadataWriter {
             let snapshot_id =
                 finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                     .await?;
+            record_table_write_changes(
+                &mut tx,
+                snapshot_id,
+                table_id,
+                schema_name,
+                table_name,
+                mode,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -1490,6 +1766,19 @@ impl MetadataWriter for MySqlMetadataWriter {
             .await?;
             if has_partition_id == 0 {
                 sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id BIGINT")
+                    .execute(&self.pool)
+                    .await?;
+            }
+            let changes_nullable: String = sqlx::query_scalar(
+                "SELECT is_nullable FROM information_schema.columns
+                 WHERE table_schema = DATABASE()
+                   AND table_name = 'ducklake_snapshot_changes'
+                   AND column_name = 'changes_made'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if changes_nullable == "NO" {
+                sqlx::query("ALTER TABLE ducklake_snapshot_changes MODIFY changes_made TEXT NULL")
                     .execute(&self.pool)
                     .await?;
             }

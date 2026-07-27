@@ -457,6 +457,15 @@ impl MulticatalogManager {
             .await?;
         }
 
+        sqlx::query(
+            "INSERT INTO ducklake_snapshot_changes
+                 (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+             VALUES ($1, $2, NULL, NULL, NULL)",
+        )
+        .bind(drop_snapshot)
+        .bind(format!("dropped_table:{table_id}"))
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(true)
     }
