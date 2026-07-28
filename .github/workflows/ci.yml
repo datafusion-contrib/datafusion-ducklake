@@ -1,18 +1,16 @@
 name: CI
 
+# A workflow skipped by `paths-ignore` never creates its check runs, and a
+# required status check is satisfied only by a check run that exists and
+# succeeded — "absent" reads as "pending", not "not applicable", so a docs-only
+# pull request would be blocked from merging forever. The triggers therefore
+# match every push and pull request, and each expensive job short-circuits
+# internally via its "Detect code changes" step.
 on:
   push:
     branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - '.gitignore'
   pull_request:
     branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - '.gitignore'
 
 env:
   RUST_BACKTRACE: 1
@@ -49,10 +47,19 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      # Checkout is not gated: the detection script itself lives in the repo,
+      # and a shallow clone is cheap next to the build it may skip.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Detect code changes
+        id: changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/detect-code-changes.sh
+
       - name: Build on the runner's large scratch disk (Linux)
-        if: runner.os == 'Linux'
+        if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
         run: |
           sudo mkdir -p /mnt/cargo-target
           sudo chown "$(id -un)" /mnt/cargo-target
@@ -60,15 +67,18 @@ jobs:
           df -h / /mnt
 
       - name: Install Rust
+        if: steps.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ matrix.rust }}
           components: clippy
 
       - name: Install sccache
+        if: steps.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
       - name: Cache cargo registry
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ~/.cargo/registry
@@ -77,6 +87,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ~/.cargo/git
@@ -85,6 +96,7 @@ jobs:
             ${{ runner.os }}-cargo-index-
 
       - name: Cache target directory
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: target
@@ -93,9 +105,11 @@ jobs:
             ${{ runner.os }}-target-${{ matrix.rust }}-
 
       - name: Run clippy
+        if: steps.changes.outputs.code == 'true'
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
       - name: Run tests
+        if: steps.changes.outputs.code == 'true'
         # `write-sqlite` pulls in the writer and sqlite-provider tests,
         # which are `#![cfg]`-gated; without it cargo compiles them to
         # zero-test binaries.
@@ -107,6 +121,7 @@ jobs:
           fi
 
       - name: Check documentation
+        if: steps.changes.outputs.code == 'true'
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
@@ -121,9 +136,19 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      # Checkout is not gated: the detection script itself lives in the repo,
+      # and a shallow clone is cheap next to the build it may skip.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
+      - name: Detect code changes
+        id: changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/detect-code-changes.sh
+
       - name: Build on the runner's large scratch disk
+        if: steps.changes.outputs.code == 'true'
         run: |
           sudo mkdir -p /mnt/cargo-target
           sudo chown "$(id -un)" /mnt/cargo-target
@@ -131,14 +156,17 @@ jobs:
           df -h / /mnt
 
       - name: Install Rust
+        if: steps.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
 
       - name: Install sccache
+        if: steps.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
       - name: Cache cargo registry
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ~/.cargo/registry
@@ -147,6 +175,7 @@ jobs:
             ${{ runner.os }}-cargo-registry-
 
       - name: Cache cargo index
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ~/.cargo/git
@@ -155,6 +184,7 @@ jobs:
             ${{ runner.os }}-cargo-index-
 
       - name: Cache target directory
+        if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: target
@@ -168,4 +198,5 @@ jobs:
       # Multicatalog (the runtimedb-specific layer, gated on `write-postgres`) is
       # intentionally excluded here — its test files stay in-tree but don't run.
       - name: Run single-catalog test suite
+        if: steps.changes.outputs.code == 'true'
         run: cargo test --features "duckdb-bundled encryption metadata-mysql metadata-postgres metadata-sqlite write-sqlite"
