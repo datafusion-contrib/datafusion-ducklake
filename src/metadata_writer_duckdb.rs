@@ -1100,6 +1100,32 @@ impl MetadataWriter for DuckdbMetadataWriter {
         Ok(new_snapshot)
     }
 
+    fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(
+            "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+                    se.sort_direction, se.null_order
+             FROM ducklake_sort_info AS si
+             JOIN ducklake_sort_expression AS se
+               ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+             WHERE si.table_id = ? AND si.end_snapshot IS NULL
+             ORDER BY se.sort_key_index",
+        )?;
+        let rows = stmt
+            .query_map(duckdb::params![table_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    i32::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(crate::sort::SortSpec::from_rows(rows))
+    }
+
     fn set_sort_spec(&self, table_id: i64, fields: &[crate::sort::SortField]) -> Result<i64> {
         if fields.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(

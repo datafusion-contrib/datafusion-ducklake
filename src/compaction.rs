@@ -145,55 +145,6 @@ fn append_snapshot_column(batch: &RecordBatch, origin: i64) -> Result<RecordBatc
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
 }
 
-/// Reorder the rows of a compaction output by the table's live sort order, as one
-/// sorted batch. `batches` may carry trailing embedded columns (rowid, and for a
-/// partial file the per-row snapshot id) beyond `data_schema`; sort keys resolve
-/// to `data_schema` positions (the leading columns), so the embedded columns
-/// travel with their rows. Returns `batches` unchanged when there is no producible
-/// sort order, a key is not in the schema, or there are no rows — sorting only
-/// affects statistics locality, never correctness.
-fn sort_compaction_output(
-    batches: Vec<RecordBatch>,
-    data_schema: &Schema,
-    sort_spec: Option<&crate::sort::SortSpec>,
-) -> Result<Vec<RecordBatch>> {
-    let Some(keys) = sort_spec.and_then(|spec| spec.producible_columns()) else {
-        return Ok(batches);
-    };
-    if keys.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-        return Ok(batches);
-    }
-    let mut resolved = Vec::with_capacity(keys.len());
-    for (name, direction, null_order) in &keys {
-        let Ok(index) = data_schema.index_of(name) else {
-            return Ok(batches);
-        };
-        resolved.push((
-            index,
-            arrow::compute::SortOptions {
-                descending: matches!(direction, crate::sort::SortDirection::Desc),
-                nulls_first: null_order.nulls_first(),
-            },
-        ));
-    }
-    let full_schema = batches[0].schema();
-    let combined = arrow::compute::concat_batches(&full_schema, &batches)?;
-    let sort_columns: Vec<arrow::compute::SortColumn> = resolved
-        .iter()
-        .map(|(index, options)| arrow::compute::SortColumn {
-            values: Arc::clone(combined.column(*index)),
-            options: Some(*options),
-        })
-        .collect();
-    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
-    let sorted_columns = combined
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c, &indices, None))
-        .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
-    Ok(vec![RecordBatch::try_new(full_schema, sorted_columns)?])
-}
-
 /// A file's partition identity, normalized for grouping and comparison: the spec
 /// generation it was written under (`None` for an unpartitioned file) and its
 /// per-key values ordered by `partition_key_index`.
@@ -447,8 +398,11 @@ impl DuckLakeTable {
             if merged.is_empty() {
                 continue;
             }
-            let merged =
-                sort_compaction_output(merged, physical_schema.as_ref(), sort_spec.as_ref())?;
+            let merged = crate::sort::sort_batches_by_spec(
+                merged,
+                physical_schema.as_ref(),
+                sort_spec.as_ref(),
+            )?;
             // Every file in the bin shares one partition identity (that is the
             // grouping key), so the merged output inherits it: same Hive directory,
             // same `partition_id` + values in the catalog.
@@ -576,7 +530,7 @@ impl DuckLakeTable {
 
             let live_rows = out.matched_count;
             if live_rows > 0 {
-                let sorted = sort_compaction_output(
+                let sorted = crate::sort::sort_batches_by_spec(
                     out.updated_batches,
                     physical_schema.as_ref(),
                     sort_spec.as_ref(),

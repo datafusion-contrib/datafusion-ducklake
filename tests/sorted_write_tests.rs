@@ -148,6 +148,113 @@ async fn live_file_count(conn_str: &str, table_id: i64) -> usize {
         .len()
 }
 
+/// The low-level bulk write (`write_rows`, and so `write_table`/`append_table`) must
+/// apply the table's sort order itself. It has no plan to carry a `SortExec`, so
+/// without this a caller outside SQL gets rolled files whose ranges OVERLAP — the
+/// files exist but no range filter can skip any of them, silently losing the entire
+/// point of `SET SORTED BY`.
+///
+/// Asserts the file-level property that matters: each rolled file's `val` range is
+/// disjoint from every other's. A per-file sort could not achieve this (a file's
+/// min/max does not depend on row order) — only a global sort before rolling can.
+#[tokio::test(flavor = "multi_thread")]
+async fn low_level_bulk_write_sorts_and_yields_non_overlapping_files() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await;
+    let dl = ddl_catalog(&env.conn_str).await;
+    let ddl_ctx = read_ctx(&env.conn_str).await;
+    execute_ducklake_sql(
+        &ddl_ctx,
+        &dl,
+        "ALTER TABLE ducklake.main.events SET SORTED BY (val)",
+    )
+    .await
+    .unwrap();
+
+    // Shuffled input, fed as many small batches so rollover produces several files.
+    let n = 4000i32;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, true),
+    ]));
+    let batches: Vec<RecordBatch> = (0..n)
+        .step_by(200)
+        .map(|start| {
+            let ids: Vec<i32> = (start..(start + 200).min(n)).collect();
+            let vals: Vec<i32> = ids
+                .iter()
+                .map(|i| ((*i as i64 * 7919) % n as i64) as i32)
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        // Small target so this write rolls into several files.
+        .with_target_file_size(8 * 1024);
+    let result = table_writer
+        .append_table("main", "events", &batches)
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, n as i64);
+    assert!(
+        result.files_written > 1,
+        "the write must roll into several files for this to be meaningful, got {}",
+        result.files_written
+    );
+
+    // Every file's [min, max] on the sort key must be disjoint from every other's.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, snapshot, None, 4096)
+        .unwrap();
+    let val_column_id = 2i64; // events(id, val) -> column_ids 1, 2
+    let mut ranges: Vec<(i64, i64)> = page
+        .iter()
+        .map(|meta| {
+            let stat = meta
+                .column_statistics
+                .iter()
+                .find(|s| s.column_id == val_column_id)
+                .expect("val stats present");
+            (
+                stat.min_value.as_deref().unwrap().parse::<i64>().unwrap(),
+                stat.max_value.as_deref().unwrap().parse::<i64>().unwrap(),
+            )
+        })
+        .collect();
+    ranges.sort();
+    for pair in ranges.windows(2) {
+        assert!(
+            pair[0].1 < pair[1].0,
+            "file ranges must not overlap after a sorted bulk write: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // And a range filter therefore skips files.
+    let ctx = read_ctx(&env.conn_str).await;
+    let scanned = files_scanned(&ctx, "SELECT id FROM ducklake.main.events WHERE val < 100").await;
+    assert!(
+        scanned < ranges.len(),
+        "a range filter must prune files: scanned {scanned} of {}",
+        ranges.len()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn set_and_reset_sorted_by_persists_in_catalog() {
     let env = setup().await;

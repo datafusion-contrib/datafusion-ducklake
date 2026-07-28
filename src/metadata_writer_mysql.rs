@@ -1225,6 +1225,37 @@ impl MetadataWriter for MySqlMetadataWriter {
         })
     }
 
+    fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+                        se.sort_direction, se.null_order
+                 FROM ducklake_sort_info AS si
+                 JOIN ducklake_sort_expression AS se
+                   ON se.sort_id = si.sort_id AND se.table_id = si.table_id
+                 WHERE si.table_id = ? AND si.end_snapshot IS NULL
+                 ORDER BY se.sort_key_index",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let parsed = rows
+                .iter()
+                .map(|row| {
+                    Ok::<_, crate::DuckLakeError>((
+                        row.try_get::<i64, _>(0)?,
+                        i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0),
+                        row.try_get::<String, _>(2)?,
+                        row.try_get::<String, _>(3)?,
+                        row.try_get::<String, _>(4)?,
+                        row.try_get::<String, _>(5)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(crate::sort::SortSpec::from_rows(parsed))
+        })
+    }
+
     fn set_sort_spec(&self, table_id: i64, fields: &[crate::sort::SortField]) -> Result<i64> {
         if fields.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(

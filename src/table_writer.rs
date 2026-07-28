@@ -205,7 +205,7 @@ impl DuckLakeTableWriter {
     /// Begin a streaming write session.
     /// If mode is `WriteMode::Replace`, ends existing files.
     ///
-    /// **Layout-aware**: when the target table is partitioned, the session splits
+    /// **Partition-aware**: when the target table is partitioned, the session splits
     /// each batch by the transformed partition key and keeps one open parquet per
     /// partition (up to
     /// [`max_open_partitions`](Self::with_max_open_partitions), finalizing the
@@ -213,6 +213,20 @@ impl DuckLakeTableWriter {
     /// [`target_file_size`](Self::with_target_file_size). Every file produced is
     /// committed in ONE snapshot by [`TableWriteSession::finish`], so a partitioned
     /// streaming write stays as atomic as an unpartitioned one.
+    ///
+    /// **Sort order is the caller's responsibility here** — rows are written in
+    /// arrival order. Unlike [`Self::write_rows`], a streaming session cannot apply
+    /// the table's sort order itself: the useful sort is a GLOBAL one (official
+    /// DuckLake achieves it with a blocking `PhysicalOrder` above the insert plan),
+    /// and doing that here would mean buffering the entire write — the very thing
+    /// streaming exists to avoid, and unbounded across
+    /// `max_open_partitions` open files. Sorting only *within* each file would buy
+    /// nothing at the file level either, since a file's min/max is the min/max of its
+    /// rows however they are ordered; only its row-group bounds would tighten.
+    ///
+    /// So to get the file-skipping benefit of a sort order from this path, feed
+    /// batches already in sort order, or use [`Self::write_rows`] when the write fits
+    /// in memory. Writing unsorted costs pruning quality only, never correctness.
     pub fn begin_write(
         &self,
         schema_name: &str,
@@ -813,12 +827,20 @@ impl DuckLakeTableWriter {
     /// [`target_file_size`](Self::with_target_file_size)) and commit them in one
     /// snapshot via [`MetadataWriter::register_data_files`].
     ///
-    /// **Layout-aware**: the table's live partition spec is resolved here, so a
-    /// partitioned target splits `batches` into one Hive directory per partition and
-    /// stamps each file's `partition_id` + values — exactly as SQL `INSERT` does.
-    /// This is what keeps a direct caller (no SQL, no
+    /// **Layout-aware**: the table's live partition AND sort specs are resolved here,
+    /// so a partitioned target splits `batches` into one Hive directory per partition
+    /// with each file's `partition_id` + values stamped, and a sorted target has its
+    /// rows globally sorted before rolling — exactly as SQL `INSERT` does. This is
+    /// what keeps a direct caller (no SQL, no
     /// [`crate::metadata_provider::MetadataProvider`]) from writing files the
-    /// partition fence would reject.
+    /// partition fence would reject, or files whose ranges overlap when the table
+    /// declares a sort order.
+    ///
+    /// The sort is global across `batches`, mirroring official DuckLake's blocking
+    /// `PhysicalOrder` above the insert plan, so successive rolled files cover
+    /// contiguous, non-overlapping ranges. It therefore holds the whole write in
+    /// memory; the streaming [`Self::begin_write`] path cannot do this and leaves sort
+    /// order to the caller.
     ///
     /// The spec is read after the write transaction opens, which is the only view a
     /// caller without a `MetadataProvider` has. A spec change racing the commit is
@@ -896,6 +918,39 @@ impl DuckLakeTableWriter {
         } else {
             None
         };
+
+        // Lay the rows out in the table's sort order before splitting or rolling.
+        // This is a GLOBAL sort over the whole write, matching official DuckLake's
+        // blocking PhysicalOrder above the insert plan — that is what makes successive
+        // rolled files cover contiguous, non-overlapping ranges, so a reader can skip
+        // whole files. Splitting by partition afterwards preserves relative order
+        // within each partition, so every file it produces stays sorted.
+        //
+        // Skipped when the caller already arranged the rows (`!resolve_layout` — the
+        // SQL INSERT path, whose plan carries a SortExec for this same spec).
+        let sorted_owned: Vec<RecordBatch> = if resolve_layout {
+            let lengths: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
+            let sorted = crate::sort::sort_batches_by_spec(
+                batches.to_vec(),
+                arrow_schema,
+                self.metadata.live_sort_spec(setup.table_id)?.as_ref(),
+            )?;
+            // The sort concatenates into ONE batch. Rollover is evaluated at batch
+            // boundaries, so handing that single batch onward would emit one file of
+            // unbounded size no matter how large the write — losing rollover exactly
+            // when a sort order makes it most valuable. Re-slice back into the
+            // caller's batch lengths (order-preserving, zero-copy) so rollover sees
+            // the same boundaries it would have without the sort.
+            reslice_to_lengths(sorted, &lengths)
+        } else {
+            Vec::new()
+        };
+        let batches: &[RecordBatch] = if resolve_layout {
+            &sorted_owned
+        } else {
+            batches
+        };
+
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema: SchemaRef = Arc::new(arrow_schema.clone());
@@ -1153,6 +1208,32 @@ async fn finalize_and_upload_file(
     Ok(DataFileInfo::new(catalog_path, file_size, row_count)
         .with_footer_size(footer_size)
         .with_column_stats(column_stats))
+}
+
+/// Split `batches` back into slices of `lengths` rows, in order.
+///
+/// A global sort returns one concatenated batch; rollover and partition splitting
+/// both work per batch, so the single batch is re-sliced to the caller's original
+/// boundaries. `RecordBatch::slice` is a zero-copy view, so this costs no data
+/// movement. Returns the input untouched when it already matches `lengths` (no sort
+/// was applied) or when the totals disagree, so a mismatch degrades to "write what we
+/// have" rather than dropping or duplicating rows.
+fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<RecordBatch> {
+    let total: usize = lengths.iter().sum();
+    if batches.len() != 1 || batches[0].num_rows() != total || lengths.len() <= 1 {
+        return batches;
+    }
+    let combined = &batches[0];
+    let mut out = Vec::with_capacity(lengths.len());
+    let mut offset = 0usize;
+    for len in lengths {
+        if *len == 0 {
+            continue;
+        }
+        out.push(combined.slice(offset, *len));
+        offset += *len;
+    }
+    out
 }
 
 /// How a streaming write session handles a partitioned target.

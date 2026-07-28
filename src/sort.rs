@@ -221,6 +221,70 @@ impl SortSpec {
     }
 }
 
+/// Reorder rows by a table's sort order, returning ONE sorted batch.
+///
+/// `batches` may carry trailing columns beyond `data_schema` (a compaction output
+/// embeds the rowid, and for a partial file the per-row snapshot id); sort keys
+/// resolve to `data_schema` positions — the leading columns — so those trailing
+/// columns travel with their rows.
+///
+/// This is a **global** sort across all of `batches`, matching official DuckLake,
+/// which sorts a write by planting a blocking `PhysicalOrder` above the insert plan
+/// (`ducklake_insert.cpp`). That is what makes successive rolled files cover
+/// contiguous, non-overlapping value ranges — the property that lets a reader skip
+/// whole files. Sorting *within* a file would not achieve it: a file's min/max is
+/// the min/max of its rows regardless of their order, so only its row-group bounds
+/// would tighten.
+///
+/// Returns `batches` unchanged when there is no producible sort order, a key is not
+/// in the schema, or there are no rows — sort order affects statistics locality
+/// only, never correctness.
+#[cfg(feature = "write")]
+pub(crate) fn sort_batches_by_spec(
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    data_schema: &arrow::datatypes::Schema,
+    sort_spec: Option<&SortSpec>,
+) -> crate::Result<Vec<arrow::record_batch::RecordBatch>> {
+    use arrow::array::{ArrayRef, RecordBatch};
+    use std::sync::Arc;
+
+    let Some(keys) = sort_spec.and_then(|spec| spec.producible_columns()) else {
+        return Ok(batches);
+    };
+    if keys.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        return Ok(batches);
+    }
+    let mut resolved = Vec::with_capacity(keys.len());
+    for (name, direction, null_order) in &keys {
+        let Ok(index) = data_schema.index_of(name) else {
+            return Ok(batches);
+        };
+        resolved.push((
+            index,
+            arrow::compute::SortOptions {
+                descending: matches!(direction, SortDirection::Desc),
+                nulls_first: null_order.nulls_first(),
+            },
+        ));
+    }
+    let full_schema = batches[0].schema();
+    let combined = arrow::compute::concat_batches(&full_schema, &batches)?;
+    let sort_columns: Vec<arrow::compute::SortColumn> = resolved
+        .iter()
+        .map(|(index, options)| arrow::compute::SortColumn {
+            values: Arc::clone(combined.column(*index)),
+            options: Some(*options),
+        })
+        .collect();
+    let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)?;
+    let sorted_columns = combined
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c, &indices, None))
+        .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
+    Ok(vec![RecordBatch::try_new(full_schema, sorted_columns)?])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

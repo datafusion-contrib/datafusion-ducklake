@@ -745,6 +745,25 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// The table's currently-live sort spec (`ducklake_sort_info` with
+    /// `end_snapshot IS NULL`, joined to its expressions), or `None` when the table
+    /// has no sort order.
+    ///
+    /// The counterpart of `live_partition_spec` for sort: a caller reaching
+    /// [`crate::table_writer::DuckLakeTableWriter`] directly has no
+    /// [`crate::metadata_provider::MetadataProvider`] to ask, but a bulk write should
+    /// still lay its rows out in the table's sort order so successive files cover
+    /// contiguous, non-overlapping ranges.
+    ///
+    /// Unlike partitioning, getting this wrong is not a correctness problem — an
+    /// unsorted file reads back fine, it just prunes less well — so there is no
+    /// commit-time fence for sort.
+    ///
+    /// Default: `None` (backends without sort support are never sorted).
+    fn live_sort_spec(&self, _table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
+        Ok(None)
+    }
+
     /// Set the table's sort spec — the commit behind `ALTER TABLE … SET SORTED BY
     /// (…)`.
     ///
