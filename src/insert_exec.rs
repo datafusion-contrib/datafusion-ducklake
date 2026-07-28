@@ -270,10 +270,16 @@ impl ExecutionPlan for DuckLakeInsertExec {
             // commits them in one snapshot. Only for non-empty input — an empty
             // Replace still needs the single-file truncate marker below, and empty
             // Append already returned above.
+            //
+            // `_unpartitioned_as_planned`: reaching here means the plan resolved the
+            // table as unpartitioned. If a SET PARTITIONED BY went live since, the
+            // commit fence must reject so the caller re-plans against the new spec —
+            // this write must NOT quietly re-lay-out its rows under a spec the plan
+            // never saw.
             let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
             if total_rows > 0 {
                 let result = table_writer
-                    .write_rows(
+                    .write_rows_unpartitioned_as_planned(
                         &schema_name,
                         &table_name,
                         &schema_without_metadata,

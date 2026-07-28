@@ -820,9 +820,15 @@ impl DuckLakeTableWriter {
     /// [`crate::metadata_provider::MetadataProvider`]) from writing files the
     /// partition fence would reject.
     ///
-    /// The spec is read after the write transaction opens, so it reflects the table
-    /// as of this write rather than as of some earlier planning step; a spec change
-    /// racing the commit is still caught by the fence.
+    /// The spec is read after the write transaction opens, which is the only view a
+    /// caller without a `MetadataProvider` has. A spec change racing the commit is
+    /// still caught by the fence.
+    ///
+    /// Callers that DID make a layout decision earlier (the SQL `INSERT` path, which
+    /// resolves the spec at plan time and pre-splits) must use
+    /// [`Self::write_rows_unpartitioned_as_planned`] instead, so a spec that went
+    /// live in between surfaces as a conflict rather than being silently applied to a
+    /// write planned without it.
     ///
     /// `batches` must hold at least one row (the caller keeps the single-file session
     /// path for empty Replace truncation). `arrow_schema` is the table's data columns
@@ -834,6 +840,43 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
         batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.write_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .await
+    }
+
+    /// Write `batches` as UNPARTITIONED because the caller already established that
+    /// the target has no partition spec.
+    ///
+    /// Used by the SQL `INSERT` path, which resolves the spec at plan time. If a
+    /// `SET PARTITIONED BY` went live between planning and this commit, the partition
+    /// fence rejects with a conflict and the caller retries against the new spec —
+    /// deliberately, rather than re-laying-out the rows under a spec the plan never
+    /// saw.
+    pub(crate) async fn write_rows_unpartitioned_as_planned(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+    ) -> Result<WriteResult> {
+        self.write_rows_inner(schema_name, table_name, arrow_schema, mode, batches, false)
+            .await
+    }
+
+    /// Shared body of [`Self::write_rows`] and
+    /// [`Self::write_rows_unpartitioned_as_planned`]. `resolve_layout` selects
+    /// whether the table's live partition spec drives the layout, or the caller's
+    /// earlier "unpartitioned" determination stands (and the fence adjudicates).
+    async fn write_rows_inner(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        batches: &[RecordBatch],
+        resolve_layout: bool,
     ) -> Result<WriteResult> {
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
@@ -848,7 +891,11 @@ impl DuckLakeTableWriter {
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
-        let partition = self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?;
+        let partition = if resolve_layout {
+            self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
+        } else {
+            None
+        };
         let file_infos = match partition.as_ref() {
             Some(spec) => {
                 let output_schema: SchemaRef = Arc::new(arrow_schema.clone());

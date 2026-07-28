@@ -182,13 +182,15 @@ Known edges:
 - Two concurrent `CREATE TABLE` of the same name on the PostgreSQL multi-catalog path are
   rejected by a unique index, surfacing as a raw database unique-violation rather than a
   clean `Conflict`. A `DROP` racing a write can likewise surface as a raw unique-violation.
-- A write resolves the table's partition spec inside its write transaction and fences on it at
-  commit time, so a file inconsistent with the live spec is never committed — never one stamped
-  with a retired `partition_id`, and never a `partition_id`-less file in a partitioned table.
-  A `SET PARTITIONED BY` landing after an unpartitioned write was *planned* is absorbed: the
-  write lays its rows out per the new spec instead of failing. A spec change landing after the
-  resolve, or a `RESET` that retires the generation a pre-split write already targeted, aborts
-  with `Conflict` (re-open the catalog and retry).
+- Every commit path is fenced on the table's live partition generation, so a file inconsistent
+  with the live spec is never committed — never one stamped with a retired `partition_id`, and
+  never a `partition_id`-less file in a partitioned table.
+- A `SET`/`RESET PARTITIONED BY` that lands between an `INSERT` being planned and committed aborts
+  the `INSERT` with `Conflict`; re-open the catalog and retry, and the retry plans against the new
+  spec. The write is never silently re-laid-out under a spec its plan did not see — a concurrent
+  layout change is reported, not absorbed.
+- The low-level writer entry points have no plan step, so they resolve the live spec inside their
+  own write transaction and lay out accordingly; a spec change racing that commit still fences.
 - Compaction merges only *within* a partition and carries each output's `partition_id` and values
   over from its sources, including a retired generation — those rows really do have that
   generation's layout, so preserving it keeps them prunable exactly as before.
