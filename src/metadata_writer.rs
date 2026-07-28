@@ -709,7 +709,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// [`crate::table_writer::DuckLakeTableWriter`] directly (rather than through SQL
     /// `INSERT`) has no [`crate::metadata_provider::MetadataProvider`] to ask, but
     /// still must lay its files out per the spec and stamp the right `partition_id` —
-    /// otherwise [`enforce_partition_fence`] rejects the commit. Resolved against the
+    /// otherwise `enforce_partition_fence` rejects the commit. Resolved against the
     /// write schema by [`crate::partition::PartitionWriteSpec::resolve`].
     ///
     /// The returned spec is for WRITING only: `prune_safe` is always `false`, since
@@ -717,7 +717,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// generation history that the read path loads.
     ///
     /// Reading it at write-planning time is inherently racy against a concurrent
-    /// `SET`/`RESET PARTITIONED BY` — [`enforce_partition_fence`] is what makes the
+    /// `SET`/`RESET PARTITIONED BY` — `enforce_partition_fence` is what makes the
     /// commit safe, by re-checking the live generation inside the commit transaction.
     ///
     /// Default: `None` (backends without partition support are never partitioned).
@@ -1131,7 +1131,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Official DuckLake's `ducklake_add_data_files` works the same way, reading the
     /// values from the file's Hive path and validating only their shape. What IS
     /// checked here is the shape against the live spec (see
-    /// [`validate_promoted_partition_values`]).
+    /// `validate_promoted_partition_values`).
     ///
     /// Two ways to satisfy the contract safely: copy the values from the source
     /// catalog when promoting files that a partitioned DuckLake table already wrote

@@ -826,7 +826,7 @@ impl DuckLakeTableWriter {
     ///
     /// Callers that DID make a layout decision earlier (the SQL `INSERT` path, which
     /// resolves the spec at plan time and pre-splits) must use
-    /// [`Self::write_rows_unpartitioned_as_planned`] instead, so a spec that went
+    /// `write_rows_unpartitioned_as_planned` instead, so a spec that went
     /// live in between surfaces as a conflict rather than being silently applied to a
     /// write planned without it.
     ///
@@ -866,7 +866,7 @@ impl DuckLakeTableWriter {
     }
 
     /// Shared body of [`Self::write_rows`] and
-    /// [`Self::write_rows_unpartitioned_as_planned`]. `resolve_layout` selects
+    /// `write_rows_unpartitioned_as_planned`. `resolve_layout` selects
     /// whether the table's live partition spec drives the layout, or the caller's
     /// earlier "unpartitioned" determination stands (and the fence adjudicates).
     async fn write_rows_inner(
