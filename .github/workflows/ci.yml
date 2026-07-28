@@ -95,20 +95,41 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
-      # Clippy above runs `--all-features`, so `write` is always on and a
-      # read-only build can break without any job noticing (a `write`-gated
-      # module referenced from ungated code is a hard error only when `write`
-      # is off). These are the feature sets real consumers use, including the
-      # one the Benchmark workflow builds — which is push-to-main only, so a
-      # break there is not visible until after the merge.
-      # No `-D warnings`: a read-only build legitimately reports dead_code for
-      # the write-only helpers, and gating struct fields to silence that would
+      # Every other job builds with `--all-features` or `write-sqlite`, which only
+      # proves the union of features compiles. It cannot catch a module that
+      # accidentally depends on a sibling feature, because a stronger feature set
+      # always supplies the missing one. That is a hard error for real consumers:
+      # an ungated module referencing a `write`-gated one fails only when `write`
+      # is off, and the sole build without `write` was the Benchmark workflow —
+      # push-to-main only, so the break was invisible until after the merge.
+      #
+      # So isolate each independently-supported axis once. `--workspace` covers
+      # the default feature set, including the benchmark package's bins.
+      #
+      # No `-D warnings`: a read-only build legitimately reports dead_code for the
+      # write-only helpers, and `#[cfg]`-gating struct fields to silence that would
       # be worse than the warning.
       - name: Check feature combinations
         run: |
           cargo check --workspace --all-targets
-          cargo check --no-default-features --features metadata-duckdb
-          cargo check --no-default-features --features metadata-sqlite
+          for features in \
+            "" \
+            metadata-duckdb \
+            metadata-sqlite \
+            metadata-postgres \
+            metadata-mysql \
+            multicatalog-postgres \
+            write \
+            write-duckdb \
+            write-sqlite \
+            write-postgres \
+            write-mysql \
+            metadata-duckdb,encryption
+          do
+            echo "::group::cargo check --no-default-features --features '$features'"
+            cargo check --no-default-features --features "$features"
+            echo "::endgroup::"
+          done
 
       - name: Run tests
         # `write-sqlite` pulls in the writer and sqlite-provider tests,
