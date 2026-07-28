@@ -4689,6 +4689,17 @@ async fn register_existing_data_file_persists_partition_assignment() {
         "must not blame a concurrent DDL change that did not happen, got: {msg}"
     );
 
+    // A 0-row promote is refused too. The shared fence exempts empty files for the
+    // sake of the empty-Replace truncate marker, but promote has no such marker, and
+    // official's AddFileToTable applies its key-count check with no row-count
+    // exception — so exempting it here would accept a file official rejects.
+    let empty = DataFileInfo::new("f5.parquet", 0, 0);
+    assert!(
+        w.register_existing_data_file("public", "orders", &cols(), &ids, &empty, WriteMode::Append)
+            .is_err(),
+        "a 0-row promote with no partition must be refused on a partitioned table"
+    );
+
     // A value count that disagrees with the live spec is refused too.
     let wrong_arity = DataFileInfo::new("f4.parquet", 256, 1).with_partition(
         spec.partition_id,

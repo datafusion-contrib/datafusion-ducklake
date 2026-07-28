@@ -272,6 +272,77 @@ async fn streaming_session_respects_open_partition_cap() {
     assert_eq!(count, 4, "every row must be readable after eviction");
 }
 
+/// The write entry points that target ONE caller-determined file cannot satisfy a
+/// partition spec that needs one file per partition. They must refuse a partitioned
+/// table with a typed error naming the entry point — never fall through and commit a
+/// file with no partition, which would make the table's layout a lie and silently
+/// break pruning. These are the documented gaps; this test exists so that closing one
+/// is a deliberate act rather than an accident.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_file_entry_points_refuse_a_partitioned_table() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await; // partitioned by (region, year(ts))
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let batches = events_batches();
+    let arrow_schema = batches[0].schema();
+
+    // Embedded-rowid session (the UPDATE row-rewrite path).
+    let err = table_writer
+        .begin_write_with_embedded_rowid("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .expect_err("embedded-rowid write must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("begin_write_with_embedded_rowid"),
+        "the error must name the entry point, got: {err}"
+    );
+
+    // Custom-path session.
+    let err = table_writer
+        .begin_write_to_path(
+            "main",
+            "events",
+            arrow_schema.as_ref(),
+            "/tmp/some-dir",
+            "f.parquet".to_string(),
+            WriteMode::Append,
+        )
+        .expect_err("custom-path write must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("begin_write_to_path"),
+        "the error must name the entry point, got: {err}"
+    );
+
+    // Atomic append+delete (the upsert commit) on a partitioned session.
+    let mut session = table_writer
+        .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batches[0]).unwrap();
+    let err = session
+        .finish_with_deletes(&[])
+        .await
+        .expect_err("append+delete must refuse a partitioned table");
+    assert!(
+        err.to_string().contains("partitioned table"),
+        "the error must say why, got: {err}"
+    );
+
+    // Nothing was committed by any of the three.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    assert!(
+        provider
+            .get_table_file_metadata_page(env.table_id, snap, None, 4096)
+            .unwrap()
+            .is_empty(),
+        "a refused write must commit no data files"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn partitioned_insert_writes_one_file_per_partition() {
     let env = setup().await;

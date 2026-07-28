@@ -2146,7 +2146,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             // lost a race, so the fence's "concurrent SET PARTITIONED BY … retry"
             // wording would send them chasing a problem that does not exist. Tell
             // them what to actually do instead.
-            if file.partition_id.is_none() && file.record_count > 0 && live_partition_id.is_some() {
+            //
+            // Deliberately NOT exempting a 0-row file, unlike the shared fence.
+            // That exemption exists for the empty-Replace truncate marker a write
+            // session emits, which has no promote equivalent — a promoted file is one
+            // the caller actually produced. Official agrees: `AddFileToTable` compares
+            // the derived value count against the spec's key count with no row-count
+            // exception, so an empty file with no assignment is rejected there too.
+            if file.partition_id.is_none() && live_partition_id.is_some() {
                 return Err(crate::DuckLakeError::InvalidConfig(format!(
                     "cannot promote {} into table {table_id}: the table is partitioned, so a \
                      registered file must declare the single partition its rows belong to. \
