@@ -1074,15 +1074,18 @@ impl DuckLakeTableWriter {
     }
 
     /// Write `batches` into ONE OR MORE parquet files under `table_key` (data
-    /// columns with catalog field-ids, no embedded rowid), rolling over to a new
-    /// file whenever the current file's estimated encoded size reaches
-    /// `target_file_size`. `rel_prefix`, when set, is a Hive-style subpath (a
-    /// partition group) each file is placed under. Rollover is checked at batch
-    /// boundaries, so a file always holds a whole number of batches — preserving
-    /// any input ordering *across* files (file N's rows all precede file N+1's).
+    /// columns with catalog field-ids, no embedded rowid), rolling over to a new file
+    /// whenever the current file reaches `target_file_size`. `rel_prefix`, when set, is
+    /// a Hive-style subpath (a partition group) each file is placed under.
+    ///
+    /// Rollover mechanics live in [`RollingFileWriter`], shared with the streaming
+    /// session's per-partition sink so the two cannot drift. This path differs only in
+    /// its upload policy: having `await` available, it uploads each file as soon as it
+    /// rolls, so at most one staged file occupies local disk at a time.
+    ///
     /// Returns one [`DataFileInfo`] per file (relative catalog path set, stats and
-    /// footer harvested); empty rows produce no file. A write smaller than
-    /// `target_file_size` yields exactly one file.
+    /// footer harvested); empty rows produce no file, and a write below
+    /// `target_file_size` yields exactly one.
     async fn write_rolled_files(
         &self,
         table_key: &str,
@@ -1091,133 +1094,38 @@ impl DuckLakeTableWriter {
         column_ids: &[i64],
         batches: &[RecordBatch],
     ) -> Result<Vec<DataFileInfo>> {
+        let mut roller = RollingFileWriter::new(
+            table_key.to_string(),
+            rel_prefix.map(str::to_string),
+            schema_with_ids,
+            column_ids.len(),
+            self.build_writer_props(),
+            self.target_file_size,
+        );
         let mut files: Vec<DataFileInfo> = Vec::new();
-        // In-progress file (None between files / before the first row).
-        let mut writer: Option<ArrowWriter<std::io::BufWriter<std::fs::File>>> = None;
-        let mut temp: Option<NamedTempFile> = None;
-        let mut catalog_path = String::new();
-        let mut object_path = ObjectPath::from("");
-        let mut row_count: i64 = 0;
-        let mut nan_flags: Vec<Option<bool>> = Vec::new();
-
         for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            if writer.is_none() {
-                let file_name = format!("{}.parquet", Uuid::new_v4());
-                catalog_path = match rel_prefix {
-                    Some(prefix) if !prefix.is_empty() => format!("{prefix}/{file_name}"),
-                    _ => file_name.clone(),
-                };
-                let object_path_str = join_paths(table_key, &catalog_path)?;
-                object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
-                let temp_file = NamedTempFile::new()?;
-                let staging = std::io::BufWriter::new(temp_file.reopen()?);
-                writer = Some(ArrowWriter::try_new(
-                    staging,
-                    schema_with_ids.clone(),
-                    Some(self.build_writer_props()),
-                )?);
-                temp = Some(temp_file);
-                row_count = 0;
-                nan_flags = Vec::new();
-            }
-
-            let batch_with_ids =
-                RecordBatch::try_new(schema_with_ids.clone(), batch.columns().to_vec())?;
-            crate::stats_collect::accumulate_nan_flags(
-                &mut nan_flags,
-                &batch_with_ids,
-                column_ids.len(),
-            );
-            let active = writer.as_mut().unwrap();
-            active.write(&batch_with_ids)?;
-            row_count += batch.num_rows() as i64;
-
-            // Roll over at the batch boundary once the estimated encoded size
-            // (finished row groups + the in-progress one) reaches the target.
-            if active.bytes_written() + active.in_progress_size() >= self.target_file_size {
-                let info = finalize_and_upload_file(
-                    writer.take().unwrap(),
-                    temp.take().unwrap(),
-                    &self.object_store,
-                    &object_path,
-                    &catalog_path,
-                    column_ids,
-                    row_count,
-                    &nan_flags,
-                )
-                .await?;
-                files.push(info);
+            if let Some(staged) = roller.write(batch)? {
+                files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
             }
         }
-
-        // Finalize the trailing (or only) file.
-        if let Some(active) = writer.take() {
-            let info = finalize_and_upload_file(
-                active,
-                temp.take().unwrap(),
-                &self.object_store,
-                &object_path,
-                &catalog_path,
-                column_ids,
-                row_count,
-                &nan_flags,
-            )
-            .await?;
-            files.push(info);
+        if let Some(staged) = roller.finish()? {
+            files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
         }
-
         Ok(files)
     }
 }
 
-/// Finalize the parquet footer of a staged file, stream it to object storage, and
-/// harvest per-column stats — returning the [`DataFileInfo`] for the catalog
-/// commit (relative `catalog_path`). Shared by every multi-file write path.
-#[allow(clippy::too_many_arguments)]
-async fn finalize_and_upload_file(
-    writer: ArrowWriter<std::io::BufWriter<std::fs::File>>,
-    temp: NamedTempFile,
-    object_store: &Arc<dyn ObjectStore>,
-    object_path: &ObjectPath,
-    catalog_path: &str,
-    column_ids: &[i64],
-    row_count: i64,
-    nan_flags: &[Option<bool>],
-) -> Result<DataFileInfo> {
-    let staged = writer.into_inner()?;
-    let mut file = staged
-        .into_inner()
-        .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
-    let file_size = file.metadata()?.len() as i64;
-    let footer_size = read_footer_size(&mut file)?;
-
-    let local = tokio::fs::File::open(temp.path()).await?;
-    let mut reader = tokio::io::BufReader::new(local);
-    let mut upload = ObjectBufWriter::new(Arc::clone(object_store), object_path.clone());
-    if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-        let _ = upload.abort().await;
-        return Err(e.into());
-    }
-
-    let column_stats =
-        crate::stats_collect::collect_column_stats(temp.path(), column_ids, row_count, nan_flags);
-
-    Ok(DataFileInfo::new(catalog_path, file_size, row_count)
-        .with_footer_size(footer_size)
-        .with_column_stats(column_stats))
-}
-
 /// Split `batches` back into slices of `lengths` rows, in order.
 ///
-/// A global sort returns one concatenated batch; rollover and partition splitting
-/// both work per batch, so the single batch is re-sliced to the caller's original
-/// boundaries. `RecordBatch::slice` is a zero-copy view, so this costs no data
-/// movement. Returns the input untouched when it already matches `lengths` (no sort
-/// was applied) or when the totals disagree, so a mismatch degrades to "write what we
-/// have" rather than dropping or duplicating rows.
+/// A global sort returns one concatenated batch, but rollover is evaluated per batch,
+/// so handing that single batch to a [`RollingFileWriter`] would emit one file of
+/// unbounded size — losing rollover exactly where a sort order makes it most valuable.
+/// `RecordBatch::slice` is a zero-copy view, so restoring the caller's boundaries costs
+/// no data movement.
+///
+/// Returns the input untouched when it already matches `lengths` (no sort was applied)
+/// or when the totals disagree, so a mismatch degrades to "write what we have" rather
+/// than dropping or duplicating rows.
 fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<RecordBatch> {
     let total: usize = lengths.iter().sum();
     if batches.len() != 1 || batches[0].num_rows() != total || lengths.len() <= 1 {
@@ -1236,52 +1144,27 @@ fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<Recor
     out
 }
 
-/// How a streaming write session handles a partitioned target.
-#[derive(Debug, Clone, Copy)]
-enum StreamPartitionMode {
-    /// Split rows across one file per partition (a [`PartitionSink`]).
-    Split,
-    /// Refuse: this entry point writes to a single file the caller chose (a custom
-    /// path, or a file carrying embedded row lineage), which cannot also satisfy a
-    /// partition spec. Errors with the entry point named, rather than letting the
-    /// commit fail later with a partition-fence conflict that reads as a concurrent
-    /// DDL change.
-    Reject {
-        entry_point: &'static str,
-    },
-}
-
-/// One parquet file a [`PartitionSink`] is currently writing rows into.
+/// One parquet file being written to local staging.
 #[derive(Debug)]
-struct OpenPartitionFile {
-    /// The partition values every row in this file shares, in key order.
-    values: Vec<Option<String>>,
+struct OpenFile {
     writer: ArrowWriter<std::io::BufWriter<std::fs::File>>,
     temp: NamedTempFile,
-    /// Path relative to the table directory (includes the Hive subpath).
+    /// Path relative to the table directory (includes any Hive subpath).
     catalog_path: String,
     object_path: ObjectPath,
     row_count: i64,
     nan_flags: Vec<Option<bool>>,
 }
 
-/// A parquet file whose footer is written and whose staging file is complete, but
-/// which has not been uploaded yet.
+/// A finished parquet whose footer is written and whose staging file is complete on
+/// disk, awaiting upload.
 ///
-/// A streaming session finalizes files as it goes (on rollover, or when evicting to
-/// respect the open-file cap) but uploads them all in `finish`. Finalizing is
-/// synchronous, which is what lets [`TableWriteSession::write_batch`] stay
-/// synchronous; uploading is async and belongs to the one `finish` await point.
-///
-/// Holds a [`TempPath`], not a `NamedTempFile`: the staged file is not touched again
-/// until upload, so keeping its descriptor open would make the session's open-fd
-/// count grow with the TOTAL number of files written rather than staying bounded by
-/// `max_open` — a high-cardinality partition key would exhaust descriptors even
-/// though only `max_open` writers are live. `TempPath` keeps the file on disk (and
-/// still deletes it on drop) with no descriptor held.
+/// Holds a [`tempfile::TempPath`], not a `NamedTempFile`: nothing touches the file
+/// again until upload, so keeping a descriptor open would make a writer's open-fd count
+/// grow with the TOTAL number of files it produced rather than staying bounded.
+/// `TempPath` keeps the file on disk (still deleted on drop) with no descriptor held.
 #[derive(Debug)]
-struct StagedPartitionFile {
-    values: Vec<Option<String>>,
+struct StagedFile {
     temp: tempfile::TempPath,
     catalog_path: String,
     object_path: ObjectPath,
@@ -1289,99 +1172,104 @@ struct StagedPartitionFile {
     nan_flags: Vec<Option<bool>>,
 }
 
-/// Routes a streaming write's rows into one parquet file per partition.
+/// Writes batches into a sequence of parquet files, starting a new one whenever the
+/// current file reaches `target_file_size`.
 ///
-/// Mirrors DuckDB's partitioned COPY sink (which is how official DuckLake writes a
-/// partitioned table): keep a writer open per partition seen, roll a file over at
-/// `target_file_size`, and finalize the least-recently-opened file when the number
-/// of open files would exceed `max_open`. All files produced are committed in ONE
-/// snapshot, so a partitioned streaming write is as atomic as an unpartitioned one.
+/// The single home for rollover, used by both write paths — the buffered
+/// [`DuckLakeTableWriter::write_rolled_files`] and the streaming session's
+/// per-partition sink — so the check cannot be applied in one place and forgotten in
+/// the other. It was forgotten once already: a partitioned write left
+/// `target_file_size` unenforceable within a partition.
+///
+/// Deliberately synchronous, and deliberately does NOT upload: `write` returns the
+/// finished [`StagedFile`] whenever a roll happened and leaves the upload policy to the
+/// caller. That is what lets the streaming session keep
+/// [`TableWriteSession::write_batch`] synchronous (it defers uploads to `finish`) while
+/// the buffered path uploads eagerly to bound local disk use.
 #[derive(Debug)]
-struct PartitionSink {
-    spec: crate::partition::PartitionWriteSpec,
-    key_names: Vec<String>,
-    /// Object-store key prefix of the table directory; Hive subpaths hang off it.
+struct RollingFileWriter {
     table_key: String,
-    /// Field-id-tagged schema every written batch carries.
+    rel_prefix: Option<String>,
     schema_with_ids: SchemaRef,
-    column_ids: Vec<i64>,
+    /// Number of catalog data columns, for NaN-flag accumulation.
+    data_column_count: usize,
     props: WriterProperties,
     target_file_size: usize,
-    max_open: usize,
-    /// Open writers, oldest first (eviction takes from the front).
-    open: Vec<OpenPartitionFile>,
-    /// Finalized files awaiting upload at `finish`.
-    staged: Vec<StagedPartitionFile>,
+    open: Option<OpenFile>,
 }
 
-impl PartitionSink {
-    /// Split `batch` by partition and write each group to that partition's open
-    /// file, opening and rolling files as needed.
-    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        // Group by the transformed partition key. The group batches are built with
-        // the field-id-tagged schema, so they are ready to write as-is.
-        let groups = crate::partition::split_batches_by_partition(
-            &self.schema_with_ids,
-            std::slice::from_ref(batch),
-            &self.spec,
-        )?;
-        for (values, batches) in groups {
-            for group_batch in batches {
-                if group_batch.num_rows() == 0 {
-                    continue;
-                }
-                self.write_group_batch(&values, &group_batch)?;
-            }
+impl RollingFileWriter {
+    fn new(
+        table_key: String,
+        rel_prefix: Option<String>,
+        schema_with_ids: SchemaRef,
+        data_column_count: usize,
+        props: WriterProperties,
+        target_file_size: usize,
+    ) -> Self {
+        Self {
+            table_key,
+            rel_prefix,
+            schema_with_ids,
+            data_column_count,
+            props,
+            target_file_size,
+            open: None,
         }
-        Ok(())
     }
 
-    /// Append one partition's rows to that partition's open file (opening it, and
-    /// evicting another partition's file if at the cap), then roll the file over if
-    /// it has reached the target size.
-    fn write_group_batch(&mut self, values: &[Option<String>], batch: &RecordBatch) -> Result<()> {
-        let index = match self.open.iter().position(|f| f.values == values) {
-            Some(index) => index,
-            None => {
-                if self.open.len() >= self.max_open {
-                    // Evict the least-recently-opened file: finalize it locally so
-                    // it is complete on disk, and upload it at finish.
-                    let evicted = self.open.remove(0);
-                    let staged = finalize_open_file(evicted)?;
-                    self.staged.push(staged);
-                }
-                self.open.push(self.open_file(values.to_vec())?);
-                self.open.len() - 1
-            },
-        };
-
-        let file = &mut self.open[index];
+    /// Append `batch`, opening a file if none is in progress. Returns the finished
+    /// [`StagedFile`] when this batch pushed the current file to `target_file_size`
+    /// (rollover is evaluated at batch boundaries, so a file always holds a whole
+    /// number of batches and any input ordering is preserved *across* files).
+    ///
+    /// `batch` must carry the table's data columns positionally; the field-id-tagged
+    /// schema is re-imposed here.
+    fn write(&mut self, batch: &RecordBatch) -> Result<Option<StagedFile>> {
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        if self.open.is_none() {
+            self.open = Some(self.open_file()?);
+        }
+        let batch_with_ids =
+            RecordBatch::try_new(self.schema_with_ids.clone(), batch.columns().to_vec())?;
+        let open = self.open.as_mut().expect("file opened above");
         crate::stats_collect::accumulate_nan_flags(
-            &mut file.nan_flags,
-            batch,
-            self.column_ids.len(),
+            &mut open.nan_flags,
+            &batch_with_ids,
+            self.data_column_count,
         );
-        file.writer.write(batch)?;
-        file.row_count += batch.num_rows() as i64;
+        open.writer.write(&batch_with_ids)?;
+        open.row_count += batch.num_rows() as i64;
 
-        // Roll over at the batch boundary once the estimated encoded size
-        // (finished row groups + the in-progress one) reaches the target.
-        if file.writer.bytes_written() + file.writer.in_progress_size() >= self.target_file_size {
-            let rolled = self.open.remove(index);
-            let staged = finalize_open_file(rolled)?;
-            self.staged.push(staged);
+        // Estimated encoded size = finished row groups + the in-progress one.
+        if open.writer.bytes_written() + open.writer.in_progress_size() >= self.target_file_size {
+            return Ok(Some(finalize_open_file(
+                self.open.take().expect("file open"),
+            )?));
         }
-        Ok(())
+        Ok(None)
     }
 
-    /// Open a new staging parquet for `values` under that partition's Hive subpath.
-    fn open_file(&self, values: Vec<Option<String>>) -> Result<OpenPartitionFile> {
-        let rel = crate::partition::hive_subpath(&self.key_names, &values);
+    /// Finish the trailing (or only) file, if any rows were written.
+    fn finish(&mut self) -> Result<Option<StagedFile>> {
+        match self.open.take() {
+            Some(open) => Ok(Some(finalize_open_file(open)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a file is currently in progress (any rows written since the last roll).
+    fn has_open_file(&self) -> bool {
+        self.open.is_some()
+    }
+
+    fn open_file(&self) -> Result<OpenFile> {
         let file_name = format!("{}.parquet", Uuid::new_v4());
-        let catalog_path = if rel.is_empty() {
-            file_name
-        } else {
-            format!("{rel}/{file_name}")
+        let catalog_path = match self.rel_prefix.as_deref() {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}/{file_name}"),
+            _ => file_name,
         };
         let object_path_str = join_paths(&self.table_key, &catalog_path)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
@@ -1392,8 +1280,7 @@ impl PartitionSink {
             self.schema_with_ids.clone(),
             Some(self.props.clone()),
         )?;
-        Ok(OpenPartitionFile {
-            values,
+        Ok(OpenFile {
             writer,
             temp,
             catalog_path,
@@ -1402,45 +1289,18 @@ impl PartitionSink {
             nan_flags: Vec::new(),
         })
     }
-
-    /// Finalize every open file and upload all staged files, returning the
-    /// [`DataFileInfo`]s to commit — each stamped with its partition.
-    async fn into_file_infos(
-        mut self,
-        object_store: &Arc<dyn ObjectStore>,
-    ) -> Result<Vec<DataFileInfo>> {
-        for file in std::mem::take(&mut self.open) {
-            self.staged.push(finalize_open_file(file)?);
-        }
-        let mut infos = Vec::with_capacity(self.staged.len());
-        for staged in std::mem::take(&mut self.staged) {
-            let partition_values: Vec<(i32, Option<String>)> = staged
-                .values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i32, v.clone()))
-                .collect();
-            let info = upload_staged_file(staged, object_store, &self.column_ids).await?;
-            infos.push(info.with_partition(self.spec.partition_id, partition_values));
-        }
-        Ok(infos)
-    }
 }
 
-/// Write the parquet footer of an open file and flush its staging file to disk,
-/// leaving it ready to upload. Synchronous, so the streaming write path needs no
-/// await.
-fn finalize_open_file(file: OpenPartitionFile) -> Result<StagedPartitionFile> {
+/// Write the parquet footer and flush the staging file to disk, releasing its
+/// descriptor. Synchronous, so a streaming write needs no await to roll a file.
+fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
     let staged = file.writer.into_inner()?;
     // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
-    // returned handle closes that descriptor. Converting the NamedTempFile to a
-    // TempPath releases its descriptor too, leaving only the on-disk file (still
-    // deleted on drop) so staged files cost no descriptors while they wait.
+    // returned handle closes that descriptor.
     staged
         .into_inner()
         .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
-    Ok(StagedPartitionFile {
-        values: file.values,
+    Ok(StagedFile {
         temp: file.temp.into_temp_path(),
         catalog_path: file.catalog_path,
         object_path: file.object_path,
@@ -1449,10 +1309,11 @@ fn finalize_open_file(file: OpenPartitionFile) -> Result<StagedPartitionFile> {
     })
 }
 
-/// Upload a finalized staging file and harvest its stats, returning the
-/// [`DataFileInfo`] to register (relative path; the caller stamps the partition).
+/// Upload a finished staging file and harvest its per-column stats, returning the
+/// [`DataFileInfo`] for the catalog commit (relative path; the caller stamps any
+/// partition). On failure the multipart upload is aborted so no partial object is left.
 async fn upload_staged_file(
-    staged: StagedPartitionFile,
+    staged: StagedFile,
     object_store: &Arc<dyn ObjectStore>,
     column_ids: &[i64],
 ) -> Result<DataFileInfo> {
@@ -1482,7 +1343,147 @@ async fn upload_staged_file(
     )
 }
 
-/// Streaming write session. Batches stream to a local staging file; the
+/// How a streaming write session handles a partitioned target.
+#[derive(Debug, Clone, Copy)]
+enum StreamPartitionMode {
+    /// Split rows across one file per partition (a [`PartitionSink`]).
+    Split,
+    /// Refuse: this entry point writes to a single file the caller chose (a custom
+    /// path, or a file carrying embedded row lineage), which cannot also satisfy a
+    /// partition spec. Errors with the entry point named, rather than letting the
+    /// commit fail later with a partition-fence conflict that reads as a concurrent
+    /// DDL change.
+    Reject {
+        entry_point: &'static str,
+    },
+}
+
+/// Routes a streaming write's rows into one parquet file per partition.
+///
+/// Mirrors DuckDB's partitioned COPY sink (which is how official DuckLake writes a
+/// partitioned table): keep a writer open per partition seen, roll at
+/// `target_file_size`, and finalize the least-recently-opened one when the number of
+/// open files would exceed `max_open`. All files produced are committed in ONE
+/// snapshot, so a partitioned streaming write is as atomic as an unpartitioned one.
+///
+/// Each partition's file sequence is a [`RollingFileWriter`] — the same rollover
+/// implementation the buffered path uses — so the two cannot drift. This sink differs
+/// only in upload policy: `write_batch` must stay synchronous, so rolled and evicted
+/// files are held as staged files on disk and uploaded together in `finish`.
+#[derive(Debug)]
+struct PartitionSink {
+    spec: crate::partition::PartitionWriteSpec,
+    key_names: Vec<String>,
+    /// Object-store key prefix of the table directory; Hive subpaths hang off it.
+    table_key: String,
+    /// Field-id-tagged schema every written batch carries.
+    schema_with_ids: SchemaRef,
+    column_ids: Vec<i64>,
+    props: WriterProperties,
+    target_file_size: usize,
+    max_open: usize,
+    /// One roller per partition with a file in progress, oldest first (eviction takes
+    /// from the front). Paired with the partition values its files carry.
+    open: Vec<(Vec<Option<String>>, RollingFileWriter)>,
+    /// Finished files awaiting upload at `finish`, with the partition each belongs to.
+    staged: Vec<(Vec<Option<String>>, StagedFile)>,
+}
+
+impl PartitionSink {
+    /// Split `batch` by partition and write each group to that partition's roller.
+    fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // The group batches are built with the field-id-tagged schema, so the roller
+        // re-imposing that schema is a no-op rather than a mismatch.
+        let groups = crate::partition::split_batches_by_partition(
+            &self.schema_with_ids,
+            std::slice::from_ref(batch),
+            &self.spec,
+        )?;
+        for (values, batches) in groups {
+            for group_batch in batches {
+                if group_batch.num_rows() == 0 {
+                    continue;
+                }
+                self.write_group_batch(&values, &group_batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Append one partition's rows to its roller, opening one (and evicting another
+    /// partition's file if already at `max_open`) when this partition has none.
+    fn write_group_batch(&mut self, values: &[Option<String>], batch: &RecordBatch) -> Result<()> {
+        let index = match self.open.iter().position(|(v, _)| v == values) {
+            Some(index) => index,
+            None => {
+                if self.open.len() >= self.max_open {
+                    // Evict the least-recently-opened partition: finish its file so it
+                    // is complete on disk, and upload it at `finish`. That partition
+                    // simply gets another file if more of its rows arrive.
+                    let (evicted_values, mut evicted) = self.open.remove(0);
+                    if let Some(staged) = evicted.finish()? {
+                        self.staged.push((evicted_values, staged));
+                    }
+                }
+                let rel = crate::partition::hive_subpath(&self.key_names, values);
+                self.open.push((
+                    values.to_vec(),
+                    RollingFileWriter::new(
+                        self.table_key.clone(),
+                        if rel.is_empty() {
+                            None
+                        } else {
+                            Some(rel)
+                        },
+                        self.schema_with_ids.clone(),
+                        self.column_ids.len(),
+                        self.props.clone(),
+                        self.target_file_size,
+                    ),
+                ));
+                self.open.len() - 1
+            },
+        };
+
+        let (partition_values, roller) = &mut self.open[index];
+        if let Some(staged) = roller.write(batch)? {
+            let partition_values = partition_values.clone();
+            self.staged.push((partition_values, staged));
+            // The roller rolled its file; drop it from `open` unless it already has a
+            // fresh one in progress, so the open-file cap counts real open files.
+            if !self.open[index].1.has_open_file() {
+                self.open.remove(index);
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish every open file and upload all staged files, returning the
+    /// [`DataFileInfo`]s to commit — each stamped with its partition.
+    async fn into_file_infos(
+        mut self,
+        object_store: &Arc<dyn ObjectStore>,
+    ) -> Result<Vec<DataFileInfo>> {
+        for (values, mut roller) in std::mem::take(&mut self.open) {
+            if let Some(staged) = roller.finish()? {
+                self.staged.push((values, staged));
+            }
+        }
+        let mut infos = Vec::with_capacity(self.staged.len());
+        for (values, staged) in std::mem::take(&mut self.staged) {
+            let partition_values: Vec<(i32, Option<String>)> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as i32, v.clone()))
+                .collect();
+            let info = upload_staged_file(staged, object_store, &self.column_ids).await?;
+            infos.push(info.with_partition(self.spec.partition_id, partition_values));
+        }
+        Ok(infos)
+    }
+}
+
+/// Streaming write session./// Streaming write session. Batches stream to a local staging file; the
 /// finished parquet is uploaded in `finish()`. If the session is dropped
 /// without finishing, the staging file is removed and nothing is uploaded.
 #[derive(Debug)]
