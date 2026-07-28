@@ -426,7 +426,14 @@ fn transform_array(
 /// partition values — one group per distinct key. Returns `(values, batches)` per
 /// group, where `values[i]` is the encoded value for partition key `i` (`None` for
 /// SQL NULL). Rows sharing a key land in the same group regardless of which input
-/// batch they came from.
+/// batch they came from, and keep their relative order.
+///
+/// Each group holds ONE OUTPUT BATCH PER INPUT BATCH that contributed rows to it,
+/// rather than a single concatenated batch. This matters because the writer evaluates
+/// file rollover at batch boundaries: collapsing a group into one batch would leave
+/// `target_file_size` unenforceable within a partition, emitting one file of unbounded
+/// size however large the write. It also keeps peak memory to one input batch's worth
+/// of `take` output instead of a full copy of the input.
 ///
 /// `output_schema` is the schema the returned batches carry (the table's clean data
 /// columns); `batches` must already match it positionally.
@@ -436,72 +443,88 @@ pub(crate) fn split_batches_by_partition(
     spec: &PartitionWriteSpec,
 ) -> crate::Result<Vec<PartitionGroup>> {
     use arrow::array::{ArrayRef, RecordBatch, UInt32Array};
-    use arrow::compute::{concat_batches, take};
+    use arrow::compute::take;
     use std::collections::HashMap;
 
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-    let input_schema = batches[0].schema();
-    let combined = concat_batches(&input_schema, batches)?;
-    let num_rows = combined.num_rows();
-    if num_rows == 0 {
-        return Ok(Vec::new());
-    }
+    // Group index by partition values, so groups keep first-seen order across
+    // batches and every batch appends into the same group.
+    let mut order: Vec<Vec<Option<String>>> = Vec::new();
+    let mut groups: HashMap<Vec<Option<String>>, Vec<RecordBatch>> = HashMap::new();
 
-    // Transform each partition-key column once for the whole dataset.
-    let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
-    for key in &spec.keys {
-        transformed.push(transform_array(
-            &key.transform,
-            combined.column(key.input_index),
-        )?);
-    }
-
-    // Group row indices by the encoded partition-value tuple.
-    let mut groups: HashMap<Vec<Option<String>>, Vec<u32>> = HashMap::new();
-    for row in 0..num_rows {
-        let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
-        for array in &transformed {
-            let scalar = ScalarValue::try_from_array(array, row)?;
-            // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
-            // non-null value of a type it cannot encode. Those must not be
-            // conflated: silently mapping an unencodable non-null value to `None`
-            // would group every distinct such value into one file with a NULL
-            // partition value (data corruption). A NULL is a legitimate partition
-            // value; an unencodable non-null value is a hard error.
-            let encoded = if scalar.is_null() {
-                None
-            } else {
-                match crate::stats_encode::encode_scalar(&scalar) {
-                    Some(encoded) => Some(encoded),
-                    None => {
-                        return Err(crate::DuckLakeError::Unsupported(format!(
-                            "partitioned write: partition-key value of type {} cannot be \
-                             encoded; partitioning by this column type is not supported",
-                            array.data_type()
-                        )));
-                    },
-                }
-            };
-            values.push(encoded);
+    for batch in batches {
+        let num_rows = batch.num_rows();
+        if num_rows == 0 {
+            continue;
         }
-        groups.entry(values).or_default().push(row as u32);
+        // Transform each partition-key column once per batch.
+        let mut transformed: Vec<ArrayRef> = Vec::with_capacity(spec.keys.len());
+        for key in &spec.keys {
+            transformed.push(transform_array(
+                &key.transform,
+                batch.column(key.input_index),
+            )?);
+        }
+
+        // Row indices of this batch, bucketed by encoded partition-value tuple.
+        // Ascending within a bucket, so relative order is preserved.
+        let mut per_batch: HashMap<Vec<Option<String>>, Vec<u32>> = HashMap::new();
+        let mut per_batch_order: Vec<Vec<Option<String>>> = Vec::new();
+        for row in 0..num_rows {
+            let mut values: Vec<Option<String>> = Vec::with_capacity(spec.keys.len());
+            for array in &transformed {
+                let scalar = ScalarValue::try_from_array(array, row)?;
+                // `encode_scalar` returns `None` for BOTH a genuine SQL NULL and a
+                // non-null value of a type it cannot encode. Those must not be
+                // conflated: silently mapping an unencodable non-null value to `None`
+                // would group every distinct such value into one file with a NULL
+                // partition value (data corruption). A NULL is a legitimate partition
+                // value; an unencodable non-null value is a hard error.
+                let encoded = if scalar.is_null() {
+                    None
+                } else {
+                    match crate::stats_encode::encode_scalar(&scalar) {
+                        Some(encoded) => Some(encoded),
+                        None => {
+                            return Err(crate::DuckLakeError::Unsupported(format!(
+                                "partitioned write: partition-key value of type {} cannot be \
+                                 encoded; partitioning by this column type is not supported",
+                                array.data_type()
+                            )));
+                        },
+                    }
+                };
+                values.push(encoded);
+            }
+            if !per_batch.contains_key(&values) {
+                per_batch_order.push(values.clone());
+            }
+            per_batch.entry(values).or_default().push(row as u32);
+        }
+
+        // Materialize this batch's contribution to each group it touched.
+        for values in per_batch_order {
+            let indices = per_batch.remove(&values).unwrap_or_default();
+            if indices.is_empty() {
+                continue;
+            }
+            let index_array = UInt32Array::from(indices);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|c| take(c, &index_array, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let out = RecordBatch::try_new(output_schema.clone(), columns)?;
+            if !groups.contains_key(&values) {
+                order.push(values.clone());
+            }
+            groups.entry(values).or_default().push(out);
+        }
     }
 
-    // Materialize one batch per group via `take` (output uses the clean schema).
-    let mut result = Vec::with_capacity(groups.len());
-    for (values, indices) in groups {
-        let index_array = UInt32Array::from(indices);
-        let columns = combined
-            .columns()
-            .iter()
-            .map(|c| take(c, &index_array, None))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
-        result.push((values, vec![batch]));
-    }
-    Ok(result)
+    Ok(order
+        .into_iter()
+        .filter_map(|values| groups.remove(&values).map(|batches| (values, batches)))
+        .collect())
 }
 
 /// One column of a partition spec: which table column, and how it is transformed.

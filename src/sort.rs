@@ -189,8 +189,14 @@ impl SortSpec {
     /// The producible sort keys as `(column_name, direction, null_order)`, in order,
     /// or `None` if any key is not a bare column (see [`SortSpec::is_producible`]).
     pub fn producible_columns(&self) -> Option<Vec<(String, SortDirection, NullOrder)>> {
+        // Skip fields whose dialect is not `duckdb`, matching official DuckLake, which
+        // `continue`s past them when building the sort expression
+        // (`ducklake_sort_data.cpp`). Their expression is written in some other
+        // engine's dialect, so evaluating it here would sort by something official
+        // ignores entirely.
         self.fields
             .iter()
+            .filter(|f| f.dialect.eq_ignore_ascii_case("duckdb"))
             .map(|f| f.column_candidate().map(|c| (c, f.direction, f.null_order)))
             .collect()
     }

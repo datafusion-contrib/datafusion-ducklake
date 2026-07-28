@@ -272,6 +272,101 @@ async fn streaming_session_respects_open_partition_cap() {
     assert_eq!(count, 4, "every row must be readable after eviction");
 }
 
+/// A partitioned write must still respect `target_file_size` WITHIN each partition.
+///
+/// Rollover is evaluated at batch boundaries, so if the partition splitter collapsed
+/// each group into one batch the writer would emit a single file per partition of
+/// unbounded size — `target_file_size` silently unenforceable exactly on the tables
+/// most likely to be large. DuckLake merges but never splits, so such a file could
+/// never be broken up afterwards either.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_write_rolls_within_each_partition() {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await; // partitioned by (region, year(ts))
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("ts", ts_type, true),
+    ]));
+    // Many batches, ALL in the same (us, 2023) partition, so the only way to end up
+    // with more than one file is rollover firing inside that partition.
+    let y2023: i64 = 1_673_776_800_000_000;
+    let batches: Vec<RecordBatch> = (0..40)
+        .map(|b| {
+            let ids: Vec<i32> = (b * 100..(b + 1) * 100).collect();
+            let n = ids.len();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(ids)) as ArrayRef,
+                    Arc::new(arrow::array::StringArray::from(vec!["us"; n])) as ArrayRef,
+                    Arc::new(TimestampMicrosecondArray::from(vec![y2023; n])) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .with_target_file_size(8 * 1024);
+
+    let result = table_writer
+        .append_table("main", "events", &batches)
+        .await
+        .unwrap();
+    assert_eq!(result.records_written, 4000);
+    assert!(
+        result.files_written > 1,
+        "a single partition exceeding target_file_size must roll into several files, got {}",
+        result.files_written
+    );
+
+    // Every file still carries that one partition, and the rows all read back.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), result.files_written);
+    for meta in &page {
+        let mut values = meta.file.partition_values.clone();
+        values.sort_by_key(|(index, _)| *index);
+        let values: Vec<Option<String>> = values.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(
+            values,
+            vec![Some("us".to_string()), Some("2023".to_string())],
+            "every rolled file belongs to the same partition"
+        );
+    }
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        4000
+    );
+}
+
 /// The write entry points that target ONE caller-determined file cannot satisfy a
 /// partition spec that needs one file per partition. They must refuse a partitioned
 /// table with a typed error naming the entry point — never fall through and commit a
