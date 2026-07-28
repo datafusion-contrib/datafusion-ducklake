@@ -16,6 +16,13 @@ env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: "sccache"
+  # Incremental artifacts are useless on a fresh CI runner and inflate the target
+  # directory that the cache below has to carry, so keep them out of it. (This is
+  # also what sccache needs in order to cache Rust at all — it declines to cache
+  # incrementally-compiled crates, hence the "Cache hits rate (Rust) 0.00 %" in
+  # run logs. sccache still only caches within a run: its local-disk store is not
+  # persisted, and its GHA backend needs the retired Actions Cache v1 API.)
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   fmt:
@@ -89,29 +96,32 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
-      - name: Cache cargo registry
+      # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
+      # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
+      # cache is being saved" on every run — the crate has no git dependencies, so
+      # that directory is never created. Cached together, the registry always
+      # exists so the step is valid, and a future git dependency is still covered.
+      - name: Cache cargo home
         if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-home-
 
-      - name: Cache cargo index
-        if: steps.changes.outputs.code == 'true'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
+      # Cache the directory cargo actually writes to. This said `path: target` while
+      # the Linux scratch-disk step above redirects `CARGO_TARGET_DIR` to
+      # /mnt/cargo-target, so every Linux run logged "Path Validation Error: Path(s)
+      # ... do(es) not exist, hence no cache is being saved" and rebuilt from
+      # scratch. macOS has no scratch-disk step, so `target` is correct there.
       - name: Cache target directory
         if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: target
+          path: ${{ runner.os == 'Linux' && '/mnt/cargo-target' || 'target' }}
           key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-${{ matrix.rust }}-
@@ -290,29 +300,29 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
-      - name: Cache cargo registry
+      # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
+      # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
+      # cache is being saved" on every run — the crate has no git dependencies, so
+      # that directory is never created. Cached together, the registry always
+      # exists so the step is valid, and a future git dependency is still covered.
+      - name: Cache cargo home
         if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-home-
 
-      - name: Cache cargo index
-        if: steps.changes.outputs.code == 'true'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
+      # This job always uses the scratch disk, so cache that path rather than the
+      # `target` it never writes to. See the `check` job.
       - name: Cache target directory
         if: steps.changes.outputs.code == 'true'
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: target
+          path: /mnt/cargo-target
           key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-target-full-
