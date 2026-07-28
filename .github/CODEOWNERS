@@ -1,0 +1,12 @@
+# Code owners for datafusion-ducklake.
+#
+# Owners are auto-requested for review on every pull request, and the
+# `main-review` ruleset requires an approval from one of them before a PR can
+# merge. Owners themselves bypass that requirement, so this gates contributions
+# from everyone else.
+#
+# Code owners must have write access to the repository, otherwise the entry is
+# silently ignored. A pull request is governed by the version of this file on
+# the base branch, not the version in the pull request.
+
+* @zfarrell @shefeek-jinnah @anoop-narang
