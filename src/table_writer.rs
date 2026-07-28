@@ -275,6 +275,7 @@ impl DuckLakeTableWriter {
     /// row's original rowid. A later read detects the embedded column by its
     /// field-id and serves those rowids inline instead of synthesizing
     /// `row_id_start + position`.
+    /// Partitioned tables route rows through the standard partition sink.
     ///
     /// [`ROW_ID_PARQUET_FIELD_ID`]: crate::row_id::ROW_ID_PARQUET_FIELD_ID
     pub fn begin_write_with_embedded_rowid(
@@ -300,9 +301,7 @@ impl DuckLakeTableWriter {
             true,
             true,
             mode,
-            StreamPartitionMode::Reject {
-                entry_point: "begin_write_with_embedded_rowid",
-            },
+            StreamPartitionMode::Split,
         )
     }
 
@@ -1458,6 +1457,15 @@ impl PartitionSink {
         Ok(())
     }
 
+    fn pending_file_count(&self) -> usize {
+        self.staged.len()
+            + self
+                .open
+                .iter()
+                .filter(|(_, roller)| roller.has_open_file())
+                .count()
+    }
+
     /// Finish every open file and upload all staged files, returning the
     /// [`DataFileInfo`]s to commit — each stamped with its partition.
     async fn into_file_infos(
@@ -1689,15 +1697,22 @@ impl TableWriteSession {
         // Reject an unsupported combination before uploading the staged parquet,
         // so a misuse leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
-        if self.partition_sink.is_some() {
-            return Err(crate::error::DuckLakeError::Unsupported(
-                "an update/upsert on a partitioned table is not supported yet: the new row \
-                 versions span one file per partition, and the atomic append+delete commit \
-                 currently registers a single data file"
-                    .to_string(),
-            ));
-        }
-        let file_info = self.upload_staged().await?;
+        let file_info = match self.partition_sink.take() {
+            Some(sink) => {
+                let file_count = sink.pending_file_count();
+                if file_count != 1 {
+                    return Err(crate::error::DuckLakeError::Unsupported(format!(
+                        "an atomic append+delete commit accepts one appended data file, but the \
+                         partitioned write produced {file_count}"
+                    )));
+                }
+                sink.into_file_infos(&self.object_store)
+                    .await?
+                    .pop()
+                    .expect("one pending partition file")
+            },
+            None => self.upload_staged().await?,
+        };
         let committed = self.metadata.register_data_file_with_deletes(
             self.table_id,
             &self.schema_name,
