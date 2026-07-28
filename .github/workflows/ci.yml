@@ -95,16 +95,70 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
-      # Every other job builds with `--all-features` or `write-sqlite`, which only
-      # proves the union of features compiles. It cannot catch a module that
-      # accidentally depends on a sibling feature, because a stronger feature set
-      # always supplies the missing one. That is a hard error for real consumers:
-      # an ungated module referencing a `write`-gated one fails only when `write`
-      # is off, and the sole build without `write` was the Benchmark workflow —
-      # push-to-main only, so the break was invisible until after the merge.
-      #
-      # So isolate each independently-supported axis once. `--workspace` covers
-      # the default feature set, including the benchmark package's bins.
+      - name: Run tests
+        # `write-sqlite` pulls in the writer and sqlite-provider tests,
+        # which are `#![cfg]`-gated; without it cargo compiles them to
+        # zero-test binaries.
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            cargo test --features "skip-tests-with-docker write-sqlite"
+          else
+            cargo test --features "write-sqlite"
+          fi
+
+      - name: Check documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Every other job builds with `--all-features` or `write-sqlite`, which only
+  # proves the union of features compiles. It cannot catch a module that
+  # accidentally depends on a sibling feature, because a stronger feature set
+  # always supplies the missing one. That is a hard error for real consumers: an
+  # ungated module referencing a `write`-gated one fails only when `write` is off,
+  # and the sole build without `write` was the Benchmark workflow — push-to-main
+  # only, so such a break stayed invisible until after the merge.
+  #
+  # Runs on one OS by design: this checks `#[cfg(feature = ...)]` resolution, which
+  # is platform-independent (the crate has no `target_os`/`target_arch` cfgs and no
+  # platform-conditional dependencies), so a second OS would only duplicate compute.
+  # Its own job so it runs concurrently with `check` instead of doubling that job.
+  feature-check:
+    name: Check feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Build on the runner's large scratch disk
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown "$(id -un)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
+
+      - name: Cache cargo registry
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo index
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      # Isolate each independently-supported feature axis once. `--workspace`
+      # covers the default feature set, including the benchmark package's bins.
       #
       # No `-D warnings`: a read-only build legitimately reports dead_code for the
       # write-only helpers, and `#[cfg]`-gating struct fields to silence that would
@@ -130,22 +184,6 @@ jobs:
             cargo check --no-default-features --features "$features"
             echo "::endgroup::"
           done
-
-      - name: Run tests
-        # `write-sqlite` pulls in the writer and sqlite-provider tests,
-        # which are `#![cfg]`-gated; without it cargo compiles them to
-        # zero-test binaries.
-        run: |
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            cargo test --features "skip-tests-with-docker write-sqlite"
-          else
-            cargo test --features "write-sqlite"
-          fi
-
-      - name: Check documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
 
   test-full:
     name: Test (single-catalog backends + encryption, Docker)
