@@ -18,6 +18,15 @@ env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: "sccache"
+  # Without this sccache defaults to a local-disk cache under ~/.cache/sccache,
+  # which nothing persists between runs — so every run started from an empty
+  # cache and `RUSTC_WRAPPER` bought nothing. Points it at the Actions cache.
+  SCCACHE_GHA_ENABLED: "true"
+  # sccache cannot cache incrementally-compiled crates and silently declines to
+  # try, which is why runs reported "Cache hits rate (Rust) 0.00 %" with ~990
+  # Rust misses. Incremental state is useless in CI anyway (fresh runner, no
+  # rebuild), so turning it off is what lets sccache cache Rust at all.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   fmt:
@@ -68,30 +77,27 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
-      - name: Cache cargo registry
+      # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
+      # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
+      # cache is being saved" on every run — the crate has no git dependencies, so
+      # that directory is never created. Cached together, the registry always
+      # exists so the step is valid, and a future git dependency is still covered.
+      - name: Cache cargo home
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-home-
 
-      - name: Cache cargo index
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
-      - name: Cache target directory
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-${{ matrix.rust }}-
-
+      # No target-directory cache: on Linux `CARGO_TARGET_DIR` points at the scratch
+      # disk above, so caching `target` saved an empty path ("Path Validation Error
+      # ... no cache is being saved") — it never worked. On macOS it did work, but a
+      # ~2.8 GB entry per OS competes with sccache for the repo's 10 GB cache budget
+      # and evicts it. sccache (persisted via SCCACHE_GHA_ENABLED above) caches the
+      # same dependency compilations far more cheaply, on both platforms.
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
@@ -138,29 +144,23 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
-      - name: Cache cargo registry
+      # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
+      # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
+      # cache is being saved" on every run — the crate has no git dependencies, so
+      # that directory is never created. Cached together, the registry always
+      # exists so the step is valid, and a future git dependency is still covered.
+      - name: Cache cargo home
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-cargo-home-
 
-      - name: Cache cargo index
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
-
-      - name: Cache target directory
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: target
-          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-target-full-
+      # No target-directory cache here either — `CARGO_TARGET_DIR` is the scratch
+      # disk, so this only ever cached an empty `target`. See the `check` job.
 
       # Runs the single-catalog suites across every metadata backend
       # (Postgres/MySQL via testcontainers, SQLite, DuckDB) + encryption.
