@@ -395,12 +395,14 @@ fn sanitize_partition_path(value: &str) -> String {
 /// One partition group of a partitioned write: the per-key partition values every
 /// row in the group shares (`values[i]` for partition key `i`, `None` == SQL NULL),
 /// and the row batches for that partition.
+#[cfg(feature = "write")]
 pub type PartitionGroup = (Vec<Option<String>>, Vec<arrow::record_batch::RecordBatch>);
 
 /// Apply a partition transform to a whole column array: identity returns the
 /// column unchanged; the temporal transforms return an `Int32` calendar component
 /// (year/month/day/hour) via Arrow's `date_part`. Only producible transforms are
 /// valid here — [`PartitionWriteSpec::resolve`] rejects `bucket`/unknown up front.
+#[cfg(feature = "write")]
 fn transform_array(
     transform: &PartitionTransform,
     array: &arrow::array::ArrayRef,
@@ -437,6 +439,10 @@ fn transform_array(
 ///
 /// `output_schema` is the schema the returned batches carry (the table's clean data
 /// columns); `batches` must already match it positionally.
+///
+/// Write-only: the partition-value encoding lives in [`crate::stats_encode`], which
+/// is itself gated behind `write`.
+#[cfg(feature = "write")]
 pub(crate) fn split_batches_by_partition(
     output_schema: &arrow::datatypes::SchemaRef,
     batches: &[arrow::record_batch::RecordBatch],
@@ -600,10 +606,16 @@ impl PartitionSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the `write`-gated split tests below build record batches.
+    #[cfg(feature = "write")]
     use arrow::array::{ArrayRef, RecordBatch, StringArray};
-    use arrow::datatypes::{Field, Schema, SchemaRef};
+    #[cfg(feature = "write")]
+    use arrow::datatypes::SchemaRef;
+    use arrow::datatypes::{Field, Schema};
+    #[cfg(feature = "write")]
     use std::sync::Arc;
 
+    #[cfg(feature = "write")]
     fn identity_region_spec() -> PartitionWriteSpec {
         PartitionWriteSpec {
             partition_id: 1,
@@ -615,6 +627,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "write")]
     #[test]
     fn split_groups_by_identity_and_keeps_null_partition() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -646,6 +659,7 @@ mod tests {
         assert_eq!(values, vec![None, Some("us".to_string())]);
     }
 
+    #[cfg(feature = "write")]
     #[test]
     fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
