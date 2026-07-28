@@ -2141,6 +2141,20 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .fetch_optional(&mut *tx)
             .await?;
+            // Diagnose the promote-specific case before the shared fence: a caller
+            // that supplied no partition assignment for a partitioned table has not
+            // lost a race, so the fence's "concurrent SET PARTITIONED BY … retry"
+            // wording would send them chasing a problem that does not exist. Tell
+            // them what to actually do instead.
+            if file.partition_id.is_none() && file.record_count > 0 && live_partition_id.is_some() {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "cannot promote {} into table {table_id}: the table is partitioned, so a \
+                     registered file must declare the single partition its rows belong to. \
+                     Attach it with DataFileInfo::with_partition (copy the values from the \
+                     source catalog, or derive them from the file's Hive path).",
+                    file.path
+                )));
+            }
             crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
             if let Some(partition_id) = live_partition_id.filter(|_| file.partition_id.is_some()) {
                 let key_rows = sqlx::query(

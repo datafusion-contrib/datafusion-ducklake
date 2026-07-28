@@ -1140,6 +1140,20 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// `identity` key, `min == max == value` proves the file is single-partition
     /// without reading a row.
     ///
+    /// Promoting into a partitioned table WITHOUT an assignment is refused with a
+    /// message naming the fix — not the partition fence's concurrency wording, which
+    /// would misdescribe what went wrong.
+    ///
+    /// # Sort order
+    ///
+    /// A table's sort order is NOT enforced here: promoting an unsorted file into a
+    /// sorted table is allowed, not an error. Sort order only affects how tight a
+    /// file's min/max statistics are — an unsorted file reads back correctly, it just
+    /// prunes less well, and a later compaction re-sorts it. Contrast partitioning,
+    /// where a wrong value makes the read path prune away live rows, which is why
+    /// that IS enforced. Official DuckLake's `ducklake_add_data_files` likewise
+    /// ignores sort order entirely.
+    ///
     /// Default: unsupported; only multicatalog Postgres, whose column ids are
     /// reusable across catalogs, implements it.
     #[allow(clippy::too_many_arguments)]
@@ -1364,31 +1378,35 @@ mod tests {
     }
 
     #[test]
-    fn promoted_temporal_value_must_be_its_calendar_component() {
-        // A `month` key's value is 1..=12; 13 or a date string is not a month.
+    fn promoted_temporal_value_must_parse_as_an_integer_and_no_more() {
+        // Official types a temporal partition key as BIGINT and only casts
+        // (GetPartitionKeyType / MapPartitionColumns) — it does NOT range-check the
+        // calendar component. So a non-integer is rejected, but an out-of-range
+        // month like 13 must be ACCEPTED, or we would refuse a value official takes.
         let transforms = vec!["month".to_string()];
         let date_key = vec![Some(DataType::Date32)];
-        for bad in ["13", "0", "2024-06"] {
-            assert!(
-                validate_promoted_partition_values(
-                    1,
-                    &transforms,
-                    &date_key,
-                    &promoted(vec![(0, Some(bad.to_string()))]),
-                )
-                .is_err(),
-                "month value {bad} must be rejected"
-            );
-        }
         assert!(
             validate_promoted_partition_values(
                 1,
                 &transforms,
                 &date_key,
-                &promoted(vec![(0, Some("6".into()))]),
+                &promoted(vec![(0, Some("2024-06".into()))]),
             )
-            .is_ok()
+            .is_err(),
+            "a non-integer month value must be rejected"
         );
+        for accepted in ["6", "13", "0"] {
+            assert!(
+                validate_promoted_partition_values(
+                    1,
+                    &transforms,
+                    &date_key,
+                    &promoted(vec![(0, Some(accepted.to_string()))]),
+                )
+                .is_ok(),
+                "month value {accepted} must be accepted (official does not range-check)"
+            );
+        }
     }
 
     #[test]

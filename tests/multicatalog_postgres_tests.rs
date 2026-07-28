@@ -4663,9 +4663,11 @@ async fn register_existing_data_file_persists_partition_assignment() {
         "a promoted file must carry its partition value so it stays prunable"
     );
 
-    // An unpartitioned promote into a now-partitioned table is refused: such a file
+    // An unpartitioned promote into a partitioned table is refused: such a file
     // cannot satisfy the spec, and silently accepting it would make the table's
-    // partition layout a lie.
+    // partition layout a lie. The error must name the actual fix — nothing raced
+    // here, so the fence's "concurrent SET PARTITIONED BY / retry" wording would send
+    // the caller chasing a problem that does not exist.
     let unpartitioned = DataFileInfo::new("f3.parquet", 256, 1);
     let err = w
         .register_existing_data_file(
@@ -4677,9 +4679,14 @@ async fn register_existing_data_file_persists_partition_assignment() {
             WriteMode::Append,
         )
         .unwrap_err();
+    let msg = err.to_string();
     assert!(
-        matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
-        "expected a partition-fence conflict, got: {err}"
+        msg.contains("with_partition"),
+        "the error must tell the caller to declare the file's partition, got: {msg}"
+    );
+    assert!(
+        !msg.contains("concurrent"),
+        "must not blame a concurrent DDL change that did not happen, got: {msg}"
     );
 
     // A value count that disagrees with the live spec is refused too.

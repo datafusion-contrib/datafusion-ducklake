@@ -98,12 +98,20 @@ impl PartitionTransform {
     /// column of `column_type`. A NULL value (`None`) is always well-formed — it is a
     /// partition in its own right.
     ///
-    /// Mirrors what official DuckLake checks before registering a partition value:
-    /// an `identity` value must cast to the column's type (`MapHiveColumn`), a
-    /// `bucket(N)` value must be an integer in `0..N`
-    /// (`IsValidTransformedHivePartitionValue`), and a temporal value must be the
-    /// integer calendar component. It cannot tell whether the FILE's rows actually
-    /// share the value — only the caller knows that.
+    /// Deliberately matches official DuckLake's checks exactly, no more:
+    ///
+    /// - `identity` — must cast to the column's type. Official casts the Hive value
+    ///   to the field type and errors when it will not (`MapHiveColumn`).
+    /// - `year`/`month`/`day`/`hour` — must parse as an integer, and nothing further.
+    ///   Official types these keys as `BIGINT` (not the source column type) and only
+    ///   casts (`MapPartitionColumns` via `GetPartitionKeyType`); it does NOT check
+    ///   that a month is 1..12 or an hour 0..23. Adding such a range check here would
+    ///   reject values official accepts, so it is left out on purpose.
+    /// - `bucket(N)` — must be an integer in `0..N`, the one range check official
+    ///   does make (`IsValidTransformedHivePartitionValue`).
+    ///
+    /// None of this can tell whether the FILE's rows actually share the value — only
+    /// the caller knows that, in official too.
     pub(crate) fn value_is_well_formed(&self, value: Option<&str>, column_type: &DataType) -> bool {
         let Some(value) = value else {
             return true;
@@ -112,16 +120,10 @@ impl PartitionTransform {
             PartitionTransform::Identity => {
                 ScalarValue::try_from_string(value.to_string(), column_type).is_ok()
             },
-            PartitionTransform::Year => value.trim().parse::<i64>().is_ok(),
-            PartitionTransform::Month => {
-                matches!(value.trim().parse::<i64>(), Ok(m) if (1..=12).contains(&m))
-            },
-            PartitionTransform::Day => {
-                matches!(value.trim().parse::<i64>(), Ok(d) if (1..=31).contains(&d))
-            },
-            PartitionTransform::Hour => {
-                matches!(value.trim().parse::<i64>(), Ok(h) if (0..=23).contains(&h))
-            },
+            PartitionTransform::Year
+            | PartitionTransform::Month
+            | PartitionTransform::Day
+            | PartitionTransform::Hour => value.trim().parse::<i64>().is_ok(),
             PartitionTransform::Bucket(buckets) => {
                 matches!(value.trim().parse::<i64>(), Ok(b) if b >= 0 && b < i64::from(*buckets))
             },
@@ -271,29 +273,15 @@ impl PartitionWriteSpec {
             })?;
             let name = field.name().to_string();
 
-            // A temporal transform on a TIME-ZONE-AWARE timestamp cannot be computed
-            // portably: DuckDB evaluates `year(timestamptz)` in the session time
-            // zone, while we would compute it in UTC. Near a boundary the two
-            // disagree — `2023-01-01 00:30:00+00` is year 2023 to us and 2022 to a
-            // DuckDB session in `America/New_York` — so the value we record would be
-            // one DuckDB then prunes against under a different rule, dropping live
-            // rows. The read path already refuses to derive bounds for this case
-            // (see `year_bounds`); refuse to WRITE it too rather than commit a value
-            // whose meaning depends on who reads it.
-            if !matches!(column.transform, PartitionTransform::Identity)
-                && matches!(
-                    field.data_type(),
-                    arrow::datatypes::DataType::Timestamp(_, Some(_))
-                )
-            {
-                return Err(crate::DuckLakeError::Unsupported(format!(
-                    "partitioning by '{}' on the time-zone-aware column '{}' is not supported: \
-                     the transformed value depends on the reader's session time zone. Partition \
-                     by a time-zone-naive timestamp, or by a pre-computed column.",
-                    column.transform.to_catalog_string(),
-                    name
-                )));
-            }
+            // Caveat, deliberately NOT an error: a temporal transform on a
+            // time-zone-aware timestamp is computed here in UTC, whereas DuckDB
+            // evaluates `year(timestamptz)` in the session time zone, so near a
+            // boundary the two produce different partition values for the same row.
+            // Official DuckLake permits this combination (it emits `year(col)` and
+            // lets the session decide), so rejecting it would refuse a table official
+            // accepts. Our read path is unaffected: `year_bounds` declines to derive
+            // an envelope for tz-aware timestamps, so we never prune on such a key —
+            // only a DuckDB reader applying its own session rule could mis-prune.
             keys.push(PartitionWriteKey {
                 input_index: index,
                 name,
@@ -730,47 +718,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_temporal_transform_on_tz_aware_timestamp() {
+    fn resolve_allows_temporal_transform_on_tz_aware_timestamp() {
+        // Official DuckLake permits `year(timestamptz)` — it emits `year(col)` and
+        // lets the session time zone decide the value — so we must not refuse it.
+        // The value we compute is UTC-based, which is a documented cross-engine
+        // caveat on `resolve`, not an error.
         let tz = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()));
         let schema = Schema::new(vec![Field::new("ts", tz, true)]);
-        let spec = |transform| PartitionSpec {
+        let spec = PartitionSpec {
             partition_id: 1,
             columns: vec![PartitionSpecColumn {
                 partition_key_index: 0,
                 column_id: 10,
-                transform,
+                transform: PartitionTransform::Year,
             }],
             prune_safe: true,
         };
-        // A temporal transform's value depends on the reader's session time zone, so
-        // writing one would silently disagree with DuckDB near a boundary.
-        for transform in [
-            PartitionTransform::Year,
-            PartitionTransform::Month,
-            PartitionTransform::Day,
-            PartitionTransform::Hour,
-        ] {
-            let err =
-                PartitionWriteSpec::resolve(&spec(transform.clone()), &[10], &schema).unwrap_err();
-            assert!(
-                err.to_string().contains("time zone"),
-                "expected a time-zone error for {transform:?}, got: {err}"
-            );
-        }
-        // Identity is unaffected: the raw value is time-zone independent.
-        assert!(
-            PartitionWriteSpec::resolve(&spec(PartitionTransform::Identity), &[10], &schema)
-                .is_ok()
-        );
-        // A naive timestamp is fine for temporal transforms.
-        let naive = Schema::new(vec![Field::new(
-            "ts",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-            true,
-        )]);
-        assert!(
-            PartitionWriteSpec::resolve(&spec(PartitionTransform::Year), &[10], &naive).is_ok()
-        );
+        assert!(PartitionWriteSpec::resolve(&spec, &[10], &schema).is_ok());
     }
 
     #[test]
