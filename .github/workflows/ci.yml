@@ -18,14 +18,12 @@ env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: "sccache"
-  # Without this sccache defaults to a local-disk cache under ~/.cache/sccache,
-  # which nothing persists between runs — so every run started from an empty
-  # cache and `RUSTC_WRAPPER` bought nothing. Points it at the Actions cache.
-  SCCACHE_GHA_ENABLED: "true"
-  # sccache cannot cache incrementally-compiled crates and silently declines to
-  # try, which is why runs reported "Cache hits rate (Rust) 0.00 %" with ~990
-  # Rust misses. Incremental state is useless in CI anyway (fresh runner, no
-  # rebuild), so turning it off is what lets sccache cache Rust at all.
+  # Incremental artifacts are useless on a fresh CI runner and inflate the target
+  # directory that the cache below has to carry, so keep them out of it. (This is
+  # also what sccache needs in order to cache Rust at all — it declines to cache
+  # incrementally-compiled crates, hence the "Cache hits rate (Rust) 0.00 %" in
+  # run logs. sccache still only caches within a run: its local-disk store is not
+  # persisted, and its GHA backend needs the retired Actions Cache v1 API.)
   CARGO_INCREMENTAL: "0"
 
 jobs:
@@ -92,12 +90,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-home-
 
-      # No target-directory cache: on Linux `CARGO_TARGET_DIR` points at the scratch
-      # disk above, so caching `target` saved an empty path ("Path Validation Error
-      # ... no cache is being saved") — it never worked. On macOS it did work, but a
-      # ~2.8 GB entry per OS competes with sccache for the repo's 10 GB cache budget
-      # and evicts it. sccache (persisted via SCCACHE_GHA_ENABLED above) caches the
-      # same dependency compilations far more cheaply, on both platforms.
+      # Cache the directory cargo actually writes to. This said `path: target` while
+      # the Linux scratch-disk step above redirects `CARGO_TARGET_DIR` to
+      # /mnt/cargo-target, so every Linux run logged "Path Validation Error: Path(s)
+      # ... do(es) not exist, hence no cache is being saved" and rebuilt from
+      # scratch. macOS has no scratch-disk step, so `target` is correct there.
+      - name: Cache target directory
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ${{ runner.os == 'Linux' && '/mnt/cargo-target' || 'target' }}
+          key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ matrix.rust }}-
+
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
@@ -159,8 +164,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-home-
 
-      # No target-directory cache here either — `CARGO_TARGET_DIR` is the scratch
-      # disk, so this only ever cached an empty `target`. See the `check` job.
+      # This job always uses the scratch disk, so cache that path rather than the
+      # `target` it never writes to. See the `check` job.
+      - name: Cache target directory
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: /mnt/cargo-target
+          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-full-
 
       # Runs the single-catalog suites across every metadata backend
       # (Postgres/MySQL via testcontainers, SQLite, DuckDB) + encryption.
