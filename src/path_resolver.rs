@@ -76,7 +76,7 @@ fn validate_no_path_traversal(path: &str) -> Result<()> {
 }
 
 /// Validate a path for both null bytes and path traversal
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     validate_no_null_bytes(path)?;
     validate_no_path_traversal(path)?;
     Ok(())

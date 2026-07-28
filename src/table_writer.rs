@@ -10,9 +10,9 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::StreamExt;
-use object_store::ObjectStore;
 use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -22,10 +22,11 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::metadata_writer::{
-    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter,
-    SnapshotCommitMetadata, WriteMode, WriteResult, validate_delete_entries,
+    ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, RestoreResult,
+    SnapshotCommitMetadata, TableRestoreCommit, TableRestoreOptions, WriteMode, WriteResult,
+    validate_delete_entries, validate_table_restore_plan,
 };
-use crate::path_resolver::join_paths;
+use crate::path_resolver::{join_paths, validate_path};
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
 
@@ -609,6 +610,62 @@ impl DuckLakeTableWriter {
     ) -> Result<WriteResult> {
         self.write_all(schema_name, table_name, batches, WriteMode::Append)
             .await
+    }
+
+    /// Restore one table's data state from an earlier snapshot in a new snapshot.
+    ///
+    /// Every source data and positional-delete object is copied to a fresh sibling path before
+    /// the metadata commit. This keeps physical cleanup path-safe: expiring a retired source row
+    /// can never delete an object referenced by the restored live row. The metadata commit
+    /// revalidates the catalog head, schema generation, and source file set atomically.
+    pub async fn restore_table_data_to_snapshot(
+        &self,
+        table_id: i64,
+        source_snapshot_id: i64,
+        expected_base_snapshot_id: i64,
+        options: &TableRestoreOptions,
+    ) -> Result<RestoreResult> {
+        let plan = self.metadata.plan_table_data_restore(
+            table_id,
+            source_snapshot_id,
+            expected_base_snapshot_id,
+        )?;
+        validate_table_restore_plan(&plan)?;
+        let mut copied = Vec::with_capacity(plan.files.len());
+        for file in &plan.files {
+            let source = self.table_restore_object_path(
+                &file.source_object_path,
+                file.source_object_path_is_relative,
+            )?;
+            let restored = self.table_restore_object_path(
+                &file.restored_object_path,
+                file.restored_object_path_is_relative,
+            )?;
+            if let Err(e) = self.object_store.copy(&source, &restored).await {
+                copied.push(restored);
+                self.remove_table_restore_objects(&copied).await;
+                return Err(e.into());
+            }
+            copied.push(restored);
+        }
+        let commit = TableRestoreCommit::new(plan);
+        self.metadata.commit_table_data_restore(&commit, options)
+    }
+
+    fn table_restore_object_path(&self, path: &str, path_is_relative: bool) -> Result<ObjectPath> {
+        validate_path(path)?;
+        let path = if path_is_relative {
+            join_paths(&self.base_key_path, path)?
+        } else {
+            path.to_string()
+        };
+        Ok(ObjectPath::from(path.trim_start_matches('/')))
+    }
+
+    async fn remove_table_restore_objects(&self, files: &[ObjectPath]) {
+        for file in files {
+            let _ = self.object_store.delete(file).await;
+        }
     }
 
     /// Shared body of [`Self::write_table`] / [`Self::append_table`].

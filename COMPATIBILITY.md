@@ -118,6 +118,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | SQL-queryable `information_schema`                      |   ✅   |
 | Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`) | ✅ |
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
+| Table‑data restore in a new snapshot (SQLite and PostgreSQL via `DuckLakeTableWriter`) | 🟧 |
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
 | Configurable writer output (compression, row-group sizing) | ✅  |
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned) | ✅ |
@@ -127,6 +128,29 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
+
+## Table data restore
+
+`DuckLakeTableWriter::restore_table_data_to_snapshot` restores one table's
+data state from an earlier snapshot without changing its schema. SQLite and
+PostgreSQL support it; DuckDB and MySQL return `Unsupported` through the
+optional metadata‑backend capability.
+
+Restore copies every source data and positional‑delete Parquet object to a
+fresh sibling path before committing the new metadata snapshot. Existing
+snapshots keep their original file paths, and snapshot expiration can delete
+retired source objects without affecting the restored live rows. Copy‑phase
+failures remove completed copies when possible. Once the metadata commit
+starts, an error can have an ambiguous commit outcome, so its copies remain as
+safe orphan candidates rather than risking deletion of committed live objects.
+`delete_orphaned_files` can reclaim any unreferenced copies.
+
+The commit rejects a stale catalog head, schema changes found in either the
+schema‑version ledger or the table's column generations, and partial data or
+delete files. SQLite also rejects a restore when inlined rows are visible at
+the source snapshot or current head because restoring those rows requires more
+than data‑file metadata changes. Partial files embed per‑row snapshot windows
+and require a physical rewrite rather than a metadata‑only restore.
 
 ---
 

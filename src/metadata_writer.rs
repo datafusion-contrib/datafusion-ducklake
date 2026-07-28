@@ -3,9 +3,12 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
+use std::collections::BTreeSet;
+
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::DataType;
+use uuid::Uuid;
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -142,6 +145,21 @@ impl SnapshotCommitMetadata {
             ));
         }
         Ok(())
+    }
+}
+
+pub(crate) fn restored_table_data_changes(
+    table_id: i64,
+    retired_data: bool,
+    restored_data: bool,
+) -> String {
+    match (retired_data, restored_data) {
+        (true, true) => {
+            format!("deleted_from_table:{table_id},inserted_into_table:{table_id}")
+        },
+        (true, false) => format!("deleted_from_table:{table_id}"),
+        (false, true) => format!("inserted_into_table:{table_id}"),
+        (false, false) => String::new(),
     }
 }
 
@@ -675,6 +693,221 @@ pub struct WriteResult {
     pub records_written: i64,
 }
 
+/// Result of restoring one table's data to an earlier snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreResult {
+    /// New catalog snapshot containing the restored table state.
+    pub snapshot_id: i64,
+    /// Number of data-file metadata rows re-referenced by the restored state.
+    pub data_files_restored: usize,
+    /// Number of delete-file metadata rows re-referenced by the restored state.
+    pub delete_files_restored: usize,
+}
+
+/// Kind of object copied for a table-data restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRestoreFileKind {
+    /// A Parquet data file.
+    Data,
+    /// A Parquet positional-delete file.
+    Delete,
+}
+
+/// One physical object copied before a table-data restore commits its metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRestoreFile {
+    /// Whether this is a data or positional-delete file.
+    pub kind: TableRestoreFileKind,
+    /// Catalog identifier of the source data or delete file.
+    pub source_file_id: i64,
+    /// Source object path, resolved through the schema and table path hierarchy.
+    pub source_object_path: String,
+    /// Whether `source_object_path` is relative to the catalog `data_path`.
+    pub source_object_path_is_relative: bool,
+    /// Fresh path stored on the restored catalog row.
+    pub restored_catalog_path: String,
+    /// Whether `restored_catalog_path` is relative to the table path.
+    pub restored_catalog_path_is_relative: bool,
+    /// Fresh object path, resolved through the schema and table path hierarchy.
+    pub restored_object_path: String,
+    /// Whether `restored_object_path` is relative to the catalog `data_path`.
+    pub restored_object_path_is_relative: bool,
+}
+
+/// Physical-copy plan for restoring one table's data in a new snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRestorePlan {
+    /// Table whose data state will be restored.
+    pub table_id: i64,
+    /// Snapshot whose table data state will be copied.
+    pub source_snapshot_id: i64,
+    /// Catalog head that must still be current when the plan commits.
+    pub expected_base_snapshot_id: i64,
+    /// Data and positional-delete objects to copy before the metadata commit.
+    pub files: Vec<TableRestoreFile>,
+}
+
+/// Proof that a table-restore plan's physical copies completed.
+///
+/// This value can only be created by [`crate::table_writer::DuckLakeTableWriter`].
+/// Metadata backends receive it after the writer has copied every planned object.
+#[derive(Debug)]
+pub struct TableRestoreCommit {
+    pub(crate) plan: TableRestorePlan,
+}
+
+impl TableRestoreCommit {
+    pub(crate) fn new(plan: TableRestorePlan) -> Self {
+        Self {
+            plan,
+        }
+    }
+
+    /// Return the copied physical-object plan to commit.
+    pub fn plan(&self) -> &TableRestorePlan {
+        &self.plan
+    }
+}
+
+pub(crate) fn table_restore_file(
+    kind: TableRestoreFileKind,
+    source_file_id: i64,
+    expected_base_snapshot_id: i64,
+    catalog_path: String,
+    catalog_path_is_relative: bool,
+    object_path: String,
+    object_path_is_relative: bool,
+) -> Result<TableRestoreFile> {
+    let kind_name = match kind {
+        TableRestoreFileKind::Data => "data",
+        TableRestoreFileKind::Delete => "delete",
+    };
+    let suffix = format!(
+        "{expected_base_snapshot_id}-{kind_name}-{source_file_id}-{}",
+        Uuid::new_v4()
+    );
+    let restored_catalog_path = restored_sibling_path(&catalog_path, &suffix)?;
+    let object_prefix = object_path.strip_suffix(&catalog_path).ok_or_else(|| {
+        DuckLakeError::InvalidConfig(format!(
+            "resolved restore path '{object_path}' does not end with catalog path '{catalog_path}'"
+        ))
+    })?;
+    let restored_object_path = format!("{object_prefix}{restored_catalog_path}");
+    Ok(TableRestoreFile {
+        kind,
+        source_file_id,
+        source_object_path: object_path,
+        source_object_path_is_relative: object_path_is_relative,
+        restored_catalog_path,
+        restored_catalog_path_is_relative: catalog_path_is_relative,
+        restored_object_path,
+        restored_object_path_is_relative: object_path_is_relative,
+    })
+}
+
+pub(crate) fn validate_table_restore_plan(plan: &TableRestorePlan) -> Result<()> {
+    let mut restored_paths = BTreeSet::new();
+    for file in &plan.files {
+        if file.source_object_path == file.restored_object_path
+            && file.source_object_path_is_relative == file.restored_object_path_is_relative
+        {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "restore plan reuses source object path '{}'",
+                file.source_object_path
+            )));
+        }
+        if !restored_paths.insert((
+            file.restored_object_path.as_str(),
+            file.restored_object_path_is_relative,
+        )) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "restore plan repeats destination object path '{}'",
+                file.restored_object_path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn restored_sibling_path(path: &str, suffix: &str) -> Result<String> {
+    let (directory, name) = path
+        .rsplit_once('/')
+        .map_or(("", path), |(dir, name)| (dir, name));
+    if name.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(format!(
+            "cannot restore object from path '{path}' without a file name"
+        )));
+    }
+    let restored_name = name.rsplit_once('.').map_or_else(
+        || format!("{name}.restore-{suffix}"),
+        |(stem, extension)| format!("{stem}.restore-{suffix}.{extension}"),
+    );
+    if directory.is_empty() {
+        Ok(restored_name)
+    } else {
+        Ok(format!("{directory}/{restored_name}"))
+    }
+}
+
+/// Optional snapshot-change metadata for restoring table data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableRestoreOptions {
+    commit_metadata: SnapshotCommitMetadata,
+}
+
+impl TableRestoreOptions {
+    /// Creates restore options without snapshot-change metadata.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            commit_metadata: SnapshotCommitMetadata::new(),
+        }
+    }
+
+    /// Sets the snapshot author.
+    #[must_use]
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.commit_metadata = self.commit_metadata.with_author(author);
+        self
+    }
+
+    /// Sets the snapshot commit message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.commit_metadata = self.commit_metadata.with_message(message);
+        self
+    }
+
+    /// Sets opaque snapshot extra information.
+    #[must_use]
+    pub fn with_extra_info(mut self, extra_info: impl Into<String>) -> Self {
+        self.commit_metadata = self.commit_metadata.with_extra_info(extra_info);
+        self
+    }
+
+    /// Returns the snapshot author.
+    #[must_use]
+    pub fn author(&self) -> Option<&str> {
+        self.commit_metadata.author()
+    }
+
+    /// Returns the snapshot commit message.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.commit_metadata.message()
+    }
+
+    /// Returns the snapshot extra information.
+    #[must_use]
+    pub fn extra_info(&self) -> Option<&str> {
+        self.commit_metadata.extra_info()
+    }
+
+    pub(crate) fn commit_metadata(&self) -> &SnapshotCommitMetadata {
+        &self.commit_metadata
+    }
+}
+
 /// The ids actually committed by `register_data_file` / `publish_snapshot`.
 ///
 /// On multicatalog Postgres all metadata is written at the commit point, so the
@@ -722,6 +955,37 @@ pub struct WriteSetupResult {
 pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;
+
+    /// Plan physical object copies for restoring one table's data state.
+    ///
+    /// The default keeps external metadata backends source-compatible while making restore an
+    /// explicit optional capability.
+    fn plan_table_data_restore(
+        &self,
+        _table_id: i64,
+        _source_snapshot_id: i64,
+        _expected_base_snapshot_id: i64,
+    ) -> Result<TableRestorePlan> {
+        Err(DuckLakeError::Unsupported(
+            "table data restore is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Atomically commit a prepared table-data restore after its objects are copied.
+    ///
+    /// Implementations must allocate fresh data/delete-file identifiers, preserve row lineage,
+    /// retire the current file generation, and abort if the catalog head differs from the plan's
+    /// expected base. They must revalidate schema and partial-file constraints in the commit
+    /// transaction so a failed restore leaves no metadata changes.
+    fn commit_table_data_restore(
+        &self,
+        _commit: &TableRestoreCommit,
+        _options: &TableRestoreOptions,
+    ) -> Result<RestoreResult> {
+        Err(DuckLakeError::Unsupported(
+            "table data restore is not supported on this metadata backend".to_string(),
+        ))
+    }
 
     /// Get or create a schema, returning `(schema_id, was_created)`.
     fn get_or_create_schema(

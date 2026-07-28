@@ -136,8 +136,9 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, MetadataWriter, SnapshotCommitMetadata, SourceRetirement,
-    WriteMode, WriteResult, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, MetadataWriter, RestoreResult, SnapshotCommitMetadata,
+    SourceRetirement, TableRestoreCommit, TableRestoreFile, TableRestoreFileKind,
+    TableRestoreOptions, TableRestorePlan, WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

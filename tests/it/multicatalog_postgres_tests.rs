@@ -10,16 +10,21 @@
 //! - No orphan mapping rows after writes
 
 use datafusion_ducklake::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
+    ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, TableRestoreOptions, WriteMode,
 };
 use datafusion_ducklake::{
-    DuckLakeError, DuckLakeTableWriter, MulticatalogManager, NullOrder, PartitionTransform,
-    PostgresMetadataWriter, SortDirection, SortField, TableWriteOptions, TypeChangeOperation,
-    TypeChangeWriteMode, initialize_multicatalog_schema,
+    DeleteFileInfo, DuckLakeError, DuckLakeTableWriter, MulticatalogManager, NullOrder,
+    PartitionTransform, PostgresMetadataWriter, SortDirection, SortField, TableWriteOptions,
+    TypeChangeOperation, TypeChangeWriteMode, initialize_multicatalog_schema,
+    maintenance::{CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog},
 };
+use object_store::ObjectStore;
+use object_store::local::LocalFileSystem;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::sync::Arc;
+use tempfile::TempDir;
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -608,6 +613,309 @@ async fn postgres_sort_ddl_records_snapshot_changes() {
             .try_get(0)
             .unwrap();
     assert_eq!(end_snapshot, reset_snapshot);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_restore_copies_source_files_and_cleanup_deletes_only_retired_paths() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("restore").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    let table_path = data_path.join(format!("cat_{catalog_id}/public/events"));
+    std::fs::create_dir_all(&table_path).unwrap();
+    std::fs::write(table_path.join("first.parquet"), b"first data").unwrap();
+    std::fs::write(table_path.join("first-deletes.parquet"), b"first deletes").unwrap();
+    std::fs::write(table_path.join("second.parquet"), b"second data").unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let writer = Arc::new(writer);
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), store.clone()).unwrap();
+    let columns = cols();
+    let first_setup = writer
+        .begin_write_transaction("public", "events", &columns, WriteMode::Replace)
+        .unwrap();
+    let first = writer
+        .register_data_file(
+            first_setup.table_id,
+            "public",
+            "events",
+            first_setup.snapshot_id,
+            &DataFileInfo::new("first.parquet", 100, 10).with_footer_size(17),
+            WriteMode::Replace,
+            first_setup.base_snapshot_id,
+            &columns,
+            &first_setup.column_ids,
+        )
+        .unwrap();
+    let source_data_file_id: i64 = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_data_file
+         WHERE table_id = $1 AND path = 'first.parquet'",
+    )
+    .bind(first.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let partition_id = 1_i64;
+    sqlx::query(
+        "INSERT INTO ducklake_partition_info
+             (partition_id, table_id, begin_snapshot, end_snapshot)
+         VALUES ($1, $2, $3, NULL)",
+    )
+    .bind(partition_id)
+    .bind(first.table_id)
+    .bind(first.snapshot_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_partition_column
+             (partition_id, table_id, partition_key_index, column_id, transform)
+         VALUES ($1, $2, 0, $3, 'identity')",
+    )
+    .bind(partition_id)
+    .bind(first.table_id)
+    .bind(first_setup.column_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ducklake_data_file SET partition_id = $1 WHERE data_file_id = $2")
+        .bind(partition_id)
+        .bind(source_data_file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value
+             (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES ($1, $2, 0, '1')",
+    )
+    .bind(source_data_file_id)
+    .bind(first.table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let delete = writer
+        .set_delete_file(
+            first.table_id,
+            "public",
+            "events",
+            first.snapshot_id + 1,
+            source_data_file_id,
+            None,
+            first.snapshot_id,
+            &DeleteFileInfo::new("first-deletes.parquet", 20, 2).with_footer_size(7),
+        )
+        .unwrap();
+    let source_delete_file_id: i64 = sqlx::query_scalar(
+        "SELECT delete_file_id FROM ducklake_delete_file
+         WHERE data_file_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(source_data_file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let second_setup = writer
+        .begin_write_transaction("public", "events", &columns, WriteMode::Append)
+        .unwrap();
+    let second = writer
+        .register_data_file(
+            first.table_id,
+            "public",
+            "events",
+            second_setup.snapshot_id,
+            &DataFileInfo::new("second.parquet", 200, 20)
+                .with_partition(partition_id, vec![(0, Some("2".to_string()))]),
+            WriteMode::Append,
+            second_setup.base_snapshot_id,
+            &columns,
+            &second_setup.column_ids,
+        )
+        .unwrap();
+
+    let restored = table_writer
+        .restore_table_data_to_snapshot(
+            first.table_id,
+            delete.snapshot_id,
+            second.snapshot_id,
+            &TableRestoreOptions::new().with_message("datafusion restore"),
+        )
+        .await
+        .unwrap();
+    let live_data = sqlx::query(
+        "SELECT data_file_id, path, file_size_bytes, footer_size, record_count, row_id_start,
+                partition_id
+         FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(first.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let restored_data_file_id = live_data[0].try_get::<i64, _>("data_file_id").unwrap();
+    let restored_partition_values = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT partition_key_index, partition_value
+         FROM ducklake_file_partition_value WHERE data_file_id = $1
+         ORDER BY partition_key_index",
+    )
+    .bind(restored_data_file_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let restored_data_path = live_data[0].try_get::<String, _>("path").unwrap();
+    let live_delete = sqlx::query(
+        "SELECT delete_file_id, data_file_id, path, file_size_bytes, footer_size, delete_count
+         FROM ducklake_delete_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(first.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let restored_delete_path = live_delete.try_get::<String, _>("path").unwrap();
+    let snapshot_change =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+            "SELECT changes_made, author, commit_message, commit_extra_info
+             FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(restored.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(current_head(&pool, catalog_id).await, restored.snapshot_id);
+    assert!(restored.snapshot_id > second.snapshot_id);
+    assert_eq!(restored.data_files_restored, 1);
+    assert_eq!(restored.delete_files_restored, 1);
+    assert_eq!(live_data.len(), 1);
+    assert!(restored_data_file_id > source_data_file_id);
+    assert!(restored_data_path.starts_with(&format!(
+        "first.restore-{}-data-{source_data_file_id}-",
+        second.snapshot_id
+    )));
+    assert!(restored_data_path.ends_with(".parquet"));
+    assert_eq!(
+        (
+            live_data[0].try_get::<i64, _>("file_size_bytes").unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("footer_size")
+                .unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("record_count")
+                .unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("row_id_start")
+                .unwrap(),
+            live_data[0]
+                .try_get::<Option<i64>, _>("partition_id")
+                .unwrap(),
+        ),
+        (100, Some(17), Some(10), Some(0), Some(partition_id)),
+    );
+    assert_eq!(restored_partition_values, vec![(0, Some("1".to_string()))]);
+    let restored_delete_file_id = live_delete.try_get::<i64, _>("delete_file_id").unwrap();
+    assert!(restored_delete_file_id > source_delete_file_id);
+    assert!(restored_delete_path.starts_with(&format!(
+        "first-deletes.restore-{}-delete-{source_delete_file_id}-",
+        second.snapshot_id
+    )));
+    assert!(restored_delete_path.ends_with(".parquet"));
+    assert_eq!(
+        (
+            live_delete.try_get::<i64, _>("data_file_id").unwrap(),
+            live_delete.try_get::<i64, _>("file_size_bytes").unwrap(),
+            live_delete
+                .try_get::<Option<i64>, _>("footer_size")
+                .unwrap(),
+            live_delete
+                .try_get::<Option<i64>, _>("delete_count")
+                .unwrap(),
+        ),
+        (restored_data_file_id, 20, Some(7), Some(2)),
+    );
+    assert_eq!(
+        snapshot_change,
+        (
+            format!(
+                "deleted_from_table:{},inserted_into_table:{}",
+                first.table_id, first.table_id
+            ),
+            None,
+            Some("datafusion restore".to_string()),
+            None,
+        ),
+    );
+
+    let expired = manager
+        .expire_snapshots_in_catalog(
+            "restore",
+            ExpireCriteria::Versions(vec![
+                first.snapshot_id,
+                delete.snapshot_id,
+                second.snapshot_id,
+            ]),
+        )
+        .await
+        .unwrap();
+    let scheduled = sqlx::query_scalar::<_, String>(
+        "SELECT path FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1
+         ORDER BY path",
+    )
+    .bind(catalog_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        expired
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .collect::<Vec<_>>(),
+        vec![first.snapshot_id, delete.snapshot_id, second.snapshot_id],
+    );
+    assert_eq!(
+        scheduled,
+        vec![
+            format!("cat_{catalog_id}/public/events/first-deletes.parquet"),
+            format!("cat_{catalog_id}/public/events/first.parquet"),
+            format!("cat_{catalog_id}/public/events/second.parquet"),
+        ],
+    );
+
+    let mut cleanup =
+        cleanup_old_files_in_catalog(&manager, "restore", store, CleanupCriteria::All, false)
+            .await
+            .unwrap();
+    cleanup.sort();
+    assert_eq!(
+        cleanup,
+        vec![
+            table_path
+                .join("first-deletes.parquet")
+                .to_string_lossy()
+                .to_string(),
+            table_path
+                .join("first.parquet")
+                .to_string_lossy()
+                .to_string(),
+            table_path
+                .join("second.parquet")
+                .to_string_lossy()
+                .to_string(),
+        ],
+    );
+    let scheduled_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(scheduled_count, 0);
+    assert!(table_path.join(restored_data_path).exists());
+    assert!(table_path.join(restored_delete_path).exists());
 }
 
 /// #864: the postgres `set_delete_file` write — fenced, cumulative,

@@ -54,6 +54,9 @@ The codebase follows a layered architecture with clear separation of concerns:
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
    - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`), `PostgresSingleCatalogMetadataWriter` (`metadata_writer_postgres_single.rs`, standard spec layout), and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`, multi-catalog layout)
    - `DuckLakeTableWriter` / `TableWriteSession` (`table_writer.rs`): write Arrow batches to Parquet with configurable compression and row-group sizing
+   - `DuckLakeTableWriter::restore_table_data_to_snapshot`: copy historical
+     data/delete objects to fresh paths, then commit the restored metadata
+     generation atomically through the backend's optional plan/commit capability
    - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/it/insert_partitioning_tests.rs`)
    - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`
    - `maintenance.rs`: expire snapshots, clean up superseded files, reclaim orphaned files (Rust API, not SQL DDL)
