@@ -1537,14 +1537,14 @@ pub struct TableWriteSession {
 
 impl TableWriteSession {
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        // Partitioned target: validate up front so the shared borrow of `self` that
+        // `validate_batch_schema` takes is released before the sink is borrowed mutably.
         if self.partition_sink.is_some() {
             self.validate_batch_schema(batch)?;
+        }
+        if let Some(sink) = &mut self.partition_sink {
             let rows = batch.num_rows() as i64;
-            // `is_some` checked above.
-            self.partition_sink
-                .as_mut()
-                .expect("partition sink present")
-                .write_batch(batch)?;
+            sink.write_batch(batch)?;
             self.row_count += rows;
             return Ok(());
         }
