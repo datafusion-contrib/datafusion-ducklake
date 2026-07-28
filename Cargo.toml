@@ -114,3 +114,11 @@ required-features = ["write-sqlite"]
 [[example]]
 name = "orphan_cleanup_demo"
 required-features = ["write-sqlite"]
+
+[[example]]
+name = "dump_sort"
+required-features = ["metadata-sqlite"]
+
+[[example]]
+name = "write_sorted"
+required-features = ["write-sqlite"]
