@@ -2508,6 +2508,15 @@ impl MetadataWriter for PostgresMetadataWriter {
             .fetch_one(&mut *tx)
             .await?;
             let data_file_id: i64 = inserted.try_get(0)?;
+            // Persist the file's partition assignment, exactly as every other commit
+            // path does. Without this an append+delete commit — the update/upsert
+            // path — silently drops `partition_id` and the per-key
+            // `ducklake_file_partition_value` rows: the commit succeeds, the rows read
+            // back correctly, and the file is simply unprunable forever, an island in
+            // an otherwise partitioned table. The partition fence does not catch it,
+            // because the `DataFileInfo` it validates DOES carry the assignment; only
+            // the persistence was missing.
+            insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 

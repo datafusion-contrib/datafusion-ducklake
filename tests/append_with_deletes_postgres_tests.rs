@@ -89,6 +89,95 @@ async fn read_pairs(pool: &PgPool, cat_name: &str) -> Vec<(i32, i32)> {
     rows
 }
 
+/// An append+delete commit on a PARTITIONED table must persist the appended file's
+/// partition assignment, like every other commit path does.
+///
+/// Without it the commit succeeds and the rows read back correctly — the only symptom
+/// is that the new file carries no `partition_id` and no
+/// `ducklake_file_partition_value` rows, so it can never be pruned again: an island in
+/// an otherwise partitioned table. The partition fence does not catch this, because the
+/// `DataFileInfo` it validates DOES carry the assignment; only the persistence was
+/// missing. So this asserts the CATALOG ROWS, not the query result.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn append_with_deletes_persists_partition_metadata_postgres() {
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_part_deletes").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = writer_for(&pool, cat, &data_path).await;
+    let object_store: ObjStore = Arc::new(LocalFileSystem::new());
+    let table_writer =
+        DuckLakeTableWriter::new(writer.clone() as Arc<dyn MetadataWriter>, object_store).unwrap();
+
+    // Seed one row, then partition the table by `val`.
+    let seed = RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(Int32Array::from(vec![7]))],
+    )
+    .unwrap();
+    let seeded = table_writer
+        .write_table("public", "t", &[seed])
+        .await
+        .unwrap();
+    writer
+        .set_partition_spec(
+            seeded.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let live_partition_id: i64 = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(seeded.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Append one row through the append+delete commit (no deletes needed to exercise
+    // the same code path a partitioned update takes).
+    let appended = RecordBatch::try_new(
+        schema(),
+        vec![Arc::new(Int32Array::from(vec![2])), Arc::new(Int32Array::from(vec![9]))],
+    )
+    .unwrap();
+    let mut session = table_writer
+        .begin_write("public", "t", schema().as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&appended).unwrap();
+    session.finish_with_deletes(&[]).await.unwrap();
+
+    // The appended file must carry the live generation AND its partition value.
+    let rows: Vec<(Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.record_count = 1 AND df.end_snapshot IS NULL
+           AND df.begin_snapshot = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)",
+    )
+    .bind(seeded.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "exactly one appended file: {rows:?}");
+    assert_eq!(
+        rows[0].0,
+        Some(live_partition_id),
+        "the appended file must carry the live partition generation"
+    );
+    assert_eq!(
+        rows[0].1,
+        Some("9".to_string()),
+        "the appended file must carry its partition value"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn update_via_finish_with_deletes_is_one_snapshot_postgres() {
