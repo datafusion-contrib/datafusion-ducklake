@@ -127,20 +127,33 @@ jobs:
       # /mnt/cargo-target, so every Linux run logged "Path Validation Error: Path(s)
       # ... do(es) not exist, hence no cache is being saved" and rebuilt from
       # scratch. macOS has no scratch-disk step, so `target` is correct there.
-      - name: Cache target directory
+      # Restore on every run, save only from main. GitHub gives the repository a
+      # 10 GB cache budget and evicts least-recently-used across it, and a run's
+      # writes land in its own ref's scope — which no other pull request can read.
+      # A pull request that changes Cargo.lock therefore gets a fresh key, builds
+      # cold, and writes multi-gigabyte entries that are useful to nobody but
+      # itself while evicting the main-scoped entries every other run restores
+      # from. That is not hypothetical: PR #211 held 9.21 GB across four entries
+      # (two `macOS-target-stable` generations at 3.17 GB each) and had evicted
+      # every main-scoped cache in the repository, so unrelated pull requests were
+      # building the two slowest jobs from scratch.
+      #
+      # `Cargo.toml` joins the key because `[profile.dev.package.libduckdb-sys]`
+      # now changes the emitted artifacts. Without it the key would be unchanged,
+      # so main would hit exactly, skip saving, and the cache would keep serving
+      # unoptimised DuckDB objects that every run then recompiles and discards.
+      #
+      # `rust-toolchain.toml` is in the key because it, not `matrix.rust`, decides
+      # the compiler: it pins 1.94.0 and overrides the toolchain the `stable`
+      # action installs (the run log says as much — "note that the toolchain
+      # '1.94.0-...' is currently in use (overridden by ...rust-toolchain.toml)").
+      - name: Restore target directory
+        id: target-cache
         if: steps.changes.outputs.code == 'true'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: ${{ runner.os == 'Linux' && '/mnt/cargo-target' || 'target' }}
-          # `rust-toolchain.toml` is in the key because it, not `matrix.rust`,
-          # decides the compiler: it pins 1.94.0 and overrides the toolchain the
-          # `stable` action installs (the run log says as much — "note that the
-          # toolchain '1.94.0-...' is currently in use (overridden by
-          # ...rust-toolchain.toml)"). Keyed on Cargo.lock alone, bumping that
-          # channel left the key unchanged, so the entry kept hitting exactly,
-          # `actions/cache` skipped saving, and the job silently restored
-          # artifacts for the old rustc indefinitely.
-          key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-target-${{ matrix.rust }}-
 
@@ -190,6 +203,21 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+      # Guarded on `cache-hit != 'true'`: that output is set only by an exact
+      # primary-key match, where the entry is already current and `save` would
+      # fail on the duplicate key. A restore-keys-only match reports 'false',
+      # which is what lets the entry refresh after a lock, toolchain, or profile
+      # change.
+      - name: Save target directory (main only)
+        if: |
+          steps.changes.outputs.code == 'true'
+          && github.ref == 'refs/heads/main'
+          && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: ${{ runner.os == 'Linux' && '/mnt/cargo-target' || 'target' }}
+          key: ${{ runner.os }}-target-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
 
   # Every other job builds with `--all-features` or `write-sqlite`, which only
   # proves the union of features compiles. It cannot catch a module that
@@ -259,17 +287,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-home-
 
-      # Deliberately NOT target-cached, even though this job recompiles its
-      # feature graphs from scratch every run. The repository is already at
-      # ~10.1 GB against GitHub's 10 GB per-repo cache limit — three target
-      # directories account for ~9.4 GB of that (macOS-target-stable 3.40,
-      # Linux-target-full 3.07, Linux-target-stable 2.96) — so any entry added
-      # here is paid for by least-recently-used eviction of one of those, which
-      # then rebuilds cold and re-saves, evicting something else. A fourth target
-      # cache would trade a few minutes on this job for that oscillation across
-      # the whole workflow. Deleting the redundant `--workspace --all-targets`
-      # check below recovers most of the time without spending cache budget;
-      # revisit once the existing entries are pruned.
+      # Deliberately NOT target-cached, even though this job recompiles its twelve
+      # feature graphs from scratch every run. Unlike `check` and `test-full`, this
+      # is not a required status check, so its duration never gates a merge — it
+      # costs runner minutes and delays the all-green tick, nothing else. Deleting
+      # the redundant `--workspace --all-targets` check below recovers most of the
+      # time without spending any of the repository's 10 GB cache budget.
+      #
+      # Adding one is now defensible if the runner minutes matter (the save-only-on-
+      # main split elsewhere keeps the budget bounded at roughly 7 GB rather than
+      # letting pull requests fill it), and the entry would be ~1.3 GB of
+      # check-only rmeta. It just has to be worth a third of the budget.
       #
       # Isolate each independently-supported feature axis once.
       #
@@ -376,14 +404,16 @@ jobs:
             ${{ runner.os }}-cargo-home-
 
       # This job always uses the scratch disk, so cache that path rather than the
-      # `target` it never writes to. See the `check` job.
-      - name: Cache target directory
+      # `target` it never writes to. Restore/save split and key composition are
+      # explained in the `check` job — this is the largest entry of the three, so
+      # it is the one that most needs to stay out of pull-request cache scopes.
+      - name: Restore target directory
+        id: target-cache
         if: steps.changes.outputs.code == 'true'
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: /mnt/cargo-target
-          # See the `check` job for why `rust-toolchain.toml` belongs in the key.
-          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-target-full-
 
@@ -395,3 +425,13 @@ jobs:
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
         run: cargo test --features "duckdb-bundled encryption metadata-mysql metadata-postgres metadata-sqlite write-sqlite"
+
+      - name: Save target directory (main only)
+        if: |
+          steps.changes.outputs.code == 'true'
+          && github.ref == 'refs/heads/main'
+          && steps.target-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
+        with:
+          path: /mnt/cargo-target
+          key: ${{ runner.os }}-target-full-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml') }}
