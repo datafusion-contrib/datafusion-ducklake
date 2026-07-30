@@ -173,6 +173,23 @@ jobs:
       # Restricting the flag also matches the coverage this replaced exactly:
       # `feature-check` is `runs-on: ubuntu-latest`, so the `benchmark` package
       # was only ever checked on Linux, and the crate has no `target_os` cfgs.
+      # `autotests = false` means a file at `tests/<name>.rs` is not a test target
+      # and is never built — silently. No warning, no error, CI green, and the
+      # tests in it simply never run. That is an easy mistake to make while
+      # rebasing a branch that predates the move to `tests/it/`, so fail loudly
+      # instead. Linux only; this is a filesystem check, not a platform one.
+      - name: Check for stray test files outside tests/it
+        if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          stray=$(find tests -maxdepth 1 -name '*.rs' -type f)
+          if [[ -n "$stray" ]]; then
+            echo '::error::These files are not compiled. With autotests = false only tests/it/main.rs is a test target, so move them into tests/it/ and add a mod declaration there:'
+            echo "$stray"
+            exit 1
+          fi
+          echo "No stray test files."
+
       - name: Run clippy
         if: steps.changes.outputs.code == 'true'
         run: cargo clippy ${{ runner.os == 'Linux' && '--workspace' || '' }} --all-targets --all-features --no-deps -- -D warnings
