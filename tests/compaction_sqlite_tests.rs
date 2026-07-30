@@ -250,6 +250,65 @@ async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
     .await
 }
 
+/// A sort spec whose fields are ALL from a foreign dialect must compact unsorted, not
+/// fail.
+///
+/// `producible_columns` filters out any field whose dialect is not `duckdb`, so such a
+/// spec leaves no usable keys. Official DuckLake skips those fields and proceeds with
+/// whatever remains — nothing, here — so compaction completes and simply writes
+/// unsorted. Erroring instead would fail on a catalog official compacts fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_ignores_a_foreign_dialect_sort_spec() {
+    use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
+
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+
+    let p = pool(&temp).await;
+    let table_id = scalar_i64(
+        &p,
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't'",
+    )
+    .await;
+
+    // A sort field in another engine's dialect: readable, but not executable here.
+    let foreign = SortField {
+        sort_key_index: 0,
+        expression: "val".to_string(),
+        dialect: "spark".to_string(),
+        direction: SortDirection::Asc,
+        null_order: NullOrder::NullsLast,
+    };
+    SqliteMetadataWriter::new(&db_url(&temp))
+        .await
+        .unwrap()
+        .set_sort_spec(table_id, &[foreign])
+        .unwrap();
+
+    // Sanity: a duckdb-dialect spec on the same table is executable, so the fixture is
+    // exercising the dialect filter rather than some unrelated rejection.
+    let _ = SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast);
+
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: 1 << 30,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+    assert!(
+        result.did_work(),
+        "compaction must complete despite an unexecutable sort spec"
+    );
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+}
+
 /// Compaction of a PARTITIONED table must merge only within a partition and carry
 /// each output's partition assignment over from its sources — official DuckLake
 /// groups merge candidates by (schema_version, partition_id, partition_values).

@@ -208,6 +208,16 @@ pub(crate) fn sorted_rewrite_output(
             sort_spec.sort_id
         ))
     })?;
+    // No usable keys means "write unsorted", not an error. `producible_columns` filters
+    // out fields whose dialect is not `duckdb`, so a spec authored by another engine can
+    // legitimately leave nothing behind. Official DuckLake skips such fields and
+    // proceeds with whatever remains — an empty ORDER BY when that is all of them
+    // (`ducklake_compaction_functions.cpp`, `ducklake_insert.cpp`). Falling through to
+    // `LexOrdering::new` would instead fail a compaction that official completes; the
+    // SQL INSERT path already returns "no ordering" for this case.
+    if keys.is_empty() {
+        return Ok(input.execute(0, Arc::clone(&context))?);
+    }
 
     let mut expressions = Vec::with_capacity(keys.len());
     for (name, direction, null_order) in keys {
