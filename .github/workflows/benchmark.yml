@@ -27,21 +27,23 @@ jobs:
       - name: Install sccache
         uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
 
-      - name: Cache Cargo registry
+      # Same key as every job in the CI workflow, so this shares one cargo-home
+      # entry with them instead of maintaining a private pair. It previously keyed
+      # on `-cargo-registry-`/`-cargo-index-`, which CI also wrote until those two
+      # steps were merged into `Cache cargo home`; leaving this on the old keys
+      # would have orphaned it, and two extra per-OS entries count against the
+      # repository's 10 GB cache budget for no benefit. Combining the paths also
+      # drops the "Path Validation Error" that the `~/.cargo/git` step logged on
+      # every run, since the crate has no git dependencies.
+      - name: Cache cargo home
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-home-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
-
-      - name: Cache Cargo index
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-index-
+            ${{ runner.os }}-cargo-home-
 
       - name: Cache TPC-H test data
         id: cache-tpch
