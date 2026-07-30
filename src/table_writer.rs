@@ -41,6 +41,12 @@ pub use crate::partition::PartitionGroup;
 /// descriptors and memory.
 pub const DEFAULT_MAX_OPEN_PARTITIONS: usize = 100;
 
+/// Floor on the target data file size, matching official DuckLake's
+/// `MINIMUM_WRITE_FILE_SIZE` (`ducklake_insert.cpp`), which clamps with
+/// `MaxValue<idx_t>(target_file_size, 4096)`. A smaller request would roll a new file
+/// per batch and produce a file per row group.
+pub const MINIMUM_TARGET_FILE_SIZE: usize = 4096;
+
 /// Default target data file size: 512 MiB, matching official DuckLake's
 /// `target_file_size` default (`1 << 29`). A write rolls over to a new file once
 /// it reaches this size, so no single write can produce a file too large for
@@ -152,7 +158,7 @@ impl DuckLakeTableWriter {
     /// holds a contiguous value range with a tight min/max, enabling file-level
     /// pruning. Defaults to [`DEFAULT_TARGET_FILE_SIZE`].
     pub fn with_target_file_size(mut self, bytes: usize) -> Self {
-        self.target_file_size = bytes;
+        self.target_file_size = bytes.max(MINIMUM_TARGET_FILE_SIZE);
         self
     }
 
@@ -231,6 +237,16 @@ impl DuckLakeTableWriter {
     /// So to get the file-skipping benefit of a sort order from this path, feed
     /// batches already in sort order, or use [`Self::write_rows`] when the write fits
     /// in memory. Writing unsorted costs pruning quality only, never correctness.
+    ///
+    /// **Rolls by default.** A new data file is started once the current one exceeds
+    /// [`target_file_size`](Self::with_target_file_size), and
+    /// [`TableWriteSession::finish`] commits them all in one snapshot. Official
+    /// DuckLake rotates on every write (`result.rotate = true` in
+    /// `ducklake_insert.cpp`), and a single unbounded file could never be reorganized
+    /// afterwards — DuckLake compaction merges but never splits.
+    ///
+    /// Use [`Self::begin_write_single_file`] when the session will be finished with
+    /// [`TableWriteSession::finish_with_deletes`], which commits exactly one data file.
     pub fn begin_write(
         &self,
         schema_name: &str,
@@ -262,6 +278,45 @@ impl DuckLakeTableWriter {
             false,
             mode,
             StreamPartitionMode::Split,
+            true,
+        )
+    }
+
+    /// Begin a streaming write session that writes ONE data file, however large the
+    /// input.
+    ///
+    /// For sessions finished with [`TableWriteSession::finish_with_deletes`]: that
+    /// commit registers exactly one appended data file, so a session that rolled into
+    /// several cannot use it. [`Self::begin_write`] rolls and is the right default for
+    /// everything else.
+    ///
+    /// A single file is not reorganizable later — DuckLake compaction merges but never
+    /// splits — so prefer [`Self::begin_write`] whenever the commit allows it.
+    pub fn begin_write_single_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let file_name = format!("{}.parquet", Uuid::new_v4());
+        self.begin_write_internal(
+            schema_name,
+            table_name,
+            arrow_schema,
+            table_key,
+            file_name.clone(),
+            file_name,
+            true,
+            false,
+            mode,
+            StreamPartitionMode::Split,
+            false,
         )
     }
 
@@ -306,6 +361,7 @@ impl DuckLakeTableWriter {
             true,
             mode,
             StreamPartitionMode::Split,
+            false,
         )
     }
 
@@ -333,6 +389,7 @@ impl DuckLakeTableWriter {
             StreamPartitionMode::Reject {
                 entry_point: "begin_write_to_path",
             },
+            false,
         )
     }
 
@@ -349,6 +406,7 @@ impl DuckLakeTableWriter {
         embed_rowid: bool,
         mode: WriteMode,
         partition_mode: StreamPartitionMode,
+        roll: bool,
     ) -> Result<TableWriteSession> {
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
@@ -436,6 +494,28 @@ impl DuckLakeTableWriter {
                 },
             };
 
+        // A partitioned target already rolls inside its per-partition sink, so a
+        // second roller would be redundant (and would double-write).
+        let roller = if roll && partition_sink.is_none() {
+            let scoped_base = match self.metadata.catalog_id() {
+                Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+                None => self.base_key_path.clone(),
+            };
+            let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+            Some(RollingFileWriter::new(
+                table_key,
+                None,
+                schema_with_ids.clone(),
+                setup.column_ids.len(),
+                self.build_writer_props(),
+                self.target_file_size,
+                // Keep `TableWriteSession::file_path` accurate for the first file.
+                Some(catalog_path.clone()),
+            ))
+        } else {
+            None
+        };
+
         Ok(TableWriteSession {
             metadata: Arc::clone(&self.metadata),
             object_store: Arc::clone(&self.object_store),
@@ -456,6 +536,8 @@ impl DuckLakeTableWriter {
             row_count: 0,
             nan_flags: Vec::new(),
             partition_sink,
+            roller,
+            rolled: Vec::new(),
         })
     }
 
@@ -1145,6 +1227,7 @@ impl DuckLakeTableWriter {
             column_ids.len(),
             self.build_writer_props(),
             self.target_file_size,
+            None,
         );
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
@@ -1240,6 +1323,14 @@ struct RollingFileWriter {
     props: WriterProperties,
     target_file_size: usize,
     open: Option<OpenFile>,
+    /// Catalog path to use for the FIRST file instead of minting a fresh name.
+    ///
+    /// A streaming session pre-computes its output path at `begin_write` and exposes it
+    /// through [`TableWriteSession::file_path`]. Handing that path to the roller keeps
+    /// that accessor accurate for the first (and, for a write below
+    /// `target_file_size`, only) file, so rolling does not silently change what an
+    /// existing caller observes. Taken on first use.
+    first_catalog_path: Option<String>,
 }
 
 impl RollingFileWriter {
@@ -1250,8 +1341,10 @@ impl RollingFileWriter {
         data_column_count: usize,
         props: WriterProperties,
         target_file_size: usize,
+        first_catalog_path: Option<String>,
     ) -> Self {
         Self {
+            first_catalog_path,
             table_key,
             rel_prefix,
             schema_with_ids,
@@ -1288,7 +1381,10 @@ impl RollingFileWriter {
         open.row_count += batch.num_rows() as i64;
 
         // Estimated encoded size = finished row groups + the in-progress one.
-        if open.writer.bytes_written() + open.writer.in_progress_size() >= self.target_file_size {
+        // Strictly greater, matching official's parquet rotate predicate
+        // (`FileSize() > file_size_bytes`), so a write landing exactly on the target
+        // stays in one file.
+        if open.writer.bytes_written() + open.writer.in_progress_size() > self.target_file_size {
             return Ok(Some(finalize_open_file(
                 self.open.take().expect("file open"),
             )?));
@@ -1309,11 +1405,16 @@ impl RollingFileWriter {
         self.open.is_some()
     }
 
-    fn open_file(&self) -> Result<OpenFile> {
-        let file_name = format!("{}.parquet", Uuid::new_v4());
-        let catalog_path = match self.rel_prefix.as_deref() {
-            Some(prefix) if !prefix.is_empty() => format!("{prefix}/{file_name}"),
-            _ => file_name,
+    fn open_file(&mut self) -> Result<OpenFile> {
+        let catalog_path = match self.first_catalog_path.take() {
+            Some(path) => path,
+            None => {
+                let file_name = format!("{}.parquet", Uuid::new_v4());
+                match self.rel_prefix.as_deref() {
+                    Some(prefix) if !prefix.is_empty() => format!("{prefix}/{file_name}"),
+                    _ => file_name,
+                }
+            },
         };
         let object_path_str = join_paths(&self.table_key, &catalog_path)?;
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
@@ -1483,6 +1584,7 @@ impl PartitionSink {
                         self.column_ids.len(),
                         self.props.clone(),
                         self.target_file_size,
+                        None,
                     ),
                 ));
                 self.open.len() - 1
@@ -1586,14 +1688,32 @@ pub struct TableWriteSession {
     /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
     /// every file the sink produced in a single snapshot.
     partition_sink: Option<PartitionSink>,
+    /// Set unless the session is single-file (see
+    /// [`DuckLakeTableWriter::begin_write_single_file`]): batches are routed
+    /// through this instead of the single `writer` above, starting a new file each
+    /// time one reaches `target_file_size`, and `finish` commits them all in one
+    /// snapshot. `None` for a single-file session.
+    roller: Option<RollingFileWriter>,
+    /// Files the roller has finished, awaiting upload at `finish`.
+    rolled: Vec<StagedFile>,
 }
 
 impl TableWriteSession {
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        // Partitioned target: validate up front so the shared borrow of `self` that
-        // `validate_batch_schema` takes is released before the sink is borrowed mutably.
-        if self.partition_sink.is_some() {
+        // Rolling or partitioned target: validate up front so the shared borrow of
+        // `self` that `validate_batch_schema` takes is released before the roller or
+        // sink is borrowed mutably.
+        if self.roller.is_some() || self.partition_sink.is_some() {
             self.validate_batch_schema(batch)?;
+        }
+        if let Some(roller) = &mut self.roller {
+            let rows = batch.num_rows() as i64;
+            // `roller` and `rolled` are distinct fields, so both can be borrowed here.
+            if let Some(staged) = roller.write(batch)? {
+                self.rolled.push(staged);
+            }
+            self.row_count += rows;
+            return Ok(());
         }
         if let Some(sink) = &mut self.partition_sink {
             let rows = batch.num_rows() as i64;
@@ -1671,6 +1791,43 @@ impl TableWriteSession {
     }
 
     pub async fn finish(mut self) -> Result<WriteResult> {
+        // Rolling: finish the in-progress file, upload every file this session
+        // produced, and commit them in ONE snapshot.
+        if let Some(mut roller) = self.roller.take() {
+            if let Some(staged) = roller.finish()? {
+                self.rolled.push(staged);
+            }
+            let mut file_infos = Vec::with_capacity(self.rolled.len());
+            for staged in std::mem::take(&mut self.rolled) {
+                file_infos
+                    .push(upload_staged_file(staged, &self.object_store, &self.column_ids).await?);
+            }
+            if file_infos.is_empty() {
+                // No rows arrived. Fall through to the single-file path, which
+                // registers the 0-row marker a Replace needs to retire the prior
+                // generation.
+                return self.finish_single_file().await;
+            }
+            let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
+            let committed = self.metadata.register_data_files(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &file_infos,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.column_ids,
+            )?;
+            return Ok(WriteResult {
+                snapshot_id: committed.snapshot_id,
+                table_id: committed.table_id,
+                schema_id: committed.schema_id,
+                files_written: file_infos.len(),
+                records_written,
+            });
+        }
         // Partitioned: commit every file the sink produced in ONE snapshot, so a
         // partitioned streaming write is as atomic as an unpartitioned one.
         if let Some(sink) = self.partition_sink.take() {
@@ -1742,21 +1899,45 @@ impl TableWriteSession {
         // Reject an unsupported combination before uploading the staged parquet,
         // so a misuse leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
-        let file_info = match self.partition_sink.take() {
-            Some(sink) => {
-                let file_count = sink.pending_file_count();
-                if file_count != 1 {
+        // A rolling or partitioned session may have produced several files, but this
+        // commit registers exactly one. Both cases therefore COUNT their files before
+        // uploading anything, so a rejected write leaves no orphan object.
+        let file_info = if let Some(sink) = self.partition_sink.take() {
+            let file_count = sink.pending_file_count();
+            if file_count != 1 {
+                return Err(crate::error::DuckLakeError::Unsupported(format!(
+                    "an atomic append+delete commit accepts one appended data file, but the \
+                     partitioned write produced {file_count}"
+                )));
+            }
+            sink.into_file_infos(&self.object_store)
+                .await?
+                .pop()
+                .expect("one pending partition file")
+        } else if let Some(mut roller) = self.roller.take() {
+            // `finish` writes the parquet footer locally; nothing is uploaded yet.
+            if let Some(staged) = roller.finish()? {
+                self.rolled.push(staged);
+            }
+            match self.rolled.len() {
+                // No rows arrived. Fall through to the single-file path, whose 0-row
+                // marker is what carries a Replace truncation (and is exempt from the
+                // partition fence) — same behaviour as a non-rolling session.
+                0 => self.upload_staged().await?,
+                1 => {
+                    let staged = self.rolled.pop().expect("one staged file");
+                    upload_staged_file(staged, &self.object_store, &self.column_ids).await?
+                },
+                file_count => {
                     return Err(crate::error::DuckLakeError::Unsupported(format!(
                         "an atomic append+delete commit accepts one appended data file, but the \
-                         partitioned write produced {file_count}"
+                         write rolled into {file_count}. Open the session with \
+                         begin_write_single_file, which never rolls."
                     )));
-                }
-                sink.into_file_infos(&self.object_store)
-                    .await?
-                    .pop()
-                    .expect("one pending partition file")
-            },
-            None => self.upload_staged().await?,
+                },
+            }
+        } else {
+            self.upload_staged().await?
         };
         let committed = self.metadata.register_data_file_with_deletes(
             self.table_id,

@@ -157,6 +157,171 @@ async fn live_file_count(conn_str: &str, table_id: i64) -> usize {
 /// Asserts the file-level property that matters: each rolled file's `val` range is
 /// disjoint from every other's. A per-file sort could not achieve this (a file's
 /// min/max does not depend on row order) — only a global sort before rolling can.
+/// `begin_write` must produce SEVERAL files for a load larger than
+/// `target_file_size`, and `begin_write_single_file` must produce exactly one.
+///
+/// Rolling is the default because official DuckLake rotates on every write
+/// (`result.rotate = true`), and because DuckLake compaction merges but never splits —
+/// so a file written oversized can never be reorganized afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn begin_write_rolls_by_default_and_single_file_opts_out() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, true),
+    ]));
+    // Many batches, comfortably past an 8 KiB target once encoded.
+    let batches: Vec<RecordBatch> = (0..40)
+        .map(|b| {
+            let ids: Vec<i32> = (b * 200..(b + 1) * 200).collect();
+            let vals = ids.clone();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let writer_for = |()| async {
+        let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap();
+        DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
+            .unwrap()
+            .with_target_file_size(8 * 1024)
+    };
+
+    // Default: rolls.
+    let table_writer = writer_for(()).await;
+    let mut session = table_writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Replace)
+        .unwrap();
+    for batch in &batches {
+        session.write_batch(batch).unwrap();
+    }
+    let rolled = session.finish().await.unwrap();
+    assert_eq!(rolled.records_written, 8000);
+    assert!(
+        rolled.files_written > 1,
+        "begin_write must roll a load past target_file_size, got {} file(s)",
+        rolled.files_written
+    );
+
+    // Every row still readable through the catalog.
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        8000
+    );
+
+    // Opt out: exactly one file, however large the input.
+    let table_writer = writer_for(()).await;
+    let mut session = table_writer
+        .begin_write_single_file("main", "events", schema.as_ref(), WriteMode::Replace)
+        .unwrap();
+    for batch in &batches {
+        session.write_batch(batch).unwrap();
+    }
+    let single = session.finish().await.unwrap();
+    assert_eq!(
+        single.files_written, 1,
+        "begin_write_single_file must never roll"
+    );
+}
+
+/// `finish_with_deletes` accepts a session that produced exactly ONE file, and
+/// refuses one that rolled into several — the same rule the partitioned sink follows,
+/// because that commit registers a single appended data file.
+///
+/// The count is taken before any upload, so a refused write leaves no orphan object.
+#[tokio::test(flavor = "multi_thread")]
+async fn rolling_session_with_deletes_allows_one_file_and_refuses_several() {
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let env = setup().await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, true),
+    ]));
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    // One small batch stays within one file -> the commit is accepted.
+    let small = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    let writer = {
+        let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap();
+        DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
+            .unwrap()
+            .with_target_file_size(512 * 1024)
+    };
+    let mut session = writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&small).unwrap();
+    let result = session.finish_with_deletes(&[]).await.unwrap();
+    assert_eq!(result.records_written, 3);
+    assert_eq!(result.files_written, 1);
+
+    // A load that rolls past the target produces several files -> refused, naming the
+    // count and the single-file alternative.
+    let batches: Vec<RecordBatch> = (0..40)
+        .map(|b| {
+            let ids: Vec<i32> = (b * 200..(b + 1) * 200).collect();
+            let vals = ids.clone();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
+            )
+            .unwrap()
+        })
+        .collect();
+    let writer = {
+        let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap();
+        DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
+            .unwrap()
+            .with_target_file_size(8 * 1024)
+    };
+    let mut session = writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    for batch in &batches {
+        session.write_batch(batch).unwrap();
+    }
+    let err = session.finish_with_deletes(&[]).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("one appended data file") && msg.contains("begin_write"),
+        "the error must state the rule and the alternative, got: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn low_level_bulk_write_sorts_and_yields_non_overlapping_files() {
     use datafusion_ducklake::table_writer::DuckLakeTableWriter;
