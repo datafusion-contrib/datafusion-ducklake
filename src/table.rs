@@ -3642,6 +3642,10 @@ mod tests {
         );
     }
 
+    // `sort_ordering_for` is `#[cfg(feature = "write")]`, so the test that exercises
+    // it needs the same gate — otherwise a read-only feature combination fails to
+    // compile the test target.
+    #[cfg(feature = "write")]
     #[test]
     fn sort_ordering_rejects_expression_sort_key() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
