@@ -10,8 +10,7 @@
 //! This allows comprehensive testing of DataFusion's read path.
 //! Tests from: https://github.com/duckdb/ducklake/tree/main/test/sql
 
-mod common;
-mod hybrid_asyncdb;
+use crate::hybrid_asyncdb;
 
 use hybrid_asyncdb::HybridDuckLakeDB;
 use sqllogictest::Runner;
@@ -190,7 +189,7 @@ async fn run_hybrid_test(test_file: &str) -> Result<(), Box<dyn std::error::Erro
 /// The rest of the vendored suite is informational — most files exercise
 /// DuckDB-specific directives (`loop`, `foreach`, `SET VARIABLE`), types, or
 /// virtual columns (`file_row_number`) the hybrid runner does not translate.
-/// CDC conformance is authoritatively covered by tests/cdc_differential_tests.rs,
+/// CDC conformance is authoritatively covered by tests/it/cdc_differential_tests.rs,
 /// which diffs live against the official extension.
 const EXPECTED_PASS: &[&str] = &[
     "attach/attach_replace.test",

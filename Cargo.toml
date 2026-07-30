@@ -17,6 +17,9 @@ readme = "README.md"
 keywords = ["datafusion", "duckdb", "ducklake", "iceberg", "datalake"]
 categories = ["database", "filesystem"]
 exclude = ["datafusion-ducklake.iml", "target", "tests/test_data"]
+# The integration tests are one binary (`tests/it/main.rs`) with a module per
+# former `tests/*.rs` file, declared explicitly below rather than auto-discovered.
+autotests = false
 
 [dependencies]
 datafusion = "54"
@@ -122,6 +125,17 @@ required-features = ["metadata-sqlite"]
 [[example]]
 name = "write_sorted"
 required-features = ["write-sqlite"]
+
+# One integration-test binary instead of one per `tests/*.rs`. Cargo links a
+# separate binary per test target, and with `duckdb-bundled` on by default each
+# statically linked its own copy of DuckDB — ~50 binaries at 260-430 MB apiece.
+# That is what exhausted the runner's disk while linking (`lld` failing with
+# SIGBUS, which `CARGO_PROFILE_TEST_DEBUG: "0"` in CI works around) and what
+# inflated the cached target directory past GitHub's 10 GB per-repository budget.
+# See `tests/it/main.rs`.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
 
 # Build the vendored DuckDB C++ optimised even in dev/test builds. `duckdb-bundled`
 # is a default feature, and without this the amalgamation is compiled at the dev

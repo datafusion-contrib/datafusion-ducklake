@@ -5,7 +5,7 @@
 //! files added between snapshots for CDC (Change Data Capture) queries,
 //! and that table_deletions correctly returns deleted rows.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

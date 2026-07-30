@@ -1,14 +1,14 @@
-#![cfg(feature = "metadata-mysql")]
-//! MySQL metadata provider tests
+#![cfg(feature = "metadata-sqlite")]
+//! SQLite metadata provider tests
 //!
-//! This test suite verifies the MySQL metadata provider implementation,
+//! This test suite verifies the SQLite metadata provider implementation,
 //! including all MetadataProvider trait methods, schema initialization,
 //! concurrent access, and error handling.
 //!
 //! ## Test Setup
 //!
-//! Tests use testcontainers to spin up a temporary MySQL instance.
-//! Each test creates its own database with test data to ensure isolation.
+//! Tests use in-memory SQLite databases for fast, isolated testing.
+//! No Docker or external services required.
 //!
 //! ## Coverage
 //!
@@ -18,25 +18,23 @@
 //! - Concurrent access and thread safety
 //! - Error handling and edge cases
 
-mod common;
+use crate::common;
 
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, MySqlMetadataProvider,
+    DuckLakeCatalog, DuckdbMetadataProvider, SqliteMetadataProvider,
     metadata_provider::MetadataProvider,
 };
-use sqlx::MySqlPool;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tempfile::TempDir;
-use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::mysql::Mysql;
 
-/// Initialize DuckLake catalog schema in MySQL (for tests only)
-async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
+/// Initialize DuckLake catalog schema in SQLite (for tests only)
+async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
-            snapshot_id BIGINT PRIMARY KEY,
-            snapshot_time DATETIME(6)
+            snapshot_id INTEGER PRIMARY KEY,
+            snapshot_time TEXT
         )",
     )
     .execute(pool)
@@ -44,12 +42,12 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_schema (
-            schema_id BIGINT PRIMARY KEY,
-            schema_name VARCHAR(255) NOT NULL,
-            path VARCHAR(1024) NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            begin_snapshot BIGINT NOT NULL,
-            end_snapshot BIGINT
+            schema_id INTEGER PRIMARY KEY,
+            schema_name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative INTEGER NOT NULL,
+            begin_snapshot INTEGER NOT NULL,
+            end_snapshot INTEGER
         )",
     )
     .execute(pool)
@@ -57,27 +55,35 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_table (
-            table_id BIGINT PRIMARY KEY,
-            schema_id BIGINT NOT NULL,
-            table_name VARCHAR(255) NOT NULL,
-            path VARCHAR(1024) NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            begin_snapshot BIGINT NOT NULL,
-            end_snapshot BIGINT,
+            table_id INTEGER PRIMARY KEY,
+            schema_id INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative INTEGER NOT NULL,
+            begin_snapshot INTEGER NOT NULL,
+            end_snapshot INTEGER,
             FOREIGN KEY (schema_id) REFERENCES ducklake_schema(schema_id)
         )",
     )
     .execute(pool)
     .await?;
 
+    // Schema must match SQL_CREATE_SCHEMA in metadata_writer_sqlite.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
-            column_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            column_name VARCHAR(255) NOT NULL,
-            column_type VARCHAR(255) NOT NULL,
+            column_id INTEGER PRIMARY KEY,
+            table_id INTEGER NOT NULL,
+            column_name TEXT NOT NULL,
+            column_type TEXT NOT NULL,
             column_order INTEGER NOT NULL,
-            nulls_allowed BOOLEAN,
+            nulls_allowed INTEGER,
+            initial_default TEXT,
+            default_value TEXT,
+            parent_column INTEGER,
+            default_value_type TEXT,
+            default_value_dialect TEXT,
+            begin_snapshot INTEGER NOT NULL DEFAULT 1,
+            end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -86,15 +92,18 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_data_file (
-            data_file_id BIGINT PRIMARY KEY,
-            table_id BIGINT NOT NULL,
-            path VARCHAR(1024) NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            footer_size BIGINT,
-            encryption_key VARCHAR(255),
-            begin_snapshot BIGINT NOT NULL DEFAULT 1,
-            end_snapshot BIGINT,
+            data_file_id INTEGER PRIMARY KEY,
+            table_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative INTEGER NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            footer_size INTEGER,
+            encryption_key TEXT,
+            record_count INTEGER,
+            row_id_start INTEGER,
+            mapping_id INTEGER,
+            begin_snapshot INTEGER NOT NULL DEFAULT 1,
+            end_snapshot INTEGER,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -103,17 +112,17 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_delete_file (
-            delete_file_id BIGINT PRIMARY KEY,
-            data_file_id BIGINT NOT NULL,
-            table_id BIGINT NOT NULL,
-            path VARCHAR(1024) NOT NULL,
-            path_is_relative BOOLEAN NOT NULL,
-            file_size_bytes BIGINT NOT NULL,
-            footer_size BIGINT,
-            encryption_key VARCHAR(255),
-            delete_count BIGINT,
-            begin_snapshot BIGINT NOT NULL,
-            end_snapshot BIGINT,
+            delete_file_id INTEGER PRIMARY KEY,
+            data_file_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            path_is_relative INTEGER NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            footer_size INTEGER,
+            encryption_key TEXT,
+            delete_count INTEGER,
+            begin_snapshot INTEGER NOT NULL,
+            end_snapshot INTEGER,
             FOREIGN KEY (data_file_id) REFERENCES ducklake_data_file(data_file_id),
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
@@ -123,74 +132,68 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_metadata (
-            `key` VARCHAR(255) NOT NULL,
-            value VARCHAR(1024) NOT NULL,
-            scope VARCHAR(255),
-            scope_id BIGINT,
-            PRIMARY KEY (`key`)
+            key TEXT NOT NULL PRIMARY KEY,
+            value TEXT NOT NULL,
+            scope TEXT,
+            scope_id INTEGER
         )",
     )
     .execute(pool)
     .await?;
 
-    // MySQL indexes
+    // SQLite indexes
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_schema_snapshot ON ducklake_schema(begin_snapshot, end_snapshot)",
     )
     .execute(pool)
-    .await
-    .ok(); // Ignore if already exists
+    .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_table_schema ON ducklake_table(schema_id)")
         .execute(pool)
-        .await
-        .ok();
+        .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_table_snapshot ON ducklake_table(begin_snapshot, end_snapshot)",
     )
     .execute(pool)
-    .await
-    .ok();
+    .await?;
 
     Ok(())
 }
 
-/// Helper to create a MySQL provider with initialized schema
-async fn create_mysql_provider()
--> anyhow::Result<(MySqlMetadataProvider, testcontainers::ContainerAsync<Mysql>)> {
-    let container = Mysql::default().start().await?;
-
-    let host = "127.0.0.1";
-    let port = container.get_host_port_ipv4(3306).await?;
-    let conn_str = format!("mysql://root@{}:{}/test", host, port);
-
-    let provider = MySqlMetadataProvider::new(&conn_str)
+/// Helper to create a SQLite provider with initialized schema (in-memory)
+async fn create_sqlite_provider() -> anyhow::Result<SqliteMetadataProvider> {
+    // Use a unique in-memory database for each test
+    let provider = SqliteMetadataProvider::new("sqlite::memory:")
         .await
         .expect("Failed to create provider");
     init_schema(&provider.pool).await?;
 
-    Ok((provider, container))
+    Ok(provider)
 }
 
-/// Helper to populate test data in MySQL
-async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<()> {
+/// Helper to populate test data in SQLite
+async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
     let pool = &provider.pool;
 
     // Insert snapshots
-    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
-        .bind(1i64)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, datetime('now'))",
+    )
+    .bind(1i64)
+    .execute(pool)
+    .await?;
 
-    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
-        .bind(2i64)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, datetime('now'))",
+    )
+    .bind(2i64)
+    .execute(pool)
+    .await?;
 
     // Insert metadata (data_path)
     sqlx::query(
-        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
     )
     .bind("data_path")
     .bind("file:///tmp/ducklake_data/")
@@ -205,7 +208,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(1i64)
     .bind("test_schema")
     .bind("test_schema/")
-    .bind(true)
+    .bind(1i32)
     .bind(1i64)
     .bind(None::<i64>)
     .execute(pool)
@@ -219,7 +222,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(2i64)
     .bind("schema2")
     .bind("schema2/")
-    .bind(true)
+    .bind(1i32)
     .bind(2i64)
     .bind(None::<i64>)
     .execute(pool)
@@ -234,7 +237,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(1i64)
     .bind("users")
     .bind("users/")
-    .bind(true)
+    .bind(1i32)
     .bind(1i64)
     .bind(None::<i64>)
     .execute(pool)
@@ -249,7 +252,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(1i64)
     .bind("products")
     .bind("products/")
-    .bind(true)
+    .bind(1i32)
     .bind(2i64)
     .bind(None::<i64>)
     .execute(pool)
@@ -265,7 +268,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind("id")
     .bind("INT")
     .bind(0i32)
-    .bind(false)
+    .bind(0i32) // false
     .execute(pool)
     .await?;
 
@@ -278,7 +281,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind("name")
     .bind("VARCHAR")
     .bind(1i32)
-    .bind(true)
+    .bind(1i32) // true
     .execute(pool)
     .await?;
 
@@ -291,7 +294,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind("email")
     .bind("VARCHAR")
     .bind(2i32)
-    .bind(true)
+    .bind(1i32) // true
     .execute(pool)
     .await?;
 
@@ -303,7 +306,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(1i64)
     .bind(1i64)
     .bind("data_001.parquet")
-    .bind(true)
+    .bind(1i32)
     .bind(1024i64)
     .bind(Some(128i64))
     .bind(1i64)
@@ -317,7 +320,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(2i64)
     .bind(1i64)
     .bind("data_002.parquet")
-    .bind(true)
+    .bind(1i32)
     .bind(2048i64)
     .bind(Some(256i64))
     .bind(1i64)
@@ -334,7 +337,7 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     .bind(1i64)
     .bind(1i64)
     .bind("data_001.delete.parquet")
-    .bind(true)
+    .bind(1i32)
     .bind(512i64)
     .bind(Some(64i64))
     .bind(Some(5i64))
@@ -346,9 +349,9 @@ async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<
     Ok(())
 }
 
-/// Helper to populate MySQL with metadata from a DuckDB-created catalog
+/// Helper to populate SQLite with metadata from a DuckDB-created catalog
 async fn populate_from_duckdb_catalog(
-    provider: &MySqlMetadataProvider,
+    provider: &SqliteMetadataProvider,
 ) -> anyhow::Result<(String, TempDir)> {
     // Step 1: Create temporary directory and DuckDB catalog with real Parquet files
     let temp_dir = TempDir::new()?;
@@ -366,27 +369,21 @@ async fn populate_from_duckdb_catalog(
 
     let schemas = duckdb_provider.list_schemas(current_snapshot.snapshot_id)?;
 
-    // Step 3: Populate MySQL with metadata from DuckDB
+    // Step 3: Populate SQLite with metadata from DuckDB
     let pool = &provider.pool;
 
     // Insert snapshots
     for snapshot in &snapshots {
-        let timestamp_value: Option<sqlx::types::chrono::NaiveDateTime> =
-            snapshot.timestamp.as_ref().and_then(|ts_str| {
-                sqlx::types::chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.6f")
-                    .ok()
-            });
-
         sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, ?)")
             .bind(snapshot.snapshot_id)
-            .bind(timestamp_value)
+            .bind(&snapshot.timestamp)
             .execute(pool)
             .await?;
     }
 
     // Insert data_path metadata
     sqlx::query(
-        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
     )
     .bind("data_path")
     .bind(&data_path)
@@ -402,7 +399,7 @@ async fn populate_from_duckdb_catalog(
         .bind(schema.schema_id)
         .bind(&schema.schema_name)
         .bind(&schema.path)
-        .bind(schema.path_is_relative)
+        .bind(schema.path_is_relative as i32)
         .bind(1i64)
         .bind(None::<i64>)
         .execute(pool)
@@ -419,7 +416,7 @@ async fn populate_from_duckdb_catalog(
             .bind(schema.schema_id)
             .bind(&table.table_name)
             .bind(&table.path)
-            .bind(table.path_is_relative)
+            .bind(table.path_is_relative as i32)
             .bind(1i64)
             .bind(None::<i64>)
             .execute(pool)
@@ -438,7 +435,7 @@ async fn populate_from_duckdb_catalog(
                 .bind(&column.column_name)
                 .bind(&column.column_type)
                 .bind(order as i32)
-                .bind(column.is_nullable)
+                .bind(column.is_nullable as i32)
                 .execute(pool)
                 .await?;
             }
@@ -456,7 +453,7 @@ async fn populate_from_duckdb_catalog(
                 .bind(data_file_id)
                 .bind(table.table_id)
                 .bind(&file.file.path)
-                .bind(file.file.path_is_relative)
+                .bind(file.file.path_is_relative as i32)
                 .bind(file.file.file_size_bytes)
                 .bind(file.file.footer_size)
                 .bind(1i64)
@@ -475,7 +472,7 @@ async fn populate_from_duckdb_catalog(
                     .bind(data_file_id)
                     .bind(table.table_id)
                     .bind(&delete_file.path)
-                    .bind(delete_file.path_is_relative)
+                    .bind(delete_file.path_is_relative as i32)
                     .bind(delete_file.file_size_bytes)
                     .bind(delete_file.footer_size)
                     .bind(None::<i64>)
@@ -492,9 +489,8 @@ async fn populate_from_duckdb_catalog(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_schema_initialization_idempotent() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
     init_schema(&provider.pool)
@@ -507,9 +503,8 @@ async fn test_schema_initialization_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_current_snapshot() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     // Initially should be 0 (no snapshots)
     let snapshot_id = provider
@@ -530,9 +525,8 @@ async fn test_get_current_snapshot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_data_path() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -544,9 +538,8 @@ async fn test_get_data_path() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_snapshots() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -560,9 +553,8 @@ async fn test_list_snapshots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_schemas_snapshot_isolation() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -589,9 +581,8 @@ async fn test_list_schemas_snapshot_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_schema_by_name() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -633,9 +624,8 @@ async fn test_get_schema_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_tables() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -658,9 +648,8 @@ async fn test_list_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_table_by_name() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -685,9 +674,8 @@ async fn test_get_table_by_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_table_exists() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -723,9 +711,8 @@ async fn test_table_exists() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_get_table_structure() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -742,18 +729,20 @@ async fn test_get_table_structure() {
 
     assert_eq!(columns[0].column_name, "id");
     assert_eq!(columns[0].column_type, "INT");
+    assert!(!columns[0].is_nullable);
 
     assert_eq!(columns[1].column_name, "name");
     assert_eq!(columns[1].column_type, "VARCHAR");
+    assert!(columns[1].is_nullable);
 
     assert_eq!(columns[2].column_name, "email");
     assert_eq!(columns[2].column_type, "VARCHAR");
+    assert!(columns[2].is_nullable);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_get_table_files_for_select() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -789,9 +778,8 @@ async fn test_get_table_files_for_select() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_all_tables() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -811,9 +799,8 @@ async fn test_list_all_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_list_all_columns() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -834,9 +821,8 @@ async fn test_list_all_columns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_all_files() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -856,9 +842,8 @@ async fn test_list_all_files() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_concurrent_access() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -889,9 +874,8 @@ async fn test_concurrent_access() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_datafusion_integration() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -913,26 +897,8 @@ async fn test_datafusion_integration() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn test_error_invalid_connection_string() {
-    let result = MySqlMetadataProvider::new("invalid://connection:string").await;
-    assert!(
-        result.is_err(),
-        "Should fail with invalid connection string"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn test_error_connection_refused() {
-    let result = MySqlMetadataProvider::new("mysql://root@localhost:9999/db").await;
-    assert!(result.is_err(), "Should fail when connection is refused");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_query_real_parquet_files() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     let (_data_path, _temp_dir) = populate_from_duckdb_catalog(&provider)
         .await
@@ -996,9 +962,8 @@ async fn test_query_real_parquet_files() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_query_with_filter() {
-    let (provider, _container) = create_mysql_provider().await.unwrap();
+    let provider = create_sqlite_provider().await.unwrap();
 
     let (_data_path, _temp_dir) = populate_from_duckdb_catalog(&provider)
         .await
@@ -1032,51 +997,84 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(1), "Diana");
 }
 
-/// Connecting as a password-protected `caching_sha2_password` user over a
-/// non-TLS channel must succeed.
-///
-/// This is MySQL 8's default auth plugin. On the first connection for a user the
-/// server's fast-auth cache is cold, so it demands full authentication; over an
-/// insecure channel the client must fetch the server's RSA public key and send
-/// the password encrypted. sqlx bundled that RSA backend unconditionally through
-/// 0.8, but 0.9 moved it behind the `mysql-rsa` feature and substitutes a stub
-/// that fails at connect time with "RSA auth backend disabled". Nothing catches
-/// that at compile time, and the rest of this suite connects as passwordless
-/// `root` (an empty password skips the RSA exchange entirely), so this test is
-/// what pins `sqlx/mysql-rsa` into the `metadata-mysql` feature.
 #[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn test_connect_caching_sha2_password_without_tls() {
-    let container = Mysql::default()
-        .with_init_sql(
-            "CREATE USER 'rsauser'@'%' IDENTIFIED WITH caching_sha2_password BY 'secret-pw';
-             GRANT ALL PRIVILEGES ON test.* TO 'rsauser'@'%';"
-                .to_string()
-                .into_bytes(),
-        )
-        .start()
-        .await
-        .expect("Failed to start MySQL");
+async fn test_schema_capability_probe_memoized_positive_only() {
+    let provider = create_sqlite_provider().await.unwrap();
 
-    let port = container
-        .get_host_port_ipv4(3306)
+    populate_test_data(&provider)
         .await
-        .expect("Failed to get port");
-    let conn_str = format!("mysql://rsauser:secret-pw@127.0.0.1:{}/test", port);
+        .expect("Failed to populate test data");
 
-    let provider = MySqlMetadataProvider::new(&conn_str)
-        .await
-        .expect("should connect as a caching_sha2_password user over a non-TLS channel");
-
-    // Prove the connection is actually usable, not merely constructed.
-    init_schema(&provider.pool)
-        .await
-        .expect("should run DDL over the authenticated connection");
-    let snapshots = provider
-        .list_snapshots()
-        .expect("should query over the authenticated connection");
+    // Minimal fixture: every optional capability is absent, so the
+    // positive-only memo must stay empty and repeated calls keep re-probing
+    // (the status quo for legacy catalogs) while returning identical results.
+    assert!(!provider.schema_capabilities_cached());
+    let first = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
     assert!(
-        snapshots.is_empty(),
-        "freshly initialized catalog should have no snapshots"
+        !provider.schema_capabilities_cached(),
+        "a negative probe result must not be cached"
     );
+    let second = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert_eq!(first.len(), 2);
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+    // Upgrade the catalog mid-flight: add every capability the provider
+    // probes. Because false was never cached, the very next call must see
+    // the upgrade and memoize the all-true answer.
+    let pool = &provider.pool;
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partial_max INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_delete_file ADD COLUMN partial_max INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partition_id INTEGER")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_schema_versions (
+            begin_snapshot INTEGER NOT NULL,
+            schema_version INTEGER NOT NULL,
+            table_id INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_inlined_data_tables (
+            table_id INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            schema_snapshot INTEGER
+        )",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let migrated_first = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert!(
+        provider.schema_capabilities_cached(),
+        "an all-true probe result must be cached after the first call"
+    );
+    let migrated_second = provider
+        .get_table_files_for_select(1, 1)
+        .expect("Should get table files");
+    assert_eq!(migrated_first.len(), 2);
+    assert_eq!(
+        format!("{migrated_first:?}"),
+        format!("{migrated_second:?}")
+    );
+
+    // Clones share the memo (the cell is Arc-shared).
+    assert!(provider.clone().schema_capabilities_cached());
 }

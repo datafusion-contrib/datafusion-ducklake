@@ -1,7 +1,7 @@
 #![cfg(feature = "metadata-duckdb")]
 //! Tests for missing delete file error handling (issue #52)
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

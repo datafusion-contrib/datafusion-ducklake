@@ -38,16 +38,16 @@ This directory contains comprehensive tests for the delete file filtering functi
 
 ```bash
 # Run all delete filter tests
-cargo test --test delete_filter_tests
+cargo test --test it delete_filter_tests
 
 # Run with output
-cargo test --test delete_filter_tests -- --nocapture
+cargo test --test it delete_filter_tests -- --nocapture
 
 # Run a specific test
-cargo test --test delete_filter_tests test_table_with_delete_files
+cargo test --test it delete_filter_tests::test_table_with_delete_files
 
 # Run unit tests only
-cargo test --test delete_filter_tests unit_tests::
+cargo test --test it delete_filter_tests::unit_tests::
 ```
 
 ## Test Data
@@ -88,5 +88,5 @@ To clean and regenerate all test data:
 ```bash
 rm -rf tests/test_data/
 ./tests/generate_test_data.sh
-cargo test --test delete_filter_tests
+cargo test --test it delete_filter_tests
 ```

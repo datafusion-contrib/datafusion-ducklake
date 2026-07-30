@@ -4,7 +4,7 @@
 //! These tests verify that the delete file implementation correctly filters out
 //! deleted rows from query results while maintaining backward compatibility.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -6,7 +6,7 @@
 //! snapshot / schema / table / column / data-file rows the provider resolves.
 //!
 //! Uses testcontainers to spin up a throwaway MySQL, so it is gated the same way
-//! as `tests/mysql_metadata_provider_test.rs`: it is ignored under
+//! as `tests/it/mysql_metadata_provider_test.rs`: it is ignored under
 //! `skip-tests-with-docker` on macOS (Docker unavailable there).
 
 use datafusion_ducklake::{

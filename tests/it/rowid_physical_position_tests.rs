@@ -10,7 +10,7 @@
 //!
 //! See docs/rowid-lineage-physical-position-plan.md.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -6,7 +6,7 @@
 //! official extension) and then query through DataFusion to verify our
 //! injected `rowid` column matches what DuckDB itself would return.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -54,7 +54,7 @@ The codebase follows a layered architecture with clear separation of concerns:
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
    - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`) and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`)
    - `DuckLakeTableWriter` / `TableWriteSession` (`table_writer.rs`): write Arrow batches to Parquet with configurable compression and row-group sizing
-   - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/insert_partitioning_tests.rs`)
+   - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/it/insert_partitioning_tests.rs`)
    - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`
    - `maintenance.rs`: expire snapshots, clean up superseded files, reclaim orphaned files (Rust API, not SQL DDL)
    - Multi-catalog (PostgreSQL, **experimental & library-specific** — not part of the DuckLake spec, not accepted upstream): `MulticatalogManager` (`multicatalog.rs`) creates/manages many catalogs in one store; `MulticatalogProvider` (`multicatalog_provider.rs`, feature `multicatalog-postgres`) reads them. All PostgreSQL writes currently go through this path. SQL CTAS is unsupported here (first write of a table goes through `DuckLakeTableWriter`); `INSERT INTO` works once the table exists.
@@ -187,7 +187,7 @@ The `DuckLakeTable` provider handles URL resolution by:
 - `DeleteFilterExec` wraps Parquet scans and filters rows by global position
 - Supports MOR (Merge-On-Read) pattern for efficient row-level deletes
 - Handles edge cases: COUNT(*) optimization, empty batches, all rows deleted
-- See `delete_filter.rs` and `tests/delete_filter_tests.rs` for implementation and tests
+- See `delete_filter.rs` and `tests/it/delete_filter_tests.rs` for implementation and tests
 
 ### Filter Pushdown
 - Implements `supports_filters_pushdown()` returning `Inexact` for all filters
@@ -249,9 +249,19 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - No optional metadata caching layer (all lookups are dynamic)
 
 ### Testing
-The project includes comprehensive tests (`tests/`, ~27 integration files plus unit
+The project includes comprehensive tests (`tests/it/`, ~50 integration modules plus unit
 tests in `src/`). Many are feature-gated — e.g. write tests need `write-sqlite`, and
 the postgres/mysql provider and multicatalog tests require Docker (`testcontainers`).
+
+The integration tests are a **single binary**, `tests/it/main.rs`, with one module per
+file rather than one `tests/*.rs` target each (`autotests = false` plus an explicit
+`[[test]] name = "it"`). Cargo links one binary per test target, and with
+`duckdb-bundled` on by default each statically linked its own copy of DuckDB, so ~50
+targets meant several GB of linker output per build. Practical consequences: a test's
+name now carries its module as a prefix (`write_tests::test_append_semantics`), so
+substring filters still work; and targeting one former file is
+`cargo test --test it <module>::` rather than `--test <file>`.
+
 Representative groups:
 - **Reads & deletes**: `delete_filter_tests.rs`, `missing_delete_file_tests.rs`, `table_tests.rs`, `row_count_tests.rs`
 - **Writes**: `write_tests.rs`, `sql_write_tests.rs`, `concurrent_write_tests.rs`, `insert_partitioning_tests.rs`
@@ -260,7 +270,7 @@ Representative groups:
 - **Capabilities**: `information_schema_test.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
 - **Concurrency & object store**: `concurrent_tests.rs`, `object_store_integration_test.rs`
 - **SQL logic tests**: `sqllogictest_runner.rs` driving `tests/sqllogictests/`
-- **Test data generation**: helpers in `tests/common/mod.rs` — each test builds its own
+- **Test data generation**: helpers in `tests/it/common/mod.rs` — each test builds its own
   DuckLake catalog in a temp directory on the fly; no external shell scripts required
 
 Run tests with:
@@ -269,4 +279,5 @@ cargo test                    # Default features; postgres/mysql/multicatalog te
 cargo test delete_filter      # Delete file tests only
 cargo test concurrent         # Concurrency tests only
 cargo test --ignored          # Performance benchmarks
+cargo test --test it foo::     # One former test file, by module prefix
 ```

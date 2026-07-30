@@ -180,7 +180,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
 /// Differential dump vs official DuckLake: writes the SAME diverse-typed data
 /// the `duckdb` CLI reference used, then prints the persisted per-file and
 /// table-wide stats so they can be diffed against official. Run with:
-///   cargo test --features write-sqlite --test column_stats_tests -- --nocapture differential_dump
+///   cargo test --features write-sqlite --test it -- --nocapture column_stats_tests::differential_dump
 #[tokio::test(flavor = "multi_thread")]
 async fn differential_dump() {
     let temp = TempDir::new().unwrap();

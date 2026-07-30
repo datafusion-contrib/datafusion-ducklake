@@ -13,7 +13,7 @@
 //! sequence (rewritten/superseded data files), and an all-deleted table — the
 //! cases where naively summing physical `record_count` would overcount.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

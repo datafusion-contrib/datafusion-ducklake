@@ -1,13 +1,13 @@
-#![cfg(feature = "metadata-postgres")]
-//! PostgreSQL metadata provider tests
+#![cfg(feature = "metadata-mysql")]
+//! MySQL metadata provider tests
 //!
-//! This test suite verifies the PostgreSQL metadata provider implementation,
+//! This test suite verifies the MySQL metadata provider implementation,
 //! including all MetadataProvider trait methods, schema initialization,
 //! concurrent access, and error handling.
 //!
 //! ## Test Setup
 //!
-//! Tests use testcontainers to spin up a temporary PostgreSQL instance.
+//! Tests use testcontainers to spin up a temporary MySQL instance.
 //! Each test creates its own database with test data to ensure isolation.
 //!
 //! ## Coverage
@@ -18,25 +18,25 @@
 //! - Concurrent access and thread safety
 //! - Error handling and edge cases
 
-mod common;
+use crate::common;
 
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, PostgresMetadataProvider,
+    DuckLakeCatalog, DuckdbMetadataProvider, MySqlMetadataProvider,
     metadata_provider::MetadataProvider,
 };
-use sqlx::PgPool;
+use sqlx::MySqlPool;
 use std::sync::Arc;
 use tempfile::TempDir;
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::mysql::Mysql;
 
-/// Initialize DuckLake catalog schema in PostgreSQL (for tests only)
-async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
+/// Initialize DuckLake catalog schema in MySQL (for tests only)
+async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
             snapshot_id BIGINT PRIMARY KEY,
-            snapshot_time TIMESTAMP
+            snapshot_time DATETIME(6)
         )",
     )
     .execute(pool)
@@ -45,8 +45,8 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_schema (
             schema_id BIGINT PRIMARY KEY,
-            schema_name VARCHAR NOT NULL,
-            path VARCHAR NOT NULL,
+            schema_name VARCHAR(255) NOT NULL,
+            path VARCHAR(1024) NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT
@@ -59,8 +59,8 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS ducklake_table (
             table_id BIGINT PRIMARY KEY,
             schema_id BIGINT NOT NULL,
-            table_name VARCHAR NOT NULL,
-            path VARCHAR NOT NULL,
+            table_name VARCHAR(255) NOT NULL,
+            path VARCHAR(1024) NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT,
@@ -74,9 +74,10 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS ducklake_column (
             column_id BIGINT PRIMARY KEY,
             table_id BIGINT NOT NULL,
-            column_name VARCHAR NOT NULL,
-            column_type VARCHAR NOT NULL,
+            column_name VARCHAR(255) NOT NULL,
+            column_type VARCHAR(255) NOT NULL,
             column_order INTEGER NOT NULL,
+            nulls_allowed BOOLEAN,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -87,10 +88,13 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS ducklake_data_file (
             data_file_id BIGINT PRIMARY KEY,
             table_id BIGINT NOT NULL,
-            path VARCHAR NOT NULL,
+            path VARCHAR(1024) NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
+            encryption_key VARCHAR(255),
+            begin_snapshot BIGINT NOT NULL DEFAULT 1,
+            end_snapshot BIGINT,
             FOREIGN KEY (table_id) REFERENCES ducklake_table(table_id)
         )",
     )
@@ -102,10 +106,11 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
             delete_file_id BIGINT PRIMARY KEY,
             data_file_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
-            path VARCHAR NOT NULL,
+            path VARCHAR(1024) NOT NULL,
             path_is_relative BOOLEAN NOT NULL,
             file_size_bytes BIGINT NOT NULL,
             footer_size BIGINT,
+            encryption_key VARCHAR(255),
             delete_count BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT,
@@ -118,63 +123,49 @@ async fn init_schema(pool: &PgPool) -> anyhow::Result<()> {
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_metadata (
-            key VARCHAR NOT NULL PRIMARY KEY,
-            value VARCHAR NOT NULL,
-            scope VARCHAR,
-            scope_id BIGINT
+            `key` VARCHAR(255) NOT NULL,
+            value VARCHAR(1024) NOT NULL,
+            scope VARCHAR(255),
+            scope_id BIGINT,
+            PRIMARY KEY (`key`)
         )",
     )
     .execute(pool)
     .await?;
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_schema_snapshot ON ducklake_schema(begin_snapshot, end_snapshot)")
-        .execute(pool)
-        .await?;
+    // MySQL indexes
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_schema_snapshot ON ducklake_schema(begin_snapshot, end_snapshot)",
+    )
+    .execute(pool)
+    .await
+    .ok(); // Ignore if already exists
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_table_schema ON ducklake_table(schema_id)")
         .execute(pool)
-        .await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_table_snapshot ON ducklake_table(begin_snapshot, end_snapshot)")
-        .execute(pool)
-        .await?;
+        .await
+        .ok();
 
     sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_name_active
-         ON ducklake_schema(schema_name) WHERE end_snapshot IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_table_snapshot ON ducklake_table(begin_snapshot, end_snapshot)",
     )
     .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_table_name_active
-         ON ducklake_table(schema_id, table_name) WHERE end_snapshot IS NULL",
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_column_name_unique
-         ON ducklake_column(table_id, column_name)",
-    )
-    .execute(pool)
-    .await?;
+    .await
+    .ok();
 
     Ok(())
 }
 
-/// Helper to create a PostgreSQL provider with initialized schema
-async fn create_postgres_provider() -> anyhow::Result<(
-    PostgresMetadataProvider,
-    testcontainers::ContainerAsync<Postgres>,
-)> {
-    let container = Postgres::default().start().await?;
+/// Helper to create a MySQL provider with initialized schema
+async fn create_mysql_provider()
+-> anyhow::Result<(MySqlMetadataProvider, testcontainers::ContainerAsync<Mysql>)> {
+    let container = Mysql::default().start().await?;
 
     let host = "127.0.0.1";
-    let port = container.get_host_port_ipv4(5432).await?;
-    let conn_str = format!("postgresql://postgres:postgres@{}:{}/postgres", host, port);
+    let port = container.get_host_port_ipv4(3306).await?;
+    let conn_str = format!("mysql://root@{}:{}/test", host, port);
 
-    let provider = PostgresMetadataProvider::new(&conn_str)
+    let provider = MySqlMetadataProvider::new(&conn_str)
         .await
         .expect("Failed to create provider");
     init_schema(&provider.pool).await?;
@@ -182,25 +173,24 @@ async fn create_postgres_provider() -> anyhow::Result<(
     Ok((provider, container))
 }
 
-/// Helper to populate test data in PostgreSQL
-async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Result<()> {
-    // Get the pool for direct SQL access
+/// Helper to populate test data in MySQL
+async fn populate_test_data(provider: &MySqlMetadataProvider) -> anyhow::Result<()> {
     let pool = &provider.pool;
 
     // Insert snapshots
-    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES ($1, NOW())")
+    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
         .bind(1i64)
         .execute(pool)
         .await?;
 
-    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES ($1, NOW())")
+    sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, NOW())")
         .bind(2i64)
         .execute(pool)
         .await?;
 
     // Insert metadata (data_path)
     sqlx::query(
-        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES ($1, $2, NULL, NULL)",
+        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
     )
     .bind("data_path")
     .bind("file:///tmp/ducklake_data/")
@@ -210,7 +200,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     // Insert schema
     sqlx::query(
         "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+         VALUES (?, ?, ?, ?, ?, ?)"
     )
     .bind(1i64)
     .bind("test_schema")
@@ -224,7 +214,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     // Insert another schema (only in snapshot 2)
     sqlx::query(
         "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+         VALUES (?, ?, ?, ?, ?, ?)"
     )
     .bind(2i64)
     .bind("schema2")
@@ -238,7 +228,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     // Insert table
     sqlx::query(
         "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(1i64)
     .bind(1i64)
@@ -253,7 +243,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     // Insert another table (only in snapshot 2)
     sqlx::query(
         "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(2i64)
     .bind(1i64)
@@ -267,45 +257,48 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
 
     // Insert columns for users table
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(1i64)
     .bind(1i64)
     .bind("id")
     .bind("INT")
     .bind(0i32)
+    .bind(false)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(2i64)
     .bind(1i64)
     .bind("name")
     .bind("VARCHAR")
     .bind(1i32)
+    .bind(true)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
+         VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(3i64)
     .bind(1i64)
     .bind("email")
     .bind("VARCHAR")
     .bind(2i32)
+    .bind(true)
     .execute(pool)
     .await?;
 
     // Insert data file
     sqlx::query(
-        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(1i64)
     .bind(1i64)
@@ -313,12 +306,13 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     .bind(true)
     .bind(1024i64)
     .bind(Some(128i64))
+    .bind(1i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size)
-         VALUES ($1, $2, $3, $4, $5, $6)"
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, begin_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(2i64)
     .bind(1i64)
@@ -326,6 +320,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     .bind(true)
     .bind(2048i64)
     .bind(Some(256i64))
+    .bind(1i64)
     .execute(pool)
     .await?;
 
@@ -333,7 +328,7 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     sqlx::query(
         "INSERT INTO ducklake_delete_file (delete_file_id, data_file_id, table_id, path, path_is_relative,
                                            file_size_bytes, footer_size, delete_count, begin_snapshot, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(1i64)
     .bind(1i64)
@@ -351,16 +346,9 @@ async fn populate_test_data(provider: &PostgresMetadataProvider) -> anyhow::Resu
     Ok(())
 }
 
-/// Helper to populate PostgreSQL with metadata from a DuckDB-created catalog
-///
-/// This creates actual Parquet files using DuckDB + DuckLake extension,
-/// then reads the metadata from DuckDB and populates PostgreSQL with it.
-/// Both providers can then query the same real Parquet files.
-///
-/// Returns the data_path and TempDir. The TempDir must be kept alive for the
-/// duration of the test to prevent cleanup of Parquet files.
+/// Helper to populate MySQL with metadata from a DuckDB-created catalog
 async fn populate_from_duckdb_catalog(
-    provider: &PostgresMetadataProvider,
+    provider: &MySqlMetadataProvider,
 ) -> anyhow::Result<(String, TempDir)> {
     // Step 1: Create temporary directory and DuckDB catalog with real Parquet files
     let temp_dir = TempDir::new()?;
@@ -378,90 +366,83 @@ async fn populate_from_duckdb_catalog(
 
     let schemas = duckdb_provider.list_schemas(current_snapshot.snapshot_id)?;
 
-    // Step 3: Populate PostgreSQL with metadata from DuckDB
-    // Use a transaction for atomicity (all-or-nothing)
-    let mut tx = provider.pool.begin().await?;
+    // Step 3: Populate MySQL with metadata from DuckDB
+    let pool = &provider.pool;
 
     // Insert snapshots
     for snapshot in &snapshots {
-        // Parse timestamp string to NaiveDateTime if present
         let timestamp_value: Option<sqlx::types::chrono::NaiveDateTime> =
             snapshot.timestamp.as_ref().and_then(|ts_str| {
                 sqlx::types::chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S%.6f")
                     .ok()
             });
 
-        sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES ($1, $2)")
+        sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, ?)")
             .bind(snapshot.snapshot_id)
             .bind(timestamp_value)
-            .execute(&mut *tx)
+            .execute(pool)
             .await?;
     }
 
     // Insert data_path metadata
     sqlx::query(
-        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES ($1, $2, NULL, NULL)",
+        "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
     )
     .bind("data_path")
     .bind(&data_path)
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
 
     // Insert schemas, tables, columns, and files
     for schema in &schemas {
         sqlx::query(
             "INSERT INTO ducklake_schema (schema_id, schema_name, path, path_is_relative, begin_snapshot, end_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6)"
+             VALUES (?, ?, ?, ?, ?, ?)"
         )
         .bind(schema.schema_id)
         .bind(&schema.schema_name)
         .bind(&schema.path)
         .bind(schema.path_is_relative)
-        // NOTE: Hardcoded to snapshot 1 - this assumes single-snapshot catalogs.
-        // For multi-snapshot testing, DuckDB metadata would need to expose
-        // begin_snapshot/end_snapshot for schemas and tables.
-        .bind(1i64) // begin_snapshot
-        .bind(None::<i64>) // end_snapshot (active)
-        .execute(&mut *tx)
+        .bind(1i64)
+        .bind(None::<i64>)
+        .execute(pool)
         .await?;
 
-        // Get tables for this schema
         let tables = duckdb_provider.list_tables(schema.schema_id, current_snapshot.snapshot_id)?;
 
         for table in &tables {
             sqlx::query(
                 "INSERT INTO ducklake_table (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot, end_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(table.table_id)
             .bind(schema.schema_id)
             .bind(&table.table_name)
             .bind(&table.path)
             .bind(table.path_is_relative)
-            .bind(1i64) // begin_snapshot
-            .bind(None::<i64>) // end_snapshot (active)
-            .execute(&mut *tx)
+            .bind(1i64)
+            .bind(None::<i64>)
+            .execute(pool)
             .await?;
 
-            // Get columns for this table
             let columns = duckdb_provider
                 .get_table_structure(table.table_id, duckdb_provider.get_current_snapshot()?)?;
 
             for (order, column) in columns.iter().enumerate() {
                 sqlx::query(
-                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order)
-                     VALUES ($1, $2, $3, $4, $5)"
+                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed)
+                     VALUES (?, ?, ?, ?, ?, ?)"
                 )
                 .bind(column.column_id)
                 .bind(table.table_id)
                 .bind(&column.column_name)
                 .bind(&column.column_type)
                 .bind(order as i32)
-                .execute(&mut *tx)
+                .bind(column.is_nullable)
+                .execute(pool)
                 .await?;
             }
 
-            // Get data files for this table
             let files = duckdb_provider
                 .get_table_files_for_select(table.table_id, current_snapshot.snapshot_id)?;
 
@@ -469,8 +450,8 @@ async fn populate_from_duckdb_catalog(
                 let data_file_id = table.table_id * 1000 + file_idx as i64 + 1;
 
                 sqlx::query(
-                    "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size)
-                     VALUES ($1, $2, $3, $4, $5, $6)"
+                    "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)"
                 )
                 .bind(data_file_id)
                 .bind(table.table_id)
@@ -478,17 +459,17 @@ async fn populate_from_duckdb_catalog(
                 .bind(file.file.path_is_relative)
                 .bind(file.file.file_size_bytes)
                 .bind(file.file.footer_size)
-                .execute(&mut *tx)
+                .bind(1i64)
+                .execute(pool)
                 .await?;
 
-                // Insert delete file if present
                 if let Some(delete_file) = &file.delete_file {
                     let delete_file_id = data_file_id;
 
                     sqlx::query(
                         "INSERT INTO ducklake_delete_file (delete_file_id, data_file_id, table_id, path, path_is_relative,
                                                            file_size_bytes, footer_size, delete_count, begin_snapshot, end_snapshot)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     )
                     .bind(delete_file_id)
                     .bind(data_file_id)
@@ -497,28 +478,23 @@ async fn populate_from_duckdb_catalog(
                     .bind(delete_file.path_is_relative)
                     .bind(delete_file.file_size_bytes)
                     .bind(delete_file.footer_size)
-                    .bind(None::<i64>) // delete_count
-                    .bind(1i64) // begin_snapshot
-                    .bind(None::<i64>) // end_snapshot (active)
-                    .execute(&mut *tx)
+                    .bind(None::<i64>)
+                    .bind(1i64)
+                    .bind(None::<i64>)
+                    .execute(pool)
                     .await?;
                 }
             }
         }
     }
 
-    // Commit the transaction atomically
-    tx.commit().await?;
-
-    // Return temp_dir so caller can keep it alive during the test
-    // When temp_dir is dropped, Parquet files are automatically cleaned up
     Ok((data_path, temp_dir))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_schema_initialization_idempotent() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     // Initialize schema again - should be idempotent
     init_schema(&provider.pool)
@@ -533,7 +509,7 @@ async fn test_schema_initialization_idempotent() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_current_snapshot() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     // Initially should be 0 (no snapshots)
     let snapshot_id = provider
@@ -556,7 +532,7 @@ async fn test_get_current_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_data_path() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -570,7 +546,7 @@ async fn test_get_data_path() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_snapshots() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -586,7 +562,7 @@ async fn test_list_snapshots() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_schemas_snapshot_isolation() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -615,7 +591,7 @@ async fn test_list_schemas_snapshot_isolation() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_schema_by_name() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -659,7 +635,7 @@ async fn test_get_schema_by_name() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_tables() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -684,7 +660,7 @@ async fn test_list_tables() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_get_table_by_name() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -711,7 +687,7 @@ async fn test_get_table_by_name() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_table_exists() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -749,7 +725,7 @@ async fn test_table_exists() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_get_table_structure() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -777,7 +753,7 @@ async fn test_get_table_structure() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_get_table_files_for_select() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -815,7 +791,7 @@ async fn test_get_table_files_for_select() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_all_tables() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -837,7 +813,7 @@ async fn test_list_all_tables() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_list_all_columns() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -858,9 +834,9 @@ async fn test_list_all_columns() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_list_all_files() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
@@ -882,13 +858,12 @@ async fn test_list_all_files() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_concurrent_access() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
         .expect("Failed to populate test data");
 
-    // Clone provider for concurrent access (Arc allows sharing)
     let provider = Arc::new(provider);
 
     // Spawn 10 concurrent tasks
@@ -896,7 +871,6 @@ async fn test_concurrent_access() {
     for _ in 0..10 {
         let provider = provider.clone();
         let task = tokio::spawn(async move {
-            // Each task performs multiple operations
             let snapshot = provider
                 .get_current_snapshot()
                 .expect("Should get snapshot");
@@ -909,7 +883,6 @@ async fn test_concurrent_access() {
         tasks.push(task);
     }
 
-    // Wait for all tasks to complete
     for task in tasks {
         task.await.expect("Task should complete successfully");
     }
@@ -918,16 +891,14 @@ async fn test_concurrent_access() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_datafusion_integration() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     populate_test_data(&provider)
         .await
         .expect("Failed to populate test data");
 
-    // Create DuckLake catalog with PostgreSQL provider
     let catalog = DuckLakeCatalog::new(provider).expect("Should create catalog");
 
-    // Register with DataFusion
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
@@ -944,7 +915,7 @@ async fn test_datafusion_integration() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_error_invalid_connection_string() {
-    let result = PostgresMetadataProvider::new("invalid://connection:string").await;
+    let result = MySqlMetadataProvider::new("invalid://connection:string").await;
     assert!(
         result.is_err(),
         "Should fail with invalid connection string"
@@ -954,29 +925,25 @@ async fn test_error_invalid_connection_string() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_error_connection_refused() {
-    let result =
-        PostgresMetadataProvider::new("postgresql://postgres:postgres@localhost:9999/db").await;
+    let result = MySqlMetadataProvider::new("mysql://root@localhost:9999/db").await;
     assert!(result.is_err(), "Should fail when connection is refused");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_query_real_parquet_files() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
-    // Populate PostgreSQL with metadata from DuckDB-created catalog
     let (_data_path, _temp_dir) = populate_from_duckdb_catalog(&provider)
         .await
         .expect("Failed to populate from DuckDB catalog");
 
-    // Create DuckLake catalog with PostgreSQL provider
     let catalog = DuckLakeCatalog::new(provider).expect("Should create catalog");
 
-    // Register with DataFusion
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
-    // Query actual table data (not just information_schema)
+    // Query actual table data
     let df = ctx
         .sql("SELECT * FROM ducklake.main.users ORDER BY id")
         .await
@@ -984,7 +951,6 @@ async fn test_query_real_parquet_files() {
 
     let results = df.collect().await.expect("Should collect results");
 
-    // Verify we got the expected 4 rows from create_catalog_no_deletes
     assert_eq!(results.len(), 1, "Should have one batch");
     let batch = &results[0];
     assert_eq!(batch.num_rows(), 4, "Should have 4 rows");
@@ -996,7 +962,7 @@ async fn test_query_real_parquet_files() {
     assert_eq!(schema.field(1).name(), "name");
     assert_eq!(schema.field(2).name(), "email");
 
-    // Verify first row data (Alice)
+    // Verify first row data
     use datafusion::arrow::array::{Int32Array, StringArray};
     let id_col = batch
         .column(0)
@@ -1032,7 +998,7 @@ async fn test_query_real_parquet_files() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "provider-test fixture drift vs current schema; fixed with the provider rework"]
 async fn test_query_with_filter() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
+    let (provider, _container) = create_mysql_provider().await.unwrap();
 
     let (_data_path, _temp_dir) = populate_from_duckdb_catalog(&provider)
         .await
@@ -1066,71 +1032,51 @@ async fn test_query_with_filter() {
     assert_eq!(name_col.value(1), "Diana");
 }
 
-/// Bring the minimal fixture schema up to a fully-migrated catalog: every
-/// optional capability the provider probes (`partial_max` columns, the
-/// `ducklake_schema_versions` ledger) plus the file columns the scan
-/// projection reads.
-async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query(
-        "ALTER TABLE ducklake_data_file
-             ADD COLUMN IF NOT EXISTS encryption_key VARCHAR,
-             ADD COLUMN IF NOT EXISTS record_count BIGINT,
-             ADD COLUMN IF NOT EXISTS row_id_start BIGINT,
-             ADD COLUMN IF NOT EXISTS begin_snapshot BIGINT NOT NULL DEFAULT 1,
-             ADD COLUMN IF NOT EXISTS end_snapshot BIGINT,
-             ADD COLUMN IF NOT EXISTS partial_max BIGINT,
-             ADD COLUMN IF NOT EXISTS partition_id BIGINT",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE ducklake_delete_file
-             ADD COLUMN IF NOT EXISTS encryption_key VARCHAR,
-             ADD COLUMN IF NOT EXISTS partial_max BIGINT",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
-             begin_snapshot BIGINT NOT NULL,
-             schema_version BIGINT NOT NULL,
-             table_id BIGINT NOT NULL
-         )",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
+/// Connecting as a password-protected `caching_sha2_password` user over a
+/// non-TLS channel must succeed.
+///
+/// This is MySQL 8's default auth plugin. On the first connection for a user the
+/// server's fast-auth cache is cold, so it demands full authentication; over an
+/// insecure channel the client must fetch the server's RSA public key and send
+/// the password encrypted. sqlx bundled that RSA backend unconditionally through
+/// 0.8, but 0.9 moved it behind the `mysql-rsa` feature and substitutes a stub
+/// that fails at connect time with "RSA auth backend disabled". Nothing catches
+/// that at compile time, and the rest of this suite connects as passwordless
+/// `root` (an empty password skips the RSA exchange entirely), so this test is
+/// what pins `sqlx/mysql-rsa` into the `metadata-mysql` feature.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn test_schema_capability_probe_memoized_positive_only() {
-    let (provider, _container) = create_postgres_provider().await.unwrap();
-
-    populate_test_data(&provider)
+async fn test_connect_caching_sha2_password_without_tls() {
+    let container = Mysql::default()
+        .with_init_sql(
+            "CREATE USER 'rsauser'@'%' IDENTIFIED WITH caching_sha2_password BY 'secret-pw';
+             GRANT ALL PRIVILEGES ON test.* TO 'rsauser'@'%';"
+                .to_string()
+                .into_bytes(),
+        )
+        .start()
         .await
-        .expect("Failed to populate test data");
-    migrate_fixture_to_current_schema(&provider.pool)
-        .await
-        .expect("Failed to migrate fixture schema");
+        .expect("Failed to start MySQL");
 
-    // Fully-migrated catalog: the first scan probes once (all capabilities
-    // true) and memoizes; the second scan reuses the memo and must return
-    // identical results.
-    assert!(!provider.schema_capabilities_cached());
-    let first = provider
-        .get_table_files_for_select(1, 1)
-        .expect("Should get table files");
+    let port = container
+        .get_host_port_ipv4(3306)
+        .await
+        .expect("Failed to get port");
+    let conn_str = format!("mysql://rsauser:secret-pw@127.0.0.1:{}/test", port);
+
+    let provider = MySqlMetadataProvider::new(&conn_str)
+        .await
+        .expect("should connect as a caching_sha2_password user over a non-TLS channel");
+
+    // Prove the connection is actually usable, not merely constructed.
+    init_schema(&provider.pool)
+        .await
+        .expect("should run DDL over the authenticated connection");
+    let snapshots = provider
+        .list_snapshots()
+        .expect("should query over the authenticated connection");
     assert!(
-        provider.schema_capabilities_cached(),
-        "an all-true probe result must be cached after the first call"
+        snapshots.is_empty(),
+        "freshly initialized catalog should have no snapshots"
     );
-    let second = provider
-        .get_table_files_for_select(1, 1)
-        .expect("Should get table files");
-    assert_eq!(first.len(), 2);
-    assert_eq!(format!("{first:?}"), format!("{second:?}"));
-
-    // Clones share the memo (the cell is Arc-shared).
-    assert!(provider.clone().schema_capabilities_cached());
 }

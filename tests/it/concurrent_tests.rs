@@ -22,7 +22,7 @@
 //!
 //! These tests verify these guarantees hold under concurrent load.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

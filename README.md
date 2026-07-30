@@ -154,7 +154,7 @@ writer options.
 > Writing to a **standard, single-catalog** DuckLake store (the spec-compliant layout) is
 > supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`),
 > where SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
-> [`tests/sql_write_tests.rs`](tests/sql_write_tests.rs).
+> [`tests/it/sql_write_tests.rs`](tests/it/sql_write_tests.rs).
 
 ---
 
@@ -179,7 +179,7 @@ files automatically. Supported transforms are `identity` (the raw value) and
 (`month`/`day`/`hour` are recorded but not yet used to skip files). Partitioned **writes**
 are supported on **SQLite** today; **read + pruning** work on all backends. `RESET
 PARTITIONED BY` turns it off. See [COMPATIBILITY.md](COMPATIBILITY.md) and
-[`tests/partition_write_tests.rs`](tests/partition_write_tests.rs).
+[`tests/it/partition_write_tests.rs`](tests/it/partition_write_tests.rs).
 
 ---
 

@@ -5,7 +5,7 @@ use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, register_ducklake_functions};
 use std::sync::Arc;
 
-mod common;
+use crate::common;
 
 #[tokio::test]
 #[ignore] // Snapshots table requires ducklake_snapshot table which test catalogs don't create
