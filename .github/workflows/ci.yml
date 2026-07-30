@@ -151,9 +151,18 @@ jobs:
       # only thing it contributed was workspace scope. Bare cargo commands act on
       # the root package alone here, because the workspace root is itself a
       # package rather than a virtual manifest.
+      #
+      # Linux only, and measured rather than assumed: `ducklake-benchmark`
+      # depends on `duckdb` with `bundled`, so pulling it in makes clippy compile
+      # DuckDB's C++ a second time, in a second feature context. On macOS that
+      # took this step from 56s to 208s (run 30531835616) — and macOS is the
+      # longest required check, so it lands squarely on the critical path.
+      # Restricting the flag also matches the coverage this replaced exactly:
+      # `feature-check` is `runs-on: ubuntu-latest`, so the `benchmark` package
+      # was only ever checked on Linux, and the crate has no `target_os` cfgs.
       - name: Run clippy
         if: steps.changes.outputs.code == 'true'
-        run: cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings
+        run: cargo clippy ${{ runner.os == 'Linux' && '--workspace' || '' }} --all-targets --all-features --no-deps -- -D warnings
 
       # macOS only. This step used to run on Linux too, as
       # `cargo test --features write-sqlite` — but `--features` keeps the default
