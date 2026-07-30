@@ -368,11 +368,8 @@ async fn partitioned_write_rolls_within_each_partition() {
 }
 
 /// The write entry points that target ONE caller-determined file cannot satisfy a
-/// partition spec that needs one file per partition. They must refuse a partitioned
-/// table with a typed error naming the entry point — never fall through and commit a
-/// file with no partition, which would make the table's layout a lie and silently
-/// break pruning. These are the documented gaps; this test exists so that closing one
-/// is a deliberate act rather than an accident.
+/// partition spec that needs one file per partition. They must refuse an incompatible
+/// write before upload rather than commit a file without partition metadata.
 #[tokio::test(flavor = "multi_thread")]
 async fn single_file_entry_points_refuse_a_partitioned_table() {
     use datafusion_ducklake::table_writer::DuckLakeTableWriter;
@@ -386,15 +383,6 @@ async fn single_file_entry_points_refuse_a_partitioned_table() {
     let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
     let batches = events_batches();
     let arrow_schema = batches[0].schema();
-
-    // Embedded-rowid session (the UPDATE row-rewrite path).
-    let err = table_writer
-        .begin_write_with_embedded_rowid("main", "events", arrow_schema.as_ref(), WriteMode::Append)
-        .expect_err("embedded-rowid write must refuse a partitioned table");
-    assert!(
-        err.to_string().contains("begin_write_with_embedded_rowid"),
-        "the error must name the entry point, got: {err}"
-    );
 
     // Custom-path session.
     let err = table_writer
@@ -420,10 +408,10 @@ async fn single_file_entry_points_refuse_a_partitioned_table() {
     let err = session
         .finish_with_deletes(&[])
         .await
-        .expect_err("append+delete must refuse a partitioned table");
+        .expect_err("append+delete must refuse multiple partition files");
     assert!(
-        err.to_string().contains("partitioned table"),
-        "the error must say why, got: {err}"
+        err.to_string().contains("produced 2"),
+        "the error must report the incompatible file count, got: {err}"
     );
 
     // Nothing was committed by any of the three.
@@ -435,6 +423,205 @@ async fn single_file_entry_points_refuse_a_partitioned_table() {
             .unwrap()
             .is_empty(),
         "a refused write must commit no data files"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_update_commits_one_partition_file_atomically() {
+    use arrow::array::{Int32Array, Int64Array, StringViewArray, UInt64Array};
+    use sqlx::sqlite::SqlitePool;
+
+    let env = setup().await;
+    let ctx = write_ctx(&env.conn_str).await;
+    let inserted = ctx
+        .sql(
+            "INSERT INTO ducklake.main.events VALUES \
+             (1, 'us', TIMESTAMP '2024-06-20 12:00:00')",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        inserted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        1,
+    );
+
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let before_snapshot = provider.get_current_snapshot().unwrap();
+    let ctx = write_ctx(&env.conn_str).await;
+    let updated = ctx
+        .sql("UPDATE ducklake.main.events SET region = 'eu' WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        updated[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        1,
+    );
+
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, snapshot, None, 4096)
+        .unwrap();
+    let replacement = page
+        .iter()
+        .find(|metadata| metadata.file.begin_snapshot == Some(snapshot))
+        .unwrap();
+    let mut partition_values = replacement.file.partition_values.clone();
+    partition_values.sort_by_key(|(index, _)| *index);
+
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::with_writer(
+        Arc::new(SqliteMetadataProvider::new(&env.conn_str).await.unwrap()),
+        Arc::new(writer),
+    )
+    .unwrap()
+    .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let rows = ctx
+        .sql("SELECT rowid, id, region FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows = arrow::compute::concat_batches(&rows[0].schema(), &rows).unwrap();
+    let pool = SqlitePool::connect(&env.conn_str).await.unwrap();
+    let delete_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_delete_file WHERE begin_snapshot = ?")
+            .bind(snapshot)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(snapshot, before_snapshot + 1);
+    assert_eq!(
+        partition_values,
+        vec![(0, Some("eu".to_string())), (1, Some("2024".to_string()))],
+    );
+    assert_eq!(delete_count, 1);
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(
+        rows.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        0,
+    );
+    assert_eq!(
+        rows.column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        1,
+    );
+    assert_eq!(
+        rows.column(2)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .value(0),
+        "eu",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_append_with_deletes_commits_one_partition_file_atomically() {
+    use datafusion_ducklake::metadata_writer::DeleteFileEntry;
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+    use sqlx::sqlite::SqlitePool;
+
+    let env = setup().await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(
+        SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap(),
+    );
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&object_store)).unwrap();
+    let batches = events_batches();
+    let schema = batches[0].schema();
+
+    let mut seed = table_writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    seed.write_batch(&batches[0].slice(0, 1)).unwrap();
+    let seeded = seed.finish().await.unwrap();
+
+    let pool = SqlitePool::connect(&env.conn_str).await.unwrap();
+    let (source_data_file_id, source_path) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT data_file_id, path FROM ducklake_data_file
+             WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(env.table_id)
+    .bind(seeded.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let delete = table_writer
+        .write_delete_file("main", "events", &source_path, &[0])
+        .await
+        .unwrap();
+
+    let mut replacement = table_writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    replacement.write_batch(&batches[0].slice(1, 1)).unwrap();
+    let committed = replacement
+        .finish_with_deletes(&[DeleteFileEntry {
+            data_file_id: source_data_file_id,
+            expected_prev_delete_file: None,
+            delete,
+        }])
+        .await
+        .unwrap();
+
+    let delete_snapshot: i64 = sqlx::query_scalar(
+        "SELECT begin_snapshot FROM ducklake_delete_file
+         WHERE data_file_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(source_data_file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, committed.snapshot_id, None, 4096)
+        .unwrap();
+    let appended = page
+        .iter()
+        .find(|metadata| metadata.file.data_file_id != source_data_file_id)
+        .unwrap();
+
+    assert_eq!(committed.files_written, 1);
+    assert_eq!(committed.records_written, 1);
+    assert_eq!(delete_snapshot, committed.snapshot_id);
+    assert_eq!(appended.file.begin_snapshot, Some(committed.snapshot_id));
+    assert_eq!(
+        appended.file.partition_values,
+        vec![(0, Some("us".to_string())), (1, Some("2024".to_string()))],
     );
 }
 
