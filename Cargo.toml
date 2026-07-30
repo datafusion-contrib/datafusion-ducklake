@@ -122,3 +122,23 @@ required-features = ["metadata-sqlite"]
 [[example]]
 name = "write_sorted"
 required-features = ["write-sqlite"]
+
+# Build the vendored DuckDB C++ optimised even in dev/test builds. `duckdb-bundled`
+# is a default feature, and without this the amalgamation is compiled at the dev
+# profile's `opt-level = 0` — so every test that builds a catalog through DuckDB
+# runs against an unoptimised engine. Cargo passes this package's `OPT_LEVEL` to
+# the `cc` invocation in its build script, so the setting reaches the C++.
+#
+# Measured on the full suite (601 tests, `skip-tests-with-docker write-sqlite`):
+# 101.9s -> 32.6s, a 3.1x speedup. `run_all_sqllogictests` alone, the single
+# longest test, goes 84.7s -> 23.2s. Only Rust code stays unoptimised, so
+# debugging this crate is unaffected; DuckDB is a dependency we never step into.
+#
+# This costs a slower first compile of the amalgamation, which the target-directory
+# cache absorbs, and ~0.3 GB more in that cache (2.5 -> 2.8 GB of object files).
+#
+# Scope note: `[profile]` is honoured only from the workspace root, so this
+# applies to builds of this workspace — CI and contributors — and is ignored by
+# downstream consumers, who pick their own profile.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
