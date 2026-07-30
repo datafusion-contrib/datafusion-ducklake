@@ -10,7 +10,6 @@
 //!
 //! These are the guarantees an incremental, rowid-keyed index relies on.
 
-
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};

@@ -10,7 +10,6 @@
 //! missed, and positions matched in the wrong partition emitted the wrong
 //! row's content. All tests here FAIL on the pre-fix code.
 
-
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
