@@ -791,12 +791,13 @@ async fn reserve_ids(
 /// row sharing a `column_id`, which a versioned / type-promoted column requires,
 /// so this migration is what lets existing users' catalogs support type promotion.
 ///
-/// **Idempotent:** a no-op once `column_id` is no longer a PK (re-runs on every
-/// `initialize_schema`). **Crash-safe:** the rebuild is one transaction (SQLite
-/// DDL is transactional), so a crash leaves either the old or the new table whole,
-/// never a half-state. **Lossless:** every row and every `column_id` value is
-/// preserved (field-ids baked in Parquet stay valid), and it tolerates older
-/// catalogs missing some of the 13 columns (those are filled with `NULL`).
+/// **Idempotent:** a no-op once `column_id` is no longer a PK and all current
+/// metadata columns exist (re-runs on every `initialize_schema`). **Crash-safe:**
+/// SQLite runs the rebuild in one transaction, so a crash leaves either the old or
+/// the new table whole, never a half-state. **Lossless:** every row and every
+/// `column_id` value is preserved (field-ids baked in Parquet stay valid), and it
+/// tolerates older catalogs missing some of the 13 columns (those are filled with
+/// `NULL`).
 async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
     // Legacy shape iff `column_id` is a PRIMARY KEY. `pragma_table_info` returns
     // one row per column with a `pk` flag (0 = not part of the PK).
@@ -813,8 +814,11 @@ async fn migrate_ducklake_column_drop_pk(pool: &SqlitePool) -> Result<()> {
         }
         legacy_cols.insert(name);
     }
-    if !column_id_is_pk {
-        // Fresh (already bare) or previously migrated — nothing to do.
+    let has_default_columns =
+        ["initial_default", "default_value", "default_value_type", "default_value_dialect"]
+            .iter()
+            .all(|name| legacy_cols.contains(*name));
+    if !column_id_is_pk && has_default_columns {
         return Ok(());
     }
 
@@ -1299,6 +1303,10 @@ async fn live_columns_for_stats(
                 .unwrap_or(arrow::datatypes::DataType::Null),
             ducklake_type,
             is_nullable: true,
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         });
     }
     Ok((columns, column_ids))
@@ -1558,9 +1566,10 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -1570,6 +1579,10 @@ async fn finalize_snapshot(
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut **tx)
                 .await?;
             },
@@ -1803,8 +1816,9 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Locate the live version of the column.
             let row = sqlx::query(
-                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column
-                 FROM ducklake_column
+                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column,
+                        initial_default, default_value, default_value_type, default_value_dialect
+                  FROM ducklake_column
                  WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
                    AND parent_column IS NULL",
             )
@@ -1824,6 +1838,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .try_get::<Option<bool>, _>("nulls_allowed")?
                 .unwrap_or(true);
             let parent_column: Option<i64> = row.try_get("parent_column")?;
+            let initial_default: Option<String> = row.try_get("initial_default")?;
+            let default_value: Option<String> = row.try_get("default_value")?;
+            let default_value_type: Option<String> = row.try_get("default_value_type")?;
+            let default_value_dialect: Option<String> = row.try_get("default_value_dialect")?;
 
             // No-op / not-a-widening guards. Canonical equality first so an
             // alias-only restatement is reported as "no change", not attempted.
@@ -1860,8 +1878,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_column
-                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name, column_type, nulls_allowed, parent_column)
-                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
+                     (column_id, begin_snapshot, end_snapshot, table_id, column_order, column_name,
+                      column_type, nulls_allowed, parent_column, initial_default, default_value,
+                      default_value_type, default_value_dialect)
+                 VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(column_id)
             .bind(new_snapshot)
@@ -1871,6 +1891,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(new_ducklake_type)
             .bind(nulls_allowed)
             .bind(parent_column)
+            .bind(initial_default)
+            .bind(default_value)
+            .bind(default_value_type)
+            .bind(default_value_dialect)
             .execute(&mut *tx)
             .await?;
 
@@ -2263,9 +2287,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 let parent_id = column.parent_index.map(|index| column_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -2275,6 +2300,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -4351,6 +4380,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cnt2, 2, "migration must be idempotent");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_bare_column_table_adds_default_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("legacy-defaults.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&conn_str).await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE ducklake_column (
+                column_id BIGINT,
+                begin_snapshot BIGINT,
+                end_snapshot BIGINT,
+                table_id BIGINT,
+                column_order BIGINT,
+                column_name VARCHAR,
+                column_type VARCHAR,
+                nulls_allowed BOOLEAN,
+                parent_column BIGINT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ducklake_column
+             (column_id, begin_snapshot, table_id, column_order, column_name,
+              column_type, nulls_allowed)
+             VALUES (5, 1, 1, 0, 'id', 'int32', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_ducklake_column_drop_pk(&pool).await.unwrap();
+
+        let default_columns: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
+             WHERE name IN ('initial_default', 'default_value',
+                            'default_value_type', 'default_value_dialect')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(default_columns, 4);
+        let row: (i64, String) =
+            sqlx::query_as("SELECT column_id, column_name FROM ducklake_column WHERE table_id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (5, "id".to_string()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

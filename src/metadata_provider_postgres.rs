@@ -369,7 +369,8 @@ impl MetadataProvider for PostgresMetadataProvider {
     ) -> Result<Vec<DuckLakeTableColumn>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
+                        initial_default, default_value, default_value_type, default_value_dialect
                  FROM ducklake_column
                  WHERE table_id = $1
                    AND $2 >= begin_snapshot
@@ -388,14 +389,18 @@ impl MetadataProvider for PostgresMetadataProvider {
                     let nulls_allowed: Option<bool> = row.try_get(3)?;
                     let parent_column: Option<i64> = row.try_get(4)?;
                     Ok((
-                        DuckLakeTableColumn {
-                            column_id: row.try_get(0)?,
-                            column_name: row.try_get(1)?,
-                            column_type: row.try_get(2)?,
-                            is_nullable: nulls_allowed.unwrap_or(true),
-                            data_type: None,
-                            nested_column_ids: Vec::new(),
-                        },
+                        DuckLakeTableColumn::new(
+                            row.try_get(0)?,
+                            row.try_get(1)?,
+                            row.try_get(2)?,
+                            nulls_allowed.unwrap_or(true),
+                        )
+                        .with_defaults(
+                            row.try_get(5)?,
+                            row.try_get(6)?,
+                            row.try_get(7)?,
+                            row.try_get(8)?,
+                        ),
                         parent_column,
                     ))
                 })
@@ -1266,7 +1271,9 @@ impl MetadataProvider for PostgresMetadataProvider {
     fn list_all_columns(&self, snapshot_id: i64) -> Result<Vec<ColumnWithTable>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.schema_name, t.table_name, c.column_id, c.column_name, c.column_type, c.nulls_allowed, c.parent_column
+                "SELECT s.schema_name, t.table_name, c.column_id, c.column_name, c.column_type,
+                        c.nulls_allowed, c.parent_column, c.initial_default, c.default_value,
+                        c.default_value_type, c.default_value_dialect
                  FROM ducklake_schema s
                  JOIN ducklake_table t ON s.schema_id = t.schema_id
                  JOIN ducklake_column c ON t.table_id = c.table_id
@@ -1294,14 +1301,18 @@ impl MetadataProvider for PostgresMetadataProvider {
                     let table_name: String = row.try_get(1)?;
                     let nulls_allowed: Option<bool> = row.try_get(5)?;
                     let parent_column: Option<i64> = row.try_get(6)?;
-                    let column = DuckLakeTableColumn {
-                        column_id: row.try_get(2)?,
-                        column_name: row.try_get(3)?,
-                        column_type: row.try_get(4)?,
-                        is_nullable: nulls_allowed.unwrap_or(true),
-                        data_type: None,
-                        nested_column_ids: Vec::new(),
-                    };
+                    let column = DuckLakeTableColumn::new(
+                        row.try_get(2)?,
+                        row.try_get(3)?,
+                        row.try_get(4)?,
+                        nulls_allowed.unwrap_or(true),
+                    )
+                    .with_defaults(
+                        row.try_get(7)?,
+                        row.try_get(8)?,
+                        row.try_get(9)?,
+                        row.try_get(10)?,
+                    );
                     Ok((
                         ColumnWithTable {
                             schema_name,

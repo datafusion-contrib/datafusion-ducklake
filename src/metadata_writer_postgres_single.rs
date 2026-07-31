@@ -911,9 +911,10 @@ async fn finalize_snapshot(
                     .await?;
                     sqlx::query(
                         "INSERT INTO ducklake_column
-                             (column_id, table_id, column_name, column_type, column_order,
-                              nulls_allowed, parent_column, begin_snapshot)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot, initial_default,
+                          default_value, default_value_type, default_value_dialect)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                     )
                     .bind(column_id)
                     .bind(table_id)
@@ -923,6 +924,10 @@ async fn finalize_snapshot(
                     .bind(column.is_nullable)
                     .bind(parent_id)
                     .bind(snapshot_id)
+                    .bind(&column.initial_default)
+                    .bind(&column.default_value)
+                    .bind(&column.default_value_type)
+                    .bind(&column.default_value_dialect)
                     .execute(&mut **tx)
                     .await?;
                 } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
@@ -942,9 +947,10 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                            (column_id, table_id, column_name, column_type, column_order,
+                             nulls_allowed, parent_column, begin_snapshot, initial_default,
+                             default_value, default_value_type, default_value_dialect)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -954,6 +960,10 @@ async fn finalize_snapshot(
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut **tx)
                 .await?;
             },
@@ -1139,9 +1149,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                     (column_id, table_id, column_name, column_type, column_order,
+                      nulls_allowed, parent_column, begin_snapshot, initial_default,
+                      default_value, default_value_type, default_value_dialect)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -1151,6 +1162,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1889,6 +1904,15 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(*ddl).execute(&self.pool).await?;
             }
+            sqlx::query(
+                "ALTER TABLE ducklake_column
+                 ADD COLUMN IF NOT EXISTS initial_default VARCHAR,
+                 ADD COLUMN IF NOT EXISTS default_value VARCHAR,
+                 ADD COLUMN IF NOT EXISTS default_value_type VARCHAR,
+                 ADD COLUMN IF NOT EXISTS default_value_dialect VARCHAR",
+            )
+            .execute(&self.pool)
+            .await?;
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
             // (idempotent, lossless — NULL means "not partitioned").
             sqlx::query(

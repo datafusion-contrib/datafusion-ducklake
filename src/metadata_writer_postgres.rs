@@ -84,6 +84,10 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         column_order BIGINT NOT NULL,
         nulls_allowed BOOLEAN DEFAULT TRUE,
         parent_column BIGINT,
+        initial_default VARCHAR,
+        default_value VARCHAR,
+        default_value_type VARCHAR,
+        default_value_dialect VARCHAR,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT,
         PRIMARY KEY (table_id, column_id, begin_snapshot)
@@ -349,6 +353,22 @@ pub(crate) async fn migrate_ducklake_column_to_composite_pk(pool: &PgPool) -> Re
                 EXECUTE 'ALTER TABLE ducklake_column ADD PRIMARY KEY (table_id, column_id, begin_snapshot)';
             END IF;
         END $$;"#,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Add default metadata to a catalog created before those DuckLake columns were
+/// supported. The fields are nullable, so existing column versions retain the
+/// specified absence of a default.
+pub(crate) async fn migrate_column_default_metadata(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "ALTER TABLE ducklake_column
+         ADD COLUMN IF NOT EXISTS initial_default VARCHAR,
+         ADD COLUMN IF NOT EXISTS default_value VARCHAR,
+         ADD COLUMN IF NOT EXISTS default_value_type VARCHAR,
+         ADD COLUMN IF NOT EXISTS default_value_dialect VARCHAR",
     )
     .execute(pool)
     .await?;
@@ -858,6 +878,10 @@ async fn live_columns_for_stats(
                 .unwrap_or(arrow::datatypes::DataType::Null),
             ducklake_type,
             is_nullable: true,
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         });
     }
     Ok((columns, column_ids))
@@ -1247,10 +1271,11 @@ async fn finalize_snapshot(
                 None => {
                     sqlx::query(
                         "INSERT INTO ducklake_column
-                             (column_id, table_id, column_name, column_type, column_order,
-                              nulls_allowed, parent_column, begin_snapshot)
-                         OVERRIDING SYSTEM VALUE
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                               (column_id, table_id, column_name, column_type, column_order,
+                                nulls_allowed, parent_column, begin_snapshot, initial_default,
+                                default_value, default_value_type, default_value_dialect)
+                          OVERRIDING SYSTEM VALUE
+                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                     )
                     .bind(column_id)
                     .bind(table_id)
@@ -1260,6 +1285,10 @@ async fn finalize_snapshot(
                     .bind(column.is_nullable)
                     .bind(parent_id)
                     .bind(snapshot_id)
+                    .bind(&column.initial_default)
+                    .bind(&column.default_value)
+                    .bind(&column.default_value_type)
+                    .bind(&column.default_value_dialect)
                     .execute(&mut **tx)
                     .await?;
                 },
@@ -1401,8 +1430,9 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Live version of the column.
             let row = sqlx::query(
-                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column
-                 FROM ducklake_column
+                "SELECT column_id, column_type, column_order, nulls_allowed, parent_column,
+                        initial_default, default_value, default_value_type, default_value_dialect
+                  FROM ducklake_column
                  WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL
                    AND parent_column IS NULL",
             )
@@ -1422,6 +1452,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .try_get::<Option<bool>, _>("nulls_allowed")?
                 .unwrap_or(true);
             let parent_column: Option<i64> = row.try_get("parent_column")?;
+            let initial_default: Option<String> = row.try_get("initial_default")?;
+            let default_value: Option<String> = row.try_get("default_value")?;
+            let default_value_type: Option<String> = row.try_get("default_value_type")?;
+            let default_value_dialect: Option<String> = row.try_get("default_value_dialect")?;
 
             // No-op / not-a-widening guards (canonical first so an alias-only
             // restatement is "no change", not attempted).
@@ -1505,9 +1539,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             sqlx::query(
                 "INSERT INTO ducklake_column
-                     (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot, parent_column)
+                     (column_id, table_id, column_name, column_type, column_order, nulls_allowed,
+                      parent_column, begin_snapshot, initial_default, default_value,
+                      default_value_type, default_value_dialect)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(column_id)
             .bind(table_id)
@@ -1515,8 +1551,12 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(new_ducklake_type)
             .bind(column_order)
             .bind(nulls_allowed)
-            .bind(snapshot_id)
             .bind(parent_column)
+            .bind(snapshot_id)
+            .bind(initial_default)
+            .bind(default_value)
+            .bind(default_value_type)
+            .bind(default_value_dialect)
             .execute(&mut *tx)
             .await?;
 
@@ -1686,9 +1726,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let parent_id = column.parent_index.map(|index| column_ids[index]);
                 let row = sqlx::query(
                     "INSERT INTO ducklake_column
-                         (table_id, column_name, column_type, column_order, nulls_allowed,
-                          parent_column, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING column_id",
+                           (table_id, column_name, column_type, column_order, nulls_allowed,
+                            parent_column, begin_snapshot, initial_default, default_value,
+                            default_value_type, default_value_dialect)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                       RETURNING column_id",
                 )
                 .bind(table_id)
                 .bind(&column.name)
@@ -1697,6 +1739,10 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .fetch_one(&mut *tx)
                 .await?;
                 column_ids.push(row.try_get(0)?);
@@ -4114,6 +4160,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
             execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
+            migrate_column_default_metadata(&self.pool).await?;
             // Upgrade a pre-existing store's ducklake_column to the composite PK
             // (legacy single-row column_id PK → versioned-capable). Idempotent.
             migrate_ducklake_column_to_composite_pk(&self.pool).await?;

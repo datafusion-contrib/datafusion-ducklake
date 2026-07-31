@@ -160,6 +160,14 @@ pub struct ColumnDef {
     pub(crate) is_nullable: bool,
     /// Arrow type retained so nested child names and nullability survive catalog flattening.
     pub(crate) data_type: DataType,
+    /// Literal used for files that predate a newly added column
+    pub(crate) initial_default: Option<String>,
+    /// Literal applied when a write omits this column
+    pub(crate) default_value: Option<String>,
+    /// Default encoding kind (`literal` when a default is set)
+    pub(crate) default_value_type: Option<String>,
+    /// SQL dialect recorded for interoperability
+    pub(crate) default_value_dialect: Option<String>,
 }
 
 impl ColumnDef {
@@ -198,6 +206,10 @@ impl ColumnDef {
             ducklake_type,
             is_nullable,
             data_type,
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         })
     }
 
@@ -221,7 +233,28 @@ impl ColumnDef {
             ducklake_type,
             is_nullable,
             data_type: data_type.clone(),
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         })
+    }
+
+    /// Set a DuckLake literal default for this column.
+    pub fn with_default(mut self, value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        let data_type = ducklake_to_arrow_type(&self.ducklake_type)?;
+        if crate::types::parse_ducklake_default_scalar(&value, &data_type).is_none() {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "Cannot decode default '{value}' for column '{}' as {data_type}",
+                self.name
+            )));
+        }
+        self.initial_default = Some(value.clone());
+        self.default_value = Some(value);
+        self.default_value_type = Some("literal".to_string());
+        self.default_value_dialect = Some("duckdb".to_string());
+        Ok(self)
     }
 }
 
@@ -232,6 +265,10 @@ pub(crate) struct CatalogColumnDef {
     pub logical_type: String,
     pub is_nullable: bool,
     pub parent_index: Option<usize>,
+    pub initial_default: Option<String>,
+    pub default_value: Option<String>,
+    pub default_value_type: Option<String>,
+    pub default_value_dialect: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +282,7 @@ pub(crate) struct ExistingCatalogColumn {
 pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogColumnDef>> {
     let mut result = Vec::new();
     for column in columns {
+        let root_index = result.len();
         append_column_def(
             &column.name,
             &column.data_type,
@@ -252,6 +290,13 @@ pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogCo
             None,
             &mut result,
         )?;
+        let root = &mut result[root_index];
+        root.initial_default.clone_from(&column.initial_default);
+        root.default_value.clone_from(&column.default_value);
+        root.default_value_type
+            .clone_from(&column.default_value_type);
+        root.default_value_dialect
+            .clone_from(&column.default_value_dialect);
     }
     Ok(result)
 }
@@ -270,6 +315,10 @@ fn append_column_def(
         logical_type: arrow_to_ducklake_type(data_type)?,
         is_nullable,
         parent_index,
+        initial_default: None,
+        default_value: None,
+        default_value_type: None,
+        default_value_dialect: None,
     });
     match data_type {
         DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
@@ -2106,7 +2155,10 @@ mod tests {
             false,
         );
         let columns = vec![
-            ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+            ColumnDef::from_arrow("id", &DataType::Int32, false)
+                .unwrap()
+                .with_default("7")
+                .unwrap(),
             ColumnDef::from_arrow("levels", &levels, false).unwrap(),
             ColumnDef::from_arrow("attrs", &attrs, true).unwrap(),
         ];
@@ -2142,6 +2194,14 @@ mod tests {
             top_level_column_ids(&definitions, &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]).unwrap(),
             vec![10, 11, 16]
         );
+        let defaults = definitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, column)| {
+                column.default_value.as_deref().map(|value| (index, value))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, vec![(0, "7")]);
     }
 
     #[test]

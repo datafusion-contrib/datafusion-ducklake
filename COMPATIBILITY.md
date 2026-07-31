@@ -112,6 +112,25 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
 | Complex / nested (list, struct, map)  | Supported | Recursive types and nullable‑field evolution; no pruning     |
 
+### Column defaults
+
+Parquet scans apply `initial_default` only when a file physically lacks the
+column. DataFusion inserts apply literal `default_value` metadata when the SQL
+statement omits the column. DuckLake's string sentinel `"NULL"` means no
+operational default, and BLOB defaults retain printable bytes while decoding
+DuckDB `\xNN` escapes.
+
+DuckDB expression defaults remain metadata-only: they do not prevent table
+reads, but DataFusion does not evaluate them. Supply those columns explicitly
+on insert. Defaults added to nested children are not materialized yet, and the
+table-change, insertion, and deletion functions do not fill defaults for fields
+missing from older files.
+
+Writer initialization migrates missing default-metadata columns on SQLite,
+MySQL, and PostgreSQL. DuckDB read providers project missing fields as `NULL`.
+For a legacy SQLite, MySQL, or PostgreSQL catalog opened through a read-only
+provider, run writer initialization with a schema-migration role before reading.
+
 ---
 
 ## Capabilities

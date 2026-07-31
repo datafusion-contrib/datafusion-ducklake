@@ -876,9 +876,10 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -888,6 +889,10 @@ async fn finalize_snapshot(
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut **tx)
                 .await?;
             },
@@ -1069,9 +1074,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                 let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
@@ -1081,6 +1087,10 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
+                .bind(&column.initial_default)
+                .bind(&column.default_value)
+                .bind(&column.default_value_type)
+                .bind(&column.default_value_dialect)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1835,6 +1845,37 @@ impl MetadataWriter for MySqlMetadataWriter {
             // create each table separately (see SQL_CREATE_TABLES).
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(*ddl).execute(&self.pool).await?;
+            }
+            let default_columns: Vec<String> = sqlx::query_scalar(
+                "SELECT column_name FROM information_schema.columns
+                 WHERE table_schema = DATABASE()
+                   AND table_name = 'ducklake_column'
+                   AND column_name IN ('initial_default', 'default_value',
+                                       'default_value_type', 'default_value_dialect')",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for (name, ddl) in [
+                (
+                    "initial_default",
+                    "ALTER TABLE ducklake_column ADD COLUMN initial_default VARCHAR(1024)",
+                ),
+                (
+                    "default_value",
+                    "ALTER TABLE ducklake_column ADD COLUMN default_value VARCHAR(1024)",
+                ),
+                (
+                    "default_value_type",
+                    "ALTER TABLE ducklake_column ADD COLUMN default_value_type VARCHAR(1024)",
+                ),
+                (
+                    "default_value_dialect",
+                    "ALTER TABLE ducklake_column ADD COLUMN default_value_dialect VARCHAR(1024)",
+                ),
+            ] {
+                if !default_columns.iter().any(|column| column == name) {
+                    sqlx::query(ddl).execute(&self.pool).await?;
+                }
             }
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
             // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first

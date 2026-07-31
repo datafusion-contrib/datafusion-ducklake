@@ -37,7 +37,8 @@ pub const SQL_GET_VIEW_BY_NAME: &str =
        AND (? < end_snapshot OR end_snapshot IS NULL)";
 
 pub const SQL_GET_TABLE_COLUMNS: &str =
-    "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+    "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
+            initial_default, default_value, default_value_type, default_value_dialect
      FROM ducklake_column
      WHERE table_id = ?
        AND ? >= begin_snapshot
@@ -324,7 +325,11 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
         c.column_name,
         c.column_type,
         c.nulls_allowed,
-        c.parent_column
+        c.parent_column,
+        c.initial_default,
+        c.default_value,
+        c.default_value_type,
+        c.default_value_dialect
     FROM ducklake_schema s
     JOIN ducklake_table t ON s.schema_id = t.schema_id
     JOIN ducklake_column c ON t.table_id = c.table_id
@@ -571,6 +576,14 @@ pub struct DuckLakeTableColumn {
     pub is_nullable: bool,
     pub(crate) data_type: Option<DataType>,
     pub(crate) nested_column_ids: Vec<i64>,
+    /// Value substituted for this column in files that predate it
+    pub initial_default: Option<String>,
+    /// Value applied when a new write omits this column
+    pub default_value: Option<String>,
+    /// How to interpret the stored defaults (`literal` or `expression`)
+    pub default_value_type: Option<String>,
+    /// SQL dialect used to encode the stored defaults
+    pub default_value_dialect: Option<String>,
 }
 
 pub(crate) fn is_inlined_data_table(name: &str) -> bool {
@@ -701,6 +714,10 @@ impl DuckLakeTableColumn {
             is_nullable,
             data_type: None,
             nested_column_ids: Vec::new(),
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
         }
     }
 
@@ -709,6 +726,22 @@ impl DuckLakeTableColumn {
             Some(data_type) => Ok(data_type.clone()),
             None => ducklake_to_arrow_type(&self.column_type),
         }
+    }
+
+    /// Attach the default metadata stored in `ducklake_column`.
+    pub(crate) fn with_defaults(
+        mut self,
+        initial_default: Option<String>,
+        default_value: Option<String>,
+        default_value_type: Option<String>,
+        default_value_dialect: Option<String>,
+    ) -> Self {
+        self.initial_default = initial_default;
+        // DuckLake stores a missing operational default as the string sentinel `NULL`
+        self.default_value = default_value.filter(|value| value != "NULL");
+        self.default_value_type = default_value_type;
+        self.default_value_dialect = default_value_dialect;
+        self
     }
 }
 

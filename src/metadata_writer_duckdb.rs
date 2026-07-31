@@ -810,9 +810,10 @@ fn finalize_snapshot(
             None => {
                 tx.execute(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order,
-                          nulls_allowed, parent_column, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          (column_id, table_id, column_name, column_type, column_order,
+                           nulls_allowed, parent_column, begin_snapshot, initial_default,
+                           default_value, default_value_type, default_value_dialect)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         column_id,
                         table_id,
@@ -821,7 +822,11 @@ fn finalize_snapshot(
                         order as i64,
                         column.is_nullable,
                         parent_id,
-                        snapshot_id
+                        snapshot_id,
+                        column.initial_default.as_deref(),
+                        column.default_value.as_deref(),
+                        column.default_value_type.as_deref(),
+                        column.default_value_dialect.as_deref()
                     ],
                 )?;
             },
@@ -978,9 +983,10 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let parent_id = column.parent_index.map(|index| column_ids[index]);
             tx.execute(
                 "INSERT INTO ducklake_column
-                     (column_id, table_id, column_name, column_type, column_order,
-                      nulls_allowed, parent_column, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                      (column_id, table_id, column_name, column_type, column_order,
+                       nulls_allowed, parent_column, begin_snapshot, initial_default,
+                       default_value, default_value_type, default_value_dialect)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     column_id,
                     table_id,
@@ -989,7 +995,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     order as i64,
                     column.is_nullable,
                     parent_id,
-                    snapshot_id
+                    snapshot_id,
+                    column.initial_default.as_deref(),
+                    column.default_value.as_deref(),
+                    column.default_value_type.as_deref(),
+                    column.default_value_dialect.as_deref()
                 ],
             )?;
         }

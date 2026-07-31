@@ -37,6 +37,7 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
         crate::metadata_writer_postgres::SQL_CREATE_MULTICATALOG_TABLES,
     )
     .await?;
+    crate::metadata_writer_postgres::migrate_column_default_metadata(pool).await?;
     // Upgrade a pre-existing store's ducklake_column from the legacy single-row
     // column_id PK to the composite (table_id, column_id, begin_snapshot) PK so
     // versioned / type-promoted columns work on catalogs created before this

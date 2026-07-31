@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and partition labels are identical at any setting (#280).
 
 - Add read-only DuckLake views across metadata backends and writer-compatible view metadata (#264).
+- Add literal column defaults for schema evolution and omitted `INSERT` fields
+  across metadata backends (#259).
 
 ### Changed
 
@@ -90,6 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time (#280).
 
 ### Fixed
+
+- Fix `NULL` sentinels, BLOB decoding, expression-default reads, and legacy
+  schema migration (#259).
 
 - An upload whose final flush failed panicked with "Already shut down" instead of
   returning the error. `BufWriter::shutdown` leaves the writer shut down even when it

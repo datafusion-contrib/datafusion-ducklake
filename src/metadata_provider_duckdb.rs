@@ -8,11 +8,10 @@ use crate::metadata_provider::{
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
-    SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_COLUMNS,
-    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS,
-    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
-    build_inlined_batch, is_inlined_data_table, reconstruct_columns,
+    SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
+    SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS,
+    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, build_inlined_batch, is_inlined_data_table, reconstruct_columns,
     reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
@@ -166,12 +165,13 @@ fn decode_view(row: &duckdb::Row<'_>) -> duckdb::Result<ViewMetadata> {
     })
 }
 
-/// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
+/// Optional catalog-schema capabilities probed before version-dependent queries.
 ///
 /// Older catalogs (spec 0.2) may lack the `partial_max` columns and the
 /// inlined-data registry. CDC queries fall back to the old-spec
 /// `partial_file_info` string (data files) or degrade the predicate to NULL
 /// (delete files); inlined-data reads return empty when a capability is absent.
+/// Older catalogs may also lack any or all of the four default-value columns.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
@@ -182,6 +182,14 @@ struct SchemaCapabilities {
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
     views: bool,
+    /// `ducklake_column.initial_default` exists.
+    column_initial_default: bool,
+    /// `ducklake_column.default_value` exists.
+    column_default_value: bool,
+    /// `ducklake_column.default_value_type` exists.
+    column_default_value_type: bool,
+    /// `ducklake_column.default_value_dialect` exists.
+    column_default_value_dialect: bool,
 }
 
 impl SchemaCapabilities {
@@ -190,7 +198,90 @@ impl SchemaCapabilities {
             && self.delete_file_partial_max
             && self.inlined_data_tables
             && self.views
+            && self.column_initial_default
+            && self.column_default_value
+            && self.column_default_value_type
+            && self.column_default_value_dialect
     }
+}
+
+fn get_table_columns_sql(capabilities: SchemaCapabilities) -> String {
+    let initial_default = if capabilities.column_initial_default {
+        "initial_default"
+    } else {
+        "NULL AS initial_default"
+    };
+    let default_value = if capabilities.column_default_value {
+        "default_value"
+    } else {
+        "NULL AS default_value"
+    };
+    let value_type = if capabilities.column_default_value_type {
+        "default_value_type"
+    } else {
+        "NULL AS default_value_type"
+    };
+    let dialect = if capabilities.column_default_value_dialect {
+        "default_value_dialect"
+    } else {
+        "NULL AS default_value_dialect"
+    };
+    format!(
+        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
+                {initial_default}, {default_value}, {value_type}, {dialect}
+         FROM ducklake_column
+         WHERE table_id = ?
+           AND ? >= begin_snapshot
+           AND (? < end_snapshot OR end_snapshot IS NULL)
+         ORDER BY column_order"
+    )
+}
+
+fn list_all_columns_sql(capabilities: SchemaCapabilities) -> String {
+    let initial_default = if capabilities.column_initial_default {
+        "c.initial_default"
+    } else {
+        "NULL AS initial_default"
+    };
+    let default_value = if capabilities.column_default_value {
+        "c.default_value"
+    } else {
+        "NULL AS default_value"
+    };
+    let value_type = if capabilities.column_default_value_type {
+        "c.default_value_type"
+    } else {
+        "NULL AS default_value_type"
+    };
+    let dialect = if capabilities.column_default_value_dialect {
+        "c.default_value_dialect"
+    } else {
+        "NULL AS default_value_dialect"
+    };
+    format!(
+        "SELECT
+            s.schema_name,
+            t.table_name,
+            c.column_id,
+            c.column_name,
+            c.column_type,
+            c.nulls_allowed,
+            c.parent_column,
+            {initial_default},
+            {default_value},
+            {value_type},
+            {dialect}
+         FROM ducklake_schema s
+         JOIN ducklake_table t ON s.schema_id = t.schema_id
+         JOIN ducklake_column c ON t.table_id = c.table_id
+         WHERE ? >= s.begin_snapshot
+           AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+           AND ? >= t.begin_snapshot
+           AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
+           AND ? >= c.begin_snapshot
+           AND (? < c.end_snapshot OR c.end_snapshot IS NULL)
+         ORDER BY s.schema_name, t.table_name, c.column_order"
+    )
 }
 
 /// DuckDB metadata provider
@@ -249,12 +340,16 @@ impl DuckdbMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let (data_file_partial_max, delete_file_partial_max, inlined_data_tables, views): (
-            bool,
-            bool,
-            bool,
-            bool,
-        ) = conn.query_row(
+        let (
+            data_file_partial_max,
+            delete_file_partial_max,
+            inlined_data_tables,
+            views,
+            column_initial_default,
+            column_default_value,
+            column_default_value_type,
+            column_default_value_dialect,
+        ): (bool, bool, bool, bool, bool, bool, bool, bool) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
@@ -263,15 +358,38 @@ impl DuckdbMetadataProvider {
                (SELECT COUNT(*) FROM information_schema.tables
                 WHERE table_name = 'ducklake_inlined_data_tables') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
-                WHERE table_name = 'ducklake_view') > 0",
+                WHERE table_name = 'ducklake_view') > 0,
+                (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
+                 WHERE name = 'initial_default') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
+                WHERE name = 'default_value') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
+                WHERE name = 'default_value_type') > 0,
+               (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
+                WHERE name = 'default_value_dialect') > 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
             inlined_data_tables,
             views,
+            column_initial_default,
+            column_default_value,
+            column_default_value_type,
+            column_default_value_dialect,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -396,7 +514,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
         snapshot_id: i64,
     ) -> crate::Result<Vec<DuckLakeTableColumn>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_GET_TABLE_COLUMNS)?;
+        let sql = get_table_columns_sql(self.schema_capabilities(&conn)?);
+        let mut stmt = conn.prepare(&sql)?;
 
         let raw_columns: Vec<(DuckLakeTableColumn, Option<i64>)> = stmt
             .query_map(duckdb::params![table_id, snapshot_id, snapshot_id], |row| {
@@ -411,6 +530,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         column_name,
                         column_type,
                         nulls_allowed.unwrap_or(true),
+                    )
+                    .with_defaults(
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ),
                     parent_column,
                 ))
@@ -1087,7 +1212,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
     fn list_all_columns(&self, snapshot_id: i64) -> crate::Result<Vec<ColumnWithTable>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_LIST_ALL_COLUMNS)?;
+        let sql = list_all_columns_sql(self.schema_capabilities(&conn)?);
+        let mut stmt = conn.prepare(&sql)?;
 
         let raw_columns: Vec<(ColumnWithTable, Option<i64>)> = stmt
             .query_map(
@@ -1104,14 +1230,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     let table_name: String = row.get(1)?;
                     let nulls_allowed: Option<bool> = row.get(5)?;
                     let parent_column: Option<i64> = row.get(6)?;
-                    let column = DuckLakeTableColumn {
-                        column_id: row.get(2)?,
-                        column_name: row.get(3)?,
-                        column_type: row.get(4)?,
-                        is_nullable: nulls_allowed.unwrap_or(true),
-                        data_type: None,
-                        nested_column_ids: Vec::new(),
-                    };
+                    let column = DuckLakeTableColumn::new(
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        nulls_allowed.unwrap_or(true),
+                    )
+                    .with_defaults(
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    );
                     Ok((
                         ColumnWithTable {
                             schema_name,
@@ -1350,7 +1480,11 @@ mod tests {
     use duckdb::arrow::array::{Int32Builder, ListBuilder};
     use duckdb::types::{ListType, ValueRef};
 
-    use super::{duckdb_inlined_scalar, parse_partial_file_info_max};
+    use super::{
+        SchemaCapabilities, duckdb_inlined_scalar, get_table_columns_sql, list_all_columns_sql,
+        parse_partial_file_info_max,
+    };
+    use duckdb::{Connection, params};
 
     #[test]
     fn nested_inlined_value_reports_recovery() {
@@ -1374,6 +1508,79 @@ mod tests {
              which cannot be decoded as List(Int32); flush inlined data to Parquet (or disable \
              data inlining at write time)"
         );
+    }
+
+    #[test]
+    fn legacy_columns_without_defaults_are_null_projected() -> duckdb::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE ducklake_schema (
+                schema_id BIGINT, schema_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT
+            );
+            CREATE TABLE ducklake_table (
+                table_id BIGINT, schema_id BIGINT, table_name VARCHAR,
+                begin_snapshot BIGINT, end_snapshot BIGINT
+            );
+            CREATE TABLE ducklake_column (
+                column_id BIGINT, table_id BIGINT, column_order BIGINT, column_name VARCHAR,
+                column_type VARCHAR, nulls_allowed BOOLEAN, parent_column BIGINT,
+                begin_snapshot BIGINT, end_snapshot BIGINT
+            );
+            INSERT INTO ducklake_schema VALUES (1, 'main', 1, NULL);
+            INSERT INTO ducklake_table VALUES (2, 1, 'events', 1, NULL);
+            INSERT INTO ducklake_column VALUES (3, 2, 0, 'id', 'int64', false, NULL, 1, NULL);",
+        )?;
+        let capabilities = SchemaCapabilities {
+            data_file_partial_max: false,
+            delete_file_partial_max: false,
+            inlined_data_tables: false,
+            views: false,
+            column_initial_default: false,
+            column_default_value: false,
+            column_default_value_type: false,
+            column_default_value_dialect: false,
+        };
+
+        let table_defaults = conn.query_row(
+            &get_table_columns_sql(capabilities),
+            params![2, 1, 1],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )?;
+        let listed_defaults = conn.query_row(
+            &list_all_columns_sql(capabilities),
+            params![1, 1, 1, 1, 1, 1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
+        )?;
+
+        assert_eq!(table_defaults, (None, None, None, None));
+        assert_eq!(
+            listed_defaults,
+            (
+                "main".to_string(),
+                "events".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+        Ok(())
     }
 
     #[test]

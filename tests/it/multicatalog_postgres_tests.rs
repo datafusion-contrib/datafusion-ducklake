@@ -4582,7 +4582,19 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
     .unwrap();
     assert_eq!(pk_len, 1, "downgrade produced the legacy single-column PK");
 
-    // Re-run the multicatalog bootstrap → the migration converts the PK.
+    sqlx::query(
+        "ALTER TABLE ducklake_column
+         DROP COLUMN initial_default,
+         DROP COLUMN default_value,
+         DROP COLUMN default_value_type,
+         DROP COLUMN default_value_dialect",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Re-run the multicatalog bootstrap: the migrations convert the PK and add
+    // the nullable default metadata without changing existing rows.
     initialize_multicatalog_schema(&pool).await.unwrap();
     let pk_len_after: i32 = sqlx::query_scalar(
         "SELECT array_length(conkey, 1) FROM pg_constraint
@@ -4594,6 +4606,24 @@ async fn multicatalog_migrates_legacy_single_pk_to_composite_with_data() {
     assert_eq!(
         pk_len_after, 3,
         "bootstrap migrated the legacy PK to the composite PK"
+    );
+    let default_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name
+         FROM information_schema.columns
+         WHERE table_name = 'ducklake_column'
+           AND column_name IN (
+               'initial_default', 'default_value',
+               'default_value_type', 'default_value_dialect'
+           )
+         ORDER BY column_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        default_columns,
+        vec!["default_value", "default_value_dialect", "default_value_type", "initial_default",],
+        "bootstrap restored all DuckLake default metadata columns"
     );
 
     // Data preserved — reads through the provider return the original values.

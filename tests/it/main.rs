@@ -20,6 +20,7 @@ mod append_with_deletes_tests;
 mod cdc_cumulative_delete_tests;
 mod cdc_differential_tests;
 mod cdc_rowid_tests;
+mod column_defaults_tests;
 mod column_stats_tests;
 mod common;
 mod compaction_postgres_tests;
