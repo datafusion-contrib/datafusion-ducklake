@@ -104,7 +104,7 @@ jobs:
 
       - name: Install sccache
         if: steps.changes.outputs.code == 'true'
-        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
 
       # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
       # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
@@ -288,7 +288,7 @@ jobs:
 
       - name: Install sccache
         if: steps.changes.outputs.code == 'true'
-        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
 
       # One step for both cargo-home paths, matching the other jobs: as two steps
       # the `~/.cargo/git` one logs "Path Validation Error" on every run, because
@@ -402,7 +402,7 @@ jobs:
 
       - name: Install sccache
         if: steps.changes.outputs.code == 'true'
-        uses: mozilla-actions/sccache-action@9e326ebed976843c9932b3aa0e021c6f50310eb4 # v0.0.6
+        uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
 
       # One step for both cargo-home paths. As two steps, the `~/.cargo/git` one
       # logged "Path Validation Error: Path(s) ... do(es) not exist, hence no
