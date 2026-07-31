@@ -239,7 +239,7 @@ impl SchemaProvider for DuckLakeSchema {
                 WriteMode::Replace,
                 setup.base_snapshot_id,
                 &columns,
-                &setup.column_ids,
+                &setup.field_ids,
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

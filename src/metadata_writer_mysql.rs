@@ -34,9 +34,11 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, SnapshotCommitMetadata,
-    WriteMode, WriteSetupResult, columns_differ, quote_snapshot_name, quote_snapshot_table,
-    table_write_changes, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
+    SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
+    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
+    quote_snapshot_name, quote_snapshot_table, table_write_changes, top_level_column_ids,
+    validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::Row;
@@ -650,6 +652,8 @@ async fn recompute_table_column_stats(
     column_ids: &[i64],
 ) -> Result<()> {
     use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+    let catalog_columns = catalog_column_defs(columns)?;
+    let column_ids = top_level_column_ids(&catalog_columns, column_ids)?;
 
     let live_file_count: i64 = sqlx::query(
         "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
@@ -728,8 +732,16 @@ async fn finalize_snapshot(
     // live columns ordered by `column_order`; an empty set means a brand-new table
     // (the creating write is DDL). Mirrors upstream `SchemaChangesMade()`.
     use std::collections::{HashMap, HashSet};
+    let proposed = catalog_column_defs(columns)?;
+    if proposed.len() != column_ids.len() {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "column_ids has {} entries for {} catalog column nodes",
+            column_ids.len(),
+            proposed.len()
+        )));
+    }
     let current = sqlx::query(
-        "SELECT column_name, column_type, column_order, nulls_allowed
+        "SELECT column_id, column_name, column_type, column_order, nulls_allowed, parent_column
          FROM ducklake_column
          WHERE table_id = ? AND end_snapshot IS NULL
          ORDER BY column_order",
@@ -738,16 +750,40 @@ async fn finalize_snapshot(
     .fetch_all(&mut **tx)
     .await?;
 
-    let mut existing: Vec<(String, String, bool)> = Vec::with_capacity(current.len());
-    for row in &current {
-        let name: String = row.try_get("column_name")?;
-        let ty: String = row.try_get("column_type")?;
-        let nullable: bool = row
-            .try_get::<Option<bool>, _>("nulls_allowed")?
-            .unwrap_or(true);
-        existing.push((name, ty, nullable));
+    let existing_catalog_columns = current
+        .iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>(ExistingCatalogColumn {
+                column_id: row.try_get("column_id")?,
+                name: row.try_get("column_name")?,
+                ducklake_type: row.try_get("column_type")?,
+                parent_column: row.try_get("parent_column")?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let existing_nullability = current
+        .iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>(
+                row.try_get::<Option<bool>, _>("nulls_allowed")?
+                    .unwrap_or(true),
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
+    if committed_ids != column_ids {
+        return Err(crate::DuckLakeError::Conflict(
+            "table columns were created concurrently with different field ids; retry the write"
+                .to_string(),
+        ));
     }
-    let is_ddl = existing.is_empty() || columns_differ(&existing, columns);
+    let is_ddl = current.is_empty()
+        || catalog_columns_differ(
+            &existing_catalog_columns,
+            &existing_nullability,
+            &proposed,
+            column_ids,
+        );
     if is_ddl {
         // A DDL commit bumps the per-catalog schema_version (the insert above only
         // carried it forward). A pure data write keeps the carried value.
@@ -757,43 +793,70 @@ async fn finalize_snapshot(
     // Reconcile the column generation SURGICALLY so each column keeps a stable
     // column_id (== parquet field_id) across writes: end only removed columns,
     // insert only new ones, and leave unchanged columns (and their ids) in place.
-    let new_names: HashSet<&str> = columns.iter().map(|c| c.name()).collect();
-    let mut current_by_name: HashMap<String, (i64, bool)> = HashMap::new();
+    let proposed_ids = column_ids.iter().copied().collect::<HashSet<_>>();
+    let mut current_by_id: HashMap<i64, (i64, bool, String)> = HashMap::new();
     for row in &current {
-        let name: String = row.try_get("column_name")?;
+        let column_id: i64 = row.try_get("column_id")?;
         let order: i64 = row.try_get("column_order")?;
         let nullable: bool = row
             .try_get::<Option<bool>, _>("nulls_allowed")?
             .unwrap_or(true);
-        if !new_names.contains(name.as_str()) {
-            // Column dropped in the new schema: end its generation.
+        let ducklake_type: String = row.try_get("column_type")?;
+        if !proposed_ids.contains(&column_id) {
             sqlx::query(
                 "UPDATE ducklake_column SET end_snapshot = ?
-                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                 WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
             .bind(table_id)
-            .bind(&name)
+            .bind(column_id)
             .execute(&mut **tx)
             .await?;
         }
-        current_by_name.insert(name, (order, nullable));
+        current_by_id.insert(column_id, (order, nullable, ducklake_type));
     }
 
-    for (order, (col, column_id)) in columns.iter().zip(column_ids.iter()).enumerate() {
-        match current_by_name.get(col.name()) {
-            // Existing column kept: its id stays stable. Sync order/nullability
-            // only if they changed (type changes are rejected at begin).
-            Some(&(cur_order, cur_nullable)) => {
-                if cur_order != order as i64 || cur_nullable != col.is_nullable() {
+    for (order, (column, column_id)) in proposed.iter().zip(column_ids).enumerate() {
+        let parent_id = column.parent_index.map(|index| column_ids[index]);
+        match current_by_id.get(column_id) {
+            Some((cur_order, cur_nullable, cur_type)) => {
+                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
+                if migrate_type {
                     sqlx::query(
-                        "UPDATE ducklake_column SET column_order = ?, nulls_allowed = ?
-                         WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                        "UPDATE ducklake_column SET end_snapshot = ?
+                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .execute(&mut **tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_column
+                             (column_id, table_id, column_name, column_type, column_order,
+                              nulls_allowed, parent_column, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(column_id)
+                    .bind(table_id)
+                    .bind(&column.name)
+                    .bind(&column.ducklake_type)
+                    .bind(order as i64)
+                    .bind(column.is_nullable)
+                    .bind(parent_id)
+                    .bind(snapshot_id)
+                    .execute(&mut **tx)
+                    .await?;
+                } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
+                    sqlx::query(
+                        "UPDATE ducklake_column
+                         SET column_order = ?, nulls_allowed = ?
+                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
                     )
                     .bind(order as i64)
-                    .bind(col.is_nullable())
+                    .bind(column.is_nullable)
                     .bind(table_id)
-                    .bind(col.name())
+                    .bind(column_id)
                     .execute(&mut **tx)
                     .await?;
                 }
@@ -802,15 +865,17 @@ async fn finalize_snapshot(
             None => {
                 sqlx::query(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
-                .bind(col.name())
-                .bind(col.ducklake_type())
+                .bind(&column.name)
+                .bind(&column.ducklake_type)
                 .bind(order as i64)
-                .bind(col.is_nullable())
+                .bind(column.is_nullable)
+                .bind(parent_id)
                 .bind(snapshot_id)
                 .execute(&mut **tx)
                 .await?;
@@ -982,26 +1047,31 @@ impl MetadataWriter for MySqlMetadataWriter {
 
             // Reserve a contiguous column_id block from the monotonic counter and
             // insert with explicit ids, keeping the allocator authoritative.
-            let n = columns.len() as i64;
+            let catalog_columns = catalog_column_defs(columns)?;
+            let n = catalog_columns.len() as i64;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             let first_column_id = last_column_id - n + 1;
-            let mut column_ids = Vec::with_capacity(columns.len());
-            for (order, col) in columns.iter().enumerate() {
-                let column_id = first_column_id + order as i64;
+            let field_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+            for (order, (column, column_id)) in
+                catalog_columns.iter().zip(field_ids.iter()).enumerate()
+            {
+                let parent_id = column.parent_index.map(|index| field_ids[index]);
                 sqlx::query(
-                    "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ducklake_column
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(column_id)
                 .bind(table_id)
-                .bind(col.name())
-                .bind(col.ducklake_type())
+                .bind(&column.name)
+                .bind(&column.ducklake_type)
                 .bind(order as i64)
-                .bind(col.is_nullable())
+                .bind(column.is_nullable)
+                .bind(parent_id)
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                column_ids.push(column_id);
             }
 
             let table_begin_snapshot: i64 =
@@ -1019,7 +1089,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .await?;
             }
             tx.commit().await?;
-            Ok(column_ids)
+            top_level_column_ids(&catalog_columns, &field_ids)
         })
     }
 
@@ -1349,7 +1419,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             for (name, _transform) in columns {
                 let column_id: i64 = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(name)
@@ -1534,7 +1605,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 })?;
                 let exists: Option<i64> = sqlx::query_scalar(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                 )
                 .bind(table_id)
                 .bind(&column)
@@ -1834,7 +1906,8 @@ impl MetadataWriter for MySqlMetadataWriter {
 
             // Reserve the column ids first so the counter UPDATE takes the write
             // lock up front. These ids match the staged parquet field ids.
-            let n = columns.len() as i64;
+            let catalog_columns = catalog_column_defs(columns)?;
+            let n = catalog_columns.len() as i64;
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             // Freshly reserved ids. Only a genuinely-new column actually consumes
             // one below; an existing column keeps its current id, so some of these
@@ -1910,7 +1983,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // unchanged column must keep its id, or files already written would
             // read back as NULL).
             let rows = sqlx::query(
-                "SELECT column_name, column_type, nulls_allowed, column_id
+                "SELECT column_name, column_type, column_id, parent_column
                  FROM ducklake_column
                  WHERE table_id = ? AND end_snapshot IS NULL
                  ORDER BY column_order",
@@ -1919,17 +1992,21 @@ impl MetadataWriter for MySqlMetadataWriter {
             .fetch_all(&mut *tx)
             .await?;
 
-            let mut existing_columns: Vec<(String, String, bool)> = Vec::with_capacity(rows.len());
-            let mut existing_ids: std::collections::HashMap<String, i64> =
-                std::collections::HashMap::new();
+            let mut existing_catalog_columns = Vec::with_capacity(rows.len());
             for row in rows {
                 let name: String = row.try_get(0)?;
-                let col_type: String = row.try_get(1)?;
-                let nullable: bool = row.try_get::<Option<bool>, _>(2)?.unwrap_or(true);
-                let cid: i64 = row.try_get(3)?;
-                existing_ids.insert(name.clone(), cid);
-                existing_columns.push((name, col_type, nullable));
+                let ducklake_type: String = row.try_get(1)?;
+                let column_id: i64 = row.try_get(2)?;
+                let parent_column: Option<i64> = row.try_get(3)?;
+                existing_catalog_columns.push(ExistingCatalogColumn {
+                    column_id,
+                    name,
+                    ducklake_type,
+                    parent_column,
+                });
             }
+            let field_ids =
+                assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 
             // Data-write policy (§5): a data write — Replace OR Append — must NOT
             // change a column's type (that is schema evolution and must go through
@@ -1937,24 +2014,19 @@ impl MetadataWriter for MySqlMetadataWriter {
             // comparison is canonical (`int64` ≡ `bigint`) so an alias-only
             // restatement is a no-op. Append additionally requires a genuinely new
             // column to be nullable.
-            if !existing_columns.is_empty() {
+            if !existing_catalog_columns.is_empty() {
                 use std::collections::HashMap;
 
-                let existing_map: HashMap<&str, (&str, bool)> = existing_columns
+                let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
                     .iter()
-                    .map(|(name, col_type, nullable)| {
-                        (name.as_str(), (col_type.as_str(), *nullable))
-                    })
+                    .map(|column| (column.column_id, column))
                     .collect();
 
-                for new_col in columns.iter() {
-                    if let Some((existing_type, _existing_nullable)) =
-                        existing_map.get(new_col.name())
-                    {
-                        if !crate::types::types_equal_canonical(
-                            existing_type,
-                            new_col.ducklake_type(),
-                        ) {
+                for (new_column, column_id) in catalog_columns.iter().zip(&field_ids) {
+                    if let Some(existing_column) = existing_map.get(column_id) {
+                        let same_type =
+                            catalog_column_type_equal(&existing_column.ducklake_type, new_column);
+                        if !same_type {
                             return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                                 operation: TypeChangeOperation::DataWrite {
                                     mode: match mode {
@@ -1962,15 +2034,18 @@ impl MetadataWriter for MySqlMetadataWriter {
                                         WriteMode::Append => TypeChangeWriteMode::Append,
                                     },
                                 },
-                                column: new_col.name().to_string(),
-                                from: (*existing_type).to_string(),
-                                to: new_col.ducklake_type().to_string(),
+                                column: new_column.name.clone(),
+                                from: existing_column.ducklake_type.clone(),
+                                to: new_column.ducklake_type.clone(),
                             });
                         }
-                    } else if mode == WriteMode::Append && !new_col.is_nullable() {
+                    } else if mode == WriteMode::Append
+                        && new_column.parent_index.is_none()
+                        && !new_column.is_nullable
+                    {
                         return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                             "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
-                            new_col.name()
+                            new_column.name
                         )));
                     }
                 }
@@ -1983,12 +2058,6 @@ impl MetadataWriter for MySqlMetadataWriter {
             // themselves are written at the commit point (not here): the read path
             // resolves columns by `end_snapshot IS NULL` only, so inserting at begin
             // would leak the new generation to concurrent reads.
-            let column_ids: Vec<i64> = columns
-                .iter()
-                .zip(fresh_ids.iter())
-                .map(|(col, &fresh)| existing_ids.get(col.name()).copied().unwrap_or(fresh))
-                .collect();
-
             // No snapshot row, no column rows, and no Replace retirement are written
             // here — all are deferred to the atomic commit so the head never
             // resolves to an incomplete snapshot. This TX commits only the
@@ -2002,7 +2071,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 base_snapshot_id,
                 schema_id,
                 table_id,
-                column_ids,
+                column_ids: top_level_column_ids(&catalog_columns, &field_ids)?,
+                field_ids,
             })
         })
     }

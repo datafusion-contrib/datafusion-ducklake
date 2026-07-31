@@ -728,15 +728,15 @@ async fn test_get_table_structure() {
     assert_eq!(columns.len(), 3, "users table should have 3 columns");
 
     assert_eq!(columns[0].column_name, "id");
-    assert_eq!(columns[0].column_type, "INT");
+    assert_eq!(columns[0].column_type, "int32");
     assert!(!columns[0].is_nullable);
 
     assert_eq!(columns[1].column_name, "name");
-    assert_eq!(columns[1].column_type, "VARCHAR");
+    assert_eq!(columns[1].column_type, "varchar");
     assert!(columns[1].is_nullable);
 
     assert_eq!(columns[2].column_name, "email");
-    assert_eq!(columns[2].column_type, "VARCHAR");
+    assert_eq!(columns[2].column_type, "varchar");
     assert!(columns[2].is_nullable);
 }
 

@@ -14,10 +14,13 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use arrow::array::{Array, Int32Array, Int64Array, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, StructArray,
+    UInt64Array,
+};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
@@ -27,8 +30,8 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode, register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, PartitionTransform,
+    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode, register_ducklake_functions,
 };
 
 /// The `(id, val)` schema used throughout.
@@ -313,6 +316,193 @@ async fn update_sets_value_where_id() {
         "id=2 gets the new value; others unchanged"
     );
     assert_eq!(rows.len(), 4, "row count is unchanged by UPDATE");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_table_with_list_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp_dir).await);
+    let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(10), Some(11)]),
+        Some(vec![Some(20)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("items", values.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(values)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "list_table", &[batch])
+        .await
+        .unwrap();
+
+    let ctx = writable_ctx(&temp_dir).await;
+    assert_eq!(
+        run_dml_count(
+            &ctx,
+            "UPDATE ducklake.main.list_table SET id = 20 WHERE id = 2",
+        )
+        .await,
+        1,
+    );
+
+    let batches = read_ctx(&temp_dir, false)
+        .await
+        .sql("SELECT id, items FROM ducklake.main.list_table ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 20]);
+    let first = values.value(0);
+    let first = first.as_any().downcast_ref::<Int32Array>().unwrap();
+    let second = values.value(1);
+    let second = second.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(first.values(), &[10, 11]);
+    assert_eq!(second.values(), &[20]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_table_with_struct_column() {
+    let temp_dir = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp_dir).await);
+    let fields = vec![
+        Arc::new(
+            Field::new("label", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "3".to_string(),
+            )])),
+        ),
+        Arc::new(
+            Field::new("score", DataType::Int32, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "4".to_string(),
+            )])),
+        ),
+    ];
+    let values = StructArray::new(
+        fields.clone().into(),
+        vec![
+            Arc::new(StringArray::from(vec!["one", "two"])),
+            Arc::new(Int32Array::from(vec![10, 20])),
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("attrs", DataType::Struct(fields.into()), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(values)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "struct_table", &[batch])
+        .await
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let catalog_schema = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(catalog_schema.schema_id, "struct_table", snapshot)
+        .unwrap()
+        .unwrap();
+    let metadata_writer = make_writer(&temp_dir).await;
+    metadata_writer
+        .set_partition_spec(
+            table.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    metadata_writer
+        .set_sort_spec(
+            table.table_id,
+            &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+
+    let ctx = writable_ctx(&temp_dir).await;
+    assert_eq!(
+        run_dml_count(
+            &ctx,
+            "UPDATE ducklake.main.struct_table SET id = 20 WHERE id = 2",
+        )
+        .await,
+        1,
+    );
+    let ctx = writable_ctx(&temp_dir).await;
+    assert_eq!(
+        run_dml_count(
+            &ctx,
+            "UPDATE ducklake.main.struct_table SET id = 200 WHERE id = 20",
+        )
+        .await,
+        1,
+    );
+
+    let batches = read_ctx(&temp_dir, false)
+        .await
+        .sql("SELECT id, attrs FROM ducklake.main.struct_table ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let attrs = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let labels = attrs
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .unwrap();
+    let scores = attrs
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    assert_eq!(ids.values(), &[1, 200]);
+    assert_eq!(
+        labels.iter().collect::<Vec<_>>(),
+        vec![Some("one"), Some("two")]
+    );
+    assert_eq!(scores.values(), &[10, 20]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -39,9 +39,11 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, SnapshotCommitMetadata,
-    WriteMode, WriteSetupResult, columns_differ, quote_snapshot_name, quote_snapshot_table,
-    table_write_changes, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
+    SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
+    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
+    quote_snapshot_name, quote_snapshot_table, table_write_changes, top_level_column_ids,
+    validate_name,
 };
 use crate::partition::PartitionTransform;
 use duckdb::{Connection, OptionalExt, Transaction, params};
@@ -596,6 +598,8 @@ fn recompute_table_column_stats(
     column_ids: &[i64],
 ) -> Result<()> {
     use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
+    let catalog_columns = catalog_column_defs(columns)?;
+    let column_ids = top_level_column_ids(&catalog_columns, column_ids)?;
 
     let live_file_count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
@@ -665,6 +669,14 @@ fn finalize_snapshot(
     base_snapshot: i64,
 ) -> Result<i64> {
     use std::collections::{HashMap, HashSet};
+    let proposed = catalog_column_defs(columns)?;
+    if proposed.len() != column_ids.len() {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "column_ids has {} entries for {} catalog column nodes",
+            column_ids.len(),
+            proposed.len()
+        )));
+    }
 
     // Allocate the snapshot FIRST (carrying schema_version forward); corrected to
     // a DDL bump below once the commit is classified.
@@ -673,28 +685,56 @@ fn finalize_snapshot(
     // The table's live columns ordered by column_order. Collected into an owned
     // Vec so the prepared statement is dropped before we mutate the same
     // connection. An empty set means a brand-new table (its creating write is DDL).
-    let current: Vec<(String, String, i64, bool)> = {
+    let current: Vec<(i64, String, String, i64, bool, Option<i64>)> = {
         let mut stmt = tx.prepare(
-            "SELECT column_name, column_type, column_order, nulls_allowed
+            "SELECT column_id, column_name, column_type, column_order, nulls_allowed, parent_column
              FROM ducklake_column
              WHERE table_id = ? AND end_snapshot IS NULL
              ORDER BY column_order",
         )?;
         let mapped = stmt.query_map(params![table_id], |row| {
-            let name: String = row.get(0)?;
-            let ty: String = row.get(1)?;
-            let order: i64 = row.get(2)?;
-            let nullable: Option<bool> = row.get(3)?;
-            Ok((name, ty, order, nullable.unwrap_or(true)))
+            let column_id: i64 = row.get(0)?;
+            let name: String = row.get(1)?;
+            let ty: String = row.get(2)?;
+            let order: i64 = row.get(3)?;
+            let nullable: Option<bool> = row.get(4)?;
+            let parent_column: Option<i64> = row.get(5)?;
+            Ok((
+                column_id,
+                name,
+                ty,
+                order,
+                nullable.unwrap_or(true),
+                parent_column,
+            ))
         })?;
         mapped.collect::<std::result::Result<Vec<_>, duckdb::Error>>()?
     };
-
-    let existing: Vec<(String, String, bool)> = current
+    let existing_catalog_columns = current
         .iter()
-        .map(|(name, ty, _order, nullable)| (name.clone(), ty.clone(), *nullable))
-        .collect();
-    let is_ddl = existing.is_empty() || columns_differ(&existing, columns);
+        .map(|column| ExistingCatalogColumn {
+            column_id: column.0,
+            name: column.1.clone(),
+            ducklake_type: column.2.clone(),
+            parent_column: column.5,
+        })
+        .collect::<Vec<_>>();
+    let existing_nullability = current.iter().map(|column| column.4).collect::<Vec<_>>();
+    let committed_ids = assign_column_ids(&proposed, &existing_catalog_columns, column_ids)?;
+    if committed_ids != column_ids {
+        return Err(crate::DuckLakeError::Conflict(
+            "table columns were created concurrently with different field ids; retry the write"
+                .to_string(),
+        ));
+    }
+
+    let is_ddl = current.is_empty()
+        || catalog_columns_differ(
+            &existing_catalog_columns,
+            &existing_nullability,
+            &proposed,
+            column_ids,
+        );
     if is_ddl {
         // A DDL commit bumps schema_version (the insert only carried it forward).
         schema_version = bump_schema_version(tx, snapshot_id)?;
@@ -703,29 +743,54 @@ fn finalize_snapshot(
     // Reconcile the column generation SURGICALLY so each column keeps a stable
     // column_id (== parquet field_id): end only removed columns, insert only new
     // ones, and leave unchanged columns (and their ids) in place.
-    let new_names: HashSet<&str> = columns.iter().map(|c| c.name()).collect();
-    let mut current_by_name: HashMap<String, (i64, bool)> = HashMap::new();
-    for (name, _ty, order, nullable) in &current {
-        if !new_names.contains(name.as_str()) {
+    let proposed_ids = column_ids.iter().copied().collect::<HashSet<_>>();
+    let mut current_by_id: HashMap<i64, (i64, bool, String)> = HashMap::new();
+    for (column_id, _name, ty, order, nullable, _parent_id) in &current {
+        if !proposed_ids.contains(column_id) {
             tx.execute(
                 "UPDATE ducklake_column SET end_snapshot = ?
-                 WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
-                params![snapshot_id, table_id, name.as_str()],
+                 WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                params![snapshot_id, table_id, column_id],
             )?;
         }
-        current_by_name.insert(name.clone(), (*order, *nullable));
+        current_by_id.insert(*column_id, (*order, *nullable, ty.clone()));
     }
 
-    for (order, (col, column_id)) in columns.iter().zip(column_ids.iter()).enumerate() {
-        match current_by_name.get(col.name()) {
-            // Existing column kept: its id stays stable. Sync order/nullability
-            // only if they changed (type changes are rejected at begin).
-            Some(&(cur_order, cur_nullable)) => {
-                if cur_order != order as i64 || cur_nullable != col.is_nullable() {
+    for (order, (column, column_id)) in proposed.iter().zip(column_ids).enumerate() {
+        let parent_id = column.parent_index.map(|index| column_ids[index]);
+        match current_by_id.get(column_id) {
+            // Existing column kept: its id stays stable. Sync metadata only if it
+            // changed. A legacy list representation gets a snapshot-bounded row.
+            Some((cur_order, cur_nullable, cur_type)) => {
+                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
+                if migrate_type {
                     tx.execute(
-                        "UPDATE ducklake_column SET column_order = ?, nulls_allowed = ?
-                         WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
-                        params![order as i64, col.is_nullable(), table_id, col.name()],
+                        "UPDATE ducklake_column SET end_snapshot = ?
+                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                        params![snapshot_id, table_id, column_id],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO ducklake_column
+                             (column_id, table_id, column_name, column_type, column_order,
+                              nulls_allowed, parent_column, begin_snapshot)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![
+                            column_id,
+                            table_id,
+                            column.name.as_str(),
+                            column.ducklake_type.as_str(),
+                            order as i64,
+                            column.is_nullable,
+                            parent_id,
+                            snapshot_id
+                        ],
+                    )?;
+                } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
+                    tx.execute(
+                        "UPDATE ducklake_column
+                         SET column_order = ?, nulls_allowed = ?
+                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                        params![order as i64, column.is_nullable, table_id, column_id],
                     )?;
                 }
             },
@@ -733,15 +798,17 @@ fn finalize_snapshot(
             None => {
                 tx.execute(
                     "INSERT INTO ducklake_column
-                         (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         column_id,
                         table_id,
-                        col.name(),
-                        col.ducklake_type(),
+                        column.name.as_str(),
+                        column.ducklake_type.as_str(),
                         order as i64,
-                        col.is_nullable(),
+                        column.is_nullable,
+                        parent_id,
                         snapshot_id
                     ],
                 )?;
@@ -888,26 +955,31 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
         // Reserve a contiguous column_id block from the monotonic counter and
         // insert with explicit ids, keeping the allocator authoritative.
-        let n = columns.len() as i64;
+        let catalog_columns = catalog_column_defs(columns)?;
+        let n = catalog_columns.len() as i64;
         let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
         let first_column_id = last_column_id - n + 1;
-        let mut column_ids = Vec::with_capacity(columns.len());
-        for (order, col) in columns.iter().enumerate() {
-            let column_id = first_column_id + order as i64;
+        let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
+        for (order, (column, column_id)) in
+            catalog_columns.iter().zip(column_ids.iter()).enumerate()
+        {
+            let parent_id = column.parent_index.map(|index| column_ids[index]);
             tx.execute(
-                "INSERT INTO ducklake_column (column_id, table_id, column_name, column_type, column_order, nulls_allowed, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ducklake_column
+                     (column_id, table_id, column_name, column_type, column_order,
+                      nulls_allowed, parent_column, begin_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     column_id,
                     table_id,
-                    col.name(),
-                    col.ducklake_type(),
+                    column.name.as_str(),
+                    column.ducklake_type.as_str(),
                     order as i64,
-                    col.is_nullable(),
+                    column.is_nullable,
+                    parent_id,
                     snapshot_id
                 ],
             )?;
-            column_ids.push(column_id);
         }
 
         let table_begin_snapshot: i64 = tx.query_row(
@@ -924,7 +996,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             )?;
         }
         tx.commit()?;
-        Ok(column_ids)
+        top_level_column_ids(&catalog_columns, &column_ids)
     }
 
     fn register_data_file(
@@ -1222,7 +1294,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let column_id: i64 = tx
                 .query_row(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                     params![table_id, name.as_str()],
                     |row| row.get(0),
                 )
@@ -1385,7 +1458,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let exists: Option<i64> = tx
                 .query_row(
                     "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL",
+                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
+                       AND parent_column IS NULL",
                     params![table_id, column.as_str()],
                     |row| row.get(0),
                 )
@@ -1612,7 +1686,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let tx = conn.transaction()?;
 
         // Reserve the column ids first. These match the staged parquet field ids.
-        let n = columns.len() as i64;
+        let catalog_columns = catalog_column_defs(columns)?;
+        let n = catalog_columns.len() as i64;
         let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
         // Freshly reserved ids. Only a genuinely-new column consumes one below; an
         // existing column keeps its current id, so some may go unused (harmless
@@ -1675,9 +1750,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // column's id (column_id == parquet field_id == a column's stable
         // identity). Collected into owned Vec so the statement drops before the
         // commit that follows.
-        let existing_rows: Vec<(String, String, bool, i64)> = {
+        let existing_rows: Vec<(String, String, i64, Option<i64>)> = {
             let mut stmt = tx.prepare(
-                "SELECT column_name, column_type, nulls_allowed, column_id
+                "SELECT column_name, column_type, column_id, parent_column
                  FROM ducklake_column
                  WHERE table_id = ? AND end_snapshot IS NULL
                  ORDER BY column_order",
@@ -1685,39 +1760,41 @@ impl MetadataWriter for DuckdbMetadataWriter {
             let mapped = stmt.query_map(params![table_id], |row| {
                 let name: String = row.get(0)?;
                 let col_type: String = row.get(1)?;
-                let nullable: Option<bool> = row.get(2)?;
-                let cid: i64 = row.get(3)?;
-                Ok((name, col_type, nullable.unwrap_or(true), cid))
+                let cid: i64 = row.get(2)?;
+                let parent_column: Option<i64> = row.get(3)?;
+                Ok((name, col_type, cid, parent_column))
             })?;
             mapped.collect::<std::result::Result<Vec<_>, duckdb::Error>>()?
         };
 
-        let mut existing_columns: Vec<(String, String, bool)> =
-            Vec::with_capacity(existing_rows.len());
-        let mut existing_ids: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        for (name, col_type, nullable, cid) in existing_rows {
-            existing_ids.insert(name.clone(), cid);
-            existing_columns.push((name, col_type, nullable));
+        let mut existing_catalog_columns = Vec::with_capacity(existing_rows.len());
+        for (name, ducklake_type, column_id, parent_column) in existing_rows {
+            existing_catalog_columns.push(ExistingCatalogColumn {
+                column_id,
+                name,
+                ducklake_type,
+                parent_column,
+            });
         }
+        let field_ids = assign_column_ids(&catalog_columns, &existing_catalog_columns, &fresh_ids)?;
 
         // Data-write policy: a data write — Replace OR Append — must NOT change a
         // column's type (that is schema evolution, which must go through
         // promote_column_type). Comparison is canonical (int64 ≡ bigint) so an
         // alias-only restatement is a no-op. Append additionally requires a
         // genuinely new column to be nullable. Mirrors the SQLite writer.
-        if !existing_columns.is_empty() {
+        if !existing_catalog_columns.is_empty() {
             use std::collections::HashMap;
-            let existing_map: HashMap<&str, (&str, bool)> = existing_columns
+            let existing_map: HashMap<i64, &ExistingCatalogColumn> = existing_catalog_columns
                 .iter()
-                .map(|(name, col_type, nullable)| (name.as_str(), (col_type.as_str(), *nullable)))
+                .map(|column| (column.column_id, column))
                 .collect();
 
-            for new_col in columns.iter() {
-                if let Some((existing_type, _existing_nullable)) = existing_map.get(new_col.name())
-                {
-                    if !crate::types::types_equal_canonical(existing_type, new_col.ducklake_type())
-                    {
+            for (new_column, column_id) in catalog_columns.iter().zip(&field_ids) {
+                if let Some(existing_column) = existing_map.get(column_id) {
+                    let same_type =
+                        catalog_column_type_equal(&existing_column.ducklake_type, new_column);
+                    if !same_type {
                         return Err(crate::error::DuckLakeError::UnsupportedTypeChange {
                             operation: TypeChangeOperation::DataWrite {
                                 mode: match mode {
@@ -1725,15 +1802,18 @@ impl MetadataWriter for DuckdbMetadataWriter {
                                     WriteMode::Append => TypeChangeWriteMode::Append,
                                 },
                             },
-                            column: new_col.name().to_string(),
-                            from: (*existing_type).to_string(),
-                            to: new_col.ducklake_type().to_string(),
+                            column: new_column.name.clone(),
+                            from: existing_column.ducklake_type.clone(),
+                            to: new_column.ducklake_type.clone(),
                         });
                     }
-                } else if mode == WriteMode::Append && !new_col.is_nullable() {
+                } else if mode == WriteMode::Append
+                    && new_column.parent_index.is_none()
+                    && !new_column.is_nullable
+                {
                     return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                         "Schema evolution error: new column '{}' must be nullable. Adding non-nullable columns is not allowed.",
-                        new_col.name()
+                        new_column.name
                     )));
                 }
             }
@@ -1744,12 +1824,6 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // These are baked into the staged parquet's field_id metadata, so they
         // must equal the ids finalize_snapshot commits. The column rows are
         // written at the commit point (not here).
-        let column_ids: Vec<i64> = columns
-            .iter()
-            .zip(fresh_ids.iter())
-            .map(|(col, &fresh)| existing_ids.get(col.name()).copied().unwrap_or(fresh))
-            .collect();
-
         // Only the idempotent get-or-create schema/table rows are committed here;
         // they carry begin_snapshot = the reserved id and stay invisible until the
         // snapshot publishes, since schema/table reads ARE snapshot-scoped.
@@ -1760,7 +1834,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             base_snapshot_id,
             schema_id,
             table_id,
-            column_ids,
+            column_ids: top_level_column_ids(&catalog_columns, &field_ids)?,
+            field_ids,
         })
     }
 }
@@ -1770,7 +1845,94 @@ mod tests {
     use super::*;
     use crate::DuckdbMetadataProvider;
     use crate::metadata_provider::MetadataProvider;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn duckdb_writer_persists_recursive_columns() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("nested.ducklake");
+        let writer = DuckdbMetadataWriter::new_with_init(db_path.to_str().unwrap()).unwrap();
+        let levels = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("price", DataType::Decimal128(38, 16), false)),
+                    Arc::new(Field::new("count", DataType::UInt32, false)),
+                ]
+                .into(),
+            ),
+            false,
+        )));
+        let columns = vec![ColumnDef::from_arrow("bids", &levels, false).unwrap()];
+
+        let setup = writer
+            .begin_write_transaction("main", "depths", &columns, WriteMode::Replace)
+            .unwrap();
+        assert_eq!(setup.column_ids, vec![setup.field_ids[0]]);
+        assert_eq!(setup.field_ids.len(), 4);
+        writer
+            .register_data_file(
+                setup.table_id,
+                "main",
+                "depths",
+                setup.snapshot_id,
+                &DataFileInfo::new("depths.parquet", 1, 1),
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.field_ids,
+            )
+            .unwrap();
+
+        let mut connection = writer.connection();
+        let transaction = connection.transaction().unwrap();
+        let mut statement = transaction
+            .prepare(
+                "SELECT column_id, column_name, column_type, parent_column
+                 FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL
+                 ORDER BY column_order",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![setup.table_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (setup.field_ids[0], "bids".into(), "list".into(), None),
+                (
+                    setup.field_ids[1],
+                    "element".into(),
+                    "struct".into(),
+                    Some(setup.field_ids[0]),
+                ),
+                (
+                    setup.field_ids[2],
+                    "price".into(),
+                    "decimal(38, 16)".into(),
+                    Some(setup.field_ids[1]),
+                ),
+                (
+                    setup.field_ids[3],
+                    "count".into(),
+                    "uint32".into(),
+                    Some(setup.field_ids[1]),
+                ),
+            ]
+        );
+    }
 
     /// End-to-end round trip: write a small table through the real write path
     /// (begin_write_transaction + register_data_file), then read every catalog

@@ -9,8 +9,8 @@ use crate::metadata_provider::{
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
     SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
     SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, reconstruct_list_columns,
-    reconstruct_list_columns_with_table,
+    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, reconstruct_columns,
+    reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -245,7 +245,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(reconstruct_list_columns(raw_columns))
+        reconstruct_columns(raw_columns)
     }
 
     fn get_table_files_for_select(
@@ -811,6 +811,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         column_name: row.get(3)?,
                         column_type: row.get(4)?,
                         is_nullable: nulls_allowed.unwrap_or(true),
+                        data_type: None,
+                        nested_column_ids: Vec::new(),
                     };
                     Ok((
                         ColumnWithTable {
@@ -824,7 +826,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             )?
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(reconstruct_list_columns_with_table(raw_columns))
+        reconstruct_columns_with_table(raw_columns)
     }
 
     fn list_all_files(&self, snapshot_id: i64) -> crate::Result<Vec<FileWithTable>> {

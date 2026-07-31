@@ -90,13 +90,13 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 
 ## Type support
 
-| Category                         | Status | Notes                                          |
-|----------------------------------|:------:|------------------------------------------------|
-| Integers / floats / boolean      |   ✅   |                                                |
-| Strings / dates / timestamps     |   ✅   |                                                |
-| Decimal (precision & scale)      |   ✅   |                                                |
-| Geometry                         |   ✅   | Mapped to `Binary` (WKB)                        |
-| Complex / nested (list, struct, map) | 🟧 | Minimal support; many cases return errors      |
+| Category                              |  Status   | Notes                                                        |
+| ------------------------------------- | :-------: | ------------------------------------------------------------ |
+| Integers / floats / boolean           |    ✅     |                                                              |
+| Strings / dates / timestamps          |    ✅     |                                                              |
+| Decimal (precision & scale)           |    ✅     |                                                              |
+| Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
+| Complex / nested (list, struct, map)  | Supported | Recursive types and nullable‑field evolution; no pruning     |
 
 ---
 

@@ -7,7 +7,7 @@ use crate::metadata_provider::{
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
     SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
-    reconstruct_list_columns, reconstruct_list_columns_with_table,
+    reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -419,12 +419,14 @@ impl MetadataProvider for SqliteMetadataProvider {
                             column_name: row.try_get(1)?,
                             column_type: row.try_get(2)?,
                             is_nullable: nulls_allowed.unwrap_or(true),
+                            data_type: None,
+                            nested_column_ids: Vec::new(),
                         },
                         parent_column,
                     ))
                 })
                 .collect();
-            Ok(reconstruct_list_columns(raw?))
+            reconstruct_columns(raw?)
         })
     }
 
@@ -1243,6 +1245,8 @@ impl MetadataProvider for SqliteMetadataProvider {
                         column_name: row.try_get(3)?,
                         column_type: row.try_get(4)?,
                         is_nullable: nulls_allowed.unwrap_or(true),
+                        data_type: None,
+                        nested_column_ids: Vec::new(),
                     };
                     Ok((
                         ColumnWithTable {
@@ -1254,7 +1258,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     ))
                 })
                 .collect();
-            Ok(reconstruct_list_columns_with_table(raw?))
+            reconstruct_columns_with_table(raw?)
         })
     }
 

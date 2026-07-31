@@ -286,6 +286,11 @@ pub(crate) fn sort_batches_by_spec(
         .iter()
         .map(|c| arrow::compute::take(c, &indices, None))
         .collect::<std::result::Result<Vec<ArrayRef>, _>>()?;
+    let sorted_columns = sorted_columns
+        .iter()
+        .zip(full_schema.fields())
+        .map(|(column, field)| crate::column_rename::coerce_column(column, field.data_type()))
+        .collect::<datafusion::common::Result<Vec<_>>>()?;
     Ok(vec![RecordBatch::try_new(full_schema, sorted_columns)?])
 }
 
@@ -412,5 +417,72 @@ mod tests {
     #[test]
     fn from_rows_empty_is_none() {
         assert_eq!(SortSpec::from_rows(vec![]), None);
+    }
+
+    #[cfg(feature = "write")]
+    #[test]
+    fn sort_batches_preserves_nested_field_metadata() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use arrow::{
+            array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let field_id =
+            |value: &str| HashMap::from([("PARQUET:field_id".to_string(), value.to_string())]);
+        let money_fields = vec![
+            Arc::new(Field::new("amount", DataType::Int32, false).with_metadata(field_id("2"))),
+            Arc::new(Field::new("currency", DataType::Utf8, false).with_metadata(field_id("3"))),
+        ];
+        let money: ArrayRef = Arc::new(StructArray::new(
+            money_fields.clone().into(),
+            vec![
+                Arc::new(Int32Array::from(vec![20, 10])),
+                Arc::new(StringArray::from(vec!["EUR", "USD"])),
+            ],
+            None,
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("money", DataType::Struct(money_fields.into()), false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2, 1])), money],
+        )
+        .unwrap();
+        let sort_spec = SortSpec {
+            sort_id: 1,
+            fields: vec![SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        };
+
+        let sorted = sort_batches_by_spec(vec![batch], &schema, Some(&sort_spec)).unwrap();
+
+        assert_eq!(
+            sorted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[1, 2]
+        );
+        assert_eq!(
+            sorted[0].schema().field(1).data_type(),
+            sorted[0].column(1).data_type()
+        );
+        let DataType::Struct(fields) = sorted[0].column(1).data_type() else {
+            panic!("money must remain a struct");
+        };
+        assert_eq!(
+            fields[0].metadata().get("PARQUET:field_id"),
+            Some(&"2".into())
+        );
+        assert_eq!(
+            fields[1].metadata().get("PARQUET:field_id"),
+            Some(&"3".into())
+        );
     }
 }

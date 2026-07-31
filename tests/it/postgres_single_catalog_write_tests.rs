@@ -18,10 +18,10 @@ use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-use datafusion_ducklake::metadata_writer::{ColumnDef, MetadataWriter, WriteMode};
+use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, PostgresMetadataProvider,
-    PostgresSingleCatalogMetadataWriter,
+    DuckLakeCatalog, DuckLakeTableWriter, NullOrder, PartitionTransform, PostgresMetadataProvider,
+    PostgresSingleCatalogMetadataWriter, SortDirection, SortField,
 };
 
 /// Returns everything the caller must keep alive — dropping the container tears
@@ -634,6 +634,59 @@ async fn sort_spec_set_then_reset() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn partition_and_sort_specs_ignore_nested_name_collision() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "t", None, snapshot)
+        .unwrap();
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::from_arrow(
+            "payload",
+            &DataType::Struct(vec![Field::new("id", DataType::Int32, true)].into()),
+            true,
+        )
+        .unwrap(),
+    ];
+    writer.set_columns(table_id, &columns, snapshot).unwrap();
+    let top_level_id: i64 = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_column
+         WHERE table_id = $1 AND column_name = 'id' AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    writer
+        .set_partition_spec(
+            table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    writer
+        .set_sort_spec(
+            table_id,
+            &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+
+    let partition_id: i64 = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_partition_column
+         WHERE table_id = $1 ORDER BY partition_id DESC LIMIT 1",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(partition_id, top_level_id);
+    assert!(writer.live_sort_spec(table_id).unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn set_partition_spec_rejects_unknown_column() {
     use datafusion_ducklake::PartitionTransform;
 
@@ -690,6 +743,92 @@ async fn append_rejects_a_column_type_change() {
         ),
         "unexpected error: {err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn append_migrates_legacy_list_catalog_rows() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "t", None, snapshot)
+        .unwrap();
+    let columns = vec![ColumnDef::new("values", "list<float32>", true).unwrap()];
+    let ids = writer.set_columns(table_id, &columns, snapshot).unwrap();
+    let list_id = ids[0];
+    let old_element_id: i64 = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_column
+         WHERE table_id = $1 AND parent_column = $2 AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .bind(list_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM ducklake_column WHERE column_id = $1")
+        .bind(old_element_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_column SET column_type = 'list<float32>' WHERE column_id = $1")
+        .bind(list_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let write = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+        .unwrap();
+    writer
+        .register_data_file(
+            write.table_id,
+            "main",
+            "t",
+            write.snapshot_id,
+            &DataFileInfo::new("data.parquet", 1, 1),
+            WriteMode::Append,
+            write.base_snapshot_id,
+            &columns,
+            &write.field_ids,
+        )
+        .unwrap();
+
+    let versions = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        "SELECT column_type, begin_snapshot, end_snapshot
+         FROM ducklake_column
+         WHERE table_id = $1 AND column_id = $2
+         ORDER BY begin_snapshot",
+    )
+    .bind(table_id)
+    .bind(list_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        versions,
+        vec![
+            ("list<float32>".into(), snapshot, Some(write.snapshot_id)),
+            ("list".into(), write.snapshot_id, None),
+        ]
+    );
+
+    let rows = sqlx::query_as::<_, (i64, String, String, Option<i64>)>(
+        "SELECT column_id, column_name, column_type, parent_column
+         FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (list_id, "values".into(), "list".into(), None));
+    assert_eq!(rows[1].1, "element");
+    assert_eq!(rows[1].2, "float32");
+    assert_eq!(rows[1].3, Some(list_id));
+    assert_ne!(rows[1].0, old_element_id);
 }
 
 #[tokio::test(flavor = "multi_thread")]

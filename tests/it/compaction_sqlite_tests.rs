@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, Int32Array, Int64Array, ListArray};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -724,6 +724,106 @@ async fn merge_harvests_output_stats_and_removes_source_stats() {
         1,
         "merged file's id-column zone map should span the union of the sources"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_nested_table_uses_top_level_stats_ids() {
+    let temp = TempDir::new().unwrap();
+    let values1 = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(10), Some(11)]),
+        Some(vec![Some(20)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("items", values1.data_type().clone(), true),
+    ]));
+    let writer: Arc<dyn MetadataWriter> = Arc::new(make_writer(&temp).await);
+    let batch1 = batch(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(values1)],
+    );
+    DuckLakeTableWriter::new(Arc::clone(&writer), object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch1])
+        .await
+        .unwrap();
+
+    let values2 = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(30), Some(31)]),
+        Some(vec![Some(40)]),
+    ]);
+    let batch2 = batch(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![3, 4])), Arc::new(values2)],
+    );
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .append_table("main", "t", &[batch2])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        run_merge(&temp, MergeOptions::default()).await,
+        CompactionResult {
+            files_processed: 2,
+            files_created: 1,
+            rows_written: 4,
+        },
+    );
+
+    let p = pool(&temp).await;
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+        )
+        .await,
+        1,
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             JOIN ducklake_column c ON c.column_id = s.column_id
+             WHERE d.end_snapshot IS NULL AND c.parent_column IS NOT NULL",
+        )
+        .await,
+        0,
+        "compaction stats must not label an embedded column with a nested field id",
+    );
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "ducklake",
+        Arc::new(DuckLakeCatalog::new(provider).unwrap()),
+    );
+    let batches = ctx
+        .sql("SELECT id, items FROM ducklake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2, 3, 4]);
+    let expected = [vec![10, 11], vec![20], vec![30, 31], vec![40]];
+    for (index, expected) in expected.iter().enumerate() {
+        let values = values.value(index);
+        let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.values(), expected);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

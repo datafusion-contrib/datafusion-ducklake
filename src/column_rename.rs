@@ -269,7 +269,7 @@ impl Stream for ColumnRenameStream {
                             .collect();
 
                         columns.and_then(|cols| {
-                            RecordBatch::try_new(Arc::clone(&self.output_schema), cols)
+                            record_batch_with_schema(Arc::clone(&self.output_schema), cols)
                                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                         })
                     };
@@ -306,27 +306,113 @@ pub(crate) fn coerce_column(
     col: &arrow::array::ArrayRef,
     target: &arrow::datatypes::DataType,
 ) -> DataFusionResult<arrow::array::ArrayRef> {
-    use arrow::array::{Array, make_array};
+    use arrow::array::Array;
 
-    if col.data_type() == target {
+    let is_nested = matches!(
+        target,
+        arrow::datatypes::DataType::List(_)
+            | arrow::datatypes::DataType::LargeList(_)
+            | arrow::datatypes::DataType::FixedSizeList(_, _)
+            | arrow::datatypes::DataType::Map(_, _)
+            | arrow::datatypes::DataType::Struct(_)
+    );
+    if col.data_type() == target && !is_nested {
         return Ok(Arc::clone(col));
     }
 
-    let casted = arrow::compute::cast(col, target)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    if casted.data_type() == target {
+    let casted = if col.data_type() == target {
+        Arc::clone(col)
+    } else {
+        arrow::compute::cast(col, target)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+    };
+    if casted.data_type() == target && !is_nested {
         return Ok(casted);
     }
 
-    // Same physical layout, only nested field metadata (e.g. list child name)
-    // differs. Rebuild the ArrayData with the target DataType.
-    let data = casted
-        .into_data()
-        .into_builder()
-        .data_type(target.clone())
-        .build()
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-    Ok(make_array(data))
+    array_with_data_type(&casted, target)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+pub(crate) fn array_with_data_type(
+    array: &arrow::array::ArrayRef,
+    data_type: &arrow::datatypes::DataType,
+) -> Result<arrow::array::ArrayRef, arrow::error::ArrowError> {
+    use arrow::array::{Array, ArrayData, make_array};
+    use arrow::datatypes::DataType;
+    use arrow::error::ArrowError;
+
+    fn rewrite(data: &ArrayData, data_type: &DataType) -> Result<ArrayData, ArrowError> {
+        let is_nested = matches!(
+            data_type,
+            DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Map(_, _)
+                | DataType::Struct(_)
+        );
+        if data.data_type() == data_type && !is_nested {
+            return Ok(data.clone());
+        }
+        let child_types = match data_type {
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => vec![field.data_type()],
+            DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
+            _ => {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "cannot apply array type {:?} as {data_type:?}",
+                    data.data_type(),
+                )));
+            },
+        };
+        if child_types.len() != data.child_data().len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "array type {:?} has {} children, expected {} for {data_type:?}",
+                data.data_type(),
+                data.child_data().len(),
+                child_types.len(),
+            )));
+        }
+        let children = data
+            .child_data()
+            .iter()
+            .zip(child_types)
+            .map(|(child, child_type)| rewrite(child, child_type))
+            .collect::<Result<Vec<_>, _>>()?;
+        data.clone()
+            .into_builder()
+            .data_type(data_type.clone())
+            .child_data(children)
+            .build()
+    }
+
+    Ok(make_array(rewrite(&array.to_data(), data_type)?))
+}
+
+pub(crate) fn record_batch_with_schema(
+    schema: arrow::datatypes::SchemaRef,
+    columns: Vec<arrow::array::ArrayRef>,
+) -> Result<arrow::record_batch::RecordBatch, arrow::error::ArrowError> {
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(&columns)
+        .map(|(field, column)| {
+            Field::new(
+                field.name(),
+                column.data_type().clone(),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone())
+        })
+        .collect::<Vec<_>>();
+    let actual_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(actual_schema, columns)?.with_schema(schema)
 }
 
 #[cfg(test)]
@@ -362,6 +448,42 @@ mod tests {
 
         // The stream should report the output schema
         assert_eq!(stream.schema().field(0).name(), "new_col");
+    }
+
+    #[test]
+    fn coerce_column_restamps_nested_field_metadata() {
+        use arrow::{
+            array::{ArrayRef, Int32Array, RecordBatch, StructArray},
+            datatypes::Fields,
+        };
+
+        let source_fields =
+            Fields::from(vec![Arc::new(Field::new("value", DataType::Int32, false))]);
+        let source: ArrayRef = Arc::new(StructArray::new(
+            source_fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            None,
+        ));
+        let target_field = Arc::new(Field::new("value", DataType::Int32, false).with_metadata(
+            HashMap::from([("PARQUET:field_id".to_string(), "2".to_string())]),
+        ));
+        let target = DataType::Struct(Fields::from(vec![target_field]));
+
+        let coerced = coerce_column(&source, &target).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "nested",
+            target.clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![coerced]).unwrap();
+
+        let DataType::Struct(fields) = batch.column(0).data_type() else {
+            panic!("expected struct");
+        };
+        assert_eq!(
+            fields[0].metadata().get("PARQUET:field_id"),
+            Some(&"2".to_string())
+        );
     }
 
     #[test]

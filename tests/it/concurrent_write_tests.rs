@@ -422,13 +422,25 @@ async fn test_stress_concurrent_writes() {
     for i in 0..50 {
         let writer_clone = Arc::clone(&writer);
         let task = tokio::spawn(async move {
-            let table_writer =
-                DuckLakeTableWriter::new(writer_clone, create_object_store()).unwrap();
             let batch = create_user_batch(&[i], &[&format!("stress_{}", i)]);
             let table_name = format!("stress_table_{}", i % 10);
-            table_writer
-                .append_table("main", &table_name, &[batch])
-                .await
+            for _ in 0..10 {
+                let table_writer =
+                    DuckLakeTableWriter::new(Arc::clone(&writer_clone), create_object_store())
+                        .unwrap();
+                match table_writer
+                    .append_table("main", &table_name, std::slice::from_ref(&batch))
+                    .await
+                {
+                    Err(datafusion_ducklake::DuckLakeError::Conflict(_)) => {
+                        tokio::task::yield_now().await;
+                    },
+                    result => return result,
+                }
+            }
+            Err(datafusion_ducklake::DuckLakeError::Conflict(
+                "concurrent write retry limit exceeded".to_string(),
+            ))
         });
         tasks.push(task);
     }

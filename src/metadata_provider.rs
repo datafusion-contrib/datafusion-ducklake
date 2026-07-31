@@ -1,5 +1,8 @@
 use crate::Result;
-use std::collections::HashMap;
+use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
+use arrow::datatypes::{DataType, Field};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // SQL queries for DuckLake catalog tables
 // These queries are database-agnostic and work with DuckDB, SQLite, PostgreSQL, MySQL
@@ -498,7 +501,10 @@ pub struct FileWithTable {
     pub file: DuckLakeTableFile,
 }
 
-/// Column definition for a DuckLake table
+/// Column definition for a DuckLake table.
+///
+/// Built-in providers retain the reconstructed nested Arrow type and descendant
+/// IDs so reads and rewrites preserve the recursive catalog representation.
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableColumn {
     /// Unique identifier for this column in the catalog
@@ -509,6 +515,8 @@ pub struct DuckLakeTableColumn {
     pub column_type: String,
     /// Whether this column allows NULL values
     pub is_nullable: bool,
+    pub(crate) data_type: Option<DataType>,
+    pub(crate) nested_column_ids: Vec<i64>,
 }
 
 impl DuckLakeTableColumn {
@@ -523,98 +531,229 @@ impl DuckLakeTableColumn {
             column_name,
             column_type,
             is_nullable,
+            data_type: None,
+            nested_column_ids: Vec::new(),
+        }
+    }
+
+    pub(crate) fn data_type(&self) -> Result<DataType> {
+        match &self.data_type {
+            Some(data_type) => Ok(data_type.clone()),
+            None => ducklake_to_arrow_type(&self.column_type),
         }
     }
 }
 
-/// Reconstruct list types from parent-child column rows.
-///
-/// DuckLake stores list columns as two rows in `ducklake_column`:
-/// - Parent row: `column_type = "list"`, `parent_column = NULL`
-/// - Child row:  `column_type = "<element_type>"`, `parent_column = <parent_column_id>`
-///
-/// This function rewrites the parent's `column_type` to `list<element_type>`
-/// and removes child rows from the result.
-///
-/// Only handles `list` parent types. Struct, map, etc. are left unchanged.
-pub fn reconstruct_list_columns(
+/// Reconstruct nested Arrow types from DuckLake's recursive column rows.
+pub fn reconstruct_columns(
     rows: Vec<(DuckLakeTableColumn, Option<i64>)>,
-) -> Vec<DuckLakeTableColumn> {
-    use std::collections::HashMap;
-
-    // Index: column_id -> position in rows
+) -> Result<Vec<DuckLakeTableColumn>> {
     let id_to_index: HashMap<i64, usize> = rows
         .iter()
         .enumerate()
-        .map(|(i, (col, _))| (col.column_id, i))
+        .map(|(index, (column, _))| (column.column_id, index))
         .collect();
-
-    // Separate into columns and parent_column arrays
-    let mut columns: Vec<DuckLakeTableColumn> = Vec::with_capacity(rows.len());
-    let mut parent_columns: Vec<Option<i64>> = Vec::with_capacity(rows.len());
-    for (col, parent) in rows {
-        columns.push(col);
-        parent_columns.push(parent);
+    if id_to_index.len() != rows.len() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "DuckLake column metadata contains duplicate column ids".into(),
+        ));
     }
-
-    // Find children of list parents and rewrite parent types
-    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, parent_id) in parent_columns.iter().enumerate() {
-        if let Some(pid) = parent_id
-            && let Some(&parent_idx) = id_to_index.get(pid)
-            && columns[parent_idx].column_type == "list"
-        {
-            columns[parent_idx].column_type = format!("list<{}>", columns[i].column_type);
-            skip.insert(i);
+    let mut children: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, (_, parent_id)) in rows.iter().enumerate() {
+        if let Some(parent_id) = parent_id {
+            if !id_to_index.contains_key(parent_id) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "Nested column {} references missing parent column {parent_id}",
+                    rows[index].0.column_id
+                )));
+            }
+            children.entry(*parent_id).or_default().push(index);
         }
     }
 
-    // Return only top-level columns (not children)
-    columns
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !skip.contains(i))
-        .map(|(_, col)| col)
-        .collect()
+    fn build_type(
+        index: usize,
+        rows: &[(DuckLakeTableColumn, Option<i64>)],
+        children: &HashMap<i64, Vec<usize>>,
+        visiting: &mut HashSet<i64>,
+    ) -> Result<DataType> {
+        let column = &rows[index].0;
+        if visiting.len() >= crate::types::MAX_NESTED_TYPE_DEPTH {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "Nested column metadata exceeds maximum depth {}",
+                crate::types::MAX_NESTED_TYPE_DEPTH
+            )));
+        }
+        if !visiting.insert(column.column_id) {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "Nested column cycle includes column {}",
+                column.column_id
+            )));
+        }
+        let child_indices = children
+            .get(&column.column_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let data_type = match column.column_type.to_ascii_lowercase().as_str() {
+            "list" => {
+                let [child_index] = child_indices else {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "List column '{}' must have exactly one child",
+                        column.column_name
+                    )));
+                };
+                let child = &rows[*child_index].0;
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    build_type(*child_index, rows, children, visiting)?,
+                    child.is_nullable,
+                )))
+            },
+            "struct" => {
+                let fields = child_indices
+                    .iter()
+                    .map(|child_index| {
+                        let child = &rows[*child_index].0;
+                        Ok(Arc::new(Field::new(
+                            &child.column_name,
+                            build_type(*child_index, rows, children, visiting)?,
+                            child.is_nullable,
+                        )))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                DataType::Struct(fields.into())
+            },
+            "map" => {
+                let [key_index, value_index] = child_indices else {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "Map column '{}' must have key and value children",
+                        column.column_name
+                    )));
+                };
+                let key = &rows[*key_index].0;
+                let value = &rows[*value_index].0;
+                if key.column_name != "key" || value.column_name != "value" {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "Map column '{}' children must be named key then value",
+                        column.column_name
+                    )));
+                }
+                let entries = DataType::Struct(
+                    vec![
+                        Arc::new(Field::new(
+                            "key",
+                            build_type(*key_index, rows, children, visiting)?,
+                            false,
+                        )),
+                        Arc::new(Field::new(
+                            "value",
+                            build_type(*value_index, rows, children, visiting)?,
+                            value.is_nullable,
+                        )),
+                    ]
+                    .into(),
+                );
+                DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+            },
+            _ if child_indices.is_empty() => ducklake_to_arrow_type(&column.column_type)?,
+            _ => {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "Non-nested column '{}' has child columns",
+                    column.column_name
+                )));
+            },
+        };
+        visiting.remove(&column.column_id);
+        Ok(data_type)
+    }
+
+    let mut result = Vec::new();
+    for (index, (column, parent_id)) in rows.iter().enumerate() {
+        if parent_id.is_some() {
+            continue;
+        }
+        let mut column = column.clone();
+        let data_type = build_type(index, &rows, &children, &mut HashSet::new())?;
+        column.column_type = reconstructed_column_type(&column.column_type, &data_type)?;
+        column.data_type = Some(data_type);
+        fn collect_ids(
+            column_id: i64,
+            rows: &[(DuckLakeTableColumn, Option<i64>)],
+            children: &HashMap<i64, Vec<usize>>,
+            ids: &mut Vec<i64>,
+        ) {
+            if let Some(child_indices) = children.get(&column_id) {
+                for child_index in child_indices {
+                    let child_id = rows[*child_index].0.column_id;
+                    ids.push(child_id);
+                    collect_ids(child_id, rows, children, ids);
+                }
+            }
+        }
+        collect_ids(
+            column.column_id,
+            &rows,
+            &children,
+            &mut column.nested_column_ids,
+        );
+        result.push(column);
+    }
+    let reconstructed_count = result
+        .iter()
+        .map(|column| 1 + column.nested_column_ids.len())
+        .sum::<usize>();
+    if reconstructed_count != rows.len() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "DuckLake column metadata contains a parent cycle or unreachable nested column".into(),
+        ));
+    }
+    Ok(result)
 }
 
-/// Same as [`reconstruct_list_columns`] but for [`ColumnWithTable`] rows.
-pub fn reconstruct_list_columns_with_table(
+fn reconstructed_column_type(catalog_type: &str, data_type: &DataType) -> Result<String> {
+    let normalized = catalog_type.trim().to_ascii_lowercase();
+    let preserves_logical_name = matches!(data_type, DataType::Binary)
+        || matches!(data_type, DataType::Utf8View)
+            && !matches!(normalized.as_str(), "varchar" | "text" | "string");
+    if preserves_logical_name {
+        Ok(catalog_type.to_string())
+    } else {
+        arrow_to_ducklake_type(data_type)
+    }
+}
+
+/// Same as [`reconstruct_columns`] but for [`ColumnWithTable`] rows.
+pub fn reconstruct_columns_with_table(
     rows: Vec<(ColumnWithTable, Option<i64>)>,
-) -> Vec<ColumnWithTable> {
-    use std::collections::HashMap;
-
-    let id_to_index: HashMap<i64, usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, (cwt, _))| (cwt.column.column_id, i))
-        .collect();
-
-    let mut entries: Vec<ColumnWithTable> = Vec::with_capacity(rows.len());
-    let mut parent_columns: Vec<Option<i64>> = Vec::with_capacity(rows.len());
-    for (cwt, parent) in rows {
-        entries.push(cwt);
-        parent_columns.push(parent);
-    }
-
-    let mut skip: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (i, parent_id) in parent_columns.iter().enumerate() {
-        if let Some(pid) = parent_id
-            && let Some(&parent_idx) = id_to_index.get(pid)
-            && entries[parent_idx].column.column_type == "list"
-        {
-            entries[parent_idx].column.column_type =
-                format!("list<{}>", entries[i].column.column_type);
-            skip.insert(i);
+) -> Result<Vec<ColumnWithTable>> {
+    type ColumnRowsByTable = HashMap<(String, String), Vec<(DuckLakeTableColumn, Option<i64>)>>;
+    let mut grouped = ColumnRowsByTable::new();
+    let mut order = Vec::new();
+    for (entry, parent_id) in rows {
+        let key = (entry.schema_name, entry.table_name);
+        if !grouped.contains_key(&key) {
+            order.push(key.clone());
         }
+        grouped
+            .entry(key)
+            .or_default()
+            .push((entry.column, parent_id));
     }
 
-    entries
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| !skip.contains(i))
-        .map(|(_, e)| e)
-        .collect()
+    let mut result = Vec::new();
+    for (schema_name, table_name) in order {
+        let columns = reconstruct_columns(
+            grouped
+                .remove(&(schema_name.clone(), table_name.clone()))
+                .unwrap_or_default(),
+        )?;
+        result.extend(columns.into_iter().map(|column| ColumnWithTable {
+            schema_name: schema_name.clone(),
+            table_name: table_name.clone(),
+            column,
+        }));
+    }
+    Ok(result)
 }
 
 /// Metadata for a data file or delete file in DuckLake
@@ -1099,7 +1238,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_reconstruct_list_columns_basic() {
+    fn test_reconstruct_columns_list() {
         let rows = vec![
             (
                 DuckLakeTableColumn::new(1, "id".into(), "int64".into(), false),
@@ -1115,7 +1254,7 @@ mod tests {
             ),
         ];
 
-        let result = reconstruct_list_columns(rows);
+        let result = reconstruct_columns(rows).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].column_name, "id");
         assert_eq!(result[0].column_type, "int64");
@@ -1124,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reconstruct_list_columns_no_lists() {
+    fn test_reconstruct_columns_scalars() {
         let rows = vec![
             (
                 DuckLakeTableColumn::new(1, "id".into(), "int64".into(), false),
@@ -1136,15 +1275,71 @@ mod tests {
             ),
         ];
 
-        let result = reconstruct_list_columns(rows);
+        let result = reconstruct_columns(rows).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].column_type, "int64");
         assert_eq!(result[1].column_type, "varchar");
     }
 
     #[test]
-    fn test_reconstruct_list_columns_struct_parent_unchanged() {
-        // Struct parents should NOT be rewritten — child stays in result
+    fn test_reconstruct_columns_preserves_scalar_catalog_names() {
+        let rows = vec![
+            (
+                DuckLakeTableColumn::new(1, "shape".into(), "geometry".into(), true),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(2, "details".into(), "json".into(), true),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(3, "at".into(), "timetz".into(), true),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(4, "count".into(), "INT".into(), true),
+                None,
+            ),
+        ];
+
+        let result = reconstruct_columns(rows).unwrap();
+
+        assert_eq!(result[0].column_type, "geometry");
+        assert_eq!(result[1].column_type, "json");
+        assert_eq!(result[2].column_type, "timetz");
+        assert_eq!(result[3].column_type, "int32");
+    }
+
+    #[test]
+    fn test_reconstruct_columns_depth_is_bounded() {
+        let count = crate::types::MAX_NESTED_TYPE_DEPTH + 2;
+        let rows = (0..count)
+            .map(|index| {
+                let column_id = index as i64 + 1;
+                let column_type = if index + 1 == count {
+                    "int32"
+                } else {
+                    "struct"
+                };
+                (
+                    DuckLakeTableColumn::new(
+                        column_id,
+                        format!("field_{index}"),
+                        column_type.to_string(),
+                        true,
+                    ),
+                    (index > 0).then_some(column_id - 1),
+                )
+            })
+            .collect();
+
+        let error = reconstruct_columns(rows).unwrap_err();
+
+        assert!(error.to_string().contains("maximum depth"));
+    }
+
+    #[test]
+    fn test_reconstruct_columns_struct() {
         let rows = vec![
             (
                 DuckLakeTableColumn::new(1, "data".into(), "struct".into(), true),
@@ -1156,13 +1351,112 @@ mod tests {
             ),
         ];
 
-        let result = reconstruct_list_columns(rows);
-        assert_eq!(result.len(), 2); // both remain
-        assert_eq!(result[0].column_type, "struct"); // unchanged
+        let result = reconstruct_columns(rows).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].column_type, "struct<field_a:int32>");
+        assert_eq!(result[0].nested_column_ids, vec![2]);
     }
 
     #[test]
-    fn test_reconstruct_list_columns_multiple_lists() {
+    fn test_reconstruct_columns_arbitrary_nesting() {
+        let rows = vec![
+            (
+                DuckLakeTableColumn::new(1, "payload".into(), "struct".into(), false),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(2, "levels".into(), "list".into(), false),
+                Some(1),
+            ),
+            (
+                DuckLakeTableColumn::new(3, "element".into(), "struct".into(), false),
+                Some(2),
+            ),
+            (
+                DuckLakeTableColumn::new(4, "price".into(), "decimal(38, 16)".into(), false),
+                Some(3),
+            ),
+            (
+                DuckLakeTableColumn::new(5, "attrs".into(), "map".into(), true),
+                Some(1),
+            ),
+            (
+                DuckLakeTableColumn::new(6, "key".into(), "varchar".into(), false),
+                Some(5),
+            ),
+            (
+                DuckLakeTableColumn::new(7, "value".into(), "list".into(), true),
+                Some(5),
+            ),
+            (
+                DuckLakeTableColumn::new(8, "element".into(), "int32".into(), true),
+                Some(7),
+            ),
+        ];
+
+        let result = reconstruct_columns(rows).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].column_type,
+            "struct<levels:list<struct<price:decimal(38, 16)>>,attrs:map<varchar,list<int32>>>"
+        );
+        assert_eq!(result[0].nested_column_ids, vec![2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_reconstruct_columns_rejects_invalid_map_children() {
+        let rows = vec![
+            (
+                DuckLakeTableColumn::new(1, "attrs".into(), "map".into(), true),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(2, "value".into(), "int32".into(), true),
+                Some(1),
+            ),
+            (
+                DuckLakeTableColumn::new(3, "key".into(), "varchar".into(), false),
+                Some(1),
+            ),
+        ];
+
+        assert!(reconstruct_columns(rows).is_err());
+    }
+
+    #[test]
+    fn test_reconstruct_columns_rejects_duplicate_ids() {
+        let rows = vec![
+            (
+                DuckLakeTableColumn::new(1, "id".into(), "int64".into(), false),
+                None,
+            ),
+            (
+                DuckLakeTableColumn::new(1, "name".into(), "varchar".into(), true),
+                None,
+            ),
+        ];
+
+        assert!(reconstruct_columns(rows).is_err());
+    }
+
+    #[test]
+    fn test_reconstruct_columns_rejects_parent_cycle() {
+        let rows = vec![
+            (
+                DuckLakeTableColumn::new(1, "left".into(), "struct".into(), false),
+                Some(2),
+            ),
+            (
+                DuckLakeTableColumn::new(2, "right".into(), "struct".into(), false),
+                Some(1),
+            ),
+        ];
+
+        assert!(reconstruct_columns(rows).is_err());
+    }
+
+    #[test]
+    fn test_reconstruct_columns_multiple_lists() {
         let rows = vec![
             (
                 DuckLakeTableColumn::new(1, "tags".into(), "list".into(), true),
@@ -1182,14 +1476,14 @@ mod tests {
             ),
         ];
 
-        let result = reconstruct_list_columns(rows);
+        let result = reconstruct_columns(rows).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].column_type, "list<varchar>");
         assert_eq!(result[1].column_type, "list<float64>");
     }
 
     #[test]
-    fn test_reconstruct_list_columns_with_table_basic() {
+    fn test_reconstruct_columns_with_table_list() {
         let rows = vec![
             (
                 ColumnWithTable {
@@ -1209,7 +1503,7 @@ mod tests {
             ),
         ];
 
-        let result = reconstruct_list_columns_with_table(rows);
+        let result = reconstruct_columns_with_table(rows).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].column.column_type, "list<float64>");
     }

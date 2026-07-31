@@ -9,6 +9,9 @@
 //! - Per-catalog dense `schema_version` allocation
 //! - No orphan mapping rows after writes
 
+use std::sync::Arc;
+
+use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::metadata_writer::{
     ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
 };
@@ -121,6 +124,96 @@ async fn visible_records_at_head(pool: &PgPool, catalog_id: i64, table_id: i64) 
     .unwrap()
     .try_get(0)
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_writer_persists_recursive_columns() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("nested_columns")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let levels = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("price", DataType::Decimal128(38, 16), false)),
+                Arc::new(Field::new("count", DataType::UInt32, false)),
+            ]
+            .into(),
+        ),
+        false,
+    )));
+    let columns = vec![ColumnDef::from_arrow("bids", &levels, false).unwrap()];
+
+    let setup = writer
+        .begin_write_transaction("public", "depths", &columns, WriteMode::Replace)
+        .unwrap();
+    assert_eq!(setup.column_ids, vec![setup.field_ids[0]]);
+    assert_eq!(setup.field_ids.len(), 4);
+    writer
+        .register_data_file(
+            setup.table_id,
+            "public",
+            "depths",
+            setup.snapshot_id,
+            &DataFileInfo::new("depths.parquet", 1, 1),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+        .unwrap();
+
+    let rows = sqlx::query(
+        "SELECT column_id, column_name, column_type, parent_column
+         FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(setup.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<i64, _>("column_id").unwrap(),
+                row.try_get::<String, _>("column_name").unwrap(),
+                row.try_get::<String, _>("column_type").unwrap(),
+                row.try_get::<Option<i64>, _>("parent_column").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            (setup.field_ids[0], "bids".into(), "list".into(), None),
+            (
+                setup.field_ids[1],
+                "element".into(),
+                "struct".into(),
+                Some(setup.field_ids[0]),
+            ),
+            (
+                setup.field_ids[2],
+                "price".into(),
+                "decimal(38, 16)".into(),
+                Some(setup.field_ids[1]),
+            ),
+            (
+                setup.field_ids[3],
+                "count".into(),
+                "uint32".into(),
+                Some(setup.field_ids[1]),
+            ),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

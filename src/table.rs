@@ -1988,8 +1988,14 @@ impl DuckLakeTable {
         // parquet field-id that is neither a reserved embedded column nor one of
         // the current catalog `column_id`s is a since-dropped column. Compaction
         // uses this to refuse merging a file whose data would be lost.
-        let current_column_ids: std::collections::HashSet<i32> =
-            self.columns.iter().map(|c| c.column_id as i32).collect();
+        let current_column_ids: std::collections::HashSet<i32> = self
+            .columns
+            .iter()
+            .flat_map(|column| {
+                std::iter::once(column.column_id).chain(column.nested_column_ids.iter().copied())
+            })
+            .map(|column_id| column_id as i32)
+            .collect();
         let drops_current_columns = field_id_map.keys().any(|fid| {
             *fid != ROW_ID_PARQUET_FIELD_ID
                 && *fid != SNAPSHOT_ID_PARQUET_FIELD_ID
@@ -2459,7 +2465,17 @@ impl DuckLakeTable {
     /// to the catalog on read.
     #[cfg(feature = "write")]
     pub(crate) fn column_ids(&self) -> Vec<i64> {
-        self.columns.iter().map(|c| c.column_id).collect()
+        let mut ids = Vec::new();
+        for column in &self.columns {
+            ids.push(column.column_id);
+            ids.extend_from_slice(&column.nested_column_ids);
+        }
+        ids
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn top_level_column_ids(&self) -> Vec<i64> {
+        self.columns.iter().map(|column| column.column_id).collect()
     }
 
     /// Whether `file` carries a data column that is no longer in the table's
@@ -2648,9 +2664,16 @@ impl DuckLakeTable {
             // Keep only matched rows, then apply the assignments to them.
             let matched_phys: Vec<ArrayRef> = phys_cols
                 .iter()
-                .map(|c| arrow::compute::filter(c.as_ref(), &mask))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                .enumerate()
+                .map(|(i, column)| {
+                    let filtered = arrow::compute::filter(column.as_ref(), &mask)
+                        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+                    crate::column_rename::coerce_column(
+                        &filtered,
+                        self.physical_schema.field(i).data_type(),
+                    )
+                })
+                .collect::<DataFusionResult<_>>()?;
             let matched_batch =
                 RecordBatch::try_new(self.physical_schema.clone(), matched_phys.clone())?;
             let matched_rows = matched_batch.num_rows();

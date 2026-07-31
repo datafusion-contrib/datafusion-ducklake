@@ -32,7 +32,7 @@
 //! [`cleanup_old_files_sqlite`](crate::maintenance::cleanup_old_files_sqlite)
 //! reclaims them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
@@ -44,6 +44,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
 use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
 
+use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceRetirement};
 use crate::partition::PartitionSpec;
@@ -236,7 +237,9 @@ pub(crate) fn sorted_rewrite_output(
     }
     let ordering = LexOrdering::new(expressions)
         .ok_or_else(|| DuckLakeError::Internal("sort order is empty".to_string()))?;
-    Ok(SortExec::new(ordering, input).execute(0, context)?)
+    let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
+    let output = Arc::new(ColumnRenameExec::new(sorted, schema, HashMap::new()));
+    Ok(output.execute(0, context)?)
 }
 
 impl DuckLakeTable {
@@ -380,6 +383,7 @@ impl DuckLakeTable {
             .object_store(self.object_store_url().as_ref())?;
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
         let column_ids = self.column_ids();
+        let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
 
         // Apply the table's live sort order to each merged file (mirroring official
@@ -478,8 +482,11 @@ impl DuckLakeTable {
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
             let subpath = partition_id.map(|pid| {
-                let names =
-                    self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
+                let names = self.partition_path_names(
+                    live_partition_spec.as_ref(),
+                    pid,
+                    &top_level_column_ids,
+                );
                 crate::partition::hive_subpath(&names, &partition_values)
             });
             let file = table_writer
@@ -488,6 +495,7 @@ impl DuckLakeTable {
                     self.table_name(),
                     physical_schema.as_ref(),
                     &column_ids,
+                    &top_level_column_ids,
                     merged,
                     partial,
                     subpath.as_deref(),
@@ -559,6 +567,7 @@ impl DuckLakeTable {
             .object_store(self.object_store_url().as_ref())?;
         let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
         let column_ids = self.column_ids();
+        let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
 
         // Re-apply the table's live sort order to each rewritten file so its rows
@@ -620,8 +629,11 @@ impl DuckLakeTable {
                 // partition: inherit the identity and the Hive directory.
                 let (partition_id, partition_values) = partition_key(tf);
                 let subpath = partition_id.map(|pid| {
-                    let names =
-                        self.partition_path_names(live_partition_spec.as_ref(), pid, &column_ids);
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
                     crate::partition::hive_subpath(&names, &partition_values)
                 });
                 let file = table_writer
@@ -630,6 +642,7 @@ impl DuckLakeTable {
                         self.table_name(),
                         physical_schema.as_ref(),
                         &column_ids,
+                        &top_level_column_ids,
                         sorted,
                         false,
                         subpath.as_deref(),

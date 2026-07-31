@@ -8,27 +8,30 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryViewArray, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array,
-    ListArray, ListBuilder, StringArray, StringBuilder, StringViewArray, TimestampMicrosecondArray,
-    TimestampNanosecondArray,
+    Array, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, ListBuilder, MapArray, StringArray, StringBuilder,
+    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt32Array,
+    UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::datatypes::{DataType, Field, Float32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
+use sqlx::Row;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode,
+    SqliteMetadataWriter, WriteMode, register_ducklake_functions,
 };
 
-/// Create a local filesystem object store
+/// Create a local filesystem object store.
 fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(LocalFileSystem::new())
 }
 
-/// Helper to create a test environment with writer and data directory
+/// Create a test environment with a writer and data directory.
 async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
@@ -44,7 +47,7 @@ async fn create_test_env() -> (SqliteMetadataWriter, TempDir) {
     (writer, temp_dir)
 }
 
-/// Helper to create a SessionContext with a DuckLakeCatalog
+/// Create a `SessionContext` with a `DuckLakeCatalog`.
 async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}", db_path.display());
@@ -55,6 +58,123 @@ async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
     let ctx = SessionContext::new();
     ctx.register_catalog("test", Arc::new(catalog));
     ctx
+}
+
+fn parquet_schema_fields(path: &std::path::Path) -> Vec<(String, Option<i32>)> {
+    fn collect(field: &parquet::schema::types::Type, result: &mut Vec<(String, Option<i32>)>) {
+        let info = field.get_basic_info();
+        result.push((field.name().to_string(), info.has_id().then(|| info.id())));
+        if field.is_group() {
+            for child in field.get_fields() {
+                collect(child, result);
+            }
+        }
+    }
+
+    let builder =
+        datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(path).unwrap(),
+        )
+        .unwrap();
+    let root = builder
+        .metadata()
+        .file_metadata()
+        .schema_descr()
+        .root_schema();
+    let mut result = Vec::new();
+    for field in root.get_fields() {
+        collect(field, &mut result);
+    }
+    result
+}
+
+fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
+    let conformance_path = catalog_path.with_file_name("duckdb-conformance.db");
+    std::fs::copy(catalog_path, &conformance_path).unwrap();
+
+    // This fork's catalog schema predates fields the official DuckLake extension requires. Add
+    // those compatibility fields to a disposable catalog copy before testing the
+    // nested data layout; none of these statements alter ducklake_column, the
+    // source catalog, or the Parquet file.
+    let setup = format!(
+        "INSTALL sqlite; LOAD sqlite; \
+         ATTACH '{}' AS raw (TYPE sqlite); \
+         ALTER TABLE raw.ducklake_snapshot ADD COLUMN next_catalog_id BIGINT DEFAULT 0; \
+         ALTER TABLE raw.ducklake_snapshot ADD COLUMN next_file_id BIGINT DEFAULT 0; \
+         UPDATE raw.ducklake_snapshot SET next_catalog_id = 0, next_file_id = 0; \
+         ALTER TABLE raw.ducklake_schema ADD COLUMN schema_uuid VARCHAR; \
+         UPDATE raw.ducklake_schema SET \
+             schema_uuid = '00000000-0000-0000-0000-000000000001', path = path || '/'; \
+         ALTER TABLE raw.ducklake_table ADD COLUMN table_uuid VARCHAR; \
+         UPDATE raw.ducklake_table SET \
+             table_uuid = '00000000-0000-0000-0000-000000000002', path = path || '/'; \
+         CREATE TABLE raw.ducklake_tag( \
+             object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, key VARCHAR, value VARCHAR \
+         ); \
+         CREATE TABLE raw.ducklake_inlined_data_tables( \
+             table_id BIGINT, table_name VARCHAR, schema_version BIGINT \
+         ); \
+         CREATE TABLE raw.ducklake_column_tag( \
+             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \
+             key VARCHAR, value VARCHAR \
+         ); \
+         CREATE TABLE raw.ducklake_column_mapping( \
+             mapping_id BIGINT, table_id BIGINT, type VARCHAR \
+         ); \
+         CREATE TABLE raw.ducklake_name_mapping( \
+             mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, \
+             target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN \
+         ); \
+         CREATE TABLE raw.ducklake_view( \
+             view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, \
+             schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, sql VARCHAR, column_aliases VARCHAR \
+         ); \
+         CREATE TABLE raw.ducklake_macro( \
+             schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, \
+             begin_snapshot BIGINT, end_snapshot BIGINT \
+         ); \
+         CREATE TABLE raw.ducklake_macro_impl( \
+             macro_id BIGINT, impl_id BIGINT, dialect VARCHAR, sql VARCHAR, type VARCHAR \
+         ); \
+         CREATE TABLE raw.ducklake_macro_parameters( \
+             macro_id BIGINT, impl_id BIGINT, column_id BIGINT, parameter_name VARCHAR, \
+             parameter_type VARCHAR, default_value VARCHAR, default_value_type VARCHAR \
+         ); \
+         ALTER TABLE raw.ducklake_data_file ADD COLUMN file_order BIGINT DEFAULT 0; \
+         ALTER TABLE raw.ducklake_data_file ADD COLUMN file_format VARCHAR DEFAULT 'parquet'; \
+         ALTER TABLE raw.ducklake_data_file ADD COLUMN partial_file_info VARCHAR; \
+         UPDATE raw.ducklake_data_file SET footer_size = NULL; \
+         ALTER TABLE raw.ducklake_delete_file ADD COLUMN format VARCHAR DEFAULT 'parquet'; \
+         DETACH raw; \
+         INSTALL ducklake; LOAD ducklake; \
+         ATTACH 'ducklake:{}' AS official (META_TYPE 'sqlite');",
+        conformance_path.display(),
+        conformance_path.display()
+    );
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection.execute_batch(&setup).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, CAST(bids[1].price AS VARCHAR), len(bids)
+             FROM official.main.depths ORDER BY id",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![(1, "101.0000000000000000".to_string(), 2), (2, "99.0000000000000000".to_string(), 1),],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -279,8 +399,6 @@ async fn test_write_and_read_list_column_roundtrip() {
     // get null-filled by the field-id read mapping. The field-id sits on the
     // top-level node; the List leaf carries none, so a leaf-only field-id lookup
     // would treat the column as absent. Isolates WRITE (raw parquet) vs READ.
-    use arrow::datatypes::Float32Type;
-
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
 
@@ -343,6 +461,345 @@ async fn test_write_and_read_list_column_roundtrip() {
     assert_eq!(
         nulls, 0,
         "READ side: ducklake must return v VALUES, not null-fill the List column"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_and_read_list_struct_column_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    const SCALE: i128 = 10_000_000_000_000_000;
+    let level_fields = vec![
+        Arc::new(Field::new("price", DataType::Decimal128(38, 16), false)),
+        Arc::new(Field::new("size", DataType::Decimal128(38, 16), false)),
+        Arc::new(Field::new("count", DataType::UInt32, false)),
+        Arc::new(Field::new("order_id", DataType::UInt64, false)),
+    ];
+    let levels = StructArray::new(
+        level_fields.clone().into(),
+        vec![
+            Arc::new(
+                Decimal128Array::from(vec![101 * SCALE, 100 * SCALE, 99 * SCALE])
+                    .with_precision_and_scale(38, 16)
+                    .unwrap(),
+            ),
+            Arc::new(
+                Decimal128Array::from(vec![7 * SCALE, 8 * SCALE, 9 * SCALE])
+                    .with_precision_and_scale(38, 16)
+                    .unwrap(),
+            ),
+            Arc::new(UInt32Array::from(vec![1, 2, 3])),
+            Arc::new(UInt64Array::from(vec![11, 12, 13])),
+        ],
+        None,
+    );
+    let bids = ListArray::new(
+        Arc::new(Field::new(
+            "element",
+            DataType::Struct(level_fields.into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3])),
+        Arc::new(levels),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("bids", bids.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(bids)],
+    )
+    .unwrap();
+
+    DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .write_table("main", "depths", &[batch])
+        .await
+        .unwrap();
+
+    assert_duckdb_extension_reads_depths(&temp_dir.path().join("test.db"));
+
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT id, bids FROM test.main.depths ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    let bids = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(bids.value_offsets(), &[0, 2, 3]);
+    let levels = bids
+        .values()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        levels
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .values(),
+        &[101 * SCALE, 100 * SCALE, 99 * SCALE]
+    );
+    assert_eq!(
+        levels
+            .column_by_name("order_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values(),
+        &[11, 12, 13]
+    );
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let rows = sqlx::query(
+        "SELECT c.column_id, c.column_name, c.column_type, c.parent_column
+         FROM ducklake_column c
+         JOIN ducklake_table t ON t.table_id = c.table_id
+         WHERE t.table_name = 'depths' AND c.end_snapshot IS NULL
+         ORDER BY c.column_order",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 7);
+    let ids = rows
+        .iter()
+        .map(|row| row.get::<i64, _>("column_id"))
+        .collect::<Vec<_>>();
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("column_name"),
+                row.get::<String, _>("column_type"),
+                row.get::<Option<i64>, _>("parent_column"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("id".to_string(), "int32".to_string(), None),
+            ("bids".to_string(), "list".to_string(), None),
+            ("element".to_string(), "struct".to_string(), Some(ids[1])),
+            (
+                "price".to_string(),
+                "decimal(38, 16)".to_string(),
+                Some(ids[2]),
+            ),
+            (
+                "size".to_string(),
+                "decimal(38, 16)".to_string(),
+                Some(ids[2]),
+            ),
+            ("count".to_string(), "uint32".to_string(), Some(ids[2])),
+            ("order_id".to_string(), "uint64".to_string(), Some(ids[2])),
+        ]
+    );
+
+    let parquet_path = std::fs::read_dir(temp_dir.path().join("data/main/depths"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "parquet")
+        })
+        .unwrap();
+    assert_eq!(
+        parquet_schema_fields(&parquet_path),
+        vec![
+            ("id".to_string(), Some(ids[0] as i32)),
+            ("bids".to_string(), Some(ids[1] as i32)),
+            ("list".to_string(), None),
+            ("element".to_string(), Some(ids[2] as i32)),
+            ("price".to_string(), Some(ids[3] as i32)),
+            ("size".to_string(), Some(ids[4] as i32)),
+            ("count".to_string(), Some(ids[5] as i32)),
+            ("order_id".to_string(), Some(ids[6] as i32)),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_write_and_read_struct_list_and_map_roundtrip() {
+    let (writer, temp_dir) = create_test_env().await;
+    let values = ListArray::new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3])),
+        Arc::new(Int32Array::from(vec![10, 20, 30])),
+        None,
+    );
+    let payload_fields = vec![
+        Arc::new(Field::new("label", DataType::Utf8, false)),
+        Arc::new(Field::new("values", values.data_type().clone(), false)),
+    ];
+    let payload = StructArray::new(
+        payload_fields.into(),
+        vec![Arc::new(StringArray::from(vec!["first", "second"])), Arc::new(values)],
+        None,
+    );
+    let entry_fields = vec![
+        Arc::new(Field::new("key", DataType::Utf8, false)),
+        Arc::new(Field::new("value", DataType::Int32, true)),
+    ];
+    let entries = StructArray::new(
+        entry_fields.clone().into(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ],
+        None,
+    );
+    let attrs = MapArray::new(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(entry_fields.into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3])),
+        entries,
+        None,
+        false,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("payload", payload.data_type().clone(), false),
+        Field::new("attrs", attrs.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(payload), Arc::new(attrs)]).unwrap();
+
+    DuckLakeTableWriter::new(Arc::new(writer), create_object_store())
+        .unwrap()
+        .write_table("main", "nested", &[batch])
+        .await
+        .unwrap();
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT payload, attrs FROM test.main.nested")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let payload = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let values = payload
+        .column_by_name("values")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(values.value_offsets(), &[0, 2, 3]);
+    assert_eq!(
+        values
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[10, 20, 30]
+    );
+    let attrs = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<MapArray>()
+        .unwrap();
+    assert_eq!(attrs.value_offsets(), &[0, 2, 3]);
+    assert_eq!(
+        attrs
+            .values()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values(),
+        &[1, 2, 3]
+    );
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let rows = sqlx::query(
+        "SELECT c.column_id, c.column_name, c.column_type, c.parent_column
+         FROM ducklake_column c
+         JOIN ducklake_table t ON t.table_id = c.table_id
+         WHERE t.table_name = 'nested' AND c.end_snapshot IS NULL
+         ORDER BY c.column_order",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let ids = rows
+        .iter()
+        .map(|row| row.get::<i64, _>("column_id"))
+        .collect::<Vec<_>>();
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("column_name"),
+                row.get::<String, _>("column_type"),
+                row.get::<Option<i64>, _>("parent_column"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            ("payload".to_string(), "struct".to_string(), None),
+            ("label".to_string(), "varchar".to_string(), Some(ids[0])),
+            ("values".to_string(), "list".to_string(), Some(ids[0])),
+            ("element".to_string(), "int32".to_string(), Some(ids[2])),
+            ("attrs".to_string(), "map".to_string(), None),
+            ("key".to_string(), "varchar".to_string(), Some(ids[4])),
+            ("value".to_string(), "int32".to_string(), Some(ids[4])),
+        ]
+    );
+
+    let parquet_path = std::fs::read_dir(temp_dir.path().join("data/main/nested"))
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "parquet")
+        })
+        .unwrap();
+    assert_eq!(
+        parquet_schema_fields(&parquet_path),
+        vec![
+            ("payload".to_string(), Some(ids[0] as i32)),
+            ("label".to_string(), Some(ids[1] as i32)),
+            ("values".to_string(), Some(ids[2] as i32)),
+            ("list".to_string(), None),
+            ("element".to_string(), Some(ids[3] as i32)),
+            ("attrs".to_string(), Some(ids[4] as i32)),
+            ("key_value".to_string(), None),
+            ("key".to_string(), Some(ids[5] as i32)),
+            ("value".to_string(), Some(ids[6] as i32)),
+        ]
     );
 }
 
@@ -683,6 +1140,181 @@ async fn test_append_list_columns_multi_file() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_append_migrates_legacy_list_catalog_rows() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let first_values = ListArray::from_iter_primitive::<Float32Type, _, _>(vec![
+        Some(vec![Some(1.0), Some(2.0)]),
+        Some(vec![Some(3.0)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("values", first_values.data_type().clone(), true),
+    ]));
+    let first = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(first_values)],
+    )
+    .unwrap();
+    let initial = DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "legacy_list", &[first])
+        .await
+        .unwrap();
+
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT column_id, column_name
+         FROM ducklake_column
+         WHERE table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 'legacy_list')
+           AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let list_id = rows[1].0;
+    let old_element_id = rows[2].0;
+    sqlx::query("DELETE FROM ducklake_column WHERE column_id = ?")
+        .bind(old_element_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_column SET column_type = 'list<float32>' WHERE column_id = ?")
+        .bind(list_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let second_values =
+        ListArray::from_iter_primitive::<Float32Type, _, _>(vec![Some(vec![Some(4.0), Some(5.0)])]);
+    let second = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![3])), Arc::new(second_values)],
+    )
+    .unwrap();
+    let migration = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .append_table("main", "legacy_list", &[second])
+        .await
+        .unwrap();
+
+    let list_versions = sqlx::query_as::<_, (String, i64, Option<i64>)>(
+        "SELECT column_type, begin_snapshot, end_snapshot
+         FROM ducklake_column
+         WHERE table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 'legacy_list')
+           AND column_id = ?
+         ORDER BY begin_snapshot",
+    )
+    .bind(list_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        list_versions,
+        vec![
+            (
+                "list<float32>".into(),
+                initial.snapshot_id,
+                Some(migration.snapshot_id),
+            ),
+            ("list".into(), migration.snapshot_id, None),
+        ]
+    );
+
+    let catalog_rows = sqlx::query_as::<_, (i64, String, String, Option<i64>)>(
+        "SELECT column_id, column_name, column_type, parent_column
+         FROM ducklake_column
+         WHERE table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 'legacy_list')
+           AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(catalog_rows.len(), 3);
+    assert_eq!(
+        catalog_rows[1],
+        (list_id, "values".into(), "list".into(), None)
+    );
+    assert_eq!(catalog_rows[2].1, "element");
+    assert_eq!(catalog_rows[2].2, "float32");
+    assert_eq!(catalog_rows[2].3, Some(list_id));
+    assert_ne!(catalog_rows[2].0, old_element_id);
+
+    let historical = SessionContext::new();
+    let provider = Arc::new(
+        SqliteMetadataProvider::new(&format!(
+            "sqlite:{}",
+            temp_dir.path().join("test.db").display()
+        ))
+        .await
+        .unwrap(),
+    );
+    register_ducklake_functions(&historical, provider);
+    let historical_rows = historical
+        .sql(&format!(
+            "SELECT id FROM ducklake_table_at('main', 'legacy_list', {}) ORDER BY id",
+            initial.snapshot_id
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let historical_ids = historical_rows
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..ids.len())
+                .map(|index| ids.value(index))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(historical_ids, vec![1, 2]);
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT id, \"values\" FROM test.main.legacy_list ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let value = values.value(row);
+            let value = value.as_any().downcast_ref::<Float32Array>().unwrap();
+            actual.push((ids.value(row), value.values().to_vec()));
+        }
+    }
+    assert_eq!(
+        actual,
+        vec![(1, vec![1.0, 2.0]), (2, vec![3.0]), (3, vec![4.0, 5.0])]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_multiple_tables_same_schema() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
@@ -844,6 +1476,62 @@ async fn test_streaming_write_api() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_streaming_write_list_column() {
+    use arrow::datatypes::Int32Type;
+
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let values = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(10), Some(11)]),
+        Some(vec![Some(20)]),
+    ]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("items", values.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(values)],
+    )
+    .unwrap();
+
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let mut session = table_writer
+        .begin_write("main", "streaming_list", &schema, WriteMode::Replace)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    assert_eq!(session.finish().await.unwrap().records_written, 2);
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT id, items FROM test.main.streaming_list ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let values = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
+    assert_eq!(ids.values(), &[1, 2]);
+    let first = values.value(0);
+    let first = first.as_any().downcast_ref::<Int32Array>().unwrap();
+    let second = values.value(1);
+    let second = second.as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(first.values(), &[10, 11]);
+    assert_eq!(second.values(), &[20]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_streaming_write_to_custom_path() {
     let (writer, temp_dir) = create_test_env().await;
     let object_store = create_object_store();
@@ -997,6 +1685,231 @@ async fn test_append_add_nullable_column() {
         .unwrap()
         .value(0);
     assert_eq!(count, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_append_add_non_nullable_struct_field_reads_old_files_as_null() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let first_fields = vec![
+        Arc::new(Field::new("a", DataType::Int32, false)),
+        Arc::new(Field::new("b", DataType::Utf8, true)),
+    ];
+    let first_payload = StructArray::new(
+        first_fields.clone().into(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20])),
+            Arc::new(StringArray::from(vec!["first", "second"])),
+        ],
+        None,
+    );
+    let first_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("payload", DataType::Struct(first_fields.into()), false),
+    ]));
+    let first = RecordBatch::try_new(
+        first_schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(first_payload)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "evolve_struct", &[first])
+        .await
+        .unwrap();
+
+    let second_fields = vec![
+        Arc::new(Field::new("a", DataType::Int32, false)),
+        Arc::new(Field::new("b", DataType::Utf8, true)),
+        Arc::new(Field::new("c", DataType::Int32, false)),
+    ];
+    let second_payload = StructArray::new(
+        second_fields.clone().into(),
+        vec![
+            Arc::new(Int32Array::from(vec![30])),
+            Arc::new(StringArray::from(vec!["third"])),
+            Arc::new(Int32Array::from(vec![300])),
+        ],
+        None,
+    );
+    let second_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("payload", DataType::Struct(second_fields.into()), false),
+    ]));
+    let second = RecordBatch::try_new(
+        second_schema,
+        vec![Arc::new(Int32Array::from(vec![3])), Arc::new(second_payload)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .append_table("main", "evolve_struct", &[second])
+        .await
+        .unwrap();
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT id, payload FROM test.main.evolve_struct ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let payload = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let a = payload
+            .column_by_name("a")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let c = payload
+            .column_by_name("c")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            actual.push((
+                ids.value(row),
+                a.value(row),
+                (!c.is_null(row)).then(|| c.value(row)),
+            ));
+        }
+    }
+    assert_eq!(
+        actual,
+        vec![(1, 10, None), (2, 20, None), (3, 30, Some(300))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_append_add_non_nullable_list_struct_field_reads_old_files_as_null() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let first_fields = vec![Arc::new(Field::new("price", DataType::Int32, false))];
+    let first_levels = StructArray::new(
+        first_fields.clone().into(),
+        vec![Arc::new(Int32Array::from(vec![10, 20]))],
+        None,
+    );
+    let first_bids = ListArray::new(
+        Arc::new(Field::new(
+            "element",
+            DataType::Struct(first_fields.into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+        Arc::new(first_levels),
+        None,
+    );
+    let first_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("bids", first_bids.data_type().clone(), false),
+    ]));
+    let first = RecordBatch::try_new(
+        first_schema,
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(first_bids)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+        .unwrap()
+        .write_table("main", "evolve_depths", &[first])
+        .await
+        .unwrap();
+
+    let second_fields = vec![
+        Arc::new(Field::new("price", DataType::Int32, false)),
+        Arc::new(Field::new("venue", DataType::Utf8, false)),
+    ];
+    let second_levels = StructArray::new(
+        second_fields.clone().into(),
+        vec![Arc::new(Int32Array::from(vec![30])), Arc::new(StringArray::from(vec!["X"]))],
+        None,
+    );
+    let second_bids = ListArray::new(
+        Arc::new(Field::new(
+            "element",
+            DataType::Struct(second_fields.into()),
+            false,
+        )),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1])),
+        Arc::new(second_levels),
+        None,
+    );
+    let second_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("bids", second_bids.data_type().clone(), false),
+    ]));
+    let second = RecordBatch::try_new(
+        second_schema,
+        vec![Arc::new(Int32Array::from(vec![2])), Arc::new(second_bids)],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store)
+        .unwrap()
+        .append_table("main", "evolve_depths", &[second])
+        .await
+        .unwrap();
+
+    let batches = create_read_context(&temp_dir)
+        .await
+        .sql("SELECT id, bids FROM test.main.evolve_depths ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut actual = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let bids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            let levels = bids.value(row);
+            let levels = levels.as_any().downcast_ref::<StructArray>().unwrap();
+            let prices = levels
+                .column_by_name("price")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let venues =
+                arrow::compute::cast(levels.column_by_name("venue").unwrap(), &DataType::Utf8)
+                    .unwrap();
+            let venues = venues.as_any().downcast_ref::<StringArray>().unwrap();
+            let values = (0..levels.len())
+                .map(|index| {
+                    (
+                        prices.value(index),
+                        (!venues.is_null(index)).then(|| venues.value(index).to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            actual.push((ids.value(row), values));
+        }
+    }
+    assert_eq!(
+        actual,
+        vec![(1, vec![(10, None), (20, None)]), (2, vec![(30, Some("X".to_string()))]),]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

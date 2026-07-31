@@ -6,6 +6,7 @@
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::DataType;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -157,6 +158,8 @@ pub struct ColumnDef {
     pub(crate) ducklake_type: String,
     /// Whether this column allows NULL values
     pub(crate) is_nullable: bool,
+    /// Arrow type retained so nested child names and nullability survive catalog flattening.
+    pub(crate) data_type: DataType,
 }
 
 impl ColumnDef {
@@ -189,11 +192,12 @@ impl ColumnDef {
         let ducklake_type = ducklake_type.into();
         // Validate the type string by attempting to convert it to an Arrow type.
         // We discard the result; we only care that the conversion succeeds.
-        ducklake_to_arrow_type(&ducklake_type)?;
+        let data_type = ducklake_to_arrow_type(&ducklake_type)?;
         Ok(Self {
             name,
             ducklake_type,
             is_nullable,
+            data_type,
         })
     }
 
@@ -216,8 +220,250 @@ impl ColumnDef {
             name,
             ducklake_type,
             is_nullable,
+            data_type: data_type.clone(),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogColumnDef {
+    pub name: String,
+    pub ducklake_type: String,
+    pub logical_type: String,
+    pub is_nullable: bool,
+    pub parent_index: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingCatalogColumn {
+    pub column_id: i64,
+    pub name: String,
+    pub ducklake_type: String,
+    pub parent_column: Option<i64>,
+}
+
+pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogColumnDef>> {
+    let mut result = Vec::new();
+    for column in columns {
+        append_column_def(
+            &column.name,
+            &column.data_type,
+            column.is_nullable,
+            None,
+            &mut result,
+        )?;
+    }
+    Ok(result)
+}
+
+fn append_column_def(
+    name: &str,
+    data_type: &DataType,
+    is_nullable: bool,
+    parent_index: Option<usize>,
+    result: &mut Vec<CatalogColumnDef>,
+) -> Result<()> {
+    let index = result.len();
+    result.push(CatalogColumnDef {
+        name: name.to_string(),
+        ducklake_type: catalog_type_name(data_type)?,
+        logical_type: arrow_to_ducklake_type(data_type)?,
+        is_nullable,
+        parent_index,
+    });
+    match data_type {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            append_column_def(
+                "element",
+                field.data_type(),
+                field.is_nullable(),
+                Some(index),
+                result,
+            )
+        },
+        DataType::Struct(fields) => {
+            for field in fields {
+                append_column_def(
+                    field.name(),
+                    field.data_type(),
+                    field.is_nullable(),
+                    Some(index),
+                    result,
+                )?;
+            }
+            Ok(())
+        },
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(DuckLakeError::UnsupportedType(
+                    "Arrow map entries must be a struct".to_string(),
+                ));
+            };
+            let [key, value] = fields.as_ref() else {
+                return Err(DuckLakeError::UnsupportedType(
+                    "Arrow maps must have key and value fields".to_string(),
+                ));
+            };
+            append_column_def("key", key.data_type(), false, Some(index), result)?;
+            append_column_def(
+                "value",
+                value.data_type(),
+                value.is_nullable(),
+                Some(index),
+                result,
+            )
+        },
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn catalog_column_type_equal(existing_type: &str, proposed: &CatalogColumnDef) -> bool {
+    existing_type.eq_ignore_ascii_case(&proposed.ducklake_type)
+        || crate::types::types_equal_canonical(existing_type, &proposed.ducklake_type)
+        || catalog_column_type_requires_migration(existing_type, proposed)
+}
+
+pub(crate) fn catalog_column_type_requires_migration(
+    existing_type: &str,
+    proposed: &CatalogColumnDef,
+) -> bool {
+    proposed.ducklake_type == "list"
+        && existing_type
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("list<")
+        && crate::types::types_equal_canonical(existing_type, &proposed.logical_type)
+}
+
+fn catalog_type_name(data_type: &DataType) -> Result<String> {
+    match data_type {
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            Ok("list".to_string())
+        },
+        DataType::Struct(_) => Ok("struct".to_string()),
+        DataType::Map(_, _) => Ok("map".to_string()),
+        _ => arrow_to_ducklake_type(data_type),
+    }
+}
+
+pub(crate) fn top_level_column_ids(
+    columns: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if columns.len() != field_ids.len() {
+        return Err(DuckLakeError::Internal(format!(
+            "catalog column count {} does not match field id count {}",
+            columns.len(),
+            field_ids.len()
+        )));
+    }
+    Ok(columns
+        .iter()
+        .zip(field_ids)
+        .filter_map(|(column, field_id)| column.parent_index.is_none().then_some(*field_id))
+        .collect())
+}
+
+pub(crate) fn assign_column_ids(
+    proposed: &[CatalogColumnDef],
+    existing: &[ExistingCatalogColumn],
+    fresh_ids: &[i64],
+) -> Result<Vec<i64>> {
+    if proposed.len() != fresh_ids.len() {
+        return Err(DuckLakeError::Internal(format!(
+            "proposed column count {} does not match reserved id count {}",
+            proposed.len(),
+            fresh_ids.len()
+        )));
+    }
+    let mut existing_paths: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut unresolved = existing.iter().collect::<Vec<_>>();
+    while !unresolved.is_empty() {
+        let before = unresolved.len();
+        unresolved.retain(|column| {
+            let parent_path = match column.parent_column {
+                Some(parent_id) => match existing_paths.get(&parent_id) {
+                    Some(path) => path.clone(),
+                    None => return true,
+                },
+                None => Vec::new(),
+            };
+            let mut path = parent_path;
+            path.push(column.name.clone());
+            existing_paths.insert(column.column_id, path);
+            false
+        });
+        if unresolved.len() == before {
+            return Err(DuckLakeError::InvalidConfig(
+                "Catalog contains an orphaned or cyclic nested column".to_string(),
+            ));
+        }
+    }
+    if existing_paths.len() != existing.len() {
+        return Err(DuckLakeError::InvalidConfig(
+            "Catalog contains duplicate column ids".to_string(),
+        ));
+    }
+    let mut existing_by_path = HashMap::new();
+    for column in existing {
+        let path = existing_paths
+            .get(&column.column_id)
+            .expect("every existing column path was resolved")
+            .clone();
+        if existing_by_path.insert(path, column.column_id).is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "Catalog contains duplicate nested column paths".to_string(),
+            ));
+        }
+    }
+    let mut proposed_paths: Vec<Vec<String>> = Vec::with_capacity(proposed.len());
+    let mut proposed_path_set = HashSet::with_capacity(proposed.len());
+    for column in proposed {
+        let mut path = column
+            .parent_index
+            .map(|parent_index| proposed_paths[parent_index].clone())
+            .unwrap_or_default();
+        path.push(column.name.clone());
+        if !proposed_path_set.insert(path.clone()) {
+            return Err(DuckLakeError::InvalidConfig(
+                "Proposed schema contains duplicate nested column paths".to_string(),
+            ));
+        }
+        proposed_paths.push(path);
+    }
+    Ok(proposed_paths
+        .iter()
+        .zip(fresh_ids)
+        .map(|(path, fresh_id)| existing_by_path.get(path).copied().unwrap_or(*fresh_id))
+        .collect())
+}
+
+pub(crate) fn catalog_columns_differ(
+    existing: &[ExistingCatalogColumn],
+    existing_nullability: &[bool],
+    proposed: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> bool {
+    if existing.len() != proposed.len()
+        || existing.len() != existing_nullability.len()
+        || proposed.len() != field_ids.len()
+    {
+        return true;
+    }
+    existing
+        .iter()
+        .zip(existing_nullability)
+        .zip(proposed.iter().zip(field_ids))
+        .any(|((existing, existing_nullable), (proposed, field_id))| {
+            let parent_id = proposed.parent_index.map(|index| field_ids[index]);
+            let same_type = catalog_column_type_equal(&existing.ducklake_type, proposed)
+                || crate::types::is_promotable(&proposed.ducklake_type, &existing.ducklake_type);
+            existing.column_id != *field_id
+                || existing.name != proposed.name
+                || !same_type
+                || *existing_nullable != proposed.is_nullable
+                || existing.parent_column != parent_id
+        })
 }
 
 /// Whether `proposed` is a *schema change* relative to `existing` — i.e. whether a
@@ -237,8 +483,7 @@ impl ColumnDef {
 /// anything else is real DDL. (Not `types_compatible`, which would also accept
 /// committed-widens-to-staged and wrongly classify the race as DDL.)
 ///
-/// Shared by the SQLite and Postgres writers so the DDL/DML classification can't
-/// drift between backends.
+#[cfg(test)]
 pub(crate) fn columns_differ(existing: &[(String, String, bool)], proposed: &[ColumnDef]) -> bool {
     if existing.len() != proposed.len() {
         return true;
@@ -712,8 +957,10 @@ pub struct WriteSetupResult {
     pub schema_id: i64,
     /// Table ID (may be newly created)
     pub table_id: i64,
-    /// Column IDs in order
+    /// Top-level column IDs in Arrow schema order.
     pub column_ids: Vec<i64>,
+    /// Every typed field ID in DuckLake depth-first preorder.
+    pub field_ids: Vec<i64>,
 }
 
 /// Trait for writing metadata to DuckLake catalogs.
@@ -908,8 +1155,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// for SQLite (so it may differ from `WriteSetupResult::snapshot_id` under
     /// concurrency), reserved at begin for Postgres.
     ///
-    /// `columns` / `column_ids` describe the snapshot's column generation (in
-    /// `column_order`, ids matching `WriteSetupResult::column_ids`). Backends
+    /// `columns` carries the top-level Arrow schema. `column_ids` carries every
+    /// typed node ID in depth-first `column_order`, matching
+    /// `WriteSetupResult::field_ids`. Backends
     /// that finalize columns in `begin_write_transaction` (multicatalog
     /// Postgres) ignore them; single-catalog backends (SQLite) defer the
     /// column generation to this commit and use them to insert the column rows.
@@ -1432,8 +1680,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// resolve on read. Self-contained (no `begin_write_transaction`): creates
     /// the table/columns on first write, appends after.
     ///
-    /// `column_ids` must be non-empty and 1:1 with `columns` (`column_ids[i]` is
-    /// the id assigned to `columns[i]`, in column order); a mismatch is rejected
+    /// `column_ids` must be non-empty and 1:1 with the recursive catalog nodes
+    /// flattened from `columns`, in depth-first preorder. A mismatch is rejected
     /// with [`crate::DuckLakeError::InvalidConfig`]. Rowids are freshly assigned
     /// (the source `row_id_start` is not preserved), so indexes keyed on the
     /// source's rowids do not carry over.
@@ -1570,6 +1818,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 mod tests {
     use super::*;
     use crate::DuckLakeError;
+    use arrow::datatypes::Field;
+    use std::sync::Arc;
 
     fn promoted(values: Vec<(i32, Option<String>)>) -> DataFileInfo {
         DataFileInfo::new("f.parquet", 1024, 10).with_partition(7, values)
@@ -1815,6 +2065,156 @@ mod tests {
         assert_eq!(col.name, "id");
         assert_eq!(col.ducklake_type, "int64");
         assert!(!col.is_nullable);
+    }
+
+    #[test]
+    fn test_catalog_column_defs_use_depth_first_preorder() {
+        let levels = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("price", DataType::Decimal128(38, 16), false)),
+                    Arc::new(Field::new(
+                        "tags",
+                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                        true,
+                    )),
+                ]
+                .into(),
+            ),
+            false,
+        )));
+        let attrs = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Utf8, false)),
+                        Arc::new(Field::new(
+                            "value",
+                            DataType::Struct(
+                                vec![Arc::new(Field::new("active", DataType::Boolean, false))]
+                                    .into(),
+                            ),
+                            true,
+                        )),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let columns = vec![
+            ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+            ColumnDef::from_arrow("levels", &levels, false).unwrap(),
+            ColumnDef::from_arrow("attrs", &attrs, true).unwrap(),
+        ];
+
+        let definitions = catalog_column_defs(&columns).unwrap();
+        let actual = definitions
+            .iter()
+            .map(|column| {
+                (
+                    column.name.as_str(),
+                    column.ducklake_type.as_str(),
+                    column.is_nullable,
+                    column.parent_index,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                ("id", "int32", false, None),
+                ("levels", "list", false, None),
+                ("element", "struct", false, Some(1)),
+                ("price", "decimal(38, 16)", false, Some(2)),
+                ("tags", "list", true, Some(2)),
+                ("element", "varchar", true, Some(4)),
+                ("attrs", "map", true, None),
+                ("key", "varchar", false, Some(6)),
+                ("value", "struct", true, Some(6)),
+                ("active", "boolean", false, Some(8)),
+            ]
+        );
+        assert_eq!(
+            top_level_column_ids(&definitions, &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]).unwrap(),
+            vec![10, 11, 16]
+        );
+    }
+
+    #[test]
+    fn test_assign_column_ids_rejects_duplicate_paths() {
+        let columns = vec![
+            ColumnDef::from_arrow("value", &DataType::Int32, false).unwrap(),
+            ColumnDef::from_arrow("value", &DataType::Int64, false).unwrap(),
+        ];
+        let definitions = catalog_column_defs(&columns).unwrap();
+
+        assert!(assign_column_ids(&definitions, &[], &[10, 11]).is_err());
+    }
+
+    #[test]
+    fn catalog_type_name_returns_unsupported_scalar_error() {
+        let error =
+            catalog_type_name(&DataType::Duration(arrow::datatypes::TimeUnit::Second)).unwrap_err();
+
+        assert!(matches!(error, DuckLakeError::UnsupportedType(_)));
+    }
+
+    #[test]
+    fn test_catalog_columns_differ_accepts_nested_type_alias() {
+        let columns = vec![
+            ColumnDef::from_arrow(
+                "values",
+                &DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            )
+            .unwrap(),
+        ];
+        let definitions = catalog_column_defs(&columns).unwrap();
+        let existing = vec![
+            ExistingCatalogColumn {
+                column_id: 10,
+                name: "values".into(),
+                ducklake_type: "list".into(),
+                parent_column: None,
+            },
+            ExistingCatalogColumn {
+                column_id: 11,
+                name: "element".into(),
+                ducklake_type: "bigint".into(),
+                parent_column: Some(10),
+            },
+        ];
+
+        assert!(!catalog_columns_differ(
+            &existing,
+            &[false, true],
+            &definitions,
+            &[10, 11],
+        ));
+    }
+
+    #[test]
+    fn legacy_list_type_matches_only_the_same_recursive_type() {
+        let columns = vec![
+            ColumnDef::from_arrow(
+                "values",
+                &DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            )
+            .unwrap(),
+        ];
+        let definitions = catalog_column_defs(&columns).unwrap();
+
+        assert!(catalog_column_type_equal("list<float32>", &definitions[0]));
+        assert!(catalog_column_type_requires_migration(
+            "list<float32>",
+            &definitions[0]
+        ));
+        assert!(!catalog_column_type_equal("list<int32>", &definitions[0]));
     }
 
     #[test]

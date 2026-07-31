@@ -6,25 +6,44 @@ use std::sync::Arc;
 use crate::metadata_provider::DuckLakeTableColumn;
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
+
+pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
 
 /// Convert a DuckLake type string to an Arrow DataType
 pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
-    // Normalize type string (lowercase, remove whitespace)
-    let normalized = ducklake_type.trim().to_lowercase();
+    ducklake_to_arrow_type_inner(ducklake_type, 0)
+}
+
+fn ducklake_to_arrow_type_inner(ducklake_type: &str, depth: usize) -> Result<DataType> {
+    if depth > MAX_NESTED_TYPE_DEPTH {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Type exceeds maximum nesting depth {MAX_NESTED_TYPE_DEPTH}"
+        )));
+    }
+    let type_str = ducklake_type.trim();
 
     // Handle parameterized types first
-    if let Some(decimal_params) = parse_decimal(&normalized)? {
+    if let Some(decimal_params) = parse_decimal(type_str)? {
         return Ok(decimal_params);
     }
 
     // Handle list/array types
-    if let Some(list_type) = parse_list_type(&normalized)? {
+    if let Some(list_type) = parse_list_type(type_str, depth)? {
         return Ok(list_type);
     }
 
+    if let Some(struct_type) = parse_struct_type(type_str, depth)? {
+        return Ok(struct_type);
+    }
+
+    if let Some(map_type) = parse_map_type(type_str, depth)? {
+        return Ok(map_type);
+    }
+
     // Handle basic types
-    match normalized.as_str() {
+    match type_str.to_ascii_lowercase().as_str() {
         // Boolean
         "boolean" | "bool" => Ok(DataType::Boolean),
 
@@ -84,22 +103,7 @@ pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {
         // Time with timezone - not directly supported, use string
         "timetz" | "time with time zone" => Ok(DataType::Utf8View),
 
-        _ => {
-            // Check for complex types (struct, map)
-            if normalized.starts_with("struct") {
-                Err(DuckLakeError::UnsupportedType(format!(
-                    "Struct type '{}' not yet supported. Please open an issue at https://github.com/hotdata-dev/datafusion-ducklake if you need this feature.",
-                    ducklake_type
-                )))
-            } else if normalized.starts_with("map") {
-                Err(DuckLakeError::UnsupportedType(format!(
-                    "Map type '{}' not yet supported. Please open an issue at https://github.com/hotdata-dev/datafusion-ducklake if you need this feature.",
-                    ducklake_type
-                )))
-            } else {
-                Err(DuckLakeError::UnsupportedType(ducklake_type.to_string()))
-            }
-        },
+        _ => Err(DuckLakeError::UnsupportedType(ducklake_type.to_string())),
     }
 }
 
@@ -160,6 +164,10 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
         // Null type - map to varchar as there's no direct equivalent
         DataType::Null => Ok("varchar".to_string()),
 
+        // Dictionary keys are an Arrow encoding detail. DuckLake records the logical value
+        // type, while Parquet preserves dictionary encoding in the data file.
+        DataType::Dictionary(_, value) => arrow_to_ducklake_type(value),
+
         // List types
         DataType::List(field) | DataType::LargeList(field) => {
             let inner = arrow_to_ducklake_type(field.data_type())?;
@@ -169,14 +177,36 @@ pub fn arrow_to_ducklake_type(arrow_type: &DataType) -> Result<String> {
             let inner = arrow_to_ducklake_type(field.data_type())?;
             Ok(format!("list<{}>", inner))
         },
-        DataType::Struct(_) => Err(DuckLakeError::UnsupportedType(format!(
-            "Struct type '{}' not yet supported for writing",
-            arrow_type
-        ))),
-        DataType::Map(_, _) => Err(DuckLakeError::UnsupportedType(format!(
-            "Map type '{}' not yet supported for writing",
-            arrow_type
-        ))),
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    Ok(format!(
+                        "{}:{}",
+                        field.name(),
+                        arrow_to_ducklake_type(field.data_type())?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(format!("struct<{}>", fields.join(",")))
+        },
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(DuckLakeError::UnsupportedType(
+                    "Arrow map entries must be a struct".to_string(),
+                ));
+            };
+            let [key, value] = fields.as_ref() else {
+                return Err(DuckLakeError::UnsupportedType(
+                    "Arrow maps must have key and value fields".to_string(),
+                ));
+            };
+            Ok(format!(
+                "map<{},{}>",
+                arrow_to_ducklake_type(key.data_type())?,
+                arrow_to_ducklake_type(value.data_type())?
+            ))
+        },
 
         // Other unsupported types
         other => Err(DuckLakeError::UnsupportedType(format!(
@@ -230,7 +260,8 @@ fn decimal_data_type(precision: u8, scale: i8) -> DataType {
 /// Returns `Ok(None)` if the type string is not a decimal type.
 /// Returns `Err` if it is a decimal type but has invalid precision/scale.
 fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
-    if !type_str.starts_with("decimal") && !type_str.starts_with("numeric") {
+    let normalized = type_str.to_ascii_lowercase();
+    if !normalized.starts_with("decimal") && !normalized.starts_with("numeric") {
         return Ok(None);
     }
 
@@ -287,9 +318,9 @@ fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
 /// - `list<element_type>` / `array<element_type>` (DuckDB style)
 /// - `element_type[]` (Postgres style, e.g. `varchar[]`, `float[]`)
 ///
-/// Only simple (non-nested) element types are supported.
-fn parse_list_type(type_str: &str) -> Result<Option<DataType>> {
-    let inner = if type_str.starts_with("list<") || type_str.starts_with("array<") {
+fn parse_list_type(type_str: &str, depth: usize) -> Result<Option<DataType>> {
+    let normalized = type_str.to_ascii_lowercase();
+    let inner = if normalized.starts_with("list<") || normalized.starts_with("array<") {
         // list<type> or array<type>
         let start = type_str.find('<').unwrap();
         if !type_str.ends_with('>') {
@@ -311,20 +342,136 @@ fn parse_list_type(type_str: &str) -> Result<Option<DataType>> {
         )));
     }
 
-    // Only support simple (non-nested) element types
-    if inner.contains('<') || inner.contains('[') || inner.contains('{') {
-        return Err(DuckLakeError::UnsupportedType(format!(
-            "Nested complex type '{}' not yet supported",
-            type_str
-        )));
-    }
-
-    let element_type = ducklake_to_arrow_type(inner)?;
+    let element_type = ducklake_to_arrow_type_inner(inner, depth + 1)?;
     Ok(Some(DataType::List(Arc::new(Field::new(
         "item",
         element_type,
         true,
     )))))
+}
+
+fn parse_struct_type(type_str: &str, depth: usize) -> Result<Option<DataType>> {
+    if !type_str.to_ascii_lowercase().starts_with("struct<") {
+        return Ok(None);
+    }
+    if !type_str.ends_with('>') {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Struct type '{type_str}' is missing its closing '>'"
+        )));
+    }
+    let inner = &type_str[7..type_str.len() - 1];
+    if inner.is_empty() {
+        return Ok(Some(DataType::Struct(Vec::<Arc<Field>>::new().into())));
+    }
+    let fields = split_top_level(inner, ',')?
+        .into_iter()
+        .map(|field| {
+            let Some(separator) = top_level_separator(field, ':') else {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Struct field '{field}' must use name:type syntax"
+                )));
+            };
+            let name = field[..separator].trim();
+            let type_name = field[separator + 1..].trim();
+            if name.is_empty() || type_name.is_empty() {
+                return Err(DuckLakeError::UnsupportedType(format!(
+                    "Struct field '{field}' must have a name and type"
+                )));
+            }
+            Ok(Arc::new(Field::new(
+                name,
+                ducklake_to_arrow_type_inner(type_name, depth + 1)?,
+                true,
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(DataType::Struct(fields.into())))
+}
+
+fn parse_map_type(type_str: &str, depth: usize) -> Result<Option<DataType>> {
+    if !type_str.to_ascii_lowercase().starts_with("map<") {
+        return Ok(None);
+    }
+    if !type_str.ends_with('>') {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Map type '{type_str}' is missing its closing '>'"
+        )));
+    }
+    let parts = split_top_level(&type_str[4..type_str.len() - 1], ',')?;
+    let [key_type, value_type] = parts.as_slice() else {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Map type '{type_str}' must have key and value types"
+        )));
+    };
+    let entries = DataType::Struct(
+        vec![
+            Arc::new(Field::new(
+                "key",
+                ducklake_to_arrow_type_inner(key_type, depth + 1)?,
+                false,
+            )),
+            Arc::new(Field::new(
+                "value",
+                ducklake_to_arrow_type_inner(value_type, depth + 1)?,
+                true,
+            )),
+        ]
+        .into(),
+    );
+    Ok(Some(DataType::Map(
+        Arc::new(Field::new("entries", entries, false)),
+        false,
+    )))
+}
+
+fn split_top_level(value: &str, separator: char) -> Result<Vec<&str>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut angle_depth = 0_i32;
+    let mut paren_depth = 0_i32;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => angle_depth += 1,
+            '>' => angle_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            _ => {},
+        }
+        if angle_depth < 0 || paren_depth < 0 {
+            return Err(DuckLakeError::UnsupportedType(format!(
+                "Unbalanced nested type '{value}'"
+            )));
+        }
+        if character == separator && angle_depth == 0 && paren_depth == 0 {
+            parts.push(value[start..index].trim());
+            start = index + character.len_utf8();
+        }
+    }
+    if angle_depth != 0 || paren_depth != 0 {
+        return Err(DuckLakeError::UnsupportedType(format!(
+            "Unbalanced nested type '{value}'"
+        )));
+    }
+    parts.push(value[start..].trim());
+    Ok(parts)
+}
+
+fn top_level_separator(value: &str, separator: char) -> Option<usize> {
+    let mut angle_depth = 0_i32;
+    let mut paren_depth = 0_i32;
+    for (index, character) in value.char_indices() {
+        match character {
+            '<' => angle_depth += 1,
+            '>' => angle_depth -= 1,
+            '(' => paren_depth += 1,
+            ')' => paren_depth -= 1,
+            _ => {},
+        }
+        if character == separator && angle_depth == 0 && paren_depth == 0 {
+            return Some(index);
+        }
+    }
+    None
 }
 
 /// Normalize a DuckLake type string to its canonical form.
@@ -466,12 +613,15 @@ pub fn types_equal_canonical(a: &str, b: &str) -> bool {
     }
 }
 
-/// Build an Arrow schema from a list of DuckLake table columns
+/// Build an Arrow schema from a list of DuckLake table columns.
+///
+/// Struct fields are nullable on reads because a field added after older files were written is
+/// absent from those files even when its current catalog row is non-nullable.
 pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     let fields: Result<Vec<Field>> = columns
         .iter()
         .map(|col| {
-            let data_type = ducklake_to_arrow_type(&col.column_type)?;
+            let data_type = read_compatible_data_type(&col.data_type()?, true);
             Ok(Field::new(&col.column_name, data_type, col.is_nullable))
         })
         .collect();
@@ -479,37 +629,68 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     Ok(Schema::new(fields?))
 }
 
+fn read_compatible_data_type(data_type: &DataType, nullable_struct_fields: bool) -> DataType {
+    let rewrite_field = |field: &Arc<Field>, nullable: bool| {
+        Arc::new(
+            field
+                .as_ref()
+                .clone()
+                .with_data_type(read_compatible_data_type(field.data_type(), true))
+                .with_nullable(field.is_nullable() || nullable),
+        )
+    };
+    match data_type {
+        DataType::List(field) => DataType::List(rewrite_field(field, false)),
+        DataType::LargeList(field) => DataType::LargeList(rewrite_field(field, false)),
+        DataType::FixedSizeList(field, size) => {
+            DataType::FixedSizeList(rewrite_field(field, false), *size)
+        },
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| rewrite_field(field, nullable_struct_fields))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
+        DataType::Map(entries, sorted) => DataType::Map(
+            Arc::new(
+                entries
+                    .as_ref()
+                    .clone()
+                    .with_data_type(read_compatible_data_type(entries.data_type(), false)),
+            ),
+            *sorted,
+        ),
+        _ => data_type.clone(),
+    }
+}
+
 /// Extract field_id to column_name mapping from Parquet metadata.
 /// DuckLake column_id == Parquet field_id, enabling column matching after renames.
 pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, String> {
     let schema_descr = metadata.file_metadata().schema_descr();
-    // DuckLake assigns one field_id per *top-level* column (`column_id` == the
-    // top-level field's field_id), so read ids off the top-level fields — the
-    // root group's direct children — NOT the Parquet leaf columns.
-    //
-    // For a scalar the top-level field *is* the leaf, so both are equivalent. But
-    // for a nested column (List / struct / map) the field_id lives on the group
-    // node while the leaves carry none — e.g. a `List<Float32>` column `v` is
-    // `v (group, field_id=2) -> list -> element (leaf, no id)`. Walking the leaves
-    // (`num_columns()`) misses `v`'s id entirely, so the matcher treats the column
-    // as absent and null-fills it. Walking top-level fields finds the id where it
-    // actually sits.
-    let entries = schema_descr
-        .root_schema()
-        .get_fields()
-        .iter()
-        .filter_map(|field| {
-            let basic_info = field.get_basic_info();
-            basic_info
-                .has_id()
-                .then(|| (basic_info.id(), field.name().to_string()))
-        });
-    field_ids_dropping_duplicates(entries)
+    fn collect(type_: &parquet::schema::types::Type, entries: &mut Vec<(i32, String)>) {
+        let basic_info = type_.get_basic_info();
+        if basic_info.has_id() {
+            entries.push((basic_info.id(), type_.name().to_string()));
+        }
+        if type_.is_group() {
+            for child in type_.get_fields() {
+                collect(child, entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    for field in schema_descr.root_schema().get_fields() {
+        collect(field, &mut entries);
+    }
+    field_ids_dropping_duplicates(entries.into_iter())
 }
 
 /// Collect a `field_id -> name` map, dropping any `field_id` shared by more than
-/// one top-level column. DuckLake assigns exactly one field_id per top-level
-/// column, so a collision is malformed/adversarial parquet; binding the catalog
+/// one field. DuckLake assigns exactly one field_id per catalog column node, so
+/// a collision is malformed/adversarial parquet; binding the catalog
 /// column with that id to either physical column risks reading the wrong data.
 /// Dropping the id makes the reader null-fill that column (via its "field_id
 /// absent" path) instead of silently substituting the wrong one.
@@ -534,6 +715,180 @@ fn field_ids_dropping_duplicates(
     map
 }
 
+fn arrow_field_id_names(schema: &Schema) -> HashMap<i32, String> {
+    fn collect(field: &Field, names: &mut HashMap<i32, String>) {
+        if let Some(id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|value| value.parse().ok())
+        {
+            names.insert(id, field.name().clone());
+        }
+        match field.data_type() {
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _)
+            | DataType::Map(child, _) => collect(child, names),
+            DataType::Struct(fields) => {
+                for child in fields {
+                    collect(child, names);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    let mut names = HashMap::new();
+    for field in schema.fields() {
+        collect(field, &mut names);
+    }
+    names
+}
+
+fn data_type_has_field_ids(data_type: &DataType) -> bool {
+    let fields: &[Arc<Field>] = match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => std::slice::from_ref(field),
+        DataType::Struct(fields) => fields,
+        _ => return false,
+    };
+    fields.iter().any(|field| {
+        field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY)
+            || data_type_has_field_ids(field.data_type())
+    })
+}
+
+fn read_data_type_with_field_id_mapping(
+    data_type: &DataType,
+    nested_column_ids: &[i64],
+    parquet_field_ids: &HashMap<i32, String>,
+    arrow_field_names: &HashMap<i32, String>,
+    match_by_id: bool,
+) -> Result<DataType> {
+    fn rewrite_field(
+        field: &Field,
+        ids: &mut std::slice::Iter<'_, i64>,
+        parquet_field_ids: &HashMap<i32, String>,
+        arrow_field_names: &HashMap<i32, String>,
+        match_by_id: bool,
+    ) -> Result<Arc<Field>> {
+        let column_id = ids.next().ok_or_else(|| {
+            DuckLakeError::InvalidConfig(
+                "Nested column metadata has fewer field ids than its Arrow type".to_string(),
+            )
+        })?;
+        let field_id = i32::try_from(*column_id).map_err(|_| {
+            DuckLakeError::Internal(format!(
+                "column_id {column_id} for nested column '{}' exceeds i32 range for Parquet field_id",
+                field.name()
+            ))
+        })?;
+        let is_absent = match_by_id && !parquet_field_ids.contains_key(&field_id);
+        let name = if let Some(parquet_name) = parquet_field_ids.get(&field_id) {
+            arrow_field_names
+                .get(&field_id)
+                .unwrap_or(parquet_name)
+                .clone()
+        } else if match_by_id {
+            format!("__ducklake_absent_field_{field_id}")
+        } else {
+            field.name().clone()
+        };
+        let data_type = rewrite_type(
+            field.data_type(),
+            ids,
+            parquet_field_ids,
+            arrow_field_names,
+            match_by_id,
+        )?;
+        Ok(Arc::new(
+            field
+                .clone()
+                .with_name(name)
+                .with_data_type(data_type)
+                .with_nullable(field.is_nullable() || is_absent),
+        ))
+    }
+
+    fn rewrite_type(
+        data_type: &DataType,
+        ids: &mut std::slice::Iter<'_, i64>,
+        parquet_field_ids: &HashMap<i32, String>,
+        arrow_field_names: &HashMap<i32, String>,
+        match_by_id: bool,
+    ) -> Result<DataType> {
+        match data_type {
+            DataType::List(field) => Ok(DataType::List(rewrite_field(
+                field,
+                ids,
+                parquet_field_ids,
+                arrow_field_names,
+                match_by_id,
+            )?)),
+            DataType::LargeList(field) => Ok(DataType::LargeList(rewrite_field(
+                field,
+                ids,
+                parquet_field_ids,
+                arrow_field_names,
+                match_by_id,
+            )?)),
+            DataType::FixedSizeList(field, size) => Ok(DataType::FixedSizeList(
+                rewrite_field(
+                    field,
+                    ids,
+                    parquet_field_ids,
+                    arrow_field_names,
+                    match_by_id,
+                )?,
+                *size,
+            )),
+            DataType::Struct(fields) => Ok(DataType::Struct(
+                fields
+                    .iter()
+                    .map(|field| {
+                        rewrite_field(
+                            field,
+                            ids,
+                            parquet_field_ids,
+                            arrow_field_names,
+                            match_by_id,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into(),
+            )),
+            DataType::Map(entries, sorted) => Ok(DataType::Map(
+                Arc::new(entries.as_ref().clone().with_data_type(rewrite_type(
+                    entries.data_type(),
+                    ids,
+                    parquet_field_ids,
+                    arrow_field_names,
+                    match_by_id,
+                )?)),
+                *sorted,
+            )),
+            _ => Ok(data_type.clone()),
+        }
+    }
+
+    let mut ids = nested_column_ids.iter();
+    let result = rewrite_type(
+        data_type,
+        &mut ids,
+        parquet_field_ids,
+        arrow_field_names,
+        match_by_id,
+    )?;
+    if ids.next().is_some() {
+        return Err(DuckLakeError::InvalidConfig(
+            "Nested column metadata has more field ids than its Arrow type".to_string(),
+        ));
+    }
+    Ok(result)
+}
+
 /// Build a schema for reading Parquet files across schema evolution.
 /// Returns (read_schema, name_mapping): read_schema uses each column's physical
 /// name in the file, and name_mapping maps that physical name -> current name for
@@ -546,11 +901,12 @@ pub fn build_read_schema_with_field_id_mapping(
     file_schema: Option<&Schema>,
 ) -> Result<(Schema, HashMap<String, String>)> {
     let mut name_mapping: HashMap<String, String> = HashMap::new();
+    let arrow_field_names = file_schema.map(arrow_field_id_names).unwrap_or_default();
 
     let fields: Result<Vec<Field>> = current_columns
         .iter()
         .map(|col| {
-            let mut data_type = ducklake_to_arrow_type(&col.column_type)?;
+            let mut data_type = col.data_type()?;
             let field_id = i32::try_from(col.column_id).map_err(|_| {
                 DuckLakeError::Internal(format!(
                     "column_id {} for column '{}' exceeds i32 range for Parquet field_id",
@@ -580,23 +936,17 @@ pub fn build_read_schema_with_field_id_mapping(
                     (format!("__ducklake_absent_field_{}", field_id), true, true)
                 };
 
-            // For list/nested columns the Parquet reader reproduces the *file's*
-            // child field name (e.g. "" for files our streaming writer produces
-            // vs "item" for files written through the Arrow writer), and
-            // DataFusion's scan validates each batch against the read schema. The
-            // reconstructed name (always "item") may not match, so adopt the
-            // file's actual type for these columns when the file schema is known.
-            // Scalars keep the reconstructed type (precise per the catalog). An
-            // absent column has a synthetic name not in the file, so skip it.
-            if !is_absent
-                && matches!(
-                    data_type,
-                    DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
-                )
-                && let Some(fs) = file_schema
-                && let Ok(file_field) = fs.field_with_name(&read_name)
-            {
-                data_type = file_field.data_type().clone();
+            if !is_absent && !col.nested_column_ids.is_empty() {
+                let match_nested_by_id = file_schema
+                    .and_then(|schema| schema.field_with_name(&read_name).ok())
+                    .is_some_and(|field| data_type_has_field_ids(field.data_type()));
+                data_type = read_data_type_with_field_id_mapping(
+                    &data_type,
+                    &col.nested_column_ids,
+                    parquet_field_ids,
+                    &arrow_field_names,
+                    match_nested_by_id,
+                )?;
             }
 
             if needs_rename {
@@ -630,12 +980,16 @@ mod tests {
                 column_name: "userId".to_string(), // Current name (renamed)
                 column_type: "int32".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
             DuckLakeTableColumn {
                 column_id: 2,
                 column_name: "name".to_string(), // Not renamed
                 column_type: "varchar".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
         ];
 
@@ -664,6 +1018,8 @@ mod tests {
             column_name: "id".to_string(),
             column_type: "int32".to_string(),
             is_nullable: true,
+            data_type: None,
+            nested_column_ids: Vec::new(),
         }];
 
         let mut parquet_field_ids = HashMap::new();
@@ -685,6 +1041,8 @@ mod tests {
             column_name: "id".to_string(),
             column_type: "int32".to_string(),
             is_nullable: true,
+            data_type: None,
+            nested_column_ids: Vec::new(),
         }];
 
         let parquet_field_ids = HashMap::new(); // No field_ids in Parquet
@@ -710,12 +1068,16 @@ mod tests {
                 column_name: "id".to_string(),
                 column_type: "int32".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
             DuckLakeTableColumn {
                 column_id: 2,
                 column_name: "tag".to_string(),
                 column_type: "varchar".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
         ];
 
@@ -742,6 +1104,122 @@ mod tests {
             name_mapping.get(read_schema.field(1).name()),
             Some(&"tag".to_string())
         );
+    }
+
+    #[test]
+    fn test_build_read_schema_keeps_new_nested_field() {
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: 1,
+            column_name: "payload".to_string(),
+            column_type: "struct<a:int32,b:varchar,c:int32>".to_string(),
+            is_nullable: false,
+            data_type: Some(DataType::Struct(
+                vec![
+                    Arc::new(Field::new("a", DataType::Int32, false)),
+                    Arc::new(Field::new("b", DataType::Utf8View, true)),
+                    Arc::new(Field::new("c", DataType::Int32, false)),
+                ]
+                .into(),
+            )),
+            nested_column_ids: vec![2, 3, 4],
+        }];
+        let parquet_field_ids = HashMap::from([
+            (1, "payload".to_string()),
+            (2, "a".to_string()),
+            (3, "old_b".to_string()),
+        ]);
+        let id_metadata =
+            |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let file_schema = Schema::new(vec![
+            Field::new(
+                "payload",
+                DataType::Struct(
+                    vec![
+                        Arc::new(
+                            Field::new("a", DataType::Int32, false).with_metadata(id_metadata(2)),
+                        ),
+                        Arc::new(
+                            Field::new("old_b", DataType::Utf8, true).with_metadata(id_metadata(3)),
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+            .with_metadata(id_metadata(1)),
+        ]);
+
+        let (read_schema, _) = build_read_schema_with_field_id_mapping(
+            &current_columns,
+            &parquet_field_ids,
+            Some(&file_schema),
+        )
+        .unwrap();
+        let DataType::Struct(fields) = read_schema.field(0).data_type() else {
+            panic!("payload must remain a struct");
+        };
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), "a");
+        assert_eq!(fields[1].name(), "old_b");
+        assert_eq!(fields[2].name(), "__ducklake_absent_field_4");
+        assert_eq!(fields[2].data_type(), &DataType::Int32);
+        assert!(fields[2].is_nullable());
+    }
+
+    #[test]
+    fn test_build_read_schema_does_not_reuse_dropped_nested_name() {
+        let current_columns = vec![DuckLakeTableColumn {
+            column_id: 1,
+            column_name: "payload".to_string(),
+            column_type: "struct<c:int32>".to_string(),
+            is_nullable: false,
+            data_type: Some(DataType::Struct(
+                vec![Arc::new(Field::new("c", DataType::Int32, true))].into(),
+            )),
+            nested_column_ids: vec![4],
+        }];
+        let parquet_field_ids = HashMap::from([(1, "payload".to_string()), (3, "c".to_string())]);
+        let id_metadata =
+            |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let file_schema = Schema::new(vec![
+            Field::new(
+                "payload",
+                DataType::Struct(
+                    vec![Arc::new(
+                        Field::new("c", DataType::Int32, true).with_metadata(id_metadata(3)),
+                    )]
+                    .into(),
+                ),
+                false,
+            )
+            .with_metadata(id_metadata(1)),
+        ]);
+
+        let (read_schema, _) = build_read_schema_with_field_id_mapping(
+            &current_columns,
+            &parquet_field_ids,
+            Some(&file_schema),
+        )
+        .unwrap();
+        let DataType::Struct(fields) = read_schema.field(0).data_type() else {
+            panic!("payload must remain a struct");
+        };
+
+        assert_eq!(fields[0].name(), "__ducklake_absent_field_4");
+    }
+
+    #[test]
+    fn test_nested_type_depth_is_bounded() {
+        let nested = format!(
+            "{}int32{}",
+            "list<".repeat(MAX_NESTED_TYPE_DEPTH + 1),
+            ">".repeat(MAX_NESTED_TYPE_DEPTH + 1)
+        );
+
+        let error = ducklake_to_arrow_type(&nested).unwrap_err();
+
+        assert!(error.to_string().contains("maximum nesting depth"));
     }
 
     #[test]
@@ -844,6 +1322,15 @@ mod tests {
             arrow_to_ducklake_type(&DataType::LargeBinary).unwrap(),
             "blob"
         );
+    }
+
+    #[test]
+    fn test_dictionary_uses_logical_value_type() {
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        assert_eq!(arrow_to_ducklake_type(&dictionary).unwrap(), "varchar");
+
+        let list = DataType::List(Arc::new(Field::new("item", dictionary, true)));
+        assert_eq!(arrow_to_ducklake_type(&list).unwrap(), "list<varchar>");
     }
 
     #[test]
@@ -998,51 +1485,48 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_struct_type_errors() {
-        // Test struct type returns error
-        let result = ducklake_to_arrow_type("struct<a:int32,b:varchar>");
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("struct<a:int32,b:varchar>"));
-                assert!(msg.contains("not yet supported"));
-                assert!(msg.contains("open an issue"));
-            },
-            _ => panic!("Expected UnsupportedType error for struct type"),
-        }
+    fn test_struct_type() {
+        let result = ducklake_to_arrow_type("STRUCT<Price:DECIMAL(38,16),Label:VARCHAR>").unwrap();
+        assert_eq!(
+            result,
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("Price", DataType::Decimal128(38, 16), true,)),
+                    Arc::new(Field::new("Label", DataType::Utf8View, true)),
+                ]
+                .into(),
+            )
+        );
     }
 
     #[test]
-    fn test_unsupported_map_type_errors() {
-        // Test map type returns error
-        let result = ducklake_to_arrow_type("map<varchar,int32>");
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("map<varchar,int32>"));
-                assert!(msg.contains("not yet supported"));
-                assert!(msg.contains("open an issue"));
-            },
-            _ => panic!("Expected UnsupportedType error for map type"),
-        }
+    fn test_map_type() {
+        let result = ducklake_to_arrow_type("map<varchar,list<int32>>").unwrap();
+        let DataType::Map(entries, false) = result else {
+            panic!("expected map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected map entries struct");
+        };
+        assert_eq!(fields[0].name(), "key");
+        assert_eq!(fields[0].data_type(), &DataType::Utf8View);
+        assert_eq!(
+            fields[1].data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        );
     }
 
     #[test]
-    fn test_nested_complex_types_error() {
-        // Nested complex types return error
-        let result = ducklake_to_arrow_type("list<struct<a:int32,b:varchar>>");
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("Nested complex type"));
-                assert!(msg.contains("not yet supported"));
-            },
-            _ => panic!("Expected UnsupportedType error for nested complex type"),
-        }
+    fn test_arbitrarily_composed_nested_types() {
+        let type_name = "list<struct<levels:list<struct<price:decimal(38, 16)>>,attrs:map<varchar,list<int32>>>>";
+        let arrow = ducklake_to_arrow_type(type_name).unwrap();
+        assert_eq!(arrow_to_ducklake_type(&arrow).unwrap(), type_name);
 
-        // Nested list also errors
-        assert!(ducklake_to_arrow_type("list<list<int32>>").is_err());
-        assert!(ducklake_to_arrow_type("int32[][]").is_err());
+        let nested_lists = ducklake_to_arrow_type("int32[][]").unwrap();
+        assert_eq!(
+            arrow_to_ducklake_type(&nested_lists).unwrap(),
+            "list<list<int32>>"
+        );
     }
 
     #[test]
@@ -1237,17 +1721,12 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_to_ducklake_unsupported_struct() {
+    fn test_arrow_to_ducklake_struct() {
         let struct_type = DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into());
-        let result = arrow_to_ducklake_type(&struct_type);
-        assert!(result.is_err());
-        match result {
-            Err(DuckLakeError::UnsupportedType(msg)) => {
-                assert!(msg.contains("Struct type"));
-                assert!(msg.contains("not yet supported"));
-            },
-            _ => panic!("Expected UnsupportedType error"),
-        }
+        assert_eq!(
+            arrow_to_ducklake_type(&struct_type).unwrap(),
+            "struct<a:int32>"
+        );
     }
 
     #[test]
@@ -1367,12 +1846,16 @@ mod tests {
                 column_name: "id".to_string(),
                 column_type: "int32".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
             DuckLakeTableColumn {
                 column_id: 2,
                 column_name: "tags".to_string(),
                 column_type: "list<varchar>".to_string(),
                 is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
             },
         ];
 
@@ -1385,17 +1868,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_schema_with_unsupported_type() {
-        // Test that build_arrow_schema propagates complex type errors
+    fn test_build_schema_with_struct_type() {
         let columns = vec![DuckLakeTableColumn {
             column_id: 1,
             column_name: "data".to_string(),
             column_type: "struct<a:int32>".to_string(),
             is_nullable: true,
+            data_type: Some(DataType::Struct(
+                vec![Arc::new(Field::new("a", DataType::Int32, false))].into(),
+            )),
+            nested_column_ids: Vec::new(),
         }];
 
-        let result = build_arrow_schema(&columns);
-        assert!(result.is_err());
+        let schema = build_arrow_schema(&columns).unwrap();
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into())
+        );
     }
 
     #[test]
@@ -1405,6 +1894,8 @@ mod tests {
             column_name: "id".to_string(),
             column_type: "int32".to_string(),
             is_nullable: true,
+            data_type: None,
+            nested_column_ids: Vec::new(),
         }];
 
         let mut parquet_field_ids = HashMap::new();
@@ -1421,6 +1912,8 @@ mod tests {
             column_name: "id".to_string(),
             column_type: "int32".to_string(),
             is_nullable: true,
+            data_type: None,
+            nested_column_ids: Vec::new(),
         }];
 
         let parquet_field_ids = HashMap::new();
@@ -1451,6 +1944,8 @@ mod tests {
             column_name: "id".to_string(),
             column_type: "int32".to_string(),
             is_nullable: true,
+            data_type: None,
+            nested_column_ids: Vec::new(),
         }];
 
         let mut parquet_field_ids = HashMap::new();

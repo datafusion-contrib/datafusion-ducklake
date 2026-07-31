@@ -9,11 +9,13 @@
 //! as `tests/it/mysql_metadata_provider_test.rs`: it is ignored under
 //! `skip-tests-with-docker` on macOS (Docker unavailable there).
 
+use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::{
     ColumnDef, DataFileInfo, MetadataProvider, MetadataWriter, MySqlMetadataProvider,
     MySqlMetadataWriter, SnapshotCommitMetadata, WriteMode,
 };
 use sqlx::Row;
+use std::sync::Arc;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::mysql::Mysql;
 
@@ -191,4 +193,95 @@ async fn mysql_writer_roundtrip_write_then_read() {
     assert_eq!(empty_structure[0].column_name, "c1");
     let empty_files = provider.get_table_files_for_select(empty_id, snap).unwrap();
     assert!(empty_files.is_empty(), "empty_t has no data files");
+
+    let levels = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(
+            vec![
+                Arc::new(Field::new("price", DataType::Decimal128(38, 16), false)),
+                Arc::new(Field::new("count", DataType::UInt32, false)),
+            ]
+            .into(),
+        ),
+        false,
+    )));
+    let nested_columns = vec![ColumnDef::from_arrow("bids", &levels, false).unwrap()];
+    let nested_setup = writer
+        .begin_write_transaction("main", "depths", &nested_columns, WriteMode::Replace)
+        .unwrap();
+    assert_eq!(nested_setup.column_ids, vec![nested_setup.field_ids[0]]);
+    assert_eq!(nested_setup.field_ids.len(), 4);
+    let nested_commit = writer
+        .register_data_file(
+            nested_setup.table_id,
+            "main",
+            "depths",
+            nested_setup.snapshot_id,
+            &DataFileInfo::new("depths.parquet", 1, 1),
+            WriteMode::Replace,
+            nested_setup.base_snapshot_id,
+            &nested_columns,
+            &nested_setup.field_ids,
+        )
+        .unwrap();
+    let nested_structure = provider
+        .get_table_structure(nested_setup.table_id, nested_commit.snapshot_id)
+        .unwrap();
+    assert_eq!(nested_structure.len(), 1);
+    assert_eq!(nested_structure[0].column_name, "bids");
+    assert_eq!(
+        nested_structure[0].column_type,
+        "list<struct<price:decimal(38, 16),count:uint32>>"
+    );
+
+    let nested_rows = sqlx::query(
+        "SELECT column_id, column_name, column_type, parent_column
+         FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(nested_setup.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let nested_actual = nested_rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<i64, _>("column_id").unwrap(),
+                row.try_get::<String, _>("column_name").unwrap(),
+                row.try_get::<String, _>("column_type").unwrap(),
+                row.try_get::<Option<i64>, _>("parent_column").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        nested_actual,
+        vec![
+            (
+                nested_setup.field_ids[0],
+                "bids".into(),
+                "list".into(),
+                None
+            ),
+            (
+                nested_setup.field_ids[1],
+                "element".into(),
+                "struct".into(),
+                Some(nested_setup.field_ids[0]),
+            ),
+            (
+                nested_setup.field_ids[2],
+                "price".into(),
+                "decimal(38, 16)".into(),
+                Some(nested_setup.field_ids[1]),
+            ),
+            (
+                nested_setup.field_ids[3],
+                "count".into(),
+                "uint32".into(),
+                Some(nested_setup.field_ids[1]),
+            ),
+        ]
+    );
 }
