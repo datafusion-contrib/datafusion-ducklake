@@ -69,6 +69,7 @@ pub mod information_schema;
 mod inlined_feed;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
+pub mod macros;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
@@ -177,6 +178,7 @@ pub use catalog::DuckLakeCatalog;
 pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
 pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
+pub use macros::register_ducklake_macros;
 pub use metadata_provider::{
     ColumnTag, ConsistentRead, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush,
     DuckLakeInlinedFlushData, DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag,

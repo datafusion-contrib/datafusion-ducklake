@@ -23,9 +23,9 @@ use crate::metadata_provider::{
     DuckLakeInlinedDelete, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,
     DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableField, DuckLakeTableFile, DuckLakeTag, FILE_METADATA_BATCH_SIZE, FileWithTable,
-    InlinedFileDeleteChange, InlinedRowSelection, InlinedRowsAfter, MetadataProvider, ObjectTag,
-    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    TagTarget, ViewMetadata, ViewWithSchema,
+    InlinedFileDeleteChange, InlinedRowSelection, InlinedRowsAfter, MacroMetadata,
+    MetadataProvider, ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata,
+    TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -868,6 +868,10 @@ impl MetadataProvider for MemoizedMetadataProvider {
 
     fn list_views(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
         self.reader()?.list_views(schema_id, snapshot_id)
+    }
+
+    fn list_macros(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<MacroMetadata>> {
+        self.reader()?.list_macros(schema_id, snapshot_id)
     }
 
     fn get_table_structure(
