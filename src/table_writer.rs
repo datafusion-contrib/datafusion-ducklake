@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+use arrow::array::{Array, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -826,6 +827,8 @@ impl DuckLakeTableWriter {
         partition_mode: StreamPartitionMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
+        let validation_schema =
+            Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
             self.metadata
@@ -950,6 +953,7 @@ impl DuckLakeTableWriter {
             column_ids: setup.column_ids,
             field_ids: setup.field_ids,
             schema_with_ids,
+            validation_schema,
             writer: Some(writer),
             temp: Some(temp),
             catalog_path,
@@ -1110,6 +1114,38 @@ impl DuckLakeTableWriter {
             session.write_batch(batch)?;
         }
         session.finish().await
+    }
+
+    fn validation_schema(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        incoming_schema: &Schema,
+    ) -> Result<Schema> {
+        let Some(columns) = self
+            .metadata
+            .get_table_column_nullability(schema_name, table_name)?
+        else {
+            return Ok(incoming_schema.clone());
+        };
+        let nullability: HashMap<&str, bool> = columns
+            .iter()
+            .map(|(name, nullable)| (name.as_str(), *nullable))
+            .collect();
+        let fields: Vec<Arc<Field>> = incoming_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                nullability.get(field.name().as_str()).map_or_else(
+                    || Arc::clone(field),
+                    |nullable| Arc::new(field.as_ref().clone().with_nullable(*nullable)),
+                )
+            })
+            .collect();
+        Ok(Schema::new_with_metadata(
+            fields,
+            incoming_schema.metadata().clone(),
+        ))
     }
 
     /// Write a positional `(file_path, pos)` delete parquet, upload it, and
@@ -1438,6 +1474,10 @@ impl DuckLakeTableWriter {
                 "write_partitioned: no partition groups".to_string(),
             ));
         }
+        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        for (_, batches) in &groups {
+            validate_not_null_batches(&validation_schema, batches)?;
+        }
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
             self.metadata
@@ -1630,6 +1670,8 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
     ) -> Result<WriteResult> {
+        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup =
             self.metadata
@@ -2972,6 +3014,7 @@ pub struct TableWriteSession {
     column_ids: Vec<i64>,
     field_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
+    validation_schema: SchemaRef,
     /// Parquet writer streaming to the local staging file (`temp`). Batches are
     /// written to disk as they arrive rather than buffered in memory, so peak
     /// memory stays bounded by the parquet row-group size regardless of table
@@ -3111,6 +3154,7 @@ impl TableWriteSession {
                 )));
             }
         }
+        validate_not_null_batches(&self.validation_schema, std::slice::from_ref(batch))?;
         Ok(())
     }
 
@@ -3497,6 +3541,174 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
         .collect()
 }
 
+pub(crate) fn validate_not_null_batches(
+    target_schema: &Schema,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    for batch in batches {
+        if batch.num_columns() < target_schema.fields().len() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Schema mismatch: batch has {} columns, expected at least {}",
+                batch.num_columns(),
+                target_schema.fields().len()
+            )));
+        }
+
+        let active = vec![true; batch.num_rows()];
+        for (field, array) in target_schema.fields().iter().zip(batch.columns()) {
+            validate_field_not_null(field, array.as_ref(), field.name(), &active)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_not_null(
+    field: &Field,
+    array: &dyn Array,
+    path: &str,
+    active: &[bool],
+) -> Result<()> {
+    if active.len() != array.len() {
+        return Err(crate::error::DuckLakeError::Internal(format!(
+            "NOT NULL validation length mismatch at column '{path}': {} active rows for {} values",
+            active.len(),
+            array.len()
+        )));
+    }
+    if !field.is_nullable()
+        && active
+            .iter()
+            .enumerate()
+            .any(|(index, is_active)| *is_active && array.is_null(index))
+    {
+        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+            "NOT NULL constraint failed: {path}"
+        )));
+    }
+
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::InvalidConfig(format!(
+                        "Schema mismatch at column '{path}': expected struct, got {}",
+                        array.data_type()
+                    ))
+                })?;
+            let child_active: Vec<bool> = active
+                .iter()
+                .enumerate()
+                .map(|(index, is_active)| *is_active && values.is_valid(index))
+                .collect();
+            if fields.len() != values.num_columns() {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column '{path}': batch has {} struct fields, expected {}",
+                    values.num_columns(),
+                    fields.len()
+                )));
+            }
+            for (child, values) in fields.iter().zip(values.columns()) {
+                let child_path = format!("{path}.{}", child.name());
+                validate_field_not_null(child, values.as_ref(), &child_path, &child_active)?;
+            }
+        },
+        DataType::List(child) => {
+            let values = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column '{path}': expected list, got {}",
+                    array.data_type()
+                ))
+            })?;
+            let mut child_active = vec![false; values.values().len()];
+            let offsets = values.value_offsets();
+            for (index, is_active) in active.iter().enumerate() {
+                if *is_active && values.is_valid(index) {
+                    child_active[offsets[index] as usize..offsets[index + 1] as usize].fill(true);
+                }
+            }
+            let child_path = format!("{path}.{}", child.name());
+            validate_field_not_null(child, values.values().as_ref(), &child_path, &child_active)?;
+        },
+        DataType::LargeList(child) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::InvalidConfig(format!(
+                        "Schema mismatch at column '{path}': expected large list, got {}",
+                        array.data_type()
+                    ))
+                })?;
+            let mut child_active = vec![false; values.values().len()];
+            let offsets = values.value_offsets();
+            for (index, is_active) in active.iter().enumerate() {
+                if *is_active && values.is_valid(index) {
+                    child_active[offsets[index] as usize..offsets[index + 1] as usize].fill(true);
+                }
+            }
+            let child_path = format!("{path}.{}", child.name());
+            validate_field_not_null(child, values.values().as_ref(), &child_path, &child_active)?;
+        },
+        DataType::FixedSizeList(child, _) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::InvalidConfig(format!(
+                        "Schema mismatch at column '{path}': expected fixed-size list, got {}",
+                        array.data_type()
+                    ))
+                })?;
+            let mut child_active = vec![false; values.values().len()];
+            let item_count = values.value_length() as usize;
+            for (index, is_active) in active.iter().enumerate() {
+                if *is_active && values.is_valid(index) {
+                    let offset = values.value_offset(index) as usize;
+                    child_active[offset..offset + item_count].fill(true);
+                }
+            }
+            let child_path = format!("{path}.{}", child.name());
+            validate_field_not_null(child, values.values().as_ref(), &child_path, &child_active)?;
+        },
+        DataType::Map(entries, _) => {
+            let values = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column '{path}': expected map, got {}",
+                    array.data_type()
+                ))
+            })?;
+            let mut entry_active = vec![false; values.entries().len()];
+            let offsets = values.value_offsets();
+            for (index, is_active) in active.iter().enumerate() {
+                if *is_active && values.is_valid(index) {
+                    entry_active[offsets[index] as usize..offsets[index + 1] as usize].fill(true);
+                }
+            }
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column '{path}': map entries must be a struct"
+                )));
+            };
+            if fields.len() != values.entries().num_columns() {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Schema mismatch at column '{path}': batch has {} map fields, expected {}",
+                    values.entries().num_columns(),
+                    fields.len()
+                )));
+            }
+            for (child, values) in fields.iter().zip(values.entries().columns()) {
+                let child_path = format!("{path}.{}", child.name());
+                validate_field_not_null(child, values.as_ref(), &child_path, &entry_active)?;
+            }
+        },
+        _ => {},
+    }
+
+    Ok(())
+}
+
 fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Schema> {
     fn with_field_id(field: &Field, column_ids: &[i64], next_id: &mut usize) -> Result<Field> {
         let field_id = column_ids.get(*next_id).copied().ok_or_else(|| {
@@ -3608,8 +3820,11 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Decimal128Array, Int32Array, StringArray, StringViewArray, StructArray};
-    use arrow::datatypes::DataType;
+    use arrow::array::{
+        Decimal128Array, Int32Array, ListArray, StringArray, StringViewArray, StructArray,
+    };
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::{DataType, Int32Type};
     use rstest::rstest;
 
     #[rstest]
@@ -3745,6 +3960,105 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
+    }
+
+    #[test]
+    fn test_validate_not_null_batches_names_top_level_column() {
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let target_schema = Schema::new(vec![Field::new("required", DataType::Int32, false)]);
+
+        let error = validate_not_null_batches(&target_schema, &[batch]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: NOT NULL constraint failed: required"
+        );
+    }
+
+    #[test]
+    fn test_validate_not_null_batches_names_nested_struct_path() {
+        let child = Arc::new(Field::new("required", DataType::Int32, true));
+        let values = StructArray::new(
+            vec![Arc::clone(&child)].into(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+            None,
+        );
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "profile",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(values)]).unwrap();
+        let target_child = Field::new("required", DataType::Int32, false);
+        let target_schema = Schema::new(vec![Field::new(
+            "profile",
+            DataType::Struct(vec![target_child].into()),
+            true,
+        )]);
+
+        let error = validate_not_null_batches(&target_schema, &[batch]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: NOT NULL constraint failed: profile.required"
+        );
+    }
+
+    #[test]
+    fn test_validate_not_null_batches_ignores_child_null_under_null_parent() {
+        let child = Arc::new(Field::new("required", DataType::Int32, true));
+        let values = StructArray::new(
+            vec![Arc::clone(&child)].into(),
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+            Some(NullBuffer::from(vec![true, false])),
+        );
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "profile",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(values)]).unwrap();
+        let target_child = Field::new("required", DataType::Int32, false);
+        let target_schema = Schema::new(vec![Field::new(
+            "profile",
+            DataType::Struct(vec![target_child].into()),
+            true,
+        )]);
+
+        validate_not_null_batches(&target_schema, &[batch]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_not_null_batches_names_list_element_path() {
+        let values =
+            ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![Some(1), None])]);
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "items",
+            values.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(batch_schema, vec![Arc::new(values)]).unwrap();
+        let target_schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+            true,
+        )]);
+
+        let error = validate_not_null_batches(&target_schema, &[batch]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: NOT NULL constraint failed: items.element"
+        );
     }
 
     #[test]
