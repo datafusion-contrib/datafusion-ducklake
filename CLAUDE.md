@@ -226,7 +226,8 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 ### Current Limitations
 - Writes are supported on SQLite and PostgreSQL only; DuckDB and MySQL are read-only
 - No `UPDATE` / `DELETE` operations yet (delete files are read but not written)
-- No SQL-level time travel (`AS OF`); a catalog binds to one snapshot, selectable programmatically via `DuckLakeCatalog::with_snapshot`
+- No SQL `AS OF` syntax; use `DuckLakeCatalog::with_snapshot`,
+  `DuckLakeCatalog::with_snapshot_at`, or `ducklake_table_at` for snapshot selection
 - Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
 - Partitioning (`identity` + temporal `year`/`month`/`day`/`hour`) is supported: read + pruning on
   all backends, and partitioned writes on every writable backend, declared via

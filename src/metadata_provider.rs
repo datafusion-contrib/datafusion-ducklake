@@ -349,6 +349,98 @@ pub struct SnapshotMetadata {
     pub timestamp: Option<String>,
 }
 
+pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
+    let mut timestamp = raw.trim();
+    for suffix in ["Z", " UTC", "+00:00", "+00"] {
+        if let Some(stripped) = timestamp.strip_suffix(suffix) {
+            timestamp = stripped.trim();
+            break;
+        }
+    }
+    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(timestamp, format) {
+            return Some(parsed);
+        }
+    }
+    chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d")
+        .ok()
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+}
+
+pub(crate) fn resolve_snapshot_at_or_before(
+    provider: &dyn MetadataProvider,
+    timestamp: chrono::NaiveDateTime,
+) -> Result<i64> {
+    resolve_snapshot_at(provider, timestamp, false)
+}
+
+pub(crate) fn resolve_snapshot_at_or_after(
+    provider: &dyn MetadataProvider,
+    timestamp: chrono::NaiveDateTime,
+) -> Result<i64> {
+    resolve_snapshot_at(provider, timestamp, true)
+}
+
+fn resolve_snapshot_at(
+    provider: &dyn MetadataProvider,
+    timestamp: chrono::NaiveDateTime,
+    at_or_after: bool,
+) -> Result<i64> {
+    let mut best: Option<(chrono::NaiveDateTime, i64)> = None;
+    for snapshot in provider.list_snapshots()? {
+        let Some(candidate_time) = snapshot
+            .timestamp
+            .as_deref()
+            .and_then(parse_snapshot_timestamp)
+        else {
+            continue;
+        };
+        if (at_or_after && candidate_time < timestamp)
+            || (!at_or_after && candidate_time > timestamp)
+        {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((best_time, best_id)) if at_or_after => {
+                candidate_time < best_time
+                    || (candidate_time == best_time && snapshot.snapshot_id < best_id)
+            },
+            Some((best_time, best_id)) => {
+                candidate_time > best_time
+                    || (candidate_time == best_time && snapshot.snapshot_id > best_id)
+            },
+        };
+        if replace {
+            best = Some((candidate_time, snapshot.snapshot_id));
+        }
+    }
+    best.map(|(_, snapshot_id)| snapshot_id).ok_or_else(|| {
+        crate::error::DuckLakeError::InvalidSnapshot(format!(
+            "No snapshot found {} timestamp {timestamp}",
+            if at_or_after {
+                "at or after"
+            } else {
+                "at or before"
+            }
+        ))
+    })
+}
+
+pub(crate) fn require_snapshot(provider: &dyn MetadataProvider, snapshot_id: i64) -> Result<i64> {
+    if provider
+        .list_snapshots()?
+        .iter()
+        .any(|snapshot| snapshot.snapshot_id == snapshot_id)
+    {
+        Ok(snapshot_id)
+    } else {
+        Err(crate::error::DuckLakeError::InvalidSnapshot(format!(
+            "Snapshot {snapshot_id} does not exist"
+        )))
+    }
+}
+
 /// Metadata for a schema in the DuckLake catalog
 #[derive(Debug, Clone)]
 pub struct SchemaMetadata {

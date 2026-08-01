@@ -65,5 +65,6 @@ mod sqllogictest_runner;
 mod table_changes_tests;
 mod table_deletions_repartition_tests;
 mod table_tests;
+mod time_travel_tests;
 mod type_promotion_tests;
 mod write_tests;

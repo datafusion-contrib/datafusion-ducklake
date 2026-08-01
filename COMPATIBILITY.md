@@ -214,10 +214,12 @@ Known edges:
 ## Limitations
 
 - **Write backends:** DuckDB and MySQL are read-only; writes require SQLite or PostgreSQL.
-- **No SQL-level time travel:** a catalog is bound to a single snapshot. You *can* select
-  the snapshot programmatically — `DuckLakeCatalog::with_snapshot(provider, snapshot_id)`
-  binds to a specific one, and querying another point in time means creating another
-  catalog. What's missing is SQL-level historical querying (`AS OF`) within one handle.
+- **No `AS OF` syntax:** select a catalog snapshot by ID with
+  `DuckLakeCatalog::with_snapshot`, by UTC timestamp with
+  `DuckLakeCatalog::with_snapshot_at`, or select one table per query with
+  `ducklake_table_at`. Timestamp selection uses the latest snapshot at or before the
+  requested time. For snapshots with the same timestamp, an as‑of or change‑data end
+  bound selects the highest ID, while a change‑data start bound selects the lowest ID.
 - **One mutation per session, then re-open the catalog.** Because a catalog pins its
   snapshot at creation and never refreshes, a `SessionContext` observes a single generation
   for its lifetime. After an `UPDATE`/`DELETE`/`INSERT` commits, the same session keeps

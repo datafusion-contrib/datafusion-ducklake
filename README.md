@@ -274,8 +274,8 @@ A few highlights worth knowing up front:
 
 - Reads work on DuckDB, SQLite, PostgreSQL, and MySQL; **writes are SQLite/PostgreSQL only**.
 - Object stores: local filesystem and S3-compatible (S3, MinIO).
-- Snapshots can be selected programmatically (`DuckLakeCatalog::with_snapshot`), but there
-  is no SQL-level time travel (`AS OF`) yet.
+- Snapshots can be selected through `DuckLakeCatalog` or per query with
+  `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
 - Table partitioning: read + file pruning on all backends; partitioned writes on SQLite.
 - Data inlined by DuckDB's ducklake extension is **not read** — see COMPATIBILITY.md for
   the `COUNT(*)` undercount caveat and how to avoid it.

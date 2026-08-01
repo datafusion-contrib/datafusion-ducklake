@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::information_schema::InformationSchemaProvider;
-use crate::metadata_provider::MetadataProvider;
+use crate::metadata_provider::{MetadataProvider, resolve_snapshot_at_or_before};
 use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::schema::DuckLakeSchema;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
@@ -88,6 +88,17 @@ impl DuckLakeCatalog {
             #[cfg(feature = "write")]
             write_config: None,
         })
+    }
+
+    /// Create a read-only catalog bound to the latest snapshot at or before a
+    /// UTC timestamp. When snapshots share a timestamp, selects the highest
+    /// snapshot ID so every commit recorded at that instant is visible.
+    pub fn with_snapshot_at(
+        provider: Arc<dyn MetadataProvider>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Self> {
+        let snapshot_id = resolve_snapshot_at_or_before(provider.as_ref(), timestamp.naive_utc())?;
+        Self::with_snapshot(provider, snapshot_id)
     }
 
     /// Create a catalog with write support.

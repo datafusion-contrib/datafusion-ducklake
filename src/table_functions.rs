@@ -7,8 +7,12 @@ use datafusion::logical_expr::Expr;
 use std::sync::Arc;
 
 use crate::information_schema::{FilesTable, SnapshotsTable, TableInfoTable};
-use crate::metadata_provider::MetadataProvider;
+use crate::metadata_provider::{
+    MetadataProvider, parse_snapshot_timestamp, require_snapshot, resolve_snapshot_at_or_after,
+    resolve_snapshot_at_or_before,
+};
 use crate::path_resolver::{parse_object_store_url, resolve_path};
+use crate::table::DuckLakeTable;
 use crate::table_changes::{TableChangesTable, TableInsertionsTable};
 use crate::table_deletions::TableDeletionsTable;
 use crate::types::build_arrow_schema;
@@ -83,6 +87,86 @@ impl TableFunctionImpl for DucklakeListFilesFunction {
 }
 
 #[derive(Debug)]
+pub struct DucklakeTableAtFunction {
+    provider: Arc<dyn MetadataProvider>,
+}
+
+impl DucklakeTableAtFunction {
+    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+        Self {
+            provider,
+        }
+    }
+}
+
+impl TableFunctionImpl for DucklakeTableAtFunction {
+    fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
+        const FN_NAME: &str = "ducklake_table_at";
+        if exprs.len() != 3 {
+            return plan_err!(
+                "{FN_NAME}() requires 3 arguments: \
+                 {FN_NAME}('schema', 'table', version_or_timestamp)"
+            );
+        }
+        let string_arg = |expr: &Expr, name: &str| match expr {
+            Expr::Literal(ScalarValue::Utf8(Some(value)), _) => Ok(value.clone()),
+            _ => plan_err!("{name} of {FN_NAME}() must be a string literal"),
+        };
+        let schema_name = string_arg(&exprs[0], "schema")?;
+        let table_name = string_arg(&exprs[1], "table")?;
+        let snapshot_id = resolve_snapshot_bound(
+            &self.provider,
+            &exprs[2],
+            FN_NAME,
+            "version_or_timestamp",
+            false,
+        )?;
+        require_snapshot(self.provider.as_ref(), snapshot_id)
+            .map_err(|error| datafusion::error::DataFusionError::Plan(error.to_string()))?;
+
+        let schema = self
+            .provider
+            .get_schema_by_name(&schema_name, snapshot_id)
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Schema '{schema_name}' does not exist at snapshot {snapshot_id}"
+                ))
+            })?;
+        let table = self
+            .provider
+            .get_table_by_name(schema.schema_id, &table_name, snapshot_id)
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Table '{schema_name}.{table_name}' does not exist at snapshot {snapshot_id}"
+                ))
+            })?;
+        let data_path = self
+            .provider
+            .get_data_path()
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let (object_store_url, catalog_path) = parse_object_store_url(&data_path)
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let schema_path = resolve_path(&catalog_path, &schema.path, schema.path_is_relative)
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let table_path = resolve_path(&schema_path, &table.path, table.path_is_relative)
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let provider = DuckLakeTable::new(
+            table.table_id,
+            table.table_name,
+            Arc::clone(&self.provider),
+            snapshot_id,
+            Arc::new(object_store_url),
+            table_path,
+        )
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+
+        Ok(Arc::new(provider))
+    }
+}
+
+#[derive(Debug)]
 pub struct DucklakeTableChangesFunction {
     provider: Arc<dyn MetadataProvider>,
 }
@@ -112,32 +196,11 @@ fn parse_table_name(table_name: &str) -> (&str, &str) {
     }
 }
 
-/// Parse a snapshot-time string as stored by the catalog backends. Accepts
-/// `YYYY-MM-DD HH:MM:SS[.fff]` / `YYYY-MM-DDTHH:MM:SS[.fff]` / `YYYY-MM-DD`,
-/// with an optional trailing `Z`, ` UTC`, `+00` or `+00:00` (times are UTC).
-fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
-    let mut t = raw.trim();
-    for suffix in ["Z", " UTC", "+00:00", "+00"] {
-        if let Some(stripped) = t.strip_suffix(suffix) {
-            t = stripped.trim();
-            break;
-        }
-    }
-    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
-        if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(t, fmt) {
-            return Some(ts);
-        }
-    }
-    chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-}
-
 /// Resolve a snapshot bound argument: an integer snapshot id, or a timestamp
 /// (a string literal or a `TIMESTAMP '...'` cast) resolved against the
-/// catalog's snapshot times — a START bound resolves to the FIRST snapshot
+/// catalog's snapshot times: a START bound resolves to the FIRST snapshot
 /// at-or-after the timestamp, an END bound to the LAST snapshot at-or-before
-/// it, matching official DuckLake's `AT (TIMESTAMP => ...)` semantics.
+/// it.
 fn resolve_snapshot_bound(
     provider: &Arc<dyn MetadataProvider>,
     expr: &Expr,
@@ -201,37 +264,13 @@ fn resolve_snapshot_bound(
         },
     };
 
-    let snapshots = provider
-        .list_snapshots()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-    let mut best: Option<i64> = None;
-    for s in &snapshots {
-        let Some(t) = s.timestamp.as_deref().and_then(parse_snapshot_timestamp) else {
-            continue;
-        };
-        let candidate = if is_start {
-            t >= ts
-        } else {
-            t <= ts
-        };
-        if candidate {
-            best = Some(match best {
-                None => s.snapshot_id,
-                Some(b) if is_start => b.min(s.snapshot_id),
-                Some(b) => b.max(s.snapshot_id),
-            });
-        }
-    }
-    best.ok_or_else(|| {
-        datafusion::error::DataFusionError::Plan(format!(
-            "{fn_name}(): no snapshot {} timestamp {ts}",
-            if is_start {
-                "at or after"
-            } else {
-                "at or before"
-            },
-        ))
-    })
+    let resolved = if is_start {
+        resolve_snapshot_at_or_after(provider.as_ref(), ts)
+    } else {
+        resolve_snapshot_at_or_before(provider.as_ref(), ts)
+    };
+    resolved
+        .map_err(|error| datafusion::error::DataFusionError::Plan(format!("{fn_name}(): {error}")))
 }
 
 /// Parse the common `('schema.table', start, end)` argument list of the CDC
@@ -413,6 +452,10 @@ pub fn register_ducklake_functions(
         Arc::new(DucklakeListFilesFunction::new(provider.clone())),
     );
     ctx.register_udtf(
+        "ducklake_table_at",
+        Arc::new(DucklakeTableAtFunction::new(provider.clone())),
+    );
+    ctx.register_udtf(
         "ducklake_table_changes",
         Arc::new(DucklakeTableChangesFunction::new(provider.clone())),
     );
@@ -428,7 +471,7 @@ pub fn register_ducklake_functions(
 
 #[cfg(test)]
 mod snapshot_bound_tests {
-    use super::parse_snapshot_timestamp;
+    use crate::metadata_provider::parse_snapshot_timestamp;
 
     #[test]
     fn parses_backend_snapshot_time_formats() {
