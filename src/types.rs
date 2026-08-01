@@ -18,6 +18,32 @@ use datafusion::physical_expr_adapter::{
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
 
+pub(crate) const ARROW_EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
+pub(crate) const ARROW_EXTENSION_METADATA_KEY: &str = "ARROW:extension:metadata";
+pub(crate) const GEOMETRY_EXTENSION_NAME: &str = "geoarrow.wkb";
+
+#[cfg(feature = "write")]
+pub(crate) fn is_geometry_field(field: &Field) -> bool {
+    field
+        .metadata()
+        .get(ARROW_EXTENSION_NAME_KEY)
+        .map(String::as_str)
+        == Some(GEOMETRY_EXTENSION_NAME)
+}
+
+fn with_geometry_extension(field: Field, ducklake_type: &str) -> Field {
+    if !refuses_inlining(ducklake_type) {
+        return field;
+    }
+    let mut metadata = field.metadata().clone();
+    metadata.insert(
+        ARROW_EXTENSION_NAME_KEY.to_string(),
+        GEOMETRY_EXTENSION_NAME.to_string(),
+    );
+    metadata.insert(ARROW_EXTENSION_METADATA_KEY.to_string(), "{}".to_string());
+    field.with_metadata(metadata)
+}
+
 pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
 
 pub(crate) const INITIAL_DEFAULT_METADATA_KEY: &str = "ducklake.initial_default";
@@ -1014,7 +1040,10 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
         .iter()
         .map(|col| {
             let data_type = read_compatible_data_type(&col.data_type()?, true);
-            Ok(Field::new(&col.column_name, data_type, col.is_nullable))
+            Ok(with_geometry_extension(
+                Field::new(&col.column_name, data_type, col.is_nullable),
+                &col.column_type,
+            ))
         })
         .collect();
 
@@ -1931,7 +1960,7 @@ pub fn build_read_schema_with_field_id_mapping(
                     initial_default.clone(),
                 )]));
             }
-            Ok(field)
+            Ok(with_geometry_extension(field, &col.column_type))
         })
         .collect();
 

@@ -1738,9 +1738,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 })
             };
             let statistics = match sqlx::query(AssertSqlSafe(format!(
-                "SELECT stats.data_file_id, stats.column_id,
-                        stats.column_size_bytes, stats.value_count, stats.null_count,
-                        stats.min_value, stats.max_value, stats.contains_nan
+                "SELECT stats.*
                  FROM ducklake_file_column_stats AS stats
                  INNER JOIN ducklake_data_file AS data
                    ON data.data_file_id = stats.data_file_id
@@ -1767,14 +1765,15 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.try_get(0)?,
-                            column_id: row.try_get(1)?,
-                            column_size_bytes: row.try_get(2)?,
-                            value_count: row.try_get(3)?,
-                            null_count: row.try_get(4)?,
-                            min_value: row.try_get(5)?,
-                            max_value: row.try_get(6)?,
-                            contains_nan: row.try_get(7)?,
+                            data_file_id: row.try_get("data_file_id")?,
+                            column_id: row.try_get("column_id")?,
+                            column_size_bytes: row.try_get("column_size_bytes")?,
+                            value_count: row.try_get("value_count")?,
+                            null_count: row.try_get("null_count")?,
+                            min_value: row.try_get("min_value")?,
+                            max_value: row.try_get("max_value")?,
+                            contains_nan: row.try_get("contains_nan")?,
+                            extra_stats: row.try_get("extra_stats").unwrap_or(None),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -1875,7 +1874,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             .fetch_one(&mut *self.connection().await?)
             .await?;
             let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+                "SELECT *
                  FROM ducklake_table_column_stats WHERE table_id = ?",
             )
             .bind(table_id)
@@ -1885,13 +1884,14 @@ impl MetadataProvider for MySqlMetadataProvider {
                 Ok(rows) => rows
                     .into_iter()
                     .map(|row| {
-                        let column_id = row.try_get(0)?;
+                        let column_id = row.try_get("column_id")?;
                         Ok(DuckLakeTableColumnStatistics {
                             column_id,
-                            contains_null: row.try_get(1)?,
-                            min_value: row.try_get(2)?,
-                            max_value: row.try_get(3)?,
-                            contains_nan: row.try_get(4)?,
+                            contains_null: row.try_get("contains_null")?,
+                            min_value: row.try_get("min_value")?,
+                            max_value: row.try_get("max_value")?,
+                            contains_nan: row.try_get("contains_nan")?,
+                            extra_stats: row.try_get("extra_stats").unwrap_or(None),
                             column_size_bytes: None,
                             bounds_are_exact,
                         })
@@ -1931,7 +1931,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             };
 
             let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+                "SELECT *
                  FROM ducklake_table_column_stats WHERE table_id = ?",
             )
             .bind(table_id)
@@ -1942,11 +1942,12 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeTableColumnStatistics {
-                            column_id: row.try_get(0)?,
-                            contains_null: row.try_get(1)?,
-                            min_value: row.try_get(2)?,
-                            max_value: row.try_get(3)?,
-                            contains_nan: row.try_get(4)?,
+                            column_id: row.try_get("column_id")?,
+                            contains_null: row.try_get("contains_null")?,
+                            min_value: row.try_get("min_value")?,
+                            max_value: row.try_get("max_value")?,
+                            contains_nan: row.try_get("contains_nan")?,
+                            extra_stats: row.try_get("extra_stats").unwrap_or(None),
                             column_size_bytes: None,
                             bounds_are_exact: false,
                         })
@@ -1957,15 +1958,7 @@ impl MetadataProvider for MySqlMetadataProvider {
             };
 
             let files = match sqlx::query(
-                "SELECT
-                    stats.data_file_id,
-                    stats.column_id,
-                    stats.column_size_bytes,
-                    stats.value_count,
-                    stats.null_count,
-                    stats.min_value,
-                    stats.max_value,
-                    stats.contains_nan
+                "SELECT stats.*
                  FROM ducklake_file_column_stats AS stats
                  INNER JOIN ducklake_data_file AS data
                     ON data.data_file_id = stats.data_file_id
@@ -1984,14 +1977,15 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .into_iter()
                     .map(|row| {
                         Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.try_get(0)?,
-                            column_id: row.try_get(1)?,
-                            column_size_bytes: row.try_get(2)?,
-                            value_count: row.try_get(3)?,
-                            null_count: row.try_get(4)?,
-                            min_value: row.try_get(5)?,
-                            max_value: row.try_get(6)?,
-                            contains_nan: row.try_get(7)?,
+                            data_file_id: row.try_get("data_file_id")?,
+                            column_id: row.try_get("column_id")?,
+                            column_size_bytes: row.try_get("column_size_bytes")?,
+                            value_count: row.try_get("value_count")?,
+                            null_count: row.try_get("null_count")?,
+                            min_value: row.try_get("min_value")?,
+                            max_value: row.try_get("max_value")?,
+                            contains_nan: row.try_get("contains_nan")?,
+                            extra_stats: row.try_get("extra_stats").unwrap_or(None),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,

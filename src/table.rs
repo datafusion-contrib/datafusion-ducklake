@@ -7724,6 +7724,7 @@ mod tests {
                     min_value: Some("1".to_string()),
                     max_value: Some("1000000".to_string()),
                     contains_nan: None,
+                    extra_stats: None,
                     column_size_bytes: Some(1_000_000),
                     bounds_are_exact: true,
                 }],
@@ -7771,6 +7772,7 @@ mod tests {
                         min_value: Some(data_file_id.to_string()),
                         max_value: Some(data_file_id.to_string()),
                         contains_nan: None,
+                        extra_stats: None,
                     }],
                 })
                 .collect();
@@ -8299,6 +8301,7 @@ mod tests {
         }
         let column_statistics = id_bounds
             .map(|(min, max)| DuckLakeFileColumnStatistics {
+                extra_stats: None,
                 data_file_id,
                 column_id: ID_COLUMN_ID,
                 column_size_bytes: Some(8),
@@ -9249,6 +9252,7 @@ mod tests {
                     min_value: Some("0".to_string()),
                     max_value: Some("9".to_string()),
                     contains_nan: None,
+                    extra_stats: None,
                     column_size_bytes: Some(40),
                     bounds_are_exact: false,
                 }],
@@ -9296,6 +9300,7 @@ mod tests {
                         min_value: Some("1.0".to_string()),
                         max_value: Some("2.0".to_string()),
                         contains_nan,
+                        extra_stats: None,
                     }],
                     ..Default::default()
                 },
@@ -9360,6 +9365,7 @@ mod tests {
                         min_value: Some("1.0".to_string()),
                         max_value: Some("2.0".to_string()),
                         contains_nan,
+                        extra_stats: None,
                         column_size_bytes: Some(16),
                         bounds_are_exact: true,
                     }],
@@ -9419,6 +9425,7 @@ mod tests {
                 min_value: Some(min.to_string()),
                 max_value: Some(max.to_string()),
                 contains_nan,
+                extra_stats: None,
             };
         let build = |nan_b| {
             build_datafusion_statistics(

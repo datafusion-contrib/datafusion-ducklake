@@ -1993,13 +1993,14 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let columns = match conn.prepare(SQL_GET_TABLE_COLUMN_STATS) {
             Ok(mut stmt) => stmt
                 .query_map([table_id], |row| {
-                    let column_id = row.get(0)?;
+                    let column_id = row.get("column_id")?;
                     Ok(DuckLakeTableColumnStatistics {
                         column_id,
-                        contains_null: row.get(1)?,
-                        min_value: row.get(2)?,
-                        max_value: row.get(3)?,
-                        contains_nan: row.get(4)?,
+                        contains_null: row.get("contains_null")?,
+                        min_value: row.get("min_value")?,
+                        max_value: row.get("max_value")?,
+                        contains_nan: row.get("contains_nan")?,
+                        extra_stats: row.get("extra_stats").unwrap_or(None),
                         column_size_bytes: None,
                         bounds_are_exact,
                     })
@@ -2125,9 +2126,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             })
         };
         let statistics = match conn.prepare(&format!(
-            "SELECT stats.data_file_id, stats.column_id,
-                    stats.column_size_bytes, stats.value_count, stats.null_count,
-                    stats.min_value, stats.max_value, stats.contains_nan
+            "SELECT stats.*
              FROM ducklake_file_column_stats AS stats
              INNER JOIN ducklake_data_file AS data
                ON data.data_file_id = stats.data_file_id
@@ -2151,14 +2150,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     ],
                     |row| {
                         Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.get(0)?,
-                            column_id: row.get(1)?,
-                            column_size_bytes: row.get(2)?,
-                            value_count: row.get(3)?,
-                            null_count: row.get(4)?,
-                            min_value: row.get(5)?,
-                            max_value: row.get(6)?,
-                            contains_nan: row.get(7)?,
+                            data_file_id: row.get("data_file_id")?,
+                            column_id: row.get("column_id")?,
+                            column_size_bytes: row.get("column_size_bytes")?,
+                            value_count: row.get("value_count")?,
+                            null_count: row.get("null_count")?,
+                            min_value: row.get("min_value")?,
+                            max_value: row.get("max_value")?,
+                            contains_nan: row.get("contains_nan")?,
+                            extra_stats: row.get("extra_stats").unwrap_or(None),
                         })
                     },
                 )?
@@ -2248,11 +2248,12 @@ impl MetadataProvider for DuckdbMetadataProvider {
             Ok(mut stmt) => stmt
                 .query_map([table_id], |row| {
                     Ok(DuckLakeTableColumnStatistics {
-                        column_id: row.get(0)?,
-                        contains_null: row.get(1)?,
-                        min_value: row.get(2)?,
-                        max_value: row.get(3)?,
-                        contains_nan: row.get(4)?,
+                        column_id: row.get("column_id")?,
+                        contains_null: row.get("contains_null")?,
+                        min_value: row.get("min_value")?,
+                        max_value: row.get("max_value")?,
+                        contains_nan: row.get("contains_nan")?,
+                        extra_stats: row.get("extra_stats").unwrap_or(None),
                         column_size_bytes: None,
                         bounds_are_exact: false,
                     })
@@ -2266,14 +2267,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
             Ok(mut stmt) => stmt
                 .query_map([table_id, snapshot_id, snapshot_id], |row| {
                     Ok(DuckLakeFileColumnStatistics {
-                        data_file_id: row.get(0)?,
-                        column_id: row.get(1)?,
-                        column_size_bytes: row.get(2)?,
-                        value_count: row.get(3)?,
-                        null_count: row.get(4)?,
-                        min_value: row.get(5)?,
-                        max_value: row.get(6)?,
-                        contains_nan: row.get(7)?,
+                        data_file_id: row.get("data_file_id")?,
+                        column_id: row.get("column_id")?,
+                        column_size_bytes: row.get("column_size_bytes")?,
+                        value_count: row.get("value_count")?,
+                        null_count: row.get("null_count")?,
+                        min_value: row.get("min_value")?,
+                        max_value: row.get("max_value")?,
+                        contains_nan: row.get("contains_nan")?,
+                        extra_stats: row.get("extra_stats").unwrap_or(None),
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?,

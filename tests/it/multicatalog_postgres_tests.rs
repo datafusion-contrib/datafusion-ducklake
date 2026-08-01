@@ -6631,6 +6631,7 @@ async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
                 value_count: i64,
                 contains_nan: Option<bool>,
                 size: i64| ColumnStat {
+        extra_stats: None,
         column_id,
         min_value: min.map(str::to_string),
         max_value: max.map(str::to_string),
@@ -6753,6 +6754,7 @@ async fn register_existing_data_files_refuses_stats_for_columns_it_does_not_adop
     w.set_data_path("/data").unwrap();
 
     let stat = |column_id: i64| ColumnStat {
+        extra_stats: None,
         column_id,
         min_value: Some("1".into()),
         max_value: Some("2".into()),
@@ -6833,6 +6835,7 @@ async fn file_column_stats(pool: &PgPool, table_id: i64) -> Vec<(String, ColumnS
         (
             r.get::<String, _>(0),
             ColumnStat {
+                extra_stats: None,
                 column_id: r.get(1),
                 min_value: r.get(2),
                 max_value: r.get(3),
@@ -7041,6 +7044,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
 
     let stats = vec![
         ColumnStat {
+            extra_stats: None,
             column_id: begin.column_ids[0],
             min_value: Some("1".to_string()),
             max_value: Some("900".to_string()),
@@ -7050,6 +7054,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
             column_size_bytes: Some(1_111),
         },
         ColumnStat {
+            extra_stats: None,
             column_id: begin.column_ids[1],
             min_value: Some("alpha".to_string()),
             max_value: Some("omega".to_string()),
@@ -7060,6 +7065,7 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
         },
         // All-NULL column: bounds absent, size still present.
         ColumnStat {
+            extra_stats: None,
             column_id: begin.column_ids[2],
             min_value: None,
             max_value: None,
@@ -7311,6 +7317,7 @@ fn file_stats(column_ids: &[i64]) -> Vec<datafusion_ducklake::metadata_writer::C
         .iter()
         .map(
             |&column_id| datafusion_ducklake::metadata_writer::ColumnStat {
+                extra_stats: None,
                 column_id,
                 min_value: Some("1".to_string()),
                 max_value: Some("9".to_string()),

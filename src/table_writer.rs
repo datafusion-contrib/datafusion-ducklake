@@ -1657,7 +1657,7 @@ impl DuckLakeTableWriter {
         // A session buffers its first rows while they number at most the
         // table's limit, as official's insert does, and commits them inlined
         // when the write ends there.
-        let inline_limit = if inline && self.metadata.supports_data_inlining(arrow_schema) {
+        let inline_limit = if inline && self.supports_data_inlining(arrow_schema) {
             let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
             (limit > 0
                 && self
@@ -3351,6 +3351,14 @@ impl DuckLakeTableWriter {
         crate::metadata_writer::with_inlining_limit(self.configured_inlining_limit(), f)
     }
 
+    fn supports_data_inlining(&self, schema: &Schema) -> bool {
+        self.metadata.supports_data_inlining(schema)
+            && !schema
+                .fields()
+                .iter()
+                .any(|field| crate::types::is_geometry_field(field))
+    }
+
     /// Whether `rows` rows of `schema_name.table_name` go to inlined storage:
     /// at most the scoped limit, of types and values this writer inlines, in a
     /// table whose columns official inlines (no GEOMETRY).
@@ -3382,8 +3390,7 @@ impl DuckLakeTableWriter {
             limit: None,
         };
         // The deprecated flush writes the rows it flushes to Parquet.
-        if self.flushing_inlined || rows == 0 || !self.metadata.supports_data_inlining(arrow_schema)
-        {
+        if self.flushing_inlined || rows == 0 || !self.supports_data_inlining(arrow_schema) {
             return Ok(decision);
         }
         let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
@@ -3417,7 +3424,7 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         limit: Option<usize>,
     ) -> Result<bool> {
-        if !self.metadata.supports_data_inlining(arrow_schema) {
+        if !self.supports_data_inlining(arrow_schema) {
             return Ok(false);
         }
         let limit = match limit {
@@ -6868,7 +6875,13 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
     schema
         .fields()
         .iter()
-        .map(|field| ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()))
+        .map(|field| {
+            if crate::types::is_geometry_field(field) {
+                ColumnDef::new(field.name(), "geometry", field.is_nullable())
+            } else {
+                ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable())
+            }
+        })
         .collect()
 }
 
@@ -7910,6 +7923,28 @@ mod tests {
         assert_eq!(columns[1].name, "name");
         assert_eq!(columns[1].ducklake_type, "varchar");
         assert!(columns[1].is_nullable);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_column_defs_preserves_geometry() {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::types::ARROW_EXTENSION_NAME_KEY.to_string(),
+            crate::types::GEOMETRY_EXTENSION_NAME.to_string(),
+        );
+        metadata.insert(
+            crate::types::ARROW_EXTENSION_METADATA_KEY.to_string(),
+            "{}".to_string(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("g", DataType::Binary, true).with_metadata(metadata),
+        ]);
+
+        let columns = arrow_schema_to_column_defs(&schema).unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "g");
+        assert_eq!(columns[0].ducklake_type, "geometry");
+        assert!(columns[0].is_nullable);
     }
 
     #[test]

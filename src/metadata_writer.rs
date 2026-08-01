@@ -1314,6 +1314,7 @@ pub(crate) fn file_column_stats<'a>(
             file.column_stats
                 .iter()
                 .map(|stat| crate::stats_encode::FileColumnStat {
+                    extra_stats: stat.extra_stats.clone(),
                     column_id: stat.column_id,
                     min_value: stat.min_value.clone(),
                     max_value: stat.max_value.clone(),
@@ -1656,6 +1657,8 @@ pub struct ColumnStat {
     /// Total compressed size of the column in bytes, summed over the file's
     /// column chunks (parquet `total_compressed_size`).
     pub column_size_bytes: Option<i64>,
+    /// Type-specific JSON statistics, such as a geometry bounding box.
+    pub extra_stats: Option<String>,
 }
 
 /// How a committed file's `ducklake_data_file.row_id_start` is decided.

@@ -177,20 +177,12 @@ pub const SQL_GET_TABLE_STATS: &str =
     "SELECT record_count, file_size_bytes FROM ducklake_table_stats WHERE table_id = ?";
 
 pub const SQL_GET_TABLE_COLUMN_STATS: &str = "
-    SELECT column_id, contains_null, min_value, max_value, contains_nan
+    SELECT *
     FROM ducklake_table_column_stats
     WHERE table_id = ?";
 
 pub const SQL_GET_FILE_COLUMN_STATS: &str = "
-    SELECT
-        stats.data_file_id,
-        stats.column_id,
-        stats.column_size_bytes,
-        stats.value_count,
-        stats.null_count,
-        stats.min_value,
-        stats.max_value,
-        stats.contains_nan
+    SELECT stats.*
     FROM ducklake_file_column_stats AS stats
     INNER JOIN ducklake_data_file AS data
         ON data.data_file_id = stats.data_file_id
@@ -2545,6 +2537,8 @@ pub struct DuckLakeTableColumnStatistics {
     /// the sign, **neither** bound is trustworthy unless it is `Some(false)` —
     /// see `float_bound_is_usable` in `table.rs`.
     pub contains_nan: Option<bool>,
+    /// Type-specific JSON statistics, such as a geometry bounding box.
+    pub extra_stats: Option<String>,
     /// Sum of compressed bytes reported by every visible file for this column.
     /// Built-in providers leave it `None`: summing it reads every file's
     /// statistics.
@@ -2571,6 +2565,8 @@ pub struct DuckLakeFileColumnStatistics {
     pub max_value: Option<String>,
     /// Tri-state NaN flag; see [`DuckLakeTableColumnStatistics::contains_nan`].
     pub contains_nan: Option<bool>,
+    /// Type-specific JSON statistics, such as a geometry bounding box.
+    pub extra_stats: Option<String>,
 }
 
 /// One visible data file and its catalog column statistics.

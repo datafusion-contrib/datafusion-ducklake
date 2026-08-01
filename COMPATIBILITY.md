@@ -848,8 +848,8 @@ to its first 256 bytes (back to a character boundary for a string), a maximum to
 last byte in its first 256 below `0x7F` (`0xFF` for a blob), incremented; a file whose
 maximum has no such byte keeps no bounds for the column. A file's string bound holding a
 NUL byte is kept as official keeps it, except on PostgreSQL, whose text holds none: there
-the file records no bound. Official's `extra_stats` (its
-`GEOMETRY` and `VARIANT` statistics) are kept as they are.
+the file records no bound. Geometry bounds and geometry types are collected from Parquet geometry statistics and
+stored in `extra_stats`. VARIANT statistics are kept as they are.
 
 `ducklake_table_stats.record_count` counts every row ever inserted, as official's
 does: inserts and inlined inserts add their rows, and deletes, truncates, `Replace`'s
