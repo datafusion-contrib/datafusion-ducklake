@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
+use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -828,7 +829,9 @@ impl DuckLakeTableWriter {
         partition_mode: StreamPartitionMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
-        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let validation_schema =
+            Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
@@ -952,6 +955,7 @@ impl DuckLakeTableWriter {
             column_ids: setup.column_ids,
             field_ids: setup.field_ids,
             schema_with_ids,
+            validation_schema,
             writer: Some(writer),
             temp: Some(temp),
             catalog_path,
@@ -1112,6 +1116,38 @@ impl DuckLakeTableWriter {
             session.write_batch(batch)?;
         }
         session.finish().await
+    }
+
+    fn validation_schema(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        incoming_schema: &Schema,
+    ) -> Result<Schema> {
+        let Some(columns) = self
+            .metadata
+            .get_table_column_nullability(schema_name, table_name)?
+        else {
+            return Ok(incoming_schema.clone());
+        };
+        let nullability: HashMap<String, bool> = columns
+            .iter()
+            .map(|(name, nullable)| (name.to_lowercase(), *nullable))
+            .collect();
+        let fields: Vec<Arc<Field>> = incoming_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                nullability.get(&field.name().to_lowercase()).map_or_else(
+                    || Arc::clone(field),
+                    |nullable| Arc::new(field.as_ref().clone().with_nullable(*nullable)),
+                )
+            })
+            .collect();
+        Ok(Schema::new_with_metadata(
+            fields,
+            incoming_schema.metadata().clone(),
+        ))
     }
 
     /// Write a positional `(file_path, pos)` delete parquet, upload it, and
@@ -1440,7 +1476,11 @@ impl DuckLakeTableWriter {
                 "write_partitioned: no partition groups".to_string(),
             ));
         }
-        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        for (_, batches) in &groups {
+            validate_not_null_batches(&validation_schema, batches)?;
+        }
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
@@ -1632,7 +1672,9 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
     ) -> Result<WriteResult> {
-        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        validate_not_null_batches(&validation_schema, batches)?;
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
@@ -1775,7 +1817,9 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
     ) -> Result<PreparedTableWrite> {
-        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
+        validate_not_null_batches(&validation_schema, batches)?;
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup =
             self.metadata
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
@@ -2272,7 +2316,10 @@ impl DuckLakeWriteTransaction<'_> {
         if positional_deletes.is_empty() && inlined_deletes.is_empty() {
             return Ok(());
         }
-        let columns = arrow_schema_to_column_defs(arrow_schema)?;
+        let validation_schema =
+            self.writer
+                .validation_schema(schema_name, table_name, arrow_schema)?;
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup = self.writer.metadata.begin_write_transaction(
             schema_name,
             table_name,
@@ -2975,6 +3022,7 @@ pub struct TableWriteSession {
     column_ids: Vec<i64>,
     field_ids: Vec<i64>,
     schema_with_ids: SchemaRef,
+    validation_schema: SchemaRef,
     /// Parquet writer streaming to the local staging file (`temp`). Batches are
     /// written to disk as they arrive rather than buffered in memory, so peak
     /// memory stays bounded by the parquet row-group size regardless of table
@@ -3114,6 +3162,7 @@ impl TableWriteSession {
                 )));
             }
         }
+        validate_not_null_batches(&self.validation_schema, std::slice::from_ref(batch))?;
         Ok(())
     }
 
@@ -3500,6 +3549,31 @@ fn arrow_schema_to_column_defs(schema: &Schema) -> Result<Vec<ColumnDef>> {
         .collect()
 }
 
+pub(crate) fn validate_not_null_batches(
+    target_schema: &Schema,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    for batch in batches {
+        if batch.num_columns() < target_schema.fields().len() {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Schema mismatch: batch has {} columns, expected at least {}",
+                batch.num_columns(),
+                target_schema.fields().len()
+            )));
+        }
+
+        for (field, array) in target_schema.fields().iter().zip(batch.columns()) {
+            if !field.is_nullable() && array.null_count() > 0 {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "NOT NULL constraint failed: {}",
+                    field.name()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_schema_with_field_ids(schema: &Schema, column_ids: &[i64]) -> Result<Schema> {
     fn with_field_id(field: &Field, column_ids: &[i64], next_id: &mut usize) -> Result<Field> {
         let field_id = column_ids.get(*next_id).copied().ok_or_else(|| {
@@ -3748,6 +3822,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
+    }
+
+    #[test]
+    fn test_validate_not_null_batches_names_top_level_column() {
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "required",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
+        )
+        .unwrap();
+        let target_schema = Schema::new(vec![Field::new("required", DataType::Int32, false)]);
+
+        let error = validate_not_null_batches(&target_schema, &[batch]).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: NOT NULL constraint failed: required"
+        );
     }
 
     #[test]

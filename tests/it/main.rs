@@ -54,6 +54,7 @@ mod mysql_metadata_provider_test;
 mod mysql_metadata_writer_test;
 mod name_mapping_tests;
 mod nested_field_id_schema_tests;
+mod not_null_write_tests;
 mod numeric_metadata_validation_tests;
 mod object_store_integration_test;
 mod object_store_scheme_tests;

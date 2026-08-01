@@ -66,7 +66,7 @@ use futures::stream::{self, TryStreamExt};
 use crate::compaction::sorted_rewrite_batches;
 use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
-use crate::table_writer::DuckLakeTableWriter;
+use crate::table_writer::{DuckLakeTableWriter, validate_not_null_batches};
 
 /// Schema for the output of update operations (count of rows updated).
 fn make_update_count_schema() -> SchemaRef {
@@ -243,8 +243,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // below — so a failure before the commit leaves the live snapshot
             // untouched (only orphan objects, cleaned by maintenance).
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
-            let mut delete_entries: Vec<DeleteFileEntry> = Vec::new();
+            let mut pending_deletes = Vec::new();
             let mut total_updated: u64 = 0;
+            let physical_schema = table.physical_schema();
 
             for scan in &scans {
                 let batches =
@@ -261,19 +262,28 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 }
                 total_updated += out.matched_count as u64;
                 updated_batches.extend(out.updated_batches);
+                pending_deletes.push((
+                    scan.data_file_id,
+                    scan.delete_file_id,
+                    scan.source_path.clone(),
+                    out.cumulative_positions,
+                ));
+            }
 
+            validate_not_null_batches(physical_schema.as_ref(), &updated_batches)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+            let mut delete_entries: Vec<DeleteFileEntry> =
+                Vec::with_capacity(pending_deletes.len());
+            for (data_file_id, expected_prev_delete_file, source_path, positions) in pending_deletes
+            {
                 let delete_info = table_writer
-                    .write_delete_file(
-                        &schema_name,
-                        &table_name,
-                        &scan.source_path,
-                        &out.cumulative_positions,
-                    )
+                    .write_delete_file(&schema_name, &table_name, &source_path, &positions)
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 delete_entries.push(DeleteFileEntry {
-                    data_file_id: scan.data_file_id,
-                    expected_prev_delete_file: scan.delete_file_id,
+                    data_file_id,
+                    expected_prev_delete_file,
                     delete: delete_info,
                 });
             }
@@ -286,7 +296,6 @@ impl ExecutionPlan for DuckLakeUpdateExec {
 
             // Append the rewritten rows (embedding their original rowids) AND
             // apply every positional delete in ONE snapshot.
-            let physical_schema = table.physical_schema();
             let sort_spec = table
                 .live_sort_spec()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;

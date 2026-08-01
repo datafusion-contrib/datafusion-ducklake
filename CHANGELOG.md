@@ -44,6 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `MetadataWriter::get_table_column_nullability` is a new required method with no
+  default; every external `MetadataWriter` implementation must return the live top-level
+  `nulls_allowed` of an existing table, or `None` when the table does not exist (#319).
+- A write that puts a NULL into a top-level column the catalog marks `nulls_allowed = false` now
+  fails with `NOT NULL constraint failed: <column>` before any file or snapshot is authored, as
+  in DuckDB. This covers SQL `INSERT` and `UPDATE`, the low-level and partitioned writers, and
+  staged transaction writes. Before, the NULL was stored (#319).
 - **BREAKING**: `SnapshotMetadata` adds `schema_version: Option<i64>`; update
   struct literals (#318).
 - **BREAKING**: `RenderedColumnFilter` adds
