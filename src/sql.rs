@@ -1,12 +1,12 @@
-//! SQL entry point for DuckLake data-layout DDL (partition + sort order).
+//! SQL entry point for DuckLake metadata and data-layout DDL.
 //!
 //! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
 //! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
 //! any `LogicalPlan` exists, so a custom `QueryPlanner`/analyzer can never
 //! intercept it. Instead, [`execute_ducklake_sql`] is a transparent wrapper the
 //! caller uses in place of [`SessionContext::sql`]: it recognizes these DDL forms
-//! with a tiny hand-rolled parser (reusing DataFusion's bundled sqlparser — no new
-//! dependency), dispatches them to the programmatic
+//! and `COMMENT ON`, using DataFusion's bundled sqlparser with no new dependency,
+//! then dispatches them to the programmatic
 //! [`MetadataWriter`](crate::metadata_writer::MetadataWriter) API on the given
 //! [`DuckLakeCatalog`], and delegates everything else to `ctx.sql(sql)` unchanged.
 //!
@@ -34,7 +34,8 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    ObjectName, Statement,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
@@ -42,17 +43,17 @@ use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
 
 use crate::catalog::DuckLakeCatalog;
+use crate::metadata_provider::{TagObjectType, TagTarget};
 use crate::partition::PartitionTransform;
 use crate::sort::{NullOrder, SortDirection, SortField};
 
-/// Execute a SQL statement against `ctx`, handling DuckLake partition DDL
-/// (`ALTER TABLE … SET/RESET PARTITIONED BY`) directly on `catalog` and delegating
-/// everything else to [`SessionContext::sql`].
+/// Execute a SQL statement against `ctx`, handling DuckLake comments and layout
+/// DDL directly on `catalog` and delegating everything else to
+/// [`SessionContext::sql`].
 ///
-/// For a partition DDL statement this resolves the target table through
-/// `catalog`'s provider/writer, applies the change, and returns an empty result
-/// set (matching DataFusion's own DDL). It is fully transparent for every other
-/// statement, so callers can route all their SQL through it.
+/// For a recognized statement this resolves the target through `catalog`'s
+/// provider/writer, applies the change, and returns an empty result set matching
+/// DataFusion's own DDL. Callers can route all their SQL through it.
 ///
 /// The DDL targets `catalog` (the 1–3 part table name's catalog segment, if any,
 /// is not cross-checked); a read-only catalog yields a clear error.
@@ -67,9 +68,15 @@ pub async fn execute_ducklake_sql(
     }
 }
 
-/// The DuckLake data-layout DDL statements this module recognizes. `table` holds
-/// the raw name parts `(value, is_quoted)` for later identifier normalization.
+/// The DuckLake metadata and data-layout DDL statements this module recognizes.
+/// Names hold raw `(value, is_quoted)` parts for identifier normalization.
 enum DuckLakeDdl {
+    Comment {
+        object_type: CommentObject,
+        object_name: Vec<(String, bool)>,
+        comment: Option<String>,
+        if_exists: bool,
+    },
     SetPartition {
         table: Vec<(String, bool)>,
         transforms: Vec<(String, PartitionTransform)>,
@@ -87,7 +94,7 @@ enum DuckLakeDdl {
 }
 
 fn parse_err(error: ParserError) -> DataFusionError {
-    DataFusionError::Plan(format!("partition DDL parse error: {error}"))
+    DataFusionError::Plan(format!("DuckLake DDL parse error: {error}"))
 }
 
 /// After a recognized partition-DDL statement, reject any trailing input (a lone
@@ -104,13 +111,37 @@ fn expect_statement_end(parser: &mut Parser) -> DataFusionResult<()> {
     Ok(())
 }
 
-/// Recognize `ALTER TABLE <name> {SET|RESET} {PARTITIONED|SORTED} BY [...]`.
-/// Returns `Ok(None)` when the statement is not DuckLake data-layout DDL (so the
-/// caller delegates to `ctx.sql`), `Ok(Some(_))` when it is well-formed, and `Err`
-/// when it is clearly our DDL but malformed (so the caller gets a precise error
-/// rather than a confusing tokenizer error).
+/// Recognize `COMMENT ON` and DuckLake partition/sort `ALTER TABLE` statements.
+/// Returns `Ok(None)` for unrelated SQL, `Ok(Some(_))` for recognized DDL, and
+/// `Err` for malformed recognized DDL.
 fn parse_ducklake_ddl(sql: &str) -> DataFusionResult<Option<DuckLakeDdl>> {
     let dialect = GenericDialect {};
+    if sql
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("comment"))
+    {
+        let mut statements = Parser::parse_sql(&dialect, sql).map_err(parse_err)?;
+        if statements.len() != 1 {
+            return Err(DataFusionError::Plan(
+                "COMMENT ON accepts exactly one statement".to_string(),
+            ));
+        }
+        return match statements.pop().expect("one statement checked above") {
+            Statement::Comment {
+                object_type,
+                object_name,
+                comment,
+                if_exists,
+            } => Ok(Some(DuckLakeDdl::Comment {
+                object_type,
+                object_name: object_name_parts(&object_name),
+                comment,
+                if_exists,
+            })),
+            _ => Ok(None),
+        };
+    }
     let mut parser = match Parser::new(&dialect).try_with_sql(sql) {
         Ok(parser) => parser,
         // Let ctx.sql surface the tokenizer error for consistency.
@@ -351,6 +382,48 @@ fn resolve_schema_table(parts: &[(String, bool)]) -> DataFusionResult<(String, S
     }
 }
 
+fn resolve_schema(parts: &[(String, bool)]) -> DataFusionResult<String> {
+    let norm = |(value, quoted): &(String, bool)| {
+        if *quoted {
+            value.clone()
+        } else {
+            value.to_ascii_lowercase()
+        }
+    };
+    match parts {
+        [schema] => Ok(norm(schema)),
+        [_catalog, schema] => Ok(norm(schema)),
+        _ => Err(DataFusionError::Plan(
+            "COMMENT ON SCHEMA target must have 1 or 2 parts".to_string(),
+        )),
+    }
+}
+
+fn resolve_schema_table_column(
+    parts: &[(String, bool)],
+) -> DataFusionResult<(String, String, String)> {
+    let norm = |(value, quoted): &(String, bool)| {
+        if *quoted {
+            value.clone()
+        } else {
+            value.to_ascii_lowercase()
+        }
+    };
+    match parts {
+        [table, column] => Ok(("main".to_string(), norm(table), norm(column))),
+        [schema, table, column] => Ok((norm(schema), norm(table), norm(column))),
+        [_catalog, schema, table, column] => Ok((norm(schema), norm(table), norm(column))),
+        _ => Err(DataFusionError::Plan(
+            "COMMENT ON COLUMN target must have 2 to 4 parts".to_string(),
+        )),
+    }
+}
+
+fn empty_dataframe(ctx: &SessionContext) -> DataFusionResult<DataFrame> {
+    let plan = LogicalPlanBuilder::empty(false).build()?;
+    Ok(DataFrame::new(ctx.state(), plan))
+}
+
 async fn apply_ducklake_ddl(
     ctx: &SessionContext,
     catalog: &DuckLakeCatalog,
@@ -359,7 +432,7 @@ async fn apply_ducklake_ddl(
     let writer = catalog.writer().ok_or_else(|| {
         DataFusionError::Plan(
             "catalog is read-only; open it with DuckLakeCatalog::with_writer to run \
-             DuckLake data-layout DDL"
+             DuckLake metadata DDL"
                 .to_string(),
         )
     })?;
@@ -370,7 +443,115 @@ async fn apply_ducklake_ddl(
         .get_current_snapshot()
         .map_err(DataFusionError::from)?;
 
+    if let DuckLakeDdl::Comment {
+        object_type,
+        object_name,
+        comment,
+        if_exists,
+    } = ddl
+    {
+        let missing = |kind: &str, name: &str| {
+            if if_exists {
+                Ok(None)
+            } else {
+                Err(DataFusionError::Plan(format!("{kind} '{name}' not found")))
+            }
+        };
+        let target = match object_type {
+            CommentObject::Schema => {
+                let schema_name = resolve_schema(&object_name)?;
+                match provider
+                    .get_schema_by_name(&schema_name, snapshot)
+                    .map_err(DataFusionError::from)?
+                {
+                    Some(schema) => Some(TagTarget::Object {
+                        object_type: TagObjectType::Schema,
+                        object_id: schema.schema_id,
+                    }),
+                    None => missing("schema", &schema_name)?,
+                }
+            },
+            CommentObject::Table | CommentObject::View => {
+                let (schema_name, object_name) = resolve_schema_table(&object_name)?;
+                let Some(schema) = provider
+                    .get_schema_by_name(&schema_name, snapshot)
+                    .map_err(DataFusionError::from)?
+                else {
+                    let _ = missing("schema", &schema_name)?;
+                    return empty_dataframe(ctx);
+                };
+                if object_type == CommentObject::Table {
+                    match provider
+                        .get_table_by_name(schema.schema_id, &object_name, snapshot)
+                        .map_err(DataFusionError::from)?
+                    {
+                        Some(table) => Some(TagTarget::Object {
+                            object_type: TagObjectType::Table,
+                            object_id: table.table_id,
+                        }),
+                        None => missing("table", &object_name)?,
+                    }
+                } else {
+                    match provider
+                        .get_view_id_by_name(schema.schema_id, &object_name, snapshot)
+                        .map_err(DataFusionError::from)?
+                    {
+                        Some(view_id) => Some(TagTarget::Object {
+                            object_type: TagObjectType::View,
+                            object_id: view_id,
+                        }),
+                        None => missing("view", &object_name)?,
+                    }
+                }
+            },
+            CommentObject::Column => {
+                let (schema_name, table_name, column_name) =
+                    resolve_schema_table_column(&object_name)?;
+                let Some(schema) = provider
+                    .get_schema_by_name(&schema_name, snapshot)
+                    .map_err(DataFusionError::from)?
+                else {
+                    let _ = missing("schema", &schema_name)?;
+                    return empty_dataframe(ctx);
+                };
+                let Some(table) = provider
+                    .get_table_by_name(schema.schema_id, &table_name, snapshot)
+                    .map_err(DataFusionError::from)?
+                else {
+                    let _ = missing("table", &table_name)?;
+                    return empty_dataframe(ctx);
+                };
+                match provider
+                    .get_table_structure(table.table_id, snapshot)
+                    .map_err(DataFusionError::from)?
+                    .into_iter()
+                    .find(|column| column.column_name == column_name)
+                {
+                    Some(column) => Some(TagTarget::Column {
+                        table_id: table.table_id,
+                        column_id: column.column_id,
+                    }),
+                    None => missing("column", &column_name)?,
+                }
+            },
+            other => {
+                return Err(DataFusionError::Plan(format!(
+                    "COMMENT ON {other} is not supported for DuckLake catalogs"
+                )));
+            },
+        };
+        if let Some(target) = target {
+            writer
+                .set_tag(target, "comment", comment.as_deref())
+                .map_err(DataFusionError::from)?;
+        }
+        return empty_dataframe(ctx);
+    }
+
     let parts = match &ddl {
+        DuckLakeDdl::Comment {
+            ..
+        } => unreachable!("comments return above"),
         DuckLakeDdl::SetPartition {
             table,
             ..
@@ -398,6 +579,9 @@ async fn apply_ducklake_ddl(
         .ok_or_else(|| DataFusionError::Plan(format!("table '{table_name}' not found")))?;
 
     match ddl {
+        DuckLakeDdl::Comment {
+            ..
+        } => unreachable!("comments return above"),
         DuckLakeDdl::SetPartition {
             transforms,
             ..
@@ -431,6 +615,5 @@ async fn apply_ducklake_ddl(
     }
 
     // DDL returns an empty (0-row) result, matching DataFusion's own DDL.
-    let plan = LogicalPlanBuilder::empty(false).build()?;
-    Ok(DataFrame::new(ctx.state(), plan))
+    empty_dataframe(ctx)
 }

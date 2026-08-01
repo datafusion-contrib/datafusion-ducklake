@@ -16,8 +16,9 @@ use datafusion_ducklake::metadata_writer::{
     ColumnDef, ColumnStat, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
 };
 use datafusion_ducklake::{
-    DuckLakeError, DuckLakeTableWriter, MulticatalogManager, NullOrder, PartitionTransform,
-    PostgresMetadataWriter, SortDirection, SortField, TableWriteOptions, TypeChangeOperation,
+    DuckLakeError, DuckLakeTableWriter, MetadataProvider, MulticatalogManager,
+    MulticatalogProvider, NullOrder, PartitionTransform, PostgresMetadataWriter, SortDirection,
+    SortField, TableWriteOptions, TagObjectType, TagTarget, TypeChangeOperation,
     TypeChangeWriteMode, initialize_multicatalog_schema,
 };
 use sqlx::AssertSqlSafe;
@@ -150,6 +151,123 @@ fn assert_invalid_config<T>(res: datafusion_ducklake::Result<T>, context: &str) 
         Err(other) => panic!("{context}: expected InvalidConfig, got {other:?}"),
         Ok(_) => panic!("{context}: expected InvalidConfig, got Ok"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn comments_and_tags_are_catalog_scoped_and_tombstoned_on_drop() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("tags").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("main", "events", &cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+    let table_comment_snapshot = writer
+        .set_tag(
+            TagTarget::Object {
+                object_type: TagObjectType::Table,
+                object_id: setup.table_id,
+            },
+            "comment",
+            Some("events table"),
+        )
+        .unwrap();
+    let column_tag_snapshot = writer
+        .set_tag(
+            TagTarget::Column {
+                table_id: setup.table_id,
+                column_id: setup.column_ids[0],
+            },
+            "classification",
+            Some("internal"),
+        )
+        .unwrap();
+    let tag_schema_versions: Vec<i64> = sqlx::query_scalar(
+        "SELECT schema_version FROM ducklake_snapshot
+         WHERE snapshot_id IN ($1, $2) ORDER BY snapshot_id",
+    )
+    .bind(table_comment_snapshot)
+    .bind(column_tag_snapshot)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tag_schema_versions.len(), 2);
+    assert_eq!(tag_schema_versions[0], tag_schema_versions[1]);
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        column_tag_snapshot
+    );
+    assert_eq!(
+        provider
+            .get_tags(
+                TagTarget::Object {
+                    object_type: TagObjectType::Table,
+                    object_id: setup.table_id,
+                },
+                column_tag_snapshot,
+            )
+            .unwrap()[0]
+            .value
+            .as_deref(),
+        Some("events table")
+    );
+    assert_eq!(
+        provider
+            .list_all_column_tags(column_tag_snapshot)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        provider.list_all_object_tags(column_tag_snapshot).unwrap()[0].object_type,
+        Some(TagObjectType::Table)
+    );
+    assert!(
+        manager
+            .drop_table_in_catalog("tags", "main", "events")
+            .await
+            .unwrap()
+    );
+    let drop_snapshot = provider.get_current_snapshot().unwrap();
+    assert!(drop_snapshot > column_tag_snapshot);
+    assert!(
+        provider
+            .list_all_object_tags(drop_snapshot)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        provider
+            .list_all_column_tags(drop_snapshot)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        provider
+            .list_all_object_tags(table_comment_snapshot)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 /// Current catalog head = MAX(snapshot_id) over the catalog's mapping rows

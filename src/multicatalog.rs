@@ -531,6 +531,26 @@ impl MulticatalogManager {
         .bind(format!("dropped_table:{table_id}"))
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
+        )
+        .bind(drop_snapshot)
+        .bind(catalog_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE ducklake_catalog_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND object_type = 'table' AND object_id = $3
+               AND end_snapshot IS NULL",
+        )
+        .bind(drop_snapshot)
+        .bind(catalog_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(true)
     }

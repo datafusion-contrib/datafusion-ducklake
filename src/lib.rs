@@ -113,7 +113,8 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 pub use catalog::DuckLakeCatalog;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
-    DuckLakeFileData, DuckLakeTableFile, MetadataProvider, SnapshotChangeMetadata,
+    ColumnTag, DuckLakeFileData, DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag,
+    SnapshotChangeMetadata, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;

@@ -36,7 +36,25 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableType;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::metadata_provider::MetadataProvider;
+use crate::metadata_provider::{ColumnTag, MetadataProvider, ObjectTag, TagObjectType};
+
+fn object_comment(tags: &[ObjectTag], object_type: TagObjectType, object_id: i64) -> Option<&str> {
+    tags.iter()
+        .find(|entry| {
+            entry.object_id == object_id
+                && entry.tag.key == "comment"
+                && entry.object_type.is_none_or(|kind| kind == object_type)
+        })
+        .and_then(|entry| entry.tag.value.as_deref())
+}
+
+fn column_comment(tags: &[ColumnTag], table_id: i64, column_id: i64) -> Option<&str> {
+    tags.iter()
+        .find(|entry| {
+            entry.table_id == table_id && entry.column_id == column_id && entry.tag.key == "comment"
+        })
+        .and_then(|entry| entry.tag.value.as_deref())
+}
 
 /// Live table provider for snapshots - queries metadata on every scan
 #[derive(Debug)]
@@ -120,6 +138,7 @@ impl SchemataTable {
             Field::new("schema_name", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
             Field::new("path_is_relative", DataType::Boolean, false),
+            Field::new("comment", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -136,6 +155,10 @@ impl SchemataTable {
         let schemas = self
             .provider
             .list_schemas(snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let tags = self
+            .provider
+            .list_all_object_tags(snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let snapshot_ids: ArrayRef = Arc::new(Int64Array::from(vec![snapshot_id; schemas.len()]));
@@ -161,10 +184,16 @@ impl SchemataTable {
                 .map(|s| s.path_is_relative)
                 .collect::<Vec<_>>(),
         ));
+        let comments: ArrayRef = Arc::new(StringArray::from(
+            schemas
+                .iter()
+                .map(|schema| object_comment(&tags, TagObjectType::Schema, schema.schema_id))
+                .collect::<Vec<_>>(),
+        ));
 
         RecordBatch::try_new(
             self.schema.clone(),
-            vec![snapshot_ids, schema_ids, schema_names, paths, path_is_relative],
+            vec![snapshot_ids, schema_ids, schema_names, paths, path_is_relative, comments],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
@@ -212,6 +241,7 @@ impl TablesTable {
             Field::new("table_name", DataType::Utf8, false),
             Field::new("path", DataType::Utf8, false),
             Field::new("path_is_relative", DataType::Boolean, false),
+            Field::new("comment", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -229,6 +259,10 @@ impl TablesTable {
         let all_tables = self
             .provider
             .list_all_tables(snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let tags = self
+            .provider
+            .list_all_object_tags(snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let snapshot_ids: ArrayRef =
@@ -268,10 +302,24 @@ impl TablesTable {
                 .map(|t| t.table.path_is_relative)
                 .collect::<Vec<_>>(),
         ));
+        let comments: ArrayRef = Arc::new(StringArray::from(
+            all_tables
+                .iter()
+                .map(|table| object_comment(&tags, TagObjectType::Table, table.table.table_id))
+                .collect::<Vec<_>>(),
+        ));
 
         RecordBatch::try_new(
             self.schema.clone(),
-            vec![snapshot_ids, schema_names, table_ids, table_names, paths, path_is_relative],
+            vec![
+                snapshot_ids,
+                schema_names,
+                table_ids,
+                table_names,
+                paths,
+                path_is_relative,
+                comments,
+            ],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
@@ -406,6 +454,7 @@ impl ColumnsTable {
             Field::new("column_id", DataType::Int64, false),
             Field::new("column_name", DataType::Utf8, false),
             Field::new("column_type", DataType::Utf8, false),
+            Field::new("comment", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -423,6 +472,10 @@ impl ColumnsTable {
         let all_columns_data = self
             .provider
             .list_all_columns(snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let tags = self
+            .provider
+            .list_all_column_tags(snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
         let schema_names: ArrayRef = Arc::new(StringArray::from(
@@ -459,10 +512,16 @@ impl ColumnsTable {
                 .map(|c| c.column.column_type.as_str())
                 .collect::<Vec<_>>(),
         ));
+        let comments: ArrayRef = Arc::new(StringArray::from(
+            all_columns_data
+                .iter()
+                .map(|column| column_comment(&tags, column.table_id, column.column.column_id))
+                .collect::<Vec<_>>(),
+        ));
 
         RecordBatch::try_new(
             self.schema.clone(),
-            vec![schema_names, table_names, column_ids, column_names, column_types],
+            vec![schema_names, table_names, column_ids, column_names, column_types, comments],
         )
         .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
@@ -768,6 +827,180 @@ impl TableProvider for FilesTable {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TagsTableKind {
+    Object,
+    Column,
+}
+
+/// Live table provider for raw snapshot-visible object or column tags.
+#[derive(Debug)]
+struct TagsTable {
+    provider: Arc<dyn MetadataProvider>,
+    kind: TagsTableKind,
+    schema: SchemaRef,
+}
+
+impl TagsTable {
+    fn object(provider: Arc<dyn MetadataProvider>) -> Self {
+        Self {
+            provider,
+            kind: TagsTableKind::Object,
+            schema: Arc::new(Schema::new(vec![
+                Field::new("object_type", DataType::Utf8, false),
+                Field::new("object_id", DataType::Int64, false),
+                Field::new("begin_snapshot", DataType::Int64, false),
+                Field::new("end_snapshot", DataType::Int64, true),
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+        }
+    }
+
+    fn column(provider: Arc<dyn MetadataProvider>) -> Self {
+        Self {
+            provider,
+            kind: TagsTableKind::Column,
+            schema: Arc::new(Schema::new(vec![
+                Field::new("table_id", DataType::Int64, false),
+                Field::new("column_id", DataType::Int64, false),
+                Field::new("begin_snapshot", DataType::Int64, false),
+                Field::new("end_snapshot", DataType::Int64, true),
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Utf8, true),
+            ])),
+        }
+    }
+
+    fn query_tags(&self) -> DataFusionResult<RecordBatch> {
+        let snapshot_id = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let arrays: Vec<ArrayRef> = match self.kind {
+            TagsTableKind::Object => {
+                let tags = self
+                    .provider
+                    .list_all_object_tags(snapshot_id)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                let schemas = self
+                    .provider
+                    .list_schemas(snapshot_id)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                let tables = self
+                    .provider
+                    .list_all_tables(snapshot_id)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        tags.iter()
+                            .map(|entry| {
+                                entry.object_type.unwrap_or_else(|| {
+                                    if schemas
+                                        .iter()
+                                        .any(|schema| schema.schema_id == entry.object_id)
+                                    {
+                                        TagObjectType::Schema
+                                    } else if tables
+                                        .iter()
+                                        .any(|table| table.table.table_id == entry.object_id)
+                                    {
+                                        TagObjectType::Table
+                                    } else {
+                                        TagObjectType::View
+                                    }
+                                })
+                            })
+                            .map(TagObjectType::as_str),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter().map(|entry| entry.object_id).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.begin_snapshot)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.end_snapshot)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.key.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.value.as_deref())
+                            .collect::<Vec<_>>(),
+                    )),
+                ]
+            },
+            TagsTableKind::Column => {
+                let tags = self
+                    .provider
+                    .list_all_column_tags(snapshot_id)
+                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+                vec![
+                    Arc::new(Int64Array::from(
+                        tags.iter().map(|entry| entry.table_id).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter().map(|entry| entry.column_id).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.begin_snapshot)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.end_snapshot)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.key.as_str())
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        tags.iter()
+                            .map(|entry| entry.tag.value.as_deref())
+                            .collect::<Vec<_>>(),
+                    )),
+                ]
+            },
+        };
+        RecordBatch::try_new(self.schema.clone(), arrays)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for TagsTable {
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let batch = self.query_tags()?;
+        let mem_table = MemTable::try_new(self.schema.clone(), vec![vec![batch]])?;
+        mem_table.scan(state, projection, filters, limit).await
+    }
+}
+
 /// Schema provider for information_schema
 ///
 /// Provides live metadata tables that query the catalog database on every access.
@@ -795,6 +1028,8 @@ impl SchemaProvider for InformationSchemaProvider {
             "views".to_string(),
             "table_info".to_string(),
             "columns".to_string(),
+            "object_tags".to_string(),
+            "column_tags".to_string(),
             "files".to_string(),
         ]
     }
@@ -808,6 +1043,8 @@ impl SchemaProvider for InformationSchemaProvider {
             "views" => Some(Arc::new(ViewsTable::new(self.provider.clone()))),
             "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone()))),
             "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone()))),
+            "object_tags" => Some(Arc::new(TagsTable::object(self.provider.clone()))),
+            "column_tags" => Some(Arc::new(TagsTable::column(self.provider.clone()))),
             "files" => Some(Arc::new(FilesTable::new(self.provider.clone()))),
             _ => None,
         };

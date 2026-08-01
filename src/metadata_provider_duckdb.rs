@@ -4,21 +4,22 @@ use crate::inlined_filter::{
 };
 use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
+    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
     DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, MetadataSetting, SQL_GET_DATA_FILES,
-    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS,
-    SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT,
-    SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC,
+    DuckLakeTag, FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, MetadataSetting,
+    ObjectTag, SQL_GET_COLUMN_TAGS, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_NAME_MAPPING,
+    SQL_GET_OBJECT_TAGS, SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC,
     SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME,
-    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS,
-    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata,
-    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
-    ViewWithSchema, build_inlined_batch, inlined_delete_table_name, inlined_missing_scalar,
-    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
-    resolve_metadata_settings,
+    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_COLUMN_TAGS,
+    SQL_LIST_OBJECT_TAGS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS,
+    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, build_inlined_batch,
+    inlined_delete_table_name, inlined_missing_scalar, is_inlined_data_table, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -814,6 +815,7 @@ fn list_all_columns_sql(capabilities: SchemaCapabilities) -> String {
         "SELECT
             s.schema_name,
             t.table_name,
+            t.table_id,
             c.column_id,
             c.column_name,
             c.column_type,
@@ -2083,6 +2085,70 @@ impl MetadataProvider for DuckdbMetadataProvider {
         Ok(exists)
     }
 
+    fn get_tags(&self, target: TagTarget, snapshot_id: i64) -> crate::Result<Vec<DuckLakeTag>> {
+        let conn = self.connection();
+        let sql = match target {
+            TagTarget::Object {
+                ..
+            } => SQL_GET_OBJECT_TAGS,
+            TagTarget::Column {
+                ..
+            } => SQL_GET_COLUMN_TAGS,
+        };
+        let mut stmt = match conn.prepare(sql) {
+            Ok(stmt) => stmt,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let decode = |row: &duckdb::Row<'_>| {
+            Ok(DuckLakeTag {
+                begin_snapshot: row.get(0)?,
+                end_snapshot: row.get(1)?,
+                key: row.get(2)?,
+                value: row.get(3)?,
+            })
+        };
+        let tags = match target {
+            TagTarget::Object {
+                object_id,
+                ..
+            } => stmt
+                .query_map(params![object_id, snapshot_id, snapshot_id], decode)?
+                .collect::<Result<Vec<_>, _>>()?,
+            TagTarget::Column {
+                table_id,
+                column_id,
+            } => stmt
+                .query_map(
+                    params![table_id, column_id, snapshot_id, snapshot_id],
+                    decode,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(tags)
+    }
+
+    fn get_view_id_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<i64>> {
+        let conn = self.connection();
+        let mut stmt = match conn.prepare(
+            "SELECT view_id FROM ducklake_view
+             WHERE schema_id = ? AND view_name = ?
+               AND ? >= begin_snapshot
+               AND (? < end_snapshot OR end_snapshot IS NULL)",
+        ) {
+            Ok(stmt) => stmt,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut rows = stmt.query(params![schema_id, name, snapshot_id, snapshot_id])?;
+        Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+    }
+
     fn list_all_tables(&self, snapshot_id: i64) -> crate::Result<Vec<TableWithSchema>> {
         let conn = self.connection();
         let mut stmt = conn.prepare(SQL_LIST_ALL_TABLES)?;
@@ -2154,24 +2220,26 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 |row| {
                     let schema_name: String = row.get(0)?;
                     let table_name: String = row.get(1)?;
-                    let nulls_allowed: Option<bool> = row.get(5)?;
-                    let parent_column: Option<i64> = row.get(6)?;
+                    let table_id: i64 = row.get(2)?;
+                    let nulls_allowed: Option<bool> = row.get(6)?;
+                    let parent_column: Option<i64> = row.get(7)?;
                     let column = DuckLakeTableColumn::new(
-                        row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                         nulls_allowed.unwrap_or(true),
                     )
                     .with_defaults(
-                        row.get(7)?,
                         row.get(8)?,
                         row.get(9)?,
                         row.get(10)?,
+                        row.get(11)?,
                     );
                     Ok((
                         ColumnWithTable {
                             schema_name,
                             table_name,
+                            table_id,
                             column,
                         },
                         parent_column,
@@ -2181,6 +2249,54 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         reconstruct_columns_with_table(raw_columns)
+    }
+
+    fn list_all_object_tags(&self, snapshot_id: i64) -> crate::Result<Vec<ObjectTag>> {
+        let conn = self.connection();
+        let mut stmt = match conn.prepare(SQL_LIST_OBJECT_TAGS) {
+            Ok(stmt) => stmt,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let tags = stmt
+            .query_map(params![snapshot_id, snapshot_id], |row| {
+                Ok(ObjectTag {
+                    object_type: None,
+                    object_id: row.get(0)?,
+                    tag: DuckLakeTag {
+                        begin_snapshot: row.get(1)?,
+                        end_snapshot: row.get(2)?,
+                        key: row.get(3)?,
+                        value: row.get(4)?,
+                    },
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tags)
+    }
+
+    fn list_all_column_tags(&self, snapshot_id: i64) -> crate::Result<Vec<ColumnTag>> {
+        let conn = self.connection();
+        let mut stmt = match conn.prepare(SQL_LIST_COLUMN_TAGS) {
+            Ok(stmt) => stmt,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let tags = stmt
+            .query_map(params![snapshot_id, snapshot_id], |row| {
+                Ok(ColumnTag {
+                    table_id: row.get(0)?,
+                    column_id: row.get(1)?,
+                    tag: DuckLakeTag {
+                        begin_snapshot: row.get(2)?,
+                        end_snapshot: row.get(3)?,
+                        key: row.get(4)?,
+                        value: row.get(5)?,
+                    },
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tags)
     }
 
     fn list_all_files(&self, snapshot_id: i64) -> crate::Result<Vec<FileWithTable>> {
