@@ -188,6 +188,11 @@ async fn list_snapshots_is_catalog_scoped() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let _ = seed_two_catalogs(&pool).await.unwrap();
 
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = snapshot_id * 10")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let pa = MulticatalogProvider::with_pool(pool.clone(), "pg_prod")
         .await
         .unwrap();
@@ -195,20 +200,23 @@ async fn list_snapshots_is_catalog_scoped() {
         .await
         .unwrap();
 
-    let ids_a: Vec<i64> = pa
+    let snapshots_a: Vec<_> = pa
         .list_snapshots()
         .unwrap()
         .into_iter()
-        .map(|s| s.snapshot_id)
+        .map(|s| (s.snapshot_id, s.schema_version))
         .collect();
-    let ids_b: Vec<i64> = pb
+    let snapshots_b: Vec<_> = pb
         .list_snapshots()
         .unwrap()
         .into_iter()
-        .map(|s| s.snapshot_id)
+        .map(|s| (s.snapshot_id, s.schema_version))
         .collect();
-    assert_eq!(ids_a, vec![1, 2, 4]);
-    assert_eq!(ids_b, vec![3]);
+    assert_eq!(
+        snapshots_a,
+        vec![(1, Some(10)), (2, Some(20)), (4, Some(40))]
+    );
+    assert_eq!(snapshots_b, vec![(3, Some(30))]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

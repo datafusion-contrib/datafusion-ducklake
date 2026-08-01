@@ -307,10 +307,19 @@ or writer capabilities fall back to Parquet. Inline inserts, deletes, and flushe
 
 Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
 registry; standard PostgreSQL staged commits create it on demand. SQLite also
-migrates legacy non-null change ledgers. Snapshot-change readers on all backends
-preserve NULL changes and snapshots without ledger rows. Commit metadata lookup
-searches snapshots with live Parquet files; it is not general idempotency for
-inline-only, delete-only, or retired commits.
+migrates legacy non-null change ledgers.
+
+Snapshot-change readers on all backends preserve NULL changes and snapshots
+without ledger rows. `ducklake_snapshots()` and `information_schema.snapshots`
+expose nullable `schema_version`, the DuckDB-compatible `changes` map, raw
+`changes_made`, and optional commit fields. The existing `timestamp` column
+remains UTF-8. `SnapshotMetadata` adds only `schema_version: Option<i64>`;
+`list_snapshots()` and time travel do not read the change ledger. The SQL
+listings reuse `list_snapshot_changes()`, which requires the current
+commit-metadata columns.
+
+Commit metadata lookup searches snapshots with live Parquet files; it is not
+general idempotency for inline-only, delete-only, or retired commits.
 
 Table settings require a supported option and a live table. Coordination locks
 cover the catalog file on SQLite and DuckDB, and the requested identity on

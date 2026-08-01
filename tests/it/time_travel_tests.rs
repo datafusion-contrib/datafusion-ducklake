@@ -10,8 +10,8 @@ use arrow::record_batch::RecordBatch;
 use chrono::{TimeZone, Utc};
 use datafusion::prelude::SessionContext;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, SqliteMetadataProvider, SqliteMetadataWriter,
-    register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter, register_ducklake_functions,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::SqlitePool;
@@ -179,4 +179,70 @@ async fn version_timestamp_and_same_second_cdc_select_snapshots() {
         .unwrap_err()
         .to_string();
     assert!(invalid_timestamp.contains("No snapshot found at or before timestamp"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_selection_does_not_require_commit_metadata_columns() {
+    let temp = TempDir::new().unwrap();
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp.path().join("legacy.db").display()
+    );
+    let writer = Arc::new(
+        SqliteMetadataWriter::new_with_init(&connection)
+            .await
+            .unwrap(),
+    );
+    MetadataWriter::set_data_path(writer.as_ref(), temp.path().to_str().unwrap()).unwrap();
+    let snapshot = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[31, 47])])
+        .await
+        .unwrap();
+    drop(writer);
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    sqlx::raw_sql(
+        "ALTER TABLE ducklake_snapshot_changes DROP COLUMN author;
+                   ALTER TABLE ducklake_snapshot_changes DROP COLUMN commit_message;
+                   ALTER TABLE ducklake_snapshot_changes DROP COLUMN commit_extra_info;
+                   UPDATE ducklake_snapshot SET snapshot_time = '2026-09-22 12:00:00';",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let provider = Arc::new(SqliteMetadataProvider::new(&connection).await.unwrap());
+    let snapshots = provider.list_snapshots().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].snapshot_id, snapshot.snapshot_id);
+    assert_eq!(
+        snapshots[0].timestamp.as_deref(),
+        Some("2026-09-22 12:00:00.000000")
+    );
+    assert_eq!(snapshots[0].schema_version, Some(1));
+    let ctx = SessionContext::new();
+    let catalog = DuckLakeCatalog::with_snapshot_at(
+        provider.clone(),
+        Utc.with_ymd_and_hms(2026, 9, 22, 12, 1, 0)
+            .single()
+            .unwrap(),
+    )
+    .unwrap();
+    ctx.register_catalog("lake", Arc::new(catalog));
+    register_ducklake_functions(&ctx, provider);
+    assert_eq!(
+        ids(&ctx, "SELECT id FROM lake.main.t ORDER BY id").await,
+        vec![31, 47]
+    );
+    assert_eq!(
+        ids(
+            &ctx,
+            &format!(
+                "SELECT id FROM ducklake_table_at('main', 't', {}) ORDER BY id",
+                snapshot.snapshot_id
+            )
+        )
+        .await,
+        vec![31, 47]
+    );
 }

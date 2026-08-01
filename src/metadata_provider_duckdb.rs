@@ -1058,6 +1058,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 Ok(SnapshotMetadata {
                     snapshot_id,
                     timestamp,
+                    schema_version: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

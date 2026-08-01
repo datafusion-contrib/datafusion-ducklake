@@ -626,8 +626,9 @@ impl MetadataProvider for MySqlMetadataProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT snapshot_id, snapshot_time
-                 FROM ducklake_snapshot ORDER BY snapshot_id",
+                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version
+                 FROM ducklake_snapshot s
+                 ORDER BY s.snapshot_id",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -642,6 +643,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                     Ok(SnapshotMetadata {
                         snapshot_id,
                         timestamp: timestamp_str,
+                        schema_version: row.try_get(2)?,
                     })
                 })
                 .collect()

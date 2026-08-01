@@ -603,7 +603,7 @@ impl MetadataProvider for MulticatalogProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.snapshot_id, s.snapshot_time
+                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version
                  FROM ducklake_snapshot s
                  JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
                  WHERE m.catalog_id = $1
@@ -622,6 +622,7 @@ impl MetadataProvider for MulticatalogProvider {
                     Ok(SnapshotMetadata {
                         snapshot_id,
                         timestamp: timestamp_str,
+                        schema_version: row.try_get(2)?,
                     })
                 })
                 .collect()

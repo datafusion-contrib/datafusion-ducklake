@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Snapshot SQL listings expose schema version, structured changes, raw tokens,
+  and commit metadata (#318).
+
+### Changed
+
+- **BREAKING**: `SnapshotMetadata` adds `schema_version: Option<i64>`; update
+  struct literals (#318).
+- Snapshot SQL listings expand from two to eight columns; select named columns
+  to retain a fixed shape (#318).
+
 ## [0.8.0] - 2026-09-16
 
 ### Added

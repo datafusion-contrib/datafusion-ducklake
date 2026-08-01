@@ -45,7 +45,20 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_snapshot (
             snapshot_id INTEGER PRIMARY KEY,
-            snapshot_time TEXT
+            snapshot_time TEXT,
+            schema_version INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+            snapshot_id INTEGER PRIMARY KEY,
+            changes_made TEXT,
+            author TEXT,
+            commit_message TEXT,
+            commit_extra_info TEXT
         )",
     )
     .execute(pool)
@@ -227,16 +240,35 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
 
     // Insert snapshots
     sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, datetime('now'))",
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         VALUES (?, datetime('now'), ?)",
     )
     .bind(1i64)
+    .bind(3i64)
     .execute(pool)
     .await?;
 
     sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, datetime('now'))",
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         VALUES (?, datetime('now'), ?)",
     )
     .bind(2i64)
+    .bind(3i64)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes
+             (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+         VALUES (?, ?, ?, ?, ?), (?, ?, NULL, NULL, NULL)",
+    )
+    .bind(1i64)
+    .bind("created_table:\"test_schema\".\"test_table\"")
+    .bind("Ada")
+    .bind("Create test table")
+    .bind("{\"ticket\":42}")
+    .bind(2i64)
+    .bind("inserted_into_table:1")
     .execute(pool)
     .await?;
 
@@ -422,13 +454,35 @@ async fn populate_from_duckdb_catalog(
     // Step 3: Populate SQLite with metadata from DuckDB
     let pool = &provider.pool;
 
+    let changes = duckdb_provider.list_snapshot_changes()?;
+
     // Insert snapshots
     for snapshot in &snapshots {
-        sqlx::query("INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time) VALUES (?, ?)")
+        sqlx::query(
+            "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+             VALUES (?, ?, ?)",
+        )
+        .bind(snapshot.snapshot_id)
+        .bind(&snapshot.timestamp)
+        .bind(snapshot.schema_version)
+        .execute(pool)
+        .await?;
+        if let Some(snapshot) = changes.iter().find(|change| {
+            change.snapshot_id == snapshot.snapshot_id && change.changes_made.is_some()
+        }) {
+            sqlx::query(
+                "INSERT INTO ducklake_snapshot_changes
+                     (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
             .bind(snapshot.snapshot_id)
-            .bind(&snapshot.timestamp)
+            .bind(&snapshot.changes_made)
+            .bind(&snapshot.author)
+            .bind(&snapshot.commit_message)
+            .bind(&snapshot.commit_extra_info)
             .execute(pool)
             .await?;
+        }
     }
 
     // Insert data_path metadata
@@ -597,9 +651,46 @@ async fn test_list_snapshots() {
 
     let snapshots = provider.list_snapshots().expect("Should list snapshots");
 
+    let changes = provider.list_snapshot_changes().unwrap();
+    assert_eq!(changes.len(), snapshots.len());
     assert_eq!(snapshots.len(), 2, "Should have 2 snapshots");
     assert_eq!(snapshots[0].snapshot_id, 1);
+    assert_eq!(snapshots[0].schema_version, Some(3));
+    assert_eq!(
+        changes[0].changes_made.as_deref(),
+        Some("created_table:\"test_schema\".\"test_table\"")
+    );
+    assert_eq!(changes[0].author.as_deref(), Some("Ada"));
+    assert_eq!(
+        changes[0].commit_message.as_deref(),
+        Some("Create test table")
+    );
+    assert_eq!(
+        changes[0].commit_extra_info.as_deref(),
+        Some("{\"ticket\":42}")
+    );
     assert_eq!(snapshots[1].snapshot_id, 2);
+    assert_eq!(snapshots[1].schema_version, Some(3));
+    assert_eq!(
+        changes[1].changes_made.as_deref(),
+        Some("inserted_into_table:1")
+    );
+    assert_eq!(changes[1].author, None);
+    assert_eq!(changes[1].commit_message, None);
+    assert_eq!(changes[1].commit_extra_info, None);
+
+    sqlx::query("DROP TABLE ducklake_snapshot_changes")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    let snapshots = provider.list_snapshots().unwrap();
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| (snapshot.snapshot_id, snapshot.schema_version))
+            .collect::<Vec<_>>(),
+        vec![(1, Some(3)), (2, Some(3))]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

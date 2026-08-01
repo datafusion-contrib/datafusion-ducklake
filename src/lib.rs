@@ -51,6 +51,7 @@ pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
 pub mod schema;
+mod snapshot_changes;
 pub mod snapshot_filter;
 pub mod sort;
 pub mod table;

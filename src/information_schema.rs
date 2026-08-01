@@ -25,9 +25,10 @@
 //! SELECT * FROM ducklake.information_schema.tables WHERE schema_name = 'public';
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::{SchemaProvider, Session};
 use datafusion::datasource::TableProvider;
@@ -37,6 +38,7 @@ use datafusion::logical_expr::TableType;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::metadata_provider::MetadataProvider;
+use crate::snapshot_changes::snapshot_changes;
 
 /// Live table provider for snapshots - queries metadata on every scan
 #[derive(Debug)]
@@ -50,6 +52,19 @@ impl SnapshotsTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("timestamp", DataType::Utf8, true),
+            Field::new("schema_version", DataType::Int64, true),
+            Field::new(
+                "changes",
+                snapshot_changes(std::iter::empty())
+                    .expect("empty snapshot changes are valid")
+                    .data_type()
+                    .clone(),
+                false,
+            ),
+            Field::new("changes_made", DataType::Utf8, true),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("commit_message", DataType::Utf8, true),
+            Field::new("commit_extra_info", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -63,6 +78,23 @@ impl SnapshotsTable {
             .list_snapshots()
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
+        let changes = self
+            .provider
+            .list_snapshot_changes()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+            .into_iter()
+            .map(|change| (change.snapshot_id, change))
+            .collect::<HashMap<_, _>>();
+        let changes = snapshots
+            .iter()
+            .map(|snapshot| changes.get(&snapshot.snapshot_id))
+            .collect::<Vec<_>>();
+        let display_changes = snapshot_changes(
+            changes
+                .iter()
+                .map(|change| change.and_then(|change| change.changes_made.as_deref())),
+        )?;
+
         let snapshot_ids: ArrayRef = Arc::new(Int64Array::from(
             snapshots.iter().map(|s| s.snapshot_id).collect::<Vec<_>>(),
         ));
@@ -74,8 +106,55 @@ impl SnapshotsTable {
                 .collect::<Vec<_>>(),
         ));
 
-        RecordBatch::try_new(self.schema.clone(), vec![snapshot_ids, timestamps])
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        let schema_versions: ArrayRef = Arc::new(Int64Array::from(
+            snapshots
+                .iter()
+                .map(|s| s.schema_version)
+                .collect::<Vec<_>>(),
+        ));
+
+        let changes_made: ArrayRef = Arc::new(StringArray::from(
+            changes
+                .iter()
+                .map(|s| s.and_then(|s| s.changes_made.as_deref()))
+                .collect::<Vec<_>>(),
+        ));
+
+        let authors: ArrayRef = Arc::new(StringArray::from(
+            changes
+                .iter()
+                .map(|s| s.and_then(|s| s.author.as_deref()))
+                .collect::<Vec<_>>(),
+        ));
+
+        let commit_messages: ArrayRef = Arc::new(StringArray::from(
+            changes
+                .iter()
+                .map(|s| s.and_then(|s| s.commit_message.as_deref()))
+                .collect::<Vec<_>>(),
+        ));
+
+        let commit_extra_info: ArrayRef = Arc::new(StringArray::from(
+            changes
+                .iter()
+                .map(|s| s.and_then(|s| s.commit_extra_info.as_deref()))
+                .collect::<Vec<_>>(),
+        ));
+
+        RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                snapshot_ids,
+                timestamps,
+                schema_versions,
+                Arc::new(display_changes),
+                changes_made,
+                authors,
+                commit_messages,
+                commit_extra_info,
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
