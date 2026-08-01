@@ -838,8 +838,8 @@ time-travel read through them still covers rows of files ended since. Bounds com
 official's `RequiresValueComparison` decides: numbers, booleans and `DATE`, `TIME` and
 `TIMESTAMP` values by value, everything else as text. Parquet files this crate writes
 record statistics per leaf field of a `STRUCT`, `LIST` or `MAP`, and float bounds that
-leave NaN out with `contains_nan` set, as official's do. Inlined bounds are DuckDB's
-text of each value (`nan`, `TIME`, escaped `BLOB`, strings of any length), with no NaN
+leave NaN out with `contains_nan` set, as official's do. Predicates on struct fields can use leaf bounds to prune files during scan planning.
+Inlined bounds are DuckDB's text of each value (`nan`, `TIME`, escaped `BLOB`, strings of any length), with no NaN
 flag; `UUID`, `INTERVAL` and other values this crate has no DuckDB text for leave the
 bound unknown. File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and
 `TIME` bounds as text, as official's Parquet statistics do. A file's string and blob
