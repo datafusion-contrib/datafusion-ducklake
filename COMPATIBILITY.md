@@ -840,8 +840,8 @@ official's `RequiresValueComparison` decides: numbers, booleans and `DATE`, `TIM
 record statistics per leaf field of a `STRUCT`, `LIST` or `MAP`, and float bounds that
 leave NaN out with `contains_nan` set, as official's do. Inlined bounds are DuckDB's
 text of each value (`nan`, `TIME`, escaped `BLOB`, strings of any length), with no NaN
-flag; `UUID`, `INTERVAL` and other values this crate has no DuckDB text for leave the
-bound unknown. File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and
+flag. UUID bounds use canonical UUID strings. `INTERVAL` and other values this crate has
+no DuckDB text for leave the bound unknown. File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and
 `TIME` bounds as text, as official's Parquet statistics do. A file's string and blob
 bounds over 256 bytes are truncated as DuckDB's Parquet writer truncates them: a minimum
 to its first 256 bytes (back to a character boundary for a string), a maximum to the

@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -56,6 +56,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
             false,
         ),
+        Field::new("object_uuid", DataType::FixedSizeBinary(16), true),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -74,6 +75,13 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                     1_578_227_696_123_456,
                 ])
                 .with_timezone("America/New_York"),
+            ),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                    [Some([0xff; 16]), None, Some([0x01; 16])].into_iter(),
+                    16,
+                )
+                .unwrap(),
             ),
         ],
     )
@@ -136,6 +144,12 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some(0),
                 Some(3)
             ),
+            (
+                Some("01010101-0101-0101-0101-010101010101".to_string()),
+                Some("ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
+                Some(1),
+                Some(2),
+            ),
         ],
         "per-file zone maps must match DuckDB-canonical encodings"
     );
@@ -154,7 +168,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             .collect();
     assert_eq!(
         sizes.len(),
-        4,
+        5,
         "one column_size_bytes row per written column"
     );
     for (i, s) in sizes.iter().enumerate() {
@@ -164,7 +178,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
         );
     }
 
-    // Global roll-up: one row per column, contains_null true only for `name`.
+    // Global roll-up: one row per column, contains_null true for `name` and `object_uuid`.
     let table_stats: Vec<(Option<bool>, Option<String>, Option<String>)> = sqlx::query(
         "SELECT contains_null, min_value, max_value
          FROM ducklake_table_column_stats ORDER BY column_id",
@@ -200,6 +214,11 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some(false),
                 Some("1969-12-31 23:59:59.123456+00".to_string()),
                 Some("2024-01-15 12:30:00.123456+00".to_string())
+            ),
+            (
+                Some(true),
+                Some("01010101-0101-0101-0101-010101010101".to_string()),
+                Some("ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
             ),
         ],
         "table-wide roll-up must reflect the single file's bounds"
