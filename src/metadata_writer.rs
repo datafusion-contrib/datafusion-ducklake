@@ -1485,6 +1485,16 @@ pub struct MultiTableCommit {
     pub tables: Vec<CommitIds>,
 }
 
+/// Conflict-detection metadata for one committed snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotChanges {
+    /// Committed snapshot identifier.
+    pub snapshot_id: i64,
+    /// DuckLake's comma-separated high-level changeset. `None` means the
+    /// snapshot cannot be classified safely for retry.
+    pub changes_made: Option<String>,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
@@ -1682,6 +1692,19 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn set_tag(&self, _target: TagTarget, _key: &str, _value: Option<&str>) -> Result<i64> {
         Err(DuckLakeError::InvalidConfig(
             "tags are not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Return every snapshot committed after `snapshot_id`, in ascending order,
+    /// with its conflict-detection changeset. Optimistic metadata backends use
+    /// this after [`crate::DuckLakeError::SnapshotCollision`] to decide whether
+    /// the staged commit may be retried without rewriting data files.
+    ///
+    /// Writers that cannot provide a complete sequence keep the conservative
+    /// default: the collision is not retryable.
+    fn snapshot_changes_since(&self, _snapshot_id: i64) -> Result<Vec<SnapshotChanges>> {
+        Err(DuckLakeError::Unsupported(
+            "snapshot conflict inspection is not supported by this metadata writer".to_string(),
         ))
     }
 

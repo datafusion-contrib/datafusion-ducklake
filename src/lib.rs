@@ -112,6 +112,8 @@ pub mod metadata_provider_sqlite;
 #[cfg(feature = "write")]
 pub mod compaction;
 #[cfg(feature = "write")]
+pub mod conflict_retry;
+#[cfg(feature = "write")]
 pub mod delete_exec;
 #[cfg(feature = "write")]
 pub mod insert_exec;
@@ -177,6 +179,8 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 #[cfg(feature = "write")]
 pub use compaction::{CompactionResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]
+pub use conflict_retry::ConflictRetryConfig;
+#[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
@@ -184,8 +188,8 @@ pub use insert_exec::DuckLakeInsertExec;
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
     DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
-    PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
+    PromoteLayout, PromotedFile, RowIdStart, SnapshotChanges, SnapshotCommitMetadata,
+    SourceRetirement, StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

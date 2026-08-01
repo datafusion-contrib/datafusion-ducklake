@@ -2,6 +2,7 @@
 //! Concurrent write tests for DuckLake catalogs.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -10,8 +11,10 @@ use datafusion_ducklake::metadata_writer::MetadataWriter;
 use datafusion_ducklake::{
     DuckLakeTableWriter, SqliteMetadataWriter, TableWriteOptions, WriteMode,
 };
+use futures::TryStreamExt;
 use object_store::ObjectStoreExt;
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use tempfile::TempDir;
 
 fn create_object_store() -> Arc<dyn object_store::ObjectStore> {
@@ -452,4 +455,69 @@ async fn test_stress_concurrent_writes() {
         }
     }
     assert_eq!(successes, 50);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_appends_commit_one_parquet_each() {
+    let temp_dir = TempDir::new().unwrap();
+    let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let object_store = create_object_store();
+
+    DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&object_store))
+        .unwrap()
+        .write_table(
+            "main",
+            "shared_table",
+            &[create_user_batch(&[0], &["initial"])],
+        )
+        .await
+        .unwrap();
+
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&object_store)).unwrap();
+    let schema = create_user_schema();
+    let mut first = table_writer
+        .begin_write("main", "shared_table", &schema, WriteMode::Append)
+        .unwrap();
+    let mut second = table_writer
+        .begin_write("main", "shared_table", &schema, WriteMode::Append)
+        .unwrap();
+    assert_eq!(first.snapshot_id(), second.snapshot_id());
+    let table_path = first
+        .file_path()
+        .rsplit_once('/')
+        .map(|(path, _)| ObjectPath::from(path))
+        .unwrap();
+    first
+        .write_batch(&create_user_batch(&[1], &["first"]))
+        .unwrap();
+    second
+        .write_batch(&create_user_batch(&[2], &["second"]))
+        .unwrap();
+
+    let first = tokio::spawn(first.finish());
+    let second = tokio::spawn(second.finish());
+    let (first, second) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::try_join!(first, second)
+    })
+    .await
+    .expect("concurrent appends must finish without deadlock")
+    .unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.files_written, 1);
+    assert_eq!(first.records_written, 1);
+    assert_eq!(second.files_written, 1);
+    assert_eq!(second.records_written, 1);
+    assert_ne!(first.snapshot_id, second.snapshot_id);
+
+    let objects: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(10),
+        object_store.list(Some(&table_path)).try_collect(),
+    )
+    .await
+    .expect("table object listing must finish")
+    .unwrap();
+    assert_eq!(objects.len(), 3, "initial write plus two append files");
 }

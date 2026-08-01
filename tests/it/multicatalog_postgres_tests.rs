@@ -17,8 +17,8 @@ use datafusion_ducklake::metadata_writer::{
 };
 use datafusion_ducklake::{
     DuckLakeError, DuckLakeTableWriter, MetadataProvider, MulticatalogManager,
-    MulticatalogProvider, NullOrder, PartitionTransform, PostgresMetadataWriter, SortDirection,
-    SortField, TableWriteOptions, TagObjectType, TagTarget, TypeChangeOperation,
+    MulticatalogProvider, NullOrder, PartitionTransform, PostgresMetadataWriter, SnapshotChanges,
+    SortDirection, SortField, TableWriteOptions, TagObjectType, TagTarget, TypeChangeOperation,
     TypeChangeWriteMode, initialize_multicatalog_schema,
 };
 use sqlx::AssertSqlSafe;
@@ -9510,4 +9510,51 @@ async fn orphan_sweep_keeps_a_catalogs_own_absolute_file_under_its_own_root() {
         "the sweep deleted a live file this catalog owns: {deleted:?}"
     );
     assert!(!dir.join("stray.parquet").exists(), "the orphan is gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn snapshot_changes_since_is_ordered_and_catalog_scoped() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let first_catalog = manager.create_catalog("first_changes").await.unwrap();
+    let other_catalog = manager.create_catalog("other_changes").await.unwrap();
+    let first_writer = PostgresMetadataWriter::with_pool(pool.clone(), first_catalog)
+        .await
+        .unwrap();
+    let other_writer = PostgresMetadataWriter::with_pool(pool.clone(), other_catalog)
+        .await
+        .unwrap();
+
+    let first = first_writer.create_snapshot().unwrap();
+    let other = other_writer.create_snapshot().unwrap();
+    let second = first_writer.create_snapshot().unwrap();
+    for (snapshot_id, changes_made) in [
+        (first, "inserted_into_table:7"),
+        (other, "altered_table:8"),
+        (second, "deleted_from_table:7"),
+    ] {
+        sqlx::query(
+            "UPDATE ducklake_snapshot_changes SET changes_made = $2 WHERE snapshot_id = $1",
+        )
+        .bind(snapshot_id)
+        .bind(changes_made)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        first_writer.snapshot_changes_since(0).unwrap(),
+        vec![
+            SnapshotChanges {
+                snapshot_id: first,
+                changes_made: Some("inserted_into_table:7".to_string()),
+            },
+            SnapshotChanges {
+                snapshot_id: second,
+                changes_made: Some("deleted_from_table:7".to_string()),
+            },
+        ]
+    );
 }

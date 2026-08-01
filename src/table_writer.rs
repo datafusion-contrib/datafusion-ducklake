@@ -22,6 +22,7 @@ use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::conflict_retry::{CommitChange, CommitTarget, ConflictRetryConfig, commit_with_retry};
 use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter,
@@ -110,6 +111,10 @@ pub struct DuckLakeWriteOptions {
     pub auto_compact: Option<bool>,
     /// Minimum deleted-row fraction for automatic rewrite selection.
     pub rewrite_delete_threshold: Option<f64>,
+    /// Snapshot-collision retry policy; `None` leaves the writer's policy
+    /// unchanged, which defaults to the DuckLake extension's retry count,
+    /// backoff, and initial wait.
+    pub conflict_retry: Option<ConflictRetryConfig>,
     deferred_error: Option<String>,
 }
 
@@ -150,6 +155,7 @@ impl DuckLakeWriteOptions {
                 "rewrite_delete_threshold",
                 Some(0.95),
             )?,
+            conflict_retry: None,
             deferred_error: None,
         })
     }
@@ -165,6 +171,13 @@ impl DuckLakeWriteOptions {
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Sets the snapshot-collision retry policy.
+    #[must_use]
+    pub fn with_conflict_retry(mut self, config: ConflictRetryConfig) -> Self {
+        self.conflict_retry = Some(config);
         self
     }
 
@@ -213,6 +226,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.rewrite_delete_threshold.is_some() {
             self.rewrite_delete_threshold = overrides.rewrite_delete_threshold;
+        }
+        if overrides.conflict_retry.is_some() {
+            self.conflict_retry = overrides.conflict_retry;
         }
         self
     }
@@ -464,6 +480,9 @@ pub struct DuckLakeTableWriter {
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
     upload_concurrency: usize,
+    /// Bounded metadata-only snapshot-collision retry policy. Set via
+    /// [`DuckLakeTableWriter::with_conflict_retry`].
+    conflict_retry: ConflictRetryConfig,
     /// Target data file size in approximate encoded bytes. A write rolls over to a
     /// new file once the current file's estimated encoded size reaches this, so a
     /// large write produces several files instead of one. Paired with a sort order,
@@ -498,6 +517,7 @@ impl DuckLakeTableWriter {
             max_row_group_rows: None,
             max_row_group_bytes: None,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            conflict_retry: ConflictRetryConfig::default(),
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
             data_inlining_row_limit: None,
@@ -570,6 +590,12 @@ impl DuckLakeTableWriter {
     /// Defaults to [`DEFAULT_UPLOAD_CONCURRENCY`]. Values below 1 are clamped to 1
     /// (a write must still upload its files).
     #[must_use]
+    /// Override the metadata-only snapshot-collision retry policy.
+    pub fn with_conflict_retry(mut self, config: ConflictRetryConfig) -> Self {
+        self.conflict_retry = config;
+        self
+    }
+
     pub fn with_upload_concurrency(mut self, files: usize) -> Self {
         self.upload_concurrency = files.max(1);
         self
@@ -602,6 +628,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
+        }
+        if let Some(config) = options.conflict_retry {
+            self.conflict_retry = config;
         }
         if let Some(sort_on_insert) = options.sort_on_insert {
             self.sort_on_insert = sort_on_insert;
@@ -829,6 +858,7 @@ impl DuckLakeTableWriter {
         partition_mode: StreamPartitionMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
+        self.conflict_retry.validate()?;
         let validation_schema =
             Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
@@ -968,6 +998,8 @@ impl DuckLakeTableWriter {
             rolled: Vec::new(),
             upload_concurrency: self.upload_concurrency,
             commit_metadata: SnapshotCommitMetadata::default(),
+            schema_id: setup.schema_id,
+            conflict_retry: self.conflict_retry,
         })
     }
 
@@ -1471,6 +1503,7 @@ impl DuckLakeTableWriter {
         groups: Vec<PartitionGroup>,
         options: &TableWriteOptions,
     ) -> Result<WriteResult> {
+        self.conflict_retry.validate()?;
         if groups.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "write_partitioned: no partition groups".to_string(),
@@ -1570,21 +1603,38 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let committed = self.metadata.register_data_files_with_commit_metadata(
-            setup.table_id,
-            schema_name,
-            table_name,
+        let committed = commit_registration_with_retry(
+            &self.metadata,
+            self.conflict_retry,
+            options.expected_base_snapshot_id,
+            &[registration_target(
+                mode,
+                setup.schema_id,
+                schema_name,
+                setup.table_id,
+                table_name,
+            )],
             setup.snapshot_id,
-            &file_infos,
-            mode,
             options
                 .expected_base_snapshot_id
                 .unwrap_or(setup.base_snapshot_id),
-            &columns,
-            &setup.field_ids,
-            &options.commit_metadata,
-            options.expected_base_snapshot_id,
-        )?;
+            |snapshot_id, base_snapshot| {
+                self.metadata.register_data_files_with_commit_metadata(
+                    setup.table_id,
+                    schema_name,
+                    table_name,
+                    snapshot_id,
+                    &file_infos,
+                    mode,
+                    base_snapshot,
+                    &columns,
+                    &setup.field_ids,
+                    &options.commit_metadata,
+                    options.expected_base_snapshot_id,
+                )
+            },
+        )
+        .await?;
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
@@ -1672,6 +1722,7 @@ impl DuckLakeTableWriter {
         batches: &[RecordBatch],
         resolve_layout: bool,
     ) -> Result<WriteResult> {
+        self.conflict_retry.validate()?;
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
@@ -1787,17 +1838,34 @@ impl DuckLakeTableWriter {
         }
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
 
-        let committed = self.metadata.register_data_files(
-            setup.table_id,
-            schema_name,
-            table_name,
+        let committed = commit_registration_with_retry(
+            &self.metadata,
+            self.conflict_retry,
+            None,
+            &[registration_target(
+                mode,
+                setup.schema_id,
+                schema_name,
+                setup.table_id,
+                table_name,
+            )],
             setup.snapshot_id,
-            &file_infos,
-            mode,
             setup.base_snapshot_id,
-            &columns,
-            &setup.field_ids,
-        )?;
+            |snapshot_id, base_snapshot| {
+                self.metadata.register_data_files(
+                    setup.table_id,
+                    schema_name,
+                    table_name,
+                    snapshot_id,
+                    &file_infos,
+                    mode,
+                    base_snapshot,
+                    &columns,
+                    &setup.field_ids,
+                )
+            },
+        )
+        .await?;
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
@@ -2992,6 +3060,56 @@ async fn upload_staged_files_ordered(
     Ok(infos)
 }
 
+fn registration_target<'a>(
+    mode: WriteMode,
+    schema_id: i64,
+    schema_name: &'a str,
+    table_id: i64,
+    table_name: &'a str,
+) -> CommitTarget<'a> {
+    CommitTarget {
+        change: match mode {
+            WriteMode::Append => CommitChange::Insert,
+            WriteMode::Replace => CommitChange::Replace,
+        },
+        schema_id,
+        schema_name,
+        table_id,
+        table_name,
+    }
+}
+
+/// Register staged files, retrying only the metadata commit when a snapshot-id
+/// collision is followed by changes that commute with `targets`.
+///
+/// A commit fenced at `expected_base_snapshot_id` is not retried: the caller asked
+/// to commit on exactly that head, so any intervening snapshot is a conflict.
+async fn commit_registration_with_retry<F>(
+    metadata: &Arc<dyn MetadataWriter>,
+    config: ConflictRetryConfig,
+    expected_base_snapshot_id: Option<i64>,
+    targets: &[CommitTarget<'_>],
+    snapshot_id: i64,
+    base_snapshot: i64,
+    mut register: F,
+) -> Result<crate::metadata_writer::CommitIds>
+where
+    F: FnMut(i64, i64) -> Result<crate::metadata_writer::CommitIds>,
+{
+    if expected_base_snapshot_id.is_some() {
+        return register(snapshot_id, base_snapshot);
+    }
+    commit_with_retry(
+        config,
+        snapshot_id,
+        base_snapshot,
+        targets,
+        register,
+        |attempt_base| std::future::ready(metadata.snapshot_changes_since(attempt_base)),
+    )
+    .await
+}
+
 /// Streaming write session. Batches stream to a local staging file; the
 /// finished parquet is uploaded in `finish()`. If the session is dropped
 /// without finishing, the staging file is removed and nothing is uploaded.
@@ -3058,9 +3176,28 @@ pub struct TableWriteSession {
     /// How many of those files `finish` uploads concurrently.
     upload_concurrency: usize,
     commit_metadata: SnapshotCommitMetadata,
+    schema_id: i64,
+    conflict_retry: ConflictRetryConfig,
 }
 
 impl TableWriteSession {
+    fn insert_target(&self) -> CommitTarget<'_> {
+        registration_target(
+            self.mode,
+            self.schema_id,
+            &self.schema_name,
+            self.table_id,
+            &self.table_name,
+        )
+    }
+
+    fn delete_target(&self) -> CommitTarget<'_> {
+        CommitTarget {
+            change: CommitChange::Delete,
+            ..self.insert_target()
+        }
+    }
+
     // Keep the read plan's snapshot for source-scoped conflict checks without
     // enabling the broader table-generation precondition.
     pub(crate) const fn with_base_snapshot_id(mut self, snapshot_id: i64) -> Self {
@@ -3255,19 +3392,30 @@ impl TableWriteSession {
                 return self.finish_single_file().await;
             }
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = self.metadata.register_data_files_with_commit_metadata(
-                self.table_id,
-                &self.schema_name,
-                &self.table_name,
-                self.snapshot_id,
-                &file_infos,
-                self.mode,
-                self.base_snapshot_id,
-                &self.columns,
-                &self.field_ids,
-                &self.commit_metadata,
+            let committed = commit_registration_with_retry(
+                &self.metadata,
+                self.conflict_retry,
                 self.expected_base_snapshot_id,
-            )?;
+                &[self.insert_target()],
+                self.snapshot_id,
+                self.base_snapshot_id,
+                |snapshot_id, base_snapshot| {
+                    self.metadata.register_data_files_with_commit_metadata(
+                        self.table_id,
+                        &self.schema_name,
+                        &self.table_name,
+                        snapshot_id,
+                        &file_infos,
+                        self.mode,
+                        base_snapshot,
+                        &self.columns,
+                        &self.field_ids,
+                        &self.commit_metadata,
+                        self.expected_base_snapshot_id,
+                    )
+                },
+            )
+            .await?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -3287,19 +3435,30 @@ impl TableWriteSession {
                 return self.finish_single_file().await;
             }
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = self.metadata.register_data_files_with_commit_metadata(
-                self.table_id,
-                &self.schema_name,
-                &self.table_name,
-                self.snapshot_id,
-                &file_infos,
-                self.mode,
-                self.base_snapshot_id,
-                &self.columns,
-                &self.field_ids,
-                &self.commit_metadata,
+            let committed = commit_registration_with_retry(
+                &self.metadata,
+                self.conflict_retry,
                 self.expected_base_snapshot_id,
-            )?;
+                &[self.insert_target()],
+                self.snapshot_id,
+                self.base_snapshot_id,
+                |snapshot_id, base_snapshot| {
+                    self.metadata.register_data_files_with_commit_metadata(
+                        self.table_id,
+                        &self.schema_name,
+                        &self.table_name,
+                        snapshot_id,
+                        &file_infos,
+                        self.mode,
+                        base_snapshot,
+                        &self.columns,
+                        &self.field_ids,
+                        &self.commit_metadata,
+                        self.expected_base_snapshot_id,
+                    )
+                },
+            )
+            .await?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -3318,19 +3477,30 @@ impl TableWriteSession {
         // register_data_file returns the ids actually committed (snapshot id
         // assigned at commit; real schema/table ids, which may differ from the
         // begin-time reservations under a concurrent create). Report those.
-        let committed = self.metadata.register_data_file_with_commit_metadata(
-            self.table_id,
-            &self.schema_name,
-            &self.table_name,
-            self.snapshot_id,
-            &file_info,
-            self.mode,
-            self.base_snapshot_id,
-            &self.columns,
-            &self.field_ids,
-            &self.commit_metadata,
+        let committed = commit_registration_with_retry(
+            &self.metadata,
+            self.conflict_retry,
             self.expected_base_snapshot_id,
-        )?;
+            &[self.insert_target()],
+            self.snapshot_id,
+            self.base_snapshot_id,
+            |snapshot_id, base_snapshot| {
+                self.metadata.register_data_file_with_commit_metadata(
+                    self.table_id,
+                    &self.schema_name,
+                    &self.table_name,
+                    snapshot_id,
+                    &file_info,
+                    self.mode,
+                    base_snapshot,
+                    &self.columns,
+                    &self.field_ids,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )
+            },
+        )
+        .await?;
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
@@ -3402,40 +3572,50 @@ impl TableWriteSession {
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
         // One appended file goes through the single-file commit, so a backend that
         // implements only that form keeps working; N>1 needs the multi-file commit.
-        let committed = match file_infos.as_slice() {
-            [file_info] => self
-                .metadata
-                .register_data_file_with_deletes_and_commit_metadata(
-                    self.table_id,
-                    &self.schema_name,
-                    &self.table_name,
-                    self.snapshot_id,
-                    file_info,
-                    deletes,
-                    self.mode,
-                    self.base_snapshot_id,
-                    &self.columns,
-                    &self.field_ids,
-                    &self.commit_metadata,
-                    self.expected_base_snapshot_id,
-                )?,
-            file_infos => self
-                .metadata
-                .register_data_files_with_deletes_and_commit_metadata(
-                    self.table_id,
-                    &self.schema_name,
-                    &self.table_name,
-                    self.snapshot_id,
-                    file_infos,
-                    deletes,
-                    self.mode,
-                    self.base_snapshot_id,
-                    &self.columns,
-                    &self.field_ids,
-                    &self.commit_metadata,
-                    self.expected_base_snapshot_id,
-                )?,
-        };
+        let targets = [self.insert_target(), self.delete_target()];
+        let committed = commit_registration_with_retry(
+            &self.metadata,
+            self.conflict_retry,
+            self.expected_base_snapshot_id,
+            &targets,
+            self.snapshot_id,
+            self.base_snapshot_id,
+            |snapshot_id, base_snapshot| match file_infos.as_slice() {
+                [file_info] => self
+                    .metadata
+                    .register_data_file_with_deletes_and_commit_metadata(
+                        self.table_id,
+                        &self.schema_name,
+                        &self.table_name,
+                        snapshot_id,
+                        file_info,
+                        deletes,
+                        self.mode,
+                        base_snapshot,
+                        &self.columns,
+                        &self.field_ids,
+                        &self.commit_metadata,
+                        self.expected_base_snapshot_id,
+                    ),
+                file_infos => self
+                    .metadata
+                    .register_data_files_with_deletes_and_commit_metadata(
+                        self.table_id,
+                        &self.schema_name,
+                        &self.table_name,
+                        snapshot_id,
+                        file_infos,
+                        deletes,
+                        self.mode,
+                        base_snapshot,
+                        &self.columns,
+                        &self.field_ids,
+                        &self.commit_metadata,
+                        self.expected_base_snapshot_id,
+                    ),
+            },
+        )
+        .await?;
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
             table_id: committed.table_id,

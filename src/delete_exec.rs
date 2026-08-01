@@ -48,6 +48,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
 
+use crate::conflict_retry::{CommitChange, CommitTarget, commit_with_retry};
 use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter};
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
@@ -258,6 +259,22 @@ async fn run_delete(
     base_snapshot: i64,
 ) -> DataFusionResult<u64> {
     let state: &dyn Session = session_state;
+    let conflict_retry = table.write_options().conflict_retry.unwrap_or_default();
+    conflict_retry
+        .validate()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let snapshot_id = base_snapshot.checked_add(1).ok_or_else(|| {
+        DataFusionError::Execution(
+            "cannot delete after the maximum snapshot identifier".to_string(),
+        )
+    })?;
+    let target = CommitTarget {
+        change: CommitChange::Delete,
+        schema_id: -1,
+        schema_name,
+        table_id,
+        table_name,
+    };
     let table_files = table
         .files()
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -272,9 +289,18 @@ async fn run_delete(
             if table_files.is_empty() && inlined_data.is_empty() {
                 return Ok(0);
             }
-            return writer
-                .commit_truncate(table_id, schema_name, table_name, base_snapshot)
-                .map_err(|e| DataFusionError::External(Box::new(e)));
+            return commit_with_retry(
+                conflict_retry,
+                snapshot_id,
+                base_snapshot,
+                &[target],
+                |_attempt_snapshot, attempt_base| {
+                    writer.commit_truncate(table_id, schema_name, table_name, attempt_base)
+                },
+                |attempt_base| std::future::ready(writer.snapshot_changes_since(attempt_base)),
+            )
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)));
         },
         Some(p) => p,
     };
@@ -378,16 +404,25 @@ async fn run_delete(
     // (atomic multi-file DELETE). No new data file is appended, so this uses the
     // dedicated delete-only commit rather than `register_data_file_with_deletes`
     // (which requires an appended file).
-    writer
-        .commit_deletes(
-            table_id,
-            schema_name,
-            table_name,
-            base_snapshot,
-            &entries,
-            &inlined_rows,
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    commit_with_retry(
+        conflict_retry,
+        snapshot_id,
+        base_snapshot,
+        &[target],
+        |_attempt_snapshot, attempt_base| {
+            writer.commit_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                attempt_base,
+                &entries,
+                &inlined_rows,
+            )
+        },
+        |attempt_base| std::future::ready(writer.snapshot_changes_since(attempt_base)),
+    )
+    .await
+    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     Ok(total_deleted)
 }
