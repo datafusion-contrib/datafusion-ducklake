@@ -303,6 +303,94 @@ impl TableProvider for TablesTable {
     }
 }
 
+/// Live table provider for views.
+#[derive(Debug)]
+pub struct ViewsTable {
+    provider: Arc<dyn MetadataProvider>,
+    schema: SchemaRef,
+}
+
+impl ViewsTable {
+    pub fn new(provider: Arc<dyn MetadataProvider>) -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("snapshot_id", DataType::Int64, false),
+            Field::new("schema_name", DataType::Utf8, false),
+            Field::new("view_id", DataType::Int64, false),
+            Field::new("view_name", DataType::Utf8, false),
+            Field::new("dialect", DataType::Utf8, false),
+            Field::new("sql", DataType::Utf8, false),
+            Field::new("column_aliases", DataType::Utf8, true),
+        ]));
+        Self {
+            provider,
+            schema,
+        }
+    }
+
+    fn query_views(&self) -> DataFusionResult<RecordBatch> {
+        let snapshot_id = self
+            .provider
+            .get_current_snapshot()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let views = self
+            .provider
+            .list_all_views(snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        RecordBatch::try_new(
+            Arc::clone(&self.schema),
+            vec![
+                Arc::new(Int64Array::from(vec![snapshot_id; views.len()])),
+                Arc::new(StringArray::from_iter_values(
+                    views.iter().map(|view| view.schema_name.as_str()),
+                )),
+                Arc::new(Int64Array::from_iter_values(
+                    views.iter().map(|view| view.view.view_id),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    views.iter().map(|view| view.view.view_name.as_str()),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    views.iter().map(|view| view.view.dialect.as_str()),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    views.iter().map(|view| view.view.sql.as_str()),
+                )),
+                Arc::new(StringArray::from(
+                    views
+                        .iter()
+                        .map(|view| view.view.column_aliases.as_deref())
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    }
+}
+
+#[async_trait::async_trait]
+impl TableProvider for ViewsTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::prelude::Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let batch = self.query_views()?;
+        let mem_table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
+        mem_table.scan(state, projection, filters, limit).await
+    }
+}
+
 /// Live table provider for columns - queries metadata on every scan
 #[derive(Debug)]
 pub struct ColumnsTable {
@@ -704,6 +792,7 @@ impl SchemaProvider for InformationSchemaProvider {
             "snapshots".to_string(),
             "schemata".to_string(),
             "tables".to_string(),
+            "views".to_string(),
             "table_info".to_string(),
             "columns".to_string(),
             "files".to_string(),
@@ -716,6 +805,7 @@ impl SchemaProvider for InformationSchemaProvider {
             "snapshots" => Some(Arc::new(SnapshotsTable::new(self.provider.clone()))),
             "schemata" => Some(Arc::new(SchemataTable::new(self.provider.clone()))),
             "tables" => Some(Arc::new(TablesTable::new(self.provider.clone()))),
+            "views" => Some(Arc::new(ViewsTable::new(self.provider.clone()))),
             "table_info" => Some(Arc::new(TableInfoTable::new(self.provider.clone()))),
             "columns" => Some(Arc::new(ColumnsTable::new(self.provider.clone()))),
             "files" => Some(Arc::new(FilesTable::new(self.provider.clone()))),

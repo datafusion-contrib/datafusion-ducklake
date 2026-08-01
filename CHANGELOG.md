@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add read-only DuckLake views across metadata backends and writer-compatible view metadata (#264).
+
 ### Fixed
 
 - `files_matching` prunes a data file that carries a delete file. Its recorded

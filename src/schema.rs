@@ -6,10 +6,12 @@ use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::error::Result as DataFusionResult;
+use datafusion::logical_expr::TableType;
 
 use crate::metadata_provider::MetadataProvider;
 use crate::path_resolver::resolve_path;
 use crate::table::DuckLakeTable;
+use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode, validate_name};
@@ -126,8 +128,8 @@ impl DuckLakeSchema {
 #[async_trait]
 impl SchemaProvider for DuckLakeSchema {
     fn table_names(&self) -> Vec<String> {
-        // Use cached snapshot_id
-        self.provider
+        let mut names = self
+            .provider
             .list_tables(self.schema_id, self.snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
@@ -141,7 +143,26 @@ impl SchemaProvider for DuckLakeSchema {
             .unwrap_or_default()
             .into_iter()
             .map(|t| t.table_name)
-            .collect()
+            .collect::<Vec<_>>();
+        names.extend(
+            self.provider
+                .list_views(self.schema_id, self.snapshot_id)
+                .inspect_err(|e| {
+                    tracing::error!(
+                        error = %e,
+                        schema_id = %self.schema_id,
+                        snapshot_id = %self.snapshot_id,
+                        schema_name = %self.schema_name,
+                        "Failed to list views from catalog"
+                    )
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(|view| view.view_name),
+        );
+        names.sort();
+        names.dedup();
+        names
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
@@ -179,16 +200,67 @@ impl SchemaProvider for DuckLakeSchema {
 
                 Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
             },
-            Ok(None) => Ok(None),
+            Ok(None) => match self
+                .provider
+                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+            {
+                Ok(Some(view)) => {
+                    let (definition, planned) = match resolve_view_definition(
+                        &view,
+                        self.provider.as_ref(),
+                        self.snapshot_id,
+                        &self.schema_name,
+                    ) {
+                        Ok(definition) => {
+                            let planned = plan_view(
+                                &view,
+                                &definition,
+                                Arc::clone(&self.provider),
+                                self.snapshot_id,
+                                &self.schema_name,
+                                self.row_lineage,
+                            )
+                            .await;
+                            (definition, planned)
+                        },
+                        Err(e) => (view.sql.clone(), Err(e)),
+                    };
+                    let table = match planned {
+                        Ok(table) => table,
+                        Err(e) => Arc::new(UnplannableViewTable::new(definition, &e)),
+                    };
+                    Ok(Some(table))
+                },
+                Ok(None) => Ok(None),
+                Err(e) => Err(datafusion::error::DataFusionError::External(Box::new(e))),
+            },
             Err(e) => Err(datafusion::error::DataFusionError::External(Box::new(e))),
         }
     }
 
+    async fn table_type(&self, name: &str) -> DataFusionResult<Option<TableType>> {
+        if self
+            .provider
+            .table_exists(self.schema_id, name, self.snapshot_id)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        {
+            return Ok(Some(TableType::Base));
+        }
+        self.provider
+            .get_view_by_name(self.schema_id, name, self.snapshot_id)
+            .map(|view| view.map(|_| TableType::View))
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+    }
+
     fn table_exist(&self, name: &str) -> bool {
-        // Use cached snapshot_id
         self.provider
             .table_exists(self.schema_id, name, self.snapshot_id)
             .unwrap_or(false)
+            || self
+                .provider
+                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+                .map(|view| view.is_some())
+                .unwrap_or(false)
     }
 
     /// Register a new table in this schema.
@@ -203,6 +275,17 @@ impl SchemaProvider for DuckLakeSchema {
     ) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
         // Validate table name to prevent path traversal attacks
         validate_table_name(&name)?;
+
+        if self
+            .provider
+            .get_view_by_name(self.schema_id, &name, self.snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .is_some()
+        {
+            return Err(DataFusionError::Plan(format!(
+                "Cannot create table '{name}': a view with that name already exists"
+            )));
+        }
 
         let writer = self.writer.as_ref().ok_or_else(|| {
             DataFusionError::Plan(

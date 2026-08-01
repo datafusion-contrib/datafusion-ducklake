@@ -85,6 +85,17 @@ const SQL_CREATE_TABLES: &[&str] = &[
     // Bare table (no PRIMARY KEY), mirroring upstream: a versioned column needs
     // several rows sharing one `column_id`. The `*default*` columns and
     // `parent_column` are left NULL.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_view (
+        view_id BIGINT,
+        view_uuid UUID,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_id BIGINT,
+        view_name VARCHAR,
+        dialect VARCHAR,
+        sql VARCHAR,
+        column_aliases VARCHAR
+    )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_column (
         column_id BIGINT,
         begin_snapshot BIGINT,

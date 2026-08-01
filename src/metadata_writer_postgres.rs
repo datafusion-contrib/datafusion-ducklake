@@ -65,6 +65,17 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     // row sharing the same `column_id`. Identity is the composite
     // (table_id, column_id, begin_snapshot); a partial unique index (below) enforces
     // at most one *live* version per field-id.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_view (
+        view_id BIGINT,
+        view_uuid UUID,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_id BIGINT,
+        view_name VARCHAR,
+        dialect VARCHAR,
+        sql VARCHAR,
+        column_aliases VARCHAR
+    )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_column (
         column_id BIGINT GENERATED ALWAYS AS IDENTITY,
         table_id BIGINT NOT NULL,

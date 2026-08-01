@@ -6,8 +6,8 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     InlinedDataBackend, MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, block_on, inlined_text_projection, is_inlined_data_table, parse_inlined_rows,
-    reconstruct_columns, reconstruct_columns_with_table,
+    TableWithSchema, ViewMetadata, ViewWithSchema, block_on, inlined_text_projection,
+    is_inlined_data_table, parse_inlined_rows, reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -27,6 +27,18 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn decode_view(row: &PgRow) -> Result<ViewMetadata> {
+    Ok(ViewMetadata {
+        view_id: row.try_get(0)?,
+        schema_id: row.try_get(1)?,
+        begin_snapshot: row.try_get(2)?,
+        view_name: row.try_get(3)?,
+        dialect: row.try_get(4)?,
+        sql: row.try_get(5)?,
+        column_aliases: row.try_get(6)?,
+    })
 }
 
 fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile> {
@@ -126,6 +138,8 @@ struct SchemaCapabilities {
     data_file_partition_id: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
     inlined_data_tables: bool,
+    /// The `ducklake_view` table exists.
+    views: bool,
 }
 
 impl SchemaCapabilities {
@@ -135,6 +149,7 @@ impl SchemaCapabilities {
             && self.schema_versions
             && self.data_file_partition_id
             && self.inlined_data_tables
+            && self.views
     }
 }
 
@@ -191,7 +206,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -200,7 +215,8 @@ impl PostgresMetadataProvider {
                to_regclass('ducklake_schema_versions') IS NOT NULL,
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
-               to_regclass('ducklake_inlined_data_tables') IS NOT NULL",
+               to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
+               to_regclass('ducklake_view') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -210,6 +226,7 @@ impl PostgresMetadataProvider {
             schema_versions: row.2,
             data_file_partition_id: row.3,
             inlined_data_tables: row.4,
+            views: row.5,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -320,6 +337,28 @@ impl MetadataProvider for PostgresMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn list_views(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(
+                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
+                 FROM ducklake_view
+                 WHERE schema_id = $1
+                   AND $2 >= begin_snapshot
+                   AND ($3 < end_snapshot OR end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter().map(|row| decode_view(&row)).collect()
         })
     }
 
@@ -1098,6 +1137,35 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn get_view_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(None);
+            }
+            let row = sqlx::query(
+                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
+                 FROM ducklake_view
+                 WHERE schema_id = $1
+                   AND view_name = $2
+                   AND $3 >= begin_snapshot
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .bind(name)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            row.map(|row| decode_view(&row)).transpose()
+        })
+    }
+
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
         block_on(async {
             let row = sqlx::query(
@@ -1151,6 +1219,44 @@ impl MetadataProvider for PostgresMetadataProvider {
                     Ok(TableWithSchema {
                         schema_name,
                         table,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn list_all_views(&self, snapshot_id: i64) -> Result<Vec<ViewWithSchema>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(
+                "SELECT s.schema_name, v.view_id, v.schema_id, v.begin_snapshot, v.view_name,
+                        v.dialect, v.sql, v.column_aliases
+                 FROM ducklake_schema s
+                 JOIN ducklake_view v ON s.schema_id = v.schema_id
+                 WHERE $1 >= s.begin_snapshot
+                   AND ($1 < s.end_snapshot OR s.end_snapshot IS NULL)
+                   AND $1 >= v.begin_snapshot
+                   AND ($1 < v.end_snapshot OR v.end_snapshot IS NULL)
+                 ORDER BY s.schema_name, v.view_name",
+            )
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ViewWithSchema {
+                        schema_name: row.try_get(0)?,
+                        view: ViewMetadata {
+                            view_id: row.try_get(1)?,
+                            schema_id: row.try_get(2)?,
+                            begin_snapshot: row.try_get(3)?,
+                            view_name: row.try_get(4)?,
+                            dialect: row.try_get(5)?,
+                            sql: row.try_get(6)?,
+                            column_aliases: row.try_get(7)?,
+                        },
                     })
                 })
                 .collect()

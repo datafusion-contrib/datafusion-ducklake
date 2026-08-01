@@ -56,6 +56,7 @@ pub mod table_changes;
 pub mod table_deletions;
 pub mod table_functions;
 pub mod types;
+pub(crate) mod view;
 
 // Metadata providers (feature-gated)
 #[cfg(feature = "metadata-duckdb")]

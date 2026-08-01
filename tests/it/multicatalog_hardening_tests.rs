@@ -1018,3 +1018,76 @@ async fn unknown_catalog_id_errors_clearly_on_lock() {
         err
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_provider_lists_and_resolves_views() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("views")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let setup = writer
+        .begin_write_transaction("public", "items", &users_cols(), WriteMode::Replace)
+        .unwrap();
+    let committed = writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "items",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &users_cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+
+    let schema_id: i64 = sqlx::query_scalar(
+        "SELECT s.schema_id FROM ducklake_schema s
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+         WHERE m.catalog_id = $1 AND s.schema_name = 'public' AND s.end_snapshot IS NULL",
+    )
+    .bind(catalog_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_view
+         (view_id, view_uuid, begin_snapshot, end_snapshot, schema_id, view_name, dialect, sql, column_aliases)
+         VALUES ($1, '00000000-0000-0000-0000-000000000001'::uuid, $2, NULL, $3, $4, $5, $6, $7)",
+    )
+    .bind(1_i64)
+    .bind(committed.snapshot_id)
+    .bind(schema_id)
+    .bind("active_items")
+    .bind("duckdb")
+    .bind("SELECT * FROM {DUCKLAKE_CATALOG}.public.items")
+    .bind("")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool, catalog_id)
+        .await
+        .unwrap();
+    let views = provider
+        .list_views(schema_id, committed.snapshot_id)
+        .unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].view_name, "active_items");
+    assert_eq!(views[0].begin_snapshot, committed.snapshot_id);
+    assert_eq!(
+        provider
+            .get_view_by_name(schema_id, "active_items", committed.snapshot_id)
+            .unwrap(),
+        Some(views[0].clone())
+    );
+    let all_views = provider.list_all_views(committed.snapshot_id).unwrap();
+    assert_eq!(all_views.len(), 1);
+    assert_eq!(all_views[0].schema_name, "public");
+    assert_eq!(all_views[0].view, views[0]);
+}

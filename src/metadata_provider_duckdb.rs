@@ -8,10 +8,12 @@ use crate::metadata_provider::{
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
-    SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
-    SQL_LIST_ALL_TABLES, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_TABLE_EXISTS,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, build_inlined_batch,
-    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
+    SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_COLUMNS,
+    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS,
+    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
+    build_inlined_batch, is_inlined_data_table, reconstruct_columns,
+    reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -152,6 +154,18 @@ fn decode_duckdb_text(value: &[u8], column: &str) -> crate::Result<String> {
     })
 }
 
+fn decode_view(row: &duckdb::Row<'_>) -> duckdb::Result<ViewMetadata> {
+    Ok(ViewMetadata {
+        view_id: row.get(0)?,
+        schema_id: row.get(1)?,
+        begin_snapshot: row.get(2)?,
+        view_name: row.get(3)?,
+        dialect: row.get(4)?,
+        sql: row.get(5)?,
+        column_aliases: row.get(6)?,
+    })
+}
+
 /// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
 ///
 /// Older catalogs (spec 0.2) may lack the `partial_max` columns and the
@@ -166,11 +180,16 @@ struct SchemaCapabilities {
     delete_file_partial_max: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
     inlined_data_tables: bool,
+    /// The `ducklake_view` table exists.
+    views: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
+        self.data_file_partial_max
+            && self.delete_file_partial_max
+            && self.inlined_data_tables
+            && self.views
     }
 }
 
@@ -230,7 +249,8 @@ impl DuckdbMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let (data_file_partial_max, delete_file_partial_max, inlined_data_tables): (
+        let (data_file_partial_max, delete_file_partial_max, inlined_data_tables, views): (
+            bool,
             bool,
             bool,
             bool,
@@ -241,14 +261,17 @@ impl DuckdbMetadataProvider {
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
                 WHERE name = 'partial_max') > 0,
                (SELECT COUNT(*) FROM information_schema.tables
-                WHERE table_name = 'ducklake_inlined_data_tables') > 0",
+                WHERE table_name = 'ducklake_inlined_data_tables') > 0,
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_name = 'ducklake_view') > 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
             inlined_data_tables,
+            views,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -353,6 +376,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tables)
+    }
+
+    fn list_views(&self, schema_id: i64, snapshot_id: i64) -> crate::Result<Vec<ViewMetadata>> {
+        let conn = self.connection();
+        if !self.schema_capabilities(&conn)?.views {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(SQL_LIST_VIEWS)?;
+        let views = stmt
+            .query_map([schema_id, snapshot_id, snapshot_id], decode_view)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(views)
     }
 
     fn get_table_structure(
@@ -968,6 +1003,25 @@ impl MetadataProvider for DuckdbMetadataProvider {
         }
     }
 
+    fn get_view_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<ViewMetadata>> {
+        let conn = self.connection();
+        if !self.schema_capabilities(&conn)?.views {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(SQL_GET_VIEW_BY_NAME)?;
+        let mut rows = stmt.query(params![schema_id, name, snapshot_id, snapshot_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(decode_view(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> crate::Result<bool> {
         let conn = self.connection();
         let exists: bool = conn.query_row(
@@ -1002,6 +1056,33 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tables)
+    }
+
+    fn list_all_views(&self, snapshot_id: i64) -> crate::Result<Vec<ViewWithSchema>> {
+        let conn = self.connection();
+        if !self.schema_capabilities(&conn)?.views {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(SQL_LIST_ALL_VIEWS)?;
+        stmt.query_map(
+            params![snapshot_id, snapshot_id, snapshot_id, snapshot_id],
+            |row| {
+                Ok(ViewWithSchema {
+                    schema_name: row.get(0)?,
+                    view: ViewMetadata {
+                        view_id: row.get(1)?,
+                        schema_id: row.get(2)?,
+                        begin_snapshot: row.get(3)?,
+                        view_name: row.get(4)?,
+                        dialect: row.get(5)?,
+                        sql: row.get(6)?,
+                        column_aliases: row.get(7)?,
+                    },
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     fn list_all_columns(&self, snapshot_id: i64) -> crate::Result<Vec<ColumnWithTable>> {

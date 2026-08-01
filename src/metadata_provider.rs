@@ -23,6 +23,19 @@ pub const SQL_LIST_TABLES: &str =
        AND ? >= begin_snapshot
        AND (? < end_snapshot OR end_snapshot IS NULL)";
 
+pub const SQL_LIST_VIEWS: &str =
+    "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases FROM ducklake_view
+     WHERE schema_id = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)";
+
+pub const SQL_GET_VIEW_BY_NAME: &str =
+    "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases FROM ducklake_view
+     WHERE schema_id = ?
+       AND view_name = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)";
+
 pub const SQL_GET_TABLE_COLUMNS: &str =
     "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
      FROM ducklake_column
@@ -292,6 +305,17 @@ pub const SQL_LIST_ALL_TABLES: &str = "
       AND (? < t.end_snapshot OR t.end_snapshot IS NULL)
     ORDER BY s.schema_name, t.table_name";
 
+pub const SQL_LIST_ALL_VIEWS: &str = "
+    SELECT s.schema_name, v.view_id, v.schema_id, v.begin_snapshot, v.view_name, v.dialect, v.sql,
+           v.column_aliases
+    FROM ducklake_schema s
+    JOIN ducklake_view v ON s.schema_id = v.schema_id
+    WHERE ? >= s.begin_snapshot
+      AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+      AND ? >= v.begin_snapshot
+      AND (? < v.end_snapshot OR v.end_snapshot IS NULL)
+    ORDER BY s.schema_name, v.view_name";
+
 pub const SQL_LIST_ALL_COLUMNS: &str = "
     SELECT
         s.schema_name,
@@ -479,6 +503,34 @@ pub struct TableWithSchema {
     pub schema_name: String,
     /// Table metadata
     pub table: TableMetadata,
+}
+
+/// Metadata for a view in the DuckLake catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewMetadata {
+    /// Unique identifier for this view in the catalog.
+    pub view_id: i64,
+    /// Schema containing the view.
+    pub schema_id: i64,
+    /// Snapshot that created this view generation.
+    pub begin_snapshot: i64,
+    /// Name of the view as it appears in SQL queries.
+    pub view_name: String,
+    /// SQL dialect used by the stored definition.
+    pub dialect: String,
+    /// Query defining the view.
+    pub sql: String,
+    /// DuckLake's quoted, comma-separated output aliases.
+    pub column_aliases: Option<String>,
+}
+
+/// View metadata with its schema name for information-schema queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewWithSchema {
+    /// Name of the schema this view belongs to.
+    pub schema_name: String,
+    /// View metadata.
+    pub view: ViewMetadata,
 }
 
 /// Column metadata with its schema and table names (for bulk queries)
@@ -1129,6 +1181,11 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// List tables for a specific snapshot
     fn list_tables(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<TableMetadata>>;
 
+    /// List views visible in a schema at a specific snapshot.
+    fn list_views(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        Ok(Vec::new())
+    }
+
     /// Get table structure (columns) visible at `snapshot_id`. Columns are
     /// snapshot-scoped (`snapshot_id >= begin_snapshot AND (snapshot_id <
     /// end_snapshot OR end_snapshot IS NULL)`), matching upstream DuckLake and
@@ -1303,6 +1360,16 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         snapshot_id: i64,
     ) -> Result<Option<TableMetadata>>;
 
+    /// Get a visible view by name.
+    fn get_view_by_name(
+        &self,
+        _schema_id: i64,
+        _name: &str,
+        _snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        Ok(None)
+    }
+
     /// Check if table exists for a specific snapshot
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool>;
 
@@ -1310,6 +1377,22 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List all tables across all schemas for a snapshot
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>>;
+
+    /// List all views across all visible schemas for a snapshot.
+    fn list_all_views(&self, snapshot_id: i64) -> Result<Vec<ViewWithSchema>> {
+        let mut views = Vec::new();
+        for schema in self.list_schemas(snapshot_id)? {
+            views.extend(
+                self.list_views(schema.schema_id, snapshot_id)?
+                    .into_iter()
+                    .map(|view| ViewWithSchema {
+                        schema_name: schema.schema_name.clone(),
+                        view,
+                    }),
+            );
+        }
+        Ok(views)
+    }
 
     /// List all columns across all tables for a snapshot
     fn list_all_columns(&self, snapshot_id: i64) -> Result<Vec<ColumnWithTable>>;

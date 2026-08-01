@@ -104,6 +104,17 @@ const SQL_CREATE_TABLES: &[&str] = &[
     // never promotes types — the shape stays identical to SQLite/upstream so
     // catalogs interoperate. The four `*default*` columns and `parent_column` are
     // left NULL (no nested-type / column-default writes).
+    r#"CREATE TABLE IF NOT EXISTS ducklake_view (
+        view_id BIGINT,
+        view_uuid VARCHAR(36),
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        schema_id BIGINT,
+        view_name VARCHAR(1024),
+        dialect VARCHAR(1024),
+        `sql` TEXT,
+        column_aliases TEXT
+    ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_column (
         column_id BIGINT,
         begin_snapshot BIGINT,

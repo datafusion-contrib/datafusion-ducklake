@@ -96,6 +96,18 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
 -- constraints). The four `*default*` columns + `parent_column` are projected by
 -- DuckDB when it reads catalogs we produce; we leave them NULL (no nested-type
 -- or column-default writes yet). See docs/column-id-versioning-design.md §4.1.
+CREATE TABLE IF NOT EXISTS ducklake_view (
+    view_id BIGINT,
+    view_uuid UUID,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    schema_id BIGINT,
+    view_name VARCHAR,
+    dialect VARCHAR,
+    sql VARCHAR,
+    column_aliases VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS ducklake_column (
     column_id BIGINT,
     begin_snapshot BIGINT,

@@ -117,6 +117,18 @@ CREATE TABLE IF NOT EXISTS ducklake_table (
 -- write a second row sharing the same column_id. Mirrors the SQLite writer's
 -- `ducklake_column`. The four `*default*` columns + `parent_column` are left
 -- NULL (no nested-type / column-default writes here).
+CREATE TABLE IF NOT EXISTS ducklake_view (
+    view_id BIGINT,
+    view_uuid UUID,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    schema_id BIGINT,
+    view_name VARCHAR,
+    dialect VARCHAR,
+    sql VARCHAR,
+    column_aliases VARCHAR
+);
+
 CREATE TABLE IF NOT EXISTS ducklake_column (
     column_id BIGINT,
     begin_snapshot BIGINT,

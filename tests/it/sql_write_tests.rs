@@ -12,6 +12,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
@@ -48,6 +49,29 @@ async fn create_writable_catalog() -> (SessionContext, TempDir) {
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
+    (ctx, temp_dir)
+}
+
+async fn create_writable_catalog_with_main_schema() -> (SessionContext, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let connection = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let writer = SqliteMetadataWriter::new_with_init(&connection)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let snapshot_id = writer.create_snapshot().unwrap();
+    writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
     (ctx, temp_dir)
 }
 
@@ -93,8 +117,7 @@ async fn test_create_table_as_select() {
     // Check if CTAS is supported - it may not be fully implemented yet
     match result {
         Ok(df) => {
-            // Execute the statement
-            let _batches = df.collect().await.unwrap();
+            df.collect().await.unwrap();
 
             // Verify table was created by reading it back with fresh context
             let read_ctx = create_read_context(&temp_dir).await;
@@ -109,10 +132,127 @@ async fn test_create_table_as_select() {
             assert_eq!(total_rows, 3);
         },
         Err(e) => {
-            // CTAS may not be fully supported yet - this is expected
-            println!("CREATE TABLE AS SELECT not yet fully supported: {}", e);
+            println!("CREATE TABLE AS SELECT not yet fully supported: {e}");
         },
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_legacy_catalog_without_view_metadata_keeps_ctas_working() {
+    let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("test.db").display()
+    );
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+
+    let columns = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM pragma_table_info('ducklake_view') ORDER BY cid",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns,
+        vec![
+            "view_id",
+            "view_uuid",
+            "begin_snapshot",
+            "end_snapshot",
+            "schema_id",
+            "view_name",
+            "dialect",
+            "sql",
+            "column_aliases",
+        ]
+    );
+
+    sqlx::query("DROP TABLE ducklake_view")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let error = ctx
+        .sql("SELECT * FROM ducklake.main.missing")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("table 'ducklake.main.missing' not found"),
+        "{error}"
+    );
+
+    ctx.sql("CREATE TABLE ducklake.main.created AS SELECT 1 AS id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let views = ctx
+        .sql("SELECT * FROM ducklake.information_schema.views")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(views.iter().map(|batch| batch.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sqlite_view_is_queryable_and_blocks_table_shadowing() {
+    let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("test.db").display()
+    );
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    let schema_id = sqlx::query_scalar::<_, i64>(
+        "SELECT schema_id FROM ducklake_schema WHERE schema_name = 'main' AND end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO ducklake_view
+         (view_id, view_uuid, begin_snapshot, end_snapshot, schema_id, view_name, dialect, sql, column_aliases)
+         VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+    )
+    .bind(1_i64)
+    .bind("00000000-0000-0000-0000-000000000001")
+    .bind(1_i64)
+    .bind(schema_id)
+    .bind("constant_view")
+    .bind("duckdb")
+    .bind("SELECT 42 AS answer")
+    .bind("")
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let batches = ctx
+        .sql("SELECT answer FROM ducklake.main.constant_view")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let answer = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(answer.values(), &[42]);
+
+    let error = ctx
+        .sql("CREATE TABLE ducklake.main.constant_view AS SELECT 1 AS id")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("already exists"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

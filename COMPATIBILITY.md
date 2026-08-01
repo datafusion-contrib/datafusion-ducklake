@@ -130,6 +130,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
 | Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
 | SQL-queryable `information_schema`                      |   ✅   |
+| Read-only DuckLake views on every metadata backend      |   🟧   |
 | Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`) | ✅ |
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
 | Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
@@ -141,6 +142,28 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
+
+### Views
+
+Every metadata backend reads snapshot-visible rows from `ducklake_view`. Catalogs without that
+table expose an empty view set, and each writer creates the official table layout, including
+`view_uuid`. Creating, replacing, altering, or dropping views is not supported.
+
+DataFusion plans each stored definition using its recorded dialect. The reader restores DuckLake's
+`{DUCKLAKE_CATALOG}` placeholder outside quoted strings and identifiers. For DuckDB
+`schema.table` bodies, it resolves only a unique schema visible at the view's `begin_snapshot`
+whose `schema_id` remains visible at the requested snapshot, then quotes the canonical schema name.
+This supports same-schema, cross-schema, and mixed-case references without letting an external
+qualifier retarget a schema created later. Other multipart qualifiers fail with the named view and
+dialect error. This disambiguation assumes metadata created through DuckDB's view binder; manually
+inserted definitions that violate its ambiguity checks are outside the compatibility guarantee.
+
+A definition that DataFusion cannot plan remains visible in view listings. Such a view has no rows
+in DataFusion's `information_schema.columns` until its definition becomes plannable.
+
+View planning uses a private, snapshot-pinned `SessionContext`, rejects DDL, DML, and statement
+commands, and propagates the catalog's row-lineage option. Caller-registered UDFs and caller session
+settings, including `execution.time_zone`, are not inherited.
 
 ---
 

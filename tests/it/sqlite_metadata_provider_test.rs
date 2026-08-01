@@ -68,6 +68,22 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_view (
+            view_id INTEGER,
+            view_uuid TEXT,
+            schema_id INTEGER NOT NULL,
+            view_name TEXT NOT NULL,
+            dialect TEXT NOT NULL,
+            sql TEXT NOT NULL,
+            column_aliases TEXT,
+            begin_snapshot INTEGER NOT NULL,
+            end_snapshot INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     // Schema must match SQL_CREATE_SCHEMA in metadata_writer_sqlite.rs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_column (
@@ -645,6 +661,51 @@ async fn test_list_tables() {
     let table_names: Vec<_> = tables.iter().map(|t| t.table_name.as_str()).collect();
     assert!(table_names.contains(&"users"));
     assert!(table_names.contains(&"products"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_list_views() -> anyhow::Result<()> {
+    let provider = create_sqlite_provider().await?;
+    populate_test_data(&provider).await?;
+    sqlx::query(
+        "INSERT INTO ducklake_view
+         (view_id, schema_id, view_name, dialect, sql, column_aliases, begin_snapshot, end_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(7i64)
+    .bind(1i64)
+    .bind("active_view")
+    .bind("duckdb")
+    .bind("SELECT id FROM users")
+    .bind("\"identifier\"")
+    .bind(2i64)
+    .bind(None::<i64>)
+    .bind(8i64)
+    .bind(1i64)
+    .bind("expired_view")
+    .bind("duckdb")
+    .bind("SELECT name FROM users")
+    .bind("")
+    .bind(1i64)
+    .bind(2i64)
+    .execute(&provider.pool)
+    .await?;
+
+    assert_eq!(provider.list_views(1, 1)?[0].view_name, "expired_view");
+    let views = provider.list_views(1, 2)?;
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].view_name, "active_view");
+    assert_eq!(views[0].begin_snapshot, 2);
+    assert_eq!(views[0].column_aliases.as_deref(), Some("\"identifier\""));
+    assert_eq!(
+        provider.get_view_by_name(1, "active_view", 2)?,
+        Some(views[0].clone())
+    );
+    let all_views = provider.list_all_views(2)?;
+    assert_eq!(all_views.len(), 1);
+    assert_eq!(all_views[0].schema_name, "test_schema");
+    assert_eq!(all_views[0].view, views[0]);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

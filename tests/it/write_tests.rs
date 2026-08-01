@@ -125,11 +125,7 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
              mapping_id BIGINT, column_id BIGINT, source_name VARCHAR, \
              target_field_id BIGINT, parent_column BIGINT, is_partition BOOLEAN \
          ); \
-         CREATE TABLE raw.ducklake_view( \
-             view_id BIGINT, view_uuid VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT, \
-             schema_id BIGINT, view_name VARCHAR, dialect VARCHAR, sql VARCHAR, column_aliases VARCHAR \
-         ); \
-         CREATE TABLE raw.ducklake_macro( \
+             CREATE TABLE raw.ducklake_macro( \
              schema_id BIGINT, macro_id BIGINT, macro_name VARCHAR, \
              begin_snapshot BIGINT, end_snapshot BIGINT \
          ); \

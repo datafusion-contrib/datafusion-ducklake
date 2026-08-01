@@ -6,9 +6,9 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
     InlinedDataBackend, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC,
-    SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
-    inlined_text_projection, is_inlined_data_table, parse_inlined_rows, reconstruct_columns,
-    reconstruct_columns_with_table,
+    SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, block_on, inlined_text_projection, is_inlined_data_table,
+    parse_inlined_rows, reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -30,6 +30,18 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
 
 fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+fn decode_view(row: &MySqlRow) -> Result<ViewMetadata> {
+    Ok(ViewMetadata {
+        view_id: row.try_get(0)?,
+        schema_id: row.try_get(1)?,
+        begin_snapshot: row.try_get(2)?,
+        view_name: row.try_get(3)?,
+        dialect: row.try_get(4)?,
+        sql: row.try_get(5)?,
+        column_aliases: row.try_get(6)?,
+    })
 }
 
 fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFile> {
@@ -84,11 +96,16 @@ struct SchemaCapabilities {
     delete_file_partial_max: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
     inlined_data_tables: bool,
+    /// The `ducklake_view` table exists.
+    views: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
+        self.data_file_partial_max
+            && self.delete_file_partial_max
+            && self.inlined_data_tables
+            && self.views
     }
 }
 
@@ -145,7 +162,7 @@ impl MySqlMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (i64, i64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
             "SELECT
                (SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_schema = DATABASE()
@@ -157,7 +174,10 @@ impl MySqlMetadataProvider {
                   AND column_name = 'partial_max'),
                (SELECT COUNT(*) FROM information_schema.tables
                 WHERE table_schema = DATABASE()
-                  AND table_name = 'ducklake_inlined_data_tables')",
+                  AND table_name = 'ducklake_inlined_data_tables'),
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'ducklake_view')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -165,6 +185,7 @@ impl MySqlMetadataProvider {
             data_file_partial_max: row.0 > 0,
             delete_file_partial_max: row.1 > 0,
             inlined_data_tables: row.2 > 0,
+            views: row.3 > 0,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -276,6 +297,28 @@ impl MetadataProvider for MySqlMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn list_views(&self, schema_id: i64, snapshot_id: i64) -> Result<Vec<ViewMetadata>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(
+                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, `sql`, column_aliases
+                 FROM ducklake_view
+                 WHERE schema_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter().map(|row| decode_view(&row)).collect()
         })
     }
 
@@ -935,6 +978,35 @@ impl MetadataProvider for MySqlMetadataProvider {
         })
     }
 
+    fn get_view_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> Result<Option<ViewMetadata>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(None);
+            }
+            let row = sqlx::query(
+                "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, `sql`, column_aliases
+                 FROM ducklake_view
+                 WHERE schema_id = ?
+                   AND view_name = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .bind(name)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            row.map(|row| decode_view(&row)).transpose()
+        })
+    }
+
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
         block_on(async {
             // MySQL doesn't support SELECT EXISTS(...) the same way PostgreSQL does
@@ -989,6 +1061,47 @@ impl MetadataProvider for MySqlMetadataProvider {
                     Ok(TableWithSchema {
                         schema_name,
                         table,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn list_all_views(&self, snapshot_id: i64) -> Result<Vec<ViewWithSchema>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.views {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(
+                "SELECT s.schema_name, v.view_id, v.schema_id, v.begin_snapshot, v.view_name,
+                        v.dialect, v.`sql`, v.column_aliases
+                 FROM ducklake_schema s
+                 JOIN ducklake_view v ON s.schema_id = v.schema_id
+                 WHERE ? >= s.begin_snapshot
+                   AND (? < s.end_snapshot OR s.end_snapshot IS NULL)
+                   AND ? >= v.begin_snapshot
+                   AND (? < v.end_snapshot OR v.end_snapshot IS NULL)
+                 ORDER BY s.schema_name, v.view_name",
+            )
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ViewWithSchema {
+                        schema_name: row.try_get(0)?,
+                        view: ViewMetadata {
+                            view_id: row.try_get(1)?,
+                            schema_id: row.try_get(2)?,
+                            begin_snapshot: row.try_get(3)?,
+                            view_name: row.try_get(4)?,
+                            dialect: row.try_get(5)?,
+                            sql: row.try_get(6)?,
+                            column_aliases: row.try_get(7)?,
+                        },
                     })
                 })
                 .collect()
