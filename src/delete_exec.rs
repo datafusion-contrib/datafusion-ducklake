@@ -298,6 +298,7 @@ async fn run_delete(
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
     let mut total_deleted: u64 = 0;
+    let inlined_deletes = table.inlined_deletes_by_file()?;
 
     for tf in &table_files {
         // A file rewritten by an UPDATE or by compaction is handled here like any
@@ -316,22 +317,28 @@ async fn run_delete(
             continue;
         }
 
-        // Already-deleted positions for this file (if a delete file is live).
-        // Rows already deleted are neither re-counted nor re-deleted.
+        // Already-deleted positions for this file: the live delete file plus any
+        // inlined deletes. Rows already deleted are neither re-counted nor
+        // re-deleted, and a predicate matching only such rows commits nothing.
         let existing = match tf.delete_file {
             Some(ref df) => table.read_delete_file_positions(state, df).await?,
             None => HashSet::new(),
         };
+        let mut already_deleted = existing.clone();
+        if let Some(inlined) = inlined_deletes.get(&tf.data_file_id) {
+            already_deleted.extend(inlined);
+        }
 
-        let newly_deleted = matched.difference(&existing).count() as u64;
-        if newly_deleted == 0 {
+        let newly_deleted: HashSet<i64> = matched.difference(&already_deleted).copied().collect();
+        if newly_deleted.is_empty() {
             // Every matched row was already deleted: nothing changes here.
             continue;
         }
 
-        // Cumulative (prior ∪ new) still-deleted set: at most one delete file is
-        // live per data file, so each write carries the full set.
-        let mut cumulative: Vec<i64> = existing.union(&matched).copied().collect();
+        // Carry forward prior Parquet positions and add only newly matched live
+        // rows. Inlined positions stay in their metadata table until a dedicated
+        // flush materializes and retires them.
+        let mut cumulative: Vec<i64> = existing.union(&newly_deleted).copied().collect();
         cumulative.sort_unstable();
 
         let delete_info = table_writer
@@ -344,7 +351,7 @@ async fn run_delete(
             expected_prev_delete_file: tf.delete_file_id,
             delete: delete_info,
         });
-        total_deleted += newly_deleted;
+        total_deleted += newly_deleted.len() as u64;
     }
 
     if entries.is_empty() {

@@ -325,7 +325,14 @@ Known edges:
 - **Data inlining: scalar rows are read on every metadata backend.** DuckLake
   inlines `INSERT`s of up to 10 rows into the catalog by default. SQLite,
   DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
-  `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes and the
-  `rowid` path remain unsupported. Non‑scalar inlined columns fail with an
+  `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
+  (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
+  `DELETE`, and compaction on all four backends; the `rowid` path remains
+  unsupported for inlined rows. Non‑scalar inlined columns fail with an
   error that directs users to flush the rows to Parquet or disable inlining at
   write time.
+- **The change feed does not surface inlined deletes.** `ducklake_table_changes`
+  and `ducklake_table_deletions` read delete *files* added in the window; a
+  snapshot whose only change is an inlined Parquet‑row delete emits no `delete`
+  rows even though scans at the window's two ends differ. Flush or avoid
+  inlined deletes on tables consumed through the change feed.

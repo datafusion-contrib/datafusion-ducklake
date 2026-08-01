@@ -1329,7 +1329,9 @@ impl TableProvider for TableChangesTable {
         // Deletes applied in the window surface as `delete` rows (and pair into
         // update preimages), so they participate in both the empty check and
         // the path decision — a delete-only window is NOT empty. The insertions
-        // feed never reads the delete side.
+        // feed never reads the delete side. Inlined deletes
+        // (ducklake_inlined_delete_<table_id>) are not read here: a window whose
+        // only change is an inlined delete emits no rows (see COMPATIBILITY.md).
         let delete_files = if self.insertions_only {
             Vec::new()
         } else {

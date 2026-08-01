@@ -40,6 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the error (#280).
 - `files_matching` no longer stops pruning a data file once that file carries a delete
   file (#276).
+- Inlined positions remain in metadata during `DELETE` and `UPDATE`;
+  replacement Parquet delete files contain only Parquet-owned and newly matched
+  live positions (#262).
+- Unqualified `DELETE` and metadata row counts subtract visible inline
+  positions; `rewrite_data_files` includes them in automatic delete-ratio
+  selection (#262).
+- Delete-file and compaction commits abort when a source file gains a distinct
+  inline position after planning, instead of duplicating or resurrecting the
+  deleted row (#262).
+- `merge_adjacent_files` skips data files masked by inline positions, preserving
+  historical rows and valid metadata references (#262).
 - Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB, PostgreSQL and
   MySQL catalogs; unsupported non-scalar inline values report how to flush or disable
   inlining (#261).

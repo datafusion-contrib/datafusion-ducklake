@@ -1079,6 +1079,56 @@ async fn detect_replace_conflict(
     Ok(())
 }
 
+// The caller holds SQLite's write lock, so the source-file check is ordered
+// with publication.
+async fn detect_new_inlined_deletes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    base_snapshot: i64,
+    data_file_ids: &[i64],
+) -> Result<()> {
+    if data_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(&table)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
+
+    let conflict: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT 1 FROM \"{table}\" newer
+         WHERE newer.file_id IN ({})
+           AND (newer.begin_snapshot IS NULL OR (
+             newer.begin_snapshot > ?
+             AND (newer.row_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM \"{table}\" prior
+               WHERE prior.file_id = newer.file_id
+                 AND prior.row_id = newer.row_id
+                 AND prior.begin_snapshot <= ?
+             ))
+           ))
+         LIMIT 1",
+        id_list(data_file_ids),
+    )))
+    .bind(base_snapshot)
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if conflict.is_some() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "table {table_id} gained an inlined delete on a source file since snapshot \
+             {base_snapshot}; re-open the catalog and re-plan"
+        )));
+    }
+    Ok(())
+}
+
 /// Retire the prior generation's still-visible data files at `snapshot_id` and
 /// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard
 /// spares files registered for *this* snapshot, so a multi-file write does not
@@ -2855,6 +2905,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             {
                 detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
             }
+            if !deletes.is_empty() {
+                let file_ids = deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
+            }
 
             // Partition-spec fence: the new row versions are a NEW write, so they
             // must agree with the table's live partition generation exactly as
@@ -3106,6 +3163,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             {
                 detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
             }
+            if !deletes.is_empty() {
+                let file_ids = deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
+            }
 
             // Partition-spec fence (both directions, every file): the new row
             // versions are a NEW write, so each must agree with the table's live
@@ -3315,6 +3379,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Write-lock-first: the MAX+1 insert takes the SQLite write lock up
             // front, so concurrent writers can't collide or deadlock.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let file_ids = deletes
+                .iter()
+                .map(|entry| entry.data_file_id)
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
 
             for entry in deletes {
                 // Target-file fence: abort iff the data file is no longer live (a
@@ -3435,6 +3504,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             // (MAX(snapshot_id)) only ever resolves to the fully-applied layout.
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let source_data_ids = sources
+                .iter()
+                .map(|source| source.data_file_id)
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &source_data_ids).await?;
 
             // Conflict fence per source: the data file must still be live, and its
             // live delete file must still match what the caller read the source's
@@ -3479,8 +3553,6 @@ impl MetadataWriter for SqliteMetadataWriter {
                     )));
                 }
             }
-
-            let source_data_ids: Vec<i64> = sources.iter().map(|s| s.data_file_id).collect();
 
             match retirement {
                 SourceRetirement::Remove => {
@@ -3832,7 +3904,30 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
-            let live_rows = (gross.unwrap_or(0) - deleted).max(0) as u64;
+            let inlined_table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let inlined_exists: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(&inlined_table)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let inlined_deleted: i64 = if inlined_exists.is_some() {
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM (
+                       SELECT DISTINCT d.file_id, d.row_id
+                       FROM \"{inlined_table}\" d
+                       JOIN ducklake_data_file f ON f.data_file_id = d.file_id
+                       WHERE f.table_id = ? AND f.end_snapshot IS NULL
+                         AND d.begin_snapshot <= ?
+                     )"
+                )))
+                .bind(table_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                0
+            };
+            let live_rows = (gross.unwrap_or(0) - deleted - inlined_deleted).max(0) as u64;
 
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = ?

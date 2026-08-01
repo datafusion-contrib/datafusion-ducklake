@@ -647,6 +647,64 @@ async fn detect_replace_conflict(
     Ok(())
 }
 
+// The SHARE lock orders inserts from other PostgreSQL clients with the
+// source-file check and surrounding metadata commit.
+async fn detect_new_inlined_deletes(
+    table_id: i64,
+    base_snapshot: i64,
+    data_file_ids: &[i64],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    if data_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&table)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !exists {
+        return Ok(());
+    }
+
+    sqlx::query(AssertSqlSafe(format!(
+        "LOCK TABLE \"{table}\" IN SHARE MODE"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    let file_ids = data_file_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict = sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM \"{table}\" newer
+         WHERE newer.file_id IN ({file_ids})
+           AND (newer.begin_snapshot IS NULL OR (
+             newer.begin_snapshot > $1
+             AND (newer.row_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM \"{table}\" prior
+               WHERE prior.file_id = newer.file_id
+                 AND prior.row_id = newer.row_id
+                 AND prior.begin_snapshot <= $2
+             ))
+           ))
+         LIMIT 1"
+    )))
+    .bind(base_snapshot)
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if conflict.is_some() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "table {table_id} gained an inlined delete on a source file since snapshot \
+             {base_snapshot}; re-open the catalog and re-plan"
+        )));
+    }
+    Ok(())
+}
+
 /// Retire the generation preceding `snapshot_id` for a Replace: end-snapshot
 /// every still-live file from an earlier snapshot and zero the visible
 /// record/byte totals. The `begin_snapshot < snapshot_id` guard leaves the
@@ -1818,13 +1876,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
-
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
                 detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
             }
-
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
                 schema_name,
@@ -2917,6 +2973,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             {
                 detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
             }
+            if !deletes.is_empty() {
+                let file_ids = deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(table_id, base_snapshot, &file_ids, &mut tx).await?;
+            }
 
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
@@ -3172,6 +3235,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             {
                 detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
             }
+            if !deletes.is_empty() {
+                let file_ids = deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(table_id, base_snapshot, &file_ids, &mut tx).await?;
+            }
 
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
@@ -3384,6 +3454,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let file_ids = deletes
+                .iter()
+                .map(|entry| entry.data_file_id)
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(table_id, base_snapshot, &file_ids, &mut tx).await?;
 
             // Allocate the snapshot (commit-ordered IDENTITY). A delete is
             // non-DDL, so carry the per-catalog schema_version forward.
@@ -3528,6 +3603,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let source_data_ids = sources
+                .iter()
+                .map(|source| source.data_file_id)
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(table_id, base_snapshot, &source_data_ids, &mut tx).await?;
 
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
@@ -3588,8 +3668,6 @@ impl MetadataWriter for PostgresMetadataWriter {
                     )));
                 }
             }
-
-            let source_data_ids: Vec<i64> = sources.iter().map(|s| s.data_file_id).collect();
 
             match retirement {
                 SourceRetirement::Remove => {
@@ -3827,7 +3905,34 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
-            let live_rows = (gross.unwrap_or(0) - deleted).max(0) as u64;
+            let inlined_table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let inlined_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&inlined_table)
+                .fetch_one(&mut *tx)
+                .await?;
+            let inlined_deleted: i64 = if inlined_exists {
+                sqlx::query(AssertSqlSafe(format!(
+                    "LOCK TABLE \"{inlined_table}\" IN SHARE MODE"
+                )))
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT COUNT(*)::BIGINT FROM (
+                       SELECT DISTINCT d.file_id, d.row_id
+                       FROM \"{inlined_table}\" d
+                       JOIN ducklake_data_file f ON f.data_file_id = d.file_id
+                       WHERE f.table_id = $1 AND f.end_snapshot IS NULL
+                         AND d.begin_snapshot <= $2
+                     ) counted"
+                )))
+                .bind(table_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                0
+            };
+            let live_rows = (gross.unwrap_or(0) - deleted - inlined_deleted).max(0) as u64;
 
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = $1

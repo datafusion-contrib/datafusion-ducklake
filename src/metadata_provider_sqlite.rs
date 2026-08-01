@@ -3,11 +3,12 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
-    block_on, reconstruct_columns, reconstruct_columns_with_table,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics,
+    FileWithTable, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC,
+    SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, reconstruct_columns,
+    reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -1134,6 +1135,37 @@ impl MetadataProvider for SqliteMetadataProvider {
                 batches.push(build_inlined_batch(&schema, columns, &present, &rows)?);
             }
             Ok(batches)
+        })
+    }
+
+    fn get_inlined_deletes(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedDelete>> {
+        block_on(async {
+            let table = inlined_delete_table_name(table_id)?;
+            let sql = format!(
+                "SELECT file_id, row_id FROM {} WHERE begin_snapshot <= ? ORDER BY file_id, row_id",
+                quote_ident(&table)
+            );
+            match sqlx::query(AssertSqlSafe(sql.as_str()))
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeInlinedDelete {
+                            data_file_id: row.try_get(0)?,
+                            row_id: row.try_get(1)?,
+                        })
+                    })
+                    .collect(),
+                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) => Err(error.into()),
+            }
         })
     }
 

@@ -1995,6 +1995,13 @@ pub struct TableWriteSession {
 }
 
 impl TableWriteSession {
+    // Keep the read plan's snapshot for source-scoped conflict checks without
+    // enabling the broader table-generation precondition.
+    pub(crate) const fn with_base_snapshot_id(mut self, snapshot_id: i64) -> Self {
+        self.base_snapshot_id = snapshot_id;
+        self
+    }
+
     /// Applies snapshot metadata and an optional table-state precondition.
     #[must_use]
     pub fn with_options(mut self, options: &TableWriteOptions) -> Self {

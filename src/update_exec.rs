@@ -86,6 +86,7 @@ pub struct DuckLakeUpdateExec {
     writer: Arc<dyn MetadataWriter>,
     schema_name: String,
     table_name: String,
+    base_snapshot: i64,
     /// Per-source-file positional read plans (built at plan time).
     scans: Vec<UpdateSourceScan>,
     /// `(physical_column_index, new_value_expr)` for each assigned column.
@@ -104,6 +105,7 @@ impl DuckLakeUpdateExec {
         writer: Arc<dyn MetadataWriter>,
         schema_name: String,
         table_name: String,
+        base_snapshot: i64,
         scans: Vec<UpdateSourceScan>,
         assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
@@ -115,6 +117,7 @@ impl DuckLakeUpdateExec {
             writer,
             schema_name,
             table_name,
+            base_snapshot,
             scans,
             assignments,
             predicate,
@@ -219,6 +222,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let writer = Arc::clone(&self.writer);
         let schema_name = self.schema_name.clone();
         let table_name = self.table_name.clone();
+        let base_snapshot = self.base_snapshot;
         let scans = self.scans.clone();
         let assignments = self.assignments.clone();
         let predicate = self.predicate.clone();
@@ -300,6 +304,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     physical_schema.as_ref(),
                     WriteMode::Append,
                 )
+                .map(|session| session.with_base_snapshot_id(base_snapshot))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             while let Some(batch) = updated_batches.try_next().await? {
                 session

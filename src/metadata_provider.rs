@@ -586,6 +586,15 @@ pub struct DuckLakeTableColumn {
     pub default_value_dialect: Option<String>,
 }
 
+/// A positional deletion stored directly in a DuckLake metadata catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuckLakeInlinedDelete {
+    /// Catalog id of the Parquet data file containing the deleted row.
+    pub data_file_id: i64,
+    /// Zero-based physical row position within the Parquet data file.
+    pub row_id: i64,
+}
+
 pub(crate) fn is_inlined_data_table(name: &str) -> bool {
     name.starts_with("ducklake_inlined_data_")
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -593,6 +602,21 @@ pub(crate) fn is_inlined_data_table(name: &str) -> bool {
 
 pub(crate) const INLINED_DATA_REMEDIATION: &str =
     "flush inlined data to Parquet (or disable data inlining at write time)";
+
+/// Return the specification-defined physical table name for a table's inlined
+/// Parquet-row deletions.
+///
+/// External metadata providers can use this helper to implement
+/// [`MetadataProvider::get_inlined_deletes`] without duplicating identifier
+/// validation.
+pub fn inlined_delete_table_name(table_id: i64) -> Result<String> {
+    if table_id < 0 {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "DuckLake table id must be non-negative, was {table_id}"
+        )));
+    }
+    Ok(format!("ducklake_inlined_delete_{table_id}"))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InlinedDataBackend {
@@ -1359,11 +1383,25 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
+    /// that are visible at `snapshot_id`.
+    ///
+    /// The default keeps legacy catalogs and providers without deletion inlining
+    /// source-compatible. Implementations return an empty vector when the
+    /// physical table does not exist.
+    fn get_inlined_deletes(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedDelete>> {
+        Ok(Vec::new())
+    }
+
     /// Net number of live rows in a table at a snapshot, accounting for delete
-    /// files: `SUM(record_count) - SUM(delete_count)` over the files visible at
-    /// `snapshot_id`. This matches a `SELECT COUNT(*)` against the table at that
-    /// snapshot without scanning any data — the counts come from catalog
-    /// metadata.
+    /// files and inlined positions: `SUM(record_count) - SUM(delete_count) -
+    /// distinct inlined positions` over the files visible at `snapshot_id`.
+    /// This matches a `SELECT COUNT(*)` against the table at that snapshot
+    /// without scanning any data — the counts come from catalog metadata.
     ///
     /// The default implementation derives the count from
     /// [`get_table_files_for_select`](Self::get_table_files_for_select), so it
@@ -1373,10 +1411,22 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// contributes 0 and cannot be counted from metadata alone.
     fn get_table_row_count(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
         let files = self.get_table_files_for_select(table_id, snapshot_id)?;
+        let visible_file_ids = files
+            .iter()
+            .map(|file| file.data_file_id)
+            .collect::<std::collections::HashSet<_>>();
+        let inlined_count = self
+            .get_inlined_deletes(table_id, snapshot_id)?
+            .into_iter()
+            .filter(|delete| visible_file_ids.contains(&delete.data_file_id))
+            .map(|delete| (delete.data_file_id, delete.row_id))
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
         let net: i64 = files
             .iter()
             .map(|f| f.max_row_count.unwrap_or(0) - f.delete_count.unwrap_or(0))
-            .sum();
+            .sum::<i64>()
+            - inlined_count;
         Ok(net.max(0) as u64)
     }
 

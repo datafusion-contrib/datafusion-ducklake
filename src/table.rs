@@ -1840,6 +1840,40 @@ impl DuckLakeTable {
         Ok(positions)
     }
 
+    pub(crate) fn inlined_deletes_by_file(&self) -> DataFusionResult<HashMap<i64, HashSet<i64>>> {
+        let deletes = self
+            .provider
+            .get_inlined_deletes(self.table_id, self.snapshot_id)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let mut by_file: HashMap<i64, HashSet<i64>> = HashMap::new();
+        for delete in deletes {
+            if delete.data_file_id < 0 || delete.row_id < 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "inlined delete has invalid file_id {} and row_id {}",
+                    delete.data_file_id, delete.row_id
+                )));
+            }
+            by_file
+                .entry(delete.data_file_id)
+                .or_default()
+                .insert(delete.row_id);
+        }
+        Ok(by_file)
+    }
+
+    async fn deleted_positions_for_file(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        let mut positions = inlined_positions.cloned().unwrap_or_default();
+        if let Some(delete_file) = &table_file.delete_file {
+            positions.extend(self.read_delete_file_positions(state, delete_file).await?);
+        }
+        Ok(positions)
+    }
+
     /// Whether `file` was rewritten — by an UPDATE or by compaction — rather
     /// than only ever inserted. A rewritten file embeds its rows' original row
     /// ids as a reserved parquet column (tagged with
@@ -2036,6 +2070,7 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
@@ -2045,12 +2080,10 @@ impl DuckLakeTable {
         // Deletes filter by physical row position, so this is a positional path:
         // it must read the file in row-group-aligned, non-repartitionable,
         // non-pruning partitions and synthesize positions before filtering.
-        let deleted_positions = if let Some(ref delete_file) = table_file.delete_file {
-            let p = self.read_delete_file_positions(state, delete_file).await?;
-            (!p.is_empty()).then_some(p)
-        } else {
-            None
-        };
+        let deleted_positions = self
+            .deleted_positions_for_file(state, table_file, inlined_positions)
+            .await?;
+        let deleted_positions = (!deleted_positions.is_empty()).then_some(deleted_positions);
 
         let output_schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
@@ -2292,10 +2325,12 @@ impl DuckLakeTable {
     ///   DataSourceExec → FileRowNumberExec → DeleteFilterExec(?) → RowIdExec(?)
     ///   → ColumnRenameExec. Embedded-rowid files with no deletes keep a plain
     ///   DataSourceExec → ColumnRenameExec (rowid read from the file).
+    #[allow(clippy::too_many_arguments, reason = "per-file row-lineage scan inputs stay explicit")]
     async fn build_exec_for_file_with_rowid(
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
         user_proj: &[usize],
         rowid_idx: usize,
@@ -2323,12 +2358,10 @@ impl DuckLakeTable {
         }
 
         // Resolve deletes once.
-        let deleted_positions = if let Some(ref delete_file) = table_file.delete_file {
-            let p = self.read_delete_file_positions(state, delete_file).await?;
-            (!p.is_empty()).then_some(p)
-        } else {
-            None
-        };
+        let deleted_positions = self
+            .deleted_positions_for_file(state, table_file, inlined_positions)
+            .await?;
+        let deleted_positions = (!deleted_positions.is_empty()).then_some(deleted_positions);
         let has_deletes = deleted_positions.is_some();
 
         // We need synthesized physical positions when rowid must be synthesized
@@ -2474,6 +2507,7 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
         output_schema: SchemaRef,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // This path applies no delete filtering, and that has been safe only
@@ -2519,22 +2553,50 @@ impl DuckLakeTable {
         let read_schema = Arc::new(Schema::new(fields));
         let projection: Vec<usize> = (0..read_schema.fields().len()).collect();
 
-        let resolved_path = self.resolve_file_path(&table_file.file)?;
-        let mut pf = PartitionedFile::new(
-            &resolved_path,
-            validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
-        );
-        if let Some(footer_size) = table_file.file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
-            pf = pf.with_metadata_size_hint(hint);
-        }
-        let builder = self
-            .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
-            .with_file_group(FileGroup::new(vec![pf]))
-            .with_projection_indices(Some(projection))?;
-        let scan = DataSourceExec::from_data_source(builder.build());
+        let deleted_positions = self
+            .deleted_positions_for_file(state, table_file, inlined_positions)
+            .await?;
+        let scan: Arc<dyn ExecutionPlan> = if deleted_positions.is_empty() {
+            let resolved_path = self.resolve_file_path(&table_file.file)?;
+            let mut pf = PartitionedFile::new(
+                &resolved_path,
+                validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
+            );
+            if let Some(footer_size) = table_file.file.footer_size
+                && footer_size > 0
+                && let Ok(hint) = usize::try_from(footer_size)
+            {
+                pf = pf.with_metadata_size_hint(hint);
+            }
+            let builder = self
+                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .with_file_group(FileGroup::new(vec![pf]))
+                .with_projection_indices(Some(projection))?;
+            DataSourceExec::from_data_source(builder.build())
+        } else {
+            let target_partitions = state.config().target_partitions();
+            let (file_groups, partition_starts) =
+                self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
+            let source = PositionalFileSource::wrap(Arc::new(
+                self.create_parquet_source(read_schema.clone()),
+            ));
+            let num_file_groups = file_groups.len();
+            let builder = self
+                .scan_config_builder(source)
+                .with_file_groups(file_groups)
+                .with_output_partitioning(Some(
+                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
+                ))
+                .with_projection_indices(Some(projection))?;
+            let scan = DataSourceExec::from_data_source(builder.build());
+            let with_positions: Arc<dyn ExecutionPlan> =
+                Arc::new(FileRowNumberExec::new(scan, partition_starts));
+            Arc::new(DeleteFilterExec::try_new(
+                with_positions,
+                table_file.file.path.clone(),
+                Arc::new(deleted_positions),
+            )?)
+        };
 
         // Drop rows newer than the read snapshot, then present the catalog schema.
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(SnapshotFilterExec::try_new(
@@ -2701,8 +2763,9 @@ impl DuckLakeTable {
         &self,
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
+        inlined_positions: Option<&HashSet<i64>>,
     ) -> DataFusionResult<UpdateSourceScan> {
-        self.build_update_scan_with_snapshot(state, table_file, false)
+        self.build_update_scan_with_snapshot(state, table_file, false, inlined_positions)
             .await
     }
 
@@ -2725,6 +2788,7 @@ impl DuckLakeTable {
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
         want_snapshot_id: bool,
+        inlined_positions: Option<&HashSet<i64>>,
     ) -> DataFusionResult<UpdateSourceScan> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
@@ -2737,13 +2801,17 @@ impl DuckLakeTable {
             )));
         }
 
-        // Rows already masked by a live delete file must not be re-updated, and
-        // must remain masked in the file's new cumulative delete.
-        let existing_deleted: HashSet<i64> = if let Some(ref delete_file) = table_file.delete_file {
-            self.read_delete_file_positions(state, delete_file).await?
-        } else {
-            HashSet::new()
+        // Both delete sources mask the scan, but only prior Parquet positions are
+        // carried into the replacement Parquet delete file. Inlined positions
+        // remain owned by their metadata table until an explicit flush.
+        let existing_parquet_deleted = match &table_file.delete_file {
+            Some(delete_file) => self.read_delete_file_positions(state, delete_file).await?,
+            None => HashSet::new(),
         };
+        let mut deleted_positions = existing_parquet_deleted.clone();
+        if let Some(inlined) = inlined_positions {
+            deleted_positions.extend(inlined);
+        }
 
         // The scan schema is the cached per-file one, plus the embedded
         // snapshot-id column when this caller asked for it. Appending here (and
@@ -2803,11 +2871,11 @@ impl DuckLakeTable {
         );
         let mut plan: Arc<dyn ExecutionPlan> =
             Arc::new(FileRowNumberExec::new(scan, partition_starts));
-        if !existing_deleted.is_empty() {
+        if !deleted_positions.is_empty() {
             plan = Arc::new(DeleteFilterExec::try_new(
                 plan,
                 table_file.file.path.clone(),
-                Arc::new(existing_deleted.clone()),
+                Arc::new(deleted_positions),
             )?);
         }
         let pos_index = plan.schema().index_of(ROW_POS_COLUMN_NAME)?;
@@ -2819,7 +2887,7 @@ impl DuckLakeTable {
             embedded_snapshot_batch_idx,
             pos_index,
             row_id_start: table_file.row_id_start,
-            existing_deleted,
+            existing_parquet_deleted,
             data_file_id: table_file.data_file_id,
             delete_file_id: table_file.delete_file_id,
             source_path: table_file.file.path.clone(),
@@ -2873,7 +2941,7 @@ impl DuckLakeTable {
         }
 
         let matched_count = new_positions.len();
-        let mut cumulative = scan.existing_deleted.clone();
+        let mut cumulative = scan.existing_parquet_deleted.clone();
         cumulative.extend(new_positions);
         let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
         cumulative_positions.sort_unstable();
@@ -3094,9 +3162,9 @@ pub(crate) struct UpdateSourceScan {
     /// The source file's catalog `row_id_start` (used to synthesize rowids for a
     /// non-embedded file).
     pub(crate) row_id_start: Option<i64>,
-    /// Positions already masked by the file's live delete file, carried forward
-    /// into the new cumulative delete.
-    pub(crate) existing_deleted: HashSet<i64>,
+    /// Positions already masked by the live Parquet delete file, carried into
+    /// the replacement Parquet delete file.
+    pub(crate) existing_parquet_deleted: HashSet<i64>,
     /// Catalog id of the source data file (the positional delete's target).
     pub(crate) data_file_id: i64,
     /// Catalog id of the file's currently-live delete file (compare-and-swap
@@ -3185,6 +3253,7 @@ impl TableProvider for DuckLakeTable {
         };
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         let pruning = match self.file_pruning_predicates(state, filters) {
             Ok(pruning) => pruning,
             Err(error) => {
@@ -3209,12 +3278,18 @@ impl TableProvider for DuckLakeTable {
                     let exec = if self.needs_snapshot_filter(table_file) {
                         let output_schema =
                             self.output_schema_for_projection(&user_proj, rowid_idx);
-                        self.build_exec_for_partial_file(state, table_file, output_schema)
-                            .await?
+                        self.build_exec_for_partial_file(
+                            state,
+                            table_file,
+                            inlined_deletes.get(&table_file.data_file_id),
+                            output_schema,
+                        )
+                        .await?
                     } else {
                         self.build_exec_for_file_with_rowid(
                             state,
                             table_file,
+                            inlined_deletes.get(&table_file.data_file_id),
                             &file_statistics,
                             &user_proj,
                             rowid_idx,
@@ -3230,9 +3305,11 @@ impl TableProvider for DuckLakeTable {
             let (needs_filter, rest): (Vec<_>, Vec<_>) = table_files
                 .into_iter()
                 .partition(|table_file| self.needs_snapshot_filter(table_file));
-            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) = rest
-                .into_iter()
-                .partition(|table_file| table_file.delete_file.is_some());
+            let (files_with_deletes, files_without_deletes): (Vec<_>, Vec<_>) =
+                rest.into_iter().partition(|table_file| {
+                    table_file.delete_file.is_some()
+                        || inlined_deletes.contains_key(&table_file.data_file_id)
+                });
 
             if !files_without_deletes.is_empty() {
                 execs.push(
@@ -3251,6 +3328,7 @@ impl TableProvider for DuckLakeTable {
                     self.build_exec_for_file_with_deletes(
                         state,
                         table_file,
+                        inlined_deletes.get(&table_file.data_file_id),
                         &file_statistics,
                         projection,
                         limit,
@@ -3264,8 +3342,13 @@ impl TableProvider for DuckLakeTable {
                     None => self.schema.clone(),
                 };
                 execs.push(
-                    self.build_exec_for_partial_file(state, table_file, output_schema)
-                        .await?,
+                    self.build_exec_for_partial_file(
+                        state,
+                        table_file,
+                        inlined_deletes.get(&table_file.data_file_id),
+                        output_schema,
+                    )
+                    .await?,
                 );
             }
         }
@@ -3482,9 +3565,13 @@ impl TableProvider for DuckLakeTable {
         let table_files = self
             .files()
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut scans = Vec::with_capacity(table_files.len());
         for tf in &table_files {
-            scans.push(self.build_update_scan(state, tf).await?);
+            scans.push(
+                self.build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
+                    .await?,
+            );
         }
 
         Ok(Arc::new(DuckLakeUpdateExec::new(
@@ -3492,6 +3579,7 @@ impl TableProvider for DuckLakeTable {
             Arc::clone(writer),
             schema_name.clone(),
             self.table_name.clone(),
+            self.snapshot_id,
             scans,
             phys_assignments,
             predicate,

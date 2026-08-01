@@ -527,6 +527,81 @@ async fn update_expression_referencing_column() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn update_does_not_resurrect_inlined_deletes() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2, 3], vec![10, 20, 30]).await;
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp_dir.path().join("test.db"),
+        &[1],
+    )
+    .await;
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 10), (3, 30)]);
+
+    let ctx = writable_ctx(&temp_dir).await;
+    let count = run_dml_count(&ctx, "UPDATE ducklake.main.t SET val = val + 1").await;
+    assert_eq!(count, 2);
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 11), (3, 31)]);
+
+    let pool = SqlitePool::connect(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let delete_count: i64 = sqlx::query_scalar(
+        "SELECT delete_count FROM ducklake_delete_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        delete_count, 2,
+        "the inline position is not copied to Parquet"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_conflicts_with_a_concurrent_inlined_delete() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2, 3], vec![10, 20, 30]).await;
+    let ctx = writable_ctx(&temp_dir).await;
+
+    let pool = SqlitePool::connect(&format!(
+        "sqlite:{}",
+        temp_dir.path().join("test.db").display()
+    ))
+    .await
+    .unwrap();
+    let base_snapshot: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         VALUES (?, CURRENT_TIMESTAMP, 1)",
+    )
+    .bind(base_snapshot + 1)
+    .execute(&pool)
+    .await
+    .unwrap();
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp_dir.path().join("test.db"),
+        &[1],
+    )
+    .await;
+
+    let error = ctx
+        .sql("UPDATE ducklake.main.t SET val = val + 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect_err("the stale update must conflict");
+    assert!(error.to_string().contains("gained an inlined delete"));
+    assert_eq!(read_pairs(&temp_dir).await, vec![(1, 10), (3, 30)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn update_multi_row_multi_file_is_one_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     // Two data files: A=(1,10),(2,20); B=(3,30),(4,40).

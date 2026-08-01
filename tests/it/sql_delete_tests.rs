@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::types::extract_parquet_field_ids;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, SqliteMetadataProvider,
     SqliteMetadataWriter,
 };
 use sqlx::sqlite::SqlitePool;
@@ -244,6 +244,169 @@ async fn delete_already_deleted_is_noop() {
         "a no-op DELETE creates no snapshot"
     );
     assert_eq!(read_ids(&temp).await, vec![1, 3, 4]);
+}
+
+/// Rows already removed by INLINED deletes are neither re-counted nor
+/// re-committed: a DELETE matching only such rows is a no-op, and a mixed
+/// predicate counts only the still-live rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_of_inline_deleted_rows_is_noop() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+    // id = 2 sits at physical position 1 of the only data file.
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+    assert_eq!(
+        read_ids(&temp).await,
+        vec![1, 3, 4],
+        "inline delete applied"
+    );
+
+    let snaps = snapshot_count(&temp).await;
+    let ctx1 = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx1, "DELETE FROM ducklake.main.t WHERE id = 2").await,
+        0,
+        "the inline-deleted row is not re-counted"
+    );
+    assert_eq!(
+        snapshot_count(&temp).await,
+        snaps,
+        "a DELETE matching only inline-deleted rows creates no snapshot"
+    );
+
+    let ctx2 = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx2, "DELETE FROM ducklake.main.t WHERE id IN (2, 3)").await,
+        1,
+        "only the live row counts"
+    );
+    assert_eq!(read_ids(&temp).await, vec![1, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_keeps_inline_and_parquet_positions_in_separate_stores() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+
+    let first = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&first, "DELETE FROM ducklake.main.t WHERE id = 1").await,
+        1
+    );
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+
+    let second = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&second, "DELETE FROM ducklake.main.t WHERE id = 3").await,
+        1
+    );
+    let pool = SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+        .await
+        .unwrap();
+    let delete_count: i64 = sqlx::query_scalar(
+        "SELECT delete_count FROM ducklake_delete_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        delete_count, 2,
+        "the Parquet file contains positions 0 and 2"
+    );
+    assert_eq!(read_ids(&temp).await, vec![4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncate_and_metadata_count_subtract_inlined_deletes() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+
+    let url = format!("sqlite:{}", temp.path().join("test.db").display());
+    let provider = SqliteMetadataProvider::new(&url).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", snapshot)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        provider
+            .get_table_row_count(table.table_id, snapshot)
+            .unwrap(),
+        3
+    );
+
+    let ctx = writable_ctx(&temp).await;
+    assert_eq!(run_delete(&ctx, "DELETE FROM ducklake.main.t").await, 3);
+    assert!(read_ids(&temp).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_delete_uses_physical_position_with_nonzero_row_id_start() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .write_table("main", "t", &[id_batch(&[1, 2, 3])])
+        .await
+        .unwrap();
+    let ctx = writable_ctx(&temp).await;
+    assert_eq!(run_delete(&ctx, "DELETE FROM ducklake.main.t").await, 3);
+
+    let writer = Arc::new(new_writer(&temp).await);
+    DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .append_table("main", "t", &[id_batch(&[4, 5, 6])])
+        .await
+        .unwrap();
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+
+    let pool = SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+        .await
+        .unwrap();
+    let row_id_start: i64 = sqlx::query_scalar(
+        "SELECT row_id_start FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_id_start, 3);
+    assert_eq!(read_ids(&temp).await, vec![4, 6]);
 }
 
 /// A DELETE matching no rows deletes nothing and reports 0.

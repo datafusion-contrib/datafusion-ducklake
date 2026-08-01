@@ -1,9 +1,9 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeStatistics,
+    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics,
+    FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
     SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
@@ -11,8 +11,8 @@ use crate::metadata_provider::{
     SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
     SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS,
     SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, ViewWithSchema, build_inlined_batch, is_inlined_data_table, reconstruct_columns,
-    reconstruct_columns_with_table,
+    ViewMetadata, ViewWithSchema, build_inlined_batch, inlined_delete_table_name,
+    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -1073,6 +1073,32 @@ impl MetadataProvider for DuckdbMetadataProvider {
             }
         }
         Ok(batches)
+    }
+
+    fn get_inlined_deletes(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<DuckLakeInlinedDelete>> {
+        let conn = self.connection();
+        let table = inlined_delete_table_name(table_id)?;
+        let sql = format!(
+            "SELECT file_id, row_id FROM {} WHERE begin_snapshot <= ? ORDER BY file_id, row_id",
+            quote_ident(&table)
+        );
+        let mut statement = match conn.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(statement
+            .query_map([snapshot_id], |row| {
+                Ok(DuckLakeInlinedDelete {
+                    data_file_id: row.get(0)?,
+                    row_id: row.get(1)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn get_schema_by_name(

@@ -875,6 +875,142 @@ async fn rewrite_can_target_explicit_data_files_without_deletes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rewrite_does_not_resurrect_inlined_deletes() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (3, 30)]);
+
+    assert_eq!(
+        run_rewrite(
+            &temp,
+            RewriteOptions {
+                delete_threshold: 0.3,
+                ..RewriteOptions::default()
+            },
+        )
+        .await,
+        CompactionResult {
+            files_processed: 1,
+            files_created: 1,
+            rows_written: 2,
+        },
+    );
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (3, 30)]);
+}
+
+/// An inlined DELETE that lands between a compaction's plan and commit trips the
+/// source-file fence instead of resurrecting the concurrently deleted row.
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_conflicts_with_a_concurrent_inlined_delete() {
+    use datafusion_ducklake::metadata_writer::SourceRetirement;
+    use datafusion_ducklake::{CompactionSourceFile, DuckLakeError};
+
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    // The plan observed no inlined deletes; a concurrent writer then inlines one.
+    let p = pool(&temp).await;
+    let base_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         VALUES (?, CURRENT_TIMESTAMP, 1)",
+    )
+    .bind(base_snapshot + 1)
+    .execute(&p)
+    .await
+    .unwrap();
+    let data_file_id = crate::inlined_delete_fixture::insert_inlined_deletes_for_only_file(
+        &temp.path().join("test.db"),
+        &[1],
+    )
+    .await;
+
+    let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+    let table_id = scalar_i64(
+        &p,
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't'",
+    )
+    .await;
+    let error = writer
+        .commit_compaction(
+            table_id,
+            base_snapshot,
+            &[CompactionSourceFile {
+                data_file_id,
+                delete_file_id: None,
+            }],
+            &[],
+            SourceRetirement::Retire,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, DuckLakeError::Conflict(_)),
+        "expected Conflict, got {error:?}"
+    );
+}
+
+/// A file whose rows are masked only by inlined deletes has `delete_file_id = NULL`,
+/// but merging it with `SourceRetirement::Remove` would erase the masked rows from
+/// every snapshot and leave `ducklake_inlined_delete_<id>` rows pointing at a removed
+/// file. Such a file must not be a merge candidate; unaffected files still merge.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_skips_files_masked_by_inlined_deletes() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    let p = pool(&temp).await;
+    let seed_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    let masked_file_id = crate::inlined_delete_fixture::insert_inlined_deletes_for_first_file(
+        &temp.path().join("test.db"),
+        &[0],
+    )
+    .await;
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]
+    );
+
+    assert_eq!(
+        run_merge(&temp, MergeOptions::default()).await,
+        CompactionResult {
+            files_processed: 2,
+            files_created: 1,
+            rows_written: 4,
+        },
+    );
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let table_id = scalar_i64(
+        &p,
+        "SELECT table_id FROM ducklake_table WHERE table_name = 't'",
+    )
+    .await;
+    let files = provider
+        .get_table_file_metadata_page(table_id, snapshot, None, 10)
+        .unwrap();
+    assert!(
+        files
+            .iter()
+            .any(|metadata| metadata.file.data_file_id == masked_file_id),
+        "the masked file must survive the merge",
+    );
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(2, 20), (3, 30), (4, 40), (5, 50), (6, 60)]
+    );
+    assert_eq!(
+        read_rows_at(&temp, seed_snapshot).await,
+        vec![(1, 10), (2, 20)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage() {
     const MEMORY_LIMIT: usize = 256 * 1024;
     const ROWS_PER_SNAPSHOT: i32 = 16_384;

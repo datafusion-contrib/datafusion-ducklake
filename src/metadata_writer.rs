@@ -1608,13 +1608,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Compaction changes the physical file layout, not the logical rows, so the
     /// commit is designed NOT to conflict with a concurrent append (which adds
-    /// unrelated files): the only conflict checks are, for each `source`, that
-    /// its data file is still live and that its live delete file still matches
-    /// [`CompactionSourceFile::delete_file_id`] (a compare-and-swap). Either
-    /// mismatch — a concurrent Replace/compaction that retired the file, or a
-    /// concurrent DELETE/UPDATE that changed its live rows since they were read —
-    /// aborts with [`crate::DuckLakeError::Conflict`] so retired rows can never
-    /// be resurrected into an output. The new snapshot carries `schema_version`
+    /// unrelated files): for each `source`, the data file must still be live,
+    /// the live delete file must still match
+    /// [`CompactionSourceFile::delete_file_id`] (a compare-and-swap), and no new
+    /// distinct inlined-delete position may have appeared after `base_snapshot`.
+    /// A concurrent Replace/compaction that retired the file or a concurrent
+    /// DELETE/UPDATE (positional or inlined) that changed its live rows since
+    /// they were read — aborts with [`crate::DuckLakeError::Conflict`] so
+    /// retired rows can never be resurrected into an output. The new snapshot carries `schema_version`
     /// forward (compaction is not DDL). `base_snapshot` is the catalog head the
     /// sources were read at, used only for the conflict diagnostic.
     ///

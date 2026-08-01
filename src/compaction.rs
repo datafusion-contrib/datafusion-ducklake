@@ -716,10 +716,14 @@ impl DuckLakeTable {
         // output on a table taking appends between merge passes, leaving each
         // partition a floor of files nothing can reduce.
         let table_files = self.files()?;
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
                 f.delete_file_id.is_none()
+                    // Removing a source with inlined deletes would erase its masked rows
+                    // from every snapshot while leaving metadata that points at the file.
+                    && !inlined_deletes.contains_key(&f.data_file_id)
                     && f.begin_snapshot.is_some()
                     && f.schema_version.is_some()
                     && (f.file.file_size_bytes as u64) >= opts.min_file_size
@@ -943,7 +947,12 @@ impl DuckLakeTable {
                     OriginSource::Constant(*begin)
                 });
                 let scan = self
-                    .build_update_scan_with_snapshot(state, tf, source_embeds_origins)
+                    .build_update_scan_with_snapshot(
+                        state,
+                        tf,
+                        source_embeds_origins,
+                        inlined_deletes.get(&tf.data_file_id),
+                    )
                     .await?;
                 leaves.push(Arc::new(CompactionSourceExec::new(
                     Arc::new(scan),
@@ -1077,17 +1086,21 @@ impl DuckLakeTable {
             .data_file_ids
             .map(|ids| ids.into_iter().collect::<HashSet<_>>());
         let table_files = self.files()?;
+        let inlined_deletes = self.inlined_deletes_by_file()?;
         let candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|tf| match &selected_ids {
                 Some(selected_ids) => selected_ids.contains(&tf.data_file_id),
-                // Threshold selection only applies to files with live deletes.
+                // Automatic selection counts both Parquet and inlined deletes.
                 None => {
                     let record_count = tf.max_row_count.unwrap_or(0);
-                    tf.delete_file_id.is_some()
+                    let inlined_count = inlined_deletes
+                        .get(&tf.data_file_id)
+                        .map_or(0, |positions| positions.len() as i64);
+                    let delete_count = tf.delete_count.unwrap_or(0) + inlined_count;
+                    delete_count > 0
                         && record_count > 0
-                        && tf.delete_count.unwrap_or(0) as f64 / record_count as f64
-                            >= opts.delete_threshold
+                        && delete_count as f64 / record_count as f64 >= opts.delete_threshold
                 },
             })
             .collect();
@@ -1114,7 +1127,9 @@ impl DuckLakeTable {
             // parallel. Rowid lineage rides out of the scan as a column, so the
             // sort and the parquet write consume the plan directly instead of a
             // fully collected `Vec<RecordBatch>`.
-            let scan = self.build_update_scan(state, tf).await?;
+            let scan = self
+                .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
+                .await?;
             let sorted = sorted_rewrite_output(
                 state.task_ctx(),
                 Arc::new(CompactionSourceExec::new(
