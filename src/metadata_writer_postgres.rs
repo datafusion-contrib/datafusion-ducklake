@@ -3117,6 +3117,36 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn reserve_row_ids(&self, table_id: i64, count: i64) -> Result<i64> {
+        if count < 0 {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "row-ID reservation count must be non-negative, got {count}"
+            )));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let start: i64 = sqlx::query_scalar(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id = next_row_id + $1
+                 WHERE table_id = $2
+                 RETURNING next_row_id - $1",
+            )
+            .bind(count)
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "cannot reserve row IDs for unknown table {table_id}"
+                ))
+            })?;
+            tx.commit().await?;
+            Ok(start)
+        })
+    }
+
     fn promote_column_type(
         &self,
         table_id: i64,

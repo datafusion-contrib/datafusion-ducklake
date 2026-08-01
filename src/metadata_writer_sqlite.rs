@@ -2993,6 +2993,35 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn reserve_row_ids(&self, table_id: i64, count: i64) -> Result<i64> {
+        if count < 0 {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "row-ID reservation count must be non-negative, got {count}"
+            )));
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let start: i64 = sqlx::query_scalar(
+                "UPDATE ducklake_table_stats
+                 SET next_row_id = next_row_id + ?
+                 WHERE table_id = ?
+                 RETURNING next_row_id - ?",
+            )
+            .bind(count)
+            .bind(table_id)
+            .bind(count)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "cannot reserve row IDs for unknown table {table_id}"
+                ))
+            })?;
+            tx.commit().await?;
+            Ok(start)
+        })
+    }
+
     fn get_or_create_schema(
         &self,
         name: &str,

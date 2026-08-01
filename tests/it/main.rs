@@ -86,6 +86,7 @@ mod sorted_write_duckdb_tests;
 mod sorted_write_tests;
 mod sql_delete_postgres_tests;
 mod sql_delete_tests;
+mod sql_merge_tests;
 mod sql_update_postgres_tests;
 mod sql_update_tests;
 mod sql_write_tests;

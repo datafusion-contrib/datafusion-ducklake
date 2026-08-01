@@ -14,6 +14,8 @@ use datafusion::prelude::SessionContext;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::MetadataWriter;
+#[cfg(feature = "write")]
+use crate::table::DuckLakeTable;
 
 /// Configuration for write operations (when write feature is enabled)
 #[cfg(feature = "write")]
@@ -239,6 +241,48 @@ impl DuckLakeCatalog {
         self.write_config
             .as_ref()
             .map(|config| Arc::clone(&config.writer))
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn table_for_write(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<DuckLakeTable> {
+        let config = self.write_config.as_ref().ok_or_else(|| {
+            crate::DuckLakeError::InvalidConfig("catalog is read-only".to_string())
+        })?;
+        let snapshot = self.snapshot.resolve(self.provider.as_ref())?;
+        let schema = self
+            .provider
+            .get_schema_by_name(schema_name, snapshot)?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!("schema '{schema_name}' not found"))
+            })?;
+        let table = self
+            .provider
+            .get_table_by_name(schema.schema_id, table_name, snapshot)?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!("table '{table_name}' not found"))
+            })?;
+        let schema_path = resolve_path(&self.catalog_path, &schema.path, schema.path_is_relative)?;
+        let table_path = resolve_path(&schema_path, &table.path, table.path_is_relative)?;
+        let settings = self
+            .provider
+            .get_metadata_settings(Some(schema.schema_id), Some(table.table_id))?;
+        let options =
+            crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings)
+                .with_overrides(&config.options);
+        Ok(DuckLakeTable::new(
+            table.table_id,
+            table.table_name,
+            Arc::clone(&self.provider),
+            snapshot,
+            Arc::clone(&self.object_store_url),
+            table_path,
+        )?
+        .with_writer(schema_name.to_string(), Arc::clone(&config.writer))
+        .with_write_options(options))
     }
 }
 

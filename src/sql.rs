@@ -1,4 +1,4 @@
-//! SQL entry point for DuckLake metadata and data-layout DDL.
+//! SQL entry point for DuckLake metadata and data-layout DDL, and `MERGE INTO`.
 //!
 //! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
 //! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
@@ -8,7 +8,8 @@
 //! and `COMMENT ON`, using DataFusion's bundled sqlparser with no new dependency,
 //! then dispatches them to the programmatic
 //! [`MetadataWriter`](crate::metadata_writer::MetadataWriter) API on the given
-//! [`DuckLakeCatalog`], and delegates everything else to `ctx.sql(sql)` unchanged.
+//! [`DuckLakeCatalog`], handles DuckLake `MERGE INTO`, and delegates everything else
+//! to `ctx.sql(sql)` unchanged.
 //!
 //! ```no_run
 //! # async fn run(ctx: &datafusion::prelude::SessionContext,
@@ -34,26 +35,29 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Merge,
     ObjectName, Statement,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
-use datafusion::sql::sqlparser::tokenizer::Token;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
 use crate::catalog::DuckLakeCatalog;
 use crate::metadata_provider::{TagObjectType, TagTarget};
 use crate::partition::PartitionTransform;
 use crate::sort::{NullOrder, SortDirection, SortField};
 
-/// Execute a SQL statement against `ctx`, handling DuckLake comments and layout
-/// DDL directly on `catalog` and delegating everything else to
+const MERGE_UPDATE_ALL_SENTINEL: &str = "__ducklake_merge_all__";
+
+/// Execute a SQL statement against `ctx`, handling DuckLake comments, `MERGE INTO`, and
+/// layout DDL directly on `catalog` and delegating everything else to
 /// [`SessionContext::sql`].
 ///
-/// For a recognized statement this resolves the target through `catalog`'s
-/// provider/writer, applies the change, and returns an empty result set matching
-/// DataFusion's own DDL. Callers can route all their SQL through it.
+/// A `MERGE INTO` returns the affected-row count. Any other recognized statement
+/// resolves its target through `catalog`'s provider/writer, applies the change,
+/// and returns an empty result set matching DataFusion's own DDL. Callers can
+/// route all their SQL through it.
 ///
 /// The DDL targets `catalog` (the 1–3 part table name's catalog segment, if any,
 /// is not cross-checked); a read-only catalog yields a clear error.
@@ -62,10 +66,97 @@ pub async fn execute_ducklake_sql(
     catalog: &DuckLakeCatalog,
     sql: &str,
 ) -> DataFusionResult<DataFrame> {
+    if let Some((merge, update_all)) = parse_ducklake_merge(sql)? {
+        return crate::merge::execute_merge(ctx, catalog, merge, update_all).await;
+    }
     match parse_ducklake_ddl(sql)? {
         Some(ddl) => apply_ducklake_ddl(ctx, catalog, ddl).await,
         None => ctx.sql(sql).await,
     }
+}
+
+fn parse_ducklake_merge(sql: &str) -> DataFusionResult<Option<(Merge, bool)>> {
+    let dialect = GenericDialect {};
+    let mut tokens = Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .map_err(|e| DataFusionError::Plan(format!("MERGE tokenize error: {e}")))?;
+    let Some(first) = tokens.iter().find(|token| !is_whitespace(token)) else {
+        return Ok(None);
+    };
+    if !is_keyword(first, Keyword::MERGE) {
+        return Ok(None);
+    }
+    let update_all = normalize_merge_shorthand(&mut tokens);
+    let statements = Parser::new(&dialect)
+        .with_tokens(tokens)
+        .parse_statements()
+        .map_err(|e| DataFusionError::Plan(format!("MERGE parse error: {e}")))?;
+    let [statement] = statements.as_slice() else {
+        return Err(DataFusionError::Plan(
+            "MERGE accepts exactly one SQL statement".to_string(),
+        ));
+    };
+    match statement {
+        Statement::Merge(merge) => Ok(Some((merge.clone(), update_all))),
+        _ => Err(DataFusionError::Plan(
+            "expected a MERGE INTO statement".to_string(),
+        )),
+    }
+}
+
+fn normalize_merge_shorthand(tokens: &mut Vec<Token>) -> bool {
+    let significant: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(index, token)| (!is_whitespace(token)).then_some(index))
+        .collect();
+    let mut additions = Vec::new();
+    let mut update_all = false;
+    for position in 1..significant.len() {
+        let previous = significant[position - 1];
+        let action = significant[position];
+        let next = significant.get(position + 1).copied();
+        let action_ends_clause = next.is_none_or(|index| {
+            is_keyword(&tokens[index], Keyword::WHEN)
+                || matches!(tokens[index], Token::SemiColon | Token::EOF)
+        });
+        if !is_keyword(&tokens[previous], Keyword::THEN) || !action_ends_clause {
+            continue;
+        }
+        if is_keyword(&tokens[action], Keyword::UPDATE) {
+            update_all = true;
+            additions.push((
+                action + 1,
+                vec![
+                    Token::Whitespace(Whitespace::Space),
+                    Token::make_keyword("SET"),
+                    Token::Whitespace(Whitespace::Space),
+                    Token::make_word(MERGE_UPDATE_ALL_SENTINEL, Some('"')),
+                    Token::Whitespace(Whitespace::Space),
+                    Token::Eq,
+                    Token::Whitespace(Whitespace::Space),
+                    Token::make_word(MERGE_UPDATE_ALL_SENTINEL, Some('"')),
+                ],
+            ));
+        } else if is_keyword(&tokens[action], Keyword::INSERT) {
+            additions.push((
+                action + 1,
+                vec![Token::Whitespace(Whitespace::Space), Token::make_keyword("ROW")],
+            ));
+        }
+    }
+    for (index, addition) in additions.into_iter().rev() {
+        tokens.splice(index..index, addition);
+    }
+    update_all
+}
+
+fn is_whitespace(token: &Token) -> bool {
+    matches!(token, Token::Whitespace(_))
+}
+
+fn is_keyword(token: &Token, keyword: Keyword) -> bool {
+    matches!(token, Token::Word(word) if word.keyword == keyword)
 }
 
 /// The DuckLake metadata and data-layout DDL statements this module recognizes.
