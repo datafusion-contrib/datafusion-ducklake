@@ -50,6 +50,11 @@ impl SnapshotsTable {
         let schema = Arc::new(Schema::new(vec![
             Field::new("snapshot_id", DataType::Int64, false),
             Field::new("timestamp", DataType::Utf8, true),
+            Field::new("schema_version", DataType::Int64, false),
+            Field::new("changes_made", DataType::Utf8, true),
+            Field::new("author", DataType::Utf8, true),
+            Field::new("commit_message", DataType::Utf8, true),
+            Field::new("commit_extra_info", DataType::Utf8, true),
         ]));
         Self {
             provider,
@@ -74,8 +79,54 @@ impl SnapshotsTable {
                 .collect::<Vec<_>>(),
         ));
 
-        RecordBatch::try_new(self.schema.clone(), vec![snapshot_ids, timestamps])
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        let schema_versions: ArrayRef = Arc::new(Int64Array::from(
+            snapshots
+                .iter()
+                .map(|s| s.schema_version)
+                .collect::<Vec<_>>(),
+        ));
+
+        let changes_made: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.changes_made.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+
+        let authors: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.author.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+
+        let commit_messages: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.commit_message.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+
+        let commit_extra_info: ArrayRef = Arc::new(StringArray::from(
+            snapshots
+                .iter()
+                .map(|s| s.commit_extra_info.as_deref())
+                .collect::<Vec<_>>(),
+        ));
+
+        RecordBatch::try_new(
+            self.schema.clone(),
+            vec![
+                snapshot_ids,
+                timestamps,
+                schema_versions,
+                changes_made,
+                authors,
+                commit_messages,
+                commit_extra_info,
+            ],
+        )
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 

@@ -8,38 +8,6 @@ use std::sync::Arc;
 use crate::common;
 
 #[tokio::test]
-#[ignore] // Snapshots table requires ducklake_snapshot table which test catalogs don't create
-async fn test_information_schema_snapshots() -> Result<(), Box<dyn std::error::Error>> {
-    // NOTE: This test is ignored because the test helper uses DuckDB's DuckLake extension
-    // which doesn't expose the ducklake_snapshot table directly.
-    // In production catalogs created by other means, this table would exist.
-
-    let temp_dir = tempfile::tempdir()?;
-    let catalog_path = temp_dir.path().join("test.ducklake");
-
-    common::create_catalog_no_deletes(&catalog_path)?;
-
-    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
-    let catalog = DuckLakeCatalog::new(provider)?;
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-
-    // Query snapshots
-    let df = ctx
-        .sql("SELECT * FROM ducklake.information_schema.snapshots")
-        .await?;
-
-    let results = df.collect().await?;
-
-    assert!(!results.is_empty(), "Should have at least one snapshot");
-    println!(
-        "✓ Snapshots table test passed - found {} row(s)",
-        results[0].num_rows()
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_information_schema_schemata() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let catalog_path = temp_dir.path().join("test.ducklake");

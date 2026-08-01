@@ -12,7 +12,13 @@ use std::sync::Arc;
 pub const SQL_GET_LATEST_SNAPSHOT: &str =
     "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot";
 
-pub const SQL_LIST_SNAPSHOTS: &str = "SELECT snapshot_id, CAST(snapshot_time AS VARCHAR) as timestamp FROM ducklake_snapshot ORDER BY snapshot_id";
+pub const SQL_LIST_SNAPSHOTS: &str = r#"
+SELECT s.snapshot_id, CAST(s.snapshot_time AS VARCHAR) AS timestamp, s.schema_version,
+       c.changes_made, c.author, c.commit_message, c.commit_extra_info
+FROM ducklake_snapshot s
+LEFT JOIN ducklake_snapshot_changes c USING (snapshot_id)
+ORDER BY s.snapshot_id
+"#;
 
 pub const SQL_LIST_SCHEMAS: &str =
     "SELECT schema_id, schema_name, path, path_is_relative FROM ducklake_schema
@@ -404,6 +410,16 @@ pub struct SnapshotMetadata {
     pub snapshot_id: i64,
     /// Timestamp when the snapshot was created (optional)
     pub timestamp: Option<String>,
+    /// Catalog schema version in effect for this snapshot
+    pub schema_version: i64,
+    /// Raw conflict-detection changeset stored by DuckLake
+    pub changes_made: Option<String>,
+    /// Optional commit author
+    pub author: Option<String>,
+    /// Optional commit message
+    pub commit_message: Option<String>,
+    /// Optional opaque commit metadata
+    pub commit_extra_info: Option<String>,
 }
 
 /// Change ledger entry associated with a DuckLake snapshot.

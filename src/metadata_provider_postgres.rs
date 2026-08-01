@@ -919,8 +919,11 @@ impl MetadataProvider for PostgresMetadataProvider {
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT snapshot_id, snapshot_time
-                 FROM ducklake_snapshot ORDER BY snapshot_id",
+                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version,
+                        c.changes_made, c.author, c.commit_message, c.commit_extra_info
+                 FROM ducklake_snapshot s
+                 LEFT JOIN ducklake_snapshot_changes c USING (snapshot_id)
+                 ORDER BY s.snapshot_id",
             )
             .fetch_all(&self.pool)
             .await?;
@@ -935,6 +938,11 @@ impl MetadataProvider for PostgresMetadataProvider {
                     Ok(SnapshotMetadata {
                         snapshot_id,
                         timestamp: timestamp_str,
+                        schema_version: row.try_get(2)?,
+                        changes_made: row.try_get(3)?,
+                        author: row.try_get(4)?,
+                        commit_message: row.try_get(5)?,
+                        commit_extra_info: row.try_get(6)?,
                     })
                 })
                 .collect()
