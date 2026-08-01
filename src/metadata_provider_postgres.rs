@@ -5,21 +5,28 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, block_on,
+    InlinedDataBackend, MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, block_on, inlined_text_projection, is_inlined_data_table, parse_inlined_rows,
     reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("does not exist") || message.contains("undefined table")
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile> {
@@ -942,6 +949,88 @@ impl MetadataProvider for PostgresMetadataProvider {
                 columns,
                 files,
             })
+        })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<RecordBatch>> {
+        block_on(async {
+            let registry = match sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in registry {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
+                let present = sqlx::query(
+                    "SELECT column_name FROM information_schema.columns
+                     WHERE table_schema = current_schema() AND table_name = $1",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL::text".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::Postgres,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT {projected} FROM {} \
+                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL) \
+                     ORDER BY row_id",
+                    quote_ident(&table)
+                );
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(parse_inlined_rows(schema.clone(), columns, rows)?);
+            }
+            Ok(batches)
         })
     }
 

@@ -6,10 +6,57 @@ use std::sync::Arc;
 use crate::metadata_provider::DuckLakeTableColumn;
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use datafusion::common::ScalarValue;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
 
 pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
+
+pub(crate) fn parse_ducklake_scalar(value: &str, data_type: &DataType) -> Option<ScalarValue> {
+    match data_type {
+        DataType::Boolean => match value.to_ascii_lowercase().as_str() {
+            "0" | "false" => Some(ScalarValue::Boolean(Some(false))),
+            "1" | "true" => Some(ScalarValue::Boolean(Some(true))),
+            _ => None,
+        },
+        DataType::Utf8 => Some(ScalarValue::Utf8(Some(value.to_string()))),
+        DataType::LargeUtf8 => Some(ScalarValue::LargeUtf8(Some(value.to_string()))),
+        DataType::Utf8View => Some(ScalarValue::Utf8View(Some(value.to_string()))),
+        DataType::Binary => decode_hex(value).map(|value| ScalarValue::Binary(Some(value))),
+        DataType::LargeBinary => {
+            decode_hex(value).map(|value| ScalarValue::LargeBinary(Some(value)))
+        },
+        DataType::BinaryView => decode_hex(value).map(|value| ScalarValue::BinaryView(Some(value))),
+        DataType::FixedSizeBinary(size) => decode_hex(value)
+            .filter(|value| value.len() == *size as usize)
+            .map(|value| ScalarValue::FixedSizeBinary(*size, Some(value))),
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Map(_, _) => None,
+        _ => ScalarValue::try_from_string(value.to_string(), data_type).ok(),
+    }
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    let value = value
+        .strip_prefix("\\x")
+        .or_else(|| value.strip_prefix("0x"))
+        .unwrap_or(value);
+    let compact: String = value.chars().filter(|c| *c != '-').collect();
+    if !compact.len().is_multiple_of(2) {
+        return None;
+    }
+    compact
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect()
+}
 
 /// Convert a DuckLake type string to an Arrow DataType
 pub fn ducklake_to_arrow_type(ducklake_type: &str) -> Result<DataType> {

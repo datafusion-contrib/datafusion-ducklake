@@ -1,6 +1,8 @@
 use crate::Result;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -517,6 +519,116 @@ pub struct DuckLakeTableColumn {
     pub is_nullable: bool,
     pub(crate) data_type: Option<DataType>,
     pub(crate) nested_column_ids: Vec<i64>,
+}
+
+pub(crate) fn is_inlined_data_table(name: &str) -> bool {
+    name.starts_with("ducklake_inlined_data_")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InlinedDataBackend {
+    Postgres,
+    MySql,
+}
+
+pub(crate) fn inlined_text_projection(
+    backend: InlinedDataBackend,
+    column: &DuckLakeTableColumn,
+    data_type: &arrow::datatypes::DataType,
+    ident: &str,
+) -> String {
+    use arrow::datatypes::DataType;
+
+    match backend {
+        InlinedDataBackend::Postgres => match data_type {
+            DataType::FixedSizeBinary(_)
+                if column.column_type.trim().eq_ignore_ascii_case("uuid") =>
+            {
+                format!("CAST({ident} AS TEXT)")
+            },
+            DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => format!("encode({ident}, 'hex')"),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                if matches!(
+                    column.column_type.trim().to_ascii_lowercase().as_str(),
+                    "varchar" | "text" | "string" | "json"
+                ) =>
+            {
+                format!("convert_from({ident}, 'UTF8')")
+            },
+            _ => format!("CAST({ident} AS TEXT)"),
+        },
+        InlinedDataBackend::MySql => match data_type {
+            DataType::FixedSizeBinary(_)
+                if column.column_type.trim().eq_ignore_ascii_case("uuid") =>
+            {
+                format!("CAST({ident} AS CHAR CHARACTER SET utf8mb4)")
+            },
+            DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => format!("HEX({ident})"),
+            _ => format!("CAST({ident} AS CHAR CHARACTER SET utf8mb4)"),
+        },
+    }
+}
+
+pub(crate) fn build_inlined_batch(
+    schema: SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    rows: &[Vec<ScalarValue>],
+) -> Result<RecordBatch> {
+    if rows.iter().any(|row| row.len() != columns.len()) {
+        return Err(crate::DuckLakeError::Internal(
+            "inlined data row does not match the catalog column count".to_string(),
+        ));
+    }
+    let arrays = (0..columns.len())
+        .map(|index| ScalarValue::iter_to_array(rows.iter().map(|row| row[index].clone())))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+pub(crate) fn parse_inlined_rows(
+    schema: SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<RecordBatch> {
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            if row.len() != columns.len() {
+                return Err(crate::DuckLakeError::Internal(
+                    "inlined data row does not match the catalog column count".to_string(),
+                ));
+            }
+            row.into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let field = schema.field(index);
+                    match value {
+                        Some(value) => crate::types::parse_ducklake_scalar(
+                            &value,
+                            field.data_type(),
+                        )
+                        .ok_or_else(|| {
+                            crate::DuckLakeError::Unsupported(format!(
+                                "inlined data for column '{}' cannot decode value '{}' as {}",
+                                columns[index].column_name,
+                                value,
+                                field.data_type()
+                            ))
+                        }),
+                        None => Ok(ScalarValue::try_from(field.data_type())?),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    build_inlined_batch(schema, columns, &rows)
 }
 
 impl DuckLakeTableColumn {
@@ -1235,7 +1347,83 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use super::*;
+
+    fn column(name: &str, column_type: &str) -> DuckLakeTableColumn {
+        DuckLakeTableColumn::new(1, name.to_string(), column_type.to_string(), true)
+    }
+
+    #[test]
+    fn inlined_text_projections_match_backend_encodings() {
+        assert_eq!(
+            inlined_text_projection(
+                InlinedDataBackend::Postgres,
+                &column("note", "varchar"),
+                &DataType::Utf8View,
+                "\"note\"",
+            ),
+            "convert_from(\"note\", 'UTF8')"
+        );
+        assert_eq!(
+            inlined_text_projection(
+                InlinedDataBackend::Postgres,
+                &column("payload", "blob"),
+                &DataType::BinaryView,
+                "\"payload\"",
+            ),
+            "encode(\"payload\", 'hex')"
+        );
+        assert_eq!(
+            inlined_text_projection(
+                InlinedDataBackend::Postgres,
+                &column("token", "uuid"),
+                &DataType::FixedSizeBinary(16),
+                "\"token\"",
+            ),
+            "CAST(\"token\" AS TEXT)"
+        );
+        assert_eq!(
+            inlined_text_projection(
+                InlinedDataBackend::MySql,
+                &column("payload", "blob"),
+                &DataType::BinaryView,
+                "`payload`",
+            ),
+            "HEX(`payload`)"
+        );
+        assert_eq!(
+            inlined_text_projection(
+                InlinedDataBackend::MySql,
+                &column("note", "varchar"),
+                &DataType::Utf8View,
+                "`note`",
+            ),
+            "CAST(`note` AS CHAR CHARACTER SET utf8mb4)"
+        );
+    }
+
+    #[test]
+    fn inlined_rows_reject_unsupported_nested_encoding() {
+        let columns = vec![column("items", "list<int32>")];
+        let schema = Arc::new(Schema::new(vec![Field::new_list(
+            "items",
+            Field::new("item", DataType::Int32, true),
+            true,
+        )]));
+        let error = parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]])
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("inlined data for column 'items' cannot decode value '[1, 2]' as List"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_reconstruct_columns_list() {

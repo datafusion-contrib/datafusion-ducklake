@@ -32,6 +32,7 @@ mod encryption_tests;
 mod files_matching_tests;
 mod hybrid_asyncdb;
 mod information_schema_test;
+mod inlined_data_backends_tests;
 mod inlined_data_sqlite_tests;
 mod insert_partitioning_tests;
 mod keyed_mutation_after_compaction_tests;
