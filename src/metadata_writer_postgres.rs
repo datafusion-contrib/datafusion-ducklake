@@ -5086,9 +5086,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                         "UPDATE/DELETE on data file {} could not commit: the file is no longer \
                          live as of the catalog's current head (retired since snapshot \
                          {base_snapshot}). This happens when another writer committed a \
-                         Replace/compaction, OR when an earlier write in THIS session already \
-                         advanced the catalog (the catalog pins its snapshot at creation and does \
-                         not refresh). Re-open the catalog at the latest snapshot and retry.",
+                         Replace/compaction. Retry the statement.",
                         entry.data_file_id
                     )));
                 }
@@ -5104,10 +5102,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     return Err(crate::DuckLakeError::Conflict(format!(
                         "UPDATE/DELETE on data file {} could not commit: its live delete file \
                          changed from {:?} to {current_prev:?} since snapshot {base_snapshot}. \
-                         Another writer committed a delete on this file, OR an earlier \
-                         UPDATE/DELETE in THIS session did (the catalog pins its snapshot at \
-                         creation and does not refresh). Re-open the catalog at the latest \
-                         snapshot and retry.",
+                         Another writer committed a delete on this file. Retry the statement.",
                         entry.data_file_id, entry.expected_prev_delete_file
                     )));
                 }
@@ -5344,9 +5339,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                         "UPDATE/DELETE on data file {} could not commit: the file is no longer \
                          live as of the catalog's current head (retired since snapshot \
                          {base_snapshot}). This happens when another writer committed a \
-                         Replace/compaction, OR when an earlier write in THIS session already \
-                         advanced the catalog (the catalog pins its snapshot at creation and does \
-                         not refresh). Re-open the catalog at the latest snapshot and retry.",
+                         Replace/compaction. Retry the statement.",
                         entry.data_file_id
                     )));
                 }
@@ -5362,10 +5355,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     return Err(crate::DuckLakeError::Conflict(format!(
                         "UPDATE/DELETE on data file {} could not commit: its live delete file \
                          changed from {:?} to {current_prev:?} since snapshot {base_snapshot}. \
-                         Another writer committed a delete on this file, OR an earlier \
-                         UPDATE/DELETE in THIS session did (the catalog pins its snapshot at \
-                         creation and does not refresh). Re-open the catalog at the latest \
-                         snapshot and retry.",
+                         Another writer committed a delete on this file. Retry the statement.",
                         entry.data_file_id, entry.expected_prev_delete_file
                     )));
                 }
@@ -5485,10 +5475,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     return Err(crate::DuckLakeError::Conflict(format!(
                         "DELETE on data file {} could not commit: the file is no longer live as \
                          of the catalog's current head (retired since snapshot {base_snapshot}). \
-                         This happens when another writer committed a Replace/compaction, OR when \
-                         an earlier write in THIS session already advanced the catalog (the \
-                         catalog pins its snapshot at creation and does not refresh). Re-open the \
-                         catalog at the latest snapshot and retry.",
+                         This happens when another writer committed a Replace/compaction. Retry the statement.",
                         entry.data_file_id
                     )));
                 }
@@ -5505,9 +5492,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     return Err(crate::DuckLakeError::Conflict(format!(
                         "DELETE on data file {} could not commit: its live delete file changed \
                          from {:?} to {current_prev:?} since snapshot {base_snapshot}. Another \
-                         writer committed a delete on this file, OR an earlier DELETE in THIS \
-                         session did (the catalog pins its snapshot at creation and does not \
-                         refresh). Re-open the catalog at the latest snapshot and retry.",
+                         writer committed a delete on this file. Retry the statement.",
                         entry.data_file_id, entry.expected_prev_delete_file
                     )));
                 }

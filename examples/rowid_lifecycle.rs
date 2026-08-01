@@ -281,7 +281,7 @@ async fn datafusion_read(
     let catalog = DuckLakeCatalog::new(provider)?.with_row_lineage(true);
     let cfg = SessionConfig::new().with_default_catalog_and_schema("dl", "main");
     let ctx = SessionContext::new_with_config_rt(cfg, runtime.clone());
-    ctx.register_catalog("dl", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "dl", catalog);
 
     let df = ctx.sql(sql).await?;
     let batches = df.collect().await?;

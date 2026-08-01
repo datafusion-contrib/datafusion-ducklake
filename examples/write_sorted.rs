@@ -76,7 +76,7 @@ async fn main() {
         .unwrap()
         .with_write_options(options);
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(200));
-    ctx.register_catalog("lake", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "lake", catalog);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),

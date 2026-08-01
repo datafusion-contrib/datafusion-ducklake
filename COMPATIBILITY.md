@@ -497,9 +497,17 @@ Known edges:
   `ducklake_table_at`. Timestamp selection uses the latest snapshot at or before the requested
   time. For snapshots with the same timestamp, an as-of or change-data end bound selects the
   highest ID, while a change-data start bound selects the lowest ID.
-- **One mutation per session, then re-open the catalog.** A catalog pins its snapshot at creation.
-  Re-open the catalog or create a fresh `SessionContext` after a mutation so later statements bind
-  the committed snapshot.
+- **`new` and `with_writer` catalogs read the latest snapshot at each lookup.** A statement
+  sees its own commits and other writers' commits, as a new DuckDB transaction does.
+  DataFusion looks up each table reference on its own, so a commit between two lookups can put
+  one statement on two snapshots. Register the catalog with `DuckLakeCatalog::register`, or call
+  `register_snapshot_consistency` on the `SessionContext`, to rebuild the tables of a plan,
+  including tables behind a view, at the newest snapshot any table of the same catalog
+  resolved; without it, a statement over several tables has no single-snapshot guarantee.
+  Snapshots of different catalogs are never compared. A table or view that changed in between
+  fails the statement, which is safe to retry. A commit by another writer before execution
+  makes an `UPDATE`/`DELETE` fail with a conflict. `with_snapshot` and `with_snapshot_at`
+  stay fixed at their snapshot, like attaching with `SNAPSHOT_VERSION`.
 - **The change feed is degraded on encrypted (PME) catalogs.**
   `ducklake_table_changes` still works on encrypted catalogs for inserted rows, but a
   range containing an `UPDATE` surfaces its rewritten rows as plain `insert`s rather

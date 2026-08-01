@@ -378,8 +378,6 @@ async fn sql_create_then_insert_then_select() {
         .await
         .unwrap();
 
-    // A catalog pins its snapshot at construction, so re-open to observe the
-    // committed table before appending to it.
     let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
     let writer2 = PostgresSingleCatalogMetadataWriter::new(&conn_str)
         .await

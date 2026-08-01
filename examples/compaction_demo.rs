@@ -185,7 +185,7 @@ async fn writable_ctx(conn: &str) -> anyhow::Result<SessionContext> {
     let provider = SqliteMetadataProvider::new(conn).await?;
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
     let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "ducklake", catalog);
     Ok(ctx)
 }
 
@@ -201,7 +201,7 @@ async fn read_rows(
         None => DuckLakeCatalog::new(provider)?,
     };
     let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "ducklake", catalog);
     let batches = ctx
         .sql(&format!(
             "SELECT id, val FROM ducklake.main.{table} ORDER BY id"

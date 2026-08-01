@@ -88,6 +88,7 @@ pub mod row_id;
 pub(crate) mod row_lineage;
 pub mod schema;
 mod snapshot_changes;
+mod snapshot_consistency;
 pub mod snapshot_filter;
 pub mod sort;
 pub mod table;
@@ -156,6 +157,7 @@ pub use metadata_provider::{
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use schema::DuckLakeSchema;
+pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
 pub use table::DuckLakeTable;
 pub use table_functions::register_ducklake_functions;

@@ -82,7 +82,7 @@ async fn data_path_on_any_object_store_scheme(#[case] scheme: &str) {
         .unwrap();
 
     // Reads and DML find the files through the runtime's store for the
-    // scheme. A catalog pins its snapshot, so each statement gets a new one.
+    // scheme.
     let runtime = Arc::new(RuntimeEnvBuilder::new().build().unwrap());
     let bucket = url::Url::parse(&format!("{}://lake", scheme.to_ascii_lowercase())).unwrap();
     runtime.register_object_store(&bucket, store.clone());

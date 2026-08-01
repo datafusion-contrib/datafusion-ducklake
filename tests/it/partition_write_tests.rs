@@ -1177,10 +1177,9 @@ async fn insert_stays_partitioned_after_repartition() {
 #[tokio::test(flavor = "multi_thread")]
 async fn set_partitioned_then_insert_same_session_partitions() {
     // P1 regression: SET PARTITIONED BY via the SQL hook, then INSERT in the SAME
-    // session (the catalog was pinned BEFORE the spec existed) must still partition
-    // — the write path resolves the spec at the current head, not the pinned snapshot.
+    // session must partition — the write path resolves the spec at the current head.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
-    let (ctx, catalog) = writable_catalog(&conn_str).await; // pins the pre-spec snapshot
+    let (ctx, catalog) = writable_catalog(&conn_str).await;
     execute_ducklake_sql(
         &ctx,
         &catalog,
@@ -1224,7 +1223,7 @@ async fn set_partitioned_then_insert_same_session_partitions() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reset_partitioned_then_insert_same_session_is_unpartitioned() {
     // P1 regression: after RESET, a same-session INSERT must write ONE unpartitioned
-    // file with NO partition_id — never a retired partition id from the pinned spec.
+    // file with NO partition_id — never a retired partition id.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
     {
         let w = SqliteMetadataWriter::new_with_init(&conn_str)
@@ -1236,7 +1235,7 @@ async fn reset_partitioned_then_insert_same_session_is_unpartitioned() {
         )
         .unwrap();
     }
-    let (ctx, catalog) = writable_catalog(&conn_str).await; // pinned where region-spec is live
+    let (ctx, catalog) = writable_catalog(&conn_str).await;
     execute_ducklake_sql(
         &ctx,
         &catalog,

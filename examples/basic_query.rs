@@ -190,7 +190,7 @@ async fn run_query(
     let ctx = SessionContext::new_with_config_rt(config, runtime.clone());
 
     // Register the DuckLake catalog (standard DataFusion pattern)
-    ctx.register_catalog("ducklake", Arc::new(ducklake_catalog));
+    DuckLakeCatalog::register(&ctx, "ducklake", ducklake_catalog);
 
     // Register table functions (ducklake_snapshots, ducklake_table_info, ducklake_list_files)
     register_ducklake_functions(&ctx, provider);
