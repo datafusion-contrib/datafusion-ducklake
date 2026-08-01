@@ -314,6 +314,41 @@ pub struct ColumnDef {
     pub(crate) default_value_dialect: Option<String>,
 }
 
+/// A metadata-only column schema change.
+#[derive(Debug, Clone)]
+pub enum ColumnChange {
+    /// Add a column or nested struct field at `path`.
+    Add {
+        /// Full column path, including the new field name.
+        path: Vec<String>,
+        /// Definition of the new field.
+        column: ColumnDef,
+        /// Return the current snapshot when the field already exists.
+        if_not_exists: bool,
+    },
+    /// Drop a column or nested struct field.
+    Drop {
+        /// Full path of the field to drop.
+        path: Vec<String>,
+        /// Return the current snapshot when the field does not exist.
+        if_exists: bool,
+    },
+    /// Rename a column or nested struct field without changing its field ID.
+    Rename {
+        /// Full path of the field to rename.
+        path: Vec<String>,
+        /// New unqualified field name.
+        new_name: String,
+    },
+    /// Widen a column or nested struct field without changing its field ID.
+    Promote {
+        /// Full path of the field to promote.
+        path: Vec<String>,
+        /// New canonical DuckLake scalar type.
+        ducklake_type: String,
+    },
+}
+
 impl ColumnDef {
     /// Returns the column name.
     pub fn name(&self) -> &str {
@@ -421,6 +456,260 @@ pub(crate) struct ExistingCatalogColumn {
     pub name: String,
     pub ducklake_type: String,
     pub parent_column: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedCatalogColumn {
+    pub column_id: Option<i64>,
+    pub name: String,
+    pub ducklake_type: String,
+    pub is_nullable: bool,
+    pub parent_index: Option<usize>,
+}
+
+pub(crate) fn plan_column_change(
+    existing: &[(ExistingCatalogColumn, bool)],
+    change: &ColumnChange,
+) -> Result<Option<Vec<PlannedCatalogColumn>>> {
+    if existing.is_empty() {
+        return Err(DuckLakeError::InvalidConfig(
+            "Cannot alter columns on a table without live columns".to_string(),
+        ));
+    }
+
+    let id_to_index = existing
+        .iter()
+        .enumerate()
+        .map(|(index, (column, _))| (column.column_id, index))
+        .collect::<HashMap<_, _>>();
+    if id_to_index.len() != existing.len() {
+        return Err(DuckLakeError::InvalidConfig(
+            "Catalog contains duplicate column ids".to_string(),
+        ));
+    }
+
+    let mut paths: Vec<Vec<String>> = Vec::with_capacity(existing.len());
+    for (column, _) in existing {
+        let mut path = match column.parent_column {
+            Some(parent_id) => {
+                let parent_index = id_to_index.get(&parent_id).copied().ok_or_else(|| {
+                    DuckLakeError::InvalidConfig(format!(
+                        "Nested column {} references missing parent column {parent_id}",
+                        column.column_id
+                    ))
+                })?;
+                if parent_index >= paths.len() {
+                    return Err(DuckLakeError::InvalidConfig(
+                        "Catalog columns are not in depth-first parent-before-child order"
+                            .to_string(),
+                    ));
+                }
+                paths[parent_index].clone()
+            },
+            None => Vec::new(),
+        };
+        path.push(column.name.clone());
+        paths.push(path);
+    }
+
+    let find_path = |path: &[String]| paths.iter().position(|candidate| candidate == path);
+    let mut drafts = existing
+        .iter()
+        .map(|(column, nullable)| PlannedCatalogColumn {
+            column_id: Some(column.column_id),
+            name: column.name.clone(),
+            ducklake_type: column.ducklake_type.clone(),
+            is_nullable: *nullable,
+            parent_index: column
+                .parent_column
+                .map(|parent_id| id_to_index[&parent_id]),
+        })
+        .collect::<Vec<_>>();
+
+    match change {
+        ColumnChange::Add {
+            path,
+            column,
+            if_not_exists,
+        } => {
+            if path.is_empty() || column.name() != path.last().expect("non-empty path") {
+                return Err(DuckLakeError::InvalidConfig(
+                    "ADD COLUMN path must end with the new column name".to_string(),
+                ));
+            }
+            if find_path(path).is_some() {
+                if *if_not_exists {
+                    return Ok(None);
+                }
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "column '{}' already exists",
+                    path.join(".")
+                )));
+            }
+
+            let parent_path = &path[..path.len() - 1];
+            let parent_index = if parent_path.is_empty() {
+                None
+            } else {
+                let index = find_path(parent_path).ok_or_else(|| {
+                    DuckLakeError::InvalidConfig(format!(
+                        "parent column '{}' does not exist",
+                        parent_path.join(".")
+                    ))
+                })?;
+                if !existing[index]
+                    .0
+                    .ducklake_type
+                    .eq_ignore_ascii_case("struct")
+                {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "parent column '{}' is not a struct",
+                        parent_path.join(".")
+                    )));
+                }
+                Some(index)
+            };
+
+            let insertion = parent_index.map_or(existing.len(), |index| {
+                paths
+                    .iter()
+                    .enumerate()
+                    .skip(index + 1)
+                    .find(|(_, candidate)| !candidate.starts_with(parent_path))
+                    .map_or(existing.len(), |(position, _)| position)
+            });
+            let definitions = catalog_column_defs(std::slice::from_ref(column))?;
+            let added = definitions.len();
+            let parent_final = parent_index.map(|parent| {
+                if parent >= insertion {
+                    parent + added
+                } else {
+                    parent
+                }
+            });
+            for draft in &mut drafts {
+                if let Some(parent) = draft.parent_index
+                    && parent >= insertion
+                {
+                    draft.parent_index = Some(parent + added);
+                }
+            }
+            let new_columns = definitions
+                .into_iter()
+                .map(|definition| PlannedCatalogColumn {
+                    column_id: None,
+                    name: definition.name,
+                    ducklake_type: definition.ducklake_type,
+                    is_nullable: definition.is_nullable,
+                    parent_index: definition
+                        .parent_index
+                        .map(|parent| insertion + parent)
+                        .or(parent_final),
+                })
+                .collect::<Vec<_>>();
+            drafts.splice(insertion..insertion, new_columns);
+        },
+        ColumnChange::Drop {
+            path,
+            if_exists,
+        } => {
+            let Some(index) = find_path(path) else {
+                if *if_exists {
+                    return Ok(None);
+                }
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "column '{}' does not exist",
+                    path.join(".")
+                )));
+            };
+            let removed = paths
+                .iter()
+                .enumerate()
+                .skip(index)
+                .take_while(|(_, candidate)| candidate.starts_with(path))
+                .map(|(position, _)| position)
+                .collect::<HashSet<_>>();
+            if removed.len() == existing.len() {
+                return Err(DuckLakeError::InvalidConfig(
+                    "Cannot drop every column from a table".to_string(),
+                ));
+            }
+            let kept = drafts
+                .into_iter()
+                .enumerate()
+                .filter(|(position, _)| !removed.contains(position))
+                .map(|(_, draft)| draft)
+                .collect::<Vec<_>>();
+            drafts = reindex_parents(kept, existing, &removed)?;
+        },
+        ColumnChange::Rename {
+            path,
+            new_name,
+        } => {
+            validate_name(new_name, "Column")?;
+            let index = find_path(path).ok_or_else(|| {
+                DuckLakeError::InvalidConfig(format!("column '{}' does not exist", path.join(".")))
+            })?;
+            let parent = existing[index].0.parent_column;
+            if existing.iter().any(|(column, _)| {
+                column.parent_column == parent
+                    && column.column_id != existing[index].0.column_id
+                    && column.name == *new_name
+            }) {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "column '{new_name}' already exists"
+                )));
+            }
+            drafts[index].name = new_name.clone();
+        },
+        ColumnChange::Promote {
+            path,
+            ducklake_type,
+        } => {
+            crate::types::ducklake_to_arrow_type(ducklake_type)?;
+            let index = find_path(path).ok_or_else(|| {
+                DuckLakeError::InvalidConfig(format!("column '{}' does not exist", path.join(".")))
+            })?;
+            let current = &existing[index].0.ducklake_type;
+            if crate::types::types_equal_canonical(current, ducklake_type) {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "column '{}' is already type '{current}' (no change)",
+                    path.join(".")
+                )));
+            }
+            if !crate::types::is_promotable(current, ducklake_type) {
+                return Err(DuckLakeError::UnsupportedTypeChange {
+                    operation: crate::error::TypeChangeOperation::PromoteColumnType,
+                    column: path.join("."),
+                    from: current.clone(),
+                    to: ducklake_type.clone(),
+                });
+            }
+            drafts[index].ducklake_type = ducklake_type.clone();
+        },
+    }
+
+    Ok(Some(drafts))
+}
+
+fn reindex_parents(
+    mut kept: Vec<PlannedCatalogColumn>,
+    existing: &[(ExistingCatalogColumn, bool)],
+    removed: &HashSet<usize>,
+) -> Result<Vec<PlannedCatalogColumn>> {
+    let old_to_new = (0..existing.len())
+        .filter(|index| !removed.contains(index))
+        .enumerate()
+        .map(|(new, old)| (old, new))
+        .collect::<HashMap<_, _>>();
+    for draft in &mut kept {
+        if let Some(parent) = draft.parent_index {
+            draft.parent_index = Some(*old_to_new.get(&parent).ok_or_else(|| {
+                DuckLakeError::InvalidConfig("Cannot keep a child of a dropped column".to_string())
+            })?);
+        }
+    }
+    Ok(kept)
 }
 
 pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogColumnDef>> {
@@ -1734,6 +2023,14 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<i64> {
         Err(DuckLakeError::InvalidConfig(
             "promote_column_type is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Apply a column schema change as a metadata-only commit.
+    /// Existing fields retain their column IDs, including recursive struct fields.
+    fn change_column(&self, _table_id: i64, _change: &ColumnChange) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "column DDL is not supported on this metadata backend".to_string(),
         ))
     }
 

@@ -182,8 +182,8 @@ pub use delete_exec::DuckLakeDeleteExec;
 pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
+    ColumnChange, ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile,
+    DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
     PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
     StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
 };

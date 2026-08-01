@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
   by every writer's schema bootstrap and by existing catalogs on their next
   initialization.
+- `ALTER TABLE ... ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, and widening `ALTER COLUMN ... SET
+  TYPE` through `execute_ducklake_sql`, including nested struct fields, on SQLite and PostgreSQL.
 
 ### Changed
 

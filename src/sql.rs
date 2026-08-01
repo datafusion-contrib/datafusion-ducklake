@@ -1,4 +1,4 @@
-//! SQL entry point for DuckLake metadata and data-layout DDL.
+//! SQL entry point for DuckLake metadata and data-layout DDL, including column changes.
 //!
 //! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
 //! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
@@ -34,16 +34,17 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectName, Statement,
+    ArrayElemTypeDef, CommentObject, DataType as SqlDataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, ObjectName, Statement,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
 
 use crate::catalog::DuckLakeCatalog;
 use crate::metadata_provider::{TagObjectType, TagTarget};
+use crate::metadata_writer::{ColumnChange, ColumnDef};
 use crate::partition::PartitionTransform;
 use crate::sort::{NullOrder, SortDirection, SortField};
 
@@ -91,6 +92,27 @@ enum DuckLakeDdl {
     ResetSort {
         table: Vec<(String, bool)>,
     },
+    AddColumn {
+        table: Vec<(String, bool)>,
+        path: Vec<String>,
+        column: ColumnDef,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        table: Vec<(String, bool)>,
+        path: Vec<String>,
+        if_exists: bool,
+    },
+    RenameColumn {
+        table: Vec<(String, bool)>,
+        path: Vec<String>,
+        new_name: String,
+    },
+    PromoteColumn {
+        table: Vec<(String, bool)>,
+        path: Vec<String>,
+        ducklake_type: String,
+    },
 }
 
 fn parse_err(error: ParserError) -> DataFusionError {
@@ -115,13 +137,13 @@ fn expect_statement_end(parser: &mut Parser) -> DataFusionResult<()> {
 /// Returns `Ok(None)` for unrelated SQL, `Ok(Some(_))` for recognized DDL, and
 /// `Err` for malformed recognized DDL.
 fn parse_ducklake_ddl(sql: &str) -> DataFusionResult<Option<DuckLakeDdl>> {
-    let dialect = GenericDialect {};
+    let dialect = DuckDbDialect {};
     if sql
         .split_whitespace()
         .next()
         .is_some_and(|word| word.eq_ignore_ascii_case("comment"))
     {
-        let mut statements = Parser::parse_sql(&dialect, sql).map_err(parse_err)?;
+        let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(parse_err)?;
         if statements.len() != 1 {
             return Err(DataFusionError::Plan(
                 "COMMENT ON accepts exactly one statement".to_string(),
@@ -202,8 +224,130 @@ fn parse_ducklake_ddl(sql: &str) -> DataFusionResult<Option<DuckLakeDdl>> {
         } else {
             Ok(None)
         }
+    } else if parser.parse_keyword(Keyword::ADD) {
+        if !parser.parse_keyword(Keyword::COLUMN) {
+            return Ok(None);
+        }
+        let if_not_exists = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
+        let path = parse_column_path(&mut parser)?;
+        let data_type = parser.parse_data_type().map_err(parse_err)?;
+        if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
+            return Err(DataFusionError::Plan(
+                "ADD COLUMN NOT NULL is not supported without a default".to_string(),
+            ));
+        }
+        let _ = parser.parse_keyword(Keyword::NULL);
+        expect_statement_end(&mut parser)?;
+        let name = path.last().expect("column paths are non-empty").clone();
+        let column = ColumnDef::new(&name, sql_type_name(&data_type)?, true)
+            .map_err(DataFusionError::from)?;
+        Ok(Some(DuckLakeDdl::AddColumn {
+            table,
+            path,
+            column,
+            if_not_exists,
+        }))
+    } else if parser.parse_keyword(Keyword::DROP) {
+        if !parser.parse_keyword(Keyword::COLUMN) {
+            return Ok(None);
+        }
+        let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+        let path = parse_column_path(&mut parser)?;
+        expect_statement_end(&mut parser)?;
+        Ok(Some(DuckLakeDdl::DropColumn {
+            table,
+            path,
+            if_exists,
+        }))
+    } else if parser.parse_keyword(Keyword::RENAME) {
+        if !parser.parse_keyword(Keyword::COLUMN) {
+            return Ok(None);
+        }
+        let path = parse_column_path(&mut parser)?;
+        if !parser.parse_keyword(Keyword::TO) {
+            return Err(DataFusionError::Plan(
+                "expected TO after RENAME COLUMN path".to_string(),
+            ));
+        }
+        let new_name = normalize_ident(&parser.parse_identifier().map_err(parse_err)?);
+        expect_statement_end(&mut parser)?;
+        Ok(Some(DuckLakeDdl::RenameColumn {
+            table,
+            path,
+            new_name,
+        }))
+    } else if parser.parse_keyword(Keyword::ALTER) {
+        if !parser.parse_keyword(Keyword::COLUMN) {
+            return Ok(None);
+        }
+        let path = parse_column_path(&mut parser)?;
+        if parser.parse_keyword(Keyword::SET) {
+            let _ = parser.parse_keyword(Keyword::DATA);
+        }
+        if !parser.parse_keyword(Keyword::TYPE) {
+            return Err(DataFusionError::Plan(
+                "expected TYPE after ALTER COLUMN path".to_string(),
+            ));
+        }
+        let data_type = parser.parse_data_type().map_err(parse_err)?;
+        expect_statement_end(&mut parser)?;
+        Ok(Some(DuckLakeDdl::PromoteColumn {
+            table,
+            path,
+            ducklake_type: crate::types::normalize_ducklake_type(&sql_type_name(&data_type)?)
+                .map_err(DataFusionError::from)?,
+        }))
     } else {
         Ok(None)
+    }
+}
+
+fn parse_column_path(parser: &mut Parser) -> DataFusionResult<Vec<String>> {
+    let mut path = vec![normalize_ident(&parser.parse_identifier().map_err(parse_err)?)];
+    while parser.consume_token(&Token::Period) {
+        path.push(normalize_ident(
+            &parser.parse_identifier().map_err(parse_err)?,
+        ));
+    }
+    Ok(path)
+}
+
+fn sql_type_name(data_type: &SqlDataType) -> DataFusionResult<String> {
+    match data_type {
+        SqlDataType::Array(kind) => {
+            let inner = match kind {
+                ArrayElemTypeDef::AngleBracket(inner)
+                | ArrayElemTypeDef::SquareBracket(inner, _)
+                | ArrayElemTypeDef::Parenthesis(inner) => inner,
+                ArrayElemTypeDef::None => {
+                    return Err(DataFusionError::Plan(
+                        "ARRAY requires an element type".to_string(),
+                    ));
+                },
+            };
+            Ok(format!("list<{}>", sql_type_name(inner)?))
+        },
+        SqlDataType::Struct(fields, _) => {
+            let fields = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let name = field
+                        .field_name
+                        .as_ref()
+                        .map(normalize_ident)
+                        .unwrap_or_else(|| format!("c{index}"));
+                    Ok(format!("{name}:{}", sql_type_name(&field.field_type)?))
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            Ok(format!("struct<{}>", fields.join(",")))
+        },
+        SqlDataType::Map(key, value) => Ok(format!(
+            "map<{},{}>",
+            sql_type_name(key)?,
+            sql_type_name(value)?
+        )),
+        other => Ok(other.to_string()),
     }
 }
 
@@ -377,7 +521,7 @@ fn resolve_schema_table(parts: &[(String, bool)]) -> DataFusionResult<(String, S
         [schema, table] => Ok((norm(schema), norm(table))),
         [_catalog, schema, table] => Ok((norm(schema), norm(table))),
         _ => Err(DataFusionError::Plan(
-            "partition DDL target must be a table name of 1–3 parts".to_string(),
+            "DuckLake DDL target must be a table name of 1–3 parts".to_string(),
         )),
     }
 }
@@ -535,6 +679,22 @@ async fn apply_ducklake_ddl(
         }
         | DuckLakeDdl::ResetSort {
             table,
+        }
+        | DuckLakeDdl::AddColumn {
+            table,
+            ..
+        }
+        | DuckLakeDdl::DropColumn {
+            table,
+            ..
+        }
+        | DuckLakeDdl::RenameColumn {
+            table,
+            ..
+        }
+        | DuckLakeDdl::PromoteColumn {
+            table,
+            ..
         } => table,
     };
     let (schema_name, table_name) = resolve_schema_table(parts)?;
@@ -581,6 +741,74 @@ async fn apply_ducklake_ddl(
             writer
                 .reset_sort_spec(table.table_id)
                 .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::AddColumn {
+            path,
+            column,
+            if_not_exists,
+            ..
+        } => {
+            writer
+                .change_column(
+                    table.table_id,
+                    &ColumnChange::Add {
+                        path,
+                        column,
+                        if_not_exists,
+                    },
+                )
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::DropColumn {
+            path,
+            if_exists,
+            ..
+        } => {
+            writer
+                .change_column(
+                    table.table_id,
+                    &ColumnChange::Drop {
+                        path,
+                        if_exists,
+                    },
+                )
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::RenameColumn {
+            path,
+            new_name,
+            ..
+        } => {
+            writer
+                .change_column(
+                    table.table_id,
+                    &ColumnChange::Rename {
+                        path,
+                        new_name,
+                    },
+                )
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::PromoteColumn {
+            path,
+            ducklake_type,
+            ..
+        } => {
+            if let [column] = path.as_slice() {
+                writer
+                    .promote_column_type(table.table_id, column, &ducklake_type)
+                    .map_err(DataFusionError::from)?;
+            } else {
+                writer
+                    .change_column(
+                        table.table_id,
+                        &ColumnChange::Promote {
+                            path,
+                            ducklake_type,
+                        },
+                    )
+                    .map_err(DataFusionError::from)?;
+            }
         },
     }
 
