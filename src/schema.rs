@@ -8,6 +8,7 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableType;
 
+use crate::catalog::SnapshotPin;
 use crate::metadata_provider::MetadataProvider;
 use crate::path_resolver::resolve_path;
 use crate::table::DuckLakeTable;
@@ -49,7 +50,7 @@ fn validate_table_name(name: &str) -> DataFusionResult<()> {
 ///
 /// Represents a schema within a DuckLake catalog and provides access to tables.
 /// Uses dynamic metadata lookup - tables are queried on-demand from the catalog database.
-/// Caches snapshot_id received from catalog.schema() call for query consistency.
+/// Shares the catalog snapshot pin so later statements see this handle's commits.
 #[derive(Debug)]
 pub struct DuckLakeSchema {
     schema_id: i64,
@@ -57,8 +58,8 @@ pub struct DuckLakeSchema {
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     provider: Arc<dyn MetadataProvider>,
-    /// Cached snapshot_id from catalog.schema() call
-    snapshot_id: i64,
+    /// Snapshot pinned by the catalog, advanced only after this handle commits.
+    snapshot: Arc<SnapshotPin>,
     /// Schema path for resolving relative table paths
     schema_path: String,
     /// Propagated from the catalog: when true, tables expose a `rowid` column.
@@ -85,7 +86,7 @@ impl DuckLakeSchema {
             schema_id,
             schema_name: schema_name.into(),
             provider,
-            snapshot_id,
+            snapshot: Arc::new(SnapshotPin::new(snapshot_id)),
             object_store_url,
             schema_path,
             row_lineage: false,
@@ -116,6 +117,12 @@ impl DuckLakeSchema {
         self
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn with_snapshot_pin(mut self, snapshot: Arc<SnapshotPin>) -> Self {
+        self.snapshot = snapshot;
+        self
+    }
+
     /// Set the write-layout options propagated to each table's INSERT path.
     #[cfg(feature = "write")]
     pub fn with_write_options(
@@ -130,14 +137,16 @@ impl DuckLakeSchema {
 #[async_trait]
 impl SchemaProvider for DuckLakeSchema {
     fn table_names(&self) -> Vec<String> {
+        let snapshot_id = self.snapshot.current();
+        // Load once so every lookup in this call uses one snapshot.
         let mut names = self
             .provider
-            .list_tables(self.schema_id, self.snapshot_id)
+            .list_tables(self.schema_id, snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
                     error = %e,
                     schema_id = %self.schema_id,
-                    snapshot_id = %self.snapshot_id,
+                    snapshot_id,
                     schema_name = %self.schema_name,
                     "Failed to list tables from catalog"
                 )
@@ -148,12 +157,12 @@ impl SchemaProvider for DuckLakeSchema {
             .collect::<Vec<_>>();
         names.extend(
             self.provider
-                .list_views(self.schema_id, self.snapshot_id)
+                .list_views(self.schema_id, snapshot_id)
                 .inspect_err(|e| {
                     tracing::error!(
                         error = %e,
                         schema_id = %self.schema_id,
-                        snapshot_id = %self.snapshot_id,
+                        snapshot_id,
                         schema_name = %self.schema_name,
                         "Failed to list views from catalog"
                     )
@@ -168,10 +177,11 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // Use cached snapshot_id
+        let snapshot_id = self.snapshot.current();
+        // Load once so table metadata is internally consistent.
         match self
             .provider
-            .get_table_by_name(self.schema_id, name, self.snapshot_id)
+            .get_table_by_name(self.schema_id, name, snapshot_id)
         {
             Ok(Some(meta)) => {
                 // Resolve table path hierarchically using path_resolver utility
@@ -183,7 +193,7 @@ impl SchemaProvider for DuckLakeSchema {
                     meta.table_id,
                     meta.table_name.clone(),
                     self.provider.clone(),
-                    self.snapshot_id, // Propagate snapshot_id
+                    snapshot_id, // Propagate snapshot_id
                     self.object_store_url.clone(),
                     table_path,
                 )
@@ -204,6 +214,7 @@ impl SchemaProvider for DuckLakeSchema {
                         .with_overrides(&self.write_options);
                     table
                         .with_writer(self.schema_name.clone(), Arc::clone(writer))
+                        .with_snapshot_pin(Arc::clone(&self.snapshot))
                         .with_write_options(options)
                 } else {
                     table
@@ -213,13 +224,13 @@ impl SchemaProvider for DuckLakeSchema {
             },
             Ok(None) => match self
                 .provider
-                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+                .get_view_by_name(self.schema_id, name, snapshot_id)
             {
                 Ok(Some(view)) => {
                     let (definition, planned) = match resolve_view_definition(
                         &view,
                         self.provider.as_ref(),
-                        self.snapshot_id,
+                        snapshot_id,
                         &self.schema_name,
                     ) {
                         Ok(definition) => {
@@ -227,7 +238,7 @@ impl SchemaProvider for DuckLakeSchema {
                                 &view,
                                 &definition,
                                 Arc::clone(&self.provider),
-                                self.snapshot_id,
+                                snapshot_id,
                                 &self.schema_name,
                                 self.row_lineage,
                             )
@@ -250,26 +261,29 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table_type(&self, name: &str) -> DataFusionResult<Option<TableType>> {
+        let snapshot_id = self.snapshot.current();
         if self
             .provider
-            .table_exists(self.schema_id, name, self.snapshot_id)
+            .table_exists(self.schema_id, name, snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         {
             return Ok(Some(TableType::Base));
         }
         self.provider
-            .get_view_by_name(self.schema_id, name, self.snapshot_id)
+            .get_view_by_name(self.schema_id, name, snapshot_id)
             .map(|view| view.map(|_| TableType::View))
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        let snapshot_id = self.snapshot.current();
+        // Check existence at the handle's current pin.
         self.provider
-            .table_exists(self.schema_id, name, self.snapshot_id)
+            .table_exists(self.schema_id, name, snapshot_id)
             .unwrap_or(false)
             || self
                 .provider
-                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+                .get_view_by_name(self.schema_id, name, snapshot_id)
                 .map(|view| view.is_some())
                 .unwrap_or(false)
     }
@@ -287,9 +301,10 @@ impl SchemaProvider for DuckLakeSchema {
         // Validate table name to prevent path traversal attacks
         validate_table_name(&name)?;
 
+        let snapshot_id = self.snapshot.current();
         if self
             .provider
-            .get_view_by_name(self.schema_id, &name, self.snapshot_id)
+            .get_view_by_name(self.schema_id, &name, snapshot_id)
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .is_some()
         {
@@ -354,6 +369,7 @@ impl SchemaProvider for DuckLakeSchema {
                 &setup.field_ids,
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.snapshot.advance(committed.snapshot_id);
 
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)
@@ -379,6 +395,7 @@ impl SchemaProvider for DuckLakeSchema {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .with_writer(self.schema_name.clone(), Arc::clone(writer))
+        .with_snapshot_pin(Arc::clone(&self.snapshot))
         .with_write_options(options);
 
         Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))

@@ -19,6 +19,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 
+use crate::catalog::SnapshotPin;
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 use crate::table_writer::DuckLakeTableWriter;
 
@@ -56,6 +57,7 @@ pub struct DuckLakeInsertExec {
     /// spec). Declared via `required_input_ordering` so DataFusion's EnforceSorting
     /// keeps the input sorted instead of pruning the SortExec as unused.
     required_ordering: Option<datafusion::physical_expr::LexOrdering>,
+    snapshot_pin: Option<Arc<SnapshotPin>>,
     cache: Arc<PlanProperties>,
 }
 
@@ -86,8 +88,14 @@ impl DuckLakeInsertExec {
             partition,
             write_options,
             required_ordering,
+            snapshot_pin: None,
             cache,
         }
+    }
+
+    pub(crate) fn with_snapshot_pin(mut self, snapshot_pin: Option<Arc<SnapshotPin>>) -> Self {
+        self.snapshot_pin = snapshot_pin;
+        self
     }
 
     fn compute_properties() -> Arc<PlanProperties> {
@@ -178,18 +186,21 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 "DuckLakeInsertExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&self.writer),
-            self.schema_name.clone(),
-            self.table_name.clone(),
-            Arc::clone(&self.arrow_schema),
-            self.write_mode,
-            self.object_store_url.clone(),
-            self.partition.clone(),
-            self.write_options.clone(),
-            self.required_ordering.clone(),
-        )))
+        Ok(Arc::new(
+            Self::new(
+                Arc::clone(&children[0]),
+                Arc::clone(&self.writer),
+                self.schema_name.clone(),
+                self.table_name.clone(),
+                Arc::clone(&self.arrow_schema),
+                self.write_mode,
+                self.object_store_url.clone(),
+                self.partition.clone(),
+                self.write_options.clone(),
+                self.required_ordering.clone(),
+            )
+            .with_snapshot_pin(self.snapshot_pin.clone()),
+        ))
     }
 
     fn execute(
@@ -213,6 +224,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let object_store_url = self.object_store_url.clone();
         let partition = self.partition.clone();
         let write_options = self.write_options.clone();
+        let snapshot_pin = self.snapshot_pin.clone();
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -268,6 +280,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
                         )
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    if let Some(snapshot_pin) = snapshot_pin.as_ref() {
+                        snapshot_pin.advance(result.snapshot_id);
+                    }
                     let count_array: ArrayRef =
                         Arc::new(UInt64Array::from(vec![result.records_written as u64]));
                     return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
@@ -297,6 +312,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                if let Some(snapshot_pin) = snapshot_pin.as_ref() {
+                    snapshot_pin.advance(result.snapshot_id);
+                }
                 let count_array: ArrayRef =
                     Arc::new(UInt64Array::from(vec![result.records_written as u64]));
                 return Ok(RecordBatch::try_new(output_schema, vec![count_array])?);
@@ -319,10 +337,13 @@ impl ExecutionPlan for DuckLakeInsertExec {
 
             let row_count = session.row_count() as u64;
 
-            session
+            let result = session
                 .finish()
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if let Some(snapshot_pin) = snapshot_pin.as_ref() {
+                snapshot_pin.advance(result.snapshot_id);
+            }
 
             let count_array: ArrayRef = Arc::new(UInt64Array::from(vec![row_count]));
             Ok(RecordBatch::try_new(output_schema, vec![count_array])?)

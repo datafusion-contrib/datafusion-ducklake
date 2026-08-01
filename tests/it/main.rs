@@ -71,6 +71,7 @@ mod row_id_tests;
 mod rowid_physical_position_tests;
 mod scan_statistics_tests;
 mod scoped_settings_tests;
+mod session_refresh_tests;
 mod sorted_write_duckdb_tests;
 mod sorted_write_tests;
 mod sql_delete_postgres_tests;

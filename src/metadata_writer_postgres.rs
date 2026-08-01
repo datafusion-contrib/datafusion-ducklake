@@ -5499,10 +5499,21 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn commit_truncate(
         &self,
         table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+    ) -> Result<u64> {
+        self.commit_truncate_with_snapshot(table_id, schema_name, table_name, base_snapshot)
+            .map(|result| result.map_or(0, |result| result.records_deleted))
+    }
+
+    fn commit_truncate_with_snapshot(
+        &self,
+        table_id: i64,
         _schema_name: &str,
         _table_name: &str,
         _base_snapshot: i64,
-    ) -> Result<u64> {
+    ) -> Result<Option<crate::metadata_writer::TruncateResult>> {
         block_on(async {
             // Metadata-only truncate in one snapshot under the catalog lock: end
             // every live data file and its live delete file, zero the visible stat
@@ -5512,10 +5523,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
             // No-op guard: nothing to truncate if the table has no live data file.
-            // Return Ok(0) BEFORE allocating a snapshot, so a repeated
-            // `DELETE FROM t` under a pinned snapshot does not create a
-            // content-free snapshot. lock_catalog above already serializes, so
-            // this read is stable.
+            // Return None before allocating a snapshot, so a repeated
+            // `DELETE FROM t` does not create a content-free snapshot.
+            // lock_catalog above already serializes, so this read is stable.
             let has_live_data: Option<i64> = sqlx::query_scalar(
                 "SELECT data_file_id FROM ducklake_data_file
                  WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
@@ -5541,7 +5551,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             }
             if has_live_data.is_none() && live_inlined == 0 {
-                return Ok(0);
+                return Ok(None);
             }
 
             let snapshot_id: i64 = sqlx::query(
@@ -5658,7 +5668,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
             tx.commit().await?;
-            Ok(live_rows)
+            Ok(Some(crate::metadata_writer::TruncateResult {
+                snapshot_id: Some(snapshot_id),
+                records_deleted: live_rows,
+            }))
         })
     }
 

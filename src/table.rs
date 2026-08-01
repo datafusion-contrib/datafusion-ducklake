@@ -35,6 +35,8 @@ use crate::types::{
 };
 
 #[cfg(feature = "write")]
+use crate::catalog::SnapshotPin;
+#[cfg(feature = "write")]
 use crate::delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
 use crate::insert_exec::DuckLakeInsertExec;
@@ -1240,6 +1242,9 @@ pub struct DuckLakeTable {
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
+    /// Writable catalog snapshot pin to advance after this table commits.
+    #[cfg(feature = "write")]
+    snapshot_pin: Option<Arc<SnapshotPin>>,
     /// Write-layout options (compression, row-group caps, file-rollover target)
     /// applied to the writer built for an INSERT into this table.
     #[cfg(feature = "write")]
@@ -1385,6 +1390,8 @@ impl DuckLakeTable {
             schema_name: None,
             #[cfg(feature = "write")]
             writer: None,
+            #[cfg(feature = "write")]
+            snapshot_pin: None,
             #[cfg(feature = "write")]
             write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         })
@@ -3126,6 +3133,12 @@ impl DuckLakeTable {
         self
     }
 
+    #[cfg(feature = "write")]
+    pub(crate) fn with_snapshot_pin(mut self, snapshot_pin: Arc<SnapshotPin>) -> Self {
+        self.snapshot_pin = Some(snapshot_pin);
+        self
+    }
+
     /// Set the write-layout options applied to this table's INSERT path
     /// (compression, row-group caps, file-rollover target). Propagated from the
     /// catalog's [`with_write_options`](crate::DuckLakeCatalog::with_write_options).
@@ -3739,6 +3752,7 @@ impl DuckLakeTable {
             encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,
             writer: None,
+            snapshot_pin: None,
             write_options: self.write_options.clone(),
         }
     }
@@ -4654,18 +4668,21 @@ impl TableProvider for DuckLakeTable {
             None => input,
         };
 
-        Ok(Arc::new(DuckLakeInsertExec::new(
-            input,
-            Arc::clone(writer),
-            schema_name.clone(),
-            self.table_name.clone(),
-            self.schema(),
-            write_mode,
-            self.object_store_url.clone(),
-            partition,
-            self.write_options.clone(),
-            ordering,
-        )))
+        Ok(Arc::new(
+            DuckLakeInsertExec::new(
+                input,
+                Arc::clone(writer),
+                schema_name.clone(),
+                self.table_name.clone(),
+                self.schema(),
+                write_mode,
+                self.object_store_url.clone(),
+                partition,
+                self.write_options.clone(),
+                ordering,
+            )
+            .with_snapshot_pin(self.snapshot_pin.clone()),
+        ))
     }
 
     /// Plan an `UPDATE t SET col = expr [, ...] [WHERE ...]`.
@@ -4776,6 +4793,7 @@ impl TableProvider for DuckLakeTable {
             phys_assignments,
             predicate,
             self.object_store_url.clone(),
+            self.snapshot_pin.clone(),
         )))
     }
 
@@ -4791,10 +4809,9 @@ impl TableProvider for DuckLakeTable {
     /// mutation happens at execute time, so planning (e.g. `EXPLAIN`) is
     /// side-effect free.
     ///
-    /// The catalog pins its snapshot at creation, so a session sees one
-    /// generation for its lifetime: re-open the catalog between mutating
-    /// statements. See the [`delete_exec`](crate::delete_exec) module docs
-    /// ("Session lifecycle") for why a second in-session `DELETE` can conflict.
+    /// A writable catalog advances its snapshot pin after a successful delete,
+    /// so later statements in the same session plan against the committed state.
+    /// See the [`delete_exec`](crate::delete_exec) module docs for the lifecycle.
     #[cfg(feature = "write")]
     async fn delete_from(
         &self,
@@ -4851,17 +4868,20 @@ impl TableProvider for DuckLakeTable {
             })?
             .clone();
 
-        Ok(Arc::new(DuckLakeDeleteExec::new(
-            Arc::new(self.clone()),
-            session_state,
-            predicate,
-            Arc::clone(writer),
-            schema_name.clone(),
-            self.table_name.clone(),
-            self.table_id,
-            self.snapshot_id,
-            self.object_store_url.clone(),
-        )))
+        Ok(Arc::new(
+            DuckLakeDeleteExec::new(
+                Arc::new(self.clone()),
+                session_state,
+                predicate,
+                Arc::clone(writer),
+                schema_name.clone(),
+                self.table_name.clone(),
+                self.table_id,
+                self.snapshot_id,
+                self.object_store_url.clone(),
+            )
+            .with_snapshot_pin(self.snapshot_pin.clone()),
+        ))
     }
 }
 

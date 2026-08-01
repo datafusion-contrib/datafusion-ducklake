@@ -1265,6 +1265,15 @@ pub struct WriteResult {
     pub records_written: i64,
 }
 
+/// Result of a metadata-only table truncate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncateResult {
+    /// Snapshot ID committed by the truncate, when the backend reports it.
+    pub snapshot_id: Option<i64>,
+    /// Number of live records removed.
+    pub records_deleted: u64,
+}
+
 /// The ids actually committed by `register_data_file` / `publish_snapshot`.
 ///
 /// On multicatalog Postgres all metadata is written at the commit point, so the
@@ -2293,10 +2302,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// `next_row_id` is deliberately preserved (rowids stay monotonic).
     ///
     /// Returns the number of rows removed (the table's live row count immediately
-    /// before the truncate: gross `record_count` minus still-live delete counts),
-    /// which the SQL `DELETE` reports as rows affected. The count is computed
-    /// inside the same transaction that ends the files, so it is consistent with
-    /// what was removed.
+    /// before the truncate: gross `record_count` minus still-live delete counts).
+    /// The count is computed inside the same transaction that ends the files, so
+    /// it is consistent with what was removed.
     ///
     /// Default: unsupported; backends override it.
     fn commit_truncate(
@@ -2309,6 +2317,25 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Err(DuckLakeError::InvalidConfig(
             "DELETE (truncate) is not supported on this metadata backend".to_string(),
         ))
+    }
+
+    /// Truncate result with the authoritative committed snapshot when the backend
+    /// exposes it. The default preserves custom writer compatibility by delegating
+    /// to [`Self::commit_truncate`] without a snapshot ID.
+    fn commit_truncate_with_snapshot(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+    ) -> Result<Option<TruncateResult>> {
+        self.commit_truncate(table_id, schema_name, table_name, base_snapshot)
+            .map(|records_deleted| {
+                Some(TruncateResult {
+                    snapshot_id: None,
+                    records_deleted,
+                })
+            })
     }
 
     /// Roll back a *pure-append* delta committed after `base_snapshot`: end

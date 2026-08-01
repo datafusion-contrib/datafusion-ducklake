@@ -433,9 +433,12 @@ Known edges:
   `ducklake_table_at`. Timestamp selection uses the latest snapshot at or before the requested
   time. For snapshots with the same timestamp, an as-of or change-data end bound selects the
   highest ID, while a change-data start bound selects the lowest ID.
-- **One mutation per session, then re-open the catalog.** A catalog pins its snapshot at creation.
-  Re-open the catalog or create a fresh `SessionContext` after a mutation so later statements bind
-  the committed snapshot.
+- **No automatic refresh for other writers.** A writable catalog advances its
+  snapshot after its own successful `INSERT`/`UPDATE`/`DELETE` or layout DDL
+  commit, so later statements in the same `SessionContext` see that commit. A
+  commit made through another writer does not move the pin; create a new catalog
+  handle to observe it. `DuckLakeCatalog::with_snapshot` always stays fixed at
+  its explicit snapshot.
 - **The change feed is degraded on encrypted (PME) catalogs.**
   `ducklake_table_changes` still works on encrypted catalogs for inserted rows, but a
   range containing an `UPDATE` surfaces its rewritten rows as plain `insert`s rather
