@@ -14,8 +14,7 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_provider::block_on;
-use crate::metadata_writer::is_inlined_system_column;
+use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
@@ -27,6 +26,7 @@ use crate::metadata_writer::{
     table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
+use crate::metadata_writer::{is_inlined_system_column, tag_change};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -567,6 +567,27 @@ CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
 );
 "#;
 
+/// Created beside the inlined-data tables so a catalog that predates tags gains them when
+/// opened with `new`, not only with `new_with_init`.
+const SQL_CREATE_TAG_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS ducklake_tag (
+    object_id BIGINT,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    key VARCHAR,
+    value VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+    table_id BIGINT,
+    column_id BIGINT,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    key VARCHAR,
+    value VARCHAR
+);
+"#;
+
 const SQL_CREATE_INLINED_DATA_TABLES: &str =
     "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
     table_id INTEGER,
@@ -614,6 +635,7 @@ impl SqliteMetadataWriter {
         sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
             .execute(&pool)
             .await?;
+        sqlx::query(SQL_CREATE_TAG_TABLES).execute(&pool).await?;
         Ok(Self {
             pool,
             lock_path,
@@ -680,9 +702,13 @@ impl SqliteMetadataWriter {
 
             bump_schema_version(&mut tx, drop_snapshot).await?;
 
-            for child in
-                ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
-            {
+            for child in [
+                "ducklake_table",
+                "ducklake_column",
+                "ducklake_column_tag",
+                "ducklake_data_file",
+                "ducklake_delete_file",
+            ] {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {child} SET end_snapshot = ?
                      WHERE table_id = ? AND end_snapshot IS NULL"
@@ -692,6 +718,15 @@ impl SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ?
+                 WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(drop_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
 
             record_snapshot_changes(
                 &mut tx,
@@ -903,6 +938,7 @@ impl SqliteMetadataWriter {
                     "ducklake_sort_info",
                     "ducklake_sort_expression",
                     "ducklake_schema_versions",
+                    "ducklake_column_tag",
                 ] {
                     sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {table} WHERE table_id IN ({dead})"
@@ -911,6 +947,19 @@ impl SqliteMetadataWriter {
                     .await?;
                 }
             }
+
+            // Object tags ended before every surviving snapshot can no longer be read.
+            // Column tags follow their table instead, as in official: they go with a dead
+            // table above, and an ended tag of a live table is kept.
+            sqlx::query(
+                "DELETE FROM ducklake_tag
+                 WHERE end_snapshot IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_snapshot
+                     WHERE snapshot_id >= ducklake_tag.begin_snapshot
+                       AND snapshot_id < ducklake_tag.end_snapshot)",
+            )
+            .execute(&mut *tx)
+            .await?;
 
             // 7. Reclaim schemas no longer covered by any surviving snapshot.
             sqlx::query(
@@ -1779,6 +1828,39 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     .execute(&mut **tx)
     .await?;
     Ok((snapshot_id, schema_version))
+}
+
+/// Copy the allocator watermarks of the immediately preceding snapshot onto `snapshot_id`. A
+/// catalog created by the DuckDB extension carries `next_catalog_id` and `next_file_id` on every
+/// snapshot and reads them unconditionally at the head. This crate does not add those columns to
+/// its own catalogs, so this carries them forward only where they already exist. It is not part
+/// of `insert_snapshot`: the crate allocates partition and sort ids from its own counters and
+/// leaves the watermarks NULL, so a later comment must copy that NULL rather than an older value
+/// from before the crate allocated its id. A comment allocates no id, so copying is always right.
+async fn carry_allocator_watermarks(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot_id: i64,
+) -> Result<()> {
+    let allocator_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('ducklake_snapshot')
+         WHERE name IN ('next_catalog_id', 'next_file_id')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if allocator_columns == 2 {
+        sqlx::query(
+            "UPDATE ducklake_snapshot
+             SET (next_catalog_id, next_file_id) = (
+                 SELECT next_catalog_id, next_file_id FROM ducklake_snapshot
+                 WHERE snapshot_id < ? ORDER BY snapshot_id DESC LIMIT 1)
+             WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -2767,6 +2849,123 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             transaction.commit().await?;
             Ok(())
+        })
+    }
+
+    fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
+        validate_name(key, "Tag key")?;
+        let change = tag_change(target, key)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            carry_allocator_watermarks(&mut tx, snapshot_id).await?;
+            let live: Option<i64> =
+                match target {
+                    TagTarget::Object {
+                        object_type: TagObjectType::View,
+                        object_id,
+                    } => sqlx::query_scalar(
+                        "SELECT 1 FROM ducklake_view WHERE view_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(object_id)
+                    .fetch_optional(&mut *tx)
+                    .await?,
+                    TagTarget::Object {
+                        object_id,
+                        ..
+                    } => sqlx::query_scalar(
+                        "SELECT 1 FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(object_id)
+                    .fetch_optional(&mut *tx)
+                    .await?,
+                    TagTarget::Column {
+                        table_id,
+                        column_id,
+                    } => {
+                        sqlx::query_scalar(
+                            "SELECT 1 FROM ducklake_column
+                     WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                        )
+                        .bind(table_id)
+                        .bind(column_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    },
+                };
+            if live.is_none() {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "set_tag: {target:?} is not live in this catalog"
+                )));
+            }
+            // A comment is a schema change in official: it bumps `schema_version`, which
+            // attached DuckDB sessions cache the loaded catalog by. Unlike a DDL commit it
+            // writes no `ducklake_schema_versions` row.
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            match target {
+                TagTarget::Object {
+                    object_id,
+                    ..
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_tag SET end_snapshot = ?
+                         WHERE object_id = ? AND key = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(object_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_tag
+                             (object_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES (?, ?, NULL, ?, ?)",
+                    )
+                    .bind(object_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_column_tag SET end_snapshot = ?
+                         WHERE table_id = ? AND column_id = ? AND key = ?
+                           AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_column_tag
+                             (table_id, column_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES (?, ?, ?, NULL, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &change,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 
@@ -5524,6 +5723,9 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
             sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+                .execute(&self.pool)
+                .await?;
+            sqlx::query(SQL_CREATE_TAG_TABLES)
                 .execute(&self.pool)
                 .await?;
             // Upgrade a pre-existing catalog's `ducklake_column` from the legacy

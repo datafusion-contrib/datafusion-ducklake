@@ -11,7 +11,7 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
-use crate::metadata_provider::block_on;
+use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
@@ -21,8 +21,9 @@ use crate::metadata_writer::{
     catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
     encode_inlined_index_columns, inlined_delete_conflicts, inlined_delete_groups,
     live_inlined_index_columns, parse_inlined_index_columns, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, table_write_changes, top_level_column_ids,
-    validate_delete_entries, validate_inlined_index_columns, validate_name, validate_table_setting,
+    staged_table_write_changes, table_storage_changes, table_write_changes, tag_change,
+    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
+    validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -528,6 +529,24 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
         catalog_id BIGINT NOT NULL,
         schema_id BIGINT NOT NULL,
         PRIMARY KEY (catalog_id, schema_id)
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_catalog_tag (
+        catalog_id BIGINT NOT NULL,
+        object_type VARCHAR NOT NULL,
+        object_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        key VARCHAR NOT NULL,
+        value VARCHAR
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_catalog_column_tag (
+        catalog_id BIGINT NOT NULL,
+        table_id BIGINT NOT NULL,
+        column_id BIGINT NOT NULL,
+        begin_snapshot BIGINT NOT NULL,
+        end_snapshot BIGINT,
+        key VARCHAR NOT NULL,
+        value VARCHAR
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
         begin_snapshot BIGINT NOT NULL,
@@ -1112,7 +1131,7 @@ async fn assert_table_in_catalog(
 /// partition-spec change, a sort-spec change does not bump `schema_version` or write
 /// a `ducklake_schema_versions` ledger row — sort order does not alter the logical
 /// schema. Returns the new snapshot id.
-async fn insert_sort_snapshot(
+async fn insert_metadata_snapshot(
     catalog_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<i64> {
@@ -1148,6 +1167,26 @@ async fn insert_sort_snapshot(
         .execute(&mut **tx)
         .await?;
     Ok(snapshot_id)
+}
+
+/// Reject a `table_id` whose table has been dropped, so a tag cannot outlive its table.
+async fn assert_table_live(
+    table_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = $1 AND end_snapshot IS NULL)",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if live {
+        Ok(())
+    } else {
+        Err(crate::DuckLakeError::InvalidConfig(format!(
+            "table_id {table_id} is not live"
+        )))
+    }
 }
 
 /// Reject only a `table_id` hint that exists and belongs to ANOTHER catalog. A
@@ -2900,6 +2939,158 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
+        validate_name(key, "Tag key")?;
+        let change = tag_change(target, key)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+
+            match target {
+                // Refused by `tag_change` above.
+                TagTarget::Object {
+                    object_type: TagObjectType::Schema,
+                    ..
+                } => {},
+                TagTarget::Object {
+                    object_type: TagObjectType::Table,
+                    object_id,
+                } => {
+                    assert_table_in_catalog(self.catalog_id, object_id, &mut tx).await?;
+                    assert_table_live(object_id, &mut tx).await?;
+                },
+                TagTarget::Object {
+                    object_type: TagObjectType::View,
+                    object_id,
+                } => {
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM ducklake_view v
+                             JOIN ducklake_catalog_schema_map m ON m.schema_id = v.schema_id
+                             WHERE m.catalog_id = $1 AND v.view_id = $2
+                               AND v.end_snapshot IS NULL
+                         )",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(object_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !exists {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "view_id {object_id} does not belong to catalog_id {}",
+                            self.catalog_id
+                        )));
+                    }
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+                    assert_table_live(table_id, &mut tx).await?;
+                    let exists: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(
+                             SELECT 1 FROM ducklake_column
+                             WHERE table_id = $1 AND column_id = $2
+                               AND end_snapshot IS NULL
+                         )",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if !exists {
+                        return Err(crate::DuckLakeError::InvalidConfig(format!(
+                            "column_id {column_id} is not live in table_id {table_id}"
+                        )));
+                    }
+                },
+            }
+
+            let snapshot_id = insert_metadata_snapshot(self.catalog_id, &mut tx).await?;
+            // A comment is a schema change in official: it bumps `schema_version`, which
+            // attached DuckDB sessions cache the loaded catalog by. Unlike a DDL commit it
+            // writes no `ducklake_schema_versions` row.
+            sqlx::query("UPDATE ducklake_snapshot SET schema_version = schema_version + 1 WHERE snapshot_id = $1")
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            match target {
+                TagTarget::Object {
+                    object_type,
+                    object_id,
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_catalog_tag SET end_snapshot = $1
+                         WHERE catalog_id = $2 AND object_type = $3 AND object_id = $4
+                           AND key = $5 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(self.catalog_id)
+                    .bind(object_type.as_str())
+                    .bind(object_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_catalog_tag
+                             (catalog_id, object_type, object_id, begin_snapshot,
+                              end_snapshot, key, value)
+                         VALUES ($1, $2, $3, $4, NULL, $5, $6)",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(object_type.as_str())
+                    .bind(object_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
+                         WHERE catalog_id = $2 AND table_id = $3 AND column_id = $4
+                           AND key = $5 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(self.catalog_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_catalog_column_tag
+                             (catalog_id, table_id, column_id, begin_snapshot,
+                              end_snapshot, key, value)
+                         VALUES ($1, $2, $3, $4, NULL, $5, $6)",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &change,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
     fn promote_column_type(
         &self,
         table_id: i64,
@@ -4156,7 +4347,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            let snapshot_id = insert_sort_snapshot(self.catalog_id, &mut tx).await?;
+            let snapshot_id = insert_metadata_snapshot(self.catalog_id, &mut tx).await?;
             write_sort_generation(table_id, snapshot_id, fields, &mut tx).await?;
 
             record_snapshot_changes(
@@ -4196,7 +4387,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 return Ok(head);
             }
 
-            let snapshot_id = insert_sort_snapshot(self.catalog_id, &mut tx).await?;
+            let snapshot_id = insert_metadata_snapshot(self.catalog_id, &mut tx).await?;
             sqlx::query(
                 "UPDATE ducklake_sort_info SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",

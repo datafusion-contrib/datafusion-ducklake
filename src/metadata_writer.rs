@@ -3,7 +3,7 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
-use crate::metadata_provider::snapshot_change_tokens;
+use crate::metadata_provider::{TagObjectType, TagTarget, snapshot_change_tokens};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -1563,6 +1563,38 @@ pub(crate) fn validate_inlined_index_columns(
     Ok(())
 }
 
+/// The `changes_made` token for a tag write, after the checks official applies: DuckLake
+/// has no schema comments, and a column carries only a `comment` tag (any other key makes
+/// DuckDB fail while loading the table). Official records a comment as an alteration of
+/// the table or view.
+pub(crate) fn tag_change(target: TagTarget, key: &str) -> Result<String> {
+    match target {
+        TagTarget::Object {
+            object_type: TagObjectType::Schema,
+            ..
+        } => Err(DuckLakeError::InvalidConfig(
+            "schema comments and tags are not supported: DuckLake has none".to_string(),
+        )),
+        TagTarget::Object {
+            object_type: TagObjectType::Table,
+            object_id,
+        } => Ok(format!("altered_table:{object_id}")),
+        TagTarget::Object {
+            object_type: TagObjectType::View,
+            object_id,
+        } => Ok(format!("altered_view:{object_id}")),
+        TagTarget::Column {
+            table_id,
+            ..
+        } if key == "comment" => Ok(format!("altered_table:{table_id}")),
+        TagTarget::Column {
+            ..
+        } => Err(DuckLakeError::InvalidConfig(format!(
+            "column tag '{key}' is not supported: official DuckLake supports only 'comment' on a column"
+        ))),
+    }
+}
+
 /// Trait for writing metadata to DuckLake catalogs.
 ///
 /// Implementations must be thread-safe (`Send + Sync`).
@@ -1623,6 +1655,22 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "commit locking is not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Set or replace a snapshot-versioned tag on an object or column.
+    ///
+    /// A `None` value remains a live tag with SQL `NULL`, matching DuckLake's
+    /// representation of `COMMENT ON ... IS NULL`. Implementations create one
+    /// metadata-only snapshot that bumps `schema_version` without a
+    /// `ducklake_schema_versions` row and records `altered_table:<id>` or
+    /// `altered_view:<id>`, as official does for a comment.
+    ///
+    /// As in official, schemas take no tags and a column takes only the `comment` key; any
+    /// other target or key is refused.
+    fn set_tag(&self, _target: TagTarget, _key: &str, _value: Option<&str>) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "tags are not supported on this metadata backend".to_string(),
         ))
     }
 

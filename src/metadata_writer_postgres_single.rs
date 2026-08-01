@@ -21,14 +21,14 @@
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
-use crate::metadata_provider::block_on;
+use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
     MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
     WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
     quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
-    top_level_column_ids, validate_name,
+    tag_change, top_level_column_ids, validate_name,
 };
 use crate::metadata_writer_postgres::{
     SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
@@ -244,6 +244,23 @@ const SQL_CREATE_TABLES: &[&str] = &[
         dialect VARCHAR NOT NULL,
         sort_direction VARCHAR NOT NULL,
         null_order VARCHAR NOT NULL
+    )"#,
+    // Tags on objects (tables and views) and on columns (DuckLake spec). A NULL
+    // value is a live tag, which is how `COMMENT ON ... IS NULL` is stored.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_tag (
+        object_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        key VARCHAR,
+        value VARCHAR
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+        table_id BIGINT,
+        column_id BIGINT,
+        begin_snapshot BIGINT,
+        end_snapshot BIGINT,
+        key VARCHAR,
+        value VARCHAR
     )"#,
 ];
 
@@ -1893,6 +1910,127 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 })
                 .collect::<Result<Vec<_>>>()?;
             Ok(crate::sort::SortSpec::from_rows(parsed))
+        })
+    }
+
+    fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
+        validate_name(key, "Tag key")?;
+        let change = tag_change(target, key)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _carried) = insert_snapshot(&mut tx).await?;
+            let live: bool = match target {
+                TagTarget::Object {
+                    object_type: TagObjectType::View,
+                    object_id,
+                } => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM ducklake_view
+                         WHERE view_id = $1 AND end_snapshot IS NULL)",
+                    )
+                    .bind(object_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                },
+                TagTarget::Object {
+                    object_id,
+                    ..
+                } => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM ducklake_table
+                         WHERE table_id = $1 AND end_snapshot IS NULL)",
+                    )
+                    .bind(object_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM ducklake_column
+                         WHERE table_id = $1 AND column_id = $2 AND end_snapshot IS NULL)",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .fetch_one(&mut *tx)
+                    .await?
+                },
+            };
+            if !live {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "set_tag: {target:?} is not live in this catalog"
+                )));
+            }
+            // A comment is a schema change in official: it bumps `schema_version`, which
+            // attached DuckDB sessions cache the loaded catalog by. Unlike a DDL commit it
+            // writes no `ducklake_schema_versions` row.
+            bump_schema_version(&mut tx, snapshot_id).await?;
+            match target {
+                TagTarget::Object {
+                    object_id,
+                    ..
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_tag SET end_snapshot = $1
+                         WHERE object_id = $2 AND key = $3 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(object_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_tag
+                             (object_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES ($1, $2, NULL, $3, $4)",
+                    )
+                    .bind(object_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_column_tag SET end_snapshot = $1
+                         WHERE table_id = $2 AND column_id = $3 AND key = $4
+                           AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_column_tag
+                             (table_id, column_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES ($1, $2, $3, NULL, $4, $5)",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &change,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 

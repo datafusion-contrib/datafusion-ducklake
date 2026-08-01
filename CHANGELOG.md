@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Comments and tags: `MetadataWriter::set_tag`, `COMMENT ON TABLE`, `VIEW` and `COLUMN`, and the
+  `object_tags` and `column_tags` views; writable on SQLite and both PostgreSQL layouts.
+- `information_schema.tables` and `columns` gain a `comment` column, which widens `SELECT *`.
 - `DuckLakeCatalog::register` and `register_snapshot_consistency` put every table of one statement,
   including tables behind a view, on a single snapshot per catalog.
 - `MulticatalogManager::table_file_owners` and `has_live_references` report file ownership, so
@@ -48,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `ColumnWithTable` gains a required `table_id` field, and `SQL_LIST_ALL_COLUMNS`
+  selects `t.table_id` as its third column; add the field to struct literals and shift positional
+  reads.
 - **BREAKING**: a catalog from `DuckLakeCatalog::new` or `with_writer` reads the latest snapshot at
   each lookup instead of the one at creation, so a session sees its own and other writers' commits
   on its next statement. Register it with `DuckLakeCatalog::register` to keep each statement on
