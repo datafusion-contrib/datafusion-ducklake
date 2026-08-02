@@ -233,6 +233,9 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
+    /// Write ordinary positional deletes as Puffin deletion vectors.
+    /// Snapshot-annotated deletes always use Parquet.
+    pub write_deletion_vectors: Option<bool>,
     /// How many threads encode a write's data files, row group by row group;
     /// `None` leaves the writer default (1: the thread that writes, one batch
     /// at a time). Clamped to at least 1. Above 1, each row group is encoded
@@ -497,6 +500,11 @@ impl DuckLakeWriteOptions {
             )?,
             max_open_partitions: None,
             upload_concurrency: None,
+            write_deletion_vectors: Some(
+                settings
+                    .get("write_deletion_vectors")
+                    .is_some_and(|value| value == "true"),
+            ),
             encode_parallelism: None,
             encode_pool: None,
             // Official sorts only while the option reads exactly `true`.
@@ -550,6 +558,13 @@ impl DuckLakeWriteOptions {
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Selects Puffin for ordinary positional deletes when `enabled` is true.
+    #[must_use]
+    pub fn with_write_deletion_vectors(mut self, enabled: bool) -> Self {
+        self.write_deletion_vectors = Some(enabled);
         self
     }
 
@@ -609,6 +624,9 @@ impl DuckLakeWriteOptions {
         }
         if overrides.max_open_partitions.is_some() {
             self.max_open_partitions = overrides.max_open_partitions;
+        }
+        if overrides.write_deletion_vectors.is_some() {
+            self.write_deletion_vectors = overrides.write_deletion_vectors;
         }
         if overrides.upload_concurrency.is_some() {
             self.upload_concurrency = overrides.upload_concurrency;
@@ -967,6 +985,7 @@ pub struct DuckLakeTableWriter {
     /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
     /// [`DuckLakeTableWriter::with_upload_concurrency`].
     upload_concurrency: usize,
+    write_deletion_vectors: bool,
     /// Threads that encode a write's row groups. Defaults to 1; override via
     /// [`DuckLakeTableWriter::with_encode_parallelism`].
     encode_parallelism: usize,
@@ -1038,6 +1057,7 @@ impl DuckLakeTableWriter {
             write_batch_size: None,
             column_options: HashMap::new(),
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
+            write_deletion_vectors: false,
             encode_parallelism: 1,
             encode_pool: None,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
@@ -1178,6 +1198,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
+        }
+        if let Some(puffin) = options.write_deletion_vectors {
+            self.write_deletion_vectors = puffin;
         }
         if let Some(threads) = options.encode_parallelism {
             self.encode_parallelism = threads.max(1);
@@ -2207,6 +2230,17 @@ impl DuckLakeTableWriter {
         use arrow::array::{Int64Array, StringArray};
 
         let table_key = self.table_key(schema_name, table_name)?;
+        if self.write_deletion_vectors && snapshots.is_none() {
+            let bytes = crate::deletion_vector::encode_deletion_vector(positions)?;
+            let file_name = format!("{}.puffin", Uuid::new_v4());
+            let object_path = join_paths(&table_key, &file_name)?;
+            let object_path = ObjectPath::from(object_path.trim_start_matches('/'));
+            let size = bytes.len() as i64;
+            self.object_store.put(&object_path, bytes.into()).await?;
+            return Ok(DeleteFileInfo::new(file_name, size, positions.len() as i64)
+                .with_format(crate::DuckLakeDeleteFileFormat::Puffin)
+                .with_deleted_positions(positions));
+        }
         let file_name = format!("{}.parquet", Uuid::new_v4());
         let object_path_str = join_paths(&table_key, &file_name)?;
         // Strip leading slash for object_store Path (it expects relative keys).

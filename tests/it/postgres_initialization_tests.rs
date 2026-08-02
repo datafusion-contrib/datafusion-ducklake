@@ -892,8 +892,8 @@ async fn concurrent_initializations_of_a_new_single_catalog_leave_it_whole() {
 /// A store that layout version 1 left lacks the statistics indexes of version 2
 /// (#403): `(table_id, column_id)` on both layouts, and `(table_id, data_file_id,
 /// column_id)` on the single-catalog one. Both layouts refuse it until it is
-/// migrated. Migrating creates the indexes and records version 2 with a minimum
-/// version of 1, so a release at version 1 still reads and writes the store.
+/// migrated. Migrating creates the indexes and records each layout's current
+/// version and minimum reader version.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
@@ -916,6 +916,12 @@ async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("{layout}: {e}"));
+        if layout == "multicatalog" {
+            sqlx::query("ALTER TABLE ducklake_delete_file DROP COLUMN format")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
         sqlx::query("UPDATE ducklake_metadata SET value = '1' WHERE key = $1")
             .bind(key)
             .execute(&pool)
@@ -954,9 +960,23 @@ async fn a_layout_version_1_store_is_migrated_to_the_stats_column_index() {
         .unwrap();
 
         assert!(indexed, "{layout}");
+        if layout == "multicatalog" {
+            let default: String = sqlx::query_scalar(
+                "SELECT column_default FROM information_schema.columns
+                 WHERE table_name = 'ducklake_delete_file' AND column_name = 'format'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(default, "'parquet'::character varying");
+        }
+        let (minimum, version) = match layout {
+            "multicatalog" => ("3", "3"),
+            _ => ("1", "2"),
+        };
         assert_eq!(
             versions,
-            [(min_key, "1".to_string()), (key.to_string(), "2".to_string())],
+            [(min_key, minimum.to_string()), (key.to_string(), version.to_string())],
             "{layout}"
         );
     }

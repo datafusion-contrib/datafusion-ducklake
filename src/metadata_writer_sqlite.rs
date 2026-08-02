@@ -2607,8 +2607,8 @@ async fn apply_positional_deletes(
         sqlx::query(
             "INSERT INTO ducklake_delete_file
                  (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, delete_count, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  footer_size, delete_count, begin_snapshot, format)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(file_id)
         .bind(entry.data_file_id)
@@ -2619,6 +2619,7 @@ async fn apply_positional_deletes(
         .bind(entry.delete.footer_size)
         .bind(entry.delete.delete_count)
         .bind(snapshot_id)
+        .bind(entry.delete.format.as_str())
         .execute(&mut **tx)
         .await?;
     }
@@ -2936,8 +2937,8 @@ async fn insert_flush_delete_file(
     sqlx::query(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-              footer_size, delete_count, begin_snapshot, partial_max, end_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              footer_size, delete_count, begin_snapshot, partial_max, end_snapshot, format)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(delete_file_id)
     .bind(data_file_id)
@@ -2950,6 +2951,7 @@ async fn insert_flush_delete_file(
     .bind(delete.begin_snapshot)
     .bind(delete.partial_max)
     .bind(delete.end_snapshot)
+    .bind(delete.delete.format.as_str())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -6262,8 +6264,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             sqlx::query(
                 "INSERT INTO ducklake_delete_file
                      (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, delete_count, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      footer_size, delete_count, begin_snapshot, format)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(file_id)
             .bind(data_file_id)
@@ -6274,6 +6276,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(delete.footer_size)
             .bind(delete.delete_count)
             .bind(snapshot_id)
+            .bind(delete.format.as_str())
             .execute(&mut *tx)
             .await?;
 
@@ -6523,8 +6526,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, delete_count, begin_snapshot, format)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(file_id)
                 .bind(entry.data_file_id)
@@ -6535,6 +6538,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.format.as_str())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -6796,8 +6800,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, delete_count, begin_snapshot, format)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(file_id)
                 .bind(entry.data_file_id)
@@ -6808,6 +6812,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.format.as_str())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -6922,8 +6927,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, delete_count, begin_snapshot, format)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(file_id)
                 .bind(entry.data_file_id)
@@ -6934,6 +6939,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.format.as_str())
                 .execute(&mut *tx)
                 .await?;
             }

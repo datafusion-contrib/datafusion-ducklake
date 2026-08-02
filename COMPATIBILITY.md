@@ -1236,6 +1236,14 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
 
 ## Limitations
 
+- **Deletion vectors.** Read bare Iceberg V3 deletion vectors and Puffin containers
+  from catalogs that mark the delete file's format as `puffin`. The default writer
+  emits positional-delete Parquet. Set `write_deletion_vectors` to opt into
+  Puffin for ordinary positional deletes. Files that record a snapshot per
+  deletion continue to use Parquet. PostgreSQL multicatalog stores need layout
+  version 3, which adds the delete file's format. Stop older processes before
+  running `migrate_multicatalog_schema`.
+
 - **`CatalogReadMemo` is not DuckLake behavior.** Official DuckLake lists a scan's files again
   in every transaction, at the snapshot that the transaction pinned. The opt-in memo keeps a
   table's listing, inlined deletions and inlined rows across queries. It serves them only while

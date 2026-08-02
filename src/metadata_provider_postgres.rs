@@ -751,6 +751,12 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
     let (delete_file, delete_count) = if delete_file_id.is_some() {
         (
             Some(DuckLakeFileData {
+                delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                    row.try_get::<Option<String>, _>("format")
+                        .ok()
+                        .flatten()
+                        .as_deref(),
+                )?,
                 path: row.try_get(9)?,
                 path_is_relative: row.try_get(10)?,
                 file_size_bytes: row.try_get(11)?,
@@ -766,12 +772,13 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
     Ok(DuckLakeTableFile {
         data_file_id: row.try_get(0)?,
         file: DuckLakeFileData {
+            delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
             path: row.try_get(1)?,
             path_is_relative: row.try_get(2)?,
             file_size_bytes: row.try_get(3)?,
             footer_size: row.try_get(4)?,
             encryption_key: row.try_get(5)?,
-            mapping_id: row.try_get(19).unwrap_or(None),
+            mapping_id: row.try_get("data_mapping_id").unwrap_or(None),
         },
         delete_file_id,
         delete_file,
@@ -786,7 +793,7 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
         // `data.partition_id`) and absent on callers that share this decoder
         // without it; `try_get` failing there degrades to `None`, matching the
         // pre-partition behaviour. Per-key values are filled in by the caller.
-        partition_id: row.try_get(18).unwrap_or(None),
+        partition_id: row.try_get("data_partition_id").unwrap_or(None),
         partition_values: Vec::new(),
     })
 }
@@ -2381,7 +2388,7 @@ impl PostgresMetadataProvider {
                         del.delete_count, data.begin_snapshot::bigint,
                         {partial_max_expr}, {schema_version_expr},
                         {partition_id_expr} AS data_partition_id,
-                        data.mapping_id::bigint
+                        data.mapping_id::bigint AS data_mapping_id, to_jsonb(del)->>'format' AS format
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -3082,7 +3089,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     {partial_max_expr} AS data_partial_max,
                     {schema_version_expr} AS data_schema_version,
                     {partition_id_expr} AS data_partition_id,
-                    data.mapping_id::bigint AS data_mapping_id
+                    data.mapping_id::bigint AS data_mapping_id, to_jsonb(del)->>'format' AS format
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -4218,7 +4225,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count, to_jsonb(del)->>'format' AS format
                 FROM ducklake_schema s
                 JOIN ducklake_table t ON s.schema_id = t.schema_id
                 JOIN ducklake_data_file data ON t.table_id = data.table_id
@@ -4249,6 +4256,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let data_file = DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.try_get(3)?,
                         path_is_relative: row.try_get(4)?,
                         file_size_bytes: row.try_get(5)?,
@@ -4259,6 +4267,12 @@ impl MetadataProvider for PostgresMetadataProvider {
 
                     let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
                         Some(DuckLakeFileData {
+                            delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                row.try_get::<Option<String>, _>("format")
+                                    .ok()
+                                    .flatten()
+                                    .as_deref(),
+                            )?,
                             path: row.try_get(9)?,
                             path_is_relative: row.try_get(10)?,
                             file_size_bytes: row.try_get(11)?,
@@ -4378,7 +4392,7 @@ WITH current_delete AS (
         ddf.path_is_relative,
         ddf.file_size_bytes,
         ddf.footer_size,
-        ddf.encryption_key
+        ddf.encryption_key, ddf.format
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.begin_snapshot <= $3
@@ -4408,7 +4422,7 @@ SELECT
     prev.file_size_bytes,
     prev.footer_size,
     current_delete.begin_snapshot,
-    current_delete.data_file_id
+    current_delete.data_file_id, current_delete.format, prev.format
 FROM current_delete
 JOIN data_files data USING (data_file_id)
 LEFT JOIN LATERAL (
@@ -4416,7 +4430,7 @@ LEFT JOIN LATERAL (
         ddf.path,
         ddf.path_is_relative,
         ddf.file_size_bytes,
-        ddf.footer_size
+        ddf.footer_size, ddf.format
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = current_delete.data_file_id
@@ -4445,14 +4459,14 @@ SELECT
     prev.file_size_bytes,
     prev.footer_size,
     data.end_snapshot,
-    data.data_file_id
+    data.data_file_id, NULL, prev.format
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
     SELECT
         ddf.path,
         ddf.path_is_relative,
         ddf.file_size_bytes,
-        ddf.footer_size
+        ddf.footer_size, ddf.format
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = data.data_file_id
@@ -4489,12 +4503,18 @@ WHERE data.table_id = $1
                         current_delete_path_is_relative: row.try_get(8)?,
                         current_delete_file_size_bytes: row.try_get(9)?,
                         current_delete_footer_size: row.try_get(10)?,
+                        current_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                            row.try_get::<Option<String>, _>(17)?.as_deref(),
+                        )?,
 
                         // previous delete
                         previous_delete_path: row.try_get(11)?,
                         previous_delete_path_is_relative: row.try_get(12)?,
                         previous_delete_file_size_bytes: row.try_get(13)?,
                         previous_delete_footer_size: row.try_get(14)?,
+                        previous_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                            row.try_get::<Option<String>, _>(18)?.as_deref(),
+                        )?,
 
                         // snapshot
                         snapshot_id: row.try_get(15)?,

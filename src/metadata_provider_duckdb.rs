@@ -432,6 +432,19 @@ fn query_data_file_page(
                 let (delete_file, delete_count) = if delete_file_id.is_some() {
                     (
                         Some(DuckLakeFileData {
+                            delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                row.get::<_, Option<String>>("format")
+                                    .ok()
+                                    .flatten()
+                                    .as_deref(),
+                            )
+                            .map_err(|e| {
+                                duckdb::Error::FromSqlConversionFailure(
+                                    0,
+                                    duckdb::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })?,
                             path: row.get(9)?,
                             path_is_relative: row.get(10)?,
                             file_size_bytes: row.get(11)?,
@@ -447,6 +460,7 @@ fn query_data_file_page(
                 Ok(DuckLakeTableFile {
                     data_file_id: row.get(0)?,
                     file: DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
                         file_size_bytes: row.get(3)?,
@@ -1812,6 +1826,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     // Parse data file (columns 0-7)
                     let data_file_id: i64 = row.get(0)?;
                     let data_file = DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(1)?,
                         path_is_relative: row.get(2)?,
                         file_size_bytes: row.get(3)?,
@@ -1827,6 +1842,19 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
                             (
                                 Some(DuckLakeFileData {
+                                    delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                        row.get::<_, Option<String>>("format")
+                                            .ok()
+                                            .flatten()
+                                            .as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        duckdb::Error::FromSqlConversionFailure(
+                                            0,
+                                            duckdb::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
                                     path: row.get(9)?,
                                     path_is_relative: row.get(10)?,
                                     file_size_bytes: row.get(11)?,
@@ -2884,6 +2912,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     // Column 2 is data_file_id; columns 3-7 are the data file.
                     let data_file_id: i64 = row.get(2)?;
                     let data_file = DuckLakeFileData {
+                        delete_format: crate::metadata_provider::DuckLakeDeleteFileFormat::Parquet,
                         path: row.get(3)?,
                         path_is_relative: row.get(4)?,
                         file_size_bytes: row.get(5)?,
@@ -2897,6 +2926,19 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         if let Ok(Some(dfid)) = row.get::<_, Option<i64>>(8) {
                             (
                                 Some(DuckLakeFileData {
+                                    delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                                        row.get::<_, Option<String>>("format")
+                                            .ok()
+                                            .flatten()
+                                            .as_deref(),
+                                    )
+                                    .map_err(|e| {
+                                        duckdb::Error::FromSqlConversionFailure(
+                                            0,
+                                            duckdb::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })?,
                                     path: row.get(9)?,
                                     path_is_relative: row.get(10)?,
                                     file_size_bytes: row.get(11)?,
@@ -3046,12 +3088,32 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     current_delete_path_is_relative: row.get(8)?,
                     current_delete_file_size_bytes: row.get(9)?,
                     current_delete_footer_size: row.get(10)?,
+                    current_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                        row.get::<_, Option<String>>(17)?.as_deref(),
+                    )
+                    .map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(
+                            17,
+                            duckdb::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
 
                     // previous delete
                     previous_delete_path: row.get(11)?,
                     previous_delete_path_is_relative: row.get(12)?,
                     previous_delete_file_size_bytes: row.get(13)?,
                     previous_delete_footer_size: row.get(14)?,
+                    previous_delete_format: crate::DuckLakeDeleteFileFormat::parse(
+                        row.get::<_, Option<String>>(18)?.as_deref(),
+                    )
+                    .map_err(|e| {
+                        duckdb::Error::FromSqlConversionFailure(
+                            18,
+                            duckdb::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?,
 
                     // snapshot
                     snapshot_id: row.get(15)?,
@@ -3093,7 +3155,7 @@ fn file_provenance_sql(sql: &str, capabilities: SchemaCapabilities) -> String {
     sql.replacen(
         "\n    FROM ",
         &format!(
-            ",\n        data.begin_snapshot,\n        {schema_version},\n        {partial_max},\n        {partition_id}\n    FROM "
+            ",\n        data.begin_snapshot,\n        {schema_version},\n        {partial_max},\n        {partition_id},\n        to_json(del)->>'format' AS format\n    FROM "
         ),
         1,
     )

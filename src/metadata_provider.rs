@@ -287,7 +287,7 @@ current_delete AS (
         df.path_is_relative,
         df.file_size_bytes,
         df.footer_size,
-        df.encryption_key
+        df.encryption_key, df.format
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
@@ -302,7 +302,7 @@ all_deletes AS (
         df.path_is_relative,
         df.file_size_bytes,
         df.footer_size,
-        df.encryption_key
+        df.encryption_key, df.format
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
@@ -328,12 +328,14 @@ SELECT
     pd.footer_size AS previous_delete_footer_size,
 
     cd.begin_snapshot,
-    data.data_file_id
+    data.data_file_id,
+    cd.format,
+    pd.format
 FROM current_delete cd
 JOIN ducklake_data_file data
   ON data.data_file_id = cd.data_file_id
 LEFT JOIN LATERAL (
-    SELECT path, path_is_relative, file_size_bytes, footer_size
+    SELECT path, path_is_relative, file_size_bytes, footer_size, format
     FROM all_deletes ad
     WHERE ad.data_file_id = cd.data_file_id
       AND ad.begin_snapshot < cd.begin_snapshot
@@ -365,10 +367,12 @@ SELECT
     pd.footer_size,
 
     data.end_snapshot,
-    data.data_file_id
+    data.data_file_id,
+    NULL,
+    pd.format
 FROM ducklake_data_file data
 LEFT JOIN LATERAL (
-    SELECT path, path_is_relative, file_size_bytes, footer_size
+    SELECT path, path_is_relative, file_size_bytes, footer_size, format
     FROM all_deletes ad
     WHERE ad.data_file_id = data.data_file_id
       AND ad.begin_snapshot <= data.end_snapshot
@@ -904,7 +908,7 @@ pub(crate) fn inlined_file_deletes_for_flush_sql(
                 data.end_snapshot, ex.end_snapshot,
                 (SELECT MAX(other.end_snapshot) FROM ducklake_delete_file other
                  WHERE other.data_file_id = del.file_id
-                   AND other.begin_snapshot < ex.begin_snapshot)
+                   AND other.begin_snapshot < ex.begin_snapshot), ex.*
          FROM {table} del
          JOIN ducklake_data_file data ON data.data_file_id = del.file_id
           AND data.begin_snapshot <= {p1}
@@ -2418,10 +2422,46 @@ pub fn reconstruct_columns_with_table(
     Ok(result)
 }
 
+/// Physical format of a DuckLake positional delete file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DuckLakeDeleteFileFormat {
+    /// Standard positional-delete Parquet file.
+    #[default]
+    Parquet,
+    /// Iceberg V3 deletion vector, either bare or in a Puffin container.
+    Puffin,
+}
+
+impl DuckLakeDeleteFileFormat {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
+        match value
+            .unwrap_or("parquet")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "parquet" => Ok(Self::Parquet),
+            "puffin" => Ok(Self::Puffin),
+            value => Err(crate::DuckLakeError::InvalidConfig(format!(
+                "Unsupported delete file format '{value}'"
+            ))),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Puffin => "puffin",
+        }
+    }
+}
+
 /// Metadata for a data file or delete file in DuckLake
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeFileData {
+    /// The physical format for a positional delete file.
+    pub delete_format: DuckLakeDeleteFileFormat,
     /// Path to the file (may be relative or absolute)
     pub path: String,
     /// Whether the path is relative to the table's path
@@ -2440,6 +2480,7 @@ pub struct DuckLakeFileData {
 impl DuckLakeFileData {
     pub fn new(path: String, path_is_relative: bool, file_size_bytes: i64) -> Self {
         Self {
+            delete_format: DuckLakeDeleteFileFormat::Parquet,
             path,
             path_is_relative,
             encryption_key: None,
@@ -2669,12 +2710,14 @@ pub struct DeleteFileChange {
     pub current_delete_path_is_relative: Option<bool>,
     pub current_delete_file_size_bytes: Option<i64>,
     pub current_delete_footer_size: Option<i64>,
+    pub current_delete_format: DuckLakeDeleteFileFormat,
 
     /* -------- Delete file replaced (if any) -------- */
     pub previous_delete_path: Option<String>,
     pub previous_delete_path_is_relative: Option<bool>,
     pub previous_delete_file_size_bytes: Option<i64>,
     pub previous_delete_footer_size: Option<i64>,
+    pub previous_delete_format: DuckLakeDeleteFileFormat,
 
     /* -------- Snapshot where change occurred -------- */
     pub snapshot_id: i64,

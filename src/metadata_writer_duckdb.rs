@@ -1719,8 +1719,8 @@ fn insert_flush_delete_file(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
               file_size_bytes, footer_size, delete_count, begin_snapshot, partial_max,
-              end_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              end_snapshot, format)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             delete_file_id,
             data_file_id,
@@ -1733,6 +1733,7 @@ fn insert_flush_delete_file(
             delete.begin_snapshot,
             delete.partial_max,
             delete.end_snapshot,
+            delete.delete.format.as_str(),
         ],
     )?;
     Ok(())
@@ -2517,8 +2518,8 @@ fn apply_delete_entry(
     tx.execute(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
-              file_size_bytes, footer_size, delete_count, begin_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              file_size_bytes, footer_size, delete_count, begin_snapshot, format)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             delete_file_id,
             entry.data_file_id,
@@ -2528,7 +2529,8 @@ fn apply_delete_entry(
             entry.delete.file_size_bytes,
             entry.delete.footer_size,
             entry.delete.delete_count,
-            snapshot_id
+            snapshot_id,
+            entry.delete.format.as_str(),
         ],
     )?;
     Ok(())
