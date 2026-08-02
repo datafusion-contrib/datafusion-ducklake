@@ -17,6 +17,7 @@ use datafusion::physical_expr_adapter::{
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::metadata::ParquetMetaData;
+use parquet::variant::VariantType;
 
 pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
 
@@ -476,6 +477,7 @@ fn ducklake_to_arrow_type_inner(ducklake_type: &str, depth: usize) -> Result<Dat
         // Binary types. BinaryView for the same reasons as the string types above.
         "blob" | "binary" | "bytea" => Ok(DataType::BinaryView),
         "uuid" => Ok(DataType::FixedSizeBinary(16)),
+        "variant" => Ok(variant_data_type()),
 
         // Geometry types (stored as binary WKB format). Kept as Binary (not
         // promoted to BinaryView): the WKB bytes are consumed by geometry
@@ -1005,6 +1007,16 @@ pub fn types_equal_canonical(a: &str, b: &str) -> bool {
     }
 }
 
+pub(crate) fn variant_data_type() -> DataType {
+    DataType::Struct(
+        vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
+        ]
+        .into(),
+    )
+}
+
 /// Build an Arrow schema from a list of DuckLake table columns.
 ///
 /// Struct fields are nullable on reads because a field added after older files were written is
@@ -1013,8 +1025,18 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     let fields: Result<Vec<Field>> = columns
         .iter()
         .map(|col| {
-            let data_type = read_compatible_data_type(&col.data_type()?, true);
-            Ok(Field::new(&col.column_name, data_type, col.is_nullable))
+            let is_variant = col.column_type.trim().eq_ignore_ascii_case("variant");
+            let data_type = if is_variant {
+                variant_data_type()
+            } else {
+                read_compatible_data_type(&col.data_type()?, true)
+            };
+            let field = Field::new(&col.column_name, data_type, col.is_nullable);
+            Ok(if is_variant {
+                field.with_extension_type(VariantType)
+            } else {
+                field
+            })
         })
         .collect();
 
@@ -1900,7 +1922,13 @@ pub fn build_read_schema_with_field_id_mapping(
                     (format!("{ABSENT_FIELD_PREFIX}{field_id}"), true, true)
                 };
 
-            if !is_absent && !col.nested_column_ids.is_empty() {
+            let is_variant = col.column_type.trim().eq_ignore_ascii_case("variant");
+            if is_variant
+                && let Some(field) =
+                    file_schema.and_then(|schema| schema.field_with_name(&read_name).ok())
+            {
+                data_type = field.data_type().clone();
+            } else if !is_absent && !col.nested_column_ids.is_empty() {
                 let match_nested_by_id = file_schema
                     .and_then(|schema| schema.field_with_name(&read_name).ok())
                     .is_some_and(|field| data_type_has_field_ids(field.data_type()));
@@ -1931,7 +1959,11 @@ pub fn build_read_schema_with_field_id_mapping(
                     initial_default.clone(),
                 )]));
             }
-            Ok(field)
+            Ok(if is_variant {
+                field.with_extension_type(VariantType)
+            } else {
+                field
+            })
         })
         .collect();
 
@@ -2918,6 +2950,25 @@ mod tests {
         assert_eq!(
             ducklake_to_arrow_type("blob").unwrap(),
             DataType::BinaryView
+        );
+    }
+
+    #[test]
+    fn test_variant_type_uses_parquet_extension_storage() {
+        let data_type = ducklake_to_arrow_type("variant").unwrap();
+        assert_eq!(data_type, variant_data_type());
+
+        let schema = build_arrow_schema(&[DuckLakeTableColumn::new(
+            1,
+            "payload".to_string(),
+            "variant".to_string(),
+            true,
+        )])
+        .unwrap();
+        assert!(
+            schema
+                .field(0)
+                .has_valid_extension_type::<parquet::variant::VariantType>()
         );
     }
 

@@ -916,6 +916,21 @@ impl MetadataProvider for MemoizedMetadataProvider {
             .get_table_summary_statistics(table_id, snapshot_id)
     }
 
+    fn get_file_variant_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: i64,
+        last_data_file_id: i64,
+    ) -> Result<Vec<crate::metadata_provider::DuckLakeFileVariantStatistics>> {
+        self.reader()?.get_file_variant_statistics(
+            table_id,
+            snapshot_id,
+            after_data_file_id,
+            last_data_file_id,
+        )
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Read DuckLake VARIANT columns and prune files using shredded integer statistics.
+
 - `ColumnWriteOptions::bloom_filter` / `with_bloom_filter`: give a column a bloom filter, or none,
   whatever its dictionary, so a column of mostly distinct values can prune point lookups.
 - `MetadataProvider::get_data_file_column_statistics` and `DataFileChange::data_file_id`: the

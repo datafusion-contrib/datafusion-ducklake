@@ -1590,6 +1590,62 @@ impl MetadataProvider for MySqlMetadataProvider {
         })
     }
 
+    fn get_file_variant_statistics(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: i64,
+        last_data_file_id: i64,
+    ) -> Result<Vec<crate::metadata_provider::DuckLakeFileVariantStatistics>> {
+        block_on(async {
+            let mut connection = self.connection().await?;
+            Ok(
+                match sqlx::query(
+                    "SELECT stats.data_file_id, stats.column_id, stats.variant_path,
+                        stats.shredded_type, stats.value_count, stats.null_count,
+                        stats.min_value, stats.max_value, stats.contains_nan
+                 FROM ducklake_file_variant_stats AS stats
+                 INNER JOIN ducklake_data_file AS data
+                   ON data.data_file_id = stats.data_file_id
+                  AND data.table_id = stats.table_id
+                 WHERE stats.table_id = ?
+                   AND ? >= data.begin_snapshot
+                   AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
+                   AND stats.data_file_id > ?
+                   AND stats.data_file_id <= ?
+                 ORDER BY stats.data_file_id, stats.column_id, stats.variant_path",
+                )
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(after_data_file_id)
+                .bind(last_data_file_id)
+                .fetch_all(&mut *connection)
+                .await
+                {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|row| {
+                            Ok(crate::metadata_provider::DuckLakeFileVariantStatistics {
+                                data_file_id: row.try_get(0)?,
+                                column_id: row.try_get(1)?,
+                                variant_path: row.try_get(2)?,
+                                shredded_type: row.try_get(3)?,
+                                value_count: row.try_get(4)?,
+                                null_count: row.try_get(5)?,
+                                min_value: row.try_get(6)?,
+                                max_value: row.try_get(7)?,
+                                contains_nan: row.try_get(8)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                    Err(error) => return Err(error.into()),
+                },
+            )
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

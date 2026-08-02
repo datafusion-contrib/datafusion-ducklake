@@ -28,7 +28,7 @@ datafusion-datasource = { version = "55", default-features = false }
 # which `datafusion` does not re-export. Keep the version in lockstep with `datafusion`.
 datafusion-datasource-parquet = { version = "55", default-features = false }
 arrow = "59.2"
-parquet = { version = "59.2", features = ["async"] }
+parquet = { version = "59.2", features = ["async", "variant_experimental"] }
 object_store = { version = "0.13", default-features = false }
 url = "2.5"
 percent-encoding = "2"

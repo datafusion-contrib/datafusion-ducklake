@@ -4,6 +4,7 @@ use datafusion::catalog::TableFunctionImpl;
 use datafusion::common::{Result as DataFusionResult, ScalarValue, plan_err};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::ScalarUDF;
 use std::sync::Arc;
 
 use crate::information_schema::{FilesTable, SnapshotsTable, TableInfoTable};
@@ -15,6 +16,7 @@ use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::table::DuckLakeTable;
 use crate::table_changes::{TableChangesTable, TableInsertionsTable};
 use crate::table_deletions::TableDeletionsTable;
+use crate::variant::VariantGetInt64;
 
 #[derive(Debug)]
 pub struct DucklakeSnapshotsFunction {
@@ -470,6 +472,7 @@ pub fn register_ducklake_functions(
     ctx: &datafusion::execution::context::SessionContext,
     provider: Arc<dyn MetadataProvider>,
 ) {
+    ctx.register_udf(ScalarUDF::new_from_impl(VariantGetInt64::new()));
     ctx.register_udtf(
         "ducklake_snapshots",
         Arc::new(DucklakeSnapshotsFunction::new(provider.clone())),

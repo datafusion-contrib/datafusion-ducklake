@@ -181,7 +181,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Decimal (precision & scale)           |    ✅     |                                                              |
 | Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
 | Complex / nested (list, struct, map)  | Supported | Recursive types, nullable evolution, inlining; no pruning       |
-| Variant                               |    ❌     | Tables with a `VARIANT` column cannot be read                |
+| Variant | ✅ | Read unshredded and shredded Parquet VARIANT columns |
 
 ### Column defaults
 
