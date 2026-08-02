@@ -4,6 +4,7 @@
 //! file fails with one `Unsupported` error, while inlined writes, which write no
 //! Parquet, proceed as official's do.
 
+#![cfg(not(feature = "encryption"))]
 #![cfg(feature = "write-sqlite")]
 
 use std::sync::Arc;

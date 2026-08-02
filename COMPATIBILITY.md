@@ -163,7 +163,7 @@ AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before cre
 | `tls-native-tls`           | Use native TLS for SQLx PostgreSQL connections                                    |           |
 | `tls-rustls-aws-lc-rs`     | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                            |           |
 | `tls-rustls-ring`          | Use Rustls with Ring for SQLx PostgreSQL connections                              |           |
-| `encryption`               | Parquet Modular Encryption (PME) reads                                            |           |
+| `encryption`               | Parquet Modular Encryption (PME) reads and writes                                 |           |
 | `skip-tests-with-docker`   | CI-only: skip tests that require Docker                                           |           |
 
 For dynamic linking against a system `libduckdb`, disable defaults and re-enable just
@@ -295,7 +295,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Read-only DuckLake views on every metadata backend                                                                                                                                                                                                                                                                               | 🟧       |
 | Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`)                                                                                                                                              | ✅        |
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation                                                                                                                                                                                                                                                 | ✅        |
-| Parquet Modular Encryption (PME) reads (feature `encryption`)                                                                                                                                                                                                                                                                    | ✅        |
+| Parquet Modular Encryption (PME) reads and writes (feature `encryption`)                                                                                                                                                                                                                                                                    | ✅        |
 | Keep a table's catalog reads across queries (`CatalogReadMemo`, opt-in, not DuckLake behavior: see Limitations)                                                                                                                                                                                                                   | 🟧       |
 | Keep a table's delete positions across scans (`DuckLakeReadOptions`, opt-in)                                                                                                                                                                                                                                                     | ✅        |
 | Configurable writer output (compression, row-group sizing)                                                                                                                                                                                                                                                                       | ✅        |
@@ -636,9 +636,8 @@ Differences from official:
   flush changes the change feeds: windows holding one of the two snapshots report
   the row's deletion before the flush, and after it only those holding the snapshot
   the flush kept, the earlier here and the inlined deletion's in official.
-- A catalog whose `encrypted` option is `true` is refused: flush fails with
-  `Unsupported` before writing anything. Official writes encrypted Parquet there; this
-  crate writes no encrypted files (see "Encrypted catalogs" below).
+- Flushing a catalog whose `encrypted` option is `true` writes encrypted Parquet when
+  the `encryption` feature is enabled. Other builds refuse the flush before writing.
 - Arrow 59 cannot write `Interval(MonthDayNano)` to Parquet, so a catalog holding
   such inlined values fails the flush with an `Unsupported` error and keeps its
   rows inlined.
@@ -678,9 +677,8 @@ cleanup phase. The merge and rewrite phases record `merge_adjacent:<id>` and
 official: they commit one snapshot per table, where official commits one for the
 whole phase. `rewrite_data_files` writes one file per rewritten file where official packs
 the surviving rows into fewer files up to `target_file_size`, so the rows match but the
-file layout differs (datafusion-contrib/datafusion-ducklake#377). On an encrypted
-catalog `checkpoint` skips the phases that write Parquet (flush, merge, rewrite) and
-runs expiry and cleanup. Interval options parse as official parses them, with DuckDB's
+file layout differs (datafusion-contrib/datafusion-ducklake#377). Without the `encryption` feature, an encrypted catalog's `checkpoint` skips
+the phases that write Parquet (flush, merge, rewrite) and runs expiry and cleanup. Interval options parse as official parses them, with DuckDB's
 `Interval::FromString`: fractions (`'1.5 months'` is one month and 15 days), signed
 times (`'-00:30:00'`, the text `set_option` stores for `INTERVAL '-30 minutes'`), a
 trailing `ago`, and a bare number of seconds; what DuckDB rejects (`'+1 day'`,
@@ -1457,15 +1455,15 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Encrypted catalogs: no Parquet writes.** On a catalog whose global `encrypted` option
-  is `true`, every operation that would write a Parquet file fails with `Unsupported`
-  before writing it, or creating the table it writes to: an insert over the inlining limit (SQL or `DuckLakeTableWriter`),
-  `ducklake_flush_inlined_data`, `merge_adjacent_files`, `rewrite_data_files`, and a
-  `DELETE` or `UPDATE` that writes a delete file or Parquet rows. Official writes those
-  files with Parquet Modular Encryption, which this crate does not write yet. Writes
-  that store rows or deletions inlined in the catalog proceed, as official's do;
-  `checkpoint` skips the Parquet phases, and registering existing files writes none. As
-  in official, only the exact values `true` and `false` are read; another value fails.
+- **Encrypted catalogs.** When the global `encrypted` option is `true` and the
+  `encryption` feature is enabled, each new data or delete file gets its own
+  Parquet Modular Encryption key. The writer stores the key in the same catalog
+  commit as the file. Flush and compaction write encrypted outputs with fresh keys.
+  DuckDB needs the encrypted DataPageV2 fix from duckdb/duckdb#27766 to read V2 files.
+  Builds without `encryption` still allow inlined writes and refuse operations that
+  would write Parquet into an encrypted catalog. In such builds, checkpoint skips
+  the Parquet phases and can still expire snapshots and clean up files.
+  The catalog accepts the exact values `true` and `false`.
 - **`DuckdbMetadataProvider` reads metadata tables from the default schema only.** A DuckDB
   catalog attached with `METADATA_SCHEMA` keeps them elsewhere and cannot be read.
 - **Data inlining: supported rows are read on every metadata backend.** The DuckDB

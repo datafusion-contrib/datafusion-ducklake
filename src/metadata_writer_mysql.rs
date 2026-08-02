@@ -1887,8 +1887,8 @@ async fn insert_flush_delete_file(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
               file_size_bytes, footer_size, delete_count, begin_snapshot, partial_max,
-              end_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              end_snapshot, encryption_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(delete_file_id)
     .bind(data_file_id)
@@ -1901,6 +1901,7 @@ async fn insert_flush_delete_file(
     .bind(delete.begin_snapshot)
     .bind(delete.partial_max)
     .bind(delete.end_snapshot)
+    .bind(delete.delete.encryption_key.as_deref())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2324,8 +2325,8 @@ async fn apply_delete_entry(
     sqlx::query(
         "INSERT INTO ducklake_delete_file
              (delete_file_id, data_file_id, table_id, path, path_is_relative,
-              file_size_bytes, footer_size, delete_count, begin_snapshot)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              file_size_bytes, footer_size, delete_count, begin_snapshot, encryption_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(delete_file_id)
     .bind(entry.data_file_id)
@@ -2336,6 +2337,7 @@ async fn apply_delete_entry(
     .bind(entry.delete.footer_size)
     .bind(entry.delete.delete_count)
     .bind(snapshot_id)
+    .bind(entry.delete.encryption_key.as_deref())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -3105,8 +3107,8 @@ async fn commit_staged_files(
         sqlx::query(
             "INSERT INTO ducklake_data_file
                  (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(data_file_id)
         .bind(write.table_id)
@@ -3117,6 +3119,7 @@ async fn commit_staged_files(
         .bind(file.record_count)
         .bind(row_ids.stored)
         .bind(snapshot_id)
+        .bind(file.encryption_key.as_deref())
         .execute(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
@@ -4590,8 +4593,8 @@ impl MetadataWriter for MySqlMetadataWriter {
             sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(data_file_id)
             .bind(table_id)
@@ -4602,6 +4605,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(file.record_count)
             .bind(row_ids.stored)
             .bind(snapshot_id)
+            .bind(file.encryption_key.as_deref())
             .execute(&mut *tx)
             .await?;
 
@@ -4771,8 +4775,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(data_file_id)
                 .bind(table_id)
@@ -4783,6 +4787,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(file.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
@@ -5053,8 +5058,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(data_file_id)
                 .bind(table_id)
@@ -5065,6 +5070,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(file.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
@@ -5368,8 +5374,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          footer_size, record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(data_file_id)
                 .bind(table_id)
@@ -5381,6 +5387,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(crate::metadata_writer::carried_row_id_start(&output.file))
                 .bind(begin_snapshot)
                 .bind(output.partial_max)
+                .bind(output.file.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
                 insert_file_column_stats(
@@ -5469,8 +5476,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                     sqlx::query(
                         "INSERT INTO ducklake_data_file
                              (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                              footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              footer_size, record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     )
                     .bind(data_file_id)
                     .bind(table.table_id)
@@ -5482,6 +5489,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(carried_row_id_start(&out.file))
                     .bind(out.begin_snapshot)
                     .bind(out.partial_max)
+                    .bind(out.file.encryption_key.as_deref())
                     .execute(&mut *tx)
                     .await?;
                     insert_file_column_stats(

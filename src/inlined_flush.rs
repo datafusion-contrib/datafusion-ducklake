@@ -34,10 +34,8 @@
 //!   delete file beside it, so time travel reads duplicated rows and resurrects
 //!   the ended file's deletions. Deletions that cannot merge (an overlap with
 //!   an earlier delete file, or a deletion after its end) stay inlined.
-//! - A catalog whose `encrypted` option is `true` is refused, as every
-//!   Parquet-writing operation is. Otherwise, inlined deletions of an encrypted
-//!   data or delete file stay inlined (this crate cannot write encrypted delete
-//!   files), and reads keep applying them.
+//! - Flush writes encrypted Parquet in an encrypted catalog when the
+//!   `encryption` feature is enabled.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -199,28 +197,21 @@ impl WrittenObjects {
     }
 }
 
-/// Refuse `operation` on a catalog whose `encrypted` option is `true`, as the
-/// writer reads it ([`crate::metadata_writer::MetadataWriter::catalog_encrypted`], which fails on a
-/// value other than `true` or `false`). Official DuckLake writes the Parquet
-/// files of such a catalog with Parquet Modular Encryption; this crate writes
-/// no encrypted files, so writing plaintext ones there would break the
-/// catalog's guarantee.
-pub(crate) fn refuse_encrypted_catalog(
+/// Check that an encrypted catalog can write Parquet in this build.
+pub(crate) fn check_encrypted_write(
     writer: &dyn crate::metadata_writer::MetadataWriter,
     operation: &str,
 ) -> Result<()> {
-    if writer.catalog_encrypted()? {
+    if !cfg!(feature = "encryption") && writer.catalog_encrypted()? {
         return Err(encrypted_catalog_error(operation));
     }
     Ok(())
 }
 
-/// The error every Parquet-writing operation on an encrypted catalog fails
-/// with: [`DuckLakeError::Unsupported`], naming the operation.
 pub(crate) fn encrypted_catalog_error(operation: &str) -> DuckLakeError {
     DuckLakeError::Unsupported(format!(
         "{operation}: the catalog is encrypted, and this crate does not write encrypted Parquet \
-         files"
+         files without the encryption feature"
     ))
 }
 
@@ -240,7 +231,7 @@ impl DuckLakeCatalog {
     /// exist, a concurrent commit conflicts ([`DuckLakeError::Conflict`]),
     /// inlined rows hold a type Parquet cannot store through Arrow (`INTERVAL`,
     /// [`DuckLakeError::Unsupported`]), or the catalog's `encrypted` option is
-    /// `true` ([`DuckLakeError::Unsupported`], before anything is written). Any of these fails the whole flush and
+    /// `true` in a build without the `encryption` feature. Any of these fails the whole flush and
     /// removes the objects it wrote. Dropping empty superseded inlined tables
     /// runs after the flush commits, so an error there is returned although the
     /// flush has committed.
@@ -281,7 +272,7 @@ impl DuckLakeCatalog {
             )
         })?;
         let provider = self.provider();
-        refuse_encrypted_catalog(writer.as_ref(), "flush_inlined_data")?;
+        check_encrypted_write(writer.as_ref(), "flush_inlined_data")?;
         let base_snapshot = match base_snapshot {
             Some(snapshot) => snapshot,
             None => provider.get_current_snapshot()?,
@@ -859,8 +850,7 @@ async fn write_inlined_table(
 
     let data_column_ids = field_ids(&data.columns);
     // Official's flush takes `hive_file_pattern` like an insert does (DuckDB
-    // 1.5.6, ducklake 664400c5); an encrypted catalog is refused before this,
-    // so the setting alone decides.
+    // 1.5.6, ducklake 664400c5).
     let hive = table.write_options().hive_file_pattern.unwrap_or(true);
     let mut files = Vec::new();
     for (partition, group) in groups {
@@ -1113,7 +1103,7 @@ async fn plan_file_deletes(
                 .existing_delete
                 .as_ref()
                 .is_some_and(|(_, file, _)| file.encryption_key.is_some());
-        if encrypted {
+        if encrypted && !cfg!(feature = "encryption") {
             tracing::warn!(
                 data_file_id,
                 "leaving inlined deletions of an encrypted file inlined: writing encrypted \
@@ -1137,8 +1127,13 @@ async fn plan_file_deletes(
             Some((delete_file_id, file, begin_snapshot)) => {
                 if merge || retired_with_deletes {
                     let path = resolve_path(table.table_path(), &file.path, file.path_is_relative)?;
-                    for (position, snapshot) in
-                        read_delete_file(object_store, &path, *begin_snapshot).await?
+                    for (position, snapshot) in read_delete_file(
+                        object_store,
+                        &path,
+                        *begin_snapshot,
+                        file.encryption_key.as_deref(),
+                    )
+                    .await?
                     {
                         deletions
                             .entry(position)
@@ -1211,13 +1206,15 @@ async fn read_delete_file(
     object_store: &dyn ObjectStore,
     path: &str,
     begin_snapshot: i64,
+    encryption_key: Option<&str>,
 ) -> Result<Vec<(i64, i64)>> {
     let bytes = object_store
         .get(&ObjectPath::from(path.trim_start_matches('/')))
         .await?
         .bytes()
         .await?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)?.build()?;
+    let options = crate::encryption::parquet_reader_options(encryption_key)?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new_with_options(bytes, options)?.build()?;
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch?;

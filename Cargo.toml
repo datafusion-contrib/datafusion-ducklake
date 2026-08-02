@@ -41,6 +41,7 @@ thiserror = "2.0"
 
 # Encryption support (optional)
 base64 = { version = "0.22", optional = true }
+getrandom = { version = "0.3", optional = true }
 hex = { version = "0.4", optional = true }
 
 # Write support (optional)
@@ -99,7 +100,13 @@ tls-rustls-ring = ["sqlx?/tls-rustls-ring"]
 duckdb-bundled = ["metadata-duckdb", "duckdb/bundled"]
 
 # Encryption support for Parquet files
-encryption = ["parquet/encryption", "datafusion/parquet_encryption", "dep:base64", "dep:hex"]
+encryption = [
+    "parquet/encryption",
+    "datafusion/parquet_encryption",
+    "dep:base64",
+    "dep:getrandom",
+    "dep:hex",
+]
 
 # Write support
 write = ["dep:uuid", "dep:tempfile"]

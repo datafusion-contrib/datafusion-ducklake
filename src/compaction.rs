@@ -1037,7 +1037,7 @@ impl DuckLakeTable {
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
-        crate::inlined_flush::refuse_encrypted_catalog(writer.as_ref(), "merge_adjacent_files")?;
+        crate::inlined_flush::check_encrypted_write(writer.as_ref(), "merge_adjacent_files")?;
         self.write_options().validate()?;
         if !self.write_options().auto_compact.unwrap_or(true) {
             return Ok(CompactionResult::empty());
@@ -1475,7 +1475,7 @@ impl DuckLakeTable {
     /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy) says so,
     /// returning the table reopened at the flush snapshot and the snapshot;
     /// `None` when it flushed nothing (the default policy, read-only,
-    /// `auto_compact` off, an encrypted catalog, or no trigger fired).
+    /// `auto_compact` off, encryption unavailable, or no trigger fired).
     async fn flush_inlined_if_due(
         &self,
         state: &dyn Session,
@@ -1496,7 +1496,9 @@ impl DuckLakeTable {
         if policy.min_inlined_rows.is_none() && policy.max_inlined_age.is_none() {
             return Ok(None);
         }
-        if !self.write_options().auto_compact.unwrap_or(true) || writer.catalog_encrypted()? {
+        if !self.write_options().auto_compact.unwrap_or(true)
+            || (!cfg!(feature = "encryption") && writer.catalog_encrypted()?)
+        {
             return Ok(None);
         }
         let Some(backlog) = self.inlined_flush_backlog(state).await? else {
@@ -1641,7 +1643,7 @@ impl DuckLakeTable {
                     .to_string(),
             )
         })?;
-        crate::inlined_flush::refuse_encrypted_catalog(writer.as_ref(), "rewrite_data_files")?;
+        crate::inlined_flush::check_encrypted_write(writer.as_ref(), "rewrite_data_files")?;
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
@@ -1880,7 +1882,7 @@ impl crate::DuckLakeCatalog {
     /// A writer without them (the single-catalog PostgreSQL writer) fails with
     /// [`DuckLakeError::Unsupported`] before any phase runs. On a catalog whose
     /// `encrypted` option is `true` the phases that write Parquet (1, 3 and 4)
-    /// are skipped, since this crate writes no encrypted Parquet files, and
+    /// are skipped in builds without `encryption`, and
     /// expiry and cleanup run. Errors also when the catalog is read-only, or an
     /// interval option does not parse.
     pub async fn checkpoint(&self, state: &dyn Session) -> Result<CheckpointResult> {
@@ -1899,7 +1901,7 @@ impl crate::DuckLakeCatalog {
         }
         let provider = self.provider();
         let settings = provider.get_metadata_settings(None, None)?;
-        let encrypted = writer.catalog_encrypted()?;
+        let encrypted = !cfg!(feature = "encryption") && writer.catalog_encrypted()?;
         if encrypted {
             tracing::warn!(
                 "checkpoint: the catalog is encrypted; skipping the flush, merge and rewrite \

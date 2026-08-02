@@ -1237,6 +1237,7 @@ mod tests {
         pool: Arc<EncodePool>,
     ) -> DataFileProperties {
         DataFileProperties {
+            encrypted: false,
             props: writer_props(rows, bytes),
             dictionary_set: Arc::default(),
             bloom_filter_set: Arc::default(),
@@ -1780,6 +1781,7 @@ mod tests {
     #[test]
     fn content_defined_chunking_is_written_on_one_thread() {
         let props = DataFileProperties {
+            encrypted: false,
             props: WriterProperties::builder()
                 .set_content_defined_chunking(Some(Default::default()))
                 .build(),

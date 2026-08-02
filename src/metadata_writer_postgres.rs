@@ -1924,8 +1924,8 @@ impl PostgresMetadataWriter {
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot,
-                          partial_max)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
+                          partial_max, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -1936,6 +1936,7 @@ impl PostgresMetadataWriter {
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
                 .bind(entry.partial_max)
+                .bind(file.encryption_key.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
                 // Ownership is the one thing registration decides that no other
@@ -1969,8 +1970,8 @@ impl PostgresMetadataWriter {
                     let delete_file_id: i64 = sqlx::query_scalar(
                         "INSERT INTO ducklake_delete_file
                              (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                              footer_size, delete_count, begin_snapshot)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delete_file_id",
+                              footer_size, delete_count, begin_snapshot, encryption_key)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING delete_file_id",
                     )
                     .bind(data_file_id)
                     .bind(table_id)
@@ -1980,6 +1981,7 @@ impl PostgresMetadataWriter {
                     .bind(delete.footer_size)
                     .bind(delete.delete_count)
                     .bind(snapshot_id)
+                    .bind(delete.encryption_key.as_deref())
                     .fetch_one(&mut *tx)
                     .await?;
                     if let Some(owner) = delete.owner_catalog_id {
@@ -4138,8 +4140,8 @@ pub(crate) async fn apply_inlined_flush_at_snapshot(
             let data_file_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes, footer_size,
-                      record_count, row_id_start, begin_snapshot, partial_max)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                      record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  RETURNING data_file_id",
             )
             .bind(table.table_id)
@@ -4151,6 +4153,7 @@ pub(crate) async fn apply_inlined_flush_at_snapshot(
             .bind(carried_row_id_start(&out.file))
             .bind(out.begin_snapshot)
             .bind(out.partial_max)
+            .bind(out.file.encryption_key.as_deref())
             .fetch_one(&mut **tx)
             .await?;
             insert_file_column_stats(tx, table.table_id, data_file_id, &out.file.column_stats)
@@ -4231,8 +4234,8 @@ async fn insert_flush_delete_file(
     sqlx::query(
         "INSERT INTO ducklake_delete_file
              (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-              footer_size, delete_count, begin_snapshot, partial_max, end_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              footer_size, delete_count, begin_snapshot, partial_max, end_snapshot, encryption_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(data_file_id)
     .bind(table_id)
@@ -4244,6 +4247,7 @@ async fn insert_flush_delete_file(
     .bind(delete.begin_snapshot)
     .bind(delete.partial_max)
     .bind(delete.end_snapshot)
+    .bind(delete.delete.encryption_key.as_deref())
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -4289,8 +4293,8 @@ pub(crate) async fn commit_files_at_snapshot(
         let data_file_id: i64 = sqlx::query_scalar(
             "INSERT INTO ducklake_data_file
                  (table_id, path, path_is_relative, file_size_bytes, footer_size,
-                  record_count, row_id_start, begin_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                  record_count, row_id_start, begin_snapshot, encryption_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING data_file_id",
         )
         .bind(write.table_id)
@@ -4301,6 +4305,7 @@ pub(crate) async fn commit_files_at_snapshot(
         .bind(file.record_count)
         .bind(next_row_id)
         .bind(snapshot_id)
+        .bind(file.encryption_key.as_deref())
         .fetch_one(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
@@ -4733,8 +4738,8 @@ pub(crate) async fn apply_positional_deletes_at_snapshot(
         sqlx::query(
             "INSERT INTO ducklake_delete_file
                  (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                  footer_size, delete_count, begin_snapshot)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                  footer_size, delete_count, begin_snapshot, encryption_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(entry.data_file_id)
         .bind(table_id)
@@ -4744,6 +4749,7 @@ pub(crate) async fn apply_positional_deletes_at_snapshot(
         .bind(entry.delete.footer_size)
         .bind(entry.delete.delete_count)
         .bind(snapshot_id)
+        .bind(entry.delete.encryption_key.as_deref())
         .execute(&mut **tx)
         .await?;
     }
@@ -6295,8 +6301,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -6306,6 +6312,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_ids.stored)
             .bind(snapshot_id)
+            .bind(file.encryption_key.as_deref())
             .fetch_one(&mut *tx)
             .await?;
             let data_file_id: i64 = inserted.try_get(0)?;
@@ -6475,8 +6482,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                          footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -6486,6 +6493,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(file.encryption_key.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
                 let data_file_id: i64 = inserted.try_get(0)?;
@@ -7377,8 +7385,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             sqlx::query(
                 "INSERT INTO ducklake_delete_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, delete_count, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                      footer_size, delete_count, begin_snapshot, encryption_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             )
             .bind(data_file_id)
             .bind(table_id)
@@ -7388,6 +7396,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(delete.footer_size)
             .bind(delete.delete_count)
             .bind(snapshot_id)
+            .bind(delete.encryption_key.as_deref())
             .execute(&mut *tx)
             .await?;
 
@@ -7546,8 +7555,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -7557,6 +7566,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.record_count)
             .bind(row_ids.stored)
             .bind(snapshot_id)
+            .bind(file.encryption_key.as_deref())
             .fetch_one(&mut *tx)
             .await?;
             let data_file_id: i64 = inserted.try_get(0)?;
@@ -7643,8 +7653,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                          footer_size, delete_count, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(entry.data_file_id)
                 .bind(table_id)
@@ -7654,6 +7664,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -7817,8 +7828,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                          footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -7828,6 +7839,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(file.encryption_key.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
                 let data_file_id: i64 = inserted.try_get(0)?;
@@ -7912,8 +7924,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                          footer_size, delete_count, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(entry.data_file_id)
                 .bind(table_id)
@@ -7923,6 +7935,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -8052,8 +8065,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                          footer_size, delete_count, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(entry.data_file_id)
                 .bind(table_id)
@@ -8063,6 +8076,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -8262,8 +8276,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, delete_count, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                          footer_size, delete_count, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 )
                 .bind(entry.data_file_id)
                 .bind(table_id)
@@ -8273,6 +8287,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(entry.delete.footer_size)
                 .bind(entry.delete.delete_count)
                 .bind(snapshot_id)
+                .bind(entry.delete.encryption_key.as_deref())
                 .execute(&mut *tx)
                 .await?;
             }
@@ -8577,8 +8592,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
+                          footer_size, record_count, row_id_start, begin_snapshot, partial_max, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&out.file.path)
@@ -8589,6 +8604,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(crate::metadata_writer::carried_row_id_start(&out.file))
                 .bind(begin)
                 .bind(out.partial_max)
+                .bind(out.file.encryption_key.as_deref())
                 .fetch_one(&mut *tx)
                 .await?;
                 // Persist the compacted file's harvested zone maps (same tx),

@@ -2533,8 +2533,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             let data_file_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
-                      footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                      footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
             )
             .bind(table_id)
             .bind(&file.path)
@@ -2544,6 +2544,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(file.record_count)
             .bind(row_ids.stored)
             .bind(snapshot_id)
+            .bind(file.encryption_key.as_deref())
             .fetch_one(&mut *tx)
             .await?
             .try_get(0)?;
@@ -2691,8 +2692,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 let data_file_id: i64 = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+                          footer_size, record_count, row_id_start, begin_snapshot, encryption_key)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -2702,6 +2703,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
+                .bind(file.encryption_key.as_deref())
                 .fetch_one(&mut *tx)
                 .await?
                 .try_get(0)?;
