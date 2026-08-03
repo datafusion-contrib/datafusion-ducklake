@@ -874,9 +874,91 @@ async fn recompute_table_column_stats(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn finalize_snapshot(
+/// Allocate a snapshot id in commit order (plain IDENTITY).
+///
+/// `schema_version` is inserted as a placeholder and patched by
+/// [`apply_schema_version`] once every table in the commit has been finalized and
+/// we know whether any of them changed its schema.
+async fn allocate_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<i64> {
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+         VALUES (NOW(), 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    Ok(snapshot_id)
+}
+
+/// Decide and write the snapshot's `schema_version`, and record one
+/// `ducklake_schema_versions` row per table whose schema changed in it.
+///
+/// `schema_version` is a per-catalog *dense* DDL counter: DDL bumps it, DML carries
+/// it forward (with a v1 floor for the first write to the catalog). The previous
+/// value is `MAX` over the catalog's *mapped* snapshots — no `< snapshot_id` window
+/// is needed because ids are commit-ordered and this commit's snapshot is not mapped
+/// until `advance_catalog_head`.
+///
+/// **This must be called exactly once per snapshot, after all of its tables are
+/// finalized.** A commit spanning several tables cannot decide per table: every
+/// table would read the same unmapped `prev_max`, so a DDL table would write
+/// `prev_max + 1` and a following DML table would write `prev_max` back — silently
+/// lowering the version it just raised. Deciding once over the union
+/// (`ddl_table_ids` non-empty ⇒ DDL) is what makes a multi-table commit correct, and
+/// it is exactly equivalent to the per-table decision when there is only one table.
+async fn apply_schema_version(
     catalog_id: i64,
+    snapshot_id: i64,
+    ddl_table_ids: &[i64],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64> {
+    let prev_max: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(catalog_id)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    let new_schema_version = if !ddl_table_ids.is_empty() {
+        prev_max + 1
+    } else {
+        prev_max.max(1)
+    };
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+        .bind(new_schema_version)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    // One row per DDL table (UNIQUE(table_id, begin_snapshot)).
+    for table_id in ddl_table_ids {
+        sqlx::query(
+            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(snapshot_id)
+        .bind(new_schema_version)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(new_schema_version)
+}
+
+/// Write one table's metadata into an **already-allocated** snapshot: get-or-create
+/// its schema and table, run the `Replace` conflict check, and lay down the column
+/// generation surgically (stable `column_id`s == parquet field-ids).
+///
+/// Returns `(schema_id, table_id, is_ddl)`. The caller owns snapshot allocation
+/// ([`allocate_snapshot`]), the `schema_version` decision ([`apply_schema_version`],
+/// which needs `is_ddl` from every table first), registering data files, and
+/// `advance_catalog_head` — so several tables can share one snapshot by calling this
+/// once per table.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_table_in_snapshot(
+    catalog_id: i64,
+    snapshot_id: i64,
     schema_name: &str,
     table_name: &str,
     table_id_hint: i64,
@@ -885,7 +967,7 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-) -> Result<(i64, i64, i64)> {
+) -> Result<(i64, i64, bool)> {
     // 1. Resolve the live schema id under the lock. Reuse it if present; else
     //    reserve a fresh id from the sequence (the row is inserted in step 4 once
     //    the snapshot id exists for begin_snapshot).
@@ -926,15 +1008,8 @@ async fn finalize_snapshot(
         }
     }
 
-    // 3. Allocate the snapshot id in commit order (plain IDENTITY). schema_version
-    //    is patched in below once we know it.
-    let snapshot_id: i64 = sqlx::query(
-        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
-         VALUES (NOW(), 0) RETURNING snapshot_id",
-    )
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
+    // 3. (Snapshot allocation is the caller's — see `allocate_snapshot`. It happens
+    //    before this call so several tables can share one snapshot.)
 
     // 4. Insert the schema row (with its reserved id) if it is new. The catalog id
     //    is encoded into the schema's *path* (not its name) so two catalogs holding
@@ -1032,31 +1107,11 @@ async fn finalize_snapshot(
     }
 
     let is_ddl = table_was_created || columns_differ(&existing_columns, columns);
-
-    // No `< S` window: ids are commit-ordered, so MAX over mapped predecessors is
-    // the immediately-preceding version. DDL bumps; DML carries forward (with a v1
-    // floor for the very first write to the catalog).
-    let prev_max: i64 = sqlx::query(
-        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
-         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
-         WHERE m.catalog_id = $1",
-    )
-    .bind(catalog_id)
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
-    let new_schema_version = if is_ddl {
-        prev_max + 1
-    } else if prev_max == 0 {
-        1
-    } else {
-        prev_max
-    };
-    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
-        .bind(new_schema_version)
-        .bind(snapshot_id)
-        .execute(&mut **tx)
-        .await?;
+    // The `schema_version` decision (and its `ducklake_schema_versions` row) is the
+    // caller's, via `apply_schema_version`: it needs `is_ddl` from EVERY table in the
+    // snapshot before it can pick a value. Nothing between here and the end of this
+    // function reads `ducklake_snapshot.schema_version`, so deferring the write is
+    // invisible within the transaction.
 
     // 7. Write the column generation SURGICALLY (mode-independent, matching the
     //    SQLite writer) so each kept column keeps a STABLE column_id (== parquet
@@ -1137,18 +1192,8 @@ async fn finalize_snapshot(
         }
     }
 
-    // 8. One ducklake_schema_versions row per DDL (UNIQUE(table_id, begin_snapshot)).
-    if is_ddl {
-        sqlx::query(
-            "INSERT INTO ducklake_schema_versions (begin_snapshot, schema_version, table_id)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(snapshot_id)
-        .bind(new_schema_version)
-        .bind(table_id)
-        .execute(&mut **tx)
-        .await?;
-    }
+    // 8. (The ducklake_schema_versions row is written by `apply_schema_version`,
+    //    which the caller runs once for the whole snapshot — see step 6.)
 
     // 9. Replace retirement: end the prior generation's files + zero the visible
     //    totals. The `begin_snapshot < S` guard spares this write's own files.
@@ -1164,7 +1209,7 @@ async fn finalize_snapshot(
         retire_prior_generation(table_id, snapshot_id, tx).await?;
     }
 
-    Ok((snapshot_id, schema_id, table_id))
+    Ok((schema_id, table_id, is_ddl))
 }
 
 impl MetadataWriter for PostgresMetadataWriter {
@@ -1501,8 +1546,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+            let snapshot_id = allocate_snapshot(&mut tx).await?;
+            let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
                 self.catalog_id,
+                snapshot_id,
                 schema_name,
                 table_name,
                 table_id,
@@ -1513,6 +1560,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            let ddl_tables = if is_ddl {
+                vec![table_id]
+            } else {
+                Vec::new()
+            };
+            apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
 
             // Partition-spec fence: this file must be consistent with the table's live
             // partition generation at commit time (both directions — see
@@ -1620,8 +1673,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+            let snapshot_id = allocate_snapshot(&mut tx).await?;
+            let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
                 self.catalog_id,
+                snapshot_id,
                 schema_name,
                 table_name,
                 table_id,
@@ -1632,6 +1687,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            let ddl_tables = if is_ddl {
+                vec![table_id]
+            } else {
+                Vec::new()
+            };
+            apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.
             // Runs inside the lock_catalog-serialized tx; rolls back on a Conflict.
@@ -2136,8 +2197,10 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // finalize inserts the columns with the adopted `column_ids`
             // (OVERRIDING SYSTEM VALUE), so the file's field-ids match.
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+            let snapshot_id = allocate_snapshot(&mut tx).await?;
+            let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
                 self.catalog_id,
+                snapshot_id,
                 schema_name,
                 table_name,
                 table_id_hint,
@@ -2148,6 +2211,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            let ddl_tables = if is_ddl {
+                vec![table_id]
+            } else {
+                Vec::new()
+            };
+            apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
 
             // rowids get a fresh range from the table counter — the source range
             // isn't preserved (index copy, which would need it, is out of scope).
@@ -2446,8 +2515,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+            let snapshot_id = allocate_snapshot(&mut tx).await?;
+            let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
                 self.catalog_id,
+                snapshot_id,
                 schema_name,
                 table_name,
                 table_id,
@@ -2458,6 +2529,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            let ddl_tables = if is_ddl {
+                vec![table_id]
+            } else {
+                Vec::new()
+            };
+            apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
 
             // Partition-spec fence: the new row versions are a NEW write, so they
             // must agree with the table's live partition generation exactly as
@@ -3254,8 +3331,10 @@ impl MetadataWriter for PostgresMetadataWriter {
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+            let snapshot_id = allocate_snapshot(&mut tx).await?;
+            let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
                 self.catalog_id,
+                snapshot_id,
                 schema_name,
                 table_name,
                 table_id,
@@ -3266,6 +3345,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &mut tx,
             )
             .await?;
+            let ddl_tables = if is_ddl {
+                vec![table_id]
+            } else {
+                Vec::new()
+            };
+            apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
 
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
