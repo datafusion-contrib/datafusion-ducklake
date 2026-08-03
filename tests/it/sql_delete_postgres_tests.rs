@@ -101,6 +101,14 @@ async fn catalog_snapshot_count(pool: &PgPool, cat: i64) -> i64 {
         .unwrap()
 }
 
+async fn snapshot_changes(pool: &PgPool, snapshot_id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1")
+        .bind(snapshot_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 /// Drives the two new commit primitives directly on the Postgres writer:
 /// (1) `commit_positional_deletes` for a WHERE delete, asserting the read
 /// reflects it and it lands as exactly one catalog snapshot; (2) `commit_truncate`
@@ -230,6 +238,10 @@ async fn positional_delete_and_truncate_commit_postgres() {
         delete_snap, commit.snapshot_id,
         "delete file's begin_snapshot is the committed head"
     );
+    assert_eq!(
+        snapshot_changes(&pool, commit.snapshot_id).await,
+        Some(format!("deleted_from_table:{}", table_meta.table_id)),
+    );
 
     // --- commit_truncate: remove the two survivors. ---
     let head2 = MulticatalogProvider::with_pool(pool.clone(), cat_name)
@@ -248,6 +260,18 @@ async fn positional_delete_and_truncate_commit_postgres() {
         read_pairs(&pool, cat_name).await,
         Vec::<(i32, i32)>::new(),
         "table empty"
+    );
+    let truncate_snapshot: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+         WHERE catalog_id = $1",
+    )
+    .bind(cat)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshot_changes(&pool, truncate_snapshot).await,
+        Some(format!("deleted_from_table:{}", table_meta.table_id)),
     );
     let snaps_after_truncate = catalog_snapshot_count(&pool, cat).await;
 

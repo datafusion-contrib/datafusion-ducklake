@@ -3,7 +3,9 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
+use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
+use arrow::datatypes::DataType;
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -43,8 +45,105 @@ pub enum WriteMode {
     /// Keep existing data and append new records
     Append,
 }
-use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
-use arrow::datatypes::DataType;
+
+pub(crate) fn table_write_changes(
+    table_id: i64,
+    mode: WriteMode,
+    has_deletes: bool,
+    replaced_existing_data: bool,
+) -> String {
+    match (mode, has_deletes, replaced_existing_data) {
+        (WriteMode::Append, false, _) | (WriteMode::Replace, false, false) => {
+            format!("inserted_into_table:{table_id}")
+        },
+        (WriteMode::Append | WriteMode::Replace, true, _) | (WriteMode::Replace, false, true) => {
+            format!("deleted_from_table:{table_id},inserted_into_table:{table_id}")
+        },
+    }
+}
+
+pub(crate) fn quote_snapshot_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+pub(crate) fn quote_snapshot_table(schema_name: &str, table_name: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_snapshot_name(schema_name),
+        quote_snapshot_name(table_name)
+    )
+}
+
+/// Optional values stored in a DuckLake snapshot change row.
+///
+/// The fields map to `author`, `commit_message`, and `commit_extra_info` in
+/// `ducklake_snapshot_changes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotCommitMetadata {
+    author: Option<String>,
+    message: Option<String>,
+    extra_info: Option<String>,
+}
+
+impl SnapshotCommitMetadata {
+    /// Creates empty commit metadata.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            author: None,
+            message: None,
+            extra_info: None,
+        }
+    }
+
+    /// Sets the snapshot author.
+    #[must_use]
+    pub fn with_author(mut self, author: impl Into<String>) -> Self {
+        self.author = Some(author.into());
+        self
+    }
+
+    /// Sets the snapshot commit message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+
+    /// Sets opaque extra information for the snapshot.
+    #[must_use]
+    pub fn with_extra_info(mut self, extra_info: impl Into<String>) -> Self {
+        self.extra_info = Some(extra_info.into());
+        self
+    }
+
+    /// Returns the snapshot author.
+    #[must_use]
+    pub fn author(&self) -> Option<&str> {
+        self.author.as_deref()
+    }
+
+    /// Returns the snapshot commit message.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    /// Returns the snapshot extra information.
+    #[must_use]
+    pub fn extra_info(&self) -> Option<&str> {
+        self.extra_info.as_deref()
+    }
+
+    fn ensure_supported_by_default(&self) -> Result<()> {
+        if self.author.is_some() || self.message.is_some() || self.extra_info.is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "commit metadata is not supported by this metadata writer".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Column definition for creating or updating a table's schema.
 ///
@@ -889,6 +988,83 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         }
     }
 
+    /// Registers one data file and attaches commit metadata.
+    ///
+    /// The default implementation accepts empty metadata and otherwise returns
+    /// an error. Metadata backends that support these fields override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "conditional writes are not supported by this metadata writer".to_string(),
+            ));
+        }
+        commit_metadata.ensure_supported_by_default()?;
+        self.register_data_file(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+        )
+    }
+
+    /// Registers multiple data files and attaches commit metadata.
+    ///
+    /// The default implementation accepts empty metadata and otherwise returns
+    /// an error. Metadata backends that support these fields override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "conditional multi-file writes are not supported by this metadata writer"
+                    .to_string(),
+            ));
+        }
+        commit_metadata.ensure_supported_by_default()?;
+        self.register_data_files(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+        )
+    }
+
     /// Register a positional delete file for a single data file, superseding any
     /// prior live delete file for it (at most one is live per data file).
     ///
@@ -957,6 +1133,46 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Err(DuckLakeError::InvalidConfig(
             "register_data_file_with_deletes is not supported by this metadata writer".to_string(),
         ))
+    }
+
+    /// Registers a data file with positional deletes and commit metadata.
+    ///
+    /// The default implementation accepts empty metadata and otherwise returns
+    /// an error. Metadata backends that support these fields override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "conditional combined writes are not supported by this metadata writer".to_string(),
+            ));
+        }
+        commit_metadata.ensure_supported_by_default()?;
+        self.register_data_file_with_deletes(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+        )
     }
 
     /// Apply positional deletes to one or more existing data files in a SINGLE

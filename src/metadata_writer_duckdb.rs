@@ -39,8 +39,9 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
-    columns_differ, validate_name,
+    ColumnDef, ColumnStat, CommitIds, DataFileInfo, MetadataWriter, SnapshotCommitMetadata,
+    WriteMode, WriteSetupResult, columns_differ, quote_snapshot_name, quote_snapshot_table,
+    table_write_changes, validate_name,
 };
 use crate::partition::PartitionTransform;
 use duckdb::{Connection, OptionalExt, Transaction, params};
@@ -73,6 +74,14 @@ CREATE TABLE IF NOT EXISTS ducklake_snapshot (
     snapshot_id BIGINT PRIMARY KEY,
     snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     schema_version BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
+    snapshot_id BIGINT PRIMARY KEY,
+    changes_made VARCHAR,
+    author VARCHAR,
+    commit_message VARCHAR,
+    commit_extra_info VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_schema_versions (
@@ -321,7 +330,101 @@ fn insert_snapshot(tx: &Transaction<'_>) -> Result<(i64, i64)> {
          VALUES (?, CURRENT_TIMESTAMP, ?)",
         params![snapshot_id, schema_version],
     )?;
+    tx.execute(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+         VALUES (?, NULL)",
+        params![snapshot_id],
+    )?;
     Ok((snapshot_id, schema_version))
+}
+
+fn record_snapshot_changes(
+    tx: &Transaction<'_>,
+    snapshot_id: i64,
+    changes_made: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let changes_made = (!changes_made.is_empty()).then_some(changes_made);
+    tx.execute(
+        "UPDATE ducklake_snapshot_changes
+         SET changes_made = CASE
+                 WHEN changes_made IS NULL THEN ?
+                 WHEN ? IS NULL THEN changes_made
+                 ELSE changes_made || ',' || ?
+             END,
+             author = ?,
+             commit_message = ?,
+             commit_extra_info = ?
+         WHERE snapshot_id = ?",
+        params![
+            changes_made,
+            changes_made,
+            changes_made,
+            commit_metadata.author(),
+            commit_metadata.message(),
+            commit_metadata.extra_info(),
+            snapshot_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_table_write_changes(
+    tx: &Transaction<'_>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    mode: WriteMode,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = tx.query_row(
+        "SELECT s.begin_snapshot, t.begin_snapshot
+         FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ?",
+        params![table_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let altered: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_schema_versions
+            WHERE table_id = ? AND begin_snapshot = ?
+         )",
+        params![table_id, snapshot_id],
+        |row| row.get(0),
+    )?;
+    let replaced_existing_data: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_data_file
+            WHERE table_id = ? AND end_snapshot = ?
+         )",
+        params![table_id, snapshot_id],
+        |row| row.get(0),
+    )?;
+
+    let mut changes = Vec::new();
+    if schema_begin_snapshot == snapshot_id {
+        changes.push(format!(
+            "created_schema:{}",
+            quote_snapshot_name(schema_name)
+        ));
+    }
+    if table_begin_snapshot == snapshot_id {
+        changes.push(format!(
+            "created_table:{}",
+            quote_snapshot_table(schema_name, table_name)
+        ));
+    } else if altered {
+        changes.push(format!("altered_table:{table_id}"));
+    }
+    changes.push(table_write_changes(
+        table_id,
+        mode,
+        false,
+        replaced_existing_data,
+    ));
+    record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata)
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -705,6 +808,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![name, schema_path, snapshot_id],
             |row| row.get(0),
         )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("created_schema:{}", quote_snapshot_name(name)),
+            &SnapshotCommitMetadata::default(),
+        )?;
         tx.commit()?;
         Ok((schema_id, true))
     }
@@ -734,12 +843,24 @@ impl MetadataWriter for DuckdbMetadataWriter {
             return Ok((table_id, false));
         }
 
+        let schema_name: String = tx.query_row(
+            "SELECT schema_name FROM ducklake_schema WHERE schema_id = ?",
+            params![schema_id],
+            |row| row.get(0),
+        )?;
+
         let table_path = path.unwrap_or(name);
         let table_id: i64 = tx.query_row(
             "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
              VALUES (?, ?, ?, true, ?) RETURNING table_id",
             params![schema_id, name, table_path, snapshot_id],
             |row| row.get(0),
+        )?;
+        record_snapshot_changes(
+            &tx,
+            snapshot_id,
+            &format!("created_table:{}", quote_snapshot_table(&schema_name, name)),
+            &SnapshotCommitMetadata::default(),
         )?;
         tx.commit()?;
         Ok((table_id, true))
@@ -789,6 +910,19 @@ impl MetadataWriter for DuckdbMetadataWriter {
             column_ids.push(column_id);
         }
 
+        let table_begin_snapshot: i64 = tx.query_row(
+            "SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?",
+            params![table_id],
+            |row| row.get(0),
+        )?;
+        if table_begin_snapshot != snapshot_id {
+            record_snapshot_changes(
+                &tx,
+                snapshot_id,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )?;
+        }
         tx.commit()?;
         Ok(column_ids)
     }
@@ -796,17 +930,49 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
-        // The schema/table were created at begin, so the names are unused here;
-        // accepted only to satisfy the trait shared with multicatalog Postgres.
-        _schema_name: &str,
-        _table_name: &str,
-        _snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
+        self.register_data_file_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "conditional writes are not supported by the DuckDB metadata writer".to_string(),
+            ));
+        }
         let mut conn = self.connection();
         let tx = conn.transaction()?;
 
@@ -873,6 +1039,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![file.record_count, file.record_count, file.file_size_bytes, table_id],
         )?;
 
+        record_table_write_changes(
+            &tx,
+            snapshot_id,
+            table_id,
+            schema_name,
+            table_name,
+            mode,
+            commit_metadata,
+        )?;
         let schema_id: i64 = tx.query_row(
             "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
             params![table_id],
@@ -891,15 +1066,50 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn register_data_files(
         &self,
         table_id: i64,
-        _schema_name: &str,
-        _table_name: &str,
-        _snapshot_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
         files: &[DataFileInfo],
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
+        self.register_data_files_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        _snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "conditional multi-file writes are not supported by the DuckDB metadata writer"
+                    .to_string(),
+            ));
+        }
         if files.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "register_data_files: files must be non-empty".to_string(),
@@ -963,6 +1173,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
                  file_size_bytes = file_size_bytes + ?
              WHERE table_id = ?",
             params![total_records, total_records, total_bytes, table_id],
+        )?;
+        record_table_write_changes(
+            &tx,
+            snapshot_id,
+            table_id,
+            schema_name,
+            table_name,
+            mode,
+            commit_metadata,
         )?;
         let schema_id: i64 = tx.query_row(
             "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
@@ -1044,6 +1263,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
         let new_schema_version = bump_schema_version(&tx, new_snapshot)?;
         record_schema_version(&tx, new_snapshot, new_schema_version, table_id)?;
+        record_snapshot_changes(
+            &tx,
+            new_snapshot,
+            &format!("altered_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
         tx.commit()?;
         Ok(new_snapshot)
     }
@@ -1096,6 +1321,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let new_schema_version = bump_schema_version(&tx, new_snapshot)?;
         record_schema_version(&tx, new_snapshot, new_schema_version, table_id)?;
+        record_snapshot_changes(
+            &tx,
+            new_snapshot,
+            &format!("altered_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
         tx.commit()?;
         Ok(new_snapshot)
     }
@@ -1196,6 +1427,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
 
         // A sort-order change does NOT bump schema_version.
+        record_snapshot_changes(
+            &tx,
+            new_snapshot,
+            &format!("altered_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
         tx.commit()?;
         Ok(new_snapshot)
     }
@@ -1220,6 +1457,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
             return Ok(head);
         }
         // A sort-order change does NOT bump schema_version.
+        record_snapshot_changes(
+            &tx,
+            new_snapshot,
+            &format!("altered_table:{table_id}"),
+            &SnapshotCommitMetadata::default(),
+        )?;
         tx.commit()?;
         Ok(new_snapshot)
     }
@@ -1227,9 +1470,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn publish_snapshot(
         &self,
         table_id: i64,
-        // The schema/table were created at begin; names unused (trait parity).
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         mode: WriteMode,
         base_snapshot: i64,
@@ -1245,6 +1487,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let tx = conn.transaction()?;
         let snapshot_id =
             finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
+        record_table_write_changes(
+            &tx,
+            snapshot_id,
+            table_id,
+            schema_name,
+            table_name,
+            mode,
+            &SnapshotCommitMetadata::default(),
+        )?;
         let schema_id: i64 = tx.query_row(
             "SELECT schema_id FROM ducklake_table WHERE table_id = ?",
             params![table_id],
@@ -1323,6 +1574,9 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // "not partitioned").
         conn.execute_batch(
             "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
+        )?;
+        conn.execute_batch(
+            "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
         )?;
         // Seed the monotonic column_id allocator (snapshot_id uses MAX+1, and
         // schema/table/data_file/delete_file ids use sequences, so none of those

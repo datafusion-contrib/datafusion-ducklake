@@ -137,6 +137,17 @@ async fn drop_table_tombstones_children_and_is_idempotent() {
     )
     .await;
     assert_eq!(next_row_id, 5, "next_row_id preserved");
+    let drop_change: String = sqlx::query_scalar(
+        "SELECT changes_made
+         FROM ducklake_snapshot_changes
+         WHERE snapshot_id = (
+             SELECT MAX(snapshot_id) FROM ducklake_snapshot
+         )",
+    )
+    .fetch_one(&p)
+    .await
+    .unwrap();
+    assert_eq!(drop_change, format!("dropped_table:{}", s.table_id));
 
     // Second drop is a no-op.
     let dropped_again = h.writer.drop_table("main", "users").unwrap();

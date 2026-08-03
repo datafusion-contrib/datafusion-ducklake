@@ -10,8 +10,8 @@ use crate::maintenance::{
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
-    validate_name,
+    MetadataWriter, SnapshotCommitMetadata, WriteMode, WriteSetupResult, columns_differ,
+    table_write_changes, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::AssertSqlSafe;
@@ -135,13 +135,10 @@ CREATE TABLE IF NOT EXISTS ducklake_data_file (
 );
 
 -- Per-snapshot change ledger (DuckLake spec). One row per snapshot recording
--- what the commit did, as a comma-separated `changes_made` string (e.g.
--- `compacted_table:<table_id>` for a compaction). Written by the compaction
--- commit so DuckDB and other spec readers can attribute the snapshot; other
--- commit paths in this crate do not populate it yet.
+-- what the commit did, as a comma-separated `changes_made` string.
 CREATE TABLE IF NOT EXISTS ducklake_snapshot_changes (
     snapshot_id INTEGER PRIMARY KEY,
-    changes_made VARCHAR NOT NULL,
+    changes_made VARCHAR,
     author VARCHAR,
     commit_message VARCHAR,
     commit_extra_info VARCHAR
@@ -303,6 +300,9 @@ impl SqliteMetadataWriter {
             .max_connections(max_connections)
             .connect(connection_string)
             .await?;
+
+        // Existing catalogs must migrate even when callers skip `initialize_schema`
+        migrate_snapshot_changes_nullable(&pool).await?;
         Ok(Self {
             pool,
         })
@@ -380,6 +380,13 @@ impl SqliteMetadataWriter {
                 .await?;
             }
 
+            record_snapshot_changes(
+                &mut tx,
+                drop_snapshot,
+                &format!("dropped_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(true)
         })
@@ -950,6 +957,79 @@ async fn migrate_add_partition_id(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn migrate_snapshot_changes_nullable(pool: &SqlitePool) -> Result<()> {
+    let info = sqlx::query("SELECT name FROM pragma_table_info('ducklake_snapshot_changes')")
+        .fetch_all(pool)
+        .await?;
+    if info.is_empty() {
+        return Ok(());
+    }
+
+    let columns = info
+        .iter()
+        .map(|row| row.try_get::<String, _>("name"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (name, statement) in [
+        (
+            "author",
+            "ALTER TABLE ducklake_snapshot_changes ADD COLUMN author VARCHAR DEFAULT NULL",
+        ),
+        (
+            "commit_message",
+            "ALTER TABLE ducklake_snapshot_changes ADD COLUMN commit_message VARCHAR DEFAULT NULL",
+        ),
+        (
+            "commit_extra_info",
+            "ALTER TABLE ducklake_snapshot_changes ADD COLUMN commit_extra_info VARCHAR DEFAULT NULL",
+        ),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
+
+    let not_null: i64 = sqlx::query_scalar(
+        "SELECT `notnull` FROM pragma_table_info('ducklake_snapshot_changes')
+         WHERE name = 'changes_made'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if not_null == 0 {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "CREATE TABLE ducklake_snapshot_changes__migrate (
+            snapshot_id INTEGER PRIMARY KEY,
+            changes_made VARCHAR,
+            author VARCHAR,
+            commit_message VARCHAR,
+            commit_extra_info VARCHAR
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes__migrate
+             (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+         SELECT snapshot_id, NULLIF(changes_made, ''), author, commit_message, commit_extra_info
+         FROM ducklake_snapshot_changes",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DROP TABLE ducklake_snapshot_changes")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "ALTER TABLE ducklake_snapshot_changes__migrate RENAME TO ducklake_snapshot_changes",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Optimistic-concurrency check for a `Replace` commit (mirrors the Postgres
 /// writer). Run while holding the SQLite write lock, before retiring the prior
 /// generation: if any data file of the table has `begin_snapshot` or
@@ -1035,7 +1115,16 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     )
     .fetch_one(&mut **tx)
     .await?;
-    Ok((row.try_get(0)?, row.try_get(1)?))
+    let snapshot_id = row.try_get(0)?;
+    let schema_version = row.try_get(1)?;
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
+         VALUES (?, NULL)",
+    )
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok((snapshot_id, schema_version))
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -1280,9 +1369,15 @@ async fn recompute_table_column_stats(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "snapshot finalization requires the complete atomic write state"
+)]
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
+    schema_name: &str,
+    table_name: &str,
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
@@ -1294,10 +1389,22 @@ async fn finalize_snapshot(
     // is corrected to a DDL bump below once we've classified the commit.
     let (snapshot_id, mut schema_version) = insert_snapshot(tx).await?;
 
-    // Classify this commit as DDL vs pure data write. `current` is the table's live
-    // columns ordered by `column_order`; an empty set means a brand-new table (the
-    // creating write is DDL). Mirrors the Postgres writer's
-    // `table_was_created || columns_differ` and upstream `SchemaChangesMade()`.
+    // Classify this commit as DDL vs pure data write. The table's begin snapshot
+    // identifies creation even when it has no columns; using an empty live-column
+    // set would misclassify a later schemaless Replace as another create.
+    let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = sqlx::query_as(
+        "SELECT schema.begin_snapshot, table_meta.begin_snapshot
+         FROM ducklake_table table_meta
+         JOIN ducklake_schema schema ON schema.schema_id = table_meta.schema_id
+         WHERE table_meta.table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    // `current` is the table's live columns ordered by `column_order`. Mirrors
+    // the Postgres writer's `table_was_created || columns_differ` and upstream
+    // `SchemaChangesMade()`.
     use std::collections::{HashMap, HashSet};
     let current = sqlx::query(
         "SELECT column_name, column_type, column_order, nulls_allowed
@@ -1318,7 +1425,8 @@ async fn finalize_snapshot(
             .unwrap_or(true);
         existing.push((name, ty, nullable));
     }
-    let is_ddl = existing.is_empty() || columns_differ(&existing, columns);
+    let table_was_created = table_begin_snapshot == snapshot_id;
+    let is_ddl = table_was_created || columns_differ(&existing, columns);
     if is_ddl {
         // A DDL commit bumps the per-catalog schema_version (the insert above only
         // carried it forward). A pure data write keeps the carried value.
@@ -1416,7 +1524,60 @@ async fn finalize_snapshot(
     if is_ddl {
         record_schema_version(tx, snapshot_id, schema_version, table_id).await?;
     }
+    let mut ddl_changes = Vec::new();
+    if table_was_created {
+        if schema_begin_snapshot == table_begin_snapshot {
+            ddl_changes.push(format!(
+                "created_schema:{}",
+                crate::metadata_writer::quote_snapshot_name(schema_name),
+            ));
+        }
+        ddl_changes.push(format!(
+            "created_table:{}",
+            crate::metadata_writer::quote_snapshot_table(schema_name, table_name),
+        ));
+    } else if is_ddl {
+        ddl_changes.push(format!("altered_table:{table_id}"));
+    }
+    if !ddl_changes.is_empty() {
+        record_snapshot_changes(
+            tx,
+            snapshot_id,
+            &ddl_changes.join(","),
+            &SnapshotCommitMetadata::default(),
+        )
+        .await?;
+    }
     Ok(snapshot_id)
+}
+
+async fn record_snapshot_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    snapshot_id: i64,
+    changes_made: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let changes_made = (!changes_made.is_empty()).then_some(changes_made);
+    sqlx::query(
+        "UPDATE ducklake_snapshot_changes
+         SET changes_made = CASE
+                 WHEN changes_made IS NULL THEN ?
+                 WHEN ? IS NULL THEN changes_made
+                 ELSE changes_made || ',' || ?
+             END,
+             author = ?, commit_message = ?, commit_extra_info = ?
+         WHERE snapshot_id = ?",
+    )
+    .bind(changes_made)
+    .bind(changes_made)
+    .bind(changes_made)
+    .bind(commit_metadata.author())
+    .bind(commit_metadata.message())
+    .bind(commit_metadata.extra_info())
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
@@ -1429,8 +1590,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            // A bare snapshot carries no schema change of its own → carry
-            // schema_version forward (no DDL bump, no ledger row).
+            // A bare snapshot carries no schema change of its own, so carry
+            // schema_version forward with the empty change summary inserted by
+            // `insert_snapshot`.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             tx.commit().await?;
             Ok(snapshot_id)
@@ -1445,16 +1607,19 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<(i64, bool)> {
         validate_name(name, "Schema")?;
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
                  WHERE schema_name = ? AND end_snapshot IS NULL",
             )
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
-                return Ok((row.try_get(0)?, false));
+                let schema_id = row.try_get(0)?;
+                tx.commit().await?;
+                return Ok((schema_id, false));
             }
 
             let schema_path = path.unwrap_or(name);
@@ -1465,10 +1630,21 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(name)
             .bind(schema_path)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-
-            Ok((row.try_get(0)?, true))
+            let schema_id = row.try_get(0)?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_schema:{}",
+                    crate::metadata_writer::quote_snapshot_name(name),
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok((schema_id, true))
         })
     }
 
@@ -1481,18 +1657,27 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
         block_on(async {
+            let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
                  WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
             )
             .bind(schema_id)
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
-                return Ok((row.try_get(0)?, false));
+                let table_id = row.try_get(0)?;
+                tx.commit().await?;
+                return Ok((table_id, false));
             }
+
+            let schema_name: String =
+                sqlx::query_scalar("SELECT schema_name FROM ducklake_schema WHERE schema_id = ?")
+                    .bind(schema_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
 
             let table_path = path.unwrap_or(name);
             let row = sqlx::query(
@@ -1503,10 +1688,21 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(name)
             .bind(table_path)
             .bind(snapshot_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
-
-            Ok((row.try_get(0)?, true))
+            let table_id = row.try_get(0)?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &format!(
+                    "created_table:{}",
+                    crate::metadata_writer::quote_snapshot_table(&schema_name, name),
+                ),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok((table_id, true))
         })
     }
 
@@ -1600,6 +1796,13 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record the schema-change ledger row so consumers can detect the change.
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
 
             // TODO(commit-time type guard, task #4): close the window where an Append
             // whose staging began before this promote commits afterward under the old
@@ -1690,6 +1893,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Setting a spec is DDL: bump + record schema_version.
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
 
             tx.commit().await?;
             Ok(new_snapshot)
@@ -1755,6 +1965,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Removing the spec is DDL: bump + record schema_version.
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1871,6 +2088,13 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // A sort-order change does NOT bump schema_version (see the trait doc):
             // it does not alter the logical schema, only future write layout.
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1901,6 +2125,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok(head);
             }
             // A sort-order change does NOT bump schema_version.
+            record_snapshot_changes(
+                &mut tx,
+                new_snapshot,
+                &format!("altered_table:{table_id}"),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             tx.commit().await?;
             Ok(new_snapshot)
         })
@@ -1921,6 +2152,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Use a transaction to ensure atomicity: if column insertion fails,
             // we don't leave existing columns marked as ended
             let mut tx = self.pool.begin().await?;
+            let table_begin_snapshot: i64 =
+                sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?")
+                    .bind(table_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
 
             sqlx::query(
                 "UPDATE ducklake_column SET end_snapshot = ?
@@ -1956,6 +2192,15 @@ impl MetadataWriter for SqliteMetadataWriter {
                 column_ids.push(column_id);
             }
 
+            if table_begin_snapshot != snapshot_id {
+                record_snapshot_changes(
+                    &mut tx,
+                    snapshot_id,
+                    &format!("altered_table:{table_id}"),
+                    &SnapshotCommitMetadata::default(),
+                )
+                .await?;
+            }
             tx.commit().await?;
             Ok(column_ids)
         })
@@ -1964,16 +2209,43 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn register_data_file(
         &self,
         table_id: i64,
-        // SQLite created the schema/table at begin, so the names are unused here;
-        // accepted only to satisfy the trait shared with multicatalog Postgres.
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_file_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         file: &DataFileInfo,
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         block_on(async {
             // Single atomic commit: insert the deferred snapshot row + finalize
@@ -1983,9 +2255,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             // only ever resolves to fully-populated data (no empty-read window).
             let mut tx = self.pool.begin().await?;
 
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
 
             // Partition-spec fence: this file must be consistent with the table's live
             // partition generation at commit time (both directions — see
@@ -2064,6 +2349,19 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let replaced_existing_data = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = ? AND end_snapshot = ?
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
+
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -2084,14 +2382,44 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn register_data_files(
         &self,
         table_id: i64,
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_files_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         files: &[DataFileInfo],
         mode: WriteMode,
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         if files.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
@@ -2103,9 +2431,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             // (Replace) retire the prior generation ONCE, then insert every file with
             // a distinct row_id_start from the advancing row-lineage counter.
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time —
             // no file stamped with a retired partition_id, and no non-empty
@@ -2181,6 +2522,18 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
+            let replaced_existing_data = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = ? AND end_snapshot = ?
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -2200,7 +2553,6 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn set_delete_file(
         &self,
         table_id: i64,
-        // SQLite created the schema/table at begin; names unused (trait parity).
         _schema_name: &str,
         _table_name: &str,
         _snapshot_id: i64,
@@ -2292,6 +2644,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -2311,9 +2672,38 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn register_data_file_with_deletes(
         &self,
         table_id: i64,
-        // SQLite created the schema/table at begin; names unused (trait parity).
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        self.register_data_file_with_deletes_and_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         file: &DataFileInfo,
         deletes: &[DeleteFileEntry],
@@ -2321,6 +2711,8 @@ impl MetadataWriter for SqliteMetadataWriter {
         base_snapshot: i64,
         columns: &[ColumnDef],
         column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         validate_delete_entries(mode, deletes)?;
         block_on(async {
@@ -2331,9 +2723,22 @@ impl MetadataWriter for SqliteMetadataWriter {
             // ever resolves to the fully-applied mutation.
             let mut tx = self.pool.begin().await?;
 
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
 
             // Partition-spec fence: the new row versions are a NEW write, so they
             // must agree with the table's live partition generation exactly as
@@ -2479,6 +2884,20 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
+            let replaced_existing_data = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = ? AND end_snapshot = ?
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made =
+                table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
+
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -2497,7 +2916,6 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn commit_positional_deletes(
         &self,
         table_id: i64,
-        // SQLite created the schema/table at begin; names unused (trait parity).
         _schema_name: &str,
         _table_name: &str,
         base_snapshot: i64,
@@ -2596,6 +3014,15 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
 
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
@@ -2832,16 +3259,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             // Attribute the snapshot for spec readers (DuckDB reads this ledger).
-            sqlx::query(
-                "INSERT INTO ducklake_snapshot_changes
-                     (snapshot_id, changes_made, commit_message)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(snapshot_id)
-            .bind(format!("compacted_table:{table_id}"))
-            .bind("datafusion compaction")
-            .execute(&mut *tx)
-            .await?;
+            let changes_made = format!("compacted_table:{table_id}");
+            let commit_metadata =
+                SnapshotCommitMetadata::new().with_message("datafusion compaction");
+            record_snapshot_changes(&mut tx, snapshot_id, &changes_made, &commit_metadata).await?;
 
             let schema_id: i64 =
                 sqlx::query_scalar("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
@@ -2973,6 +3394,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             let (columns, column_ids) = live_columns_for_stats(table_id, &mut tx).await?;
             recompute_table_column_stats(&mut tx, table_id, &columns, &column_ids).await?;
 
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+
             tx.commit().await?;
             Ok(Some(snapshot_id))
         })
@@ -3053,6 +3483,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
+            let changes_made = format!("deleted_from_table:{table_id}");
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+
             tx.commit().await?;
             Ok(live_rows)
         })
@@ -3061,9 +3500,8 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn publish_snapshot(
         &self,
         table_id: i64,
-        // SQLite created the schema/table at begin; names unused (trait parity).
-        _schema_name: &str,
-        _table_name: &str,
+        schema_name: &str,
+        table_name: &str,
         _snapshot_id: i64,
         mode: WriteMode,
         base_snapshot: i64,
@@ -3079,9 +3517,35 @@ impl MetadataWriter for SqliteMetadataWriter {
         // register_data_file instead.
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let snapshot_id = finalize_snapshot(
+                &mut tx,
+                table_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            let replaced_existing_data = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ducklake_data_file
+                    WHERE table_id = ? AND end_snapshot = ?
+                 )",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &changes_made,
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
             let schema_id: i64 =
                 sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = ?")
                     .bind(table_id)
@@ -3181,6 +3645,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
             // (idempotent, lossless — NULL means "not partitioned").
             migrate_add_partition_id(&self.pool).await?;
+            migrate_snapshot_changes_nullable(&self.pool).await?;
             // Seed the monotonic id allocators. snapshot_id and column_id are
             // reserved in begin_write_transaction and inserted at the commit, so
             // they can't use rowid autoincrement (inserting the ducklake_snapshot
@@ -3549,6 +4014,184 @@ mod tests {
         assert_eq!(cnt2, 2, "migration must be idempotent");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn migrate_snapshot_changes_to_nullable() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("legacy.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect(&conn_str).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE ducklake_snapshot_changes (
+                snapshot_id INTEGER PRIMARY KEY,
+                changes_made VARCHAR NOT NULL,
+                author VARCHAR,
+                commit_message VARCHAR,
+                commit_extra_info VARCHAR
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ducklake_snapshot_changes
+                 (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+             VALUES (1, '', NULL, NULL, NULL),
+                    (2, 'inserted_into_table:7', 'author', 'message', 'extra')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate_snapshot_changes_nullable(&pool).await.unwrap();
+
+        let not_null: i64 = sqlx::query_scalar(
+            "SELECT `notnull` FROM pragma_table_info('ducklake_snapshot_changes')
+             WHERE name = 'changes_made'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT snapshot_id, changes_made, author, commit_message, commit_extra_info
+             FROM ducklake_snapshot_changes ORDER BY snapshot_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(not_null, 0);
+        assert_eq!(
+            rows,
+            vec![
+                (1, None, None, None, None),
+                (
+                    2,
+                    Some("inserted_into_table:7".to_string()),
+                    Some("author".to_string()),
+                    Some("message".to_string()),
+                    Some("extra".to_string()),
+                ),
+            ],
+        );
+
+        migrate_snapshot_changes_nullable(&pool).await.unwrap();
+        let row_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot_changes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row_count, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_legacy_snapshot_changes_with_plain_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("legacy.db");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap();
+
+        sqlx::query("DROP TABLE ducklake_snapshot_changes")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE ducklake_snapshot_changes (
+                snapshot_id INTEGER PRIMARY KEY,
+                changes_made VARCHAR NOT NULL
+            )",
+        )
+        .execute(&writer.pool)
+        .await
+        .unwrap();
+        drop(writer);
+
+        let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let changes_made: Option<String> = sqlx::query_scalar(
+            "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        assert_eq!(changes_made, None);
+
+        let commit_metadata = SnapshotCommitMetadata::new()
+            .with_author("Jane Doe")
+            .with_message("Imported official catalog")
+            .with_extra_info("migration-regression");
+        let mut tx = writer.pool.begin().await.unwrap();
+        record_snapshot_changes(
+            &mut tx,
+            snapshot_id,
+            "inserted_into_table:7",
+            &commit_metadata,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let columns = sqlx::query(
+            "SELECT name, `notnull` FROM pragma_table_info('ducklake_snapshot_changes')",
+        )
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                row.try_get::<String, _>("name").unwrap(),
+                row.try_get::<i64, _>("notnull").unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT changes_made, author, commit_message, commit_extra_info
+             FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            columns,
+            vec![
+                ("snapshot_id".to_string(), 0),
+                ("changes_made".to_string(), 0),
+                ("author".to_string(), 0),
+                ("commit_message".to_string(), 0),
+                ("commit_extra_info".to_string(), 0),
+            ],
+        );
+        assert_eq!(
+            row,
+            (
+                Some("inserted_into_table:7".to_string()),
+                Some("Jane Doe".to_string()),
+                Some("Imported official catalog".to_string()),
+                Some("migration-regression".to_string()),
+            ),
+        );
+    }
+
     /// An existing catalog whose `ducklake_snapshot` predates `schema_version`
     /// (the pre-#151 shape) must gain the column in place: idempotent, lossless,
     /// and existing snapshot rows take the `DEFAULT 0`. `CREATE TABLE IF NOT
@@ -3684,6 +4327,61 @@ mod tests {
         assert_eq!(column_ids.len(), 2);
         assert_eq!(column_ids[0], 1);
         assert_eq!(column_ids[1], 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ddl_snapshots_record_spec_change_tokens() {
+        let (writer, _temp) = create_test_writer().await;
+        let bare_snapshot = writer.create_snapshot().unwrap();
+        let ddl_snapshot = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("ma\"in", None, ddl_snapshot)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "ev\"ents", None, ddl_snapshot)
+            .unwrap();
+        writer
+            .set_columns(
+                table_id,
+                &[ColumnDef::new("id", "int64", false).unwrap()],
+                ddl_snapshot,
+            )
+            .unwrap();
+        let partition_snapshot = writer
+            .set_partition_spec(
+                table_id,
+                &[("id".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        let reset_snapshot = writer.reset_partition_spec(table_id).unwrap();
+
+        let rows = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT snapshot_id, changes_made
+             FROM ducklake_snapshot_changes
+             ORDER BY snapshot_id",
+        )
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows,
+            vec![
+                (bare_snapshot, None),
+                (
+                    ddl_snapshot,
+                    Some(
+                        "created_schema:\"ma\"\"in\",created_table:\"ma\"\"in\".\"ev\"\"ents\""
+                            .to_string(),
+                    ),
+                ),
+                (
+                    partition_snapshot,
+                    Some(format!("altered_table:{table_id}"))
+                ),
+                (reset_snapshot, Some(format!("altered_table:{table_id}"))),
+            ],
+        );
     }
 
     /// Phase C (catalog-state faithfulness): a type promotion must leave the
@@ -3959,6 +4657,141 @@ mod tests {
             )
             .unwrap();
         assert_eq!(committed.snapshot_id, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_changes_are_atomic_with_append_and_replace() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+
+        let appended = writer
+            .register_data_file(
+                table_id,
+                "main",
+                "users",
+                snapshot_id,
+                &DataFileInfo::new("append.parquet", 1024, 100),
+                WriteMode::Append,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let replacement_snapshot_id = reserve_snapshot(&writer).await;
+        let commit_metadata = SnapshotCommitMetadata::new()
+            .with_author("Jane Doe")
+            .with_message("Replace imported data")
+            .with_extra_info("opaque-application-value");
+        let replaced = writer
+            .register_data_file_with_commit_metadata(
+                table_id,
+                "main",
+                "users",
+                replacement_snapshot_id,
+                &DataFileInfo::new("replace.parquet", 512, 50),
+                WriteMode::Replace,
+                appended.snapshot_id,
+                &[],
+                &[],
+                &commit_metadata,
+                None,
+            )
+            .unwrap();
+
+        let rows = sqlx::query(
+            "SELECT snapshot_id, changes_made, author, commit_message, commit_extra_info
+             FROM ducklake_snapshot_changes
+             ORDER BY snapshot_id",
+        )
+        .fetch_all(&writer.pool)
+        .await
+        .unwrap();
+        let actual = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<i64, _>("snapshot_id").unwrap(),
+                    row.try_get::<String, _>("changes_made").unwrap(),
+                    row.try_get::<Option<String>, _>("author").unwrap(),
+                    row.try_get::<Option<String>, _>("commit_message").unwrap(),
+                    row.try_get::<Option<String>, _>("commit_extra_info")
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    appended.snapshot_id,
+                    format!(
+                        "created_schema:\"main\",created_table:\"main\".\"users\",\
+                         inserted_into_table:{table_id}"
+                    ),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    replaced.snapshot_id,
+                    format!("deleted_from_table:{table_id},inserted_into_table:{table_id}"),
+                    Some("Jane Doe".to_string()),
+                    Some("Replace imported data".to_string()),
+                    Some("opaque-application-value".to_string()),
+                ),
+            ],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_replace_records_insertion_without_deletion() {
+        let (writer, _temp) = create_test_writer().await;
+        let snapshot_id = reserve_snapshot(&writer).await;
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        let (table_id, _) = writer
+            .get_or_create_table(schema_id, "events", None, snapshot_id)
+            .unwrap();
+
+        let committed = writer
+            .register_data_file(
+                table_id,
+                "main",
+                "events",
+                snapshot_id,
+                &DataFileInfo::new("initial.parquet", 100, 3),
+                WriteMode::Replace,
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let changes_made: String = sqlx::query_scalar(
+            "SELECT changes_made
+             FROM ducklake_snapshot_changes
+             WHERE snapshot_id = ?",
+        )
+        .bind(committed.snapshot_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            changes_made,
+            format!(
+                "created_schema:\"main\",created_table:\"main\".\"events\",\
+                 inserted_into_table:{table_id}"
+            ),
+        );
     }
 
     /// Reserve the next snapshot id the way `begin_write_transaction` now does
