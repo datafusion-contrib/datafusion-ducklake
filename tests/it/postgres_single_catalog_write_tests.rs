@@ -129,6 +129,7 @@ async fn creates_no_multicatalog_tables() {
     for t in [
         "ducklake_metadata",
         "ducklake_snapshot",
+        "ducklake_snapshot_changes",
         "ducklake_schema",
         "ducklake_table",
         "ducklake_column",
@@ -818,6 +819,238 @@ async fn unsupported_operations_error() {
         "type promotion must be rejected"
     );
     assert!(!writer.supports_update(), "UPDATE is not supported");
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot change records + commit metadata (#209 surface)
+// ---------------------------------------------------------------------------
+
+async fn changes_for(pool: &PgPool, snapshot_id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1")
+        .bind(snapshot_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The creating write records the schema, the table, and the insert — all three
+/// accumulate onto the one snapshot's `changes_made`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn snapshot_changes_record_create_and_insert() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+
+    let result = DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap();
+
+    let changes = changes_for(&pool, result.snapshot_id).await.unwrap();
+    assert!(
+        changes.contains(r#"created_schema:"main""#),
+        "missing created_schema in {changes:?}"
+    );
+    assert!(
+        changes.contains(r#"created_table:"main"."t""#),
+        "missing created_table in {changes:?}"
+    );
+    assert!(
+        changes.contains(&format!("inserted_into_table:{}", result.table_id)),
+        "missing inserted_into_table in {changes:?}"
+    );
+}
+
+/// A `Replace` that supersedes existing files records both the delete and the
+/// insert, per `table_write_changes`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn replace_records_delete_and_insert() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer), object_store()).unwrap();
+
+    tw.write_table("main", "t", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap();
+    let second = tw
+        .write_table("main", "t", &[batch(vec![2], vec![Some("b")])])
+        .await
+        .unwrap();
+
+    let changes = changes_for(&pool, second.snapshot_id).await.unwrap();
+    assert!(
+        changes.contains(&format!("deleted_from_table:{}", second.table_id)),
+        "missing deleted_from_table in {changes:?}"
+    );
+    assert!(
+        changes.contains(&format!("inserted_into_table:{}", second.table_id)),
+        "missing inserted_into_table in {changes:?}"
+    );
+}
+
+/// Every snapshot must carry exactly one change row — `insert_snapshot` seeds it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn every_snapshot_has_exactly_one_change_row() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer), object_store()).unwrap();
+
+    tw.write_table("main", "t", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+    tw.append_table("main", "t", &[batch(vec![2], vec![None])])
+        .await
+        .unwrap();
+
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_snapshot s
+         LEFT JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
+         WHERE c.snapshot_id IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphans, 0, "every snapshot needs a change row");
+
+    let snapshots: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let change_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot_changes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(snapshots, change_rows);
+}
+
+/// Author / message / extra-info round-trip through
+/// `register_data_file_with_commit_metadata`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn commit_metadata_is_persisted() {
+    use datafusion_ducklake::SnapshotCommitMetadata;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let setup_result = writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+        .unwrap();
+
+    let meta = SnapshotCommitMetadata::new()
+        .with_author("alice")
+        .with_message("nightly load")
+        .with_extra_info("job=42");
+
+    let ids = writer
+        .register_data_file_with_commit_metadata(
+            setup_result.table_id,
+            "main",
+            "t",
+            setup_result.snapshot_id,
+            &DataFileInfo::new("t/data.parquet", 1024, 1),
+            WriteMode::Append,
+            setup_result.base_snapshot_id,
+            &cols(),
+            &setup_result.column_ids,
+            &meta,
+            None,
+        )
+        .unwrap();
+
+    let (author, message, extra): (Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as(
+            "SELECT author, commit_message, commit_extra_info
+             FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(ids.snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(author.as_deref(), Some("alice"));
+    assert_eq!(message.as_deref(), Some("nightly load"));
+    assert_eq!(extra.as_deref(), Some("job=42"));
+}
+
+/// Conditional (compare-and-swap) writes are not implemented on this backend and
+/// must fail closed rather than commit unconditionally.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn conditional_writes_are_rejected() {
+    use datafusion_ducklake::SnapshotCommitMetadata;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (writer, _pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let setup_result = writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+        .unwrap();
+
+    let err = writer
+        .register_data_file_with_commit_metadata(
+            setup_result.table_id,
+            "main",
+            "t",
+            setup_result.snapshot_id,
+            &DataFileInfo::new("t/data.parquet", 1024, 1),
+            WriteMode::Append,
+            setup_result.base_snapshot_id,
+            &cols(),
+            &setup_result.column_ids,
+            &SnapshotCommitMetadata::default(),
+            Some(setup_result.base_snapshot_id),
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("conditional writes are not supported"),
+        "unexpected error: {err}"
+    );
+
+    let files_err = writer
+        .register_data_files_with_commit_metadata(
+            setup_result.table_id,
+            "main",
+            "t",
+            setup_result.snapshot_id,
+            &[DataFileInfo::new("t/data.parquet", 1024, 1)],
+            WriteMode::Append,
+            setup_result.base_snapshot_id,
+            &cols(),
+            &setup_result.column_ids,
+            &SnapshotCommitMetadata::default(),
+            Some(setup_result.base_snapshot_id),
+        )
+        .unwrap_err();
+    assert!(
+        files_err
+            .to_string()
+            .contains("conditional multi-file writes are not supported"),
+        "unexpected error: {files_err}"
+    );
+}
+
+/// Partition DDL is an ALTER and must say so in the change record.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn partition_ddl_records_altered_table() {
+    use datafusion_ducklake::PartitionTransform;
+
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let (table_id, _) = writer
+        .get_or_create_table(schema_id, "t", None, snapshot)
+        .unwrap();
+    writer.set_columns(table_id, &cols(), snapshot).unwrap();
+
+    let ddl_snapshot = writer
+        .set_partition_spec(
+            table_id,
+            &[("name".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    let changes = changes_for(&pool, ddl_snapshot).await.unwrap();
+    assert_eq!(changes, format!("altered_table:{table_id}"));
 }
 
 /// Opening a writer over an existing pool must not re-run DDL or disturb state.
