@@ -1,58 +1,23 @@
-//! Single-catalog PostgreSQL implementation of [`MetadataWriter`].
+//! Single-catalog PostgreSQL implementation of [`MetadataWriter`] — the standard,
+//! spec-compliant DuckLake layout, readable by DuckDB's `ducklake` extension.
 //!
-//! This is the **standard, spec-compliant** DuckLake layout on PostgreSQL — the
-//! same on-disk/in-catalog shape the SQLite and MySQL writers produce, and the
-//! shape DuckDB's `ducklake` extension reads. It is deliberately separate from
-//! [`crate::metadata_writer_postgres::PostgresMetadataWriter`], which implements
-//! this crate's *library-specific* multicatalog layout (extra `catalog_id`
-//! columns plus `ducklake_catalog*` map tables) and is not part of the DuckLake
-//! specification.
+//! Separate from [`crate::metadata_writer_postgres::PostgresMetadataWriter`], which
+//! writes this crate's multicatalog layout (`catalog_id` columns plus
+//! `ducklake_catalog*` map tables) and is not part of the DuckLake spec.
 //!
-//! Modelled on [`crate::metadata_writer_mysql::MySqlMetadataWriter`] rather than
-//! the multicatalog Postgres writer: same single-catalog structure, same
-//! supported surface, with the SQL mapped to the Postgres dialect.
+//! Modelled on [`crate::metadata_writer_mysql::MySqlMetadataWriter`]: same
+//! single-catalog structure and supported surface, SQL mapped to Postgres. Deletes,
+//! upserts, compaction and type promotion inherit their erroring trait defaults, and
+//! [`MetadataWriter::catalog_id`] inherits `None` so paths stay unscoped. Sync trait
+//! methods bridge async sqlx via `crate::metadata_provider::block_on`, so a
+//! multi-threaded Tokio runtime is required.
 //!
-//! ## Supported surface
-//!
-//! The write primitives the crate's table-write path needs (INSERT / REPLACE /
-//! CREATE TABLE), plus partition and sort specs. Deliberately NOT supported —
-//! these inherit their erroring trait defaults: deletes
-//! ([`MetadataWriter::set_delete_file`]), upserts, compaction, and type
-//! promotion ([`MetadataWriter::promote_column_type`]).
-//! [`MetadataWriter::catalog_id`] inherits the `None` default, which is what
-//! keeps newly-written file paths in the unscoped
-//! `{data_path}/{schema}/{table}/…` layout (the multicatalog writer returns
-//! `Some(id)` and scopes them under `cat_{id}/…`).
-//!
-//! Requires a multi-threaded Tokio runtime (`#[tokio::test(flavor =
-//! "multi_thread")]`): the sync trait methods bridge async sqlx via
-//! `crate::metadata_provider::block_on`, exactly like the SQLite and MySQL
-//! writers.
-//!
-//! ## Postgres dialect adaptations vs the MySQL template
-//!
-//! 1. **`RETURNING` exists.** IDENTITY-backed ids (`schema_id`, `table_id`,
-//!    `data_file_id`) come straight back from `INSERT … RETURNING`, replacing
-//!    MySQL's `last_insert_id()` round-trip. `reserve_ids` likewise collapses
-//!    to a single `UPDATE … RETURNING`.
-//! 2. **`snapshot_id` stays counter-allocated, not IDENTITY.** Upstream's
-//!    `ducklake_snapshot.snapshot_id` is a plain `BIGINT PRIMARY KEY`, and a
-//!    counter row gives the property the `Replace` conflict test depends on: the
-//!    `UPDATE` takes an exclusive row lock held to commit, so every commit
-//!    transaction serializes on it and *snapshot id order equals commit order*.
-//!    A bare Postgres sequence would not — sequences are non-transactional, so
-//!    two concurrent writers can commit out of id order and the scalar
-//!    `> base_snapshot` test would miss a conflict. The multicatalog writer gets
-//!    the same guarantee from its per-catalog `FOR UPDATE` lock, which has no
-//!    single-catalog equivalent.
-//! 3. **DDL type mapping.** `TINYINT(1)`→`BOOLEAN`, `VARCHAR(1024)`/`TEXT`→
-//!    `VARCHAR`, `DATETIME(6)`→`TIMESTAMP`, no `ENGINE = InnoDB`.
-//! 4. **No backticks.** `key`/`value` are non-reserved in Postgres and the
-//!    providers read them unquoted, so they stay bare here too.
-//! 5. **`INSERT IGNORE`→`INSERT … ON CONFLICT (table_id) DO NOTHING`.**
-//! 6. **`ADD COLUMN IF NOT EXISTS`** replaces MySQL's `information_schema` probe.
-//! 7. **Self-referential `INSERT … SELECT` is legal**, so `seed_counter` is a
-//!    single idempotent statement rather than MySQL's check-then-insert.
+//! `snapshot_id` is counter-allocated rather than IDENTITY. Upstream's column is a
+//! plain `BIGINT PRIMARY KEY`, and the counter's `UPDATE` holds a row lock to commit,
+//! so commits serialize and snapshot-id order equals commit order — what the
+//! `Replace` conflict test relies on. Sequences are non-transactional and would not
+//! give that; the multicatalog writer gets it from a per-catalog `FOR UPDATE` lock
+//! that has no single-catalog equivalent.
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
@@ -68,18 +33,9 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
-/// The DuckLake catalog tables in Postgres dialect, one `CREATE TABLE` per entry.
-/// sqlx runs each `query()` as a single prepared statement, so the DDL must be
-/// split rather than sent as one `;`-joined script.
-///
-/// Columns and their order match the SQLite and MySQL writers' schemas (and so
-/// upstream DuckLake) for catalog compatibility; only the SQL types are mapped.
-/// IDENTITY PKs back the ids read via `RETURNING`
-/// (`schema_id`/`table_id`/`data_file_id`/`delete_file_id`). `snapshot_id` is a
-/// plain PK assigned from the `next_snapshot_id` counter, and `ducklake_column`
-/// is a bare table (no PK) so a versioned column can hold multiple rows sharing
-/// a `column_id` — matching upstream, and unlike the multicatalog writer's
-/// composite-PK variant.
+/// The DuckLake catalog tables in Postgres dialect. Columns and their order match
+/// the SQLite and MySQL writers (and so upstream); only the SQL types differ. Split
+/// one per entry because sqlx runs each `query()` as a single prepared statement.
 const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
@@ -124,11 +80,9 @@ const SQL_CREATE_TABLES: &[&str] = &[
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT
     )"#,
-    // Bare table (no PRIMARY KEY), mirroring upstream `ducklake_column`: a column
-    // is versioned by `[begin_snapshot, end_snapshot)` and — although this writer
-    // never promotes types — the shape stays identical to SQLite/MySQL/upstream so
-    // catalogs interoperate. The four `*default*` columns and `parent_column` are
-    // left NULL (no nested-type / column-default writes).
+    // Bare table (no PRIMARY KEY), mirroring upstream: a versioned column needs
+    // several rows sharing one `column_id`. The `*default*` columns and
+    // `parent_column` are left NULL.
     r#"CREATE TABLE IF NOT EXISTS ducklake_column (
         column_id BIGINT,
         begin_snapshot BIGINT,
@@ -307,15 +261,9 @@ impl PostgresSingleCatalogMetadataWriter {
     }
 }
 
-/// Atomically reserve `n` consecutive ids from a monotonic counter stored in
-/// `ducklake_metadata` (seeded by `initialize_schema`), returning the LAST id of
-/// the block — the reserved ids are `last - n + 1 ..= last`.
-///
-/// Postgres has `UPDATE … RETURNING`, so unlike MySQL this is one statement. The
-/// `UPDATE` takes an exclusive row lock held until commit, so a concurrent
-/// `reserve_ids` on the same `key` blocks here rather than handing out an
-/// overlapping id — the same serialization SQLite gets from its single-writer
-/// lock. Used for `column_id`, `snapshot_id`, `partition_id` and `sort_id`.
+/// Reserve `n` consecutive ids from a counter in `ducklake_metadata`, returning the
+/// LAST of the block (`last - n + 1 ..= last`). The `UPDATE` holds an exclusive row
+/// lock until commit, so concurrent reservations block rather than overlap.
 async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &str,
@@ -335,11 +283,8 @@ async fn reserve_ids(
     Ok(last)
 }
 
-/// Seed a monotonic id counter row if it does not already exist, starting from
-/// the current MAX of its backing column so a pre-existing catalog keeps
-/// allocating without reuse. Idempotent: the `WHERE NOT EXISTS` guard makes a
-/// re-open a no-op. (Postgres, unlike MySQL, permits the self-referential
-/// `INSERT … SELECT` against `ducklake_metadata`.)
+/// Seed an id counter from the current MAX of its backing column, so a pre-existing
+/// catalog keeps allocating without reuse. `WHERE NOT EXISTS` makes a re-open a no-op.
 async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result<()> {
     let start: i64 = sqlx::query(max_sql).fetch_one(pool).await?.try_get(0)?;
     sqlx::query(
@@ -356,13 +301,9 @@ async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result
     Ok(())
 }
 
-/// Optimistic-concurrency check for a `Replace` commit (mirrors the SQLite /
-/// MySQL writers). Run before retiring the prior generation: if any data file of
-/// the table has `begin_snapshot` or `end_snapshot` newer than `base_snapshot`
-/// (the head observed when this write began), another writer published a newer
-/// generation in the meantime, so this `Replace` aborts with
-/// [`crate::DuckLakeError::Conflict`] rather than clobbering it. (`Append` does
-/// not call this: concurrent appends commute.)
+/// Abort a `Replace` whose base is stale: any data file newer than `base_snapshot`
+/// means another writer published in the meantime. `Append` does not call this —
+/// concurrent appends commute.
 async fn detect_replace_conflict(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -432,16 +373,12 @@ async fn seed_table_stats(
     Ok(())
 }
 
-/// Insert the next `ducklake_snapshot` row, carrying `schema_version` forward
-/// (the pure-data-write default), and return `(snapshot_id, schema_version)`.
+/// Insert the next `ducklake_snapshot` row, carrying `schema_version` forward.
 ///
-/// `snapshot_id` is allocated from the `next_snapshot_id` counter. [`reserve_ids`]
-/// takes an exclusive row lock on that counter row held until this transaction
-/// commits, so this is the "write-lock-first" serialization point of a commit —
-/// every commit transaction contends on the single counter row, so per-catalog
-/// id order equals commit order and the scalar `> base_snapshot` conflict test is
-/// exact. See the module docs for why a bare IDENTITY sequence is not used here.
-/// A DDL commit follows this with [`bump_schema_version`].
+/// Reserving `snapshot_id` takes the counter's row lock, making this the
+/// serialization point of a commit — so id order equals commit order, which the
+/// `> base_snapshot` conflict test depends on. A DDL commit follows with
+/// [`bump_schema_version`].
 async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(i64, i64)> {
     let snapshot_id = reserve_ids(tx, "next_snapshot_id", 1).await?;
     // Carry the current per-catalog schema_version forward; a DDL commit corrects
@@ -473,11 +410,8 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Resu
 }
 
 /// Append to this snapshot's `changes_made` list and stamp its commit metadata.
-///
-/// Appending (rather than overwriting) matters because a single snapshot can
-/// accumulate several changes — e.g. a first write creates the schema, the table,
-/// and inserts rows. Postgres lets one placeholder be reused, so `$1` appears
-/// three times in the CASE rather than being bound three times as on MySQL.
+/// Appends rather than overwrites: one snapshot can create a schema, a table, and
+/// insert rows.
 async fn record_snapshot_changes(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot_id: i64,
@@ -766,17 +700,13 @@ async fn live_partition_id(
     .await?)
 }
 
-/// The atomic commit point for a single-catalog write. Inserts the deferred
-/// `ducklake_snapshot` row, finalizes the column generation, and — for
-/// `Replace` — retires the prior data generation. All within the caller's
-/// transaction, so a reader never sees a half-published head.
+/// The atomic commit point: insert the deferred snapshot row, finalize the column
+/// generation, and for `Replace` retire the prior data generation — all in the
+/// caller's transaction, so a reader never sees a half-published head.
 ///
-/// The column generation is deferred to here (rather than written in
-/// `begin_write_transaction`) because the read path resolves a table's columns by
-/// `end_snapshot IS NULL` only (not snapshot-scoped), so inserting the new
-/// generation at begin would leak it to concurrent reads during the upload
-/// window. `column_ids` are the ids reserved at begin and already baked into the
-/// staged parquet's `field_id` metadata.
+/// The column generation is deferred to here rather than written at begin because
+/// the read path resolves columns by `end_snapshot IS NULL` alone (not
+/// snapshot-scoped), so writing them early would leak them to concurrent reads.
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -1814,20 +1744,16 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .execute(&self.pool)
             .await?;
-            // A catalog created elsewhere may have `changes_made` NOT NULL, but
-            // `insert_snapshot` seeds the row with NULL and fills it in at commit.
-            // Dropping a non-existent NOT NULL is a no-op in Postgres, so this is
-            // idempotent without a probe.
+            // A catalog created elsewhere may have `changes_made` NOT NULL, but the
+            // row is seeded NULL and filled in at commit. Dropping an absent NOT
+            // NULL is a no-op in Postgres, so no probe is needed.
             sqlx::query(
                 "ALTER TABLE ducklake_snapshot_changes ALTER COLUMN changes_made DROP NOT NULL",
             )
             .execute(&self.pool)
             .await?;
-            // Seed the monotonic id allocators. snapshot_id, column_id, partition_id
-            // and sort_id are reserved inside a transaction (no IDENTITY for these),
-            // so they live in ducklake_metadata. Seeded from the current MAX so a
-            // pre-existing catalog continues without reusing ids; idempotent on
-            // re-open.
+            // snapshot_id, column_id, partition_id and sort_id have no IDENTITY —
+            // they are reserved inside a transaction from these counters.
             seed_counter(
                 &self.pool,
                 "next_column_id",
@@ -1973,12 +1899,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 existing_columns.push((name, col_type, nullable));
             }
 
-            // Data-write policy (§5): a data write — Replace OR Append — must NOT
-            // change a column's type (that is schema evolution and must go through
-            // promote_column_type, which this backend does not support). The
-            // comparison is canonical (`int64` ≡ `bigint`) so an alias-only
-            // restatement is a no-op. Append additionally requires a genuinely new
-            // column to be nullable.
+            // A data write must not change a column's type — that is schema
+            // evolution, and this backend has no promote_column_type. The comparison
+            // is canonical (`int64` ≡ `bigint`). Append also requires a new column
+            // to be nullable.
             if !existing_columns.is_empty() {
                 use std::collections::HashMap;
 
@@ -2018,25 +1942,18 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 }
             }
 
-            // Final per-column ids: reuse the existing id for a column already in
-            // the table, consume a freshly reserved id only for a genuinely new
+            // Reuse an existing column's id, consume a fresh one only for a new
             // column. These are baked into the staged parquet's field_id metadata,
-            // so they must equal the ids finalize_snapshot commits. Column rows
-            // themselves are written at the commit point (not here): the read path
-            // resolves columns by `end_snapshot IS NULL` only, so inserting at begin
-            // would leak the new generation to concurrent reads.
+            // so they must equal what finalize_snapshot commits.
             let column_ids: Vec<i64> = columns
                 .iter()
                 .zip(fresh_ids.iter())
                 .map(|(col, &fresh)| existing_ids.get(col.name()).copied().unwrap_or(fresh))
                 .collect();
 
-            // No snapshot row, no column rows, and no Replace retirement are written
-            // here — all are deferred to the atomic commit so the head never
-            // resolves to an incomplete snapshot. This TX commits only the
-            // idempotent get-or-create schema/table rows; they carry begin_snapshot
-            // = the reserved id and stay invisible until the snapshot publishes,
-            // since schema/table reads ARE snapshot-scoped.
+            // Commits only the idempotent get-or-create schema/table rows. Those
+            // reads ARE snapshot-scoped, so the rows stay invisible until the
+            // snapshot publishes; everything else is deferred to the atomic commit.
             tx.commit().await?;
 
             Ok(WriteSetupResult {

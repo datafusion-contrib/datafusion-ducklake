@@ -1,20 +1,9 @@
 #![cfg(feature = "write-postgres")]
-//! Integration tests for the **single-catalog** (standard DuckLake) Postgres writer.
+//! Integration tests for the single-catalog (standard DuckLake) Postgres writer.
 //!
-//! The point of `PostgresSingleCatalogMetadataWriter` is that it produces the
-//! same catalog shape as the SQLite/MySQL writers and DuckDB's `ducklake`
-//! extension — unlike `PostgresMetadataWriter`, which writes this crate's
-//! library-specific multicatalog layout. So alongside the usual write/read
-//! coverage these tests assert the *shape*:
-//!
-//! - no `ducklake_catalog*` map tables exist
-//! - no `catalog_id` column on any DuckLake table
-//! - `catalog_id()` is `None`, so file paths stay unscoped
-//! - `ducklake_schema.path` / `ducklake_table.path` are bare relative names
-//!   (no `cat_{id}/` prefix)
-//!
-//! Plus the behaviour the multicatalog path cannot offer: SQL `CREATE TABLE AS
-//! SELECT`.
+//! Beyond the usual write/read coverage these assert the catalog *shape* — no
+//! `ducklake_catalog*` tables, no `catalog_id` column, unscoped relative paths —
+//! since that is what makes the catalog readable by other DuckLake tools.
 
 use std::sync::Arc;
 
@@ -35,9 +24,8 @@ use datafusion_ducklake::{
     PostgresSingleCatalogMetadataWriter,
 };
 
-/// Spin up Postgres, open a single-catalog writer against it, and point the
-/// catalog at a temp data directory. Returns everything the caller must keep
-/// alive (dropping the container tears the database down).
+/// Returns everything the caller must keep alive — dropping the container tears
+/// the database down.
 async fn setup() -> anyhow::Result<(
     PostgresSingleCatalogMetadataWriter,
     PgPool,
@@ -111,8 +99,6 @@ async fn table_exists(pool: &PgPool, name: &str) -> bool {
 // Catalog shape: the actual point of #165
 // ---------------------------------------------------------------------------
 
-/// The multicatalog map tables must NOT be created by this writer. Their
-/// presence is what makes a catalog unreadable by other DuckLake tools.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn creates_no_multicatalog_tables() {
@@ -150,8 +136,6 @@ async fn creates_no_multicatalog_tables() {
     }
 }
 
-/// No DuckLake table may carry a `catalog_id` column — that column is the
-/// multicatalog layout's scoping mechanism and is not in the spec.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn no_table_carries_a_catalog_id_column() {
@@ -174,8 +158,6 @@ async fn no_table_carries_a_catalog_id_column() {
     );
 }
 
-/// `catalog_id()` returning `None` is what keeps file placement unscoped —
-/// `{data_path}/{schema}/{table}/…` rather than `{data_path}/cat_{id}/…`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn catalog_id_is_none() {
@@ -183,8 +165,6 @@ async fn catalog_id_is_none() {
     assert_eq!(writer.catalog_id(), None);
 }
 
-/// Schema and table paths are stored as bare relative names, matching the other
-/// single-catalog backends.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn paths_are_unscoped_and_relative() {
@@ -222,9 +202,6 @@ async fn paths_are_unscoped_and_relative() {
     assert!(file_rel);
 }
 
-/// `ducklake_column` must be the bare upstream shape so a versioned column can
-/// hold several rows sharing one `column_id`. The multicatalog writer uses a
-/// composite PK instead; upstream and the other single-catalog backends use none.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn ducklake_column_has_no_primary_key() {
@@ -456,9 +433,6 @@ async fn initialize_schema_is_idempotent() {
     assert_eq!(counters, 4, "each id counter must be seeded exactly once");
 }
 
-/// A DDL commit bumps `schema_version` and writes a ledger row; a pure data
-/// write carries the version forward and writes none. Mirrors upstream's
-/// `if (SchemaChangesMade()) schema_version++`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn schema_version_bumps_on_ddl_and_carries_on_data_write() {
@@ -492,8 +466,6 @@ async fn schema_version_bumps_on_ddl_and_carries_on_data_write() {
     assert_eq!(ledger, 1, "only the DDL commit writes a ledger row");
 }
 
-/// Snapshot ids are counter-allocated, so they are dense and ordered by commit —
-/// the property the `Replace` conflict test relies on.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn snapshot_ids_are_dense_and_commit_ordered() {
@@ -609,7 +581,6 @@ async fn partition_spec_set_then_reset() {
     assert!(writer.live_partition_spec(table_id).unwrap().is_none());
 }
 
-/// Resetting when nothing is set must not publish an empty snapshot.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn reset_partition_spec_on_unpartitioned_table_is_a_noop() {
@@ -690,9 +661,6 @@ async fn set_partition_spec_rejects_unknown_column() {
 // Error paths
 // ---------------------------------------------------------------------------
 
-/// A data write must never silently change a column's type — that is schema
-/// evolution and belongs to `promote_column_type`, which this writer does not
-/// implement.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn append_rejects_a_column_type_change() {
@@ -798,9 +766,6 @@ async fn set_data_path_replaces_rather_than_duplicates() {
     assert_eq!(writer.get_data_path().unwrap(), "/tmp/two");
 }
 
-/// Deletes, upserts, compaction and type promotion are out of scope for this
-/// writer and must surface the trait's erroring defaults rather than silently
-/// doing nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn unsupported_operations_error() {
@@ -833,8 +798,6 @@ async fn changes_for(pool: &PgPool, snapshot_id: i64) -> Option<String> {
         .unwrap()
 }
 
-/// The creating write records the schema, the table, and the insert — all three
-/// accumulate onto the one snapshot's `changes_made`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn snapshot_changes_record_create_and_insert() {
@@ -861,8 +824,6 @@ async fn snapshot_changes_record_create_and_insert() {
     );
 }
 
-/// A `Replace` that supersedes existing files records both the delete and the
-/// insert, per `table_write_changes`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn replace_records_delete_and_insert() {
@@ -888,7 +849,6 @@ async fn replace_records_delete_and_insert() {
     );
 }
 
-/// Every snapshot must carry exactly one change row — `insert_snapshot` seeds it.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn every_snapshot_has_exactly_one_change_row() {
@@ -923,8 +883,6 @@ async fn every_snapshot_has_exactly_one_change_row() {
     assert_eq!(snapshots, change_rows);
 }
 
-/// Author / message / extra-info round-trip through
-/// `register_data_file_with_commit_metadata`.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn commit_metadata_is_persisted() {
@@ -971,8 +929,6 @@ async fn commit_metadata_is_persisted() {
     assert_eq!(extra.as_deref(), Some("job=42"));
 }
 
-/// Conditional (compare-and-swap) writes are not implemented on this backend and
-/// must fail closed rather than commit unconditionally.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn conditional_writes_are_rejected() {
@@ -1028,7 +984,6 @@ async fn conditional_writes_are_rejected() {
     );
 }
 
-/// Partition DDL is an ALTER and must say so in the change record.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn partition_ddl_records_altered_table() {
@@ -1053,7 +1008,6 @@ async fn partition_ddl_records_altered_table() {
     assert_eq!(changes, format!("altered_table:{table_id}"));
 }
 
-/// Opening a writer over an existing pool must not re-run DDL or disturb state.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn from_pool_shares_an_existing_connection_pool() {
