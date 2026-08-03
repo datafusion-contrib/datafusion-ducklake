@@ -25,6 +25,18 @@ below) where tables are created via `DuckLakeTableWriter` and then appended to w
 | PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
 | MySQL      |  ✅  |  ❌   |      ❌       | `metadata-mysql`                                       |
 
+PostgreSQL has **two** writers, both behind `write-postgres`:
+
+| Writer | Layout | Spec-compliant | SQL `CREATE TABLE`/CTAS | Read back with |
+|--------|--------|:--------------:|:-----------------------:|----------------|
+| `PostgresSingleCatalogMetadataWriter` | Standard single-catalog | ✅ | ✅ | `PostgresMetadataProvider` (and any other DuckLake reader, incl. DuckDB) |
+| `PostgresMetadataWriter` | Library-specific multi-catalog | ❌ | ❌ | `MulticatalogProvider` only |
+
+Use `PostgresSingleCatalogMetadataWriter` unless you specifically need many
+catalogs in one database. It produces the same catalog shape as the SQLite and
+MySQL writers: no `catalog_id` columns, no `ducklake_catalog*` map tables, and
+unscoped relative paths (`{data_path}/{schema}/{table}/…`).
+
 **Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
 multiple independent DuckLake catalogs. Reading multiple catalogs requires
 `multicatalog-postgres` (`MulticatalogProvider`); creating/managing them requires
@@ -33,11 +45,13 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 > ⚠️ The multi-catalog layout is **specific to this library** — it is not part of the
 > DuckLake specification and is not (yet) supported or accepted upstream. Catalogs
 > written this way are only readable through `MulticatalogProvider`, not as standard
-> single-catalog DuckLake stores. PostgreSQL writes currently go through this path, so
-> **all PostgreSQL write support should be treated as experimental** and subject to
-> change. Note also that SQL `CREATE TABLE`/CTAS is not available on this path (the first
-> write of a table goes through `DuckLakeTableWriter`); `INSERT INTO` works once a table
-> exists.
+> single-catalog DuckLake stores, so **multi-catalog should be treated as
+> experimental** and subject to change. Note also that SQL `CREATE TABLE`/CTAS is not
+> available on this path (the first write of a table goes through
+> `DuckLakeTableWriter`); `INSERT INTO` works once a table exists.
+>
+> PostgreSQL writes no longer *require* this path: `PostgresSingleCatalogMetadataWriter`
+> writes the standard spec-compliant layout and supports CTAS.
 
 ---
 

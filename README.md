@@ -108,11 +108,41 @@ df.show().await?;
 
 ## Writing a catalog
 
-PostgreSQL writes go through the **experimental multi-catalog layout** described in the
-[next section](#multi-catalog-postgresql-experimental) — treat them as a preview. Tables
-are created through the writer API; once a table exists, you append to it with SQL
-`INSERT INTO`. (SQL `CREATE TABLE` / CTAS is not supported on this path — DataFusion
-cannot create the schema, so the first write goes through `DuckLakeTableWriter`.)
+PostgreSQL has two writers, both behind the `write-postgres` feature:
+
+- **`PostgresSingleCatalogMetadataWriter`** — the **standard, spec-compliant**
+  single-catalog layout. Same catalog shape as the SQLite and MySQL writers, so the
+  catalog is readable (and writable) by other DuckLake implementations including
+  DuckDB's `ducklake` extension. SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both
+  work. **Prefer this one.**
+- **`PostgresMetadataWriter`** — the **experimental multi-catalog layout** described in
+  [its own section](#multi-catalog-postgresql-experimental), for hosting many catalogs
+  in one database. Library-specific, not in the DuckLake spec, and no CTAS.
+
+```rust,ignore
+use datafusion::prelude::*;
+use datafusion_ducklake::metadata_writer::MetadataWriter; // set_data_path
+use datafusion_ducklake::{
+    DuckLakeCatalog, PostgresMetadataProvider, PostgresSingleCatalogMetadataWriter,
+};
+use std::sync::Arc;
+
+// Bootstrap the standard DuckLake tables and point the catalog at its data root
+let writer = PostgresSingleCatalogMetadataWriter::new_with_init(
+    "postgresql://user:pass@localhost:5432/db",
+).await?;
+writer.set_data_path("/abs/path/to/data")?;
+
+// CTAS and INSERT both work on this path
+let provider = PostgresMetadataProvider::new("postgresql://user:pass@localhost:5432/db").await?;
+let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
+let ctx = SessionContext::new();
+ctx.register_catalog("ducklake", Arc::new(catalog));
+ctx.sql("CREATE TABLE ducklake.main.events AS SELECT 1 AS id").await?.collect().await?;
+```
+
+The multi-catalog path instead looks like this — tables are created through the writer
+API (no CTAS), then appended to with SQL:
 
 ```rust,ignore
 use datafusion::prelude::*;

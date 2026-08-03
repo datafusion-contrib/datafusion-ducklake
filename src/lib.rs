@@ -84,6 +84,8 @@ pub mod metadata_writer_duckdb;
 pub mod metadata_writer_mysql;
 #[cfg(feature = "write-postgres")]
 pub mod metadata_writer_postgres;
+#[cfg(feature = "write-postgres")]
+pub mod metadata_writer_postgres_single;
 #[cfg(feature = "write-sqlite")]
 pub mod metadata_writer_sqlite;
 #[cfg(feature = "write-postgres")]
@@ -143,6 +145,8 @@ pub use metadata_writer_duckdb::DuckdbMetadataWriter;
 pub use metadata_writer_mysql::MySqlMetadataWriter;
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres::PostgresMetadataWriter;
+#[cfg(feature = "write-postgres")]
+pub use metadata_writer_postgres_single::PostgresSingleCatalogMetadataWriter;
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]

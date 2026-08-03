@@ -48,6 +48,7 @@ mod positional_delete_oracle_postgres_tests;
 mod positional_delete_oracle_tests;
 mod positional_delete_tests;
 mod postgres_metadata_provider_test;
+mod postgres_single_catalog_write_tests;
 mod renamed_columns_tests;
 mod row_count_tests;
 mod row_id_tests;
