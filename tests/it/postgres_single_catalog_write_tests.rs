@@ -873,6 +873,124 @@ async fn committed_rows_reference_a_real_snapshot() {
     }
 }
 
+/// Two writers both beginning against an absent table reserve different column
+/// ids, and each stamps its own into its staged Parquet as the field_id. Whoever
+/// commits second must not silently adopt the winner's ids — the read path
+/// null-fills a column whose field_id is missing from the file, so the loser's
+/// rows would be catalog-visible but read as NULL.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn concurrent_create_of_the_same_table_conflicts_instead_of_writing_null_columns() {
+    use datafusion_ducklake::SnapshotCommitMetadata;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+
+    // Both writers observe `main.t` as absent and reserve disjoint column ids.
+    let a = writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+        .unwrap();
+    let b = writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+        .unwrap();
+    assert_ne!(
+        a.column_ids, b.column_ids,
+        "two begins against an absent table must not hand out the same ids"
+    );
+
+    // A wins and its column ids become the committed generation.
+    writer
+        .register_data_file_with_commit_metadata(
+            a.table_id,
+            "main",
+            "t",
+            a.snapshot_id,
+            &DataFileInfo::new("t/a.parquet", 1024, 1),
+            WriteMode::Append,
+            a.base_snapshot_id,
+            &cols(),
+            &a.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+        .unwrap();
+
+    // B's file is already stamped with b.column_ids, so committing it here would
+    // register unreadable data.
+    let err = writer
+        .register_data_file_with_commit_metadata(
+            b.table_id,
+            "main",
+            "t",
+            b.snapshot_id,
+            &DataFileInfo::new("t/b.parquet", 1024, 1),
+            WriteMode::Append,
+            b.base_snapshot_id,
+            &cols(),
+            &b.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "expected Conflict, got: {err}"
+    );
+
+    // Only A's file is registered, and the committed ids are A's.
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 1, "the conflicting write must not have committed");
+
+    let committed: Vec<i64> = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_column
+         WHERE end_snapshot IS NULL ORDER BY column_order",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(committed, a.column_ids);
+
+    // Retrying from a fresh begin picks up the committed ids and succeeds.
+    let retry = writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+        .unwrap();
+    assert_eq!(retry.column_ids, a.column_ids);
+    writer
+        .register_data_file_with_commit_metadata(
+            retry.table_id,
+            "main",
+            "t",
+            retry.snapshot_id,
+            &DataFileInfo::new("t/b.parquet", 1024, 1),
+            WriteMode::Append,
+            retry.base_snapshot_id,
+            &cols(),
+            &retry.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+        .unwrap();
+
+    let ctx = read_context(&conn_str).await;
+    let batches = ctx
+        .sql("SELECT count(*) AS n FROM lake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 2);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn conditional_write_accepts_a_current_base_and_rejects_a_stale_one() {

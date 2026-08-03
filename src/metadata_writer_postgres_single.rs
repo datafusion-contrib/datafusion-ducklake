@@ -799,7 +799,7 @@ async fn finalize_snapshot(
     // (the creating write is DDL). Mirrors upstream `SchemaChangesMade()`.
     use std::collections::{HashMap, HashSet};
     let current = sqlx::query(
-        "SELECT column_name, column_type, column_order, nulls_allowed
+        "SELECT column_name, column_type, column_order, nulls_allowed, column_id
          FROM ducklake_column
          WHERE table_id = $1 AND end_snapshot IS NULL
          ORDER BY column_order",
@@ -828,13 +828,14 @@ async fn finalize_snapshot(
     // column_id (== parquet field_id) across writes: end only removed columns,
     // insert only new ones, and leave unchanged columns (and their ids) in place.
     let new_names: HashSet<&str> = columns.iter().map(|c| c.name()).collect();
-    let mut current_by_name: HashMap<String, (i64, bool)> = HashMap::new();
+    let mut current_by_name: HashMap<String, (i64, bool, i64)> = HashMap::new();
     for row in &current {
         let name: String = row.try_get("column_name")?;
         let order: i64 = row.try_get("column_order")?;
         let nullable: bool = row
             .try_get::<Option<bool>, _>("nulls_allowed")?
             .unwrap_or(true);
+        let committed_column_id: i64 = row.try_get("column_id")?;
         if !new_names.contains(name.as_str()) {
             // Column dropped in the new schema: end its generation.
             sqlx::query(
@@ -847,14 +848,32 @@ async fn finalize_snapshot(
             .execute(&mut **tx)
             .await?;
         }
-        current_by_name.insert(name, (order, nullable));
+        current_by_name.insert(name, (order, nullable, committed_column_id));
     }
 
     for (order, (col, column_id)) in columns.iter().zip(column_ids.iter()).enumerate() {
         match current_by_name.get(col.name()) {
             // Existing column kept: its id stays stable. Sync order/nullability
             // only if they changed (type changes are rejected at begin).
-            Some(&(cur_order, cur_nullable)) => {
+            Some(&(cur_order, cur_nullable, cur_column_id)) => {
+                // The caller has already stamped `column_id` into its staged
+                // parquet as the field_id, so a committed id that disagrees means
+                // the staged file cannot be read back against this table: the read
+                // path null-fills a current column whose field_id is missing from a
+                // file that carries field_ids. That happens when two writers both
+                // began against an absent table and one created it first, or when
+                // the column was dropped and re-added in between. The file has to
+                // be rewritten under the committed ids, so abort and let the caller
+                // retry from a fresh begin.
+                if cur_column_id != *column_id {
+                    return Err(crate::DuckLakeError::Conflict(format!(
+                        "column '{}' of table {table_id} committed as column_id \
+                         {cur_column_id}, but this write staged its data under field_id \
+                         {column_id}; another writer created or altered the table since \
+                         this write began (retry the write against the new generation)",
+                        col.name()
+                    )));
+                }
                 if cur_order != order as i64 || cur_nullable != col.is_nullable() {
                     sqlx::query(
                         "UPDATE ducklake_column SET column_order = $1, nulls_allowed = $2
