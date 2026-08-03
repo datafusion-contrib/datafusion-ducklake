@@ -26,14 +26,14 @@
 //!
 //! Requires a multi-threaded Tokio runtime (`#[tokio::test(flavor =
 //! "multi_thread")]`): the sync trait methods bridge async sqlx via
-//! [`crate::metadata_provider::block_on`], exactly like the SQLite and MySQL
+//! `crate::metadata_provider::block_on`, exactly like the SQLite and MySQL
 //! writers.
 //!
 //! ## Postgres dialect adaptations vs the MySQL template
 //!
 //! 1. **`RETURNING` exists.** IDENTITY-backed ids (`schema_id`, `table_id`,
 //!    `data_file_id`) come straight back from `INSERT … RETURNING`, replacing
-//!    MySQL's `last_insert_id()` round-trip. [`reserve_ids`] likewise collapses
+//!    MySQL's `last_insert_id()` round-trip. `reserve_ids` likewise collapses
 //!    to a single `UPDATE … RETURNING`.
 //! 2. **`snapshot_id` stays counter-allocated, not IDENTITY.** Upstream's
 //!    `ducklake_snapshot.snapshot_id` is a plain `BIGINT PRIMARY KEY`, and a
@@ -51,7 +51,7 @@
 //!    providers read them unquoted, so they stay bare here too.
 //! 5. **`INSERT IGNORE`→`INSERT … ON CONFLICT (table_id) DO NOTHING`.**
 //! 6. **`ADD COLUMN IF NOT EXISTS`** replaces MySQL's `information_schema` probe.
-//! 7. **Self-referential `INSERT … SELECT` is legal**, so [`seed_counter`] is a
+//! 7. **Self-referential `INSERT … SELECT` is legal**, so `seed_counter` is a
 //!    single idempotent statement rather than MySQL's check-then-insert.
 
 use crate::Result;
