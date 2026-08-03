@@ -787,6 +787,144 @@ async fn unsupported_operations_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Commit atomicity
+// ---------------------------------------------------------------------------
+
+/// A write that dies between begin and commit must leave nothing behind. Schema
+/// and table visibility is `snapshot >= begin_snapshot` with no check that the
+/// snapshot exists, so a row written at begin against a guessed id would surface
+/// as soon as any other writer reached that id.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_abandoned_write_leaves_no_phantom_schema_or_table() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+
+    // Begin a write against a brand-new schema and table, then abandon it.
+    let abandoned = writer
+        .begin_write_transaction("ghost_schema", "ghost_table", &cols(), WriteMode::Replace)
+        .unwrap();
+
+    // A different writer advances the head past the id the abandoned write saw.
+    DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .write_table("main", "real", &[batch(vec![1], vec![Some("a")])])
+        .await
+        .unwrap();
+
+    let head: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        head >= abandoned.snapshot_id,
+        "the head must reach the abandoned write's speculative id for this to be a real test"
+    );
+
+    let ghost_schemas: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_schema WHERE schema_name = $1")
+            .bind("ghost_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ghost_schemas, 0, "abandoned write left a phantom schema");
+
+    let ghost_tables: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_table WHERE table_name = $1")
+            .bind("ghost_table")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ghost_tables, 0, "abandoned write left a phantom table");
+
+    // And nothing leaks through the read path either.
+    let ctx = read_context(&conn_str).await;
+    assert!(
+        ctx.sql("SELECT * FROM lake.ghost_schema.ghost_table")
+            .await
+            .is_err(),
+        "phantom table is queryable"
+    );
+}
+
+/// Every committed schema/table row must belong to a snapshot that exists.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn committed_rows_reference_a_real_snapshot() {
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    let tw = DuckLakeTableWriter::new(Arc::new(writer), object_store()).unwrap();
+    tw.write_table("main", "t", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+    tw.append_table("main", "t", &[batch(vec![2], vec![None])])
+        .await
+        .unwrap();
+
+    for table in ["ducklake_schema", "ducklake_table", "ducklake_column"] {
+        // `table` is one of the three literals above, not caller input.
+        let dangling: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} x
+             LEFT JOIN ducklake_snapshot s ON s.snapshot_id = x.begin_snapshot
+             WHERE s.snapshot_id IS NULL"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(dangling, 0, "{table} has rows with no backing snapshot");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn conditional_write_accepts_a_current_base_and_rejects_a_stale_one() {
+    use datafusion_ducklake::SnapshotCommitMetadata;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (writer, pool, _conn, _tmp, _container) = setup().await.unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer.clone()), object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch(vec![1], vec![None])])
+        .await
+        .unwrap();
+
+    let base: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let append = |path: &'static str, expected: i64| {
+        let w = writer.clone();
+        move || {
+            let s = w
+                .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
+                .unwrap();
+            w.register_data_file_with_commit_metadata(
+                s.table_id,
+                "main",
+                "t",
+                s.snapshot_id,
+                &DataFileInfo::new(path, 1024, 1),
+                WriteMode::Append,
+                s.base_snapshot_id,
+                &cols(),
+                &s.column_ids,
+                &SnapshotCommitMetadata::default(),
+                Some(expected),
+            )
+        }
+    };
+
+    // The table's generation has not moved past `base`, so this is accepted.
+    append("t/a.parquet", base)().expect("conditional write on a current base");
+
+    // It has now, so replaying the same expectation must conflict rather than commit.
+    let err = append("t/b.parquet", base)().unwrap_err();
+    assert!(
+        matches!(err, datafusion_ducklake::DuckLakeError::Conflict(_)),
+        "expected Conflict, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot change records + commit metadata (#209 surface)
 // ---------------------------------------------------------------------------
 
@@ -927,61 +1065,6 @@ async fn commit_metadata_is_persisted() {
     assert_eq!(author.as_deref(), Some("alice"));
     assert_eq!(message.as_deref(), Some("nightly load"));
     assert_eq!(extra.as_deref(), Some("job=42"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn conditional_writes_are_rejected() {
-    use datafusion_ducklake::SnapshotCommitMetadata;
-    use datafusion_ducklake::metadata_writer::DataFileInfo;
-
-    let (writer, _pool, _conn, _tmp, _container) = setup().await.unwrap();
-    let setup_result = writer
-        .begin_write_transaction("main", "t", &cols(), WriteMode::Append)
-        .unwrap();
-
-    let err = writer
-        .register_data_file_with_commit_metadata(
-            setup_result.table_id,
-            "main",
-            "t",
-            setup_result.snapshot_id,
-            &DataFileInfo::new("t/data.parquet", 1024, 1),
-            WriteMode::Append,
-            setup_result.base_snapshot_id,
-            &cols(),
-            &setup_result.column_ids,
-            &SnapshotCommitMetadata::default(),
-            Some(setup_result.base_snapshot_id),
-        )
-        .unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("conditional writes are not supported"),
-        "unexpected error: {err}"
-    );
-
-    let files_err = writer
-        .register_data_files_with_commit_metadata(
-            setup_result.table_id,
-            "main",
-            "t",
-            setup_result.snapshot_id,
-            &[DataFileInfo::new("t/data.parquet", 1024, 1)],
-            WriteMode::Append,
-            setup_result.base_snapshot_id,
-            &cols(),
-            &setup_result.column_ids,
-            &SnapshotCommitMetadata::default(),
-            Some(setup_result.base_snapshot_id),
-        )
-        .unwrap_err();
-    assert!(
-        files_err
-            .to_string()
-            .contains("conditional multi-file writes are not supported"),
-        "unexpected error: {files_err}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

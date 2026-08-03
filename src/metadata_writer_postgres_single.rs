@@ -283,6 +283,24 @@ async fn reserve_ids(
     Ok(last)
 }
 
+/// Take one id from the sequence backing an IDENTITY column without inserting a row,
+/// so `begin_write_transaction` can hand out a schema/table id that only becomes a
+/// visible row at commit. Sequences are non-transactional, so an unused reservation
+/// just leaves a gap.
+async fn reserve_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    column: &str,
+) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT nextval(pg_get_serial_sequence($1, $2))")
+            .bind(table)
+            .bind(column)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
 /// Seed an id counter from the current MAX of its backing column, so a pre-existing
 /// catalog keeps allocating without reuse. `WHERE NOT EXISTS` makes a re-open a no-op.
 async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result<()> {
@@ -700,25 +718,81 @@ async fn live_partition_id(
     .await?)
 }
 
-/// The atomic commit point: insert the deferred snapshot row, finalize the column
-/// generation, and for `Replace` retire the prior data generation — all in the
-/// caller's transaction, so a reader never sees a half-published head.
+/// The atomic commit point: insert the snapshot row, create the schema/table rows
+/// if absent, finalize the column generation, and for `Replace` retire the prior
+/// data generation — all in the caller's transaction, so a reader never sees a
+/// half-published head.
 ///
-/// The column generation is deferred to here rather than written at begin because
-/// the read path resolves columns by `end_snapshot IS NULL` alone (not
-/// snapshot-scoped), so writing them early would leak them to concurrent reads.
+/// Schema, table and column rows are all written here rather than at begin. The
+/// read path resolves columns by `end_snapshot IS NULL` alone, and resolves
+/// schemas/tables by `snapshot >= begin_snapshot` with no check that the snapshot
+/// exists — so a row written at begin with a guessed id becomes visible as soon as
+/// any writer reaches that id, even if this write never commits.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    table_id_hint: i64,
     columns: &[ColumnDef],
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
-) -> Result<i64> {
+) -> Result<CommitIds> {
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
     // corrected to a DDL bump below once we've classified the commit.
     let (snapshot_id, mut schema_version) = insert_snapshot(tx).await?;
+
+    let schema_id: i64 =
+        match sqlx::query_scalar(
+            "SELECT schema_id FROM ducklake_schema
+         WHERE schema_name = $1 AND end_snapshot IS NULL",
+        )
+        .bind(schema_name)
+        .fetch_optional(&mut **tx)
+        .await?
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES ($1, $1, TRUE, $2) RETURNING schema_id",
+            )
+            .bind(schema_name)
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?,
+        };
+
+    // A new table keeps the id reserved at begin: the caller already holds it in
+    // `WriteSetupResult` and passes it back here. `table_id` is IDENTITY, hence
+    // OVERRIDING SYSTEM VALUE.
+    let table_id: i64 = match sqlx::query_scalar(
+        "SELECT table_id FROM ducklake_table
+         WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+    )
+    .bind(schema_id)
+    .bind(table_name)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        Some(id) => id,
+        None => {
+            sqlx::query(
+                "INSERT INTO ducklake_table
+                     (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                 OVERRIDING SYSTEM VALUE
+                 VALUES ($1, $2, $3, $3, TRUE, $4)",
+            )
+            .bind(table_id_hint)
+            .bind(schema_id)
+            .bind(table_name)
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
+            table_id_hint
+        },
+    };
 
     // Classify this commit as DDL vs pure data write. `current` is the table's
     // live columns ordered by `column_order`; an empty set means a brand-new table
@@ -829,7 +903,11 @@ async fn finalize_snapshot(
     if is_ddl {
         record_schema_version(tx, snapshot_id, schema_version, table_id).await?;
     }
-    Ok(snapshot_id)
+    Ok(CommitIds {
+        snapshot_id,
+        schema_id,
+        table_id,
+    })
 }
 
 impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
@@ -1066,24 +1144,35 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        if expected_base_snapshot_id.is_some() {
-            return Err(crate::DuckLakeError::InvalidConfig(
-                "conditional writes are not supported by the single-catalog Postgres metadata \
-                 writer"
-                    .to_string(),
-            ));
-        }
         block_on(async {
-            // Single atomic commit: insert the deferred snapshot row + finalize the
-            // column generation + retire the prior generation (Replace), then
-            // register this file and advance the monotonic row-lineage counter —
-            // all in one transaction, so the head only ever resolves to
-            // fully-populated data.
+            // Single atomic commit: insert the snapshot row + create schema/table if
+            // absent + finalize the column generation + retire the prior generation
+            // (Replace), then register this file and advance the monotonic
+            // row-lineage counter — all in one transaction, so the head only ever
+            // resolves to fully-populated data.
             let mut tx = self.pool.begin().await?;
 
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let ids = finalize_snapshot(
+                &mut tx,
+                schema_name,
+                table_name,
+                table_id,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
+
+            // Caller-supplied precondition: the table's data-file generation must
+            // not have moved past the snapshot the input was read at. Replace is
+            // already fenced against `base_snapshot` inside finalize_snapshot.
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
 
             // Partition-spec fence: this file must be consistent with the table's live
             // partition generation at commit time (both directions — see
@@ -1151,19 +1240,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .await?;
 
-            let schema_id: i64 =
-                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
-
             tx.commit().await?;
-            Ok(CommitIds {
-                snapshot_id,
-                schema_id,
-                table_id,
-            })
+            Ok(ids)
         })
     }
 
@@ -1210,13 +1288,6 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        if expected_base_snapshot_id.is_some() {
-            return Err(crate::DuckLakeError::InvalidConfig(
-                "conditional multi-file writes are not supported by the single-catalog Postgres \
-                 metadata writer"
-                    .to_string(),
-            ));
-        }
         if files.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "register_data_files: files must be non-empty".to_string(),
@@ -1224,9 +1295,23 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let ids = finalize_snapshot(
+                &mut tx,
+                schema_name,
+                table_name,
+                table_id,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
+            let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
+            if mode != WriteMode::Replace
+                && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
+            {
+                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+            }
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.
             // The tx rolls back on a Conflict.
@@ -1295,18 +1380,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 commit_metadata,
             )
             .await?;
-            let schema_id: i64 =
-                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
             tx.commit().await?;
-            Ok(CommitIds {
-                snapshot_id,
-                schema_id,
-                table_id,
-            })
+            Ok(ids)
         })
     }
 
@@ -1634,31 +1709,29 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         // the new head visible atomically.
         block_on(async {
             let mut tx = self.pool.begin().await?;
-            let snapshot_id =
-                finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
-                    .await?;
+            let ids = finalize_snapshot(
+                &mut tx,
+                schema_name,
+                table_name,
+                table_id,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+            )
+            .await?;
             record_table_write_changes(
                 &mut tx,
-                snapshot_id,
-                table_id,
+                ids.snapshot_id,
+                ids.table_id,
                 schema_name,
                 table_name,
                 mode,
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            let schema_id: i64 =
-                sqlx::query("SELECT schema_id FROM ducklake_table WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
             tx.commit().await?;
-            Ok(CommitIds {
-                snapshot_id,
-                schema_id,
-                table_id,
-            })
+            Ok(ids)
         })
     }
 
@@ -1816,61 +1889,42 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .await?
                     .try_get(0)?;
 
-            // Tentative id for WriteSetupResult; the real one is assigned at the
-            // commit (finalize_snapshot), so it may differ under concurrency.
+            // Informational only. The committed id is assigned by finalize_snapshot
+            // from the counter, so under concurrency it may differ from this.
             let snapshot_id: i64 = base_snapshot_id + 1;
 
-            let schema_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT schema_id FROM ducklake_schema
-                     WHERE schema_name = $1 AND end_snapshot IS NULL",
-                )
-                .bind(schema_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    // Unscoped relative path — see get_or_create_schema.
-                    sqlx::query(
-                        "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                         VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
-                    )
-                    .bind(schema_name)
-                    .bind(schema_name)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?
-                }
+            // Look up, do NOT create. Reserving from the IDENTITY sequence hands out
+            // an id without inserting a row, so a write that dies before commit
+            // leaves nothing behind — schema/table visibility is
+            // `snapshot >= begin_snapshot` with no check that the snapshot exists,
+            // so a row written here against a guessed id would become readable the
+            // moment any writer reached it. Unused reservations leave sequence gaps,
+            // which are expected and harmless.
+            let schema_id: i64 = match sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = $1 AND end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(id) => id,
+                None => reserve_identity(&mut tx, "ducklake_schema", "schema_id").await?,
             };
 
-            let table_id: i64 = {
-                let existing = sqlx::query(
-                    "SELECT table_id FROM ducklake_table
-                     WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
-                )
-                .bind(schema_id)
-                .bind(table_name)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                if let Some(row) = existing {
-                    row.try_get(0)?
-                } else {
-                    sqlx::query(
-                        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-                         VALUES ($1, $2, $3, TRUE, $4) RETURNING table_id",
-                    )
-                    .bind(schema_id)
-                    .bind(table_name)
-                    .bind(table_name)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?
-                }
+            let table_id: i64 = match sqlx::query_scalar(
+                "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                   AND t.table_name = $2 AND t.end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(id) => id,
+                None => reserve_identity(&mut tx, "ducklake_table", "table_id").await?,
             };
 
             // Get existing columns to (a) check schema compatibility for appends
@@ -1951,9 +2005,9 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .map(|(col, &fresh)| existing_ids.get(col.name()).copied().unwrap_or(fresh))
                 .collect();
 
-            // Commits only the idempotent get-or-create schema/table rows. Those
-            // reads ARE snapshot-scoped, so the rows stay invisible until the
-            // snapshot publishes; everything else is deferred to the atomic commit.
+            // Inserts nothing: this commit only persists the counter advance for the
+            // column ids (and the sequence advances, which are non-transactional
+            // anyway). Every metadata row is written by finalize_snapshot.
             tx.commit().await?;
 
             Ok(WriteSetupResult {
