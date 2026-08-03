@@ -23,8 +23,7 @@ use tempfile::TempDir;
 /// data files, each with its own `row_id_start`.
 fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
-    conn.execute("INSTALL parquet;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
@@ -43,8 +42,7 @@ fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
 /// are correctly elided from the output.
 fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
-    conn.execute("INSTALL parquet;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
@@ -76,8 +74,7 @@ fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
 /// for the rewrite file would yield a fresh sequential range, not {0,2,5,7}.
 fn create_catalog_rowid_with_update(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
-    conn.execute("INSTALL parquet;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());

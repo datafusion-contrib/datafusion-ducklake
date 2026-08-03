@@ -32,8 +32,7 @@ const BIG: i64 = 600_000;
 
 fn open(catalog_path: &Path) -> anyhow::Result<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
-    conn.execute("INSTALL parquet;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
     conn.execute(
         &format!("ATTACH 'ducklake:{}' AS c;", catalog_path.display()),
