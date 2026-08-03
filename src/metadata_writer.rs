@@ -50,7 +50,10 @@ use arrow::datatypes::DataType;
 ///
 /// Unlike `DuckLakeTableColumn` (used for reading), this struct doesn't have a `column_id`
 /// field since IDs are assigned by the catalog during write operations.
-#[derive(Debug, Clone)]
+///
+/// Equality is structural over all three fields — a multi-table commit uses it to
+/// require that every entry for the same table describes the same columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     /// Column name
     pub(crate) name: String,
@@ -574,6 +577,82 @@ pub struct WriteResult {
     pub files_written: usize,
     /// Total records written
     pub records_written: i64,
+}
+
+/// What a [`BatchEntry`] does to its table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchOp {
+    /// Add the entry's file to the table's current contents.
+    Append,
+    /// Supersede the table's contents with the entry's file, retiring the prior
+    /// generation. Conflict-checked against the entry's `base_snapshot`.
+    Replace,
+    /// Remove the table's contents. Carries no file — this is a metadata-only
+    /// retirement, not a zero-row data file.
+    Truncate,
+}
+
+/// One table-level operation in a multi-table commit.
+///
+/// Entries are grouped by `(schema_name, table_name)`, and within a table they are
+/// applied in list order. The first entry for a table may be any [`BatchOp`]; the
+/// rest must be [`BatchOp::Append`], since a `Replace`/`Truncate` arriving after an
+/// append in the same snapshot would retire rows the caller just asked to add.
+/// Every entry for the same table must describe the same columns.
+#[derive(Debug, Clone)]
+pub struct BatchEntry {
+    /// Schema the table lives in; created if absent.
+    pub schema_name: String,
+    /// Table to write; created if absent.
+    pub table_name: String,
+    /// Table id to use **if the table does not exist yet**. Ignored when it does.
+    pub table_id_hint: i64,
+    /// What this entry does to the table.
+    pub op: BatchOp,
+    /// The data file to register. Required for `Append`/`Replace`, and must be
+    /// absent for `Truncate`.
+    pub file: Option<DataFileInfo>,
+    /// The table's columns, in order.
+    pub columns: Vec<ColumnDef>,
+    /// Column ids adopted for `columns` (`column_ids[i]` pairs with `columns[i]`),
+    /// so a file carrying DuckLake field-ids resolves on read. A file with no
+    /// embedded field-ids resolves by name, so any consistent set works for it.
+    pub column_ids: Vec<i64>,
+    /// The catalog head this entry was planned against. A `Replace` whose table has
+    /// moved past it aborts the whole batch with
+    /// [`crate::DuckLakeError::Conflict`].
+    pub base_snapshot: i64,
+}
+
+/// Per-table result of a multi-table commit.
+#[derive(Debug, Clone)]
+pub struct BatchTableCommit {
+    /// Schema name as supplied on the entries.
+    pub schema_name: String,
+    /// Table name as supplied on the entries.
+    pub table_name: String,
+    /// Committed schema id (may differ from a begin-time reservation).
+    pub schema_id: i64,
+    /// Committed table id (may differ from `table_id_hint`).
+    pub table_id: i64,
+    /// Rows added by this table's entries. `0` for a `Truncate`, and for a
+    /// `Replace` this counts only the newly registered rows, not the retired ones.
+    pub record_count: i64,
+    /// Whether this table's schema changed in this commit (i.e. it contributed to
+    /// the `schema_version` bump).
+    pub schema_changed: bool,
+}
+
+/// The result of a multi-table commit: one snapshot covering every table.
+#[derive(Debug, Clone)]
+pub struct BatchCommit {
+    /// The single snapshot every table became visible at.
+    pub snapshot_id: i64,
+    /// The snapshot's `schema_version` — bumped once if any table's schema
+    /// changed, otherwise carried forward.
+    pub schema_version: i64,
+    /// One entry per distinct table, in first-appearance order.
+    pub tables: Vec<BatchTableCommit>,
 }
 
 /// The ids actually committed by `register_data_file` / `publish_snapshot`.

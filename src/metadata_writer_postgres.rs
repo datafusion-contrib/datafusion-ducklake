@@ -13,9 +13,9 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    MetadataWriter, WriteMode, WriteSetupResult, columns_differ, validate_delete_entries,
-    validate_name,
+    BatchCommit, BatchEntry, BatchOp, BatchTableCommit, ColumnDef, ColumnStat, CommitIds,
+    DataFileInfo, DeleteFileEntry, DeleteFileInfo, MetadataWriter, WriteMode, WriteSetupResult,
+    columns_differ, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use sqlx::AssertSqlSafe;
@@ -331,6 +331,22 @@ pub struct PostgresMetadataWriter {
 }
 
 impl PostgresMetadataWriter {
+    /// Commit operations across several tables as one snapshot, in this writer's own
+    /// transaction.
+    ///
+    /// The self-contained form of [`commit_batch_in_tx`], which is where the
+    /// semantics are documented. Use that one instead when you have metadata of your
+    /// own to commit atomically alongside the DuckLake commit.
+    pub fn commit_batch(&self, entries: &[BatchEntry]) -> Result<BatchCommit> {
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let committed =
+                commit_batch_in_tx(&mut tx, self.catalog_id, self.lock_timeout_ms, entries).await?;
+            tx.commit().await?;
+            Ok(committed)
+        })
+    }
+
     /// Bind a writer to the given pool and catalog id.
     ///
     /// Use [`crate::multicatalog::MulticatalogManager::create_catalog`] to obtain
@@ -619,6 +635,335 @@ async fn retire_prior_generation(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// End every live delete file of a table at `snapshot_id`.
+///
+/// Companion to [`retire_prior_generation`], which ends live *data* files (sparing
+/// the current commit's own, via `begin_snapshot < $1`) and zeroes the visible
+/// totals but deliberately leaves delete files alone — a `Replace` registers a new
+/// generation whose files have no deletes against them yet. Emptying a table has to
+/// end both, or a later reader's live-delete roll-up still counts deletions against
+/// files that no longer exist.
+///
+/// Carries the same `begin_snapshot < $1` guard so it cannot end a delete file
+/// written by the commit it is part of.
+async fn retire_live_delete_files(
+    table_id: i64,
+    snapshot_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_delete_file SET end_snapshot = $1
+         WHERE table_id = $2 AND end_snapshot IS NULL AND begin_snapshot < $1",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Register a set of data files against one table inside an already-open commit.
+///
+/// Partition-fences every file against the table's live generation, inserts the
+/// `ducklake_data_file` rows with contiguous rowid ranges drawn from the table's
+/// monotonic counter, persists each file's zone maps and partition values, refreshes
+/// the table's column-stat roll-up, and accumulates the visible totals. Returns the
+/// number of records added.
+///
+/// Does not allocate a snapshot or advance the catalog head — the caller owns both,
+/// which is what lets several tables share one snapshot.
+async fn register_files_for_table(
+    table_id: i64,
+    snapshot_id: i64,
+    files: &[DataFileInfo],
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64> {
+    // Partition-spec fence (both directions, every file): each file must be
+    // consistent with the table's live partition generation at commit time.
+    // Runs inside the lock_catalog-serialized tx; rolls back on a Conflict.
+    // table_ids are global across the multicatalog store, so
+    // ducklake_partition_info scopes by table_id alone.
+    let live_partition_id: Option<i64> = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    for file in files {
+        crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+    }
+    sqlx::query(
+        "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+         VALUES ($1, 0, 0, 0)
+         ON CONFLICT (table_id) DO NOTHING",
+    )
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    let mut next_row_id: i64 =
+        sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_one(&mut **tx)
+            .await?
+            .try_get(0)?;
+    let mut total_records: i64 = 0;
+    let mut total_bytes: i64 = 0;
+    for file in files {
+        let inserted = sqlx::query(
+            "INSERT INTO ducklake_data_file
+                 (table_id, path, path_is_relative, file_size_bytes,
+                  footer_size, record_count, row_id_start, begin_snapshot)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
+        )
+        .bind(table_id)
+        .bind(&file.path)
+        .bind(file.path_is_relative)
+        .bind(file.file_size_bytes)
+        .bind(file.footer_size)
+        .bind(file.record_count)
+        .bind(next_row_id)
+        .bind(snapshot_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let data_file_id: i64 = inserted.try_get(0)?;
+        insert_file_column_stats(tx, table_id, data_file_id, &file.column_stats).await?;
+        insert_partition_metadata(tx, table_id, data_file_id, file).await?;
+        next_row_id += file.record_count;
+        total_records += file.record_count;
+        total_bytes += file.file_size_bytes;
+    }
+    recompute_table_column_stats(tx, table_id, columns, column_ids).await?;
+    sqlx::query(
+        "UPDATE ducklake_table_stats
+         SET next_row_id     = next_row_id + $1,
+             record_count    = record_count + $2,
+             file_size_bytes = file_size_bytes + $3
+         WHERE table_id = $4",
+    )
+    .bind(total_records)
+    .bind(total_records)
+    .bind(total_bytes)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(total_records)
+}
+
+/// Commit operations across **several tables as one snapshot**, inside a
+/// transaction the caller owns.
+///
+/// A DuckLake snapshot versions the whole catalog — it has no `table_id`, and
+/// `ducklake_snapshot_changes` records many tables against one snapshot — so one
+/// snapshot spanning N tables is the format's own model, and the single
+/// `advance_catalog_head` at the end is what makes every table become visible
+/// together or not at all.
+///
+/// # The transaction is yours
+///
+/// This takes `tx` and **does not commit it**, leaving it usable afterwards. That is
+/// the point: an application whose own metadata lives in the same database (a table
+/// registry, generation pointers, load bookkeeping) can commit that metadata in the
+/// same transaction as the DuckLake commit, so the two either both land or both roll
+/// back. Without it, such a caller is forced into a two-phase protocol with a crash
+/// window between the DuckLake commit and its own, plus the reconciliation machinery
+/// to recover from it. Use
+/// [`PostgresMetadataWriter::commit_batch`](PostgresMetadataWriter::commit_batch)
+/// instead if you have no transaction of your own.
+///
+/// # Entries
+///
+/// Entries are grouped by `(schema_name, table_name)` in first-appearance order and
+/// applied in list order within each table. The first entry for a table may be any
+/// [`BatchOp`]; the rest must be [`BatchOp::Append`]. So `replace, append, append` on
+/// one table retires the prior generation and then registers all three files — the
+/// retirement's `begin_snapshot < S` guard spares the batch's own files.
+///
+/// Aborts on the first entry that cannot be applied — a `Replace` whose table moved
+/// past its `base_snapshot`, or field-id drift on an `Append` — naming the entry.
+/// Since nothing is committed here, an abort leaves the caller's transaction to roll
+/// back with no partial batch.
+///
+/// # File ownership
+///
+/// Data files are registered by reference: they belong to the caller, and this never
+/// deletes one, including on the failure path. Cleaning up files whose commit did not
+/// land is the caller's job (see issue #215).
+///
+/// `lock_timeout_ms` bounds the wait for the catalog lock ([`DEFAULT_LOCK_TIMEOUT_MS`]
+/// is the usual value); `0` waits indefinitely.
+pub async fn commit_batch_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    catalog_id: i64,
+    lock_timeout_ms: u32,
+    entries: &[BatchEntry],
+) -> Result<BatchCommit> {
+    if entries.is_empty() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "commit_batch: entries must be non-empty".to_string(),
+        ));
+    }
+
+    // Group by table, preserving first appearance so the caller's order drives both
+    // the per-table sequence and the reported result order.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let key = (entry.schema_name.clone(), entry.table_name.clone());
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| {
+                order.push(key.clone());
+                Vec::new()
+            })
+            .push(index);
+    }
+
+    // Validate everything before writing anything, so a malformed batch costs no
+    // catalog work and reports the offending entry rather than "something failed".
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "commit_batch entry {index} ({}.{}): columns must be non-empty",
+                entry.schema_name, entry.table_name
+            )));
+        }
+        if entry.column_ids.len() != entry.columns.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "commit_batch entry {index} ({}.{}): column_ids (len {}) must be 1:1 with \
+                 columns (len {})",
+                entry.schema_name,
+                entry.table_name,
+                entry.column_ids.len(),
+                entry.columns.len()
+            )));
+        }
+        match (entry.op, entry.file.is_some()) {
+            (BatchOp::Truncate, true) => {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "commit_batch entry {index} ({}.{}): Truncate must not carry a file — it is \
+                     a metadata-only retirement, not a zero-row data file",
+                    entry.schema_name, entry.table_name
+                )));
+            },
+            (BatchOp::Append | BatchOp::Replace, false) => {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "commit_batch entry {index} ({}.{}): {:?} requires a file",
+                    entry.schema_name, entry.table_name, entry.op
+                )));
+            },
+            _ => {},
+        }
+    }
+    for key in &order {
+        let indexes = &groups[key];
+        let first = &entries[indexes[0]];
+        for &index in &indexes[1..] {
+            let entry = &entries[index];
+            if entry.op != BatchOp::Append {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "commit_batch entry {index} ({}.{}): only the FIRST entry for a table may \
+                     be {:?}; later entries must be Append, since retiring inside the same \
+                     snapshot would discard rows this batch just added",
+                    entry.schema_name, entry.table_name, entry.op
+                )));
+            }
+            if entry.columns != first.columns || entry.column_ids != first.column_ids {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "commit_batch entry {index} ({}.{}): every entry for a table must describe \
+                     the same columns and column_ids as its first entry",
+                    entry.schema_name, entry.table_name
+                )));
+            }
+        }
+    }
+
+    // One lock, one snapshot, for the whole batch.
+    lock_catalog(catalog_id, lock_timeout_ms, tx).await?;
+    let snapshot_id = allocate_snapshot(tx).await?;
+
+    let mut ddl_table_ids: Vec<i64> = Vec::new();
+    let mut tables: Vec<BatchTableCommit> = Vec::with_capacity(order.len());
+
+    for key in &order {
+        let indexes = &groups[key];
+        let first = &entries[indexes[0]];
+
+        assert_table_not_in_other_catalog(catalog_id, first.table_id_hint, tx).await?;
+
+        // Truncate rides the Replace path: it wants the same conflict check against
+        // `base_snapshot` and the same data-file retirement + stat zeroing. It differs
+        // only in registering no file, and in also ending live delete files below.
+        let mode = match first.op {
+            BatchOp::Append => WriteMode::Append,
+            BatchOp::Replace | BatchOp::Truncate => WriteMode::Replace,
+        };
+        let (schema_id, table_id, is_ddl) = finalize_table_in_snapshot(
+            catalog_id,
+            snapshot_id,
+            &first.schema_name,
+            &first.table_name,
+            first.table_id_hint,
+            &first.columns,
+            &first.column_ids,
+            mode,
+            first.base_snapshot,
+            tx,
+        )
+        .await?;
+        if is_ddl {
+            ddl_table_ids.push(table_id);
+        }
+        if first.op == BatchOp::Truncate {
+            retire_live_delete_files(table_id, snapshot_id, tx).await?;
+        }
+
+        let files: Vec<DataFileInfo> = indexes
+            .iter()
+            .filter_map(|&index| entries[index].file.clone())
+            .collect();
+        let record_count = if files.is_empty() {
+            0
+        } else {
+            register_files_for_table(
+                table_id,
+                snapshot_id,
+                &files,
+                &first.columns,
+                &first.column_ids,
+                tx,
+            )
+            .await?
+        };
+
+        tables.push(BatchTableCommit {
+            schema_name: first.schema_name.clone(),
+            table_name: first.table_name.clone(),
+            schema_id,
+            table_id,
+            record_count,
+            schema_changed: is_ddl,
+        });
+    }
+
+    // Decided once over every table in the snapshot — see `apply_schema_version` for
+    // why a per-table decision is wrong here.
+    let schema_version = apply_schema_version(catalog_id, snapshot_id, &ddl_table_ids, tx).await?;
+
+    // advance_catalog_head MUST be the last write. The caller's commit is what makes
+    // it (and every table above) visible.
+    advance_catalog_head(catalog_id, snapshot_id, tx).await?;
+
+    Ok(BatchCommit {
+        snapshot_id,
+        schema_version,
+        tables,
+    })
 }
 
 /// Publish `snapshot_id` as the catalog head by mapping it to the catalog.
@@ -1693,76 +2038,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 Vec::new()
             };
             apply_schema_version(self.catalog_id, snapshot_id, &ddl_tables, &mut tx).await?;
-            // Partition-spec fence (both directions, every file): each file must be
-            // consistent with the table's live partition generation at commit time.
-            // Runs inside the lock_catalog-serialized tx; rolls back on a Conflict.
-            // table_ids are global across the multicatalog store, so
-            // ducklake_partition_info scopes by table_id alone.
-            let live_partition_id: Option<i64> = sqlx::query_scalar(
-                "SELECT partition_id FROM ducklake_partition_info
-                 WHERE table_id = $1 AND end_snapshot IS NULL",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            for file in files {
-                crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
-            }
-            sqlx::query(
-                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES ($1, 0, 0, 0)
-                 ON CONFLICT (table_id) DO NOTHING",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-            let mut next_row_id: i64 =
-                sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
-                    .bind(table_id)
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
-            let mut total_records: i64 = 0;
-            let mut total_bytes: i64 = 0;
-            for file in files {
-                let inserted = sqlx::query(
-                    "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
-                )
-                .bind(table_id)
-                .bind(&file.path)
-                .bind(file.path_is_relative)
-                .bind(file.file_size_bytes)
-                .bind(file.footer_size)
-                .bind(file.record_count)
-                .bind(next_row_id)
-                .bind(snapshot_id)
-                .fetch_one(&mut *tx)
+            register_files_for_table(table_id, snapshot_id, files, columns, column_ids, &mut tx)
                 .await?;
-                let data_file_id: i64 = inserted.try_get(0)?;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
-                    .await?;
-                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                next_row_id += file.record_count;
-                total_records += file.record_count;
-                total_bytes += file.file_size_bytes;
-            }
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET next_row_id     = next_row_id + $1,
-                     record_count    = record_count + $2,
-                     file_size_bytes = file_size_bytes + $3
-                 WHERE table_id = $4",
-            )
-            .bind(total_records)
-            .bind(total_records)
-            .bind(total_bytes)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
             tx.commit().await?;
@@ -3158,14 +3435,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "UPDATE ducklake_delete_file SET end_snapshot = $1
-                 WHERE table_id = $2 AND end_snapshot IS NULL",
-            )
-            .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
+            // Shared with a batch `Truncate` entry. The guard inside is a no-op here
+            // (this snapshot was just allocated, so nothing can carry it yet).
+            retire_live_delete_files(table_id, snapshot_id, &mut tx).await?;
             sqlx::query(
                 "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0
                  WHERE table_id = $1",

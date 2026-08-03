@@ -17,6 +17,7 @@
 
 mod append_with_deletes_postgres_tests;
 mod append_with_deletes_tests;
+mod batch_commit_postgres_tests;
 mod cdc_cumulative_delete_tests;
 mod cdc_differential_tests;
 mod cdc_rowid_tests;
