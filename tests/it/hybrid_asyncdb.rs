@@ -70,7 +70,7 @@ impl HybridDuckLakeDB {
 
         // Create DuckDB connection for WRITE operations
         let conn = Connection::open_in_memory()?;
-        conn.execute("INSTALL ducklake;", [])?;
+        crate::common::ensure_ducklake_installed();
         conn.execute("LOAD ducklake;", [])?;
 
         let ducklake_path = format!("ducklake:{}", catalog_path.display());

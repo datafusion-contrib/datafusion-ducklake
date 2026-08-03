@@ -19,9 +19,8 @@ use tempfile::TempDir;
 /// `(region × year)`, so DuckDB writes one data file per partition.
 fn create_partitioned_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    conn.execute("INSTALL parquet;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;

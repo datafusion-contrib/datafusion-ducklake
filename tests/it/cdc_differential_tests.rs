@@ -55,8 +55,7 @@ fn write_catalog(path: &Path, statements: &[&str]) -> DataFusionResult<()> {
 /// loaded and the catalog at `path` attached as `c`.
 fn official_connection(path: &Path) -> DataFusionResult<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory().map_err(box_err)?;
-    conn.execute("INSTALL ducklake;", []).map_err(box_err)?;
-    conn.execute("INSTALL parquet;", []).map_err(box_err)?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", []).map_err(box_err)?;
     conn.execute(&format!("ATTACH 'ducklake:{}' AS c;", path.display()), [])
         .map_err(box_err)?;

@@ -21,7 +21,7 @@ async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
     // Install and load ducklake extension
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     // Create a test table with some data (local filesystem)
@@ -64,7 +64,7 @@ async fn create_s3_test_catalog(
     let conn = duckdb::Connection::open_in_memory()?;
 
     // Install and load ducklake extension
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     eprintln!("Configuring S3 secret for endpoint: {}", s3_endpoint);
@@ -97,7 +97,7 @@ async fn create_s3_test_catalog(
 
     // Load httpfs extension for S3 support
     eprintln!("Loading httpfs extension...");
-    conn.execute("INSTALL httpfs;", [])?;
+    crate::common::ensure_extension_installed("httpfs");
     conn.execute("LOAD httpfs;", [])?;
     eprintln!("httpfs loaded");
 

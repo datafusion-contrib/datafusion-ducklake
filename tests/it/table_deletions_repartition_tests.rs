@@ -33,8 +33,7 @@ fn box_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> DataFusionErro
 /// then delete `targets`.
 fn build_catalog(path: &Path, targets: &[i64]) -> DataFusionResult<()> {
     let conn = duckdb::Connection::open_in_memory().map_err(box_err)?;
-    conn.execute("INSTALL ducklake;", []).map_err(box_err)?;
-    conn.execute("INSTALL parquet;", []).map_err(box_err)?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", []).map_err(box_err)?;
     conn.execute(&format!("ATTACH 'ducklake:{}' AS c;", path.display()), [])
         .map_err(box_err)?;

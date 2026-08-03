@@ -15,7 +15,7 @@ use tempfile::TempDir;
 /// Creates a catalog with data, then corrupts file_size_bytes to a negative value
 fn create_catalog_with_negative_file_size(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
@@ -43,7 +43,7 @@ fn create_catalog_with_negative_file_size(catalog_path: &std::path::Path) -> any
 /// Creates a catalog with data, then corrupts footer_size to a negative value
 fn create_catalog_with_negative_footer_size(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());

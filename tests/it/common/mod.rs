@@ -9,23 +9,44 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, OnceLock};
 
-static INSTALL_DUCKLAKE: Once = Once::new();
+/// Extensions this process has already installed. The mutex also serializes the
+/// `INSTALL` itself, so only one thread ever writes the extension directory.
+static INSTALLED_EXTENSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-/// Install the ducklake and parquet extensions exactly once (thread-safe across parallel tests).
+/// Install DuckDB extension `name` at most once per process, serialized across threads.
 ///
-/// Pre-installing parquet avoids race conditions when multiple concurrent tests
-/// trigger DuckDB's auto-install simultaneously (observed on macOS CI).
-fn ensure_ducklake_installed() {
-    INSTALL_DUCKLAKE.call_once(|| {
-        let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
-        conn.execute("INSTALL ducklake;", [])
-            .expect("install ducklake extension");
-        conn.execute("INSTALL parquet;", [])
-            .expect("install parquet extension");
-    });
+/// `INSTALL` writes into the shared `~/.duckdb/extensions/<version>/<platform>/`
+/// directory that every connection in this binary reads. The integration tests are a
+/// single binary (see `main.rs`) whose tests run as parallel threads, so two threads
+/// installing at the same time race on the same files — observed in CI as
+/// `IO Error: Could not remove file ".../parquet.duckdb_extension": No such file or
+/// directory`. Serializing here removes the race while still downloading once.
+///
+/// `LOAD` stays per-connection: it is cheap, reads the already-installed file, and
+/// every connection needs its own.
+pub fn ensure_extension_installed(name: &str) {
+    let installed = INSTALLED_EXTENSIONS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut installed = installed.lock().expect("extension-install lock poisoned");
+    if installed.contains(name) {
+        return;
+    }
+    let conn = duckdb::Connection::open_in_memory().expect("open in-memory duckdb");
+    conn.execute(&format!("INSTALL {name};"), [])
+        .unwrap_or_else(|e| panic!("install {name} extension: {e}"));
+    installed.insert(name.to_string());
+}
+
+/// Install the `ducklake` and `parquet` extensions once per process.
+///
+/// Pre-installing parquet avoids races when several tests trigger DuckDB's
+/// auto-install simultaneously (observed on macOS CI).
+pub fn ensure_ducklake_installed() {
+    ensure_extension_installed("ducklake");
+    ensure_extension_installed("parquet");
 }
 
 /// Creates a catalog with a simple table (no deletes)

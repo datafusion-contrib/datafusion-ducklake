@@ -30,7 +30,7 @@ use tempfile::TempDir;
 fn create_catalog_with_renamed_column(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
@@ -67,7 +67,7 @@ fn create_catalog_with_renamed_column(catalog_path: &Path) -> Result<()> {
 fn create_catalog_with_multiple_renames(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
@@ -356,7 +356,7 @@ async fn test_schema_shows_renamed_columns() -> Result<()> {
 /// and applying it to every file reads the other file's renamed column as NULL.
 fn create_catalog_renamed_with_post_rename_file(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -462,7 +462,7 @@ async fn test_select_star_rename_multifile_reads_all_rows() -> Result<()> {
 /// and read the renamed column correctly.
 fn create_catalog_rename_then_delete(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -530,7 +530,7 @@ async fn test_rename_mixed_with_delete_reads_all_rows() -> Result<()> {
 /// NULL for old files (field_id absent) and values for new files.
 fn create_catalog_drop_readd(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -565,7 +565,7 @@ async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
     // Pin the expectation to DuckDB's own answer so it stays honest.
     {
         let conn = duckdb::Connection::open_in_memory()?;
-        conn.execute("INSTALL ducklake;", [])?;
+        crate::common::ensure_ducklake_installed();
         conn.execute("LOAD ducklake;", [])?;
         let ducklake_path = format!("ducklake:{}", catalog_path.display());
         conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;

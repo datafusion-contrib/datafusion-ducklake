@@ -21,7 +21,7 @@ use tempfile::TempDir;
 fn create_empty_table_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
 
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     // Create data directory (DuckLake only creates it on first INSERT)
@@ -169,7 +169,7 @@ async fn test_empty_table_aggregate() -> DataFusionResult<()> {
 /// the catalog's per-file sizes.
 fn create_populated_table_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let data_dir = catalog_path.with_extension("ducklake.files");
@@ -430,7 +430,7 @@ async fn test_statistics_zero_for_empty_table() -> DataFusionResult<()> {
 /// written as two separate INSERTs so DuckLake emits one file per range.
 fn create_two_file_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("INSTALL ducklake;", [])?;
+    crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
     let data_dir = catalog_path.with_extension("ducklake.files");
@@ -557,7 +557,7 @@ async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
                 .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
             Ok(())
         };
-        exec("INSTALL ducklake;")?;
+        crate::common::ensure_ducklake_installed();
         exec("LOAD ducklake;")?;
         std::fs::create_dir_all(catalog_path.with_extension("ducklake.files"))
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
