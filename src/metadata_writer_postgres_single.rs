@@ -1555,6 +1555,7 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<CommitIds> {
     let (snapshot_id, _) = insert_snapshot(tx).await?;
     finalize_table_snapshot(
@@ -1569,6 +1570,7 @@ async fn finalize_snapshot(
         base_snapshot,
         true,
         reserved_at_setup,
+        directory_plan,
     )
     .await
 }
@@ -1586,6 +1588,7 @@ async fn finalize_table_snapshot(
     base_snapshot: i64,
     inserts: bool,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<CommitIds> {
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
@@ -1607,6 +1610,9 @@ async fn finalize_table_snapshot(
         Some(id) => id,
         None => {
             let schema_id = reserve_catalog_id(tx).await?;
+            let schema_uuid = directory_plan
+                .schema_uuid
+                .map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_owned);
             sqlx::query_scalar(
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
@@ -1616,9 +1622,12 @@ async fn finalize_table_snapshot(
             )
             .bind(schema_id)
             .bind(schema_name)
-            .bind(directory_path(schema_name))
+            .bind(crate::metadata_writer::object_directory(
+                schema_name,
+                &schema_uuid,
+            ))
             .bind(snapshot_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&schema_uuid)
             .fetch_one(&mut **tx)
             .await?
         },
@@ -1673,6 +1682,10 @@ async fn finalize_table_snapshot(
                 reserved_at_setup,
             };
             refuse_changed_table_id(&reserved, mode, schema_name, table_name)?;
+            let table_uuid = directory_plan
+                .table
+                .and_then(|plan| plan.table_uuid.clone())
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
             sqlx::query(
                 "INSERT INTO ducklake_table
                      (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
@@ -1683,15 +1696,25 @@ async fn finalize_table_snapshot(
             .bind(table_id_hint)
             .bind(schema_id)
             .bind(table_name)
-            .bind(directory_path(table_name))
+            .bind(crate::metadata_writer::object_directory(
+                table_name,
+                &table_uuid,
+            ))
             .bind(snapshot_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&table_uuid)
             .execute(&mut **tx)
             .await?;
             table_id_hint
         },
     };
 
+    if let Some(plan) = directory_plan.table {
+        plan.check(
+            read_table_paths(tx, schema_name, table_name).await?,
+            schema_name,
+            table_name,
+        )?;
+    }
     // Classify this commit as DDL vs pure data write. `current` is the table's
     // live recursive column tree ordered by `column_order`.
     use std::collections::{HashMap, HashSet};
@@ -1922,6 +1945,24 @@ async fn finalize_table_snapshot(
     })
 }
 
+async fn read_table_paths(
+    connection: &mut sqlx::PgConnection,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Option<StoredTablePaths>> {
+    Ok(sqlx::query_as(
+        "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = $1 AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = $2 AND s.end_snapshot IS NULL",
+    )
+    .bind(table_name)
+    .bind(schema_name)
+    .fetch_optional(connection)
+    .await?)
+}
+
 impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
         self.block_on(async {
@@ -2013,6 +2054,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         write.base_snapshot_id,
                         write.inserts_rows(),
                         self.reserved_tables.take(write.table_id),
+                        write.commit_directory(writes)?,
                     )
                     .await?,
                 );
@@ -2261,7 +2303,11 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // `{data_path}/{schema}/{table}/…`, matching every other
             // single-catalog backend (the multicatalog writer scopes to
             // `cat_{id}/{schema}` instead).
-            let schema_path = directory_path(path.unwrap_or(name));
+            let schema_uuid = uuid::Uuid::now_v7().to_string();
+            let schema_path = match path {
+                Some(path) => directory_path(path),
+                None => crate::metadata_writer::object_directory(name, &schema_uuid),
+            };
             let schema_id = reserve_catalog_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_schema
@@ -2273,7 +2319,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&schema_uuid)
             .execute(&mut *tx)
             .await?;
 
@@ -2320,7 +2366,11 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = directory_path(path.unwrap_or(name));
+            let table_uuid = uuid::Uuid::now_v7().to_string();
+            let table_path = match path {
+                Some(path) => directory_path(path),
+                None => crate::metadata_writer::object_directory(name, &table_uuid),
+            };
             let table_id = reserve_catalog_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_table
@@ -2334,7 +2384,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(name)
             .bind(&table_path)
             .bind(snapshot_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&table_uuid)
             .execute(&mut *tx)
             .await?;
 
@@ -2493,6 +2543,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                file.table_directory.as_deref().into(),
             )
             .await?;
             let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
@@ -2651,6 +2702,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                crate::metadata_writer::file_directory_plan(files)?.into(),
             )
             .await?;
             let (snapshot_id, table_id) = (ids.snapshot_id, ids.table_id);
@@ -3182,6 +3234,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                Default::default(),
             )
             .await?;
             record_table_write_changes(
@@ -3241,17 +3294,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         self.block_on(async {
-            let row: Option<StoredTablePaths> = sqlx::query_as(
-                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_schema s
-                 LEFT JOIN ducklake_table t
-                     ON t.schema_id = s.schema_id AND t.table_name = $1 AND t.end_snapshot IS NULL
-                 WHERE s.schema_name = $2 AND s.end_snapshot IS NULL",
-            )
-            .bind(table_name)
-            .bind(schema_name)
-            .fetch_optional(&self.pool)
-            .await?;
+            let row =
+                read_table_paths(&mut *self.pool.acquire().await?, schema_name, table_name).await?;
             row.map(
                 |(schema_path, schema_relative, table_path, table_relative)| {
                     table_directory(
@@ -3265,6 +3309,27 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 },
             )
             .transpose()
+        })
+    }
+
+    fn plan_table_directory(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        schema_uuid: Option<&str>,
+    ) -> Result<Option<crate::metadata_writer::TableDirectoryPlan>> {
+        let data_path = self.get_data_path()?;
+        self.block_on(async {
+            let paths =
+                read_table_paths(&mut *self.pool.acquire().await?, schema_name, table_name).await?;
+            crate::metadata_writer::TableDirectoryPlan::new(
+                &data_path,
+                paths,
+                schema_name,
+                table_name,
+                schema_uuid,
+            )
+            .map(Some)
         })
     }
 

@@ -997,6 +997,7 @@ impl DuckdbMetadataWriter {
             mode,
             base_snapshot,
             self.reserved_tables.take(table_id),
+            crate::metadata_writer::file_directory_plan(files)?.into(),
         )?;
         if !deletes.is_empty() {
             let ours = TableChanges {
@@ -1565,6 +1566,7 @@ fn insert_new_table_rows(
     base_snapshot: i64,
     mode: WriteMode,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<()> {
     let live: Option<i64> = tx
         .query_row(
@@ -1583,6 +1585,13 @@ fn insert_new_table_rows(
             // live table of the id is another transaction's create that took it.
             if reserved_at_setup {
                 refuse_changed_table_id(&reserved_id_taken(), mode, schema_name, table_name)?;
+            }
+            if let Some(plan) = directory_plan.table {
+                plan.check(
+                    read_table_paths(tx, schema_name, table_name)?,
+                    schema_name,
+                    table_name,
+                )?;
             }
             return Ok(());
         },
@@ -1626,23 +1635,68 @@ fn insert_new_table_rows(
         Some(id) => id,
         None => {
             let schema_id = reserve_ids_of(tx, IdAllocator::Catalog, 1)?;
+            let schema_uuid = directory_plan
+                .schema_uuid
+                .map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_owned);
             tx.execute(
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES (?, uuidv7(), ?, ?, true, ?)",
-                params![schema_id, schema_name, directory_path(schema_name), snapshot_id],
+                 VALUES (?, CAST(? AS UUID), ?, ?, true, ?)",
+                params![
+                    schema_id,
+                    schema_uuid,
+                    schema_name,
+                    crate::metadata_writer::object_directory(schema_name, &schema_uuid),
+                    snapshot_id
+                ],
             )?;
             schema_id
         },
     };
+    let table_uuid = directory_plan
+        .table
+        .and_then(|plan| plan.table_uuid.clone())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     tx.execute(
         "INSERT INTO ducklake_table
              (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
               begin_snapshot)
-         VALUES (?, uuidv7(), ?, ?, ?, true, ?)",
-        params![table_id, schema_id, table_name, directory_path(table_name), snapshot_id],
+         VALUES (?, CAST(? AS UUID), ?, ?, ?, true, ?)",
+        params![
+            table_id,
+            table_uuid,
+            schema_id,
+            table_name,
+            crate::metadata_writer::object_directory(table_name, &table_uuid),
+            snapshot_id
+        ],
     )?;
+    if let Some(plan) = directory_plan.table {
+        plan.check(
+            read_table_paths(tx, schema_name, table_name)?,
+            schema_name,
+            table_name,
+        )?;
+    }
     Ok(())
+}
+
+fn read_table_paths(
+    conn: &Connection,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Option<StoredTablePaths>> {
+    conn.query_row(
+        "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
+        params![table_name, schema_name],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 fn reserve_file_ids(tx: &Transaction<'_>, n: i64) -> Result<Vec<i64>> {
@@ -2644,6 +2698,7 @@ fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<i64> {
     let (snapshot_id, _) = insert_snapshot(tx)?;
     insert_new_table_rows(
@@ -2655,6 +2710,7 @@ fn finalize_snapshot(
         base_snapshot,
         mode,
         reserved_at_setup,
+        directory_plan,
     )?;
     finalize_table_snapshot(
         tx,
@@ -3935,13 +3991,17 @@ impl MetadataWriter for DuckdbMetadataWriter {
             return Ok((schema_id, false));
         }
 
-        let schema_path = directory_path(path.unwrap_or(name));
+        let schema_uuid = uuid::Uuid::now_v7().to_string();
+        let schema_path = match path {
+            Some(path) => directory_path(path),
+            None => crate::metadata_writer::object_directory(name, &schema_uuid),
+        };
         let schema_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
         tx.execute(
             "INSERT INTO ducklake_schema
                  (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
-             VALUES (?, uuidv7(), ?, ?, true, ?)",
-            params![schema_id, name, schema_path, snapshot_id],
+             VALUES (?, CAST(? AS UUID), ?, ?, true, ?)",
+            params![schema_id, schema_uuid, name, schema_path, snapshot_id],
         )?;
         record_snapshot_changes(
             &tx,
@@ -3984,14 +4044,18 @@ impl MetadataWriter for DuckdbMetadataWriter {
             |row| row.get(0),
         )?;
 
-        let table_path = directory_path(path.unwrap_or(name));
+        let table_uuid = uuid::Uuid::now_v7().to_string();
+        let table_path = match path {
+            Some(path) => directory_path(path),
+            None => crate::metadata_writer::object_directory(name, &table_uuid),
+        };
         let table_id = reserve_ids_of(&tx, IdAllocator::Catalog, 1)?;
         tx.execute(
             "INSERT INTO ducklake_table
                  (table_id, table_uuid, schema_id, table_name, path, path_is_relative,
                   begin_snapshot)
-             VALUES (?, uuidv7(), ?, ?, ?, true, ?)",
-            params![table_id, schema_id, name, table_path, snapshot_id],
+             VALUES (?, CAST(? AS UUID), ?, ?, ?, true, ?)",
+            params![table_id, table_uuid, schema_id, name, table_path, snapshot_id],
         )?;
         record_snapshot_changes(
             &tx,
@@ -4227,6 +4291,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             mode,
             base_snapshot,
             self.reserved_tables.take(table_id),
+            file.table_directory.as_deref().into(),
         )?;
 
         // Partition-spec fence: this file must be consistent with the table's live
@@ -4382,6 +4447,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             mode,
             base_snapshot,
             self.reserved_tables.take(table_id),
+            crate::metadata_writer::file_directory_plan(files)?.into(),
         )?;
         // Partition-spec fence (both directions, every file): each file must be
         // consistent with the table's live partition generation at commit time. The
@@ -4564,6 +4630,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             mode,
             base_snapshot,
             self.reserved_tables.take(table_id),
+            Default::default(),
         )?;
         if mode != WriteMode::Replace
             && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
@@ -4757,6 +4824,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 write.base_snapshot_id,
                 write.mode,
                 self.reserved_tables.take(write.table_id),
+                write.commit_directory(writes)?,
             )?;
             let schema_id = validate_staged_table(&tx, write)?;
             finalize_table_snapshot(
@@ -5943,6 +6011,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             mode,
             base_snapshot,
             self.reserved_tables.take(table_id),
+            Default::default(),
         )?;
         record_table_write_changes(
             &tx,
@@ -6005,17 +6074,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         let conn = self.connection();
-        let row: Option<StoredTablePaths> = conn
-            .query_row(
-                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_schema s
-                 LEFT JOIN ducklake_table t
-                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
-                params![table_name, schema_name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
+        let row = read_table_paths(&conn, schema_name, table_name)?;
         row.map(
             |(schema_path, schema_relative, table_path, table_relative)| {
                 table_directory(
@@ -6029,6 +6088,24 @@ impl MetadataWriter for DuckdbMetadataWriter {
             },
         )
         .transpose()
+    }
+
+    fn plan_table_directory(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        schema_uuid: Option<&str>,
+    ) -> Result<Option<crate::metadata_writer::TableDirectoryPlan>> {
+        let data_path = self.get_data_path()?;
+        let paths = read_table_paths(&self.connection(), schema_name, table_name)?;
+        crate::metadata_writer::TableDirectoryPlan::new(
+            &data_path,
+            paths,
+            schema_name,
+            table_name,
+            schema_uuid,
+        )
+        .map(Some)
     }
 
     fn get_table_column_nullability(

@@ -3327,6 +3327,7 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<i64> {
     // One write-lock-first snapshot is shared by every table finalized by a
     // multi-table transaction. A single-table write uses the same path once.
@@ -3346,6 +3347,7 @@ async fn finalize_snapshot(
         base_snapshot,
         true,
         reserved_at_setup,
+        directory_plan,
     )
     .await?;
     Ok(snapshot_id)
@@ -3369,6 +3371,7 @@ async fn finalize_table_snapshot(
     base_snapshot: i64,
     inserts: bool,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<()> {
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
     // identifies creation even when it has no columns; using an empty live-column
@@ -3382,6 +3385,7 @@ async fn finalize_table_snapshot(
         base_snapshot,
         mode,
         reserved_at_setup,
+        directory_plan,
     )
     .await?;
 
@@ -3673,6 +3677,7 @@ async fn insert_new_table_rows(
     base_snapshot: i64,
     mode: WriteMode,
     reserved_at_setup: bool,
+    directory_plan: crate::metadata_writer::CommitDirectory<'_>,
 ) -> Result<(i64, i64)> {
     let live: Option<(i64, i64, i64)> = sqlx::query_as(
         "SELECT table_meta.table_id, schema.begin_snapshot, table_meta.begin_snapshot
@@ -3697,6 +3702,13 @@ async fn insert_new_table_rows(
         if reserved_at_setup {
             refuse_changed_table_id(&reserved_id_taken(), mode, schema_name, table_name)?;
         }
+        if let Some(plan) = directory_plan.table {
+            plan.check(
+                read_table_paths(tx, schema_name, table_name).await?,
+                schema_name,
+                table_name,
+            )?;
+        }
         return Ok((schema_begin, table_begin));
     }
     let reserved =
@@ -3713,35 +3725,73 @@ async fn insert_new_table_rows(
         Some(schema) => schema,
         None => {
             let schema_id = reserve_catalog_id(tx).await?;
+            let schema_uuid = directory_plan
+                .schema_uuid
+                .map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_owned);
             sqlx::query(
                 "INSERT INTO ducklake_schema
                      (schema_id, schema_uuid, schema_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, ?, ?, 1, ?)",
             )
             .bind(schema_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&schema_uuid)
             .bind(schema_name)
-            .bind(directory_path(schema_name))
+            .bind(crate::metadata_writer::object_directory(
+                schema_name,
+                &schema_uuid,
+            ))
             .bind(snapshot_id)
             .execute(&mut **tx)
             .await?;
             (schema_id, snapshot_id)
         },
     };
+    let table_uuid = directory_plan
+        .table
+        .and_then(|plan| plan.table_uuid.clone())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     sqlx::query(
         "INSERT INTO ducklake_table
              (table_id, table_uuid, schema_id, table_name, path, path_is_relative, begin_snapshot)
          VALUES (?, ?, ?, ?, ?, 1, ?)",
     )
     .bind(table_id)
-    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&table_uuid)
     .bind(schema_id)
     .bind(table_name)
-    .bind(directory_path(table_name))
+    .bind(crate::metadata_writer::object_directory(
+        table_name,
+        &table_uuid,
+    ))
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
+    if let Some(plan) = directory_plan.table {
+        plan.check(
+            read_table_paths(tx, schema_name, table_name).await?,
+            schema_name,
+            table_name,
+        )?;
+    }
     Ok((schema_begin, snapshot_id))
+}
+
+async fn read_table_paths(
+    connection: &mut sqlx::SqliteConnection,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<Option<StoredTablePaths>> {
+    Ok(sqlx::query_as(
+        "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
+                 FROM ducklake_schema s
+                 LEFT JOIN ducklake_table t
+                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
+                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
+    )
+    .bind(table_name)
+    .bind(schema_name)
+    .fetch_optional(connection)
+    .await?)
 }
 
 /// What became of `table_id`, reserved for `table_name` by a setup that saw
@@ -4831,7 +4881,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok((schema_id, false));
             }
 
-            let schema_path = directory_path(path.unwrap_or(name));
+            let schema_uuid = uuid::Uuid::now_v7().to_string();
+            let schema_path = match path {
+                Some(path) => directory_path(path),
+                None => crate::metadata_writer::object_directory(name, &schema_uuid),
+            };
             let schema_id = reserve_catalog_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_schema
@@ -4839,7 +4893,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES (?, ?, ?, ?, 1, ?)",
             )
             .bind(schema_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&schema_uuid)
             .bind(name)
             .bind(&schema_path)
             .bind(snapshot_id)
@@ -4891,7 +4945,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = directory_path(path.unwrap_or(name));
+            let table_uuid = uuid::Uuid::now_v7().to_string();
+            let table_path = match path {
+                Some(path) => directory_path(path),
+                None => crate::metadata_writer::object_directory(name, &table_uuid),
+            };
             let table_id = reserve_catalog_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_table
@@ -4899,7 +4957,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                  VALUES (?, ?, ?, ?, ?, 1, ?)",
             )
             .bind(table_id)
-            .bind(uuid::Uuid::now_v7().to_string())
+            .bind(&table_uuid)
             .bind(schema_id)
             .bind(name)
             .bind(&table_path)
@@ -5483,6 +5541,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                file.table_directory.as_deref().into(),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -5661,6 +5720,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                crate::metadata_writer::file_directory_plan(files)?.into(),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -5867,6 +5927,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                Default::default(),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -6093,6 +6154,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     write.base_snapshot_id,
                     write.inserts_rows(),
                     self.reserved_tables.take(write.table_id),
+                    write.commit_directory(writes)?,
                 )
                 .await?;
             }
@@ -6366,6 +6428,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                file.table_directory.as_deref().into(),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -6630,6 +6693,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                crate::metadata_writer::file_directory_plan(files)?.into(),
             )
             .await?;
             if mode != WriteMode::Replace
@@ -7793,6 +7857,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 mode,
                 base_snapshot,
                 self.reserved_tables.take(table_id),
+                Default::default(),
             )
             .await?;
             let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
@@ -7862,17 +7927,8 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let data_path = self.get_data_path()?;
         self.block_on(async {
-            let row: Option<StoredTablePaths> = sqlx::query_as(
-                "SELECT s.path, s.path_is_relative, t.path, t.path_is_relative
-                 FROM ducklake_schema s
-                 LEFT JOIN ducklake_table t
-                     ON t.schema_id = s.schema_id AND t.table_name = ? AND t.end_snapshot IS NULL
-                 WHERE s.schema_name = ? AND s.end_snapshot IS NULL",
-            )
-            .bind(table_name)
-            .bind(schema_name)
-            .fetch_optional(&self.pool)
-            .await?;
+            let row =
+                read_table_paths(&mut *self.pool.acquire().await?, schema_name, table_name).await?;
             row.map(
                 |(schema_path, schema_relative, table_path, table_relative)| {
                     table_directory(
@@ -7886,6 +7942,27 @@ impl MetadataWriter for SqliteMetadataWriter {
                 },
             )
             .transpose()
+        })
+    }
+
+    fn plan_table_directory(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        schema_uuid: Option<&str>,
+    ) -> Result<Option<crate::metadata_writer::TableDirectoryPlan>> {
+        let data_path = self.get_data_path()?;
+        self.block_on(async {
+            let paths =
+                read_table_paths(&mut *self.pool.acquire().await?, schema_name, table_name).await?;
+            crate::metadata_writer::TableDirectoryPlan::new(
+                &data_path,
+                paths,
+                schema_name,
+                table_name,
+                schema_uuid,
+            )
+            .map(Some)
         })
     }
 

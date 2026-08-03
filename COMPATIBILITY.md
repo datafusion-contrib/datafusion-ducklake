@@ -1029,9 +1029,10 @@ Known edges:
     whose base snapshot was expired meanwhile commits when it creates the table, which the writer
     that reserved the id knows; an `Append` to a table that existed at its setup and has no row
     left conflicts, as the table may have been dropped meanwhile.
-  - *Paths:* a file the crate writes goes to the directory the table's stored path names, which
-    a rename by official keeps; a table's first file goes under its schema's stored path, which
-    official may have stored under another name.
+  - *Paths:* files go under the table's stored directory, which a rename keeps. A new schema
+    or table uses its name if it contains at most 255 bytes of ASCII letters, digits,
+    underscores, and hyphens. Other names use the object's UUID. A new table's first files
+    use the same directories as its catalog commit.
   - *Migration:* `migrate` only adds what an older catalog lacks, so a release before 0.10
     keeps writing it, and the writers take ids past the counters and sequences older releases
     allocate from. `migrate_to_official_layout` then rebuilds it into official's layout

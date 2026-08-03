@@ -43,6 +43,124 @@ pub(crate) fn table_directory(
     resolve_path(&schema_directory, table_path, table_path_is_relative)
 }
 
+pub(crate) fn is_named_directory(name: &str) -> bool {
+    name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn object_directory(name: &str, uuid: &str) -> String {
+    directory_path(if is_named_directory(name) {
+        name
+    } else {
+        uuid
+    })
+}
+
+/// The catalog paths a write uses before its table exists.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableDirectoryPlan {
+    pub(crate) directory: String,
+    pub(crate) schema_uuid: Option<String>,
+    pub(crate) table_uuid: Option<String>,
+    schema_path: String,
+    schema_relative: bool,
+    table_path: String,
+    table_relative: bool,
+}
+
+impl TableDirectoryPlan {
+    pub(crate) fn new(
+        data_path: &str,
+        stored: Option<StoredTablePaths>,
+        schema_name: &str,
+        table_name: &str,
+        schema_uuid: Option<&str>,
+    ) -> Result<Self> {
+        let schema_uuid = (stored.is_none() && !is_named_directory(schema_name))
+            .then(|| schema_uuid.map_or_else(|| uuid::Uuid::now_v7().to_string(), str::to_owned));
+        let (schema_path, schema_relative, table_path, table_relative) =
+            stored.unwrap_or_else(|| {
+                (
+                    object_directory(schema_name, schema_uuid.as_deref().unwrap_or("")),
+                    Some(true),
+                    None,
+                    None,
+                )
+            });
+        let table_uuid = (table_path.is_none() && !is_named_directory(table_name))
+            .then(|| uuid::Uuid::now_v7().to_string());
+        let schema_relative = schema_relative.unwrap_or(true);
+        let table_relative = table_relative.unwrap_or(true);
+        let table_path = table_path
+            .unwrap_or_else(|| object_directory(table_name, table_uuid.as_deref().unwrap_or("")));
+        let directory = table_directory(
+            data_path,
+            (&schema_path, schema_relative),
+            (&table_path, table_relative),
+        )?;
+        Ok(Self {
+            directory,
+            schema_uuid,
+            table_uuid,
+            schema_path,
+            schema_relative,
+            table_path,
+            table_relative,
+        })
+    }
+
+    pub(crate) fn check(
+        &self,
+        stored: Option<StoredTablePaths>,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<()> {
+        if stored.is_some_and(|(schema, schema_relative, table, table_relative)| {
+            schema == self.schema_path
+                && schema_relative.unwrap_or(true) == self.schema_relative
+                && table.as_deref() == Some(self.table_path.as_str())
+                && table_relative.unwrap_or(true) == self.table_relative
+        }) {
+            return Ok(());
+        }
+        Err(DuckLakeError::Conflict(format!(
+            "storage directory for {} changed during the write; retry the write",
+            quote_snapshot_table(schema_name, table_name),
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CommitDirectory<'a> {
+    pub(crate) table: Option<&'a TableDirectoryPlan>,
+    pub(crate) schema_uuid: Option<&'a str>,
+}
+
+impl<'a> From<Option<&'a TableDirectoryPlan>> for CommitDirectory<'a> {
+    fn from(table: Option<&'a TableDirectoryPlan>) -> Self {
+        Self {
+            table,
+            schema_uuid: table.and_then(|plan| plan.schema_uuid.as_deref()),
+        }
+    }
+}
+
+pub(crate) fn file_directory_plan(files: &[DataFileInfo]) -> Result<Option<&TableDirectoryPlan>> {
+    let mut plans = files
+        .iter()
+        .filter_map(|file| file.table_directory.as_deref());
+    let first = plans.next();
+    if plans.any(|plan| Some(plan) != first) {
+        return Err(DuckLakeError::Conflict(
+            "staged files use different catalog directories; retry the write".to_string(),
+        ));
+    }
+    Ok(first)
+}
+
 /// What a commit finds of the id `begin_write_transaction` reserved for a
 /// table, when no live table has the table's name.
 pub(crate) struct ReservedTableId {
@@ -1684,6 +1802,9 @@ pub enum RowIdStart {
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.
 #[derive(Debug, Clone)]
 pub struct DataFileInfo {
+    /// The reserved catalog directory for staged files of a new table.
+    #[doc(hidden)]
+    pub table_directory: Option<Arc<TableDirectoryPlan>>,
     /// Path to the file (relative to table path or absolute)
     pub path: String,
     /// Whether the path is relative to the table's path
@@ -1752,6 +1873,7 @@ impl DataFileInfo {
             record_count
         );
         Self {
+            table_directory: None,
             path: path.into(),
             path_is_relative: true,
             file_size_bytes,
@@ -3169,6 +3291,43 @@ pub(crate) fn materialize_null_columns(
 }
 
 impl StagedTableWrite {
+    pub(crate) fn commit_directory<'a>(
+        &'a self,
+        writes: &'a [Self],
+    ) -> Result<CommitDirectory<'a>> {
+        let table = self.directory_plan()?;
+        let mut directory = CommitDirectory::from(table);
+        if !is_named_directory(&self.schema_name) && directory.schema_uuid.is_none() {
+            for write in writes
+                .iter()
+                .filter(|write| write.schema_name == self.schema_name)
+            {
+                if let Some(uuid) = write
+                    .directory_plan()?
+                    .and_then(|plan| plan.schema_uuid.as_deref())
+                {
+                    directory.schema_uuid = Some(uuid);
+                    break;
+                }
+            }
+        }
+        Ok(directory)
+    }
+
+    pub(crate) fn directory_plan(&self) -> Result<Option<&TableDirectoryPlan>> {
+        let primary = match &self.data {
+            StagedTableData::Files(files) => file_directory_plan(files)?,
+            _ => None,
+        };
+        let inserted = file_directory_plan(&self.inserted_files)?;
+        if primary.is_some() && inserted.is_some() && primary != inserted {
+            return Err(DuckLakeError::Conflict(
+                "staged files use different catalog directories; retry the write".to_string(),
+            ));
+        }
+        Ok(primary.or(inserted))
+    }
+
     /// Whether the stage inserts rows: `data`, or a `MERGE`'s inserted files.
     pub(crate) fn inserts_rows(&self) -> bool {
         !matches!(self.data, StagedTableData::None) || !self.inserted_files.is_empty()
@@ -4889,14 +5048,26 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// The directory the files of `schema_name.table_name` go to, as readers
     /// resolve it from the stored paths: a live table's own, or, for a table
-    /// not created yet, the directory under its live schema's path that the
-    /// table's row will name. `None` when the schema does not exist either.
+    /// not created yet, the tentative named directory under its live schema.
+    /// A staged write that needs a UUID path reserves it before uploading.
+    /// Returns `None` when the schema does not exist.
     /// A table official DuckDB renamed keeps its directory, and a schema it
     /// created may store a path other than its name, so files must not go
     /// where the names point. The default, `None`, leaves the directory to the
     /// names, as the multi-catalog layout lays files out.
     fn get_table_directory(&self, schema_name: &str, table_name: &str) -> Result<Option<String>> {
         let _ = (schema_name, table_name);
+        Ok(None)
+    }
+
+    /// Plan a default directory for a write to a schema or table with a UUID path.
+    #[doc(hidden)]
+    fn plan_table_directory(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+        _schema_uuid: Option<&str>,
+    ) -> Result<Option<TableDirectoryPlan>> {
         Ok(None)
     }
 
