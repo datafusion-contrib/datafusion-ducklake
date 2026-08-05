@@ -98,6 +98,10 @@ async fn read_pairs(pool: &PgPool, cat_name: &str) -> Vec<(i32, i32)> {
 /// an otherwise partitioned table. The partition fence does not catch this, because the
 /// `DataFileInfo` it validates DOES carry the assignment; only the persistence was
 /// missing. So this asserts the CATALOG ROWS, not the query result.
+///
+/// The commit carries a REAL delete entry: an empty `deletes` slice is a plain append
+/// and delegates to `finish`, which would exercise a different commit method and leave
+/// this path uncovered.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn append_with_deletes_persists_partition_metadata_postgres() {
@@ -139,8 +143,22 @@ async fn append_with_deletes_persists_partition_metadata_postgres() {
     .await
     .unwrap();
 
-    // Append one row through the append+delete commit (no deletes needed to exercise
-    // the same code path a partitioned update takes).
+    // Supersede the seed row (its only row, at position 0) so the commit genuinely
+    // carries a delete — the code path a partitioned update takes.
+    let (seed_data_file_id, seed_path) = sqlx::query_as::<_, (i64, String)>(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(seeded.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let del_info = table_writer
+        .write_delete_file("public", "t", &seed_path, &[0])
+        .await
+        .unwrap();
+
+    // Append one row alongside that delete.
     let appended = RecordBatch::try_new(
         schema(),
         vec![Arc::new(Int32Array::from(vec![2])), Arc::new(Int32Array::from(vec![9]))],
@@ -150,7 +168,14 @@ async fn append_with_deletes_persists_partition_metadata_postgres() {
         .begin_write("public", "t", schema().as_ref(), WriteMode::Append)
         .unwrap();
     session.write_batch(&appended).unwrap();
-    session.finish_with_deletes(&[]).await.unwrap();
+    session
+        .finish_with_deletes(&[DeleteFileEntry {
+            data_file_id: seed_data_file_id,
+            expected_prev_delete_file: None,
+            delete: del_info,
+        }])
+        .await
+        .unwrap();
 
     // The appended file must carry the live generation AND its partition value.
     let rows: Vec<(Option<i64>, Option<String>)> = sqlx::query_as(

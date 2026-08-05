@@ -1227,3 +1227,99 @@ async fn from_pool_shares_an_existing_connection_pool() {
         .unwrap();
     assert_eq!(head, 1);
 }
+
+/// `finish_with_deletes(&[])` must be a plain append here too.
+///
+/// This writer supports ordinary multi-file (partitioned) writes but not
+/// positional-delete commits, so routing an empty-delete finish through the
+/// delete-carrying commit failed as unsupported — after uploading, leaving orphaned
+/// objects — even though the identical append commits fine. The DuckDB backend covers
+/// the same class without Docker; this pins it for the second such backend.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn empty_delete_finish_commits_a_partitioned_append() {
+    use datafusion_ducklake::PartitionTransform;
+
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let writer = Arc::new(writer);
+
+    // Seed through the ordinary write path so the table is fully published, then
+    // adopt a partition spec on `name`.
+    let seeded = DuckLakeTableWriter::new(
+        Arc::clone(&writer) as Arc<dyn MetadataWriter>,
+        object_store(),
+    )
+    .unwrap()
+    .write_table("main", "t", &[batch(vec![0], vec![Some("seed")])])
+    .await
+    .unwrap();
+    writer
+        .set_partition_spec(
+            seeded.table_id,
+            &[("name".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let tw = DuckLakeTableWriter::new(
+        Arc::clone(&writer) as Arc<dyn MetadataWriter>,
+        object_store(),
+    )
+    .unwrap();
+    let mut session = tw
+        .begin_write("main", "t", arrow_schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    // Two distinct names -> two partition files -> the multi-file commit.
+    session
+        .write_batch(&batch(vec![1, 2, 3], vec![Some("a"), Some("b"), Some("a")]))
+        .unwrap();
+    let committed = session
+        .finish_with_deletes(&[])
+        .await
+        .expect("an empty-delete finish is a plain append and must commit here");
+    assert_eq!(committed.files_written, 2, "one file per name");
+    assert_eq!(committed.records_written, 3);
+
+    // Both appended files registered against the ONE committed snapshot, each with
+    // its own partition value.
+    let files: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT df.begin_snapshot, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.begin_snapshot = $2
+         ORDER BY fpv.partition_value",
+    )
+    .bind(seeded.table_id)
+    .bind(committed.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(files.len(), 2, "both partition files registered: {files:?}");
+    assert_eq!(
+        files.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+        vec![Some("a".to_string()), Some("b".to_string())],
+    );
+
+    // And every row reads back: the seed plus the three appended.
+    let ctx = read_context(&conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM lake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        4
+    );
+}

@@ -395,3 +395,141 @@ fn duckdb_register_multiple_unpartitioned_files_into_partitioned_table_conflicts
         "expected a partition-spec conflict, got: {err}"
     );
 }
+
+/// `finish_with_deletes(&[])` must be a plain append on EVERY writable backend, not
+/// only the ones that implement positional-delete commits.
+///
+/// The delete-carrying commit is implemented by the backends that support positional
+/// deletes; this one supports ordinary multi-file writes but not those. Routing an
+/// empty-delete finish through the delete commit therefore failed as unsupported here,
+/// even though `finish()` commits the identical append — and it failed only AFTER
+/// uploading, leaving orphaned objects in storage. So this asserts both halves: the
+/// commit succeeds, and every partition file is registered against the one snapshot.
+///
+/// A partitioned session is used because it is the case that reaches the multi-file
+/// commit; the single-file form was already routed to a widely-implemented method.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_empty_delete_finish_commits_a_partitioned_append() {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("catalog.ducklake");
+    let db_str = db.to_str().unwrap().to_string();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, true),
+    ]));
+    // Two regions -> the partitioned session produces two files.
+    let batch = RecordBatch::try_new(
+        arrow_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["us", "eu", "us"])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let table_id;
+    let committed;
+    {
+        let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+
+        let cols = vec![
+            ColumnDef::from_arrow("id", &DataType::Int64, false).unwrap(),
+            ColumnDef::from_arrow("region", &DataType::Utf8, true).unwrap(),
+        ];
+        let setup = writer
+            .begin_write_transaction("main", "events", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                setup.table_id,
+                "main",
+                "events",
+                setup.snapshot_id,
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &cols,
+                &setup.column_ids,
+            )
+            .unwrap();
+        table_id = setup.table_id;
+        writer
+            .set_partition_spec(
+                table_id,
+                &[("region".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new());
+        let table_writer =
+            DuckLakeTableWriter::new(Arc::new(writer) as Arc<dyn MetadataWriter>, object_store)
+                .unwrap();
+        let mut session = table_writer
+            .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        session.write_batch(&batch).unwrap();
+        committed = session
+            .finish_with_deletes(&[])
+            .await
+            .expect("an empty-delete finish is a plain append and must commit here");
+        // Writer (and its lock on the DuckDB file) dropped here.
+    }
+
+    assert_eq!(committed.files_written, 2, "one file per region");
+    assert_eq!(committed.records_written, 3);
+
+    let provider = DuckdbMetadataProvider::new(&db_str).unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), 2, "both partition files are registered");
+    let mut regions: Vec<Option<String>> = page
+        .iter()
+        .map(|m| {
+            m.file
+                .partition_values
+                .iter()
+                .find(|(k, _)| *k == 0)
+                .and_then(|(_, v)| v.clone())
+        })
+        .collect();
+    regions.sort();
+    assert_eq!(
+        regions,
+        vec![Some("eu".to_string()), Some("us".to_string())],
+        "each file carries its own partition value"
+    );
+    let rows: i64 = page.iter().filter_map(|m| m.file.max_row_count).sum();
+    assert_eq!(rows, 3, "every row was committed");
+
+    // Both files share ONE snapshot. Asserted against the catalog rows because this
+    // provider does not surface a file's `begin_snapshot` on the metadata page.
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT begin_snapshot FROM ducklake_data_file
+             WHERE table_id = ? AND end_snapshot IS NULL",
+        )
+        .unwrap();
+    let snapshots: Vec<i64> = stmt
+        .query_map([table_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        snapshots,
+        vec![committed.snapshot_id],
+        "every partition file is registered against the one committed snapshot"
+    );
+}

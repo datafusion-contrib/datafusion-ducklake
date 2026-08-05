@@ -2022,11 +2022,24 @@ impl TableWriteSession {
     /// the commit behind an update/upsert (supersede rows and insert their new
     /// versions in one snapshot). The caller resolves the positions and writes
     /// each delete file (see [`DuckLakeTableWriter::write_delete_file`]) before
-    /// calling this; `deletes` may be empty (equivalent to `finish`).
+    /// calling this; `deletes` may be empty, which delegates to
+    /// [`finish`](Self::finish).
     ///
     /// A rolling or partitioned session may have produced several appended files;
     /// all of them commit in the same snapshot as the deletes.
     pub async fn finish_with_deletes(mut self, deletes: &[DeleteFileEntry]) -> Result<WriteResult> {
+        // No deletes means this IS a plain append, so take the ordinary commit path
+        // and make the documented equivalence literal. This matters beyond
+        // tidiness: the delete-carrying commit is implemented only by the backends
+        // that support positional deletes, whereas `finish` reaches
+        // `register_data_file`/`register_data_files`, which every backend
+        // implements. Routing an empty-delete finish through the delete commit
+        // would therefore fail as unsupported on a backend that can commit the
+        // append perfectly well — and only after uploading, leaving orphaned
+        // objects behind.
+        if deletes.is_empty() {
+            return self.finish().await;
+        }
         // Reject an unsupported combination before uploading anything, so a misuse
         // leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
