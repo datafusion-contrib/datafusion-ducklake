@@ -370,7 +370,15 @@ impl DuckLakeTableWriter {
     /// row's original rowid. A later read detects the embedded column by its
     /// field-id and serves those rowids inline instead of synthesizing
     /// `row_id_start + position`.
-    /// Partitioned tables route rows through the standard partition sink.
+    ///
+    /// On a partitioned table, rows route through the standard partition sink: each
+    /// rewritten row's partition is re-derived from its OWN (possibly updated) key
+    /// values, so a row whose partition-key value changed lands in its NEW partition
+    /// rather than inheriting the source file's. The embedded rowid column travels
+    /// with the row into whichever partition file it lands in, so lineage survives a
+    /// rewrite that spreads rows over several files, and
+    /// [`TableWriteSession::finish_with_deletes`] commits all of them in the one
+    /// snapshot that carries the deletes.
     ///
     /// [`ROW_ID_PARQUET_FIELD_ID`]: crate::row_id::ROW_ID_PARQUET_FIELD_ID
     pub fn begin_write_with_embedded_rowid(

@@ -1,11 +1,12 @@
 //! Postgres (multicatalog) coverage for SQL `UPDATE` end to end.
 //!
-//! The UPDATE commit reuses `register_data_file_with_deletes` (already validated
-//! on Postgres by `append_with_deletes_postgres_tests.rs`); this PR only flips
-//! `PostgresMetadataWriter::supports_update()` to true. What was untested is the
+//! The UPDATE commit reuses the append-with-deletes primitives (validated on
+//! Postgres by `append_with_deletes_postgres_tests.rs`); what these cover is the
 //! full `TableProvider::update` path driven by SQL against a writable multicatalog
-//! catalog, which this test exercises: affected-row count, the resulting values,
-//! and rowid-lineage preservation across the embedded-rowid file rewrite.
+//! catalog: affected-row count, the resulting values, rowid-lineage preservation
+//! across the embedded-rowid file rewrite, the table's sort order, and — on a
+//! partitioned table — rows moving to their new partition with the whole
+//! multi-file rewrite plus its deletes in one snapshot.
 //! Docker-gated (testcontainers Postgres).
 
 #![cfg(feature = "write-postgres")]
@@ -256,5 +257,153 @@ async fn update_applies_postgres_sort_order() {
     assert_eq!(
         values.values().iter().copied().collect::<Vec<_>>(),
         vec![11, 21, 31],
+    );
+}
+
+/// Partitioned `UPDATE` on the multicatalog Postgres writer, end to end through SQL:
+/// an assignment that changes a row's partition-key value MOVES the row to its new
+/// partition, the rewrite spans one file per output partition, all of it commits in
+/// ONE snapshot together with the positional deletes, and every row keeps its `rowid`
+/// lineage across the multi-partition rewrite.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn partitioned_update_moves_rows_and_is_one_snapshot_postgres() {
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let os: ObjStore = Arc::new(LocalFileSystem::new());
+    let cat_name = "pg_part_update";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+
+    // `val` is the partition key, so `SET val = ...` moves rows across partitions.
+    let seed = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![10, 10, 20])),
+        ],
+    )
+    .unwrap();
+    let seeded = DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
+        .unwrap()
+        .write_table("public", "t", &[seed])
+        .await
+        .unwrap();
+    writer_for(&pool, cat, &data)
+        .await
+        .set_partition_spec(
+            seeded.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let live_partition_id: i64 = sqlx::query_scalar(
+        "SELECT partition_id FROM ducklake_partition_info
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(seeded.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let before = read_rowid_rows(&pool, cat_name).await;
+    assert_eq!(before, vec![(0, 1, 10), (1, 2, 10), (2, 3, 20)]);
+    let snapshots_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Rows 1 and 3 move to two DIFFERENT new partitions (11 and 21).
+    let ctx = writable_ctx(&pool, cat_name, cat, &data).await;
+    let batches = ctx
+        .sql(&format!(
+            "UPDATE {cat_name}.public.t SET val = val + 1 WHERE id IN (1, 3)"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("count is UInt64")
+        .value(0);
+    assert_eq!(count, 2);
+
+    // One new snapshot for the whole mutation.
+    let snapshots_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshots_after,
+        snapshots_before + 1,
+        "a partitioned UPDATE is one snapshot"
+    );
+
+    // Two appended files, one per NEW partition, both carrying the live generation.
+    let head: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let appended: Vec<(Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT f.partition_id,
+                (SELECT v.partition_value FROM ducklake_file_partition_value v
+                 WHERE v.data_file_id = f.data_file_id AND v.partition_key_index = 0)
+         FROM ducklake_data_file f
+         WHERE f.table_id = $1 AND f.begin_snapshot = $2
+         ORDER BY f.data_file_id",
+    )
+    .bind(seeded.table_id)
+    .bind(head)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        appended.len(),
+        2,
+        "one rewritten file per output partition: {appended:?}"
+    );
+    assert!(
+        appended
+            .iter()
+            .all(|(id, _)| *id == Some(live_partition_id)),
+        "rewritten files carry the live partition generation: {appended:?}"
+    );
+    let mut values: Vec<Option<String>> = appended.into_iter().map(|(_, v)| v).collect();
+    values.sort();
+    assert_eq!(
+        values,
+        vec![Some("11".to_string()), Some("21".to_string())],
+        "each moved row landed in its NEW partition"
+    );
+
+    // The deletes that supersede the old versions share that snapshot.
+    let delete_snaps: Vec<i64> = sqlx::query_scalar(
+        "SELECT begin_snapshot FROM ducklake_delete_file
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(seeded.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!delete_snaps.is_empty(), "the old versions are superseded");
+    assert!(
+        delete_snaps.iter().all(|snap| *snap == head),
+        "deletes share the appended files' snapshot: {delete_snaps:?}"
+    );
+
+    // Values moved and lineage survived the multi-partition rewrite.
+    assert_eq!(
+        read_rowid_rows(&pool, cat_name).await,
+        vec![(0, 1, 11), (1, 2, 10), (2, 3, 21)],
+        "rows 1,3 moved partition and kept rowids 0 and 2"
     );
 }

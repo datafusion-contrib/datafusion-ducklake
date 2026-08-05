@@ -122,7 +122,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Configurable writer output (compression, row-group sizing) | ✅  |
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned) | ✅ |
 | Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅ |
-| Partitioned `UPDATE` / upsert — the append+delete commit registers one data file, but the new row versions span one file per partition | ❌ |
+| Partitioned `UPDATE` / upsert — the append+delete commit registers every appended file (one per output partition) together with the positional deletes, in one snapshot. A row whose partition-key value changed moves to its NEW partition and keeps its `rowid` lineage | ✅ |
 | Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec) | ✅ |
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and

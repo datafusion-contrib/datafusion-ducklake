@@ -8,18 +8,24 @@
 //! 1. For each source data file that may hold matching rows, collect its
 //!    pre-built positional scan, select the rows matching the predicate, apply
 //!    the assignments, and produce rewritten row versions that RETAIN each row's
-//!    original rowid (written into a NEW data file that embeds the rowid column,
-//!    so lineage survives the rewrite).
+//!    original rowid (written into NEW data file(s) that embed the rowid column,
+//!    so lineage survives the rewrite). On a partitioned table each rewritten row
+//!    is routed by its OWN post-assignment key values, so an assignment that
+//!    changes a partition key MOVES the row to its new partition; the rewrite then
+//!    spans one file per output partition.
 //! 2. Resolve, per source file, the cumulative positional delete masking the old
 //!    row versions (superseded rows unioned with any already-deleted rows).
-//! 3. Commit ATOMICALLY: the appended data file AND every positional delete land
+//! 3. Commit ATOMICALLY: every appended data file AND every positional delete land
 //!    in ONE snapshot via
-//!    [`MetadataWriter::register_data_file_with_deletes`]
-//!    (driven by `TableWriteSession::finish_with_deletes`).
+//!    [`MetadataWriter::register_data_file_with_deletes`] (or, when the rewrite
+//!    produced several files,
+//!    [`MetadataWriter::register_data_files_with_deletes`]) — driven by
+//!    `TableWriteSession::finish_with_deletes`.
 //! 4. Yield a single row `count: UInt64` = rows updated.
 //!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
-//! collects matched rows into memory before writing; single partition only.
+//! collects matched rows into memory before writing; runs in a single DataFusion
+//! output partition.
 //!
 //! # Session lifecycle (important)
 //!
