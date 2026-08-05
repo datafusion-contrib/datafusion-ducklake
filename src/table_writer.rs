@@ -283,8 +283,10 @@ impl DuckLakeTableWriter {
     /// `ducklake_insert.cpp`), and a single unbounded file could never be reorganized
     /// afterwards — DuckLake compaction merges but never splits.
     ///
-    /// Use [`Self::begin_write_single_file`] when the session will be finished with
-    /// [`TableWriteSession::finish_with_deletes`], which commits exactly one data file.
+    /// This is also the right default for a session finished with
+    /// [`TableWriteSession::finish_with_deletes`]: that commit registers every
+    /// appended file, however many the session rolled or partitioned into, in the
+    /// same snapshot as the deletes.
     pub fn begin_write(
         &self,
         schema_name: &str,
@@ -323,13 +325,9 @@ impl DuckLakeTableWriter {
     /// Begin a streaming write session that writes ONE data file, however large the
     /// input.
     ///
-    /// For sessions finished with [`TableWriteSession::finish_with_deletes`]: that
-    /// commit registers exactly one appended data file, so a session that rolled into
-    /// several cannot use it. [`Self::begin_write`] rolls and is the right default for
-    /// everything else.
-    ///
     /// A single file is not reorganizable later — DuckLake compaction merges but never
-    /// splits — so prefer [`Self::begin_write`] whenever the commit allows it.
+    /// splits — so prefer [`Self::begin_write`] unless the caller genuinely needs one
+    /// output object (for example to address the whole write by path).
     pub fn begin_write_single_file(
         &self,
         schema_name: &str,
@@ -1705,15 +1703,6 @@ impl PartitionSink {
         Ok(())
     }
 
-    fn pending_file_count(&self) -> usize {
-        self.staged.len()
-            + self
-                .open
-                .iter()
-                .filter(|(_, roller)| roller.has_open_file())
-                .count()
-    }
-
     /// Finish every open file and upload all staged files, returning the
     /// [`DataFileInfo`]s to commit — each stamped with its partition.
     async fn into_file_infos(
@@ -2026,73 +2015,89 @@ impl TableWriteSession {
     /// versions in one snapshot). The caller resolves the positions and writes
     /// each delete file (see [`DuckLakeTableWriter::write_delete_file`]) before
     /// calling this; `deletes` may be empty (equivalent to `finish`).
+    ///
+    /// A rolling or partitioned session may have produced several appended files;
+    /// all of them commit in the same snapshot as the deletes.
     pub async fn finish_with_deletes(mut self, deletes: &[DeleteFileEntry]) -> Result<WriteResult> {
-        // Reject an unsupported combination before uploading the staged parquet,
-        // so a misuse leaves no orphan object in storage.
+        // Reject an unsupported combination before uploading anything, so a misuse
+        // leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
-        // A rolling or partitioned session may have produced several files, but this
-        // commit registers exactly one. Both cases therefore COUNT their files before
-        // uploading anything, so a rejected write leaves no orphan object.
-        let file_info = if let Some(sink) = self.partition_sink.take() {
-            let file_count = sink.pending_file_count();
-            if file_count != 1 {
-                return Err(crate::error::DuckLakeError::Unsupported(format!(
-                    "an atomic append+delete commit accepts one appended data file, but the \
-                     partitioned write produced {file_count}"
-                )));
+        let file_infos: Vec<DataFileInfo> = if let Some(sink) = self.partition_sink.take() {
+            let file_infos = sink.into_file_infos(&self.object_store).await?;
+            if file_infos.is_empty() {
+                // No rows reached any partition. Fall through to the single-file
+                // path, whose 0-row marker is what carries a Replace truncation
+                // (and is exempt from the partition fence).
+                vec![self.upload_staged().await?]
+            } else {
+                file_infos
             }
-            sink.into_file_infos(&self.object_store)
-                .await?
-                .pop()
-                .expect("one pending partition file")
         } else if let Some(mut roller) = self.roller.take() {
             // `finish` writes the parquet footer locally; nothing is uploaded yet.
             if let Some(staged) = roller.finish()? {
                 self.rolled.push(staged);
             }
-            match self.rolled.len() {
+            if self.rolled.is_empty() {
                 // No rows arrived. Fall through to the single-file path, whose 0-row
                 // marker is what carries a Replace truncation (and is exempt from the
                 // partition fence) — same behaviour as a non-rolling session.
-                0 => self.upload_staged().await?,
-                1 => {
-                    let staged = self.rolled.pop().expect("one staged file");
-                    upload_staged_file(staged, &self.object_store, &self.column_ids).await?
-                },
-                file_count => {
-                    return Err(crate::error::DuckLakeError::Unsupported(format!(
-                        "an atomic append+delete commit accepts one appended data file, but the \
-                         write rolled into {file_count}. Open the session with \
-                         begin_write_single_file, which never rolls."
-                    )));
-                },
+                vec![self.upload_staged().await?]
+            } else {
+                let mut file_infos = Vec::with_capacity(self.rolled.len());
+                for staged in std::mem::take(&mut self.rolled) {
+                    file_infos.push(
+                        upload_staged_file(staged, &self.object_store, &self.column_ids).await?,
+                    );
+                }
+                file_infos
             }
         } else {
-            self.upload_staged().await?
+            vec![self.upload_staged().await?]
         };
-        let committed = self
-            .metadata
-            .register_data_file_with_deletes_and_commit_metadata(
-                self.table_id,
-                &self.schema_name,
-                &self.table_name,
-                self.snapshot_id,
-                &file_info,
-                deletes,
-                self.mode,
-                self.base_snapshot_id,
-                &self.columns,
-                &self.column_ids,
-                &self.commit_metadata,
-                self.expected_base_snapshot_id,
-            )?;
+        let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
+        // One appended file goes through the single-file commit, so a backend that
+        // implements only that form keeps working; N>1 needs the multi-file commit.
+        let committed = match file_infos.as_slice() {
+            [file_info] => self
+                .metadata
+                .register_data_file_with_deletes_and_commit_metadata(
+                    self.table_id,
+                    &self.schema_name,
+                    &self.table_name,
+                    self.snapshot_id,
+                    file_info,
+                    deletes,
+                    self.mode,
+                    self.base_snapshot_id,
+                    &self.columns,
+                    &self.column_ids,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )?,
+            file_infos => self
+                .metadata
+                .register_data_files_with_deletes_and_commit_metadata(
+                    self.table_id,
+                    &self.schema_name,
+                    &self.table_name,
+                    self.snapshot_id,
+                    file_infos,
+                    deletes,
+                    self.mode,
+                    self.base_snapshot_id,
+                    &self.columns,
+                    &self.column_ids,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )?,
+        };
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
             table_id: committed.table_id,
             schema_id: committed.schema_id,
-            files_written: 1,
-            records_written: self.row_count,
+            files_written: file_infos.len(),
+            records_written,
         })
     }
 

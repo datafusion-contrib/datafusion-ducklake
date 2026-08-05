@@ -367,8 +367,8 @@ async fn partitioned_write_rolls_within_each_partition() {
     );
 }
 
-/// The write entry points that target ONE caller-determined file cannot satisfy a
-/// partition spec that needs one file per partition. They must refuse an incompatible
+/// The write entry point that targets ONE caller-determined file cannot satisfy a
+/// partition spec that needs one file per partition. It must refuse an incompatible
 /// write before upload rather than commit a file without partition metadata.
 #[tokio::test(flavor = "multi_thread")]
 async fn single_file_entry_points_refuse_a_partitioned_table() {
@@ -400,21 +400,7 @@ async fn single_file_entry_points_refuse_a_partitioned_table() {
         "the error must name the entry point, got: {err}"
     );
 
-    // Atomic append+delete (the upsert commit) on a partitioned session.
-    let mut session = table_writer
-        .begin_write("main", "events", arrow_schema.as_ref(), WriteMode::Append)
-        .unwrap();
-    session.write_batch(&batches[0]).unwrap();
-    let err = session
-        .finish_with_deletes(&[])
-        .await
-        .expect_err("append+delete must refuse multiple partition files");
-    assert!(
-        err.to_string().contains("produced 2"),
-        "the error must report the incompatible file count, got: {err}"
-    );
-
-    // Nothing was committed by any of the three.
+    // Nothing was committed.
     let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
     let snap = provider.get_current_snapshot().unwrap();
     assert!(
@@ -622,6 +608,213 @@ async fn partitioned_append_with_deletes_commits_one_partition_file_atomically()
     assert_eq!(
         appended.file.partition_values,
         vec![(0, Some("us".to_string())), (1, Some("2024".to_string()))],
+    );
+}
+
+/// A keyed mutation on a PARTITIONED table: the new row versions land in several
+/// partitions, so the appended side is several files. All of them must commit in the
+/// SAME snapshot as the delete files that supersede the old versions.
+///
+/// This is the shape official DuckLake produces for `UPDATE` on a partitioned table
+/// (a partition-moving update writes one data file per touched output partition and
+/// one delete file per touched input file, all stamped with one snapshot).
+///
+/// Also asserts each appended file carries its OWN partition values and its OWN
+/// per-column statistics — a commit that only recorded the first file's would leave
+/// the rest unprunable.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_append_with_deletes_commits_every_partition_file_atomically() {
+    use datafusion_ducklake::metadata_writer::DeleteFileEntry;
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+    use sqlx::sqlite::SqlitePool;
+
+    let env = setup().await; // partitioned by (region, year(ts))
+    let writer: Arc<dyn MetadataWriter> = Arc::new(
+        SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap(),
+    );
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::clone(&writer), Arc::clone(&object_store)).unwrap();
+    let batches = events_batches();
+    let schema = batches[0].schema();
+
+    // Seed the 4 rows across the 4 (region, year) partitions -> 4 data files.
+    let mut seed = table_writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    for batch in &batches {
+        seed.write_batch(batch).unwrap();
+    }
+    let seeded = seed.finish().await.unwrap();
+    assert_eq!(seeded.files_written, 4, "one seed file per partition");
+
+    // Supersede ids 1 and 3 — one row each, so position 0 in their own file.
+    let pool = SqlitePool::connect(&env.conn_str).await.unwrap();
+    let seed_files = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT f.data_file_id, f.path,
+                (SELECT group_concat(v.partition_value, '/') FROM ducklake_file_partition_value v
+                 WHERE v.data_file_id = f.data_file_id ORDER BY v.partition_key_index)
+         FROM ducklake_data_file f
+         WHERE f.table_id = ? AND f.begin_snapshot = ?
+         ORDER BY f.data_file_id",
+    )
+    .bind(env.table_id)
+    .bind(seeded.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    // (us,2023) holds id 1 and (eu,2023) holds id 3.
+    let mut entries = Vec::new();
+    for (data_file_id, path, partition) in &seed_files {
+        if partition != "us/2023" && partition != "eu/2023" {
+            continue;
+        }
+        let delete = table_writer
+            .write_delete_file("main", "events", path, &[0])
+            .await
+            .unwrap();
+        entries.push(DeleteFileEntry {
+            data_file_id: *data_file_id,
+            expected_prev_delete_file: None,
+            delete,
+        });
+    }
+    assert_eq!(entries.len(), 2, "two superseded partition files");
+
+    // The new versions MOVE partition: id 1 -> (apac,2023), id 3 -> (apac,2024). The
+    // partitioned session therefore produces TWO appended files, which the old
+    // one-file cap refused outright.
+    let new_versions = {
+        use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3])) as ArrayRef,
+                Arc::new(arrow::array::StringArray::from(vec!["apac", "apac"])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_673_776_800_000_000i64,
+                    1_718_884_800_000_000i64,
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+    let mut session = table_writer
+        .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&new_versions).unwrap();
+    let committed = session.finish_with_deletes(&entries).await.unwrap();
+    assert_eq!(
+        committed.files_written, 2,
+        "one appended file per partition"
+    );
+    assert_eq!(committed.records_written, 2);
+
+    // ONE snapshot carries both appended files AND both delete files.
+    let appended_snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file
+         WHERE table_id = ? AND begin_snapshot > ?",
+    )
+    .bind(env.table_id)
+    .bind(seeded.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        appended_snapshots,
+        vec![committed.snapshot_id],
+        "both appended files share the one committed snapshot"
+    );
+    let delete_snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_delete_file
+         WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(env.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        delete_snapshots,
+        vec![committed.snapshot_id],
+        "both delete files share that same snapshot"
+    );
+
+    // Each appended file carries its OWN partition values and its OWN column stats.
+    let provider = SqliteMetadataProvider::new(&env.conn_str).await.unwrap();
+    let page = provider
+        .get_table_file_metadata_page(env.table_id, committed.snapshot_id, None, 4096)
+        .unwrap();
+    let mut appended: Vec<_> = page
+        .iter()
+        .filter(|m| m.file.begin_snapshot == Some(committed.snapshot_id))
+        .collect();
+    appended.sort_by_key(|m| m.file.data_file_id);
+    assert_eq!(appended.len(), 2);
+    let partitions: Vec<Vec<(i32, Option<String>)>> = {
+        let mut p: Vec<_> = appended
+            .iter()
+            .map(|m| m.file.partition_values.clone())
+            .collect();
+        p.sort();
+        p
+    };
+    assert_eq!(
+        partitions,
+        vec![
+            vec![(0, Some("apac".to_string())), (1, Some("2023".to_string()))],
+            vec![(0, Some("apac".to_string())), (1, Some("2024".to_string()))],
+        ],
+        "each appended file is stamped with its own partition"
+    );
+    for metadata in &appended {
+        let ids: Vec<i64> = {
+            let mut ids: Vec<i64> = metadata
+                .column_statistics
+                .iter()
+                .map(|s| s.column_id)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        assert_eq!(
+            ids.len(),
+            3,
+            "file {} must carry stats for all three columns, got {:?}",
+            metadata.file.data_file_id,
+            metadata.column_statistics
+        );
+    }
+
+    // The mutation reads back as an in-place update.
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT id, region FROM ducklake.main.events ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let regions: Vec<String> = rows
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::StringViewArray>()
+                .unwrap();
+            (0..b.num_rows())
+                .map(|i| col.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        regions,
+        vec!["apac", "us", "apac", "eu"],
+        "ids 1,3 moved partition; ids 2,4 untouched"
     );
 }
 

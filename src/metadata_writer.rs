@@ -1175,6 +1175,91 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         )
     }
 
+    /// Atomically register N new data files AND apply positional deletes to
+    /// existing data files, in a SINGLE snapshot — the multi-file form of
+    /// [`register_data_file_with_deletes`], for a keyed mutation whose appended
+    /// side spans several files (one per partition, or a rolled sequence).
+    ///
+    /// [`register_data_file_with_deletes`]: MetadataWriter::register_data_file_with_deletes
+    ///
+    /// In one transaction: allocate one snapshot; insert every file in `files`,
+    /// each drawing a distinct `row_id_start` from the advancing row-lineage
+    /// counter and carrying its own per-column stats and partition assignment,
+    /// exactly as [`register_data_files`](MetadataWriter::register_data_files);
+    /// then, for each [`DeleteFileEntry`], apply the same target-file fence +
+    /// compare-and-swap + retire-prior + insert-cumulative as
+    /// [`set_delete_file`](MetadataWriter::set_delete_file), all stamped with
+    /// that one snapshot. Advance the catalog head LAST, so every appended file
+    /// and every delete become visible together — never a half-applied
+    /// intermediate state. Aborts with [`crate::DuckLakeError::Conflict`] on the
+    /// first entry whose target data file was retired since `base_snapshot`, or
+    /// whose live delete file no longer matches `expected_prev_delete_file`.
+    ///
+    /// `files` must be non-empty; `deletes` may be empty (equivalent to
+    /// [`register_data_files`](MetadataWriter::register_data_files)) and each
+    /// entry must target a distinct `data_file_id`.
+    ///
+    /// Default: unsupported; backends override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_deletes(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _files: &[DataFileInfo],
+        _deletes: &[DeleteFileEntry],
+        _mode: WriteMode,
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "register_data_files_with_deletes is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Registers multiple data files with positional deletes and commit metadata.
+    ///
+    /// The default implementation accepts empty metadata and otherwise returns
+    /// an error. Metadata backends that support these fields override it.
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_deletes_and_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        deletes: &[DeleteFileEntry],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        if expected_base_snapshot_id.is_some() {
+            return Err(DuckLakeError::InvalidConfig(
+                "conditional combined multi-file writes are not supported by this metadata writer"
+                    .to_string(),
+            ));
+        }
+        commit_metadata.ensure_supported_by_default()?;
+        self.register_data_files_with_deletes(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            deletes,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+        )
+    }
+
     /// Apply positional deletes to one or more existing data files in a SINGLE
     /// new snapshot, WITHOUT appending any data file — the commit behind a SQL
     /// `DELETE ... WHERE`. This is [`register_data_file_with_deletes`] minus the

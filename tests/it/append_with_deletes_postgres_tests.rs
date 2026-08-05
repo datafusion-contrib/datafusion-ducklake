@@ -322,3 +322,195 @@ async fn update_via_finish_with_deletes_is_one_snapshot_postgres() {
         "that shared snapshot is the committed head"
     );
 }
+
+/// Multicatalog Postgres counterpart of the multi-file append+delete commit: N appended
+/// data files AND M delete files land in ONE snapshot, with each appended file carrying
+/// its own partition assignment and its own per-column statistics.
+///
+/// Partitioned so the appended side genuinely spans several files: the new row versions
+/// MOVE partition, which is the shape a partitioned keyed mutation produces.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multi_file_append_with_deletes_is_one_snapshot_postgres() {
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let os: ObjStore = Arc::new(LocalFileSystem::new());
+    let cat_name = "pg_multi_deletes";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+    let sch = schema();
+    let writer = writer_for(&pool, cat, &data).await;
+    let table_writer =
+        DuckLakeTableWriter::new(writer.clone() as Arc<dyn MetadataWriter>, os.clone()).unwrap();
+
+    // Seed one row per partition of `val`, then partition the table by `val` so the
+    // seed files each hold exactly one row at position 0.
+    let seed = RecordBatch::try_new(
+        sch.clone(),
+        vec![Arc::new(Int32Array::from(vec![1])), Arc::new(Int32Array::from(vec![10]))],
+    )
+    .unwrap();
+    let seeded = table_writer
+        .write_table("public", "t", &[seed])
+        .await
+        .unwrap();
+    writer
+        .set_partition_spec(
+            seeded.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let extra = RecordBatch::try_new(
+        sch.clone(),
+        vec![Arc::new(Int32Array::from(vec![2])), Arc::new(Int32Array::from(vec![20]))],
+    )
+    .unwrap();
+    let seeded_partitioned = DuckLakeTableWriter::new(
+        writer_for(&pool, cat, &data).await as Arc<dyn MetadataWriter>,
+        os.clone(),
+    )
+    .unwrap()
+    .append_table("public", "t", &[extra])
+    .await
+    .unwrap();
+
+    // The two live data files: the pre-partition seed and the partitioned append.
+    let seed_files: Vec<(i64, String, bool, i64)> = sqlx::query_as(
+        "SELECT data_file_id, path, path_is_relative, file_size_bytes
+         FROM ducklake_data_file
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY data_file_id",
+    )
+    .bind(seeded.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(seed_files.len(), 2, "two seed data files");
+
+    // Supersede the row in each seed file (each holds one row, at position 0).
+    let mut entries = Vec::new();
+    for (data_file_id, path, _, _) in &seed_files {
+        let del = DuckLakeTableWriter::new(
+            writer_for(&pool, cat, &data).await as Arc<dyn MetadataWriter>,
+            os.clone(),
+        )
+        .unwrap()
+        .write_delete_file("public", "t", path, &[0])
+        .await
+        .unwrap();
+        entries.push(DeleteFileEntry {
+            data_file_id: *data_file_id,
+            expected_prev_delete_file: None,
+            delete: del,
+        });
+    }
+
+    // New versions in two DIFFERENT partitions -> the partitioned session produces two
+    // appended files, which the one-file cap used to refuse.
+    let new_versions = RecordBatch::try_new(
+        sch.clone(),
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![100, 200]))],
+    )
+    .unwrap();
+    let mut session = DuckLakeTableWriter::new(
+        writer_for(&pool, cat, &data).await as Arc<dyn MetadataWriter>,
+        os.clone(),
+    )
+    .unwrap()
+    .begin_write("public", "t", sch.as_ref(), WriteMode::Append)
+    .unwrap();
+    session.write_batch(&new_versions).unwrap();
+    let committed = session.finish_with_deletes(&entries).await.unwrap();
+    assert_eq!(
+        committed.files_written, 2,
+        "one appended file per partition"
+    );
+
+    assert_eq!(
+        read_pairs(&pool, cat_name).await,
+        vec![(1, 100), (2, 200)],
+        "both rows superseded by their new versions"
+    );
+
+    // ONE snapshot for both appended files AND both delete files.
+    let appended: Vec<(i64, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT df.data_file_id, df.begin_snapshot, df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.begin_snapshot > $2
+         ORDER BY df.data_file_id",
+    )
+    .bind(seeded.table_id)
+    .bind(seeded_partitioned.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(appended.len(), 2, "two appended files: {appended:?}");
+    assert!(
+        appended
+            .iter()
+            .all(|(_, snap, _, _)| *snap == committed.snapshot_id),
+        "every appended file carries the one committed snapshot: {appended:?}"
+    );
+    let mut partition_values: Vec<Option<String>> =
+        appended.iter().map(|(_, _, _, v)| v.clone()).collect();
+    partition_values.sort();
+    assert_eq!(
+        partition_values,
+        vec![Some("100".to_string()), Some("200".to_string())],
+        "each appended file carries its own partition value"
+    );
+    let delete_snaps: Vec<i64> = sqlx::query_scalar(
+        "SELECT begin_snapshot FROM ducklake_delete_file
+         WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(seeded.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(delete_snaps.len(), 2, "one delete file per seed file");
+    assert!(
+        delete_snaps
+            .iter()
+            .all(|snap| *snap == committed.snapshot_id),
+        "both delete files share that same snapshot: {delete_snaps:?}"
+    );
+
+    // Per-column statistics for EVERY appended file, not just the first.
+    for (data_file_id, _, _, _) in &appended {
+        let stats: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ducklake_file_column_stats WHERE data_file_id = $1",
+        )
+        .bind(data_file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stats, 2,
+            "file {data_file_id} must carry stats for both columns"
+        );
+    }
+
+    // Row lineage: the appended files draw distinct, non-overlapping rowid ranges.
+    let row_id_starts: Vec<i64> = sqlx::query_scalar(
+        "SELECT row_id_start FROM ducklake_data_file
+         WHERE table_id = $1 AND begin_snapshot = $2 ORDER BY row_id_start",
+    )
+    .bind(seeded.table_id)
+    .bind(committed.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row_id_starts.len(), 2);
+    assert!(
+        row_id_starts[0] < row_id_starts[1],
+        "each appended file gets its own rowid range: {row_id_starts:?}"
+    );
+}

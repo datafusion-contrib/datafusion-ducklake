@@ -158,3 +158,202 @@ async fn filter_on_partition_column_is_correct_and_prunes() -> anyhow::Result<()
     );
     Ok(())
 }
+
+/// Ground truth for a partition-moving `UPDATE` on a partitioned table, taken from
+/// official DuckLake: it is the shape this crate's multi-file append+delete commit has
+/// to reproduce, so it is pinned here rather than assumed.
+///
+/// Mirrors the upstream partition-moving-update scenario: two rows are updated so their
+/// partition key changes, which moves them to two NEW partitions.
+///
+/// The spec uses two identity keys rather than a `day()` transform: on the DuckDB
+/// version this crate links, a partition-moving UPDATE against a spec containing a
+/// transform trips an internal error inside the reference implementation's update sink.
+/// The commit SHAPE being pinned here is the same either way.
+///
+/// `DATA_INLINING_ROW_LIMIT 0` keeps the small write on the data-file path — with
+/// inlining on, the rows never reach `ducklake_data_file` and there is nothing to
+/// compare.
+fn create_partition_moving_update_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()> {
+    let conn = duckdb::Connection::open_in_memory()?;
+    crate::common::ensure_ducklake_installed();
+    conn.execute("LOAD ducklake;", [])?;
+    conn.execute(
+        &format!(
+            "ATTACH 'ducklake:{}' AS test_catalog (DATA_INLINING_ROW_LIMIT 0);",
+            catalog_path.display()
+        ),
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE test_catalog.t (p VARCHAR, q VARCHAR, v VARCHAR);",
+        [],
+    )?;
+    conn.execute("ALTER TABLE test_catalog.t SET PARTITIONED BY (p, q);", [])?;
+    conn.execute(
+        "INSERT INTO test_catalog.t VALUES
+            ('p1', 'q1', 'va'),
+            ('p2', 'q2', 'vb'),
+            ('p1', 'q1', 'vc'),
+            ('p2', 'q2', 'vd');",
+        [],
+    )?;
+    // Moves 'va' to (p3, q1) and 'vb' to (p3, q2): two output partitions, one
+    // superseded row in each of the two input files.
+    conn.execute(
+        "UPDATE test_catalog.t SET p = 'p3' WHERE v IN ('va','vb');",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The reference implementation commits a partition-moving UPDATE as: N appended data
+/// files (one per output partition, each with its own partition values, row-id range
+/// and per-column statistics) plus M delete files (one per superseded input file), ALL
+/// stamped with ONE snapshot — the input files stay live, superseded by their delete
+/// files rather than retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_partitioned_update_is_one_snapshot_of_n_files_and_m_deletes() -> anyhow::Result<()>
+{
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("partition_moving_update.ducklake");
+    create_partition_moving_update_catalog(&catalog_path)?;
+
+    // Read the catalog rows directly: the claim is about the metadata shape.
+    let conn = duckdb::Connection::open(&catalog_path)?;
+    let update_snapshot: i64 = conn.query_row(
+        "SELECT MAX(snapshot_id) FROM ducklake_snapshot",
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Appended side: two data files, one per NEW partition, each holding one row.
+    let mut stmt = conn.prepare(
+        "SELECT f.data_file_id, f.record_count, f.row_id_start,
+                (SELECT string_agg(v.partition_value, '/' ORDER BY v.partition_key_index)
+                 FROM ducklake_file_partition_value v WHERE v.data_file_id = f.data_file_id),
+                (SELECT COUNT(*) FROM ducklake_file_column_stats s
+                 WHERE s.data_file_id = f.data_file_id)
+         FROM ducklake_data_file f
+         WHERE f.begin_snapshot = ?
+         ORDER BY f.data_file_id",
+    )?;
+    let appended: Vec<(i64, i64, i64, String, i64)> = stmt
+        .query_map([update_snapshot], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        appended.len(),
+        2,
+        "one appended data file per output partition: {appended:?}"
+    );
+    let mut partitions: Vec<&str> = appended.iter().map(|f| f.3.as_str()).collect();
+    partitions.sort_unstable();
+    assert_eq!(
+        partitions,
+        vec!["p3/q1", "p3/q2"],
+        "each appended file carries its OWN partition values"
+    );
+    assert!(
+        appended.iter().all(|f| f.1 == 1),
+        "one moved row per appended file: {appended:?}"
+    );
+    assert_ne!(
+        appended[0].2, appended[1].2,
+        "each appended file draws its own rowid range: {appended:?}"
+    );
+    assert!(
+        appended.iter().all(|f| f.4 == 3),
+        "per-column statistics for EVERY appended file (3 columns each): {appended:?}"
+    );
+
+    // Delete side: one delete file per superseded input file, on the SAME snapshot.
+    let mut stmt = conn.prepare(
+        "SELECT data_file_id, begin_snapshot, delete_count FROM ducklake_delete_file
+         WHERE end_snapshot IS NULL ORDER BY data_file_id",
+    )?;
+    let deletes: Vec<(i64, i64, i64)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    assert_eq!(
+        deletes.len(),
+        2,
+        "one delete file per input file: {deletes:?}"
+    );
+    assert!(
+        deletes.iter().all(|d| d.1 == update_snapshot),
+        "the delete files share the appended files' snapshot: {deletes:?}"
+    );
+    assert!(
+        deletes.iter().all(|d| d.2 == 1),
+        "one superseded row per input file: {deletes:?}"
+    );
+    let appended_ids: Vec<i64> = appended.iter().map(|f| f.0).collect();
+    assert!(
+        deletes.iter().all(|d| !appended_ids.contains(&d.0)),
+        "the deletes target the INPUT files, not the appended ones"
+    );
+
+    // The input files are superseded, not retired: they stay live at the new head.
+    let retired: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retired, 0, "a keyed mutation retires no data file");
+
+    // Gross record_count: the appended rows are added, the deletes are accounted at
+    // read time rather than subtracted here.
+    let (record_count, next_row_id): (i64, i64) = conn.query_row(
+        "SELECT record_count, next_row_id FROM ducklake_table_stats",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(record_count, 6, "4 inserted + 2 new versions, gross");
+    assert_eq!(next_row_id, 6, "rowids are never reused");
+
+    // And this crate reads that catalog back as an in-place update.
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy().as_ref())?;
+    let catalog = DuckLakeCatalog::new(provider)?;
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT p, v FROM ducklake.main.t ORDER BY v")
+        .await?
+        .collect()
+        .await?;
+    let mut pairs = Vec::new();
+    for b in &batches {
+        let p = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .unwrap();
+        let v = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            pairs.push((p.value(i).to_string(), v.value(i).to_string()));
+        }
+    }
+    assert_eq!(
+        pairs,
+        vec![
+            ("p3".to_string(), "va".to_string()),
+            ("p3".to_string(), "vb".to_string()),
+            ("p1".to_string(), "vc".to_string()),
+            ("p2".to_string(), "vd".to_string()),
+        ],
+        "'va' and 'vb' moved to p3; 'vc' and 'vd' untouched"
+    );
+    Ok(())
+}

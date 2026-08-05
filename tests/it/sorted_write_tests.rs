@@ -246,13 +246,12 @@ async fn begin_write_rolls_by_default_and_single_file_opts_out() {
     );
 }
 
-/// `finish_with_deletes` accepts a session that produced exactly ONE file, and
-/// refuses one that rolled into several — the same rule the partitioned sink follows,
-/// because that commit registers a single appended data file.
-///
-/// The count is taken before any upload, so a refused write leaves no orphan object.
+/// `finish_with_deletes` commits EVERY file the session produced — the one file of a
+/// small write, and the many a rolling session rolled into — in the single snapshot
+/// that also carries the deletes. A keyed mutation whose new row versions exceed
+/// `target_file_size` is therefore not forced onto `begin_write_single_file`.
 #[tokio::test(flavor = "multi_thread")]
-async fn rolling_session_with_deletes_allows_one_file_and_refuses_several() {
+async fn rolling_session_with_deletes_commits_every_rolled_file() {
     use datafusion_ducklake::table_writer::DuckLakeTableWriter;
 
     let env = setup().await;
@@ -287,8 +286,8 @@ async fn rolling_session_with_deletes_allows_one_file_and_refuses_several() {
     assert_eq!(result.records_written, 3);
     assert_eq!(result.files_written, 1);
 
-    // A load that rolls past the target produces several files -> refused, naming the
-    // count and the single-file alternative.
+    // A load that rolls past the target produces several files -> all of them commit,
+    // in ONE snapshot.
     let batches: Vec<RecordBatch> = (0..40)
         .map(|b| {
             let ids: Vec<i32> = (b * 200..(b + 1) * 200).collect();
@@ -314,11 +313,56 @@ async fn rolling_session_with_deletes_allows_one_file_and_refuses_several() {
     for batch in &batches {
         session.write_batch(batch).unwrap();
     }
-    let err = session.finish_with_deletes(&[]).await.unwrap_err();
-    let msg = err.to_string();
+    let rolled = session.finish_with_deletes(&[]).await.unwrap();
+    assert_eq!(rolled.records_written, 8000);
     assert!(
-        msg.contains("one appended data file") && msg.contains("begin_write"),
-        "the error must state the rule and the alternative, got: {msg}"
+        rolled.files_written > 1,
+        "the load must roll past target_file_size, got {} file(s)",
+        rolled.files_written
+    );
+
+    // Every rolled file is registered against the one committed snapshot, and every
+    // row is readable through the catalog.
+    let pool = sqlx::sqlite::SqlitePool::connect(&env.conn_str)
+        .await
+        .unwrap();
+    let snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file
+         WHERE begin_snapshot = ?",
+    )
+    .bind(rolled.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshots, vec![rolled.snapshot_id]);
+    let registered: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE begin_snapshot = ?")
+            .bind(rolled.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        registered, rolled.files_written as i64,
+        "every rolled file is registered against the committed snapshot"
+    );
+
+    let ctx = read_ctx(&env.conn_str).await;
+    let rows = ctx
+        .sql("SELECT count(*) FROM ducklake.main.events")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0),
+        8003,
+        "the 3-row commit plus the 8000-row rolled commit are both live"
     );
 }
 
