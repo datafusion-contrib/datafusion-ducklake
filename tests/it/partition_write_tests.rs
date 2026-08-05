@@ -367,11 +367,15 @@ async fn partitioned_write_rolls_within_each_partition() {
     );
 }
 
-/// The write entry point that targets ONE caller-determined file cannot satisfy a
+/// `begin_write_to_path` targets ONE caller-named file, so it cannot satisfy a
 /// partition spec that needs one file per partition. It must refuse an incompatible
 /// write before upload rather than commit a file without partition metadata.
+///
+/// It is the only entry point that refuses: a rolling or partitioned session now
+/// commits every file it produced, so neither `begin_write` nor
+/// `begin_write_single_file` rejects a partitioned table.
 #[tokio::test(flavor = "multi_thread")]
-async fn single_file_entry_points_refuse_a_partitioned_table() {
+async fn custom_path_write_refuses_a_partitioned_table() {
     use datafusion_ducklake::table_writer::DuckLakeTableWriter;
 
     let env = setup().await; // partitioned by (region, year(ts))
