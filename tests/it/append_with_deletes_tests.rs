@@ -744,3 +744,422 @@ async fn register_data_file_with_deletes_rejects_invalid_entries() {
         "got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The contract: an empty-delete finish must not REQUIRE delete support
+// ---------------------------------------------------------------------------
+
+/// A metadata writer that can commit appends but NOT positional deletes.
+///
+/// It delegates everything the plain-append commit path needs to a real SQLite
+/// writer, and deliberately does NOT override the four delete-carrying commit
+/// methods, so those fall through to the [`MetadataWriter`] trait defaults and
+/// report themselves unsupported.
+///
+/// This expresses the CONTRACT under test — "an empty `deletes` slice must not need
+/// delete support" — rather than depending on which real backends happen to be in
+/// that state today. Real instances of it exist (the DuckDB, MySQL and
+/// single-catalog Postgres writers), but their test suites are gated behind write
+/// features that this crate's CI does not enable, so a regression in the routing
+/// would not be caught there. This one is gated on `write-sqlite`, which CI does
+/// enable.
+#[derive(Debug)]
+struct AppendOnlyWriter {
+    inner: SqliteMetadataWriter,
+}
+
+impl MetadataWriter for AppendOnlyWriter {
+    // --- Required methods: straight delegation. -----------------------------
+    fn create_snapshot(&self) -> datafusion_ducklake::Result<i64> {
+        self.inner.create_snapshot()
+    }
+
+    fn get_or_create_schema(
+        &self,
+        name: &str,
+        path: Option<&str>,
+        snapshot_id: i64,
+    ) -> datafusion_ducklake::Result<(i64, bool)> {
+        self.inner.get_or_create_schema(name, path, snapshot_id)
+    }
+
+    fn get_or_create_table(
+        &self,
+        schema_id: i64,
+        name: &str,
+        path: Option<&str>,
+        snapshot_id: i64,
+    ) -> datafusion_ducklake::Result<(i64, bool)> {
+        self.inner
+            .get_or_create_table(schema_id, name, path, snapshot_id)
+    }
+
+    fn set_columns(
+        &self,
+        table_id: i64,
+        columns: &[datafusion_ducklake::ColumnDef],
+        snapshot_id: i64,
+    ) -> datafusion_ducklake::Result<Vec<i64>> {
+        self.inner.set_columns(table_id, columns, snapshot_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[datafusion_ducklake::ColumnDef],
+        column_ids: &[i64],
+    ) -> datafusion_ducklake::Result<datafusion_ducklake::CommitIds> {
+        self.inner.register_data_file(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+        )
+    }
+
+    fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> datafusion_ducklake::Result<u64> {
+        self.inner.end_table_files(table_id, snapshot_id)
+    }
+
+    fn get_data_path(&self) -> datafusion_ducklake::Result<String> {
+        self.inner.get_data_path()
+    }
+
+    fn set_data_path(&self, path: &str) -> datafusion_ducklake::Result<()> {
+        self.inner.set_data_path(path)
+    }
+
+    fn initialize_schema(&self) -> datafusion_ducklake::Result<()> {
+        self.inner.initialize_schema()
+    }
+
+    fn begin_write_transaction(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[datafusion_ducklake::ColumnDef],
+        mode: WriteMode,
+    ) -> datafusion_ducklake::Result<datafusion_ducklake::WriteSetupResult> {
+        self.inner
+            .begin_write_transaction(schema_name, table_name, columns, mode)
+    }
+
+    // --- The append commit path, single and multi file. ---------------------
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_file_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        file: &DataFileInfo,
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[datafusion_ducklake::ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &datafusion_ducklake::SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> datafusion_ducklake::Result<datafusion_ducklake::CommitIds> {
+        self.inner.register_data_file_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            file,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            commit_metadata,
+            expected_base_snapshot_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_data_files_with_commit_metadata(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        snapshot_id: i64,
+        files: &[DataFileInfo],
+        mode: WriteMode,
+        base_snapshot: i64,
+        columns: &[datafusion_ducklake::ColumnDef],
+        column_ids: &[i64],
+        commit_metadata: &datafusion_ducklake::SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> datafusion_ducklake::Result<datafusion_ducklake::CommitIds> {
+        self.inner.register_data_files_with_commit_metadata(
+            table_id,
+            schema_name,
+            table_name,
+            snapshot_id,
+            files,
+            mode,
+            base_snapshot,
+            columns,
+            column_ids,
+            commit_metadata,
+            expected_base_snapshot_id,
+        )
+    }
+
+    // Needed so a partitioned session sees the table's spec and splits rows.
+    fn live_partition_spec(
+        &self,
+        table_id: i64,
+    ) -> datafusion_ducklake::Result<Option<datafusion_ducklake::partition::PartitionSpec>> {
+        self.inner.live_partition_spec(table_id)
+    }
+
+    // NOT overridden, on purpose: register_data_file_with_deletes,
+    // register_data_files_with_deletes, and their _and_commit_metadata siblings.
+    // They fall through to the trait defaults, which report them unsupported.
+}
+
+/// `finish_with_deletes(&[])` must NOT require delete support: with no deletes the
+/// session is a plain append, so it must reach the append commit that every backend
+/// implements — for a multi-file (partitioned) write and a single-file one alike.
+///
+/// Routing an empty-delete finish through the delete-carrying commit made it fail as
+/// unsupported on a writer that commits the identical append happily, and fail only
+/// AFTER uploading, leaving orphaned objects in storage.
+///
+/// The third case is the control that gives the other two meaning: a NON-empty
+/// `deletes` slice on the same writer must still be refused. Without it this test
+/// would pass just as well if delete commits had been quietly turned into no-ops.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_delete_finish_does_not_require_delete_support() {
+    use datafusion_ducklake::partition::PartitionTransform;
+
+    let temp_dir = TempDir::new().unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("region", DataType::Utf8, true),
+    ]));
+
+    // Create `p(id, region)` and partition it by `region`, so a session splits rows
+    // into one file per value and the commit takes the MULTI-file path.
+    let setup_writer = create_writer(&temp_dir).await;
+    let cols = vec![
+        datafusion_ducklake::ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        datafusion_ducklake::ColumnDef::from_arrow("region", &DataType::Utf8, true).unwrap(),
+    ];
+    let s = setup_writer
+        .begin_write_transaction("main", "p", &cols, WriteMode::Replace)
+        .unwrap();
+    setup_writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "p",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    setup_writer
+        .set_partition_spec(
+            s.table_id,
+            &[("region".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let table_id = s.table_id;
+
+    let append_only = |temp_dir: &TempDir| {
+        let db_path = temp_dir.path().join("test.db");
+        let data_path = temp_dir.path().join("data");
+        let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+        async move {
+            let inner = SqliteMetadataWriter::new_with_init(&conn_str)
+                .await
+                .unwrap();
+            inner.set_data_path(data_path.to_str().unwrap()).unwrap();
+            Arc::new(AppendOnlyWriter {
+                inner,
+            }) as Arc<dyn MetadataWriter>
+        }
+    };
+
+    // Sanity: this writer really cannot commit deletes.
+    let probe = append_only(&temp_dir).await;
+    let err = probe
+        .register_data_files_with_deletes(
+            table_id,
+            "main",
+            "p",
+            0,
+            &[DataFileInfo::new("x.parquet", 1, 1)],
+            &[],
+            WriteMode::Append,
+            0,
+            &[],
+            &[],
+        )
+        .expect_err("the wrapper must not support the multi-file delete commit");
+    assert!(
+        matches!(err, DuckLakeError::InvalidConfig(_)),
+        "expected the trait default's unsupported error, got {err:?}"
+    );
+    // Both shapes: the single-file delete commit is unsupported here too, so each of
+    // the two successes below is evidence about the ROUTING, not about this writer
+    // quietly gaining delete support for one shape.
+    let err = probe
+        .register_data_file_with_deletes(
+            table_id,
+            "main",
+            "p",
+            0,
+            &DataFileInfo::new("x.parquet", 1, 1),
+            &[],
+            WriteMode::Append,
+            0,
+            &[],
+            &[],
+        )
+        .expect_err("the wrapper must not support the single-file delete commit");
+    assert!(
+        matches!(err, DuckLakeError::InvalidConfig(_)),
+        "expected the trait default's unsupported error, got {err:?}"
+    );
+
+    // 1. MULTI-file session (two regions) + empty deletes -> must COMMIT.
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(arrow::array::StringArray::from(vec!["us", "eu", "us"])),
+        ],
+    )
+    .unwrap();
+    let mut session = DuckLakeTableWriter::new(append_only(&temp_dir).await, object_store.clone())
+        .unwrap()
+        .begin_write("main", "p", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    let multi = session
+        .finish_with_deletes(&[])
+        .await
+        .expect("an empty-delete finish must not need delete support");
+    assert_eq!(multi.files_written, 2, "one file per region");
+    assert_eq!(multi.records_written, 3);
+
+    // Every file is registered against that one snapshot.
+    let db_path = temp_dir.path().join("test.db");
+    let pool = SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .unwrap();
+    let registered: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT f.begin_snapshot,
+                (SELECT v.partition_value FROM ducklake_file_partition_value v
+                 WHERE v.data_file_id = f.data_file_id AND v.partition_key_index = 0)
+         FROM ducklake_data_file f
+         WHERE f.table_id = ? AND f.begin_snapshot = ?
+         ORDER BY 2",
+    )
+    .bind(table_id)
+    .bind(multi.snapshot_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        registered.len(),
+        2,
+        "both partition files registered: {registered:?}"
+    );
+    assert_eq!(
+        registered
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>(),
+        vec![Some("eu".to_string()), Some("us".to_string())],
+    );
+
+    // 2. SINGLE-file session + empty deletes -> must also COMMIT. One region only,
+    //    so the partitioned session yields exactly one file.
+    let single_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![4])),
+            Arc::new(arrow::array::StringArray::from(vec!["us"])),
+        ],
+    )
+    .unwrap();
+    let mut session = DuckLakeTableWriter::new(append_only(&temp_dir).await, object_store.clone())
+        .unwrap()
+        .begin_write("main", "p", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&single_batch).unwrap();
+    let single = session
+        .finish_with_deletes(&[])
+        .await
+        .expect("the single-file shape delegates too");
+    assert_eq!(single.files_written, 1);
+    assert_eq!(single.records_written, 1);
+
+    // 3. CONTROL: a NON-empty deletes slice must still be refused on this writer.
+    //    Delete commits must not have become silent no-ops.
+    let (target_data_file_id, target_path): (i64, String) = sqlx::query_as(
+        "SELECT data_file_id, path FROM ducklake_data_file
+         WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(table_id)
+    .bind(single.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let del_info = DuckLakeTableWriter::new(append_only(&temp_dir).await, object_store.clone())
+        .unwrap()
+        .write_delete_file("main", "p", &target_path, &[0])
+        .await
+        .unwrap();
+    let mut session = DuckLakeTableWriter::new(append_only(&temp_dir).await, object_store.clone())
+        .unwrap()
+        .begin_write("main", "p", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&single_batch).unwrap();
+    let err = session
+        .finish_with_deletes(&[DeleteFileEntry {
+            data_file_id: target_data_file_id,
+            expected_prev_delete_file: None,
+            delete: del_info,
+        }])
+        .await
+        .expect_err("a real delete must still be refused by a writer that cannot commit one");
+    assert!(
+        matches!(err, DuckLakeError::InvalidConfig(_)),
+        "expected the unsupported error, got {err:?}"
+    );
+
+    // The refused commit registered nothing: the live files are the two from the
+    // multi-file commit plus the one from the single-file commit.
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 3, "the refused delete commit registered no data file");
+    let deletes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_delete_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(deletes, 0, "and no delete file");
+}
