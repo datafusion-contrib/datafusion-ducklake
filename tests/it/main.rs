@@ -28,6 +28,7 @@ mod concurrent_tests;
 mod concurrent_write_tests;
 mod delete_filter_tests;
 mod encryption_tests;
+mod files_matching_tests;
 mod hybrid_asyncdb;
 mod information_schema_test;
 mod inlined_data_sqlite_tests;

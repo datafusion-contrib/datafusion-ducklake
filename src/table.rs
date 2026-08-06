@@ -904,8 +904,33 @@ impl DuckLakeTable {
     /// that does not reference a partition column is therefore never pruned by
     /// partition values.
     ///
+    /// One limit on fail-open comes from the catalog rather than from here. A
+    /// partition value whose recorded key index falls outside the range of a
+    /// signed 32-bit integer is read as key index 0 by the SQLite, PostgreSQL
+    /// and MySQL providers rather than skipped, so on such a catalog a bound can
+    /// be attributed to the wrong partition column and a file that could match
+    /// may be dropped. Nothing in this crate writes such a value; it would take a
+    /// catalog produced by other means.
+    ///
     /// Files are read from the catalog in bounded pages and pruned page by page,
     /// so peak memory tracks the size of the *result*, not the size of the table.
+    ///
+    /// # Resolving positions on the returned files
+    ///
+    /// [`Self::resolve_positions`] is only valid for files that have never been
+    /// rewritten (see its documentation). This method cannot tell the two apart —
+    /// the answer is in the parquet footer, not the catalog — and it deliberately
+    /// does not try: silently withholding a file that holds a matching key would
+    /// make a keyed mutation insert a duplicate instead of superseding one, which
+    /// fails just as quietly as a mis-resolved position.
+    ///
+    /// So the returned list may include a file rewritten by an UPDATE or by
+    /// compaction. **Check each file with [`Self::file_has_embedded_rowid`]
+    /// before resolving positions on it, and refuse the file loudly when that
+    /// reports `true`.** Skipping the check risks deleting the wrong rows;
+    /// skipping the file instead of refusing risks a duplicate key. The check
+    /// memoizes its footer read, so running it immediately before
+    /// [`Self::resolve_positions`] costs nothing extra.
     pub fn files_matching(
         &self,
         predicate: &Arc<dyn PhysicalExpr>,
@@ -923,19 +948,30 @@ impl DuckLakeTable {
             },
         };
 
+        // Decryption keys are collected for EVERY file at this snapshot, not just
+        // the retained ones, matching what `files` installs. The factory is a
+        // single shared cell that a reader clones whole (`create_parquet_source`)
+        // and that this replaces wholesale, so narrowing it to the retained files
+        // would strand the key of any file another reader is opening — a scan on
+        // a clone of this table, or a later low-level read of a file this call
+        // happened to prune. Only the keys are accumulated across pages, so the
+        // page-at-a-time memory bound still holds.
+        #[cfg(feature = "encryption")]
+        let mut encryption_keys = EncryptionFactoryBuilder::new();
+
         let mut matching = Vec::new();
         for metadata in self.file_metadata_pages("file matching") {
             let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
+            #[cfg(feature = "encryption")]
+            self.collect_encryption_keys(&mut encryption_keys, &table_files)?;
             matching.extend(
                 self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics)
                     .into_iter()
                     .cloned(),
             );
         }
-        // Register decryption keys for exactly the files handed back, the ones the
-        // caller is about to read.
         #[cfg(feature = "encryption")]
-        self.configure_encryption_factory(&matching)?;
+        self.install_encryption_factory(encryption_keys);
         Ok(matching)
     }
 
@@ -1238,9 +1274,16 @@ impl DuckLakeTable {
         ParquetSource::new(schema)
     }
 
+    /// Add each file's decryption key — and that of its live delete file — to
+    /// `builder`, resolving paths the same way the readers do. Separate from
+    /// installation so a caller reading the catalog in pages can accumulate keys
+    /// across every page and install the whole set once.
     #[cfg(feature = "encryption")]
-    fn configure_encryption_factory(&self, table_files: &[DuckLakeTableFile]) -> Result<()> {
-        let mut builder = EncryptionFactoryBuilder::new();
+    fn collect_encryption_keys(
+        &self,
+        builder: &mut EncryptionFactoryBuilder,
+        table_files: &[DuckLakeTableFile],
+    ) -> Result<()> {
         for table_file in table_files {
             let resolved_path = resolve_path(
                 &self.table_path,
@@ -1257,10 +1300,25 @@ impl DuckLakeTable {
                 builder.add_file(&path, delete_file.encryption_key.as_deref());
             }
         }
+        Ok(())
+    }
+
+    /// Make `builder`'s keys the table's current encryption factory, replacing
+    /// whatever was installed. Readers clone the cell as a whole, so the set
+    /// installed here must cover every file any of them may open.
+    #[cfg(feature = "encryption")]
+    fn install_encryption_factory(&self, builder: EncryptionFactoryBuilder) {
         let factory = builder.build();
         *self.encryption_factory.lock().unwrap() = factory
             .has_encrypted_files()
             .then(|| Arc::new(factory) as Arc<dyn EncryptionFactory>);
+    }
+
+    #[cfg(feature = "encryption")]
+    fn configure_encryption_factory(&self, table_files: &[DuckLakeTableFile]) -> Result<()> {
+        let mut builder = EncryptionFactoryBuilder::new();
+        self.collect_encryption_keys(&mut builder, table_files)?;
+        self.install_encryption_factory(builder);
         Ok(())
     }
 
@@ -1342,7 +1400,12 @@ impl DuckLakeTable {
     /// is a possible optimization — but any such pushdown must exclude float
     /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
     /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
+    ///
     /// Only valid for insert-only files, where `position = rowid - row_id_start`.
+    /// This is a precondition the method does not check: establish it with
+    /// [`Self::file_has_embedded_rowid`], which must report `false`, and refuse
+    /// the file otherwise. Resolving positions on a rewritten file can delete
+    /// the wrong rows.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -1486,18 +1549,25 @@ impl DuckLakeTable {
         Ok(positions)
     }
 
-    /// Whether `file` embeds a `_ducklake_internal_row_id` column (tagged with
-    /// [`ROW_ID_PARQUET_FIELD_ID`]) — i.e. it was rewritten by an UPDATE or
-    /// compaction rather than being insert-only.
+    /// Whether `file` was rewritten — by an UPDATE or by compaction — rather
+    /// than only ever inserted. A rewritten file embeds its rows' original row
+    /// ids as a reserved parquet column (tagged with
+    /// [`ROW_ID_PARQUET_FIELD_ID`]); an insert-only file does not.
     ///
-    /// [`Self::resolve_positions`] derives delete positions from the physical row
-    /// index, which is only the DuckLake `pos` for insert-only files; a rewritten
-    /// file's surviving rows carry embedded rowids whose physical order need not
-    /// match, so the delete path must refuse such files rather than mis-delete.
-    /// Memoized through the shared `file_read_config_cache`, so calling this right
-    /// before `resolve_positions` costs at most one extra footer read per file.
-    #[cfg(feature = "write")]
-    pub(crate) async fn file_has_embedded_rowid(
+    /// **Check this before resolving positions on a file you did not write
+    /// yourself.** [`Self::resolve_positions`] derives a row's delete position
+    /// from its physical index in the file, which is the position DuckLake
+    /// records only for a file that has never been rewritten: a rewritten file's
+    /// surviving rows carry embedded row ids whose order need not match their
+    /// physical order, so resolving positions on one can delete the wrong rows.
+    /// A caller doing its own per-file work over [`Self::files_matching`] must
+    /// therefore refuse such a file loudly rather than resolve positions on it —
+    /// the crate's own DELETE does exactly that.
+    ///
+    /// Reads the file's parquet footer once and memoizes the answer, so calling
+    /// it immediately before [`Self::resolve_positions`] costs at most one extra
+    /// footer read per file.
+    pub async fn file_has_embedded_rowid(
         &self,
         state: &dyn Session,
         file: &DuckLakeFileData,
@@ -3790,6 +3860,49 @@ mod tests {
 
         assert_eq!(matching_ids(&table, &predicate)?, vec![2]);
         Ok(())
+    }
+
+    /// Pruning a file must not take its decryption key with it. The encryption
+    /// factory is one shared cell, replaced whole and cloned whole by every
+    /// reader, so a factory narrowed to the returned files would leave a
+    /// concurrent scan — or a later low-level read — unable to open a file this
+    /// call happened to prune.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn files_matching_keeps_decryption_keys_for_pruned_files() {
+        // Hex-encoded 16-byte AES key.
+        const KEY: &str = "0123456789abcdef0123456789abcdef";
+        let encrypted = |data_file_id, id_bounds| {
+            let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
+            entry.file.file.encryption_key = Some(KEY.to_string());
+            entry
+        };
+        let table = fixed_table(vec![encrypted(1, (1, 10)), encrypted(2, (100, 110))], None)
+            .expect("table opens");
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+        let matching = table.files_matching(&predicate).expect("pruning succeeds");
+        assert_eq!(
+            matching.len(),
+            1,
+            "file 1's statistics exclude the key, so it is pruned"
+        );
+
+        let factory = {
+            let guard = table.encryption_factory.lock().unwrap();
+            guard
+                .clone()
+                .expect("an encrypted table installs a factory")
+        };
+        let pruned = ObjectPath::from("file-1.parquet");
+        let properties = factory
+            .get_file_decryption_properties(&Default::default(), &pruned)
+            .await
+            .expect("key lookup succeeds");
+        assert!(
+            properties.is_some(),
+            "the pruned file's key must stay installed for other readers",
+        );
     }
 
     /// A file with no recorded statistics is always kept. It also costs the whole
