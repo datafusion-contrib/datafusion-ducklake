@@ -915,6 +915,14 @@ impl DuckLakeTable {
     /// Files are read from the catalog in bounded pages and pruned page by page,
     /// so peak memory tracks the size of the *result*, not the size of the table.
     ///
+    /// One exception, on an encrypted table: decryption keys are collected for
+    /// every file at the snapshot rather than only the retained ones (see the
+    /// note on the encryption factory below), so peak memory additionally carries
+    /// one path/key pair per encrypted file. That is proportional to the table
+    /// rather than to the result — still far below [`Self::files`], which
+    /// materialises every file's full metadata, but the page-at-a-time bound does
+    /// not apply to it.
+    ///
     /// # Resolving positions on the returned files
     ///
     /// [`Self::resolve_positions`] is only valid for files that have never been
@@ -954,8 +962,10 @@ impl DuckLakeTable {
         // and that this replaces wholesale, so narrowing it to the retained files
         // would strand the key of any file another reader is opening — a scan on
         // a clone of this table, or a later low-level read of a file this call
-        // happened to prune. Only the keys are accumulated across pages, so the
-        // page-at-a-time memory bound still holds.
+        // happened to prune. This costs memory proportional to the table's
+        // encrypted file count rather than to the result — one path/key pair each
+        // — which is the price of not stranding a key. Still well under `files`,
+        // which materialises every file's full metadata.
         #[cfg(feature = "encryption")]
         let mut encryption_keys = EncryptionFactoryBuilder::new();
 
