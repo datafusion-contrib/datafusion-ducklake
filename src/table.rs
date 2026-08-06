@@ -38,7 +38,6 @@ use datafusion::common::DFSchema;
 use datafusion::common::pruning::PrunableStatistics;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::Operator;
-#[cfg(feature = "write")]
 use datafusion::physical_expr::PhysicalExpr;
 #[cfg(feature = "write")]
 use datafusion::physical_expr::expressions::BinaryExpr;
@@ -868,6 +867,78 @@ impl DuckLakeTable {
         Ok(files)
     }
 
+    /// The subset of [`Self::files`] whose own catalog statistics permit a match
+    /// for `predicate` — every file that could hold a matching row, and none that
+    /// is provably empty of them.
+    ///
+    /// This is the file-level pruning a `SELECT` with the same filter already
+    /// performs, exposed for callers that drive their own per-file work instead
+    /// of a scan: a keyed update, an upsert, or a delete that resolves row
+    /// positions file by file with [`Self::resolve_positions`]. Without it such a
+    /// caller must open every data file to discover which ones contain a key,
+    /// which costs the whole table on every mutation. `predicate` is the same
+    /// [`PhysicalExpr`] those callers pass to [`Self::resolve_positions`], so one
+    /// expression drives both the file list and the row match; it is resolved
+    /// against the table's physical (parquet-backed) columns, without the
+    /// synthetic `rowid`.
+    ///
+    /// Pruning is **fail-open**, and deliberately so: a file is dropped only when
+    /// its own statistics *prove* it cannot match. A file with no recorded
+    /// statistics, an undecodable partition value, a NULL partition value, or a
+    /// bound the catalog only knows approximately is always kept, and any error
+    /// building or evaluating the pruning predicate returns the complete file
+    /// list. Callers may therefore treat the result as "these files may match"
+    /// and must still evaluate `predicate` against the rows themselves; a
+    /// mutation that skipped that step could silently miss a row.
+    ///
+    /// How much it prunes depends on how completely the catalog describes the
+    /// files. A file that carries no usable bound on a column the predicate
+    /// references suppresses pruning on that column for the whole page of files
+    /// it is read with, so a table where statistics are patchy can return far
+    /// more files than it strictly must. This only ever over-returns.
+    ///
+    /// Partition values contribute bounds only on their own partition column, and
+    /// only when the table has never been re-partitioned (after a re-partition a
+    /// live file's values may belong to a retired spec generation whose key order
+    /// differs, so they are ignored rather than risk mis-pruning). A predicate
+    /// that does not reference a partition column is therefore never pruned by
+    /// partition values.
+    ///
+    /// Files are read from the catalog in bounded pages and pruned page by page,
+    /// so peak memory tracks the size of the *result*, not the size of the table.
+    pub fn files_matching(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Vec<DuckLakeTableFile>> {
+        let conjuncts = datafusion::physical_expr::split_conjunction(predicate)
+            .into_iter()
+            .cloned();
+        // Fail open: an un-prunable predicate means "keep everything", never an
+        // error the caller could mistake for "no files match".
+        let pruning = match self.pruning_predicates(conjuncts) {
+            Ok(pruning) => pruning,
+            Err(error) => {
+                tracing::debug!(%error, "skipping predicate-based file pruning");
+                Vec::new()
+            },
+        };
+
+        let mut matching = Vec::new();
+        for metadata in self.file_metadata_pages("file matching") {
+            let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
+            matching.extend(
+                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics)
+                    .into_iter()
+                    .cloned(),
+            );
+        }
+        // Register decryption keys for exactly the files handed back, the ones the
+        // caller is about to read.
+        #[cfg(feature = "encryption")]
+        self.configure_encryption_factory(&matching)?;
+        Ok(matching)
+    }
+
     fn file_metadata_pages(&self, page_name: &'static str) -> FileMetadataPages<'_> {
         FileMetadataPages {
             provider: self.provider.as_ref(),
@@ -917,6 +988,43 @@ impl DuckLakeTable {
             file = file.with_statistics(statistics);
         }
         Ok(file)
+    }
+
+    /// Split one catalog metadata page into its files and the per-file DataFusion
+    /// statistics that drive pruning, with partition-derived bounds folded in.
+    ///
+    /// Every path that prunes files — planning a scan, and
+    /// [`Self::files_matching`] — builds its statistics here, so they all prune
+    /// against identical inputs.
+    fn page_files_with_statistics(
+        &self,
+        metadata: Vec<DuckLakeFileMetadata>,
+    ) -> (Vec<DuckLakeTableFile>, HashMap<i64, Arc<Statistics>>) {
+        let mut catalog_file_statistics = Vec::new();
+        let mut table_files = Vec::with_capacity(metadata.len());
+        for DuckLakeFileMetadata {
+            file,
+            column_statistics,
+        } in metadata
+        {
+            table_files.push(file);
+            catalog_file_statistics.extend(column_statistics);
+        }
+        let (_, mut file_statistics) = build_datafusion_statistics(
+            self.physical_schema.as_ref(),
+            &self.columns,
+            &table_files,
+            DuckLakeStatistics {
+                files: catalog_file_statistics,
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        // Synthesize per-file bounds from partition values so partition columns
+        // prune even when a file carries no parquet-derived column statistics.
+        self.apply_partition_bounds(&table_files, &mut file_statistics);
+        (table_files, file_statistics)
     }
 
     /// Inject partition-derived min/max bounds into per-file statistics so the
@@ -1071,13 +1179,26 @@ impl DuckLakeTable {
         filters: &[Expr],
     ) -> DataFusionResult<Vec<PruningPredicate>> {
         let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        filters
+        let conjuncts = filters
             .iter()
             .flat_map(datafusion::logical_expr::utils::split_conjunction)
-            .map(|expr| {
-                let predicate = state.create_physical_expr(expr.clone(), &df_schema)?;
-                PruningPredicate::try_new(predicate, Arc::clone(&self.physical_schema))
-            })
+            .map(|expr| state.create_physical_expr(expr.clone(), &df_schema))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        self.pruning_predicates(conjuncts)
+    }
+
+    /// Build one [`PruningPredicate`] per conjunct against `physical_schema` (the
+    /// parquet-backed columns, excluding the synthetic rowid) — the schema the
+    /// per-file statistics are indexed by. The single place pruning predicates
+    /// are constructed, whether the conjuncts came from scan filters or from a
+    /// caller's own expression.
+    fn pruning_predicates(
+        &self,
+        conjuncts: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
+    ) -> DataFusionResult<Vec<PruningPredicate>> {
+        conjuncts
+            .into_iter()
+            .map(|conjunct| PruningPredicate::try_new(conjunct, Arc::clone(&self.physical_schema)))
             .collect()
     }
 
@@ -2580,31 +2701,7 @@ impl TableProvider for DuckLakeTable {
             },
         };
         for metadata in self.file_metadata_pages("planning") {
-            let metadata = metadata?;
-            let mut catalog_file_statistics = Vec::new();
-            let mut table_files = Vec::with_capacity(metadata.len());
-            for DuckLakeFileMetadata {
-                file,
-                column_statistics,
-            } in metadata
-            {
-                table_files.push(file);
-                catalog_file_statistics.extend(column_statistics);
-            }
-            let (_, mut file_statistics) = build_datafusion_statistics(
-                self.physical_schema.as_ref(),
-                &self.columns,
-                &table_files,
-                DuckLakeStatistics {
-                    files: catalog_file_statistics,
-                    ..Default::default()
-                },
-                false,
-                true,
-            );
-            // Synthesize per-file bounds from partition values so partition columns
-            // prune even when a file carries no parquet-derived column statistics.
-            self.apply_partition_bounds(&table_files, &mut file_statistics);
+            let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
             #[cfg(feature = "encryption")]
             self.configure_encryption_factory(&table_files)?;
 
@@ -3103,6 +3200,7 @@ mod tests {
         ColumnWithTable, DataFileChange, DeleteFileChange, FileWithTable, SchemaMetadata,
         SnapshotMetadata, TableMetadata, TableWithSchema,
     };
+    use crate::partition::{PartitionSpecColumn, PartitionTransform};
     use datafusion::prelude::{SessionContext, col, lit};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3423,6 +3521,478 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(retained, vec![1]);
+        Ok(())
+    }
+
+    // ==================== `files_matching` ====================
+    //
+    // Fixture shape: a two-column table `(id BIGINT, region BIGINT)` optionally
+    // partitioned by `region` with the `identity` transform. `id` stands in for a
+    // mutation's key column and `region` for the partition column, so a predicate
+    // can name one without the other.
+
+    const ID_COLUMN_ID: i64 = 1;
+    const REGION_COLUMN_ID: i64 = 2;
+
+    /// A catalog of exactly the files a test hands it, served through the paged
+    /// metadata API the pruning paths read.
+    #[derive(Debug)]
+    struct FixedFileProvider {
+        files: Vec<DuckLakeFileMetadata>,
+        partition_spec: Option<PartitionSpec>,
+    }
+
+    impl MetadataProvider for FixedFileProvider {
+        fn get_current_snapshot(&self) -> Result<i64> {
+            Ok(1)
+        }
+
+        fn get_data_path(&self) -> Result<String> {
+            Ok("memory:///".to_string())
+        }
+
+        fn get_table_structure(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<Vec<DuckLakeTableColumn>> {
+            Ok(vec![
+                DuckLakeTableColumn::new(
+                    ID_COLUMN_ID,
+                    "id".to_string(),
+                    "bigint".to_string(),
+                    false,
+                ),
+                DuckLakeTableColumn::new(
+                    REGION_COLUMN_ID,
+                    "region".to_string(),
+                    "bigint".to_string(),
+                    false,
+                ),
+            ])
+        }
+
+        fn get_partition_spec(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<Option<PartitionSpec>> {
+            Ok(self.partition_spec.clone())
+        }
+
+        fn get_table_files_for_select(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<Vec<DuckLakeTableFile>> {
+            Ok(self.files.iter().map(|entry| entry.file.clone()).collect())
+        }
+
+        fn get_table_file_metadata_page(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+            after_data_file_id: Option<i64>,
+            limit: usize,
+        ) -> Result<Vec<DuckLakeFileMetadata>> {
+            Ok(self
+                .files
+                .iter()
+                .filter(|entry| {
+                    after_data_file_id.is_none_or(|after| entry.file.data_file_id > after)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn get_table_summary_statistics(
+            &self,
+            _table_id: i64,
+            _snapshot_id: i64,
+        ) -> Result<DuckLakeStatistics> {
+            Ok(DuckLakeStatistics::default())
+        }
+
+        fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
+            unimplemented!()
+        }
+
+        fn list_schemas(&self, _snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
+            unimplemented!()
+        }
+
+        fn list_tables(&self, _schema_id: i64, _snapshot_id: i64) -> Result<Vec<TableMetadata>> {
+            unimplemented!()
+        }
+
+        fn get_schema_by_name(
+            &self,
+            _name: &str,
+            _snapshot_id: i64,
+        ) -> Result<Option<SchemaMetadata>> {
+            unimplemented!()
+        }
+
+        fn get_table_by_name(
+            &self,
+            _schema_id: i64,
+            _name: &str,
+            _snapshot_id: i64,
+        ) -> Result<Option<TableMetadata>> {
+            unimplemented!()
+        }
+
+        fn table_exists(&self, _schema_id: i64, _name: &str, _snapshot_id: i64) -> Result<bool> {
+            unimplemented!()
+        }
+
+        fn list_all_tables(&self, _snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
+            unimplemented!()
+        }
+
+        fn list_all_columns(&self, _snapshot_id: i64) -> Result<Vec<ColumnWithTable>> {
+            unimplemented!()
+        }
+
+        fn list_all_files(&self, _snapshot_id: i64) -> Result<Vec<FileWithTable>> {
+            unimplemented!()
+        }
+
+        fn get_data_files_added_between_snapshots(
+            &self,
+            _table_id: i64,
+            _start_snapshot: i64,
+            _end_snapshot: i64,
+        ) -> Result<Vec<DataFileChange>> {
+            unimplemented!()
+        }
+
+        fn get_delete_files_added_between_snapshots(
+            &self,
+            _table_id: i64,
+            _start_snapshot: i64,
+            _end_snapshot: i64,
+        ) -> Result<Vec<DeleteFileChange>> {
+            unimplemented!()
+        }
+    }
+
+    /// The partition value a file records for `region`: `None` = the file records
+    /// no partition value at all, `Some(None)` = it records SQL NULL.
+    type RegionValue = Option<Option<&'static str>>;
+
+    /// One data file. `id_bounds` become exact catalog min/max statistics for
+    /// `id`; `None` leaves the file without any statistics, the shape a file
+    /// written before statistics collection has. `region` never carries column
+    /// statistics, so anything that prunes it must come from the partition value.
+    fn fixture_file(
+        data_file_id: i64,
+        region: RegionValue,
+        id_bounds: Option<(i64, i64)>,
+    ) -> DuckLakeFileMetadata {
+        let mut file = DuckLakeTableFile::new(DuckLakeFileData::new(
+            format!("file-{data_file_id}.parquet"),
+            true,
+            1,
+        ));
+        file.data_file_id = data_file_id;
+        file.snapshot_id = Some(1);
+        file.begin_snapshot = Some(1);
+        file.max_row_count = Some(1);
+        if let Some(value) = region {
+            file.partition_id = Some(1);
+            file.partition_values = vec![(0, value.map(str::to_string))];
+        }
+        let column_statistics = id_bounds
+            .map(|(min, max)| DuckLakeFileColumnStatistics {
+                data_file_id,
+                column_id: ID_COLUMN_ID,
+                column_size_bytes: Some(8),
+                value_count: Some(1),
+                null_count: Some(0),
+                min_value: Some(min.to_string()),
+                max_value: Some(max.to_string()),
+                contains_nan: None,
+            })
+            .into_iter()
+            .collect();
+        DuckLakeFileMetadata {
+            file,
+            column_statistics,
+        }
+    }
+
+    /// A spec partitioning by `region` with the `identity` transform.
+    ///
+    /// The partition key index (0) deliberately differs from `region`'s position
+    /// in the schema (1): a bound written at the key index instead of the column
+    /// index would land on `id`, the very column a keyed mutation filters on.
+    fn region_spec(prune_safe: bool) -> PartitionSpec {
+        PartitionSpec {
+            partition_id: 1,
+            columns: vec![PartitionSpecColumn {
+                partition_key_index: 0,
+                column_id: REGION_COLUMN_ID,
+                transform: PartitionTransform::Identity,
+            }],
+            prune_safe,
+        }
+    }
+
+    fn fixed_table(
+        files: Vec<DuckLakeFileMetadata>,
+        partition_spec: Option<PartitionSpec>,
+    ) -> Result<DuckLakeTable> {
+        DuckLakeTable::new(
+            1,
+            "events",
+            Arc::new(FixedFileProvider {
+                files,
+                partition_spec,
+            }),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )
+    }
+
+    /// The physical expression a caller would build for a scan, and hand to both
+    /// `files_matching` and `resolve_positions`.
+    fn physical_predicate(table: &DuckLakeTable, expr: Expr) -> Arc<dyn PhysicalExpr> {
+        let df_schema = DFSchema::try_from(table.physical_schema.as_ref().clone()).unwrap();
+        SessionContext::new()
+            .state()
+            .create_physical_expr(expr, &df_schema)
+            .unwrap()
+    }
+
+    fn matching_ids(table: &DuckLakeTable, predicate: &Arc<dyn PhysicalExpr>) -> Result<Vec<i64>> {
+        Ok(table
+            .files_matching(predicate)?
+            .into_iter()
+            .map(|file| file.data_file_id)
+            .collect())
+    }
+
+    #[test]
+    fn files_matching_prunes_unpartitioned_files_by_column_statistics() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                fixture_file(2, None, Some((100, 110))),
+                fixture_file(3, None, Some((200, 210))),
+            ],
+            None,
+        )?;
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![2]);
+        Ok(())
+    }
+
+    /// A file with no recorded statistics is always kept. It also costs the whole
+    /// page its pruning on that column: an unusable bound suppresses the column
+    /// for every file being considered alongside it, which is why files 1 and 3
+    /// come back too. Both effects err the same way — toward keeping files.
+    ///
+    /// The control is
+    /// `files_matching_prunes_unpartitioned_files_by_column_statistics`: the same
+    /// shape with statistics on every file returns one file, so this result is
+    /// the missing statistics talking, not pruning being switched off.
+    #[test]
+    fn files_matching_keeps_files_without_statistics() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                fixture_file(2, None, None),
+                fixture_file(3, None, Some((200, 210))),
+            ],
+            None,
+        )?;
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// A NULL partition value yields no bound, so the file must survive a
+    /// predicate on its own partition column. As above, the underivable bound
+    /// also suppresses the column for the rest of the page, so file 2 survives
+    /// with it.
+    ///
+    /// The control is
+    /// `files_matching_prunes_a_partition_column_without_column_statistics`:
+    /// files 1 and 2 alone, same predicate, returns file 1.
+    #[test]
+    fn files_matching_keeps_a_file_with_a_null_partition_value() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, Some(Some("10")), None),
+                fixture_file(2, Some(Some("9999")), None),
+                fixture_file(3, Some(None), None),
+            ],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// A partition value that does not decode to the column type yields no
+    /// bound, with the same consequences as a NULL one. Deliberately kept apart
+    /// from the NULL case: with both in one fixture, either could be bounded
+    /// wrongly and the other would still suppress the column, hiding it.
+    #[test]
+    fn files_matching_keeps_a_file_with_an_undecodable_partition_value() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, Some(Some("10")), None),
+                fixture_file(2, Some(Some("9999")), None),
+                fixture_file(3, Some(Some("not-a-region")), None),
+            ],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// A predicate on a non-partition column must never be pruned by partition
+    /// bounds. Getting this wrong would drop a file that holds the key, and a
+    /// keyed mutation would then insert a second copy of that key instead of
+    /// superseding it — silently, with no error anywhere.
+    ///
+    /// `files_matching_prunes_a_partition_column_without_column_statistics` is the
+    /// counterpart that proves partition bounds really are live in this fixture,
+    /// so this test cannot pass merely because nothing prunes.
+    #[test]
+    fn files_matching_never_prunes_a_non_partition_predicate_by_partition_bounds() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                // Partition value far outside the predicate's range and no `id`
+                // statistics: only a partition bound leaking onto `id` could drop it.
+                fixture_file(1, Some(Some("9999")), None),
+                // Same distant partition value, but `id` statistics that admit the
+                // key — the file genuinely holds a matching row.
+                fixture_file(2, Some(Some("9999")), Some((100, 110))),
+            ],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn files_matching_prunes_a_partition_column_without_column_statistics() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, Some(Some("10")), None),
+                fixture_file(2, Some(Some("9999")), None),
+            ],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1]);
+        Ok(())
+    }
+
+    /// Same fixture and predicate as
+    /// `files_matching_prunes_a_partition_column_without_column_statistics`, with
+    /// the single difference that the spec is not prune-safe — the table has been
+    /// re-partitioned, so a file's values may belong to a retired generation whose
+    /// key order differs. Nothing may be dropped.
+    #[test]
+    fn files_matching_ignores_partition_bounds_when_the_spec_is_not_prune_safe() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, Some(Some("10")), None),
+                fixture_file(2, Some(Some("9999")), None),
+            ],
+            Some(region_spec(false)),
+        )?;
+
+        let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn files_matching_applies_every_conjunct() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, Some(Some("10")), Some((100, 110))),
+                // Excluded by the partition conjunct alone.
+                fixture_file(2, Some(Some("9999")), Some((100, 110))),
+                // Excluded by the key conjunct alone.
+                fixture_file(3, Some(Some("10")), Some((1, 10))),
+            ],
+            Some(region_spec(true)),
+        )?;
+
+        let predicate = physical_predicate(
+            &table,
+            col("id")
+                .eq(lit(105_i64))
+                .and(col("region").eq(lit(10_i64))),
+        );
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1]);
+        Ok(())
+    }
+
+    #[test]
+    fn files_matching_returns_every_file_for_a_trivially_true_predicate() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                fixture_file(2, None, Some((100, 110))),
+                fixture_file(3, None, None),
+            ],
+            None,
+        )?;
+
+        let predicate = physical_predicate(&table, lit(true));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// A million-file table read in bounded pages, with one match in the first
+    /// page and one in the last: a result assembled from a single page, or from
+    /// an eager whole-table file read, cannot produce both.
+    #[test]
+    fn files_matching_prunes_across_every_metadata_page() -> Result<()> {
+        let provider = Arc::new(LazyMillionFileProvider::default());
+        let table = DuckLakeTable::new(
+            1,
+            "events",
+            provider.clone(),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )?;
+
+        let predicate = physical_predicate(
+            &table,
+            col("id").eq(lit(5_i64)).or(col("id").eq(lit(999_999_i64))),
+        );
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![5, 999_999]);
+        assert!(provider.page_calls.load(Ordering::Relaxed) > 1);
+        assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
         Ok(())
     }
 
