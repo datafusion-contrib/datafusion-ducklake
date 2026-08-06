@@ -341,6 +341,25 @@ fn file_row_count(
     }
 }
 
+/// Whether the catalog *proves* this file holds no rows.
+///
+/// A file with no rows cannot hold a row matching any predicate, so it is safe to
+/// drop from a pruning candidate set without consulting its statistics — and worth
+/// dropping, because having no rows it also has no min/max, and a file with an
+/// absent bound suppresses pruning on that column for every file considered
+/// alongside it.
+///
+/// Only `Some(0)` is proof. `record_count` is optional in the catalog and some
+/// providers do not surface it at all, so `None` means "unknown", never "zero":
+/// treating it as zero would drop files full of live rows, silently losing them
+/// from a scan and — through
+/// [`files_matching`](DuckLakeTable::files_matching) — from a keyed mutation's
+/// view of the table. Unknown keeps the file, in line with the fail-open contract
+/// everywhere else in pruning.
+fn file_is_known_empty(file: &DuckLakeTableFile) -> bool {
+    file.max_row_count == Some(0)
+}
+
 fn build_datafusion_statistics(
     schema: &Schema,
     columns: &[DuckLakeTableColumn],
@@ -886,10 +905,22 @@ impl DuckLakeTable {
     /// its own statistics *prove* it cannot match. A file with no recorded
     /// statistics, an undecodable partition value, a NULL partition value, or a
     /// bound the catalog only knows approximately is always kept, and any error
-    /// building or evaluating the pruning predicate returns the complete file
-    /// list. Callers may therefore treat the result as "these files may match"
-    /// and must still evaluate `predicate` against the rows themselves; a
-    /// mutation that skipped that step could silently miss a row.
+    /// building or evaluating the pruning predicate discards the pruning done so
+    /// far and returns every file in the page — including files an earlier conjunct
+    /// had already excluded, since a failure part-way through leaves no basis for
+    /// trusting the exclusions that preceded it. Callers may therefore treat the
+    /// result as "these files may match" and must still evaluate `predicate`
+    /// against the rows themselves; a mutation that skipped that step could
+    /// silently miss a row.
+    ///
+    /// The one file dropped without consulting statistics is one the catalog
+    /// records as holding **no rows** (`record_count` of exactly 0): having no
+    /// rows, it cannot hold a matching one. That is a proof rather than an
+    /// estimate, so it is the one exclusion the error path above does *not* give
+    /// back — such a file is absent from the result whether or not pruning ran, and
+    /// whether or not it failed. A file whose row count the catalog leaves unset is
+    /// *not* treated as empty; unknown keeps the file, like every other unknown
+    /// here.
     ///
     /// How much it prunes depends on how completely the catalog describes the
     /// files. A file that carries no usable bound on a column the predicate
@@ -1184,14 +1215,32 @@ impl DuckLakeTable {
     /// current candidate set. Applying each conjunct repeatedly lets another
     /// conjunct first remove that file, then makes the suppressed column usable
     /// on the next pass. A file is only removed when its own statistics prove it
-    /// cannot match, and any pruning error keeps the complete input set.
+    /// cannot match, and any pruning error abandons the whole attempt: it returns
+    /// `candidates` — every input file bar the proven-empty ones — and so gives back
+    /// files an earlier conjunct had already excluded, rather than trusting
+    /// exclusions made before the failure.
+    ///
+    /// Files the catalog records as holding no rows are dropped up front by
+    /// [`file_is_known_empty`], before any statistics are consulted. A 0-row file
+    /// carries no min/max, so it would otherwise be the unusable bound described
+    /// above — suppressing its columns for a whole round. That exclusion rests on a
+    /// proof rather than on statistics, which is why `candidates` (not
+    /// `table_files`) is what both the no-predicates and the error path return: it
+    /// is the one narrowing no return path here gives back.
     fn prune_table_files_iteratively<'a>(
         &self,
         predicates: &[PruningPredicate],
         table_files: &'a [DuckLakeTableFile],
         file_statistics: &HashMap<i64, Arc<Statistics>>,
     ) -> Vec<&'a DuckLakeTableFile> {
-        let mut retained = table_files.iter().collect::<Vec<_>>();
+        // The candidate set every path below falls back to: the input minus the
+        // files proven empty. Dropping those is not a pruning decision that can be
+        // wrong, so it holds even when pruning is skipped entirely.
+        let candidates: Vec<&'a DuckLakeTableFile> = table_files
+            .iter()
+            .filter(|file| !file_is_known_empty(file))
+            .collect();
+        let mut retained = candidates.clone();
         if predicates.is_empty() {
             return retained;
         }
@@ -1203,7 +1252,7 @@ impl DuckLakeTable {
                     Ok(mask) => mask,
                     Err(e) => {
                         tracing::debug!(error = %e, "skipping plan-time file pruning");
-                        return table_files.iter().collect();
+                        return candidates;
                     },
                 };
                 debug_assert_eq!(mask.len(), retained.len());
@@ -3938,6 +3987,89 @@ mod tests {
         let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
 
         assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        Ok(())
+    }
+
+    /// A file the catalog records as holding no rows, and — the case that matters —
+    /// carrying no per-column statistics row at all.
+    ///
+    /// This is the shape that defeats pruning outright rather than merely costing
+    /// it a round. A 0-row file written by this crate normally does carry a
+    /// statistics row (`value_count` and `null_count` of 0, NULL bounds), and
+    /// DataFusion drops such a file unaided through the `null_count != row_count`
+    /// check it attaches to every comparison rewrite. With no statistics row there
+    /// is no such check to fire: nothing can drop the file, and its absent bounds
+    /// suppress the column for every file beside it, in every round. A statistics
+    /// harvest failure ([`crate::stats_collect::collect_column_stats`] yields no
+    /// rows) and a column added by later DDL both produce it.
+    fn empty_file_without_statistics(data_file_id: i64) -> DuckLakeFileMetadata {
+        let mut entry = fixture_file(data_file_id, None, None);
+        entry.file.max_row_count = Some(0);
+        entry
+    }
+
+    /// A file whose `record_count` the catalog leaves unset — what a provider that
+    /// does not surface one produces. Unknown, never empty.
+    fn file_with_unknown_row_count(
+        data_file_id: i64,
+        id_bounds: (i64, i64),
+    ) -> DuckLakeFileMetadata {
+        let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
+        entry.file.max_row_count = None;
+        entry
+    }
+
+    /// A 0-row file with no statistics row of its own, alongside files whose
+    /// statistics are ideal. Its absent bounds are indistinguishable from those of
+    /// a file that simply has none, so unless it is excluded before statistics are
+    /// consulted it suppresses `id` for the whole candidate set — and, having no
+    /// statistics, it can never be dropped to lift that suppression on a later
+    /// round, so every file comes back.
+    ///
+    /// The control is
+    /// `files_matching_prunes_unpartitioned_files_by_column_statistics`: the same
+    /// three row-bearing files without the empty one, same predicate, same result.
+    #[test]
+    fn files_matching_prunes_around_an_empty_file_without_statistics() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                fixture_file(2, None, Some((100, 110))),
+                fixture_file(3, None, Some((200, 210))),
+                empty_file_without_statistics(4),
+            ],
+            None,
+        )?;
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![2]);
+        Ok(())
+    }
+
+    /// Only a recorded row count of exactly 0 may drop a file. A catalog that
+    /// leaves `record_count` unset must never be read as "empty": that would
+    /// withhold a file holding live rows, and a keyed mutation that never sees the
+    /// file holding its key inserts a duplicate instead of superseding it, with no
+    /// error anywhere. Pinned because the mis-implementation is a one-token slip
+    /// (`max_row_count.unwrap_or(0) == 0`) that nothing else here would catch.
+    ///
+    /// File 2 carries the unknown count and is the only file whose bounds admit the
+    /// key, so reading unknown as empty collapses this result to nothing.
+    #[test]
+    fn files_matching_keeps_a_file_whose_row_count_is_unknown() -> Result<()> {
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                file_with_unknown_row_count(2, (100, 110)),
+                empty_file_without_statistics(3),
+            ],
+            None,
+        )?;
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+
+        assert_eq!(matching_ids(&table, &predicate)?, vec![2]);
         Ok(())
     }
 

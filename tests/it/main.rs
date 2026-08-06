@@ -27,6 +27,7 @@ mod compaction_sqlite_tests;
 mod concurrent_tests;
 mod concurrent_write_tests;
 mod delete_filter_tests;
+mod empty_data_file_tests;
 mod encryption_tests;
 mod files_matching_tests;
 mod hybrid_asyncdb;
