@@ -803,13 +803,30 @@ fn read_data_type_with_field_id_mapping(
             arrow_field_names,
             match_by_id,
         )?;
-        Ok(Arc::new(
-            field
-                .clone()
-                .with_name(name)
-                .with_data_type(data_type)
-                .with_nullable(field.is_nullable() || is_absent),
-        ))
+        // A nested node's field id is part of the Arrow *type* of its parent
+        // (`DataType::List`/`Struct`/`Map` embed whole child `Field`s, metadata
+        // included), so it takes part in every array/batch type check. The
+        // physical file tags each nested node with its DuckLake field id, so the
+        // read schema must declare the same id or batches the parquet reader
+        // produces for the file do not match the schema the reader was handed.
+        // Only stamp what the file actually carries: a node matched by name
+        // (`match_by_id == false`, an external file with no ids) or one absent
+        // from the file has no id to declare. Top-level fields are deliberately
+        // left bare — their metadata is not part of any type, they are resolved
+        // by name, and stamping them would make every read schema differ from
+        // the catalog schema.
+        let field_metadata_id = (match_by_id && !is_absent).then(|| field_id.to_string());
+        let mut read_field = field
+            .clone()
+            .with_name(name)
+            .with_data_type(data_type)
+            .with_nullable(field.is_nullable() || is_absent);
+        if let Some(id) = field_metadata_id {
+            let mut metadata = read_field.metadata().clone();
+            metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id);
+            read_field = read_field.with_metadata(metadata);
+        }
+        Ok(Arc::new(read_field))
     }
 
     fn rewrite_type(
@@ -1207,6 +1224,325 @@ mod tests {
         };
 
         assert_eq!(fields[0].name(), "__ducklake_absent_field_4");
+    }
+
+    /// Collect `(dotted path, field id)` for every nested node of `data_type`,
+    /// reading the id from the node's `PARQUET:field_id` metadata. Nodes without
+    /// the metadata are reported with `None` so a missing id is visible in the
+    /// assertion rather than silently skipped.
+    fn nested_field_ids(data_type: &DataType) -> Vec<(String, Option<String>)> {
+        fn walk(prefix: &str, field: &Field, out: &mut Vec<(String, Option<String>)>) {
+            let path = format!("{prefix}.{}", field.name());
+            out.push((
+                path.clone(),
+                field.metadata().get(PARQUET_FIELD_ID_META_KEY).cloned(),
+            ));
+            collect(&path, field.data_type(), out);
+        }
+        fn collect(prefix: &str, data_type: &DataType, out: &mut Vec<(String, Option<String>)>) {
+            match data_type {
+                DataType::List(child)
+                | DataType::LargeList(child)
+                | DataType::FixedSizeList(child, _) => walk(prefix, child, out),
+                DataType::Struct(children) => {
+                    for child in children {
+                        walk(prefix, child, out);
+                    }
+                },
+                // The Map wrapper ("entries"/"key_value") is a synthetic parquet
+                // group with no DuckLake column and no field id; descend through
+                // it without recording it.
+                DataType::Map(entries, _) => collect(prefix, entries.data_type(), out),
+                _ => {},
+            }
+        }
+
+        let mut out = Vec::new();
+        collect("", data_type, &mut out);
+        out
+    }
+
+    /// Columns for a table shaped
+    /// `v LIST<FLOAT>, s STRUCT<label VARCHAR, score INT>, m MAP<VARCHAR, INT>, nn LIST<LIST<INT>>`,
+    /// with catalog ids assigned depth-first (1..12) the way DuckLake assigns them.
+    fn nested_test_columns() -> Vec<DuckLakeTableColumn> {
+        vec![
+            DuckLakeTableColumn {
+                column_id: 1,
+                column_name: "v".to_string(),
+                column_type: "list".to_string(),
+                is_nullable: true,
+                data_type: Some(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Float32,
+                    true,
+                )))),
+                nested_column_ids: vec![2],
+            },
+            DuckLakeTableColumn {
+                column_id: 3,
+                column_name: "s".to_string(),
+                column_type: "struct".to_string(),
+                is_nullable: true,
+                data_type: Some(DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("label", DataType::Utf8View, true)),
+                        Arc::new(Field::new("score", DataType::Int32, true)),
+                    ]
+                    .into(),
+                )),
+                nested_column_ids: vec![4, 5],
+            },
+            DuckLakeTableColumn {
+                column_id: 6,
+                column_name: "m".to_string(),
+                column_type: "map".to_string(),
+                is_nullable: true,
+                data_type: Some(DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8View, false)),
+                                Arc::new(Field::new("value", DataType::Int32, true)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                )),
+                nested_column_ids: vec![7, 8],
+            },
+            DuckLakeTableColumn {
+                column_id: 9,
+                column_name: "nn".to_string(),
+                column_type: "list".to_string(),
+                is_nullable: true,
+                data_type: Some(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    true,
+                )))),
+                nested_column_ids: vec![10, 11],
+            },
+        ]
+    }
+
+    /// The file schema a DuckLake writer produces for [`nested_test_columns`]:
+    /// every semantic node tagged with its field id, list children named
+    /// `element`, and no id on the Map wrapper group.
+    fn nested_test_file_schema() -> Schema {
+        let id = |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        Schema::new(vec![
+            Field::new(
+                "v",
+                DataType::List(Arc::new(
+                    Field::new("element", DataType::Float32, true).with_metadata(id(2)),
+                )),
+                true,
+            )
+            .with_metadata(id(1)),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("label", DataType::Utf8, true).with_metadata(id(4))),
+                        Arc::new(Field::new("score", DataType::Int32, true).with_metadata(id(5))),
+                    ]
+                    .into(),
+                ),
+                true,
+            )
+            .with_metadata(id(3)),
+            Field::new(
+                "m",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(
+                                    Field::new("key", DataType::Utf8, false).with_metadata(id(7)),
+                                ),
+                                Arc::new(
+                                    Field::new("value", DataType::Int32, true).with_metadata(id(8)),
+                                ),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            )
+            .with_metadata(id(6)),
+            Field::new(
+                "nn",
+                DataType::List(Arc::new(
+                    Field::new(
+                        "element",
+                        DataType::List(Arc::new(
+                            Field::new("element", DataType::Int32, true).with_metadata(id(11)),
+                        )),
+                        true,
+                    )
+                    .with_metadata(id(10)),
+                )),
+                true,
+            )
+            .with_metadata(id(9)),
+        ])
+    }
+
+    fn nested_test_parquet_field_ids() -> HashMap<i32, String> {
+        HashMap::from([
+            (1, "v".to_string()),
+            (2, "element".to_string()),
+            (3, "s".to_string()),
+            (4, "label".to_string()),
+            (5, "score".to_string()),
+            (6, "m".to_string()),
+            (7, "key".to_string()),
+            (8, "value".to_string()),
+            (9, "nn".to_string()),
+            (10, "element".to_string()),
+            (11, "element".to_string()),
+        ])
+    }
+
+    /// A nested node's `PARQUET:field_id` is part of its parent's Arrow *type*,
+    /// so it takes part in every batch type check. The read schema describes the
+    /// physical file to the parquet reader, and DuckLake tags every nested node
+    /// in the file with its field id — so the read schema must declare the same
+    /// ids for List elements, Struct children and Map key/value at every depth.
+    #[test]
+    fn test_read_schema_declares_nested_field_ids() {
+        let (read_schema, _) = build_read_schema_with_field_id_mapping(
+            &nested_test_columns(),
+            &nested_test_parquet_field_ids(),
+            Some(&nested_test_file_schema()),
+        )
+        .unwrap();
+
+        let ids: Vec<(String, Option<String>)> = read_schema
+            .fields()
+            .iter()
+            .flat_map(|field| nested_field_ids(field.data_type()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (".element".to_string(), Some("2".to_string())),
+                (".label".to_string(), Some("4".to_string())),
+                (".score".to_string(), Some("5".to_string())),
+                (".key".to_string(), Some("7".to_string())),
+                (".value".to_string(), Some("8".to_string())),
+                (".element".to_string(), Some("10".to_string())),
+                (".element.element".to_string(), Some("11".to_string())),
+            ],
+            "every nested node must declare the field id the file records for it"
+        );
+
+        // The Map wrapper is a synthetic parquet group, not a DuckLake column: it
+        // must stay untagged, matching what the writer emits.
+        let DataType::Map(entries, _) = read_schema.field(2).data_type() else {
+            panic!("m must remain a map");
+        };
+        assert!(
+            !entries.metadata().contains_key(PARQUET_FIELD_ID_META_KEY),
+            "the map wrapper group has no DuckLake column and must carry no field id"
+        );
+
+        // Top-level fields are matched by name and their metadata is not part of
+        // any Arrow type, so they stay bare.
+        for field in read_schema.fields() {
+            assert!(
+                !field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY),
+                "top-level field '{}' must not be tagged",
+                field.name()
+            );
+        }
+    }
+
+    /// An external / legacy file whose nested nodes carry no field ids is matched
+    /// structurally. Declaring ids the file does not have would be the same
+    /// divergence in the opposite direction, so nothing is stamped.
+    #[test]
+    fn test_read_schema_omits_nested_field_ids_for_file_without_them() {
+        let file_schema = Schema::new(vec![
+            Field::new(
+                "v",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("label", DataType::Utf8, true)),
+                        Arc::new(Field::new("score", DataType::Int32, true)),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]);
+        let columns = nested_test_columns()[..2].to_vec();
+        // A file written before nested nodes were tagged: top-level ids only.
+        let parquet_field_ids = HashMap::from([(1, "v".to_string()), (3, "s".to_string())]);
+
+        let (read_schema, _) = build_read_schema_with_field_id_mapping(
+            &columns,
+            &parquet_field_ids,
+            Some(&file_schema),
+        )
+        .unwrap();
+
+        let ids: Vec<(String, Option<String>)> = read_schema
+            .fields()
+            .iter()
+            .flat_map(|field| nested_field_ids(field.data_type()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (".item".to_string(), None),
+                (".label".to_string(), None),
+                (".score".to_string(), None),
+            ],
+            "a file without nested field ids must not be described as having them"
+        );
+    }
+
+    /// A nested field the file predates reads as NULL under a synthetic name.
+    /// There is no physical node to describe, so it gets no field id either.
+    #[test]
+    fn test_read_schema_omits_field_id_for_absent_nested_field() {
+        let mut parquet_field_ids = nested_test_parquet_field_ids();
+        parquet_field_ids.remove(&5); // `score` was added after this file was written
+
+        let (read_schema, _) = build_read_schema_with_field_id_mapping(
+            &nested_test_columns()[1..2],
+            &parquet_field_ids,
+            Some(&nested_test_file_schema()),
+        )
+        .unwrap();
+
+        let DataType::Struct(fields) = read_schema.field(0).data_type() else {
+            panic!("s must remain a struct");
+        };
+        assert_eq!(
+            fields[0].metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"4".to_string()),
+            "a present nested field keeps its id"
+        );
+        assert_eq!(fields[1].name(), "__ducklake_absent_field_5");
+        assert!(
+            !fields[1].metadata().contains_key(PARQUET_FIELD_ID_META_KEY),
+            "a nested field absent from the file has no physical node to tag"
+        );
     }
 
     #[test]

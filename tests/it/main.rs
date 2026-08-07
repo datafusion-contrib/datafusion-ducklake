@@ -41,6 +41,7 @@ mod multicatalog_postgres_tests;
 mod multicatalog_provider_tests;
 mod mysql_metadata_provider_test;
 mod mysql_metadata_writer_test;
+mod nested_field_id_schema_tests;
 mod numeric_metadata_validation_tests;
 mod object_store_integration_test;
 mod partition_tests;
