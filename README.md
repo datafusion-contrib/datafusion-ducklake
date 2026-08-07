@@ -33,16 +33,21 @@ Add the crate:
 cargo add datafusion-ducklake
 ```
 
-The default build includes the DuckDB catalog backend, statically bundled. Other
-backends and write support are opt-in via feature flags — see
-[COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
+The default build includes the statically bundled DuckDB catalog backend. Applications configure
+their object store implementation directly. Other catalog backends and write support are opt‑in
+via feature flags. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
 
 ```toml
 # Cargo.toml — read PostgreSQL catalogs
 # (for the experimental multi-catalog write path, use features = ["write-postgres"])
 [dependencies]
 datafusion-ducklake = { version = "0.5", features = ["metadata-postgres"] }
+sqlx = { version = "0.9", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 ```
+
+`metadata-postgres`, `multicatalog-postgres`, and `write-postgres` do not select a TLS provider.
+Plain local connections work without one. For TLS, select a provider such as
+`sqlx/tls-rustls-aws-lc-rs` or `sqlx/tls-rustls-ring` in the application.
 
 The examples below also use `datafusion`, `object_store`, and `url` directly — add them
 to your `[dependencies]` as well (this crate does not re-export them). The write example
@@ -55,6 +60,9 @@ Run a query against an existing PostgreSQL catalog with the bundled example:
 cargo run --example basic_query --features metadata-postgres -- \
   "postgresql://user:password@localhost:5432/database" "SELECT * FROM main.users"
 ```
+
+Configure `object_store` directly for local, S3, or MinIO data files. Applications can instead
+register another DataFusion `ObjectStore`, such as an OpenDAL‑backed connector.
 
 (The example also accepts DuckDB, SQLite, and MySQL connection strings with the matching
 `metadata-*` feature — see [COMPATIBILITY.md](COMPATIBILITY.md).)
