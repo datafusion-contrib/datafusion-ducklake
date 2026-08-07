@@ -75,6 +75,13 @@ impl ColumnRenameExec {
 
     /// Returns whether this node only renames columns without casting,
     /// projecting, or synthesizing values.
+    ///
+    /// Nested field metadata is ignored: a read schema describes the file's
+    /// nested nodes with the `PARQUET:field_id` the file tags them with, so it
+    /// differs from the catalog type by metadata alone even when the values are
+    /// identical. Dropping that metadata on the way out is a zero-copy relabel,
+    /// not a conversion, so it must not cost the scan its filter and limit
+    /// pushdown.
     pub fn is_pure_type_preserving_rename(&self) -> bool {
         let input_schema = self.input.schema();
         input_schema.fields().len() == self.output_schema.fields().len()
@@ -83,7 +90,7 @@ impl ColumnRenameExec {
                 .iter()
                 .zip(self.output_schema.fields())
                 .all(|(input, output)| {
-                    input.data_type() == output.data_type()
+                    types_equal_ignoring_field_metadata(input.data_type(), output.data_type())
                         && self
                             .reverse_mapping
                             .get(output.name())
@@ -286,6 +293,53 @@ impl Stream for ColumnRenameStream {
 impl RecordBatchStream for ColumnRenameStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.output_schema)
+    }
+}
+
+/// Compare two Arrow types, ignoring the metadata carried by nested fields.
+///
+/// Names, nullability and value types still have to match at every level. All
+/// nested field metadata is disregarded, not only the `PARQUET:field_id` this
+/// exists for: metadata annotates a node, it never decides what its values are,
+/// so a difference confined to it is a relabel rather than a conversion. The
+/// read path attaches no other nested metadata.
+///
+/// Types with no nested fields, and the container types the read path never
+/// produces (dictionaries, unions, run-end encoding), fall back to strict
+/// equality.
+pub(crate) fn types_equal_ignoring_field_metadata(
+    left: &arrow::datatypes::DataType,
+    right: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::{DataType, Field};
+
+    fn fields_equal(left: &Field, right: &Field) -> bool {
+        left.name() == right.name()
+            && left.is_nullable() == right.is_nullable()
+            && types_equal_ignoring_field_metadata(left.data_type(), right.data_type())
+    }
+
+    match (left, right) {
+        (DataType::List(left), DataType::List(right))
+        | (DataType::LargeList(left), DataType::LargeList(right))
+        | (DataType::ListView(left), DataType::ListView(right))
+        | (DataType::LargeListView(left), DataType::LargeListView(right)) => {
+            fields_equal(left, right)
+        },
+        (DataType::FixedSizeList(left, left_size), DataType::FixedSizeList(right, right_size)) => {
+            left_size == right_size && fields_equal(left, right)
+        },
+        (DataType::Map(left, left_sorted), DataType::Map(right, right_sorted)) => {
+            left_sorted == right_sorted && fields_equal(left, right)
+        },
+        (DataType::Struct(left), DataType::Struct(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| fields_equal(left, right))
+        },
+        _ => left == right,
     }
 }
 
@@ -528,6 +582,91 @@ mod tests {
         let column = pushed[0][0].predicate.downcast_ref::<Column>().unwrap();
         assert_eq!(column.name(), "old_col");
         assert_eq!(column.index(), 0);
+    }
+
+    /// A read schema tags a nested column's children with the field ids the file
+    /// records; the catalog schema does not. Stripping that metadata on the way
+    /// out is a relabel, not a cast, so the scan keeps its pushdown.
+    #[test]
+    fn nested_field_metadata_alone_still_allows_pushdown() {
+        let element = |metadata: Option<(&str, &str)>| {
+            let field = Field::new("element", DataType::Float32, true);
+            match metadata {
+                Some((key, value)) => {
+                    field.with_metadata(HashMap::from([(key.to_string(), value.to_string())]))
+                },
+                None => field,
+            }
+        };
+        let input_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new(
+                "v",
+                DataType::List(Arc::new(element(Some(("PARQUET:field_id", "3"))))),
+                true,
+            ),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("v", DataType::List(Arc::new(element(None))), true),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let exec = ColumnRenameExec::new(input, output_schema, HashMap::new());
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+
+        assert!(exec.is_pure_type_preserving_rename());
+        assert!(exec.supports_limit_pushdown());
+        let description = exec
+            .gather_filters_for_pushdown(
+                FilterPushdownPhase::Pre,
+                vec![filter],
+                &ConfigOptions::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            description.parent_filters()[0][0].discriminant,
+            PushedDown::Yes
+        ));
+    }
+
+    /// The relaxation is metadata-only: a nested child renamed or retyped is
+    /// still a real conversion and must block pushdown.
+    #[test]
+    fn nested_child_name_or_type_difference_blocks_pushdown() {
+        let list = |child: Field| DataType::List(Arc::new(child));
+        let cases = [
+            (
+                list(Field::new("element", DataType::Float32, true)),
+                list(Field::new("item", DataType::Float32, true)),
+            ),
+            (
+                list(Field::new("element", DataType::Float32, true)),
+                list(Field::new("element", DataType::Float64, true)),
+            ),
+            (
+                list(Field::new("element", DataType::Float32, false)),
+                list(Field::new("element", DataType::Float32, true)),
+            ),
+        ];
+
+        for (input_type, output_type) in cases {
+            let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::new(
+                vec![Field::new("v", input_type.clone(), true)],
+            ))));
+            let exec = ColumnRenameExec::new(
+                input,
+                Arc::new(Schema::new(vec![Field::new(
+                    "v",
+                    output_type.clone(),
+                    true,
+                )])),
+                HashMap::new(),
+            );
+            assert!(
+                !exec.is_pure_type_preserving_rename(),
+                "{input_type:?} -> {output_type:?} is a conversion, not a relabel"
+            );
+        }
     }
 
     #[test]

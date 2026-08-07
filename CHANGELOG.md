@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed
+- `types::build_read_schema_with_field_id_mapping` declares the `PARQUET:field_id` of every nested
+  node the data file tags — list elements, struct children, map key/value, at any depth. A nested
+  node's field id is part of its parent's Arrow type, so a read schema that omitted it disagreed with
+  the batches the parquet reader produces from the very file it describes ("column types must match
+  schema types"). Callers that pair that schema with arrow-rs themselves hit the error directly;
+  scans through this crate's `TableProvider` were unaffected, because DataFusion's parquet opener
+  casts a metadata-only difference away. Files without nested field ids (external, or written before
+  nested nodes were tagged) are still described without them, and the table's catalog schema stays
+  free of storage metadata. Dropping the ids on the way out is a relabel rather than a conversion, so
+  a scan over a nested column keeps its filter and limit pushdown.
 - A write upgrades legacy single‑row `list<T>` metadata to recursive list and element rows without
   changing the existing list column ID or invalidating historical snapshots.
 - Reads null‑fill fields added inside structs, including non‑nullable fields and structs nested in
