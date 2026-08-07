@@ -26,7 +26,7 @@ datafusion = "54"
 datafusion-datasource = "54"
 arrow = "58"
 parquet = { version = "58", features = ["async"] }
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.13", default-features = false }
 url = "2.5"
 percent-encoding = "2"
 async-trait = "0.1"
@@ -51,6 +51,7 @@ duckdb = { version = "1.4.1", optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
 
 [dev-dependencies]
+object_store = { version = "0.13", features = ["aws", "fs"] }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio", "postgres", "mysql"] }
 tempfile = "3.14"
@@ -68,7 +69,7 @@ skip-tests-with-docker = []
 
 # Metadata provider backends
 metadata-duckdb = ["dep:duckdb"]
-metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/tls-rustls-ring"]
+metadata-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono"]
 # `mysql-rsa` keeps non-TLS `caching_sha2_password`/`sha256_password` auth working
 # (MySQL 8's default). sqlx bundled RSA unconditionally through 0.8; 0.9 split it
 # into an opt-in feature, and without it those connections fail at connect time.

@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. `resolve_positions` is only valid for files that have never been rewritten, and `files_matching` cannot identify those from catalog metadata alone — nor should it silently withhold them, since a keyed mutation that never sees a file holding its key inserts a duplicate. This is the check a caller runs on each returned file to refuse a rewritten one loudly instead; the crate's own DELETE uses it the same way.
 
 ### Changed
+- PostgreSQL metadata features no longer select a TLS provider. Consumers that need TLS can select
+  a provider through SQLx.
+- Object store implementations are no longer selected by the library. Consumers configure
+  `object_store` directly or register another `ObjectStore` implementation with DataFusion.
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed

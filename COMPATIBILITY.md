@@ -25,6 +25,10 @@ below) where tables are created via `DuckLakeTableWriter` and then appended to w
 | PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
 | MySQL      |  ✅  |  ❌   |      ❌       | `metadata-mysql`                                       |
 
+The listed PostgreSQL features do not select a TLS provider. Plain local connections work without
+one. For TLS, select a provider such as `sqlx/tls-rustls-aws-lc-rs` or
+`sqlx/tls-rustls-ring` in the application.
+
 PostgreSQL has **two** writers, both behind `write-postgres`:
 
 | Writer | Layout | Spec-compliant | SQL `CREATE TABLE`/CTAS | Read back with |
@@ -59,10 +63,14 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 
 | Store                       | Supported | Notes                                              |
 |-----------------------------|:---------:|----------------------------------------------------|
-| Local filesystem            |    ✅     | Available by default via DataFusion's object store |
-| S3-compatible (S3, MinIO)   |    ✅     | Register with `RuntimeEnv::register_object_store`  |
+| Local filesystem            |    ✅     | Enable `object_store/fs` in the application        |
+| S3-compatible (S3, MinIO)   |    ✅     | Enable `object_store/aws` in the application       |
 | Google Cloud Storage        |    ❌     | Not currently wired up                             |
 | Azure Blob Storage          |    ❌     | Not currently wired up                             |
+
+Applications configure `object_store` directly for local files, S3, or MinIO, or register another
+compatible `ObjectStore` implementation with DataFusion, including an OpenDAL‑backed connector.
+DuckLake enables the filesystem and AWS providers only for its own tests and examples.
 
 ---
 
