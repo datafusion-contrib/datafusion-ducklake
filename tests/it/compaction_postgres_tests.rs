@@ -451,3 +451,301 @@ async fn rewrite_targets_explicit_postgres_data_files() {
         vec![(1, 10), (2, 20), (3, 30), (4, 40)],
     );
 }
+
+/// The Postgres counterpart of the SQLite
+/// `merge_only_within_a_partition_and_preserves_assignment` test.
+///
+/// Compaction of a PARTITIONED table must merge only within a partition AND carry
+/// each output's partition assignment over from its sources, on every metadata
+/// backend. Official DuckLake takes the merged file's partition straight from
+/// `source_files[0]` and writes the resulting `ducklake_file_partition_value` rows
+/// through its shared file-registration path, so an output that kept its rows but
+/// lost its partition row is not a representable state there.
+///
+/// This asserts on CATALOG state, not query results: a merged file that dropped its
+/// partition assignment still returns every row (zone maps keep pruning), so reads
+/// look healthy while partition-value pruning is silently and permanently gone.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn merge_preserves_partition_assignment_postgres() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, WriteMode};
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store: ObjStore = Arc::new(LocalFileSystem::new());
+    let cat_name = "cat";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+
+    // Create `public.t(id, val)` with no data, then partition it by `val`, so every
+    // data file that follows is written into a partition.
+    let writer = writer_for(&pool, cat, &data).await;
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("public", "t", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+
+    // Two appends, each landing rows in BOTH partitions (val=1 and val=2), so each
+    // append writes one small file per partition: four files over two origin
+    // snapshots. Spanning origin snapshots also drives the partial-data-file path,
+    // so each merged output carries a `partial_max` as well as its partition.
+    for id in [1, 2] {
+        DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, store.clone())
+            .unwrap()
+            .append_table("public", "t", &[batch(vec![id, id + 10], vec![1, 2])])
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        live_files(&pool, cat_name).await.len(),
+        4,
+        "two appends x two partitions = four files"
+    );
+
+    // Merge with a target large enough to bin everything that is legal to bin.
+    let result = with_writable_table(&pool, cat, cat_name, &data, |t, s| async move {
+        t.merge_adjacent_files(
+            &s,
+            MergeOptions {
+                target_file_size: 1 << 30,
+                max_merged_files: 1024,
+                min_file_size: 0,
+            },
+        )
+        .await
+    })
+    .await;
+    assert!(result.did_work(), "the small files must be compacted");
+    assert_eq!(result.files_processed, 4, "all four sources merged");
+    assert_eq!(
+        result.files_created, 2,
+        "one output per partition, never one across partitions"
+    );
+
+    // The load-bearing assertion: read the merged files' partition assignment back
+    // out of the catalog. One live file per partition, each with a non-NULL
+    // `partition_id` and its own `ducklake_file_partition_value` row.
+    let live_after: Vec<(Option<i64>, Option<String>, Option<i64>)> = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value, df.partial_max
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.end_snapshot IS NULL
+         ORDER BY fpv.partition_value",
+    )
+    .bind(table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+            r.try_get::<Option<i64>, _>(2).unwrap(),
+        )
+    })
+    .collect();
+
+    assert_eq!(
+        live_after.len(),
+        2,
+        "exactly one merged file per partition, each with exactly one partition \
+         value row: {live_after:?}"
+    );
+    let values: Vec<Option<String>> = live_after.iter().map(|(_, v, _)| v.clone()).collect();
+    assert_eq!(
+        values,
+        vec![Some("1".to_string()), Some("2".to_string())],
+        "each merged file keeps its own partition value: {live_after:?}"
+    );
+    for (partition_id, value, partial_max) in &live_after {
+        assert!(
+            partition_id.is_some(),
+            "a merged file of a partitioned table must keep its partition_id \
+             (value={value:?})"
+        );
+        assert!(
+            partial_max.is_some(),
+            "an output merged across origin snapshots is a partial file, and must \
+             carry its partition alongside partial_max (value={value:?})"
+        );
+    }
+
+    // Every partitioned live file agrees with the table's live partition spec, so a
+    // later merge pass still sees well-formed partition groups to bin within.
+    let spec_id = writer
+        .live_partition_spec(table_id)
+        .unwrap()
+        .expect("table is partitioned")
+        .partition_id;
+    for (partition_id, _, _) in &live_after {
+        assert_eq!(
+            *partition_id,
+            Some(spec_id),
+            "merged files must stay on the live partition spec"
+        );
+    }
+
+    // And the rows survive intact — this passes both before and after the fix,
+    // which is exactly why the catalog assertions above are the real test.
+    assert_eq!(
+        read_rows(&pool, cat_name, None).await,
+        vec![(1, 1), (2, 1), (11, 2), (12, 2)]
+    );
+}
+
+/// The Postgres counterpart of the SQLite `rewrite_preserves_partition_assignment`
+/// test. A delete-driven rewrite commits through the same `commit_compaction`
+/// output-registration path as a merge, so it lost the partition assignment in
+/// exactly the same way. The output holds a subset of one source file's rows, so it
+/// belongs to precisely that file's partition — official DuckLake takes the
+/// partition from `source_files[0]` on this path too.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn rewrite_preserves_partition_assignment_postgres() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, WriteMode};
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store: ObjStore = Arc::new(LocalFileSystem::new());
+    let cat_name = "cat";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+
+    let writer = writer_for(&pool, cat, &data).await;
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("public", "t", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            setup.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let table_id = setup.table_id;
+    let live_spec_id = writer
+        .live_partition_spec(table_id)
+        .unwrap()
+        .expect("table is partitioned")
+        .partition_id;
+
+    // One partition (val=1) holding ten rows, so the rewrite has a single source.
+    DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, store.clone())
+        .unwrap()
+        .append_table("public", "t", &[batch((1..=10).collect(), vec![1; 10])])
+        .await
+        .unwrap();
+
+    // Delete eight of ten rows, then rewrite past the 0.5 threshold.
+    {
+        let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+            .await
+            .unwrap();
+        let catalog =
+            DuckLakeCatalog::with_writer(Arc::new(provider), writer_for(&pool, cat, &data).await)
+                .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog(cat_name, Arc::new(catalog));
+        ctx.sql(&format!("DELETE FROM {cat_name}.public.t WHERE id <= 8"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+    }
+    let result = with_writable_table(&pool, cat, cat_name, &data, |t, s| async move {
+        t.rewrite_data_files(
+            &s,
+            RewriteOptions {
+                delete_threshold: 0.5,
+                ..RewriteOptions::default()
+            },
+        )
+        .await
+    })
+    .await;
+    assert_eq!(result.files_created, 1, "the live rows are rewritten");
+
+    // The rewritten file keeps the partition it came from.
+    let (partition_id, value): (Option<i64>, Option<String>) = sqlx::query(
+        "SELECT df.partition_id, fpv.partition_value
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<Option<String>, _>(1).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        partition_id,
+        Some(live_spec_id),
+        "the rewritten file must keep its partition_id"
+    );
+    assert_eq!(
+        value,
+        Some("1".to_string()),
+        "the rewritten file must keep its partition value"
+    );
+    // And the surviving rows read back.
+    assert_eq!(
+        read_rows(&pool, cat_name, None).await,
+        vec![(9, 1), (10, 1)]
+    );
+}

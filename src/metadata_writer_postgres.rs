@@ -3572,6 +3572,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                 let data_file_id: i64 = inserted.try_get(0)?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
+                // Carry the output's partition assignment over from its sources.
+                // Every file in a compaction group shares one partition, so the
+                // output belongs to exactly that partition; without this the
+                // merged file drops out of its partition and partition-value
+                // pruning is lost for good.
+                insert_partition_metadata(&mut tx, table_id, data_file_id, &out.file).await?;
             }
 
             // Recompute the visible stat totals from the surviving files (see the
