@@ -32,10 +32,8 @@ use crate::insert_exec::DuckLakeInsertExec;
 use crate::metadata_writer::{MetadataWriter, WriteMode};
 #[cfg(feature = "write")]
 use crate::update_exec::DuckLakeUpdateExec;
-#[cfg(feature = "write")]
-use arrow::array::ArrayRef;
 use datafusion::common::DFSchema;
-use datafusion::common::pruning::PrunableStatistics;
+use datafusion::common::pruning::{PrunableStatistics, PruningStatistics};
 #[cfg(feature = "write")]
 use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
@@ -45,13 +43,13 @@ use datafusion::physical_optimizer::pruning::PruningPredicate;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
-use arrow::array::{Array, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
-use datafusion::common::{ColumnStatistics, ScalarValue, Statistics};
+use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::parquet::{ParquetAccessPlan, RowGroupAccess};
@@ -344,10 +342,7 @@ fn file_row_count(
 /// Whether the catalog *proves* this file holds no rows.
 ///
 /// A file with no rows cannot hold a row matching any predicate, so it is safe to
-/// drop from a pruning candidate set without consulting its statistics — and worth
-/// dropping, because having no rows it also has no min/max, and a file with an
-/// absent bound suppresses pruning on that column for every file considered
-/// alongside it.
+/// drop from a pruning candidate set without consulting its statistics.
 ///
 /// Only `Some(0)` is proof. `record_count` is optional in the catalog and some
 /// providers do not surface it at all, so `None` means "unknown", never "zero":
@@ -923,10 +918,8 @@ impl DuckLakeTable {
     /// here.
     ///
     /// How much it prunes depends on how completely the catalog describes the
-    /// files. A file that carries no usable bound on a column the predicate
-    /// references suppresses pruning on that column for the whole page of files
-    /// it is read with, so a table where statistics are patchy can return far
-    /// more files than it strictly must. This only ever over-returns.
+    /// files. A file that carries no usable bound is kept, while usable bounds on
+    /// other files can still prune them.
     ///
     /// Partition values contribute bounds only on their own partition column, and
     /// only when the table has never been re-partitioned (after a re-partition a
@@ -1210,23 +1203,18 @@ impl DuckLakeTable {
     /// estimates, so downstream planning sees only the relevant files.
     ///
     /// A file with a live delete file has `Inexact` statistics because its
-    /// recorded min/max may cover deleted rows. `PrunableStatistics` only uses
-    /// `Exact` bounds, and one unusable bound suppresses that column across the
-    /// current candidate set. Applying each conjunct repeatedly lets another
-    /// conjunct first remove that file, then makes the suppressed column usable
-    /// on the next pass. A file is only removed when its own statistics prove it
-    /// cannot match, and any pruning error abandons the whole attempt: it returns
-    /// `candidates` — every input file bar the proven-empty ones — and so gives back
-    /// files an earlier conjunct had already excluded, rather than trusting
-    /// exclusions made before the failure.
+    /// recorded min/max may cover deleted rows. Such a file is kept. A file is
+    /// only removed when its own exact statistics prove it cannot match, and any
+    /// pruning error abandons the whole attempt: it returns `candidates` — every
+    /// input file bar the proven-empty ones — and so gives back files an earlier
+    /// conjunct had already excluded, rather than trusting exclusions made before
+    /// the failure.
     ///
     /// Files the catalog records as holding no rows are dropped up front by
-    /// [`file_is_known_empty`], before any statistics are consulted. A 0-row file
-    /// carries no min/max, so it would otherwise be the unusable bound described
-    /// above — suppressing its columns for a whole round. That exclusion rests on a
-    /// proof rather than on statistics, which is why `candidates` (not
-    /// `table_files`) is what both the no-predicates and the error path return: it
-    /// is the one narrowing no return path here gives back.
+    /// [`file_is_known_empty`], before any statistics are consulted. That
+    /// exclusion rests on a proof rather than on statistics, which is why
+    /// `candidates` (not `table_files`) is what both the no-predicates and the
+    /// error path return: it is the one narrowing no return path here gives back.
     fn prune_table_files_iteratively<'a>(
         &self,
         predicates: &[PruningPredicate],
@@ -1320,7 +1308,7 @@ impl DuckLakeTable {
                     .unwrap_or_else(|| Arc::new(Statistics::new_unknown(&self.physical_schema)))
             })
             .collect();
-        let stats = PrunableStatistics::new(per_file, Arc::clone(&self.physical_schema));
+        let stats = FilePruningStatistics::new(per_file, Arc::clone(&self.physical_schema));
         pruning.prune(&stats)
     }
 
@@ -3345,6 +3333,77 @@ fn sort_ordering_for(
     Ok(datafusion::physical_expr::LexOrdering::new(sort_exprs))
 }
 
+struct FilePruningStatistics {
+    base: PrunableStatistics,
+    statistics: Vec<Arc<Statistics>>,
+    schema: SchemaRef,
+}
+
+impl FilePruningStatistics {
+    fn new(statistics: Vec<Arc<Statistics>>, schema: SchemaRef) -> Self {
+        let base = PrunableStatistics::new(statistics.clone(), Arc::clone(&schema));
+        Self {
+            base,
+            statistics,
+            schema,
+        }
+    }
+
+    fn exact_values(
+        &self,
+        column: &Column,
+        get_statistic: impl Fn(&ColumnStatistics) -> &Precision<ScalarValue>,
+    ) -> Option<ArrayRef> {
+        let index = self.schema.index_of(column.name()).ok()?;
+        // DataFusion 54 substitutes an untyped null for an unavailable bound,
+        // which cannot share an Arrow array with typed scalar bounds.
+        let typed_null = ScalarValue::try_new_null(self.schema.field(index).data_type()).ok()?;
+        let mut has_value = false;
+        let values = self.statistics.iter().map(|statistics| {
+            statistics
+                .column_statistics
+                .get(index)
+                .and_then(|statistics| match get_statistic(statistics) {
+                    Precision::Exact(value) => {
+                        has_value = true;
+                        Some(value.clone())
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| typed_null.clone())
+        });
+        ScalarValue::iter_to_array(values)
+            .ok()
+            .filter(|_| has_value)
+    }
+}
+
+impl PruningStatistics for FilePruningStatistics {
+    fn min_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.exact_values(column, |statistics| &statistics.min_value)
+    }
+
+    fn max_values(&self, column: &Column) -> Option<ArrayRef> {
+        self.exact_values(column, |statistics| &statistics.max_value)
+    }
+
+    fn num_containers(&self) -> usize {
+        self.base.num_containers()
+    }
+
+    fn null_counts(&self, column: &Column) -> Option<ArrayRef> {
+        self.base.null_counts(column)
+    }
+
+    fn row_counts(&self) -> Option<ArrayRef> {
+        self.base.row_counts()
+    }
+
+    fn contained(&self, column: &Column, values: &HashSet<ScalarValue>) -> Option<BooleanArray> {
+        self.base.contained(column, values)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3987,15 +4046,8 @@ mod tests {
         );
     }
 
-    /// A file with no recorded statistics is always kept. It also costs the whole
-    /// page its pruning on that column: an unusable bound suppresses the column
-    /// for every file being considered alongside it, which is why files 1 and 3
-    /// come back too. Both effects err the same way — toward keeping files.
-    ///
-    /// The control is
-    /// `files_matching_prunes_unpartitioned_files_by_column_statistics`: the same
-    /// shape with statistics on every file returns one file, so this result is
-    /// the missing statistics talking, not pruning being switched off.
+    /// A file with no recorded statistics is always kept, while exact bounds can
+    /// still prune the files beside it.
     #[test]
     fn files_matching_keeps_files_without_statistics() -> Result<()> {
         let table = fixed_table(
@@ -4009,22 +4061,16 @@ mod tests {
 
         let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
 
-        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        assert_eq!(matching_ids(&table, &predicate)?, vec![2]);
         Ok(())
     }
 
     /// A file the catalog records as holding no rows, and — the case that matters —
     /// carrying no per-column statistics row at all.
     ///
-    /// This is the shape that defeats pruning outright rather than merely costing
-    /// it a round. A 0-row file written by this crate normally does carry a
-    /// statistics row (`value_count` and `null_count` of 0, NULL bounds), and
-    /// DataFusion drops such a file unaided through the `null_count != row_count`
-    /// check it attaches to every comparison rewrite. With no statistics row there
-    /// is no such check to fire: nothing can drop the file, and its absent bounds
-    /// suppress the column for every file beside it, in every round. A statistics
-    /// harvest failure ([`crate::stats_collect::collect_column_stats`] yields no
-    /// rows) and a column added by later DDL both produce it.
+    /// A statistics harvest failure
+    /// ([`crate::stats_collect::collect_column_stats`] yields no rows) and a column
+    /// added by later DDL both produce this shape.
     fn empty_file_without_statistics(data_file_id: i64) -> DuckLakeFileMetadata {
         let mut entry = fixture_file(data_file_id, None, None);
         entry.file.max_row_count = Some(0);
@@ -4043,11 +4089,7 @@ mod tests {
     }
 
     /// A 0-row file with no statistics row of its own, alongside files whose
-    /// statistics are ideal. Its absent bounds are indistinguishable from those of
-    /// a file that simply has none, so unless it is excluded before statistics are
-    /// consulted it suppresses `id` for the whole candidate set — and, having no
-    /// statistics, it can never be dropped to lift that suppression on a later
-    /// round, so every file comes back.
+    /// statistics are ideal.
     ///
     /// The control is
     /// `files_matching_prunes_unpartitioned_files_by_column_statistics`: the same
@@ -4096,10 +4138,9 @@ mod tests {
         Ok(())
     }
 
-    /// A NULL partition value yields no bound, so the file must survive a
-    /// predicate on its own partition column. As above, the underivable bound
-    /// also suppresses the column for the rest of the page, so file 2 survives
-    /// with it.
+    /// A NULL partition value yields no bound, so that file must survive a
+    /// predicate on its own partition column. Exact bounds can still prune the
+    /// files beside it.
     ///
     /// The control is
     /// `files_matching_prunes_a_partition_column_without_column_statistics`:
@@ -4117,14 +4158,13 @@ mod tests {
 
         let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
 
-        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 3]);
         Ok(())
     }
 
     /// A partition value that does not decode to the column type yields no
     /// bound, with the same consequences as a NULL one. Deliberately kept apart
-    /// from the NULL case: with both in one fixture, either could be bounded
-    /// wrongly and the other would still suppress the column, hiding it.
+    /// from the NULL case so either mistake fails independently.
     #[test]
     fn files_matching_keeps_a_file_with_an_undecodable_partition_value() -> Result<()> {
         let table = fixed_table(
@@ -4138,7 +4178,7 @@ mod tests {
 
         let predicate = physical_predicate(&table, col("region").eq(lit(10_i64)));
 
-        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 2, 3]);
+        assert_eq!(matching_ids(&table, &predicate)?, vec![1, 3]);
         Ok(())
     }
 
