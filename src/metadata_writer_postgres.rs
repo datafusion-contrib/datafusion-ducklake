@@ -708,31 +708,53 @@ async fn schedule_compaction_files(
 /// the catalog id, not the schema id).
 /// Persist the harvested per-column stats for a just-registered data file
 /// (per-file zone maps). See the SQLite writer's equivalent for the rationale.
+///
+/// Sent as one `UNNEST` insert rather than a statement per column: this runs on
+/// every commit, and against a networked Postgres the round trip dominates the
+/// work — a wide table otherwise pays one round trip per column. Passing the
+/// columns as arrays (rather than a generated `VALUES` list) keeps the bind
+/// count fixed at nine, so a table cannot approach Postgres's 65535-parameter
+/// ceiling however many columns it has.
 async fn insert_file_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
     data_file_id: i64,
     column_stats: &[ColumnStat],
 ) -> Result<()> {
-    for stat in column_stats {
-        sqlx::query(
-            "INSERT INTO ducklake_file_column_stats
-                 (data_file_id, table_id, column_id, column_size_bytes,
-                  value_count, null_count, min_value, max_value, contains_nan, extra_stats)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL)",
-        )
-        .bind(data_file_id)
-        .bind(table_id)
-        .bind(stat.column_id)
-        .bind(stat.column_size_bytes)
-        .bind(stat.value_count)
-        .bind(stat.null_count)
-        .bind(stat.min_value.as_deref())
-        .bind(stat.max_value.as_deref())
-        .bind(stat.contains_nan)
-        .execute(&mut **tx)
-        .await?;
+    if column_stats.is_empty() {
+        return Ok(());
     }
+
+    let column_ids: Vec<i64> = column_stats.iter().map(|s| s.column_id).collect();
+    let sizes: Vec<Option<i64>> = column_stats.iter().map(|s| s.column_size_bytes).collect();
+    let value_counts: Vec<Option<i64>> = column_stats.iter().map(|s| s.value_count).collect();
+    let null_counts: Vec<Option<i64>> = column_stats.iter().map(|s| s.null_count).collect();
+    let mins: Vec<Option<String>> = column_stats.iter().map(|s| s.min_value.clone()).collect();
+    let maxes: Vec<Option<String>> = column_stats.iter().map(|s| s.max_value.clone()).collect();
+    let nans: Vec<Option<bool>> = column_stats.iter().map(|s| s.contains_nan).collect();
+
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, column_size_bytes,
+              value_count, null_count, min_value, max_value, contains_nan, extra_stats)
+         SELECT $1, $2, u.column_id, u.column_size_bytes,
+                u.value_count, u.null_count, u.min_value, u.max_value, u.contains_nan, NULL
+         FROM UNNEST($3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[],
+                     $7::text[], $8::text[], $9::boolean[])
+              AS u(column_id, column_size_bytes, value_count, null_count,
+                   min_value, max_value, contains_nan)",
+    )
+    .bind(data_file_id)
+    .bind(table_id)
+    .bind(&column_ids)
+    .bind(&sizes)
+    .bind(&value_counts)
+    .bind(&null_counts)
+    .bind(&mins)
+    .bind(&maxes)
+    .bind(&nans)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -862,21 +884,33 @@ async fn recompute_table_column_stats(
         .bind(table_id)
         .execute(&mut **tx)
         .await?;
-    for g in globals {
-        sqlx::query(
-            "INSERT INTO ducklake_table_column_stats
-                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
-        )
-        .bind(table_id)
-        .bind(g.column_id)
-        .bind(g.contains_null)
-        .bind(g.contains_nan)
-        .bind(g.min_value)
-        .bind(g.max_value)
-        .execute(&mut **tx)
-        .await?;
+    if globals.is_empty() {
+        return Ok(());
     }
+
+    // One `UNNEST` insert rather than a statement per column, for the same
+    // reason as the per-file stats above: this replace runs on every commit.
+    let column_ids: Vec<i64> = globals.iter().map(|g| g.column_id).collect();
+    let contains_null: Vec<Option<bool>> = globals.iter().map(|g| g.contains_null).collect();
+    let contains_nan: Vec<Option<bool>> = globals.iter().map(|g| g.contains_nan).collect();
+    let mins: Vec<Option<String>> = globals.iter().map(|g| g.min_value.clone()).collect();
+    let maxes: Vec<Option<String>> = globals.iter().map(|g| g.max_value.clone()).collect();
+
+    sqlx::query(
+        "INSERT INTO ducklake_table_column_stats
+             (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+         SELECT $1, u.column_id, u.contains_null, u.contains_nan, u.min_value, u.max_value, NULL
+         FROM UNNEST($2::bigint[], $3::boolean[], $4::boolean[], $5::text[], $6::text[])
+              AS u(column_id, contains_null, contains_nan, min_value, max_value)",
+    )
+    .bind(table_id)
+    .bind(&column_ids)
+    .bind(&contains_null)
+    .bind(&contains_nan)
+    .bind(&mins)
+    .bind(&maxes)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

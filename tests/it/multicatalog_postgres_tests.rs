@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::metadata_writer::{
-    ColumnDef, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
+    ColumnDef, ColumnStat, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
 };
 use datafusion_ducklake::{
     DuckLakeError, DuckLakeTableWriter, MulticatalogManager, NullOrder, PartitionTransform,
@@ -5434,4 +5434,210 @@ async fn register_existing_data_file_rejects_mismatched_column_ids() {
         0,
         "nothing is committed on a validation failure"
     );
+}
+
+/// Per-column stats round-trip through the multicatalog writer with the right
+/// value on the right column.
+///
+/// Both stats tables are written one row per column from parallel arrays, so
+/// the failure this guards against is misalignment — every row present and the
+/// counts right, but a column carrying its neighbour's bounds. Each column here
+/// gets a deliberately distinct signature, and `sparse` carries NULL bounds
+/// with a non-NULL size, so a NULL landing in the wrong array shifts a value
+/// onto the wrong column instead of quietly disappearing.
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_file_and_table_column_stats_round_trip_per_column() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("column_stats_roundtrip")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("label", "varchar", true).unwrap(),
+        ColumnDef::new("sparse", "varchar", true).unwrap(),
+    ];
+
+    let begin = writer
+        .begin_write_transaction("public", "stats", &columns, WriteMode::Replace)
+        .unwrap();
+
+    let stats = vec![
+        ColumnStat {
+            column_id: begin.column_ids[0],
+            min_value: Some("1".to_string()),
+            max_value: Some("900".to_string()),
+            null_count: Some(0),
+            value_count: Some(300),
+            contains_nan: None,
+            column_size_bytes: Some(1_111),
+        },
+        ColumnStat {
+            column_id: begin.column_ids[1],
+            min_value: Some("alpha".to_string()),
+            max_value: Some("omega".to_string()),
+            null_count: Some(7),
+            value_count: Some(293),
+            contains_nan: None,
+            column_size_bytes: Some(2_222),
+        },
+        // All-NULL column: bounds absent, size still present.
+        ColumnStat {
+            column_id: begin.column_ids[2],
+            min_value: None,
+            max_value: None,
+            null_count: Some(300),
+            value_count: Some(0),
+            contains_nan: None,
+            column_size_bytes: Some(3_333),
+        },
+    ];
+
+    writer
+        .register_data_file(
+            begin.table_id,
+            "public",
+            "stats",
+            begin.snapshot_id,
+            &DataFileInfo::new("stats.parquet", 4_096, 300).with_column_stats(stats),
+            WriteMode::Replace,
+            begin.base_snapshot_id,
+            &columns,
+            &begin.column_ids,
+        )
+        .unwrap();
+
+    let rows = sqlx::query(
+        "SELECT column_id, min_value, max_value, null_count, value_count, column_size_bytes
+         FROM ducklake_file_column_stats WHERE table_id = $1 ORDER BY column_id",
+    )
+    .bind(begin.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3, "one per-file stats row per column");
+
+    struct ExpectedFileStat {
+        min: Option<&'static str>,
+        max: Option<&'static str>,
+        nulls: i64,
+        values: i64,
+        size: i64,
+    }
+    let expected = [
+        ExpectedFileStat {
+            min: Some("1"),
+            max: Some("900"),
+            nulls: 0,
+            values: 300,
+            size: 1_111,
+        },
+        ExpectedFileStat {
+            min: Some("alpha"),
+            max: Some("omega"),
+            nulls: 7,
+            values: 293,
+            size: 2_222,
+        },
+        ExpectedFileStat {
+            min: None,
+            max: None,
+            nulls: 300,
+            values: 0,
+            size: 3_333,
+        },
+    ];
+    for (i, (row, want)) in rows.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            row.get::<i64, _>("column_id"),
+            begin.column_ids[i],
+            "column {i}: stats row is for the wrong column"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("min_value").as_deref(),
+            want.min,
+            "column {i}: min_value"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("max_value").as_deref(),
+            want.max,
+            "column {i}: max_value"
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("null_count"),
+            Some(want.nulls),
+            "column {i}: null_count"
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("value_count"),
+            Some(want.values),
+            "column {i}: value_count"
+        );
+        assert_eq!(
+            row.get::<Option<i64>, _>("column_size_bytes"),
+            Some(want.size),
+            "column {i}: column_size_bytes"
+        );
+    }
+
+    // The table-wide roll-up is rebuilt from those per-file rows on every
+    // commit, so it must land on the right columns too.
+    let rollup = sqlx::query(
+        "SELECT column_id, min_value, max_value, contains_null
+         FROM ducklake_table_column_stats WHERE table_id = $1 ORDER BY column_id",
+    )
+    .bind(begin.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rollup.len(), 3, "one roll-up row per column");
+
+    struct ExpectedRollup {
+        min: Option<&'static str>,
+        max: Option<&'static str>,
+        contains_null: bool,
+    }
+    let want_rollup = [
+        ExpectedRollup {
+            min: Some("1"),
+            max: Some("900"),
+            contains_null: false,
+        },
+        ExpectedRollup {
+            min: Some("alpha"),
+            max: Some("omega"),
+            contains_null: true,
+        },
+        ExpectedRollup {
+            min: None,
+            max: None,
+            contains_null: true,
+        },
+    ];
+    for (i, (row, want)) in rollup.iter().zip(want_rollup.iter()).enumerate() {
+        assert_eq!(
+            row.get::<i64, _>("column_id"),
+            begin.column_ids[i],
+            "column {i}: roll-up row is for the wrong column"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("min_value").as_deref(),
+            want.min,
+            "column {i}: roll-up min_value"
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("max_value").as_deref(),
+            want.max,
+            "column {i}: roll-up max_value"
+        );
+        assert_eq!(
+            row.get::<Option<bool>, _>("contains_null"),
+            Some(want.contains_null),
+            "column {i}: roll-up contains_null"
+        );
+    }
 }
