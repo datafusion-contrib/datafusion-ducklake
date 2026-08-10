@@ -707,6 +707,174 @@ struct FileReadConfig {
     row_group_count: usize,
 }
 
+/// What one file's parquet footer says: the field-id → physical-name map, the
+/// arrow schema the reader derives from it, and the row-group boundaries.
+///
+/// This is the ONLY place the crate parses a data file's footer for read
+/// planning, so field-id resolution cannot drift between the table scan and the
+/// change feeds.
+pub(crate) struct ParquetFooterFacts {
+    /// `field_id → physical column name`, at every nesting depth.
+    pub(crate) field_ids: HashMap<i32, String>,
+    /// The arrow schema the parquet reader derives for this file.
+    pub(crate) arrow_schema: SchemaRef,
+    /// Per-row-group starting physical row position (prefix sums of
+    /// `row_groups[i].num_rows()`).
+    pub(crate) row_group_starts: Vec<i64>,
+    /// Number of row groups (`row_group_starts.len()`).
+    pub(crate) row_group_count: usize,
+}
+
+/// A file's footer resolved against a table's CURRENT columns: the schema to
+/// scan it with (each column under the physical name THIS file gives it, or a
+/// guaranteed-absent name when the file predates the column), the renames back
+/// to the catalog names, and the reserved embedded columns it carries.
+#[derive(Debug, Clone)]
+pub(crate) struct ParquetFileLayout {
+    /// One field per current column, in catalog order, under its physical name.
+    /// Carries no embedded columns — each read path appends the ones it wants.
+    pub(crate) read_schema: SchemaRef,
+    /// `physical name → catalog name`, for the columns whose names differ.
+    pub(crate) name_mapping: HashMap<String, String>,
+    /// `Some(parquet_column_name)` if the file embeds the rowid column (tagged
+    /// with [`ROW_ID_PARQUET_FIELD_ID`]).
+    pub(crate) embedded_rowid_parquet_name: Option<String>,
+    /// `Some(parquet_column_name)` if the file embeds the per-row snapshot-id
+    /// column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`]) — i.e. it is a merged partial
+    /// file.
+    pub(crate) embedded_snapshot_parquet_name: Option<String>,
+    /// True if the file carries a data column that is NOT in the table's current
+    /// schema — a column dropped since the file was written.
+    pub(crate) drops_current_columns: bool,
+    pub(crate) row_group_starts: Vec<i64>,
+    pub(crate) row_group_count: usize,
+}
+
+/// Read `resolved_path`'s parquet footer once. `encryption_key` is the file's
+/// DuckLake encryption key when it has one; it is only usable with the
+/// `encryption` feature, and this function cannot open an encrypted file
+/// without it.
+pub(crate) async fn read_parquet_footer_facts(
+    state: &dyn Session,
+    object_store_url: &ObjectStoreUrl,
+    resolved_path: &str,
+    encryption_key: Option<&str>,
+) -> DataFusionResult<ParquetFooterFacts> {
+    let object_store = state.runtime_env().object_store(object_store_url)?;
+    let object_path = ObjectPath::from(resolved_path);
+    let reader = ParquetObjectReader::new(object_store, object_path);
+
+    #[cfg(feature = "encryption")]
+    let builder = {
+        use parquet::arrow::arrow_reader::ArrowReaderOptions;
+        let options = match encryption_key {
+            Some(key) if !key.is_empty() => {
+                let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+                let decryption_props =
+                    parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create decryption properties: {}",
+                                e
+                            ))
+                        })?;
+                ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
+            },
+            _ => ArrowReaderOptions::new(),
+        };
+        ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    };
+
+    #[cfg(not(feature = "encryption"))]
+    let builder = {
+        // Without the feature there is no decryption to configure.
+        let _ = encryption_key;
+        ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    };
+
+    let field_ids = extract_parquet_field_ids(builder.metadata());
+
+    // Per-row-group starting positions (prefix sums of num_rows), read from the
+    // footer we already have open. Drives row-group-aligned scan partitioning on
+    // positional paths.
+    let row_groups = builder.metadata().row_groups();
+    let row_group_count = row_groups.len();
+    let mut row_group_starts = Vec::with_capacity(row_group_count);
+    let mut row_acc: i64 = 0;
+    for rg in row_groups {
+        row_group_starts.push(row_acc);
+        row_acc = row_acc.saturating_add(rg.num_rows());
+    }
+
+    Ok(ParquetFooterFacts {
+        field_ids,
+        arrow_schema: builder.schema().clone(),
+        row_group_starts,
+        row_group_count,
+    })
+}
+
+/// Resolve one file's columns against `columns` by field id.
+///
+/// `fallback_schema` is used verbatim for a file that carries no field ids at
+/// all (an external or pre-DuckLake parquet file), where names are the only
+/// thing to match on.
+pub(crate) async fn read_parquet_file_layout(
+    state: &dyn Session,
+    object_store_url: &ObjectStoreUrl,
+    resolved_path: &str,
+    encryption_key: Option<&str>,
+    columns: &[DuckLakeTableColumn],
+    fallback_schema: &SchemaRef,
+) -> DataFusionResult<Arc<ParquetFileLayout>> {
+    let facts =
+        read_parquet_footer_facts(state, object_store_url, resolved_path, encryption_key).await?;
+
+    let (read_schema, name_mapping) = if facts.field_ids.is_empty() {
+        (fallback_schema.clone(), HashMap::new())
+    } else {
+        let (schema, mapping) = build_read_schema_with_field_id_mapping(
+            columns,
+            &facts.field_ids,
+            Some(facts.arrow_schema.as_ref()),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        (Arc::new(schema), mapping)
+    };
+
+    // Does the file carry a data column no longer in the current schema? Any
+    // parquet field-id that is neither a reserved embedded column nor one of the
+    // current catalog `column_id`s is a since-dropped column. Compaction uses
+    // this to refuse merging a file whose data would be lost.
+    let current_column_ids: HashSet<i32> = columns
+        .iter()
+        .flat_map(|column| {
+            std::iter::once(column.column_id).chain(column.nested_column_ids.iter().copied())
+        })
+        .map(|column_id| column_id as i32)
+        .collect();
+    let drops_current_columns = facts.field_ids.keys().any(|fid| {
+        *fid != ROW_ID_PARQUET_FIELD_ID
+            && *fid != SNAPSHOT_ID_PARQUET_FIELD_ID
+            && !current_column_ids.contains(fid)
+    });
+
+    Ok(Arc::new(ParquetFileLayout {
+        read_schema,
+        name_mapping,
+        embedded_rowid_parquet_name: facts.field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
+        embedded_snapshot_parquet_name: facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
+        drops_current_columns,
+        row_group_starts: facts.row_group_starts,
+        row_group_count: facts.row_group_count,
+    }))
+}
+
 /// DuckLake table provider
 ///
 /// Represents a table within a DuckLake schema and provides access to data via Parquet files.
@@ -1902,101 +2070,28 @@ impl DuckLakeTable {
             }
         }
 
-        let object_store = state
-            .runtime_env()
-            .object_store(self.object_store_url.as_ref())?;
-        let object_path = ObjectPath::from(resolved_path.as_str());
-        let reader = ParquetObjectReader::new(object_store, object_path);
-
         #[cfg(feature = "encryption")]
-        let builder = {
-            use parquet::arrow::arrow_reader::ArrowReaderOptions;
-            let options = if let Some(ref key) = file.encryption_key {
-                if !key.is_empty() {
-                    let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                    let decryption_props =
-                        parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
-                            .build()
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to create decryption properties: {}",
-                                    e
-                                ))
-                            })?;
-                    ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
-                } else {
-                    ArrowReaderOptions::new()
-                }
-            } else {
-                ArrowReaderOptions::new()
-            };
-            ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
-        };
-
+        let encryption_key = file.encryption_key.as_deref();
         #[cfg(not(feature = "encryption"))]
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let encryption_key = None;
 
-        let field_id_map = extract_parquet_field_ids(builder.metadata());
+        let layout = read_parquet_file_layout(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved_path,
+            encryption_key,
+            &self.columns,
+            &self.physical_schema,
+        )
+        .await?;
 
-        // Per-row-group starting positions (prefix sums of num_rows), read from
-        // the footer we already have open. Drives row-group-aligned scan
-        // partitioning on positional paths.
-        let row_groups = builder.metadata().row_groups();
-        let row_group_count = row_groups.len();
-        let mut row_group_starts = Vec::with_capacity(row_group_count);
-        let mut row_acc: i64 = 0;
-        for rg in row_groups {
-            row_group_starts.push(row_acc);
-            row_acc = row_acc.saturating_add(rg.num_rows());
-        }
-
-        // Standard read_schema + name_mapping for physical columns.
-        let (physical_read_schema, mut name_mapping) = if field_id_map.is_empty() {
-            (self.physical_schema.as_ref().clone(), HashMap::new())
-        } else {
-            let (s, m) = build_read_schema_with_field_id_mapping(
-                &self.columns,
-                &field_id_map,
-                Some(builder.schema().as_ref()),
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            (s, m)
-        };
-
-        // Detect the embedded rowid column by reserved field-id.
-        let embedded_rowid_parquet_name = field_id_map.get(&ROW_ID_PARQUET_FIELD_ID).cloned();
-        // Detect the embedded per-row snapshot-id column (marks a partial file).
-        let embedded_snapshot_parquet_name =
-            field_id_map.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned();
-        // Does the file carry a data column no longer in the current schema? Any
-        // parquet field-id that is neither a reserved embedded column nor one of
-        // the current catalog `column_id`s is a since-dropped column. Compaction
-        // uses this to refuse merging a file whose data would be lost.
-        let current_column_ids: std::collections::HashSet<i32> = self
-            .columns
-            .iter()
-            .flat_map(|column| {
-                std::iter::once(column.column_id).chain(column.nested_column_ids.iter().copied())
-            })
-            .map(|column_id| column_id as i32)
-            .collect();
-        let drops_current_columns = field_id_map.keys().any(|fid| {
-            *fid != ROW_ID_PARQUET_FIELD_ID
-                && *fid != SNAPSHOT_ID_PARQUET_FIELD_ID
-                && !current_column_ids.contains(fid)
-        });
-
-        let read_schema = if let Some(ref parquet_name) = embedded_rowid_parquet_name {
+        let mut name_mapping = layout.name_mapping.clone();
+        let read_schema = if let Some(ref parquet_name) = layout.embedded_rowid_parquet_name {
             // Append the embedded rowid column to read_schema under its
             // parquet name; ParquetExec will project it by name from the
             // file. We add a `parquet_name → "rowid"` rename so the user
             // sees the column as `rowid` (only needed if the names differ).
-            let mut fields: Vec<Arc<Field>> =
-                physical_read_schema.fields().iter().cloned().collect();
+            let mut fields: Vec<Arc<Field>> = layout.read_schema.fields().iter().cloned().collect();
             fields.push(Arc::new(Field::new(
                 parquet_name.clone(),
                 DataType::Int64,
@@ -2007,17 +2102,17 @@ impl DuckLakeTable {
             }
             Arc::new(Schema::new(fields))
         } else {
-            Arc::new(physical_read_schema)
+            layout.read_schema.clone()
         };
 
         let cfg = Arc::new(FileReadConfig {
             read_schema,
             name_mapping,
-            embedded_rowid_parquet_name,
-            embedded_snapshot_parquet_name,
-            drops_current_columns,
-            row_group_starts,
-            row_group_count,
+            embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
+            embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
+            drops_current_columns: layout.drops_current_columns,
+            row_group_starts: layout.row_group_starts.clone(),
+            row_group_count: layout.row_group_count,
         });
 
         {

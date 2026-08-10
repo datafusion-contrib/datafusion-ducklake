@@ -1,5 +1,5 @@
 #![cfg(feature = "metadata-duckdb")]
-//! Differential CDC conformance tests (#179).
+//! Differential CDC conformance tests.
 //!
 //! Each test builds a DuckLake catalog, runs the OFFICIAL DuckDB ducklake
 //! extension's change feeds (`ducklake_table_changes` / `ducklake_table_deletions`)
@@ -20,8 +20,13 @@
 //!   official's; the deletions list must be official's with `change_type`
 //!   inserted after `(snapshot_id, rowid)`.
 //!
-//! Not yet covered (tracked in #179): encrypted (PME) catalogs, compaction
-//! rewrites, schema evolution between snapshots.
+//! Schema evolution between snapshots IS covered, at the bottom of this file:
+//! renames (top-level, nested, and a cycle), a column dropped and re-added under
+//! the same name, and a column added between the queried snapshots — over both
+//! plan shapes and all three feeds. Encrypted (PME) catalogs cannot be diffed
+//! here at all (the extension writing these fixtures does not encrypt), and
+//! compaction REWRITES — as opposed to the adjacent-file merges two scenarios
+//! below do exercise — are still uncovered.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -877,4 +882,622 @@ async fn diff_timestamp_bounds() -> DataFusionResult<()> {
     );
     assert_feeds_match("timestamp-bounded table_changes", &official, &by_timestamp);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema evolution between snapshots
+// ---------------------------------------------------------------------------
+//
+// A data file records each column under the physical name it had when the file
+// was written, tagged with the column's field id. Official DuckLake resolves a
+// change feed's columns BY FIELD ID against the schema as of the window's END
+// snapshot, so a column renamed after a file was written still reads that
+// file's values, and a column dropped and re-added under the same name reads as
+// NULL for files that predate the re-add. Resolving by name instead returns
+// NULL, another column's values, or — in a rename cycle — silently swapped
+// ones.
+//
+// These are all COLUMN-level: every scenario keeps the table itself alive
+// throughout. Resolving the table and schema at the right snapshot is a separate
+// concern, and one these tests do not reach.
+
+/// Rendered cells of one query result, sorted row-wise.
+type ProjectedRows = Vec<Vec<String>>;
+
+/// The rows of an arbitrary projection, rendered to the canonical strings and
+/// sorted. Used where [`CanonRow`] cannot represent the projection: a feed
+/// queried WITHOUT `rowid` — the projection that selects the insert-only plan
+/// shape — and nested values extracted with engine-specific SQL.
+fn official_projection(conn: &duckdb::Connection, sql: &str) -> DataFusionResult<ProjectedRows> {
+    let mut stmt = conn.prepare(sql).map_err(box_err)?;
+    let mut rows: ProjectedRows = stmt
+        .query_map([], |row| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<usize, Value>(i) {
+                out.push(duckdb_cell(&v));
+                i += 1;
+            }
+            Ok(out)
+        })
+        .map_err(box_err)?
+        .collect::<Result<_, _>>()
+        .map_err(box_err)?;
+    rows.sort();
+    Ok(rows)
+}
+
+/// The crate-side counterpart of [`official_projection`].
+async fn crate_projection(ctx: &SessionContext, sql: &str) -> DataFusionResult<ProjectedRows> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut rows: ProjectedRows = Vec::new();
+    for batch in &batches {
+        for r in 0..batch.num_rows() {
+            rows.push(
+                (0..batch.num_columns())
+                    .map(|c| arrow_cell(batch, c, r))
+                    .collect(),
+            );
+        }
+    }
+    rows.sort();
+    Ok(rows)
+}
+
+/// Diff a projection over every snapshot window of the catalog built by
+/// `statements` whose END snapshot is at least `min_end`. `official_sql` and
+/// `crate_sql` are templates with `{a}` / `{b}` window placeholders; they differ
+/// only where the two dialects do (the table function's argument form).
+///
+/// Both engines resolve a feed's columns as of the window's end snapshot, so a
+/// projection naming a column that some DDL statement introduced is unbindable
+/// in windows that end before it: `min_end` is the snapshot from which every
+/// projected name exists. Windows below it are covered by the whole-row
+/// comparison in [`assert_cdc_conformance`], which projects no names of its own.
+async fn assert_projection_conformance(
+    statements: &[&str],
+    min_end: i64,
+    official_sql: &str,
+    crate_sql: &str,
+) -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("diff.ducklake");
+    write_catalog(&path, statements)?;
+
+    let fill = |template: &str, a: i64, b: i64| {
+        template
+            .replace("{a}", &a.to_string())
+            .replace("{b}", &b.to_string())
+    };
+
+    let mut expected: Vec<((i64, i64), ProjectedRows)> = Vec::new();
+    {
+        let conn = official_connection(&path)?;
+        for (a, b) in windows(&snapshot_ids(&conn)?) {
+            if b < min_end {
+                continue;
+            }
+            let rows = official_projection(&conn, &fill(official_sql, a, b))?;
+            expected.push(((a, b), rows));
+        }
+    }
+    assert!(
+        !expected.is_empty(),
+        "min_end {min_end} excluded every snapshot window"
+    );
+
+    let ctx = crate_context(&path).await?;
+    for ((a, b), want) in expected {
+        let sql = fill(crate_sql, a, b);
+        let got = crate_projection(&ctx, &sql).await?;
+        assert_eq!(got, want, "window [{a},{b}] diverges from official: {sql}");
+    }
+    Ok(())
+}
+
+/// One file written before a top-level rename, one after.
+const RENAME: &[&str] = &[
+    "CREATE TABLE c.t(id INTEGER, nm VARCHAR);",
+    "INSERT INTO c.t VALUES (1, 'a'), (2, 'b');",
+    "ALTER TABLE c.t RENAME COLUMN nm TO name;",
+    "INSERT INTO c.t VALUES (3, 'c');",
+];
+
+/// A rename with deletes on both sides of it: the second DELETE's source data
+/// file predates the rename, so the deleted rows' old values are only reachable
+/// by field id.
+const RENAME_WITH_DELETES: &[&str] = &[
+    "CREATE TABLE c.t(id INTEGER, nm VARCHAR);",
+    "INSERT INTO c.t VALUES (1, 'a'), (2, 'b');",
+    "DELETE FROM c.t WHERE id = 1;",
+    "ALTER TABLE c.t RENAME COLUMN nm TO name;",
+    "INSERT INTO c.t VALUES (3, 'c');",
+    "DELETE FROM c.t WHERE id = 2;",
+];
+
+/// `note` is dropped and re-added under the same name, so the old and the new
+/// column share a name and differ only by field id.
+const DROP_THEN_READD: &[&str] = &[
+    "CREATE TABLE c.t(id INTEGER, note VARCHAR);",
+    "INSERT INTO c.t VALUES (1, 'old-1'), (2, 'old-2');",
+    "ALTER TABLE c.t DROP COLUMN note;",
+    "ALTER TABLE c.t ADD COLUMN note VARCHAR;",
+    "INSERT INTO c.t VALUES (3, 'new-3');",
+];
+
+/// A top-level rename: rows written before it must still surface their values.
+#[tokio::test]
+async fn diff_renamed_column() -> DataFusionResult<()> {
+    assert_cdc_conformance("t", RENAME).await
+}
+
+/// The same rename with deletes around it, so `delete` rows and the deletions
+/// feed read a pre-rename source file.
+#[tokio::test]
+async fn diff_renamed_column_with_deletes() -> DataFusionResult<()> {
+    assert_cdc_conformance("t", RENAME_WITH_DELETES).await
+}
+
+/// Projecting `rowid` away selects a different plan for `ducklake_table_changes`
+/// and `ducklake_table_insertions` (one scan per file, unioned, with the CDC
+/// columns prepended) and skips the rowid resolution in
+/// `ducklake_table_deletions`. Each builds its own read schema, so one plan
+/// shape proves nothing about the other.
+#[tokio::test]
+async fn diff_renamed_column_without_rowid_projection() -> DataFusionResult<()> {
+    // `name` exists from the rename (snapshot 3 of RENAME, 4 of
+    // RENAME_WITH_DELETES) on.
+    assert_projection_conformance(
+        RENAME,
+        3,
+        "SELECT snapshot_id, change_type, name \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, change_type, name FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await?;
+    assert_projection_conformance(
+        RENAME,
+        3,
+        "SELECT snapshot_id, name FROM ducklake_table_insertions('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, name FROM ducklake_table_insertions('main.t', {a}, {b})",
+    )
+    .await?;
+    assert_projection_conformance(
+        RENAME_WITH_DELETES,
+        4,
+        "SELECT snapshot_id, name FROM ducklake_table_deletions('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, name FROM ducklake_table_deletions('main.t', {a}, {b})",
+    )
+    .await
+}
+
+/// A dropped, then re-added, column name. Resolving by name reads the dropped
+/// column's data out of the old files; the re-added column must read as NULL
+/// there. Which of the two the window even sees depends on its END snapshot, so
+/// this is asserted over every window rather than against one hard-coded shape.
+#[tokio::test]
+async fn diff_dropped_then_readded_column() -> DataFusionResult<()> {
+    assert_cdc_conformance("t", DROP_THEN_READD).await
+}
+
+/// The same, on the insert-only plan shape.
+#[tokio::test]
+async fn diff_dropped_then_readded_column_without_rowid_projection() -> DataFusionResult<()> {
+    assert_projection_conformance(
+        DROP_THEN_READD,
+        1,
+        "SELECT snapshot_id, change_type, id \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, change_type, id FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await?;
+    // Between the DROP (snapshot 3) and the re-ADD (4) there is no `note`
+    // column at all, so project it only from the re-add on.
+    assert_projection_conformance(
+        DROP_THEN_READD,
+        4,
+        "SELECT snapshot_id, change_type, id, note \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, change_type, id, note \
+         FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await
+}
+
+/// A rename CYCLE: `x` and `y` swap names. Resolving by name does not lose a
+/// value here, it returns the OTHER column's — the same row shape, silently
+/// wrong.
+///
+/// Only windows ending at or after the last rename (snapshot 5) can be diffed:
+/// the extension writing this catalog leaves the intermediate generations
+/// overlapping (`x` spans snapshots 1-5 while `tmp` spans 3-5 under the SAME
+/// column id), so its own `ducklake_table_changes` fails with "Column with name
+/// x already exists" for a window that ends mid-cycle.
+#[tokio::test]
+async fn diff_renamed_column_cycle() -> DataFusionResult<()> {
+    assert_projection_conformance(
+        &[
+            "CREATE TABLE c.t(x VARCHAR, y VARCHAR);",
+            "INSERT INTO c.t VALUES ('in-x', 'in-y');",
+            "ALTER TABLE c.t RENAME COLUMN x TO tmp;",
+            "ALTER TABLE c.t RENAME COLUMN y TO x;",
+            "ALTER TABLE c.t RENAME COLUMN tmp TO y;",
+            "INSERT INTO c.t VALUES ('post-x', 'post-y');",
+        ],
+        5,
+        "SELECT snapshot_id, rowid, change_type, x, y \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, rowid, change_type, x, y \
+         FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await
+}
+
+/// A column added between the queried snapshots and renamed after that: files
+/// written before the ADD carry no such field id at all, files between ADD and
+/// RENAME carry it under the old name.
+#[tokio::test]
+async fn diff_column_added_then_renamed() -> DataFusionResult<()> {
+    assert_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER);",
+            "INSERT INTO c.t VALUES (1);",
+            "ALTER TABLE c.t ADD COLUMN c INTEGER;",
+            "INSERT INTO c.t VALUES (2, 20);",
+            "ALTER TABLE c.t RENAME COLUMN c TO cc;",
+            "INSERT INTO c.t VALUES (3, 30);",
+        ],
+    )
+    .await
+}
+
+/// An UPDATE before the rename. Its rewritten file embeds the row ids, which
+/// takes a different scan branch from a plain insert — the `update_postimage`
+/// rows come from that branch.
+#[tokio::test]
+async fn diff_renamed_column_after_update() -> DataFusionResult<()> {
+    assert_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, nm VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a'), (2, 'b');",
+            "UPDATE c.t SET nm = 'B' WHERE id = 2;",
+            "ALTER TABLE c.t RENAME COLUMN nm TO name;",
+            "INSERT INTO c.t VALUES (3, 'c');",
+        ],
+    )
+    .await
+}
+
+/// A rename of a field INSIDE a struct. Nested nodes carry their own field ids,
+/// so a fix that resolves only top-level columns still loses this one.
+#[tokio::test]
+async fn diff_renamed_nested_field() -> DataFusionResult<()> {
+    let statements = &[
+        "CREATE TABLE c.t(id INTEGER, s STRUCT(a INTEGER, b INTEGER));",
+        "INSERT INTO c.t VALUES (1, {'a': 10, 'b': 20});",
+        "ALTER TABLE c.t RENAME COLUMN s.b TO bb;",
+        "INSERT INTO c.t VALUES (2, {'a': 30, 'bb': 40});",
+    ];
+    // `s.bb` exists from the rename (snapshot 3) on.
+    assert_projection_conformance(
+        statements,
+        3,
+        "SELECT snapshot_id, change_type, id, s['a'], s['bb'] \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, change_type, id, s['a'], s['bb'] \
+         FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await?;
+    assert_projection_conformance(
+        statements,
+        3,
+        "SELECT snapshot_id, rowid, id, s['a'], s['bb'] \
+         FROM ducklake_table_insertions('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, rowid, id, s['a'], s['bb'] \
+         FROM ducklake_table_insertions('main.t', {a}, {b})",
+    )
+    .await
+}
+
+/// A rename over a COMPACTION-MERGED file: its rows span several snapshots
+/// (attributed per row by an embedded snapshot column) and it predates the
+/// rename.
+///
+/// Only windows whose start does not exceed the merged file's `begin_snapshot`
+/// live-diff against the installed extension — the same 1.4-era gap
+/// `diff_compacted_inserts` documents (windows starting past it exclude the
+/// merged file entirely).
+#[tokio::test]
+async fn diff_renamed_column_over_compacted_file() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("compact_rename.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, nm VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a');",
+            "INSERT INTO c.t VALUES (2, 'b');",
+            "CALL ducklake_merge_adjacent_files('c');",
+            "ALTER TABLE c.t RENAME COLUMN nm TO name;",
+            "INSERT INTO c.t VALUES (3, 'c');",
+        ],
+    )?;
+    // Snapshots: 1 = CREATE, 2/3 = inserts, 4 = merge, 5 = rename, 6 = insert.
+    let live_windows = [(0, 6), (1, 6), (2, 6), (2, 3)];
+    let mut official: Vec<((i64, i64), CanonFeed)> = Vec::new();
+    {
+        let conn = official_connection(&path)?;
+        for (a, b) in live_windows {
+            official.push((
+                (a, b),
+                official_feed(
+                    &conn,
+                    &format!("SELECT * FROM ducklake_table_changes('c', 'main', 't', {a}, {b})"),
+                    true,
+                )?,
+            ));
+        }
+    }
+    let ctx = crate_context(&path).await?;
+    for ((a, b), official_changes) in official {
+        let crate_changes = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM ducklake_table_changes('main.t', {a}, {b})"),
+            true,
+        )
+        .await?;
+        assert_feeds_match(
+            &format!("compacted + renamed table_changes window [{a},{b}]"),
+            &official_changes,
+            &crate_changes,
+        );
+    }
+    Ok(())
+}
+
+/// GUARD (passes before the field-id fix). Every field a CDC feed advertises —
+/// at every nesting depth — must carry EMPTY metadata.
+///
+/// A read schema describes a file's nested nodes with the `PARQUET:field_id`
+/// the file tags them with. That metadata is part of the parent's Arrow type, so
+/// leaking it into a feed's output makes the feed's own batches disagree with
+/// the schema it advertises ("expected List(Float32) but found
+/// List(Float32, field: 'element', metadata: {\"PARQUET:field_id\": \"3\"})").
+#[tokio::test]
+async fn cdc_output_fields_carry_no_parquet_metadata() -> DataFusionResult<()> {
+    use arrow::datatypes::{DataType, Field};
+
+    fn assert_bare(field: &Field, path: &str, feed: &str) {
+        assert!(
+            field.metadata().is_empty(),
+            "{feed}: field {path} carries metadata {:?}",
+            field.metadata()
+        );
+        match field.data_type() {
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _)
+            | DataType::Map(child, _) => {
+                assert_bare(child, &format!("{path}.{}", child.name()), feed)
+            },
+            DataType::Struct(children) => {
+                for child in children {
+                    assert_bare(child, &format!("{path}.{}", child.name()), feed);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("bare.ducklake");
+    write_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER, v FLOAT[], s STRUCT(a INTEGER), m MAP(VARCHAR, INTEGER));",
+            "INSERT INTO c.t VALUES (1, [1.5, 2.5], {'a': 10}, MAP(['k'], [7]));",
+            "ALTER TABLE c.t RENAME COLUMN v TO vals;",
+            "INSERT INTO c.t VALUES (2, [3.5], {'a': 20}, MAP(['j'], [8]));",
+            "DELETE FROM c.t WHERE id = 1;",
+        ],
+    )?;
+    let ctx = crate_context(&path).await?;
+    for feed in ["ducklake_table_changes", "ducklake_table_insertions", "ducklake_table_deletions"]
+    {
+        let batches = ctx
+            .sql(&format!("SELECT * FROM {feed}('main.t', 0, 1000)"))
+            .await?
+            .collect()
+            .await?;
+        assert!(!batches.is_empty(), "{feed} produced no batches");
+        for batch in &batches {
+            for field in batch.schema().fields() {
+                assert_bare(field, field.name(), feed);
+            }
+            // The batch's own arrays must agree with that schema, which is what
+            // the metadata check is really about.
+            RecordBatch::try_new(batch.schema(), batch.columns().to_vec())
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        }
+    }
+    Ok(())
+}
+
+/// GUARD (passes before the field-id fix). List / struct / map values must
+/// round-trip through all three feeds unchanged: the read schema now describes
+/// nested nodes, and a nested value re-wrapped under the wrong type is exactly
+/// how the reported arrow error is produced. No DDL here — the point is that the
+/// ordinary case keeps working.
+#[tokio::test]
+async fn diff_nested_values_round_trip() -> DataFusionResult<()> {
+    let statements = &[
+        "CREATE TABLE c.t(id INTEGER, v FLOAT[], s STRUCT(a INTEGER), m MAP(VARCHAR, INTEGER));",
+        "INSERT INTO c.t VALUES (1, [1.5, 2.5], {'a': 10}, MAP(['k'], [7]));",
+        "INSERT INTO c.t VALUES (2, [3.5], {'a': 20}, MAP(['k'], [8]));",
+        "UPDATE c.t SET id = 12 WHERE id = 2;",
+        "DELETE FROM c.t WHERE id = 1;",
+    ];
+    // `m['k']` is not usable on either side of the diff: a MAP column's key is
+    // served as `Utf8` while a string literal is `Utf8View`, and the lookup will
+    // not compare the two (an ordinary `SELECT` hits this too, so it is not a CDC
+    // question). `map_extract` reaches the value on both engines.
+    let projection = "snapshot_id, rowid, id, v[1], s['a'], map_extract(m, 'k')[1]";
+    assert_projection_conformance(
+        statements,
+        1,
+        &format!(
+            "SELECT {projection}, change_type \
+             FROM ducklake_table_changes('c', 'main', 't', {{a}}, {{b}})"
+        ),
+        &format!(
+            "SELECT {projection}, change_type \
+             FROM ducklake_table_changes('main.t', {{a}}, {{b}})"
+        ),
+    )
+    .await?;
+    for feed in ["ducklake_table_insertions", "ducklake_table_deletions"] {
+        assert_projection_conformance(
+            statements,
+            1,
+            &format!("SELECT {projection} FROM {feed}('c', 'main', 't', {{a}}, {{b}})"),
+            &format!("SELECT {projection} FROM {feed}('main.t', {{a}}, {{b}})"),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// GUARD (passes before the field-id fix). A struct child added by DDL is
+/// recorded NON-nullable in the catalog while the parquet node stays optional;
+/// the feed must read it as NULL for files that predate it rather than failing
+/// the nullability check.
+#[tokio::test]
+async fn diff_struct_child_added_by_ddl() -> DataFusionResult<()> {
+    assert_projection_conformance(
+        &[
+            "CREATE TABLE c.t(id INTEGER, s STRUCT(a INTEGER));",
+            "INSERT INTO c.t VALUES (1, {'a': 10});",
+            "ALTER TABLE c.t ADD COLUMN s.b INTEGER;",
+            "INSERT INTO c.t VALUES (2, {'a': 30, 'b': 40});",
+        ],
+        // `s.b` exists from the ADD (snapshot 3) on.
+        3,
+        "SELECT snapshot_id, change_type, id, s['a'], s['b'] \
+         FROM ducklake_table_changes('c', 'main', 't', {a}, {b})",
+        "SELECT snapshot_id, change_type, id, s['a'], s['b'] \
+         FROM ducklake_table_changes('main.t', {a}, {b})",
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// The window's end snapshot resolves the TABLE, not only its columns
+// ---------------------------------------------------------------------------
+
+/// A change feed reports against the schema as of the window's END snapshot, and
+/// that includes the table itself: a window over a table that was dropped LATER
+/// must still be served, in a catalog that has since moved on. Past the drop the
+/// table is gone and the query is refused — official DuckLake says "does not
+/// exist at version N".
+#[tokio::test]
+async fn diff_window_over_since_dropped_table() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("dropped.ducklake");
+    write_catalog(
+        &path,
+        &[
+            // 1 = CREATE t, 2/3 = inserts, 4 = DROP t, 5 = CREATE other,
+            // 6 = insert into other.
+            "CREATE TABLE c.t(id INTEGER);",
+            "INSERT INTO c.t VALUES (1);",
+            "INSERT INTO c.t VALUES (2);",
+            "DROP TABLE c.t;",
+            "CREATE TABLE c.other(x INTEGER);",
+            "INSERT INTO c.other VALUES (9);",
+        ],
+    )?;
+
+    let live_windows = [(0, 3), (1, 3), (2, 2), (3, 3), (1, 1)];
+    let mut official: Vec<((i64, i64), CanonFeed)> = Vec::new();
+    {
+        let conn = official_connection(&path)?;
+        for (a, b) in live_windows {
+            official.push((
+                (a, b),
+                official_feed(
+                    &conn,
+                    &format!("SELECT * FROM ducklake_table_changes('c', 'main', 't', {a}, {b})"),
+                    true,
+                )?,
+            ));
+        }
+        // Past the drop the table does not exist at the window's end snapshot.
+        for (a, b) in [(4, 4), (1, 6)] {
+            assert!(
+                official_feed(
+                    &conn,
+                    &format!("SELECT * FROM ducklake_table_changes('c', 'main', 't', {a}, {b})"),
+                    true,
+                )
+                .is_err(),
+                "official must refuse window [{a},{b}] over a dropped table"
+            );
+        }
+    }
+
+    let ctx = crate_context(&path).await?;
+    for ((a, b), official_changes) in official {
+        let crate_changes = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM ducklake_table_changes('main.t', {a}, {b})"),
+            true,
+        )
+        .await?;
+        assert_feeds_match(
+            &format!("since-dropped table_changes window [{a},{b}]"),
+            &official_changes,
+            &crate_changes,
+        );
+    }
+    for (a, b) in [(4, 4), (1, 6)] {
+        let error = match ctx
+            .sql(&format!(
+                "SELECT * FROM ducklake_table_changes('main.t', {a}, {b})"
+            ))
+            .await
+        {
+            Ok(df) => df.collect().await.err(),
+            Err(e) => Some(e),
+        };
+        let message = error
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| String::from("<no error>"));
+        assert!(
+            message.contains("does not exist at snapshot"),
+            "window [{a},{b}] over a dropped table: unexpected outcome: {message}"
+        );
+    }
+    Ok(())
+}
+
+/// GUARD (passes before the field-id fix). A column widened by `ALTER … TYPE`
+/// after a file was written. The per-file read schema declares the column's
+/// CURRENT type, so the narrower values the older file physically holds have to be
+/// widened on the way out — the one evolution case that already worked by name,
+/// and which must keep working now that the schema is built per file.
+#[tokio::test]
+async fn diff_promoted_column_type() -> DataFusionResult<()> {
+    assert_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, n INTEGER);",
+            "INSERT INTO c.t VALUES (1, 10);",
+            "ALTER TABLE c.t ALTER COLUMN n TYPE BIGINT;",
+            "INSERT INTO c.t VALUES (2, 20);",
+            "DELETE FROM c.t WHERE id = 1;",
+        ],
+    )
+    .await
 }

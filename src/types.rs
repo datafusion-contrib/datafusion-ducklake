@@ -629,6 +629,11 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     Ok(Schema::new(fields?))
 }
 
+/// Prefix of the synthetic name a read schema gives a column the file does not
+/// carry, so the scan null-fills it instead of matching a same-named column that
+/// happens to be present.
+pub(crate) const ABSENT_FIELD_PREFIX: &str = "__ducklake_absent_field_";
+
 fn read_compatible_data_type(data_type: &DataType, nullable_struct_fields: bool) -> DataType {
     let rewrite_field = |field: &Arc<Field>, nullable: bool| {
         Arc::new(
@@ -792,7 +797,7 @@ fn read_data_type_with_field_id_mapping(
                 .unwrap_or(parquet_name)
                 .clone()
         } else if match_by_id {
-            format!("__ducklake_absent_field_{field_id}")
+            format!("{ABSENT_FIELD_PREFIX}{field_id}")
         } else {
             field.name().clone()
         };
@@ -912,6 +917,13 @@ fn read_data_type_with_field_id_mapping(
 /// renamed columns. A current column whose field_id is absent from a file that
 /// otherwise carries field_ids is read as an all-NULL column (the file predates
 /// the column, or it was dropped then re-added under the same name).
+///
+/// Nested nullability is relaxed exactly as [`build_arrow_schema`] relaxes it: a
+/// field added inside a struct, or renamed there, is recorded non-nullable in the
+/// catalog while the physical node stays optional, and a file written before the
+/// change does not carry it at all. Map keys stay non-nullable — a map's entries
+/// are structurally non-null, and relaxing them makes a `MAP` column's arrays
+/// disagree with the schema describing them.
 pub fn build_read_schema_with_field_id_mapping(
     current_columns: &[DuckLakeTableColumn],
     parquet_field_ids: &HashMap<i32, String>,
@@ -923,7 +935,10 @@ pub fn build_read_schema_with_field_id_mapping(
     let fields: Result<Vec<Field>> = current_columns
         .iter()
         .map(|col| {
-            let mut data_type = col.data_type()?;
+            // Relax nested nullability BEFORE the field ids are stamped on:
+            // the rewrite neither adds nor removes a node, so the
+            // `nested_column_ids` iterator stays aligned with the type.
+            let mut data_type = read_compatible_data_type(&col.data_type()?, true);
             let field_id = i32::try_from(col.column_id).map_err(|_| {
                 DuckLakeError::Internal(format!(
                     "column_id {} for column '{}' exceeds i32 range for Parquet field_id",
@@ -950,7 +965,7 @@ pub fn build_read_schema_with_field_id_mapping(
                 } else if parquet_field_ids.is_empty() {
                     (col.column_name.clone(), false, false) // external/legacy file
                 } else {
-                    (format!("__ducklake_absent_field_{}", field_id), true, true)
+                    (format!("{ABSENT_FIELD_PREFIX}{field_id}"), true, true)
                 };
 
             if !is_absent && !col.nested_column_ids.is_empty() {
@@ -2534,5 +2549,86 @@ mod tests {
         assert!(!types_compatible("foobar", "int32"));
         assert!(!types_compatible("int32", "foobar"));
         assert!(!types_compatible("foobar", "bazqux"));
+    }
+
+    /// A struct child the catalog records NON-nullable — what DDL that adds or
+    /// renames a nested field writes — must read as nullable, so the read schema
+    /// stays type-identical to the catalog schema the provider advertises. When
+    /// they differ the scan has to cast, and casting a nullable physical child to
+    /// a non-nullable logical one is refused outright.
+    #[test]
+    fn test_read_schema_relaxes_nested_nullability_like_catalog_schema() {
+        let columns = vec![DuckLakeTableColumn {
+            column_id: 1,
+            column_name: "s".to_string(),
+            column_type: "struct<a:int32,b:int32>".to_string(),
+            is_nullable: true,
+            data_type: Some(DataType::Struct(
+                vec![
+                    Arc::new(Field::new("a", DataType::Int32, true)),
+                    Arc::new(Field::new("b", DataType::Int32, false)),
+                ]
+                .into(),
+            )),
+            nested_column_ids: vec![2, 3],
+        }];
+        let parquet_field_ids =
+            HashMap::from([(1, "s".to_string()), (2, "a".to_string()), (3, "b".to_string())]);
+
+        let (read_schema, _) =
+            build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids, None).unwrap();
+        let DataType::Struct(fields) = read_schema.field(0).data_type() else {
+            panic!("s must remain a struct");
+        };
+        assert!(fields[1].is_nullable(), "child `b` must read as nullable");
+
+        let catalog_schema = build_arrow_schema(&columns).unwrap();
+        assert!(
+            crate::column_rename::types_equal_ignoring_field_metadata(
+                read_schema.field(0).data_type(),
+                catalog_schema.field(0).data_type(),
+            ),
+            "read {:?} != catalog {:?}",
+            read_schema.field(0).data_type(),
+            catalog_schema.field(0).data_type(),
+        );
+    }
+
+    /// A MAP's key is structurally non-null. The relaxation must not reach it:
+    /// a nullable key makes the arrays a `MAP` column produces disagree with the
+    /// schema they are read under.
+    #[test]
+    fn test_read_schema_keeps_map_key_non_nullable() {
+        let entries = Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("key", DataType::Utf8, false)),
+                    Arc::new(Field::new("value", DataType::Int32, true)),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let columns = vec![DuckLakeTableColumn {
+            column_id: 1,
+            column_name: "m".to_string(),
+            column_type: "map<varchar,int32>".to_string(),
+            is_nullable: true,
+            data_type: Some(DataType::Map(Arc::new(entries), false)),
+            nested_column_ids: vec![2, 3],
+        }];
+        let parquet_field_ids =
+            HashMap::from([(1, "m".to_string()), (2, "key".to_string()), (3, "value".to_string())]);
+
+        let (read_schema, _) =
+            build_read_schema_with_field_id_mapping(&columns, &parquet_field_ids, None).unwrap();
+        let DataType::Map(entries, _) = read_schema.field(0).data_type() else {
+            panic!("m must remain a map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("map entries must be a struct");
+        };
+        assert!(!fields[0].is_nullable(), "map key must stay non-nullable");
     }
 }

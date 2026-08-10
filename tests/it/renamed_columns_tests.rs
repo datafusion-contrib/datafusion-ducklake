@@ -609,3 +609,137 @@ async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
     );
     Ok(())
 }
+
+/// A struct whose child was touched by DDL: DuckLake records the child as
+/// NON-nullable in the catalog while the parquet node stays optional, and files
+/// written before the DDL do not carry the child at all.
+///
+/// Both `ADD COLUMN s.<child>` and `RENAME COLUMN s.<child>` rewrite the child's
+/// catalog row this way.
+fn create_catalog_evolved_struct_child(catalog_path: &Path, rename: bool) -> Result<()> {
+    let conn = duckdb::Connection::open_in_memory()?;
+    crate::common::ensure_ducklake_installed();
+    conn.execute("LOAD ducklake;", [])?;
+    let ducklake_path = format!("ducklake:{}", catalog_path.display());
+    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    if rename {
+        conn.execute(
+            "CREATE TABLE test_catalog.t (id INT, s STRUCT(a INT, b INT));",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO test_catalog.t VALUES (1, {'a': 10, 'b': 20});",
+            [],
+        )?;
+        conn.execute("ALTER TABLE test_catalog.t RENAME COLUMN s.b TO bb;", [])?;
+        conn.execute(
+            "INSERT INTO test_catalog.t VALUES (2, {'a': 30, 'bb': 40});",
+            [],
+        )?;
+    } else {
+        conn.execute("CREATE TABLE test_catalog.t (id INT, s STRUCT(a INT));", [])?;
+        conn.execute("INSERT INTO test_catalog.t VALUES (1, {'a': 10});", [])?;
+        conn.execute("ALTER TABLE test_catalog.t ADD COLUMN s.b INT;", [])?;
+        conn.execute(
+            "INSERT INTO test_catalog.t VALUES (2, {'a': 30, 'b': 40});",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+async fn evolved_struct_context(catalog_path: &Path) -> Result<SessionContext> {
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
+    let catalog = DuckLakeCatalog::new(provider)?;
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    Ok(ctx)
+}
+
+/// The child's catalog nullability must not be enforced against the file: an
+/// ordinary `SELECT` over a table whose struct child was added or renamed by DDL
+/// has to read the child as NULL where the file predates it, not fail the scan.
+#[tokio::test]
+async fn test_scan_reads_struct_child_touched_by_ddl() -> Result<()> {
+    for (rename, child, expected) in [
+        (
+            false,
+            "b",
+            vec![(1, Some(10), None), (2, Some(30), Some(40))],
+        ),
+        (
+            true,
+            "bb",
+            vec![(1, Some(10), Some(20)), (2, Some(30), Some(40))],
+        ),
+    ] {
+        let temp_dir = TempDir::new()?;
+        let catalog_path = temp_dir.path().join("evolved_struct.ducklake");
+        create_catalog_evolved_struct_child(&catalog_path, rename)?;
+        let ctx = evolved_struct_context(&catalog_path).await?;
+        let batches = ctx
+            .sql(&format!(
+                "SELECT id, s['a'], s['{child}'] FROM ducklake.main.t ORDER BY id"
+            ))
+            .await?
+            .collect()
+            .await?;
+        let mut got: Vec<(i32, Option<i32>, Option<i32>)> = Vec::new();
+        for b in &batches {
+            let cell = |col: usize, row: usize| {
+                let a = b.column(col).as_any().downcast_ref::<Int32Array>().unwrap();
+                (!a.is_null(row)).then(|| a.value(row))
+            };
+            for row in 0..b.num_rows() {
+                got.push((
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(row),
+                    cell(1, row),
+                    cell(2, row),
+                ));
+            }
+        }
+        assert_eq!(got, expected, "rename={rename}");
+    }
+    Ok(())
+}
+
+/// A read schema that relaxes nested nullability the way the catalog schema does
+/// is type-identical to it, so the rename layer above the scan is a relabel and
+/// filters still reach the parquet reader's pruning.
+#[tokio::test]
+async fn test_filter_pushes_down_over_evolved_struct_column() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let catalog_path = temp_dir.path().join("evolved_struct_pushdown.ducklake");
+    create_catalog_evolved_struct_child(&catalog_path, true)?;
+    let ctx = evolved_struct_context(&catalog_path).await?;
+
+    // The struct column has to be IN the projection: with it projected away the
+    // rename layer only ever sees scalar fields, and pushdown never depended on
+    // the nested types at all.
+    let plan = ctx
+        .sql("EXPLAIN SELECT id, s FROM ducklake.main.t WHERE id = 2")
+        .await?
+        .collect()
+        .await?;
+    let rendered = arrow::util::pretty::pretty_format_batches(&plan)?.to_string();
+    assert!(
+        rendered.contains("predicate=id@0 = 2"),
+        "the filter must reach the scan, plan was:\n{rendered}"
+    );
+
+    let rows = ctx
+        .sql("SELECT id, s FROM ducklake.main.t WHERE id = 2")
+        .await?
+        .collect()
+        .await?;
+    let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        total, 1,
+        "the pushed-down filter must keep the matching row"
+    );
+    Ok(())
+}

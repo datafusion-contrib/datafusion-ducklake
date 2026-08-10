@@ -240,6 +240,27 @@ Known edges:
   per-row snapshot column cannot be read). Non-encrypted catalogs emit the full
   official change-set (inserts, deletes, update pre/postimages, merged-file rows at
   their origin snapshots).
+- **Change feeds over an encrypted table whose columns evolved are refused.** A change
+  feed resolves each data file's columns by field id, read from that file's parquet
+  footer, so a column renamed (or dropped and re-added under the same name) after a file
+  was written still reads that file's values. The encrypted path holds no key for those
+  footers, and the only thing left to match on — the column name — is exactly what the
+  rename changed. Rather than hand back another column's values, the feed errors when
+  the table's columns changed between the oldest data file in the window and the
+  window's end snapshot. A window whose files all predate the change is unaffected, and
+  so is reading the table itself. Two details worth knowing:
+  - **The check is deliberately conservative, and refuses more than it must.** A column's
+    identity is its name plus its resolved type, and the type is what carries a nested
+    field's name — so widening a column with `ALTER … TYPE`, or adding or renaming a field
+    inside an existing `STRUCT`, also trips it, even though matching those by name would
+    have been correct. Adding a new top-level column, and dropping one outright, do not
+    trip it: the added name is in no older file, and nobody asks for the dropped one.
+  - **Only `ducklake_table_changes` and `ducklake_table_insertions` refuse with that
+    explanation.** `ducklake_table_deletions` has no encryption support at all: it reads
+    the deleted rows' source data file with no key, so on an encrypted table it fails with
+    a raw parquet decryption error rather than a message about column evolution. That feed
+    did not work on encrypted tables before either — the failure has moved from read time
+    to plan time.
 - **Partition pruning covers `identity` + `year` only.** `month`/`day`/`hour`/`bucket(N)`
   partition transforms are read correctly but fail open (files are always kept, never
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.

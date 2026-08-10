@@ -21,11 +21,11 @@
 //! deletions were silently missed or mis-attributed (issue #178).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array};
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -48,18 +48,16 @@ use datafusion::physical_plan::{
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use object_store::path::Path as ObjectPath;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::async_reader::ParquetObjectReader;
 
-use crate::metadata_provider::{DeleteFileChange, MetadataProvider};
+use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
-use crate::row_id::{
-    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID,
+use crate::row_id::{FileRowNumberExec, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::table::{
+    ParquetFileLayout, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
+    validated_record_count,
 };
-use crate::table::{validated_file_size, validated_record_count};
-use crate::types::extract_parquet_field_ids;
+use crate::table_changes::{check_column_count, present_catalog_schema};
 
 /// Delete file schema: (file_path: VARCHAR, pos: INT64)
 fn delete_file_schema() -> SchemaRef {
@@ -88,6 +86,13 @@ pub struct TableDeletionsTable {
     table_schema: SchemaRef,
     /// Combined schema: snapshot_id + rowid + change_type + table columns
     output_schema: SchemaRef,
+    /// The table's columns as of `end_snapshot`, carrying the field ids each data
+    /// file's columns are resolved by. Set via [`Self::with_columns`]; fetched
+    /// from the metadata provider on demand when it is not.
+    columns: Option<Arc<Vec<DuckLakeTableColumn>>>,
+    /// Per-file read layout, memoized by resolved path: several delete records in
+    /// one window can share a source data file.
+    layout_cache: Mutex<HashMap<String, Arc<ParquetFileLayout>>>,
 }
 
 impl TableDeletionsTable {
@@ -122,7 +127,69 @@ impl TableDeletionsTable {
             table_path,
             table_schema,
             output_schema,
+            columns: None,
+            layout_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Supply the table's columns as of the window's end snapshot.
+    ///
+    /// A data file records each column under the name it had when the file was
+    /// written, tagged with the column's field id, so the feed resolves columns by
+    /// field id rather than by name. Without this the columns are fetched from the
+    /// metadata provider on each scan; passing them in avoids that query when the
+    /// caller already holds them.
+    pub fn with_columns(mut self, columns: Vec<DuckLakeTableColumn>) -> Self {
+        self.columns = Some(Arc::new(columns));
+        self
+    }
+
+    /// The table's columns as of the window's end snapshot: whatever
+    /// [`Self::with_columns`] was given, else a fresh metadata read.
+    fn resolve_columns(&self) -> DataFusionResult<Arc<Vec<DuckLakeTableColumn>>> {
+        match &self.columns {
+            Some(columns) => Ok(Arc::clone(columns)),
+            None => {
+                let columns = self
+                    .provider
+                    .get_table_structure(self.table_id, self.end_snapshot)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Arc::new(columns))
+            },
+        }
+    }
+
+    /// The read layout of one data file, memoized by resolved path.
+    async fn file_layout(
+        &self,
+        state: &dyn Session,
+        columns: &[DuckLakeTableColumn],
+        path: &str,
+        is_relative: bool,
+    ) -> DataFusionResult<Arc<ParquetFileLayout>> {
+        let resolved = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        {
+            let cache = self.layout_cache.lock().unwrap();
+            if let Some(layout) = cache.get(&resolved) {
+                return Ok(Arc::clone(layout));
+            }
+        }
+        let layout = read_parquet_file_layout(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved,
+            None,
+            columns,
+            &self.table_schema,
+        )
+        .await?;
+        self.layout_cache
+            .lock()
+            .unwrap()
+            .entry(resolved)
+            .or_insert_with(|| Arc::clone(&layout));
+        Ok(layout)
     }
 
     /// Build execution plan for a single delete file entry. `need_rowid` gates
@@ -131,6 +198,7 @@ impl TableDeletionsTable {
     async fn build_exec_for_delete_entry(
         &self,
         state: &dyn Session,
+        columns: &[DuckLakeTableColumn],
         need_rowid: bool,
         delete_file: &DeleteFileChange,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -198,19 +266,32 @@ impl TableDeletionsTable {
             _ => None,
         };
 
-        // Detect the source file's embedded rowid column (present on UPDATE /
-        // compaction outputs). When present, a deleted row's rowid is that
-        // embedded value — NOT `row_id_start + position`, which would key the
-        // delete differently from the row's insert/update_postimage. Only probe
-        // when the rowid is actually requested.
+        // Resolve the source data file's columns by field id: it can be older than
+        // the window, and older than any rename in it. This footer read is
+        // unconditional — the embedded-rowid probe it replaces happened only when
+        // the rowid was projected, but the column names have to be resolved either
+        // way.
         let table_len = self.table_schema.fields().len();
-        let embedded_name = if need_rowid {
-            self.detect_embedded_rowid_name(
+        // Both come from the same column list; the index arithmetic below assumes
+        // they agree, and a disagreement would misalign every scan batch
+        // silently — see [`check_column_count`].
+        check_column_count(table_len, columns.len())?;
+        let layout = self
+            .file_layout(
                 state,
+                columns,
                 &delete_file.data_file_path,
                 delete_file.data_file_path_is_relative,
             )
-            .await?
+            .await?;
+
+        // The source file's embedded rowid column (present on UPDATE / compaction
+        // outputs). When present, a deleted row's rowid is that embedded value —
+        // NOT `row_id_start + position`, which would key the delete differently
+        // from the row's insert/update_postimage. Only read it when the rowid is
+        // actually requested.
+        let embedded_name = if need_rowid {
+            layout.embedded_rowid_parquet_name.clone()
         } else {
             None
         };
@@ -224,6 +305,7 @@ impl TableDeletionsTable {
             &data_file_path,
             delete_file.data_file_size_bytes,
             delete_file.data_file_footer_size.unwrap_or(0),
+            &layout,
             &embedded_name,
         )?;
 
@@ -248,51 +330,25 @@ impl TableDeletionsTable {
         })))
     }
 
-    /// Read the source file's footer and return the physical name of its embedded
-    /// row-id column ([`ROW_ID_PARQUET_FIELD_ID`]) when present. Such a file is an
-    /// UPDATE / compaction output whose logical rowids come from that column.
-    async fn detect_embedded_rowid_name(
-        &self,
-        state: &dyn Session,
-        path: &str,
-        is_relative: bool,
-    ) -> DataFusionResult<Option<String>> {
-        self.parquet_field_id_name(state, path, is_relative, ROW_ID_PARQUET_FIELD_ID)
-            .await
-    }
-
     /// Read a DELETE file's footer and return the physical name of its embedded
     /// per-row snapshot column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`]) when present.
     /// Current-spec delete files are cumulative and carry one; each row's value
     /// is the snapshot at which that position was deleted.
+    ///
+    /// A delete file holds `(file_path, pos[, snapshot])`, none of it table
+    /// columns, so it needs the raw footer rather than a read layout.
     async fn detect_delete_file_snapshot_name(
         &self,
         state: &dyn Session,
         path: &str,
         is_relative: bool,
     ) -> DataFusionResult<Option<String>> {
-        self.parquet_field_id_name(state, path, is_relative, SNAPSHOT_ID_PARQUET_FIELD_ID)
-            .await
-    }
-
-    async fn parquet_field_id_name(
-        &self,
-        state: &dyn Session,
-        path: &str,
-        is_relative: bool,
-        field_id: i32,
-    ) -> DataFusionResult<Option<String>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let object_store = state
-            .runtime_env()
-            .object_store(self.object_store_url.as_ref())?;
-        let reader = ParquetObjectReader::new(object_store, ObjectPath::from(resolved.as_str()));
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let field_ids = extract_parquet_field_ids(builder.metadata());
-        Ok(field_ids.get(&field_id).cloned())
+        let facts =
+            read_parquet_footer_facts(state, self.object_store_url.as_ref(), &resolved, None)
+                .await?;
+        Ok(facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned())
     }
 
     /// Build a ParquetExec for a delete file. When `snapshot_name` is `Some`,
@@ -345,11 +401,15 @@ impl TableDeletionsTable {
     /// and [`FileRowNumberExec`] guarantee true physical positions, so deleted
     /// rows are matched to the delete file's `pos` set regardless of how the
     /// file is read (issue #178).
+    /// The table columns are read under the physical names THIS file gives them
+    /// and presented back under the catalog schema, above [`FileRowNumberExec`] so
+    /// the position column passes through.
     fn build_data_file_scan(
         &self,
         path: &str,
         size_bytes: i64,
         footer_size: i64,
+        layout: &ParquetFileLayout,
         embedded_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
@@ -361,16 +421,12 @@ impl TableDeletionsTable {
 
         let read_schema = match embedded_name {
             Some(name) => {
-                let mut fields: Vec<Field> = self
-                    .table_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
-                fields.push(Field::new(name, DataType::Int64, true));
+                let mut fields: Vec<FieldRef> =
+                    layout.read_schema.fields().iter().cloned().collect();
+                fields.push(Arc::new(Field::new(name, DataType::Int64, true)));
                 Arc::new(Schema::new(fields))
             },
-            None => self.table_schema.clone(),
+            None => Arc::clone(&layout.read_schema),
         };
 
         let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
@@ -378,7 +434,12 @@ impl TableDeletionsTable {
             .with_file_group(FileGroup::new(vec![pf]))
             .with_partitioned_by_file_group(true);
         let scan = DataSourceExec::from_data_source(builder.build());
-        Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
+        let table_fields: Vec<FieldRef> = self.table_schema.fields().iter().cloned().collect();
+        Ok(present_catalog_schema(
+            Arc::new(FileRowNumberExec::new(scan, vec![0])),
+            &table_fields,
+            &layout.name_mapping,
+        ))
     }
 }
 
@@ -432,11 +493,16 @@ impl TableProvider for TableDeletionsTable {
         // cannot be synthesized (no embedded rowid and a NULL row_id_start).
         let need_rowid = projection.is_none_or(|indices| indices.contains(&1));
 
+        // The columns as of the window's END snapshot, carrying the field ids the
+        // per-file read schemas are built from — official DuckLake resolves a
+        // change feed against exactly that generation of the schema.
+        let columns = self.resolve_columns()?;
+
         // Build execution plan for each delete entry
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len());
         for delete_file in &delete_files {
             let exec = self
-                .build_exec_for_delete_entry(state, need_rowid, delete_file)
+                .build_exec_for_delete_entry(state, &columns, need_rowid, delete_file)
                 .await?;
             execs.push(exec);
         }

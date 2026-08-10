@@ -185,6 +185,9 @@ struct CdcTableContext {
     object_store_url: datafusion::execution::object_store::ObjectStoreUrl,
     table_path: String,
     table_schema: Arc<arrow::datatypes::Schema>,
+    /// The columns the `table_schema` was built from, carrying the field ids each
+    /// data file's columns are resolved by.
+    columns: Vec<crate::metadata_provider::DuckLakeTableColumn>,
 }
 
 /// Split `'schema.table'` (defaulting to schema `main`).
@@ -306,26 +309,29 @@ fn parse_cdc_args(
         );
     }
 
+    // A change feed reports against the schema as of the window's END snapshot —
+    // the table and its schema included, not only its columns. Resolving them at
+    // the CURRENT snapshot instead makes a window over a since-dropped table
+    // unreadable, even though every snapshot in it still has the table, and makes
+    // a window that predates a table's creation resolve to a table it should not
+    // see. Official DuckLake resolves at the end snapshot and reports "does not
+    // exist at version N" beyond it.
     let (schema_name, table_name_only) = parse_table_name(&table_name);
-    let snapshot_id = provider
-        .get_current_snapshot()
-        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let schema = provider
-        .get_schema_by_name(schema_name, snapshot_id)
+        .get_schema_by_name(schema_name, end_snapshot)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
-                "Schema '{}' not found in catalog",
-                schema_name
+                "Schema '{schema_name}' does not exist at snapshot {end_snapshot}"
             ))
         })?;
     let table = provider
-        .get_table_by_name(schema.schema_id, table_name_only, snapshot_id)
+        .get_table_by_name(schema.schema_id, table_name_only, end_snapshot)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .ok_or_else(|| {
             datafusion::error::DataFusionError::Plan(format!(
-                "Table '{}.{}' not found in catalog",
-                schema_name, table_name_only
+                "Table '{schema_name}.{table_name_only}' does not exist at snapshot \
+                 {end_snapshot}"
             ))
         })?;
     let data_path = provider
@@ -353,6 +359,7 @@ fn parse_cdc_args(
             object_store_url,
             table_path,
             table_schema,
+            columns,
         },
     ))
 }
@@ -361,15 +368,18 @@ impl TableFunctionImpl for DucklakeTableChangesFunction {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let (start_snapshot, end_snapshot, ctx) =
             parse_cdc_args(&self.provider, exprs, "ducklake_table_changes")?;
-        Ok(Arc::new(TableChangesTable::new(
-            self.provider.clone(),
-            ctx.table_id,
-            start_snapshot,
-            end_snapshot,
-            Arc::new(ctx.object_store_url),
-            ctx.table_path,
-            ctx.table_schema,
-        )))
+        Ok(Arc::new(
+            TableChangesTable::new(
+                self.provider.clone(),
+                ctx.table_id,
+                start_snapshot,
+                end_snapshot,
+                Arc::new(ctx.object_store_url),
+                ctx.table_path,
+                ctx.table_schema,
+            )
+            .with_columns(ctx.columns),
+        ))
     }
 }
 
@@ -390,15 +400,18 @@ impl TableFunctionImpl for DucklakeTableDeletionsFunction {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let (start_snapshot, end_snapshot, ctx) =
             parse_cdc_args(&self.provider, exprs, "ducklake_table_deletions")?;
-        Ok(Arc::new(TableDeletionsTable::new(
-            self.provider.clone(),
-            ctx.table_id,
-            start_snapshot,
-            end_snapshot,
-            Arc::new(ctx.object_store_url),
-            ctx.table_path,
-            ctx.table_schema,
-        )))
+        Ok(Arc::new(
+            TableDeletionsTable::new(
+                self.provider.clone(),
+                ctx.table_id,
+                start_snapshot,
+                end_snapshot,
+                Arc::new(ctx.object_store_url),
+                ctx.table_path,
+                ctx.table_schema,
+            )
+            .with_columns(ctx.columns),
+        ))
     }
 }
 
@@ -422,15 +435,18 @@ impl TableFunctionImpl for DucklakeTableInsertionsFunction {
     fn call(&self, exprs: &[Expr]) -> DataFusionResult<Arc<dyn TableProvider>> {
         let (start_snapshot, end_snapshot, ctx) =
             parse_cdc_args(&self.provider, exprs, "ducklake_table_insertions")?;
-        Ok(Arc::new(TableInsertionsTable::new(
-            self.provider.clone(),
-            ctx.table_id,
-            start_snapshot,
-            end_snapshot,
-            Arc::new(ctx.object_store_url),
-            ctx.table_path,
-            ctx.table_schema,
-        )))
+        Ok(Arc::new(
+            TableInsertionsTable::new(
+                self.provider.clone(),
+                ctx.table_id,
+                start_snapshot,
+                end_snapshot,
+                Arc::new(ctx.object_store_url),
+                ctx.table_path,
+                ctx.table_schema,
+            )
+            .with_columns(ctx.columns),
+        ))
     }
 }
 

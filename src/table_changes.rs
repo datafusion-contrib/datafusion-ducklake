@@ -10,12 +10,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt32Array};
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -35,18 +35,17 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
 use futures::{Stream, StreamExt};
-use object_store::path::Path as ObjectPath;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::arrow::async_reader::ParquetObjectReader;
 
-use crate::metadata_provider::{DataFileChange, MetadataProvider};
+use crate::column_rename::ColumnRenameExec;
+use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::positional_source::PositionalFileSource;
-use crate::row_id::{
-    FileRowNumberExec, ROW_ID_PARQUET_FIELD_ID, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID,
+use crate::row_id::{FileRowNumberExec, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::table::{
+    ParquetFileLayout, delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts,
+    validated_file_size, validated_record_count,
 };
-use crate::table::{delete_file_schema, validated_file_size, validated_record_count};
-use crate::types::extract_parquet_field_ids;
+use crate::types::ABSENT_FIELD_PREFIX;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -89,15 +88,94 @@ impl fmt::Display for ChangeType {
     }
 }
 
-/// Physical names of a data file's embedded CDC columns, when present.
-#[derive(Debug, Clone, Default)]
-struct EmbeddedCdcNames {
-    /// `_ducklake_internal_row_id` under its physical name (field id
-    /// [`ROW_ID_PARQUET_FIELD_ID`]).
-    rowid: Option<String>,
-    /// `_ducklake_internal_snapshot_id` under its physical name (field id
-    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`]).
-    snapshot: Option<String>,
+/// Present a per-file CDC scan under the catalog schema: `table_fields` resolved
+/// by field id and coerced to their catalog types, then whatever internal columns
+/// the scan appended (embedded rowid, embedded per-row snapshot, physical
+/// position) passed through unchanged, by name.
+///
+/// The wrap is decided against a target that does NOT depend on the file, because
+/// a union's branches must all end up with the SAME output schema: `UnionExec`
+/// validates the field count only, adopts the first branch's names, and panics on
+/// a type mismatch. Wrapping "only the files that need renaming" would emit the
+/// pre-rename column name for the others.
+///
+/// Two latent hazards, both shared with the ordinary table scan, which presents
+/// its positional reads the same way:
+///
+/// - A NOT NULL top-level column that an older file does not carry is read as an
+///   all-NULL array and then presented under the non-nullable catalog field, which
+///   `record_batch_with_schema` rejects. DuckDB's own extension cannot create that
+///   state (`ADD COLUMN … NOT NULL` is refused as "Adding columns with constraints
+///   not yet supported"), but this crate's writer and third-party implementations
+///   can.
+/// - The internal column names are not reserved: nothing stops a table column from
+///   being called [`ROW_POS_COLUMN_NAME`], and nothing stops an older file from
+///   physically carrying a column called `__ducklake_absent_field_<id>`. Either
+///   makes two fields of one schema share a name, and the by-name lookup then
+///   binds the first — reading the table column where the position was meant, or
+///   real data where a null-fill was meant. Reserving the names belongs with the
+///   writer's name validation, not here.
+pub(crate) fn present_catalog_schema(
+    scan: Arc<dyn ExecutionPlan>,
+    table_fields: &[FieldRef],
+    name_mapping: &HashMap<String, String>,
+) -> Arc<dyn ExecutionPlan> {
+    let scan_schema = scan.schema();
+    debug_assert!(scan_schema.fields().len() >= table_fields.len());
+    let mut fields: Vec<FieldRef> = table_fields.to_vec();
+    fields.extend(
+        scan_schema
+            .fields()
+            .iter()
+            .skip(table_fields.len())
+            .cloned(),
+    );
+    let output_schema: SchemaRef = Arc::new(Schema::new(fields));
+    if !name_mapping.is_empty() || scan_schema != output_schema {
+        Arc::new(ColumnRenameExec::new(
+            scan,
+            output_schema,
+            name_mapping.clone(),
+        ))
+    } else {
+        scan
+    }
+}
+
+/// Refuse a column list that disagrees with the table schema built from it.
+///
+/// Every CDC read path locates a scan batch's internal columns (embedded rowid,
+/// embedded per-row snapshot, physical position) by arithmetic on `table_len`,
+/// while the per-file read schema is built from the column list. If the list is
+/// LONGER, those indices address data columns and the feed reports a data value
+/// as a rowid — wrong answers, no error. Both come from one
+/// `get_table_structure` call inside the table functions, so this is
+/// unreachable there; the providers' constructors and `with_columns` are
+/// public, and this is the boundary check for a caller that pairs a schema with
+/// the wrong columns.
+pub(crate) fn check_column_count(table_len: usize, columns_len: usize) -> DataFusionResult<()> {
+    if table_len != columns_len {
+        return Err(DataFusionError::External(
+            format!(
+                "change feed built with {columns_len} column(s) but a {table_len}-field table \
+                 schema; the schema and the column list must describe the same table"
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Index of a read-schema column the file actually carries. A CDC-columns-only
+/// projection (`SELECT snapshot_id FROM …`, `COUNT(*)`) reads one data column
+/// purely for its row count, and a column the file predates is materialised as a
+/// null array rather than read from it.
+fn row_count_probe_index(read_schema: &Schema) -> usize {
+    read_schema
+        .fields()
+        .iter()
+        .position(|f| !f.name().starts_with(ABSENT_FIELD_PREFIX))
+        .unwrap_or(0)
 }
 
 /// Positions of the CDC metadata columns in the feed's output schema. They
@@ -357,6 +435,14 @@ pub struct TableChangesTable {
     table_schema: SchemaRef,
     /// Combined schema: table columns + snapshot_id + change_type
     output_schema: SchemaRef,
+    /// The table's columns as of `end_snapshot`, carrying the field ids each data
+    /// file's columns are resolved by. Set via [`Self::with_columns`]; fetched
+    /// from the metadata provider on demand when it is not.
+    columns: Option<Arc<Vec<DuckLakeTableColumn>>>,
+    /// Per-file read layout, memoized by resolved path. A file inserted and then
+    /// deleted inside the window is reached from both sides of the feed, and a
+    /// delete's source data file can be reached by several delete records.
+    layout_cache: Mutex<HashMap<String, Arc<ParquetFileLayout>>>,
     /// When set, the delete side is never read: every row added in the window
     /// surfaces as `insert` (the `ducklake_table_insertions` feed).
     insertions_only: bool,
@@ -393,8 +479,22 @@ impl TableChangesTable {
             table_path,
             table_schema,
             output_schema,
+            columns: None,
+            layout_cache: Mutex::new(HashMap::new()),
             insertions_only: false,
         }
+    }
+
+    /// Supply the table's columns as of the window's end snapshot.
+    ///
+    /// A data file records each column under the name it had when the file was
+    /// written, tagged with the column's field id, so the feed resolves columns by
+    /// field id rather than by name. Without this the columns are fetched from the
+    /// metadata provider on each scan; passing them in avoids that query when the
+    /// caller already holds them.
+    pub fn with_columns(mut self, columns: Vec<DuckLakeTableColumn>) -> Self {
+        self.columns = Some(Arc::new(columns));
+        self
     }
 
     /// Turn this feed into `ducklake_table_insertions`: the delete side is
@@ -404,6 +504,56 @@ impl TableChangesTable {
     pub fn insertions_only(mut self) -> Self {
         self.insertions_only = true;
         self
+    }
+
+    /// The table's columns as of the window's end snapshot: whatever
+    /// [`Self::with_columns`] was given, else a fresh metadata read.
+    fn resolve_columns(&self) -> DataFusionResult<Arc<Vec<DuckLakeTableColumn>>> {
+        match &self.columns {
+            Some(columns) => Ok(Arc::clone(columns)),
+            None => {
+                let columns = self
+                    .provider
+                    .get_table_structure(self.table_id, self.end_snapshot)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                Ok(Arc::new(columns))
+            },
+        }
+    }
+
+    /// The read layout of one data file, memoized by resolved path.
+    async fn file_layout(
+        &self,
+        state: &dyn Session,
+        columns: &[DuckLakeTableColumn],
+        path: &str,
+        is_relative: bool,
+    ) -> DataFusionResult<Arc<ParquetFileLayout>> {
+        let resolved = resolve_path(&self.table_path, path, is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        {
+            let cache = self.layout_cache.lock().unwrap();
+            if let Some(layout) = cache.get(&resolved) {
+                return Ok(Arc::clone(layout));
+            }
+        }
+        // No encryption key: this path never reaches an encrypted file (see the
+        // guard in `scan`), and a footer it cannot decrypt is not readable here.
+        let layout = read_parquet_file_layout(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved,
+            None,
+            columns,
+            &self.table_schema,
+        )
+        .await?;
+        self.layout_cache
+            .lock()
+            .unwrap()
+            .entry(resolved)
+            .or_insert_with(|| Arc::clone(&layout));
+        Ok(layout)
     }
 
     /// Analyze projection and split into table columns and CDC columns.
@@ -490,22 +640,26 @@ impl TableChangesTable {
         Arc::new(Schema::new(fields))
     }
 
-    /// Build a ParquetExec wrapped with PrependCDCColumnsExec for a single file
+    /// Build a ParquetExec wrapped with PrependCDCColumnsExec for a single file.
+    /// `layout` is `None` only for an encrypted file, whose footer this path
+    /// cannot decrypt: its columns are then matched by name against the catalog
+    /// schema (see the guard in [`TableProvider::scan`]).
     #[cfg(feature = "encryption")]
     async fn build_exec_for_file(
         &self,
         state: &dyn Session,
         data_file: &DataFileChange,
+        layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
         encryption_factory: &Option<Arc<dyn EncryptionFactory>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let read_schema = self.file_read_schema(layout);
         let parquet_source = if let Some(factory) = encryption_factory {
-            ParquetSource::new(self.table_schema.clone())
-                .with_encryption_factory(Arc::clone(factory))
+            ParquetSource::new(read_schema).with_encryption_factory(Arc::clone(factory))
         } else {
-            ParquetSource::new(self.table_schema.clone())
+            ParquetSource::new(read_schema)
         };
-        self.build_exec_for_file_impl(state, data_file, proj_info, parquet_source)
+        self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
             .await
     }
 
@@ -515,15 +669,22 @@ impl TableChangesTable {
         &self,
         state: &dyn Session,
         data_file: &DataFileChange,
+        layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        self.build_exec_for_file_impl(
-            state,
-            data_file,
-            proj_info,
-            ParquetSource::new(self.table_schema.clone()),
-        )
-        .await
+        let parquet_source = ParquetSource::new(self.file_read_schema(layout));
+        self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
+            .await
+    }
+
+    /// The schema to scan one data file's table columns with: the file's own
+    /// field-id-resolved read schema, or the catalog schema when there is no
+    /// layout (an encrypted file).
+    fn file_read_schema(&self, layout: Option<&ParquetFileLayout>) -> SchemaRef {
+        match layout {
+            Some(layout) => Arc::clone(&layout.read_schema),
+            None => Arc::clone(&self.table_schema),
+        }
     }
 
     /// Internal implementation for building a ParquetExec wrapped with PrependCDCColumnsExec
@@ -531,6 +692,7 @@ impl TableChangesTable {
         &self,
         _state: &dyn Session,
         data_file: &DataFileChange,
+        layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
         parquet_source: ParquetSource,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -557,7 +719,7 @@ impl TableChangesTable {
         // Determine what to read from Parquet
         let parquet_projection = if proj_info.table_indices.is_empty() {
             // Only CDC columns requested - read minimal data for row counts
-            Some(vec![0])
+            Some(vec![row_count_probe_index(&self.file_read_schema(layout))])
         } else {
             Some(proj_info.table_indices.clone())
         };
@@ -576,11 +738,25 @@ impl TableChangesTable {
         let file_scan_config = builder.build();
 
         // Use DataSourceExec directly to preserve our ParquetSource with encryption factory
-        let parquet_exec: Arc<dyn ExecutionPlan> =
+        let mut parquet_exec: Arc<dyn ExecutionPlan> =
             DataSourceExec::from_data_source(file_scan_config);
 
         // Determine if we should skip input columns (only CDC columns requested)
         let skip_input_columns = proj_info.table_indices.is_empty();
+
+        // Present the projected catalog fields, so every file's branch of the
+        // union below carries the same schema and `PrependCDCColumnsExec` can
+        // build batches under it. Nothing to present when the table columns are
+        // dropped anyway (a CDC-columns-only projection).
+        if !skip_input_columns {
+            let table_fields: Vec<FieldRef> = proj_info
+                .table_indices
+                .iter()
+                .map(|&i| Arc::clone(&self.table_schema.fields()[i]))
+                .collect();
+            let name_mapping = layout.map(|l| l.name_mapping.clone()).unwrap_or_default();
+            parquet_exec = present_catalog_schema(parquet_exec, &table_fields, &name_mapping);
+        }
 
         // Build output schema for PrependCDCColumnsExec
         let cdc_exec_schema = if skip_input_columns {
@@ -617,59 +793,55 @@ impl TableChangesTable {
         )))
     }
 
-    /// Read a file's parquet footer and return the physical names of its
-    /// embedded CDC columns: the row-id column ([`ROW_ID_PARQUET_FIELD_ID`],
-    /// present on UPDATE / non-adjacent-compaction outputs) and the per-row
-    /// snapshot-id column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`], present on
-    /// compaction-merged partial files).
-    async fn detect_embedded_cdc_names(
+    /// Read a DELETE file's footer and return the physical name of its embedded
+    /// per-row snapshot column ([`SNAPSHOT_ID_PARQUET_FIELD_ID`]) when present.
+    /// Current-spec delete files are cumulative and carry one.
+    ///
+    /// A delete file holds `(file_path, pos[, snapshot])`, none of it table
+    /// columns, so it needs the raw footer rather than a read layout.
+    async fn detect_delete_file_snapshot_name(
         &self,
         state: &dyn Session,
         path: &str,
         is_relative: bool,
-    ) -> DataFusionResult<EmbeddedCdcNames> {
+    ) -> DataFusionResult<Option<String>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let object_store = state
-            .runtime_env()
-            .object_store(self.object_store_url.as_ref())?;
-        let reader = ParquetObjectReader::new(object_store, ObjectPath::from(resolved.as_str()));
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let field_ids = extract_parquet_field_ids(builder.metadata());
-        Ok(EmbeddedCdcNames {
-            rowid: field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
-            snapshot: field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
-        })
+        let facts =
+            read_parquet_footer_facts(state, self.object_store_url.as_ref(), &resolved, None)
+                .await?;
+        Ok(facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned())
     }
 
-    /// The read schema for a data file: the table columns, plus the embedded
-    /// rowid / per-row snapshot columns (under their physical names) when
-    /// present, in that order.
+    /// The read schema for a data file: its table columns under the physical names
+    /// THIS file gives them, plus the embedded rowid / per-row snapshot columns
+    /// when present, in that order.
     fn read_schema_with_embedded(
         &self,
+        layout: &ParquetFileLayout,
         rowid_name: &Option<String>,
         snapshot_name: &Option<String>,
     ) -> SchemaRef {
         match (rowid_name, snapshot_name) {
-            (None, None) => self.table_schema.clone(),
+            (None, None) => Arc::clone(&layout.read_schema),
             (rowid, snapshot) => {
-                let mut fields: Vec<Field> = self
-                    .table_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
+                let mut fields: Vec<FieldRef> =
+                    layout.read_schema.fields().iter().cloned().collect();
                 if let Some(name) = rowid {
-                    fields.push(Field::new(name, DataType::Int64, true));
+                    fields.push(Arc::new(Field::new(name, DataType::Int64, true)));
                 }
                 if let Some(name) = snapshot {
-                    fields.push(Field::new(name, DataType::Int64, true));
+                    fields.push(Arc::new(Field::new(name, DataType::Int64, true)));
                 }
                 Arc::new(Schema::new(fields))
             },
         }
+    }
+
+    /// The catalog fields the per-file scans of the correlated feed present, so
+    /// every one of them hands `correlate_changes` the same table columns.
+    fn catalog_table_fields(&self) -> Vec<FieldRef> {
+        self.table_schema.fields().iter().cloned().collect()
     }
 
     /// Scan of an inserted data file for the correlated feed. A file with an
@@ -678,10 +850,14 @@ impl TableChangesTable {
     /// (`PositionalFileSource` + `FileRowNumberExec`) so its rowid can be
     /// synthesized as `row_id_start + position` — but only when `need_rowid`;
     /// otherwise it is a plain scan with no position column.
+    ///
+    /// Either way the plan is presented under the catalog schema, ABOVE
+    /// `FileRowNumberExec` so the position column it appends passes straight
+    /// through.
     fn build_insert_scan(
         &self,
         data_file: &DataFileChange,
-        embedded: &EmbeddedCdcNames,
+        layout: &ParquetFileLayout,
         need_rowid_resolution: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let resolved = resolve_path(
@@ -702,11 +878,12 @@ impl TableChangesTable {
         }
         // The per-row snapshot column is read only for partial (merged) files.
         let snapshot_name = if data_file.partial_max.is_some() {
-            embedded.snapshot.clone()
+            layout.embedded_snapshot_parquet_name.clone()
         } else {
             None
         };
-        let read_schema = self.read_schema_with_embedded(&embedded.rowid, &snapshot_name);
+        let embedded_rowid = &layout.embedded_rowid_parquet_name;
+        let read_schema = self.read_schema_with_embedded(layout, embedded_rowid, &snapshot_name);
         let plain_scan = |pf: PartitionedFile, schema: SchemaRef| {
             let builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
@@ -715,10 +892,10 @@ impl TableChangesTable {
             .with_file_group(FileGroup::new(vec![pf]));
             DataSourceExec::from_data_source(builder.build())
         };
-        match &embedded.rowid {
+        let scan: Arc<dyn ExecutionPlan> = match embedded_rowid {
             // Postimage / rewrite / non-adjacent merge: rowid IS the embedded
             // column — a plain scan.
-            Some(_) => Ok(plain_scan(pf, read_schema)),
+            Some(_) => plain_scan(pf, read_schema),
             // No embedded rowid but resolution required (rowid projected, or a
             // partial file whose real rowids feed the update correlation): scan
             // positionally to synthesize rowid = row_id_start + position.
@@ -729,11 +906,16 @@ impl TableChangesTable {
                         .with_file_group(FileGroup::new(vec![pf]))
                         .with_partitioned_by_file_group(true);
                 let scan = DataSourceExec::from_data_source(builder.build());
-                Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
+                Arc::new(FileRowNumberExec::new(scan, vec![0]))
             },
             // Plain insert, rowid not needed: a plain scan, no positions.
-            None => Ok(plain_scan(pf, read_schema)),
-        }
+            None => plain_scan(pf, read_schema),
+        };
+        Ok(present_catalog_schema(
+            scan,
+            &self.catalog_table_fields(),
+            &layout.name_mapping,
+        ))
     }
 
     /// Positional scan of a delete's source data file: table columns, the
@@ -746,6 +928,7 @@ impl TableChangesTable {
         resolved_path: &str,
         size_bytes: i64,
         footer_size: i64,
+        layout: &ParquetFileLayout,
         embedded_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut pf = PartitionedFile::new(
@@ -757,13 +940,17 @@ impl TableChangesTable {
         {
             pf = pf.with_metadata_size_hint(hint);
         }
-        let read_schema = self.read_schema_with_embedded(embedded_name, &None);
+        let read_schema = self.read_schema_with_embedded(layout, embedded_name, &None);
         let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
         let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
             .with_file_group(FileGroup::new(vec![pf]))
             .with_partitioned_by_file_group(true);
         let scan = DataSourceExec::from_data_source(builder.build());
-        Ok(Arc::new(FileRowNumberExec::new(scan, vec![0])))
+        Ok(present_catalog_schema(
+            Arc::new(FileRowNumberExec::new(scan, vec![0])),
+            &self.catalog_table_fields(),
+            &layout.name_mapping,
+        ))
     }
 
     /// Scan of a positional delete file (the standard `(file_path, pos)` schema);
@@ -806,6 +993,90 @@ impl TableChangesTable {
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
 
+    /// Refuse the feed when an encrypted table's columns changed identity between
+    /// the oldest data file in the window and the window's end.
+    ///
+    /// Encrypted files' footers cannot be decrypted on this path, so their columns
+    /// can only be matched by name — correct only while every in-window file
+    /// records the columns under the names the end snapshot uses. A rename or a
+    /// drop-and-re-add breaks that, and a by-name read would then return NULL or
+    /// another column's values with no indication anything was wrong. Adding a
+    /// column, and dropping one outright, stay safe: the new name is in no older
+    /// file (so it null-fills) and the dropped one is asked for by nobody.
+    ///
+    /// The identity below is coarser than "was a column renamed", so this
+    /// refuses strictly more than it has to: a type widened by `ALTER … TYPE`
+    /// and a struct child added inside an existing column both change it, and
+    /// both would in fact read correctly by name. Erring toward refusal is the
+    /// point — the alternative on this path is silently wrong values — but a
+    /// finer check (compare names per field id, ignore the rest) would let those
+    /// two through if they turn out to matter. `COMPATIBILITY.md` says so.
+    #[cfg(feature = "encryption")]
+    fn reject_evolved_encrypted_table(
+        &self,
+        columns: &[DuckLakeTableColumn],
+        data_files: &[DataFileChange],
+    ) -> DataFusionResult<()> {
+        let Some(oldest) = data_files.iter().map(|f| f.begin_snapshot).min() else {
+            return Ok(());
+        };
+        if oldest >= self.end_snapshot {
+            return Ok(());
+        }
+        let then = self
+            .provider
+            .get_table_structure(self.table_id, oldest)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // A column's identity is its name plus its resolved type — the type is
+        // what carries a NESTED field's name, so a renamed struct child shows up
+        // here too.
+        let identity = |column: &DuckLakeTableColumn| -> DataFusionResult<(String, String)> {
+            let data_type = column
+                .data_type()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            Ok((column.column_name.clone(), format!("{data_type:?}")))
+        };
+        let mut then_by_id: HashMap<i64, (String, String)> = HashMap::new();
+        let mut then_names: HashSet<String> = HashSet::new();
+        for column in &then {
+            then_by_id.insert(column.column_id, identity(column)?);
+            then_names.insert(column.column_name.clone());
+        }
+
+        let mut evolved = false;
+        for column in columns {
+            evolved = match then_by_id.get(&column.column_id) {
+                Some(previous) => *previous != identity(column)?,
+                // A column id the older snapshot did not have: safe unless its
+                // name did exist back then under a different id — that is a drop
+                // and re-add, and a by-name read would find the dropped column's
+                // data in the older files.
+                None => then_names.contains(&column.column_name),
+            };
+            if evolved {
+                break;
+            }
+        }
+
+        if evolved {
+            return Err(DataFusionError::External(
+                format!(
+                    "table {} has encrypted data files and its columns changed between \
+                     snapshot {oldest} and snapshot {}: a column was renamed, or dropped and \
+                     re-added under the same name. Change feeds resolve columns by field id, \
+                     which requires reading each file's parquet footer, and an encrypted \
+                     footer cannot be read here — so the feed would return another column's \
+                     values. Query a snapshot window whose files all predate the change, or \
+                     read the table directly.",
+                    self.table_id, self.end_snapshot
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the correlated change feed: pair a same-snapshot delete + insert
     /// that share a rowid into `update_preimage` (old) + `update_postimage`
     /// (new); surface unmatched inserts as `insert` and unmatched deletes as
@@ -814,24 +1085,34 @@ impl TableChangesTable {
     async fn build_correlated_changes(
         &self,
         state: &dyn Session,
+        columns: &[DuckLakeTableColumn],
         data_files: &[DataFileChange],
         delete_files: &[crate::metadata_provider::DeleteFileChange],
-        embedded_names: &[EmbeddedCdcNames],
+        layouts: &[Arc<ParquetFileLayout>],
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let table_len = self.table_schema.fields().len();
+        // Both come from the same column list, and the index arithmetic below
+        // (which column of a scan batch is the embedded rowid, the embedded
+        // snapshot, the position) assumes they agree. A disagreement would
+        // silently misalign every per-file scan — with more columns than
+        // `table_len` the internal-column indices land on DATA columns and the
+        // feed emits a data value as a rowid. Unreachable through the table
+        // functions, which derive both from one `get_table_structure` call, but
+        // the constructor and `with_columns` are public: refuse loudly.
+        check_column_count(table_len, columns.len())?;
         // Whether the caller wants the rowid column (at ROWID_IDX among the
         // leading CDC columns). When it does not, plain inserts skip the
         // positional scan and rowid synthesis entirely.
         let need_rowid = projection.is_none_or(|idx| idx.contains(&ROWID_IDX));
 
         let mut insert_units = Vec::with_capacity(data_files.len());
-        for (df, names) in data_files.iter().zip(embedded_names.iter()) {
+        for (df, layout) in data_files.iter().zip(layouts.iter()) {
             // Column layout of the scan batch after the `table_len` table
             // columns: [embedded rowid?][embedded snapshot? (partial files
             // only)][position? (appended by FileRowNumberExec)].
             let is_partial = df.partial_max.is_some();
-            if is_partial && names.snapshot.is_none() {
+            if is_partial && layout.embedded_snapshot_parquet_name.is_none() {
                 return Err(DataFusionError::External(
                     format!(
                         "data file {} is a merged partial file (partial_max set) but carries \
@@ -846,22 +1127,23 @@ impl TableChangesTable {
             // correlation (a placeholder could false-pair), so rowid is
             // resolved for them even when it is not projected.
             let resolve_rowid = need_rowid || is_partial;
-            let has_embedded_rowid = names.rowid.is_some();
+            let has_embedded_rowid = layout.embedded_rowid_parquet_name.is_some();
             let mut next_idx = table_len;
             let embedded_col_idx = has_embedded_rowid.then(|| {
                 let i = next_idx;
                 next_idx += 1;
                 i
             });
-            let snapshot_col_idx = (is_partial && names.snapshot.is_some()).then(|| {
-                let i = next_idx;
-                next_idx += 1;
-                i
-            });
+            let snapshot_col_idx = (is_partial && layout.embedded_snapshot_parquet_name.is_some())
+                .then(|| {
+                    let i = next_idx;
+                    next_idx += 1;
+                    i
+                });
             let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
             insert_units.push(InsertUnit {
                 snapshot_id: df.begin_snapshot,
-                scan: self.build_insert_scan(df, names, resolve_rowid)?,
+                scan: self.build_insert_scan(df, layout, resolve_rowid)?,
                 embedded_col_idx,
                 snapshot_col_idx,
                 pos_col_idx,
@@ -882,18 +1164,22 @@ impl TableChangesTable {
                     dfc.data_file_path_is_relative,
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let old_embedded = self
-                    .detect_embedded_cdc_names(
+                // The source data file can predate the window (and any rename in
+                // it), so its columns need resolving by field id too.
+                let source_layout = self
+                    .file_layout(
                         state,
+                        columns,
                         &dfc.data_file_path,
                         dfc.data_file_path_is_relative,
                     )
-                    .await?
-                    .rowid;
+                    .await?;
+                let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
                 let data_scan = self.build_delete_data_scan(
                     &resolved,
                     dfc.data_file_size_bytes,
                     dfc.data_file_footer_size.unwrap_or(0),
+                    &source_layout,
                     &old_embedded,
                 )?;
                 // A cumulative (current-spec) delete file embeds each row's
@@ -902,13 +1188,12 @@ impl TableChangesTable {
                 // the delta-vs-previous model.
                 let snapshot_name = match &dfc.current_delete_path {
                     Some(p) => {
-                        self.detect_embedded_cdc_names(
+                        self.detect_delete_file_snapshot_name(
                             state,
                             p,
                             dfc.current_delete_path_is_relative.unwrap_or(true),
                         )
                         .await?
-                        .snapshot
                     },
                     None => None,
                 };
@@ -1009,6 +1294,11 @@ impl TableProvider for TableChangesTable {
         // Analyze projection to determine what to read
         let proj_info = self.analyze_projection(projection);
 
+        // The columns as of the window's END snapshot, carrying the field ids the
+        // per-file read schemas are built from — official DuckLake resolves a
+        // change feed against exactly that generation of the schema.
+        let columns = self.resolve_columns()?;
+
         // Get data files added between snapshots (INSERT changes)
         let data_files = self
             .provider
@@ -1085,27 +1375,29 @@ impl TableProvider for TableChangesTable {
                 use datafusion::physical_plan::empty::EmptyExec;
                 return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
             }
+            // Without the footers there are no field ids to resolve columns by,
+            // and matching by name is wrong once a column has been renamed or
+            // dropped and re-added.
+            #[cfg(feature = "encryption")]
+            self.reject_evolved_encrypted_table(&columns, &data_files)?;
         }
         let any_partial = data_files.iter().any(|f| f.partial_max.is_some());
 
         if (proj_info.need_rowid || !delete_files.is_empty() || any_partial) && !any_encrypted {
-            let mut embedded_names: Vec<EmbeddedCdcNames> = Vec::with_capacity(data_files.len());
+            let mut layouts: Vec<Arc<ParquetFileLayout>> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
-                embedded_names.push(
-                    self.detect_embedded_cdc_names(
-                        state,
-                        &data_file.path,
-                        data_file.path_is_relative,
-                    )
-                    .await?,
+                layouts.push(
+                    self.file_layout(state, &columns, &data_file.path, data_file.path_is_relative)
+                        .await?,
                 );
             }
             return self
                 .build_correlated_changes(
                     state,
+                    &columns,
                     &data_files,
                     &delete_files,
-                    &embedded_names,
+                    &layouts,
                     projection,
                 )
                 .await;
@@ -1132,16 +1424,33 @@ impl TableProvider for TableChangesTable {
             }
         };
 
-        // Build execution plan for each file with projection pushdown
+        // Build execution plan for each file with projection pushdown. Each
+        // file's columns are resolved by field id — except on an encrypted
+        // catalog, whose footers this path cannot read (the query has already
+        // been refused above if that table's columns evolved).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(data_files.len());
         for data_file in &data_files {
+            let layout = if any_encrypted {
+                None
+            } else {
+                Some(
+                    self.file_layout(state, &columns, &data_file.path, data_file.path_is_relative)
+                        .await?,
+                )
+            };
             #[cfg(feature = "encryption")]
             let exec = self
-                .build_exec_for_file(state, data_file, &proj_info, &encryption_factory)
+                .build_exec_for_file(
+                    state,
+                    data_file,
+                    layout.as_deref(),
+                    &proj_info,
+                    &encryption_factory,
+                )
                 .await?;
             #[cfg(not(feature = "encryption"))]
             let exec = self
-                .build_exec_for_file(state, data_file, &proj_info)
+                .build_exec_for_file(state, data_file, layout.as_deref(), &proj_info)
                 .await?;
             execs.push(exec);
         }
@@ -1913,6 +2222,13 @@ impl TableInsertionsTable {
             inner,
             output_schema,
         }
+    }
+
+    /// Supply the table's columns as of the window's end snapshot; see
+    /// [`TableChangesTable::with_columns`].
+    pub fn with_columns(mut self, columns: Vec<DuckLakeTableColumn>) -> Self {
+        self.inner = self.inner.with_columns(columns);
+        self
     }
 
     /// Map an index of this feed's schema — `(snapshot_id, rowid, table

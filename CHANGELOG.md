@@ -17,6 +17,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. `resolve_positions` is only valid for files that have never been rewritten, and `files_matching` cannot identify those from catalog metadata alone — nor should it silently withhold them, since a keyed mutation that never sees a file holding its key inserts a duplicate. This is the check a caller runs on each returned file to refuse a rewritten one loudly instead; the crate's own DELETE uses it the same way.
 
 ### Changed
+- **BREAKING**: `ducklake_table_changes`, `ducklake_table_insertions` and
+  `ducklake_table_deletions` resolve each data file's columns **by field id**, as of the window's
+  end snapshot, instead of by current name — matching official DuckLake. Output changes, silently,
+  on any table whose columns were renamed or dropped and re-added:
+  - a renamed column returned NULL for rows in files written before the rename, and now returns
+    those rows' values;
+  - a column dropped and re-added under the same name returned the DROPPED column's values for
+    rows in files written before the re-add, and now returns NULL there (the re-added column has
+    its own field id, and those files predate it);
+  - two columns whose names were swapped returned each other's values, and now return their own;
+  - a field renamed inside a `STRUCT` behaves the same way as a top-level one.
+
+  The fix is **not retroactive**: it changes what the feeds return from now on, and nothing in the
+  catalog was damaged, so no repair tooling is needed — but anything derived from earlier feed
+  output on an affected table is still wrong. **Re-derive anything built from change-feed output on
+  a table whose columns were renamed, or dropped and re-added.** To find those tables, look for a
+  `column_id` with more than one row, or a name shared by two `column_id`s:
+
+  ```sql
+  SELECT table_id, column_id, count(*) AS generations
+  FROM ducklake_column GROUP BY table_id, column_id HAVING count(*) > 1;
+
+  SELECT table_id, column_name, count(DISTINCT column_id) AS ids
+  FROM ducklake_column GROUP BY table_id, column_name HAVING count(DISTINCT column_id) > 1;
+  ```
+
+  Field ids come from each file's parquet footer, so the feeds now read one footer per data file —
+  the insert-only feed previously read none — and each per-file scan carries one more plan node.
+  On a table with **encrypted** files the footers cannot be read, so a feed whose window spans a
+  rename or a drop-and-re-add is refused with an error rather than served by name. That refusal is
+  conservative and catches some column changes that would have been safe to match by name, and only
+  `ducklake_table_changes` / `ducklake_table_insertions` give the explanatory error; see
+  COMPATIBILITY.md.
+- `TableChangesTable`, `TableInsertionsTable` and `TableDeletionsTable` accept the table's columns
+  through a new `with_columns` builder. No signature changed; without it the columns are read from
+  the metadata provider on each scan.
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed
@@ -34,6 +70,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changing the existing list column ID or invalidating historical snapshots.
 - Reads null‑fill fields added inside structs, including non‑nullable fields and structs nested in
   lists, while preserving field‑ID‑based nested renames and drops.
+- The CDC table functions resolve the TABLE and its schema at the window's end snapshot, not at the
+  catalog's current snapshot. A window over a table that was dropped afterwards failed with
+  "Table 'main.t' not found in catalog" even though every snapshot in the window still had the
+  table; it now returns that window's changes, and a window whose end snapshot is past the drop
+  reports that the table does not exist at that snapshot — matching official DuckLake. One window
+  changes the other way: a window ending BEFORE the table was created used to resolve the table at
+  the current snapshot and return an empty feed, and now reports that the table does not exist at
+  that snapshot. Official DuckLake errors on that window too, so this is convergence rather than a
+  new restriction (#196).
+- A `SELECT` over a table whose struct child was added or renamed by DDL no longer fails with
+  "Cannot cast nullable struct field … to non-nullable field". DuckLake records such a child as
+  non-nullable while the physical parquet node stays optional, and a file written before the change
+  does not carry the child at all; `build_read_schema_with_field_id_mapping` now relaxes nested
+  nullability exactly as the sibling `build_arrow_schema` does. Map keys stay non-nullable. The read
+  schema is then type-identical to the catalog schema, so the rename layer above the scan is a
+  relabel and filters and limits reach the parquet reader's pruning on tables with nested columns.
 
 ## [0.6.0] - 2026-07-20
 

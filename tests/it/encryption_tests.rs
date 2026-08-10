@@ -106,9 +106,11 @@ fn create_catalog_with_encrypted_file(
             end_snapshot BIGINT
         );
 
-        -- Column table
+        -- Column table. A column id has one row per generation — a rename closes
+        -- the previous row and opens another under the SAME id — so it is no more
+        -- a primary key here than it is in a real catalog.
         CREATE TABLE ducklake_column (
-            column_id BIGINT PRIMARY KEY,
+            column_id BIGINT NOT NULL,
             table_id BIGINT NOT NULL,
             column_name VARCHAR NOT NULL,
             column_type VARCHAR NOT NULL,
@@ -130,6 +132,8 @@ fn create_catalog_with_encrypted_file(
             encryption_key VARCHAR,
             record_count BIGINT,
             row_id_start BIGINT,
+            partial_max BIGINT,
+            mapping_id BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT
         );
@@ -145,6 +149,7 @@ fn create_catalog_with_encrypted_file(
             footer_size BIGINT,
             encryption_key VARCHAR,
             delete_count BIGINT,
+            partial_max BIGINT,
             begin_snapshot BIGINT NOT NULL,
             end_snapshot BIGINT
         );
@@ -380,5 +385,77 @@ async fn test_read_encrypted_parquet_with_wrong_key_fails() -> anyhow::Result<()
         println!("Got expected error: {}", exec_result.unwrap_err());
     }
 
+    Ok(())
+}
+
+/// Record a rename of the `name` column in a second snapshot, the way a real
+/// catalog does: the existing generation is closed and another one opens under the
+/// SAME column id, so the id is the stable key and the name is not.
+fn rename_column_in_second_snapshot(catalog_path: &Path) -> anyhow::Result<()> {
+    let conn = duckdb::Connection::open(catalog_path)?;
+    conn.execute("INSERT INTO ducklake_snapshot (snapshot_id) VALUES (2)", [])?;
+    conn.execute(
+        "UPDATE ducklake_column SET end_snapshot = 2 WHERE column_id = 2",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO ducklake_column
+           (column_id, table_id, column_name, column_type, column_order, begin_snapshot)
+         VALUES (2, 1, 'display_name', 'VARCHAR', 1, 2)",
+        [],
+    )?;
+    Ok(())
+}
+
+async fn encrypted_changes_context(catalog_path: &Path) -> anyhow::Result<SessionContext> {
+    let ctx = SessionContext::new();
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
+    let provider_arc: Arc<dyn MetadataProvider> =
+        Arc::new(DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?);
+    ctx.register_catalog("ducklake", Arc::new(DuckLakeCatalog::new(provider)?));
+    datafusion_ducklake::register_ducklake_functions(&ctx, provider_arc);
+    Ok(ctx)
+}
+
+/// A change feed resolves each file's columns by field id, which means reading the
+/// file's parquet footer — and the change-feed path holds no key for an encrypted
+/// footer. On a table whose columns were renamed (or dropped and re-added) it must
+/// therefore REFUSE the query: matching by name instead would hand back another
+/// column's values, or NULL, with nothing to indicate it.
+#[tokio::test]
+async fn test_change_feed_refuses_evolved_encrypted_table() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let parquet_path = temp_dir.path().join("encrypted_data.parquet");
+    let catalog_path = temp_dir.path().join("catalog.duckdb");
+    let file_size = create_encrypted_parquet_file(&parquet_path, TEST_ENCRYPTION_KEY)?;
+    let key = std::str::from_utf8(TEST_ENCRYPTION_KEY)?;
+    create_catalog_with_encrypted_file(&catalog_path, &parquet_path, file_size, key)?;
+    rename_column_in_second_snapshot(&catalog_path)?;
+
+    let ctx = encrypted_changes_context(&catalog_path).await?;
+
+    // A window ending at the rename cannot be served.
+    let error = match ctx
+        .sql("SELECT * FROM ducklake_table_changes('main.encrypted_users', 1, 2)")
+        .await
+    {
+        Ok(df) => df.collect().await.expect_err("must refuse the window"),
+        Err(e) => e,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("encrypted data files") && message.contains("changed between"),
+        "unexpected error: {message}"
+    );
+
+    // A window that predates the rename is unaffected: every file records the
+    // columns under the names that window's end snapshot uses.
+    let batches = ctx
+        .sql("SELECT * FROM ducklake_table_changes('main.encrypted_users', 1, 1)")
+        .await?
+        .collect()
+        .await?;
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 3, "the pre-rename window must still be readable");
     Ok(())
 }
