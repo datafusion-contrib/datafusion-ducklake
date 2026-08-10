@@ -15,9 +15,12 @@
 //! - **Delete-all** (no `WHERE`): a metadata-only truncate — end every live data
 //!   file in one new snapshot. Much cheaper than positional-deleting every row.
 //!
-//! v1 handles insert-only data files. Files rewritten by an UPDATE/compaction
-//! (an embedded row-id column) cannot be resolved by physical position, so the
-//! filtered path cleanly errors on them rather than risk mis-deleting.
+//! A file rewritten by an UPDATE or by compaction is handled like any other. A
+//! delete file's `pos` is a row's physical index in the data file, which a
+//! rewrite leaves meaningful: the rewritten rows sit at `0..n-1`. What a rewrite
+//! disturbs is the rowid *sequence* — the surviving rowids carry holes where the
+//! applied deletes were, and the catalog records no `row_id_start` — and rowids
+//! are not what position resolution uses.
 //!
 //! # Session lifecycle (important)
 //!
@@ -76,8 +79,7 @@ fn make_delete_count_schema() -> SchemaRef {
 /// means delete ALL rows.
 pub struct DuckLakeDeleteExec {
     /// A clone of the target table, used for its reader methods
-    /// (`resolve_positions`, `read_delete_file_positions`,
-    /// `file_has_embedded_rowid`).
+    /// (`resolve_positions`, `read_delete_file_positions`).
     table: Arc<DuckLakeTable>,
     /// Session captured at plan time. A bare `TaskContext` cannot build physical
     /// exprs or drive the positional sub-plans; `SessionState` is the concrete
@@ -289,18 +291,12 @@ async fn run_delete(
     let mut total_deleted: u64 = 0;
 
     for tf in &table_files {
-        // v1 refuses files rewritten by an UPDATE/compaction: their surviving
-        // rows carry embedded rowids whose physical order need not match the
-        // DuckLake `pos` space, so positional resolution could mis-delete. Clean
-        // error, never a silent wrong delete.
-        if table.file_has_embedded_rowid(state, &tf.file).await? {
-            return Err(DataFusionError::NotImplemented(format!(
-                "DELETE on data file '{}' is not supported: the file was rewritten by an \
-                 UPDATE or compaction (it embeds a row-id column), and v1 resolves delete \
-                 positions only for insert-only files",
-                tf.file.path
-            )));
-        }
+        // A file rewritten by an UPDATE or by compaction is handled here like any
+        // other. A delete file's `pos` is a row's physical index in the data file,
+        // and a rewrite leaves that meaningful — the rewritten rows sit at
+        // `0..n-1`. What a rewrite disturbs is the rowid sequence (deleted rows are
+        // dropped, so the survivors' rowids carry holes and the catalog records no
+        // `row_id_start`), and rowids are not what resolution uses.
 
         // Physical positions matching the predicate (raw scan; delete files NOT
         // applied — resolution is over the file's own rows).

@@ -1,17 +1,17 @@
 //! Integration tests for `DuckLakeTable::files_matching` against a real
 //! (SQLite-backed) catalog, covering the two things the unit tests in
-//! `src/table.rs` cannot: that real catalog statistics actually prune, and that
-//! the safety contract a caller needs when it resolves positions on the returned
-//! files is reachable from outside the crate.
+//! `src/table.rs` cannot: that real catalog statistics actually prune, and that a
+//! rewritten file is returned like any other and reports itself as rewritten.
 //!
-//! The second is the important one. `resolve_positions` derives a row's delete
-//! position from its physical index in the file, which is only the position
-//! DuckLake records for a file that has never been rewritten. `files_matching`
-//! answers from catalog metadata alone, so it cannot know which files those are —
-//! and it must not guess and silently withhold one, because a keyed mutation that
-//! never sees a file holding its key inserts a duplicate instead of superseding.
-//! Both failure directions are silent, so the file is returned and the caller is
-//! given a public way to detect it and refuse.
+//! `files_matching` answers from catalog metadata alone, so it cannot know which
+//! of the files it returns were rewritten by an UPDATE or by compaction — and it
+//! must not guess and silently withhold one, because a keyed mutation that never
+//! sees a file holding its key inserts a duplicate instead of superseding it.
+//! Nor does it need to: `resolve_positions` reads a file's true physical row
+//! positions, which a rewrite leaves meaningful, so a rewritten file needs no
+//! special handling. `file_has_embedded_rowid` still distinguishes the two,
+//! because it answers where a row's *rowid* comes from — see
+//! `keyed_mutation_after_compaction_tests` for the mutations themselves.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
@@ -181,14 +181,14 @@ async fn files_matching_returns_only_the_file_whose_statistics_admit_the_key() {
 }
 
 /// After an UPDATE rewrites a file, `files_matching` must still return it — and
-/// the caller must be able to tell, through the public API alone, that resolving
-/// positions on it is unsafe.
+/// the caller must be able to tell, through the public API alone, which of the
+/// files it got are rewritten.
 ///
-/// The two assertions guard opposite failure directions. Dropping the rewritten
-/// file would make a keyed mutation insert a duplicate key; failing to flag it
-/// would let the caller resolve positions on it and delete the wrong rows. A
-/// blanket "everything is unsafe" answer is ruled out by requiring the
-/// insert-only file in the same result to report `false`.
+/// Dropping the rewritten file would make a keyed mutation insert a duplicate
+/// key, so it has to come back. The flag is not a safety gate — positions resolve
+/// correctly on a rewritten file — but it does report where a row's rowid comes
+/// from, and a blanket "everything is rewritten" answer is ruled out by requiring
+/// the insert-only file in the same result to report `false`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rewritten_file_is_returned_and_reports_an_embedded_rowid() {
     let temp_dir = TempDir::new().unwrap();

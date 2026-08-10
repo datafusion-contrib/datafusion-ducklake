@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomic append+delete commits accept SEVERAL appended data files: `MetadataWriter::register_data_files_with_deletes` (and its conditional `_and_commit_metadata` sibling) register N data files plus M positional delete files in ONE snapshot — matching the reference implementation, where one transaction carries both the new data files and the new delete files. A keyed mutation (update/upsert) therefore works on a partitioned table and on a write that rolled past `target_file_size` (#214).
 - SQL `UPDATE` on a PARTITIONED table: each rewritten row is routed by its own post-assignment key values, so an assignment that changes a partition key moves the row to its new partition (calendar transforms included). A rewrite spanning several partitions writes one file per partition and commits them all — with the positional deletes — in one snapshot, preserving every row's `rowid` lineage. Rewritten rows adopt the table's live spec, so a table that adopted partitioning after data was written partitions its updated rows (#214).
 - `DuckLakeTable::files_matching` — the data files a predicate could match, pruned by exactly the catalog statistics and partition bounds a `SELECT` with the same filter uses. A caller driving its own per-file work (a keyed update, an upsert, a positional delete resolved with `resolve_positions`) no longer has to open every data file in the table to find the ones holding a key. Pruning is fail-open: a file is dropped only when its own statistics prove it cannot match, and files are read in bounded pages so peak memory tracks the result rather than the table.
-- `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. `resolve_positions` is only valid for files that have never been rewritten, and `files_matching` cannot identify those from catalog metadata alone — nor should it silently withhold them, since a keyed mutation that never sees a file holding its key inserts a duplicate. This is the check a caller runs on each returned file to refuse a rewritten one loudly instead; the crate's own DELETE uses it the same way.
+- `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. It reports where a row's `rowid` comes from — the file's embedded row-id column when it has one, `row_id_start + physical position` otherwise. It is not a precondition for `resolve_positions` or for a keyed mutation; see the `### Fixed` note below.
 
 ### Changed
 - **BREAKING**: `ducklake_table_changes`, `ducklake_table_insertions` and
@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed
+- A keyed `DELETE` or `UPDATE` works on a data file that compaction has rewritten. The filtered
+  delete path previously refused such a file outright — a v1 scope limit, documented as though
+  position resolution depended on `rowid = row_id_start + physical position`. It does not:
+  `resolve_positions` reads a file's true physical row positions, and a delete file's `pos` is a
+  physical index, which a rewrite leaves meaningful (the rewritten rows sit at `0..n-1`). What a
+  rewrite disturbs is the rowid *sequence* — `rewrite_data_files` drops deleted rows, so the
+  survivors' rowids carry holes and the catalog records no `row_id_start` at all, making that
+  arithmetic not merely unreliable but uncomputable. DuckLake itself performs keyed mutations
+  against merged, reordered and partition-merged files, so this brings the crate in line with the
+  reference implementation. The consequence for callers: a table can be compacted and still take
+  `DELETE`/`UPDATE`/upsert, which previously required choosing one or the other.
 - `types::build_read_schema_with_field_id_mapping` declares the `PARQUET:field_id` of every nested
   node the data file tags — list elements, struct children, map key/value, at any depth. A nested
   node's field id is part of its parent's Arrow type, so a read schema that omitted it disagreed with

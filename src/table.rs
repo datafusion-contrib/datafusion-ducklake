@@ -1117,20 +1117,11 @@ impl DuckLakeTable {
     ///
     /// # Resolving positions on the returned files
     ///
-    /// [`Self::resolve_positions`] is only valid for files that have never been
-    /// rewritten (see its documentation). This method cannot tell the two apart —
-    /// the answer is in the parquet footer, not the catalog — and it deliberately
-    /// does not try: silently withholding a file that holds a matching key would
-    /// make a keyed mutation insert a duplicate instead of superseding one, which
-    /// fails just as quietly as a mis-resolved position.
-    ///
-    /// So the returned list may include a file rewritten by an UPDATE or by
-    /// compaction. **Check each file with [`Self::file_has_embedded_rowid`]
-    /// before resolving positions on it, and refuse the file loudly when that
-    /// reports `true`.** Skipping the check risks deleting the wrong rows;
-    /// skipping the file instead of refusing risks a duplicate key. The check
-    /// memoizes its footer read, so running it immediately before
-    /// [`Self::resolve_positions`] costs nothing extra.
+    /// The returned list may include a file rewritten by an UPDATE or by
+    /// compaction, and that is fine: [`Self::resolve_positions`] reads a file's
+    /// true physical row positions and does not depend on a row's position
+    /// matching `rowid - row_id_start`, so it is valid for rewritten files too.
+    /// A rewritten file needs no special handling here.
     pub fn files_matching(
         &self,
         predicate: &Arc<dyn PhysicalExpr>,
@@ -1616,11 +1607,14 @@ impl DuckLakeTable {
     /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
     /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
     ///
-    /// Only valid for insert-only files, where `position = rowid - row_id_start`.
-    /// This is a precondition the method does not check: establish it with
-    /// [`Self::file_has_embedded_rowid`], which must report `false`, and refuse
-    /// the file otherwise. Resolving positions on a rewritten file can delete
-    /// the wrong rows.
+    /// Valid for every data file, including one rewritten by an UPDATE or by
+    /// compaction. A delete file's `pos` is the row's **physical** index in the
+    /// data file it targets, and that is the space this method returns and the
+    /// space [`crate::delete_filter::DeleteFilterExec`] filters in — neither
+    /// consults `row_id_start` nor a rowid. A rewritten file's rowids are
+    /// therefore irrelevant here: they may be non-contiguous, or ordered
+    /// differently from the rows they sit on, without affecting which physical
+    /// row a resolved position names.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -1637,8 +1631,12 @@ impl DuckLakeTable {
         // (column index i = the i-th logical/data field); `Column::evaluate` is
         // index-based, so it resolves against the read batch regardless of any
         // physical rename. `ROW_POS_COLUMN_NAME` is appended last and is never
-        // referenced by the predicate. Valid for insert-only files, where the
-        // physical position equals `rowid - row_id_start`.
+        // referenced by the predicate.
+        //
+        // The projection is the physical data columns only. On a file that
+        // embeds a rowid column that column sits last in `read_schema`, so
+        // `0..physical_len` excludes it and the predicate's column indices still
+        // line up with the table's logical order.
         let file_cfg = self.build_file_read_config(state, data_file).await?;
 
         // Row-group-aligned partitions + a non-repartition, non-pruning source so
@@ -1769,19 +1767,19 @@ impl DuckLakeTable {
     /// ids as a reserved parquet column (tagged with
     /// [`ROW_ID_PARQUET_FIELD_ID`]); an insert-only file does not.
     ///
-    /// **Check this before resolving positions on a file you did not write
-    /// yourself.** [`Self::resolve_positions`] derives a row's delete position
-    /// from its physical index in the file, which is the position DuckLake
-    /// records only for a file that has never been rewritten: a rewritten file's
-    /// surviving rows carry embedded row ids whose order need not match their
-    /// physical order, so resolving positions on one can delete the wrong rows.
-    /// A caller doing its own per-file work over [`Self::files_matching`] must
-    /// therefore refuse such a file loudly rather than resolve positions on it —
-    /// the crate's own DELETE does exactly that.
+    /// This answers where a row's *rowid* comes from — the embedded column when
+    /// there is one, `row_id_start + physical position` otherwise — and nothing
+    /// more. It is **not** a precondition for [`Self::resolve_positions`] or for a
+    /// keyed mutation. A delete file's `pos` is a row's physical index in the data
+    /// file, and a rewrite leaves that meaningful: the rewritten file's rows sit
+    /// at `0..n-1` exactly as any other file's do. What a rewrite does disturb is
+    /// the rowid *sequence* — `rewrite_data_files` drops deleted rows, so the
+    /// surviving rowids carry holes and no longer satisfy
+    /// `rowid = row_id_start + position` (the catalog records no `row_id_start`
+    /// for such a file at all). That is precisely why positions, not rowids, are
+    /// what a delete file records.
     ///
-    /// Reads the file's parquet footer once and memoizes the answer, so calling
-    /// it immediately before [`Self::resolve_positions`] costs at most one extra
-    /// footer read per file.
+    /// Reads the file's parquet footer once and memoizes the answer.
     pub async fn file_has_embedded_rowid(
         &self,
         state: &dyn Session,
@@ -2392,6 +2390,29 @@ impl DuckLakeTable {
         table_file: &DuckLakeTableFile,
         output_schema: SchemaRef,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // This path applies no delete filtering, and that has been safe only
+        // because the combination cannot arise: a delete on a merged partial file
+        // is authored in a snapshot later than the merge that produced it, which
+        // is itself later than `partial_max`, while this path is chosen only when
+        // reading BELOW `partial_max` (see `needs_snapshot_filter`) — and the
+        // metadata provider attaches a delete file only from its own
+        // `begin_snapshot` onward. So no delete file can be live at a snapshot
+        // this path serves.
+        //
+        // Nothing has been observed to violate that; the check exists because the
+        // assumption is newly load-bearing. Positional deletes on rewritten and
+        // partial files used to be refused outright, so this path could not meet
+        // one; now that it can in principle, an invariant that was safely
+        // implicit is worth failing loudly on rather than silently returning rows
+        // a delete file says are gone.
+        if table_file.delete_file.is_some() {
+            return Err(DataFusionError::Internal(format!(
+                "partial file \"{}\" has a live delete file at read snapshot {}, which the \
+                 snapshot-filtered read path cannot apply",
+                table_file.file.path, self.snapshot_id
+            )));
+        }
+
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let snap_name = file_cfg
             .embedded_snapshot_parquet_name

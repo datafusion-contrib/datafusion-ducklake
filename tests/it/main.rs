@@ -34,6 +34,7 @@ mod hybrid_asyncdb;
 mod information_schema_test;
 mod inlined_data_sqlite_tests;
 mod insert_partitioning_tests;
+mod keyed_mutation_after_compaction_tests;
 mod maintenance_sqlite_tests;
 mod missing_delete_file_tests;
 mod multicatalog_hardening_tests;
