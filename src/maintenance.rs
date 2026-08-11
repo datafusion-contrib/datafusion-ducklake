@@ -11,10 +11,10 @@
 //! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`], [`cleanup_old_files_in_catalog`])
 //!    reads the scheduled rows, deletes the objects from the object store, and removes the rows.
 //! 3. **delete_orphaned_files** ([`delete_orphaned_files_sqlite`],
-//!    [`delete_orphaned_files_multicatalog`]) lists the data path, subtracts everything
-//!    referenced by the catalog (data files + delete files + still-scheduled-for-deletion),
-//!    and deletes whatever's left. Catches files left by aborted writes and by
-//!    `drop_catalog` (which hard-deletes catalog metadata without scheduling its files).
+//!    [`delete_orphaned_files_in_catalog`], [`delete_orphaned_files_multicatalog`]) lists a data
+//!    path, subtracts referenced data files, delete files, and files still scheduled for deletion,
+//!    and deletes whatever is left. The catalog-scoped form catches files left by aborted writes.
+//!    The global form also reclaims dropped-catalog files from retained data-path tombstones.
 //!
 //! The metadata writers deliberately hold no object store — physical I/O lives here so the
 //! catalog layer stays storage-agnostic (the object store comes from the caller, e.g. the
@@ -23,9 +23,13 @@
 use crate::Result;
 use crate::path_resolver::{parse_object_store_url, resolve_path};
 use chrono::{DateTime, Utc};
+#[cfg(feature = "write-postgres")]
+use datafusion::datasource::object_store::ObjectStoreUrl;
 use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, ObjectStoreExt};
+#[cfg(feature = "write-postgres")]
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -47,6 +51,13 @@ pub enum CleanupCriteria {
     All,
     /// Delete only files scheduled before this timestamp.
     OlderThan(DateTime<Utc>),
+}
+
+#[cfg(feature = "write-postgres")]
+struct DataPathGroup {
+    object_store_url: ObjectStoreUrl,
+    object_path: ObjectPath,
+    data_paths: Vec<String>,
 }
 
 /// Render a UTC timestamp as a SQL literal both backends parse and compare correctly.
@@ -163,7 +174,7 @@ pub async fn cleanup_old_files_in_catalog(
     criteria: CleanupCriteria,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let data_path = mgr.get_data_path().await?;
+    let data_path = mgr.get_data_path_in_catalog(catalog_name).await?;
     let files = mgr
         .list_scheduled_for_deletion_in_catalog(catalog_name, &criteria)
         .await?;
@@ -265,18 +276,11 @@ pub async fn delete_orphaned_files_sqlite(
     run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
 }
 
-/// List the multicatalog's shared `data_path` and delete every `.parquet` not
-/// referenced by any catalog in the metadata DB.
+/// Sweep every registered multicatalog data path and delete unreferenced Parquet files.
 ///
-/// **Global, not per-catalog.** In our multicatalog Postgres model every catalog
-/// shares one `data_path`, so the natural unit for orphan reclamation is the
-/// whole data path. The referenced set is built across every catalog's data
-/// files, delete files, and still-pending scheduled-for-deletion rows. This
-/// closes the file-leak left by [`MulticatalogManager::drop_catalog`] — which
-/// hard-deletes catalog metadata in one shot, so its files become unreferenced
-/// rather than scheduled.
-///
-/// [`MulticatalogManager::drop_catalog`]: crate::multicatalog::MulticatalogManager::drop_catalog
+/// All roots must resolve to the same object-store authority because this API
+/// accepts one object store. Use [`delete_orphaned_files_in_data_path`] with the
+/// matching store when one metadata database spans multiple authorities.
 #[cfg(feature = "write-postgres")]
 pub async fn delete_orphaned_files_multicatalog(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -284,7 +288,172 @@ pub async fn delete_orphaned_files_multicatalog(
     criteria: CleanupCriteria,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let data_path = mgr.get_data_path().await?;
-    let referenced = mgr.list_referenced_paths().await?;
-    run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
+    let data_path_groups = merge_data_path_groups(group_data_paths(mgr.list_data_paths().await?)?);
+    if data_path_groups.is_empty() {
+        return Err(crate::DuckLakeError::InvalidConfig(
+            "Missing required catalog metadata: 'data_path' not configured.".to_string(),
+        ));
+    }
+    let mut authority = None;
+    for group in &data_path_groups {
+        if authority
+            .as_ref()
+            .is_some_and(|expected| expected != &group.object_store_url)
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "Multicatalog data paths span multiple object-store authorities; clean each path with delete_orphaned_files_in_data_path"
+                    .to_string(),
+            ));
+        }
+        authority = Some(group.object_store_url.clone());
+    }
+
+    let mut deleted = Vec::new();
+    for group in data_path_groups {
+        deleted.extend(
+            delete_orphaned_files_in_data_path_inner(
+                mgr,
+                &group,
+                Arc::clone(&object_store),
+                criteria.clone(),
+                dry_run,
+            )
+            .await?,
+        );
+    }
+    deleted.sort();
+    deleted.dedup();
+    Ok(deleted)
+}
+
+/// Delete orphaned Parquet files within one catalog's canonical data path.
+///
+/// The sweep includes every catalog root nested under that path because object-store listing is
+/// recursive. References from every included root are retained.
+#[cfg(feature = "write-postgres")]
+pub async fn delete_orphaned_files_in_catalog(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    catalog_name: &str,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = mgr.get_data_path_in_catalog(catalog_name).await?;
+    let group = registered_data_path_group(mgr, &data_path).await?;
+    delete_orphaned_files_in_data_path_inner(mgr, &group, object_store, criteria, dry_run).await
+}
+
+/// Delete orphaned Parquet files within one retained multicatalog data path.
+///
+/// `object_store` must serve the authority parsed from `data_path`. The object-store trait does not
+/// expose its authority for runtime validation.
+#[cfg(feature = "write-postgres")]
+pub async fn delete_orphaned_files_in_data_path(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    data_path: &str,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let group = registered_data_path_group(mgr, data_path).await?;
+    delete_orphaned_files_in_data_path_inner(mgr, &group, object_store, criteria, dry_run).await
+}
+
+#[cfg(feature = "write-postgres")]
+async fn delete_orphaned_files_in_data_path_inner(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    group: &DataPathGroup,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let clear_tombstone = !dry_run && matches!(&criteria, CleanupCriteria::All);
+    let dropped_before = mgr.current_timestamp().await?;
+    let mut referenced = Vec::new();
+    for data_path in &group.data_paths {
+        let (_, base_key) = parse_object_store_url(data_path)?;
+        for (path, relative) in mgr
+            .list_referenced_paths_in_data_paths(std::slice::from_ref(data_path))
+            .await?
+        {
+            referenced.push((resolve_path(&base_key, &path, relative)?, false));
+        }
+    }
+    let deleted = run_orphan_cleanup(
+        &group.data_paths[0],
+        referenced,
+        object_store,
+        criteria,
+        dry_run,
+    )
+    .await?;
+    if clear_tombstone {
+        mgr.clear_dropped_data_paths(&group.data_paths, dropped_before)
+            .await?;
+    }
+    Ok(deleted)
+}
+
+#[cfg(feature = "write-postgres")]
+async fn registered_data_path_group(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    data_path: &str,
+) -> Result<DataPathGroup> {
+    let mut groups = group_data_paths(mgr.list_data_paths().await?)?;
+    let index = groups
+        .iter()
+        .position(|group| group.data_paths.iter().any(|path| path == data_path))
+        .ok_or_else(|| {
+            crate::DuckLakeError::InvalidConfig(format!(
+                "Data path {data_path:?} is not registered for multicatalog cleanup"
+            ))
+        })?;
+    let mut root = groups.remove(index);
+    for group in groups {
+        if group.object_store_url == root.object_store_url
+            && group.object_path.prefix_matches(&root.object_path)
+        {
+            root.data_paths.extend(group.data_paths);
+        }
+    }
+    Ok(root)
+}
+
+#[cfg(feature = "write-postgres")]
+fn group_data_paths(data_paths: Vec<String>) -> Result<Vec<DataPathGroup>> {
+    let mut groups = BTreeMap::new();
+    for data_path in data_paths {
+        let (object_store_url, base_key) = parse_object_store_url(&data_path)?;
+        let object_path = ObjectPath::from(base_key.trim_start_matches('/'));
+        groups
+            .entry((object_store_url, object_path))
+            .or_insert_with(Vec::new)
+            .push(data_path);
+    }
+    Ok(groups
+        .into_iter()
+        .map(
+            |((object_store_url, object_path), data_paths)| DataPathGroup {
+                object_store_url,
+                object_path,
+                data_paths,
+            },
+        )
+        .collect())
+}
+
+#[cfg(feature = "write-postgres")]
+fn merge_data_path_groups(groups: Vec<DataPathGroup>) -> Vec<DataPathGroup> {
+    let mut roots: Vec<DataPathGroup> = Vec::new();
+    for group in groups {
+        if let Some(root) = roots.iter_mut().find(|root| {
+            group.object_store_url == root.object_store_url
+                && group.object_path.prefix_matches(&root.object_path)
+        }) {
+            root.data_paths.extend(group.data_paths);
+        } else {
+            roots.push(group);
+        }
+    }
+    roots
 }

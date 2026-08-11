@@ -221,22 +221,28 @@ impl MetadataProvider for MulticatalogProvider {
     }
 
     fn get_data_path(&self) -> Result<String> {
-        // data_path is global per Phase 1 default.
         block_on(async {
-            let row =
-                sqlx::query("SELECT value FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
-                    .bind("data_path")
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let path: Option<String> = if catalog_has_data_path(&self.pool).await? {
+                sqlx::query_scalar("SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1")
+                    .bind(self.catalog_id)
+                    .fetch_one(&self.pool)
+                    .await?
+            } else {
+                sqlx::query_scalar(
+                    "SELECT value FROM ducklake_metadata
+                     WHERE key = 'data_path' AND scope IS NULL LIMIT 1",
+                )
+                .fetch_optional(&self.pool)
+                .await?
+            };
 
-            match row {
-                Some(r) => Ok(r.try_get(0)?),
-                None => Err(crate::error::DuckLakeError::InvalidConfig(
+            path.ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(
                     "Missing required catalog metadata: 'data_path' not configured. \
                      The catalog may be uninitialized or corrupted."
                         .to_string(),
-                )),
-            }
+                )
+            })
         })
     }
 
@@ -1415,4 +1421,17 @@ WHERE data.table_id = $1
                 .collect()
         })
     }
+}
+
+pub(crate) async fn catalog_has_data_path(pool: &PgPool) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_attribute
+             WHERE attrelid = 'ducklake_catalog'::regclass
+               AND attname = 'data_path'
+               AND NOT attisdropped
+         )",
+    )
+    .fetch_one(pool)
+    .await?)
 }

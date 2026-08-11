@@ -8,6 +8,7 @@ use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
 use crate::metadata_writer_postgres::execute_ddl_statements;
+use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
@@ -153,11 +154,10 @@ impl MulticatalogManager {
     ///
     /// # What's NOT cleaned up
     ///
-    /// Data files on object storage are not removed here. Vacuum
-    /// reclaims them later, matching the crate's drop-without-commit
-    /// convention. Callers needing tighter storage cleanup should list
-    /// the data file paths before calling this and schedule their
-    /// removal externally.
+    /// Data files on object storage are not removed here. The catalog's
+    /// effective data path is retained so orphan cleanup can visit it after
+    /// the metadata rows are gone. Callers needing synchronous cleanup must
+    /// still arrange it around this metadata-only operation.
     pub async fn drop_catalog(&self, name: &str) -> Result<bool> {
         if name.trim().is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
@@ -176,15 +176,16 @@ impl MulticatalogManager {
         // against the drop. If the row has already been deleted by a
         // parallel drop, we treat this call as a no-op.
         let row = sqlx::query(
-            "SELECT catalog_id FROM ducklake_catalog
+            "SELECT catalog_id, data_path
+             FROM ducklake_catalog
              WHERE catalog_name = $1 FOR UPDATE",
         )
         .bind(name)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let catalog_id: i64 = match row {
-            Some(r) => r.try_get(0)?,
+        let (catalog_id, data_path): (i64, Option<String>) = match row {
+            Some(r) => (r.try_get("catalog_id")?, r.try_get("data_path")?),
             None => {
                 tx.commit().await?;
                 return Ok(false);
@@ -259,6 +260,22 @@ impl MulticatalogManager {
             .bind(catalog_id)
             .execute(&mut *tx)
             .await?;
+
+        sqlx::query("DELETE FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1")
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(data_path) = data_path {
+            sqlx::query(
+                "INSERT INTO ducklake_dropped_data_path (data_path)
+                 VALUES ($1)
+                 ON CONFLICT (data_path) DO UPDATE SET dropped_at = NOW()",
+            )
+            .bind(data_path)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // Finally the catalog row itself.
         sqlx::query("DELETE FROM ducklake_catalog WHERE catalog_id = $1")
@@ -470,7 +487,9 @@ impl MulticatalogManager {
         Ok(true)
     }
 
-    /// Read the global `data_path` (Phase 1: one `data_path` shared by all catalogs).
+    /// Read the legacy global `data_path` fallback.
+    ///
+    /// Use [`Self::get_data_path_in_catalog`] for a catalog-scoped root.
     pub async fn get_data_path(&self) -> Result<String> {
         let row =
             sqlx::query("SELECT value FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
@@ -483,6 +502,89 @@ impl MulticatalogManager {
                 "Missing required catalog metadata: 'data_path' not configured.".to_string(),
             )),
         }
+    }
+
+    /// Read the `data_path` for one catalog.
+    ///
+    /// Before the writer migration adds the catalog column, readers use the legacy global value.
+    pub async fn get_data_path_in_catalog(&self, catalog_name: &str) -> Result<String> {
+        let path: Option<String> =
+            if crate::multicatalog_provider::catalog_has_data_path(&self.pool).await? {
+                sqlx::query_scalar("SELECT data_path FROM ducklake_catalog WHERE catalog_name = $1")
+                    .bind(catalog_name)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .flatten()
+            } else {
+                sqlx::query_scalar(
+                    "SELECT metadata.value
+                 FROM ducklake_catalog AS catalog
+                 CROSS JOIN LATERAL (
+                     SELECT value FROM ducklake_metadata
+                     WHERE key = 'data_path' AND scope IS NULL LIMIT 1
+                 ) AS metadata
+                 WHERE catalog.catalog_name = $1",
+                )
+                .bind(catalog_name)
+                .fetch_optional(&self.pool)
+                .await?
+            };
+        path.ok_or_else(|| {
+            crate::DuckLakeError::InvalidConfig(format!(
+                "Missing required catalog metadata: 'data_path' not configured for catalog {catalog_name:?}."
+            ))
+        })
+    }
+
+    /// List every live, legacy, or dropped catalog root that may need orphan cleanup.
+    pub async fn list_data_paths(&self) -> Result<Vec<String>> {
+        let paths = if crate::multicatalog_provider::catalog_has_data_path(&self.pool).await? {
+            sqlx::query_scalar(
+                "SELECT data_path FROM (
+                     SELECT value AS data_path
+                     FROM ducklake_metadata
+                     WHERE key = 'data_path' AND scope IS NULL
+                     UNION
+                     SELECT data_path FROM ducklake_catalog
+                     UNION
+                     SELECT data_path FROM ducklake_dropped_data_path
+                 ) AS paths
+                 WHERE data_path IS NOT NULL
+                 ORDER BY data_path",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata
+                 WHERE key = 'data_path' AND scope IS NULL",
+            )
+            .fetch_all(&self.pool)
+            .await?
+        };
+        Ok(paths)
+    }
+
+    pub(crate) async fn current_timestamp(&self) -> Result<DateTime<Utc>> {
+        Ok(sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub(crate) async fn clear_dropped_data_paths(
+        &self,
+        data_paths: &[String],
+        dropped_before: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM ducklake_dropped_data_path
+             WHERE data_path::TEXT = ANY($1) AND dropped_at <= $2",
+        )
+        .bind(data_paths)
+        .bind(dropped_before)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Expire snapshots within a single catalog and GC the metadata they leave behind.
@@ -809,29 +911,37 @@ impl MulticatalogManager {
         Ok(())
     }
 
-    /// Every physical file referenced by **any** catalog in this metadata DB:
-    /// data files, delete files, and still-scheduled-for-deletion rows. Global
-    /// (no catalog filter) — orphan cleanup operates on the whole shared
-    /// `data_path` and must subtract every catalog's referenced files to avoid
-    /// deleting another catalog's data.
-    ///
-    /// Used by [`crate::maintenance::delete_orphaned_files_multicatalog`].
-    pub(crate) async fn list_referenced_paths(&self) -> Result<Vec<(String, bool)>> {
+    /// Every physical file referenced by a catalog whose effective `data_path`
+    /// matches one of `data_paths`. Canonical-root cleanup must preserve aliases.
+    pub(crate) async fn list_referenced_paths_in_data_paths(
+        &self,
+        data_paths: &[String],
+    ) -> Result<Vec<(String, bool)>> {
         let q = format!(
-            "SELECT {PG_RESOLVED_PATH} AS p, {PG_REL_FLAG} AS rel
+            "WITH root_catalog AS (
+                 SELECT catalog_id FROM ducklake_catalog
+                 WHERE data_path::TEXT = ANY($1)
+             )
+             SELECT {PG_RESOLVED_PATH} AS p, {PG_REL_FLAG} AS rel
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+             WHERE m.catalog_id IN (SELECT catalog_id FROM root_catalog)
              UNION ALL
              SELECT {PG_RESOLVED_PATH} AS p, {PG_REL_FLAG} AS rel
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+             WHERE m.catalog_id IN (SELECT catalog_id FROM root_catalog)
              UNION ALL
              SELECT path AS p, path_is_relative AS rel
-             FROM ducklake_files_scheduled_for_deletion"
+             FROM ducklake_files_scheduled_for_deletion
+             WHERE catalog_id IN (SELECT catalog_id FROM root_catalog)"
         );
         let rows = sqlx::query(AssertSqlSafe(q.as_str()))
+            .bind(data_paths)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()

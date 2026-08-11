@@ -3932,7 +3932,7 @@ async fn delete_orphaned_files_reclaims_dropped_catalog_files() {
 /// Global sweep must NOT delete files referenced by ANY catalog. With two
 /// catalogs sharing `data_path` plus a stray, only the stray gets removed.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "pre-cat_{id} fixture layout + orphan-cleanup id collision; fixed with the maintenance rework"]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
     use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
     use datafusion_ducklake::metadata_writer::DataFileInfo;
@@ -3956,6 +3956,7 @@ async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
     wa.set_data_path(data_path.to_str().unwrap()).unwrap();
+    wb.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     // A and B each have one referenced data file.
     let sa = wa
@@ -3990,9 +3991,13 @@ async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
     .unwrap();
 
     // Materialise the three files: A's referenced, B's referenced, one stray.
-    let a_file = data_path.join("public").join("t").join("a.parquet");
-    let b_file = data_path.join("public").join("u").join("b.parquet");
-    let stray = data_path.join("public").join("t").join("stray.parquet");
+    let a_file = data_path
+        .join(format!("cat_{cat_a}"))
+        .join("public/t/a.parquet");
+    let b_file = data_path
+        .join(format!("cat_{cat_b}"))
+        .join("public/u/b.parquet");
+    let stray = data_path.join("stray.parquet");
     std::fs::create_dir_all(a_file.parent().unwrap()).unwrap();
     std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
     std::fs::write(&a_file, b"a").unwrap();
@@ -4004,12 +4009,7 @@ async fn delete_orphaned_files_spares_files_referenced_by_any_catalog() {
         .await
         .unwrap();
 
-    assert_eq!(deleted.len(), 1, "only the stray is unreferenced");
-    assert!(
-        deleted[0].ends_with("public/t/stray.parquet"),
-        "got {:?}",
-        deleted[0]
-    );
+    assert_eq!(deleted, vec![stray.to_string_lossy().into_owned()]);
     assert!(!stray.exists());
     assert!(a_file.exists(), "A's referenced file survives");
     assert!(b_file.exists(), "B's referenced file survives");

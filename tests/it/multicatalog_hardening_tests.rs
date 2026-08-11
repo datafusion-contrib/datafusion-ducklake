@@ -12,9 +12,11 @@
 
 use std::sync::Arc;
 
+use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
-    MulticatalogManager, PostgresMetadataWriter, initialize_multicatalog_schema,
+    MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
+    initialize_multicatalog_schema,
 };
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -380,24 +382,479 @@ async fn get_or_create_table_rejects_cross_catalog_schema_id() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn set_data_path_rejects_silent_overwrite() {
+async fn set_data_path_is_catalog_scoped_and_rejects_silent_overwrite() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
     let mgr = MulticatalogManager::new(pool.clone());
-    let cat = mgr.create_catalog("pg_prod").await.unwrap();
-    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let writer_a = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let writer_b = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
         .await
         .unwrap();
 
-    w.set_data_path("/data/a").unwrap();
-    // Same value is idempotent.
-    w.set_data_path("/data/a").unwrap();
-    // Different value rejected.
-    let err = w
+    writer_a.set_data_path("/data/a").unwrap();
+    writer_a.set_data_path("/data/a").unwrap();
+    let missing = writer_b
+        .get_data_path()
+        .expect_err("an unconfigured catalog must not inherit another root");
+    writer_b.set_data_path("/data/b").unwrap();
+    let err = writer_a
         .set_data_path("/data/b")
         .expect_err("must reject overwrite");
-    assert!(err.to_string().contains("already set"), "got: {}", err);
-    // Original value is untouched.
-    assert_eq!(w.get_data_path().unwrap(), "/data/a");
+    assert!(
+        err.to_string().contains("already set"),
+        "unexpected error: {err}"
+    );
+    assert!(missing.to_string().contains("not configured"));
+
+    let provider_a = MulticatalogProvider::with_pool_and_id(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let provider_b = MulticatalogProvider::with_pool_and_id(pool, cat_b)
+        .await
+        .unwrap();
+
+    assert_eq!(writer_a.get_data_path().unwrap(), "/data/a");
+    assert_eq!(writer_b.get_data_path().unwrap(), "/data/b");
+    assert_eq!(provider_a.get_data_path().unwrap(), "/data/a");
+    assert_eq!(provider_b.get_data_path().unwrap(), "/data/b");
+    assert_eq!(
+        mgr.get_data_path_in_catalog("cat_a").await.unwrap(),
+        "/data/a"
+    );
+    assert_eq!(
+        mgr.get_data_path_in_catalog("cat_b").await.unwrap(),
+        "/data/b"
+    );
+    let missing_global = mgr
+        .get_data_path()
+        .await
+        .expect_err("a fresh multicatalog store must not seed the legacy root");
+    assert!(missing_global.to_string().contains("not configured"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn legacy_data_path_is_backfilled_and_rejects_overwrite() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let catalog_id = mgr.create_catalog("legacy").await.unwrap();
+    sqlx::query("ALTER TABLE ducklake_catalog DROP COLUMN data_path")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope)
+         VALUES ('data_path', '/data/legacy', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let error = writer
+        .set_data_path("/data/new")
+        .expect_err("the migrated path is already established");
+
+    assert!(error.to_string().contains("already set"));
+    assert_eq!(writer.get_data_path().unwrap(), "/data/legacy");
+
+    let fresh_id = mgr.create_catalog("fresh").await.unwrap();
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let fresh = PostgresMetadataWriter::with_pool(pool, fresh_id)
+        .await
+        .unwrap();
+    let missing = fresh
+        .get_data_path()
+        .expect_err("a post-migration catalog must remain unconfigured");
+    fresh.set_data_path("/data/fresh").unwrap();
+    assert!(missing.to_string().contains("not configured"));
+    assert_eq!(fresh.get_data_path().unwrap(), "/data/fresh");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn reader_uses_legacy_data_path_before_writer_migration() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let catalog_id = mgr.create_catalog("legacy_reader").await.unwrap();
+    sqlx::query("ALTER TABLE ducklake_catalog DROP COLUMN data_path")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope)
+         VALUES ('data_path', '/data/legacy-reader', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let provider = MulticatalogProvider::with_pool_and_id(pool, catalog_id)
+        .await
+        .unwrap();
+
+    assert_eq!(provider.get_data_path().unwrap(), "/data/legacy-reader");
+    assert_eq!(
+        mgr.get_data_path_in_catalog("legacy_reader").await.unwrap(),
+        "/data/legacy-reader"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn global_orphan_cleanup_errors_without_data_path() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool);
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let error = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("data_path' not configured"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn catalog_orphan_cleanup_keeps_shared_root_peer_files() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_in_catalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let writer_a = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let writer_b = PostgresMetadataWriter::with_pool(pool, cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer_a.set_data_path(data_path.to_str().unwrap()).unwrap();
+    writer_b
+        .set_data_path(&format!("{}/", data_path.display()))
+        .unwrap();
+
+    for (writer, table, file) in [(&writer_a, "a", "a.parquet"), (&writer_b, "b", "b.parquet")] {
+        let setup = writer
+            .begin_write_transaction("public", table, &users_cols(), WriteMode::Replace)
+            .unwrap();
+        writer
+            .register_data_file(
+                setup.table_id,
+                "public",
+                table,
+                setup.snapshot_id,
+                &DataFileInfo::new(file, 100, 1),
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &users_cols(),
+                &setup.column_ids,
+            )
+            .unwrap();
+    }
+
+    let a_file = data_path
+        .join(format!("cat_{cat_a}"))
+        .join("public/a/a.parquet");
+    let b_file = data_path
+        .join(format!("cat_{cat_b}"))
+        .join("public/b/b.parquet");
+    let orphan_file = data_path.join("orphan.parquet");
+    std::fs::create_dir_all(a_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
+    std::fs::write(&a_file, b"a").unwrap();
+    std::fs::write(&b_file, b"b").unwrap();
+    std::fs::write(&orphan_file, b"orphan").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted =
+        delete_orphaned_files_in_catalog(&mgr, "cat_a", store, CleanupCriteria::All, false)
+            .await
+            .unwrap();
+
+    assert_eq!(deleted, vec![orphan_file.to_string_lossy().into_owned()]);
+    assert!(a_file.exists());
+    assert!(b_file.exists());
+    assert!(!orphan_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn global_orphan_cleanup_keeps_nested_root_files() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("parent").await.unwrap();
+    let cat_b = mgr.create_catalog("nested").await.unwrap();
+    let writer_a = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let writer_b = PostgresMetadataWriter::with_pool(pool, cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let root_a = temp.path().join("data");
+    let root_b = root_a.join("tenant");
+    std::fs::create_dir_all(&root_b).unwrap();
+    writer_a.set_data_path(root_a.to_str().unwrap()).unwrap();
+    writer_b.set_data_path(root_b.to_str().unwrap()).unwrap();
+
+    for (writer, table, file) in [(&writer_a, "a", "a.parquet"), (&writer_b, "b", "b.parquet")] {
+        let setup = writer
+            .begin_write_transaction("public", table, &users_cols(), WriteMode::Replace)
+            .unwrap();
+        writer
+            .register_data_file(
+                setup.table_id,
+                "public",
+                table,
+                setup.snapshot_id,
+                &DataFileInfo::new(file, 100, 1),
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &users_cols(),
+                &setup.column_ids,
+            )
+            .unwrap();
+    }
+
+    let a_file = root_a
+        .join(format!("cat_{cat_a}"))
+        .join("public/a/a.parquet");
+    let b_file = root_b
+        .join(format!("cat_{cat_b}"))
+        .join("public/b/b.parquet");
+    let orphan_file = root_a.join("orphan.parquet");
+    std::fs::create_dir_all(a_file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
+    std::fs::write(&a_file, b"a").unwrap();
+    std::fs::write(&b_file, b"b").unwrap();
+    std::fs::write(&orphan_file, b"orphan").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, vec![orphan_file.to_string_lossy().into_owned()]);
+    assert!(a_file.exists());
+    assert!(b_file.exists());
+    assert!(!orphan_file.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn global_orphan_cleanup_reclaims_dropped_distinct_root_catalog() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let writer_a = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let writer_b = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let root_a = temp.path().join("a");
+    let root_b = temp.path().join("b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    writer_a.set_data_path(root_a.to_str().unwrap()).unwrap();
+    writer_b.set_data_path(root_b.to_str().unwrap()).unwrap();
+
+    let setup = writer_b
+        .begin_write_transaction("public", "b", &users_cols(), WriteMode::Replace)
+        .unwrap();
+    writer_b
+        .register_data_file(
+            setup.table_id,
+            "public",
+            "b",
+            setup.snapshot_id,
+            &DataFileInfo::new("b.parquet", 100, 1),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &users_cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_files_scheduled_for_deletion
+             (catalog_id, data_file_id, path, path_is_relative)
+         VALUES ($1, 999, 'scheduled.parquet', TRUE)",
+    )
+    .bind(cat_b)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let b_file = root_b
+        .join(format!("cat_{cat_b}"))
+        .join("public/b/b.parquet");
+    std::fs::create_dir_all(b_file.parent().unwrap()).unwrap();
+    std::fs::write(&b_file, b"b").unwrap();
+
+    assert!(mgr.drop_catalog("cat_b").await.unwrap());
+    let scheduled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert_eq!(scheduled, 0);
+    assert_eq!(deleted, vec![b_file.to_string_lossy().into_owned()]);
+    assert!(!b_file.exists());
+    assert_eq!(
+        mgr.list_data_paths().await.unwrap(),
+        vec![root_a.to_string_lossy().into_owned()],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn global_orphan_cleanup_groups_dropped_path_aliases() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let catalog_id = mgr.create_catalog("live").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let setup = writer
+        .begin_write_transaction("public", "live", &users_cols(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            setup.table_id,
+            "public",
+            "live",
+            setup.snapshot_id,
+            &DataFileInfo::new("live.parquet", 100, 1),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &users_cols(),
+            &setup.column_ids,
+        )
+        .unwrap();
+    let data_path_alias = format!("{}/", data_path.display());
+    sqlx::query(
+        "INSERT INTO ducklake_dropped_data_path (data_path, dropped_at)
+         VALUES ($1, NOW() + INTERVAL '1 hour')",
+    )
+    .bind(&data_path_alias)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let live_file = data_path
+        .join(format!("cat_{catalog_id}"))
+        .join("public/live/live.parquet");
+    let orphan_file = data_path.join("orphan.parquet");
+    std::fs::create_dir_all(live_file.parent().unwrap()).unwrap();
+    std::fs::write(&live_file, b"live").unwrap();
+    std::fs::write(&orphan_file, b"orphan").unwrap();
+
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, vec![orphan_file.to_string_lossy().into_owned()]);
+    assert!(live_file.exists());
+    assert!(!orphan_file.exists());
+    assert_eq!(
+        mgr.list_data_paths().await.unwrap(),
+        vec![data_path.to_string_lossy().into_owned(), data_path_alias.clone()],
+    );
+
+    sqlx::query(
+        "UPDATE ducklake_dropped_data_path
+         SET dropped_at = NOW() - INTERVAL '1 hour' WHERE data_path = $1",
+    )
+    .bind(&data_path_alias)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert!(deleted.is_empty());
+    assert_eq!(
+        mgr.list_data_paths().await.unwrap(),
+        vec![data_path.to_string_lossy().into_owned()],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn global_orphan_cleanup_rejects_multiple_object_store_authorities() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_multicatalog};
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let writer_a = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let writer_b = PostgresMetadataWriter::with_pool(pool, cat_b)
+        .await
+        .unwrap();
+    writer_a.set_data_path("s3://bucket-a/data").unwrap();
+    writer_b.set_data_path("s3://bucket-b/data").unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+
+    let error = delete_orphaned_files_multicatalog(&mgr, store, CleanupCriteria::All, false)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("multiple object-store authorities")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
