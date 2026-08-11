@@ -1550,6 +1550,7 @@ impl RollingFileWriter {
 
 /// Write the parquet footer and flush the staging file to disk, releasing its
 /// descriptor. Synchronous, so a streaming write needs no await to roll a file.
+#[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
 fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
     let staged = file.writer.into_inner()?;
     // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
@@ -1569,6 +1570,7 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
 /// Upload a finished staging file and harvest its per-column stats, returning the
 /// [`DataFileInfo`] for the catalog commit (relative path; the caller stamps any
 /// partition). On failure the multipart upload is aborted so no partial object is left.
+#[tracing::instrument(name = "ducklake.upload_staged_file", level = "info", skip_all)]
 async fn upload_staged_file(
     staged: StagedFile,
     object_store: &Arc<dyn ObjectStore>,
@@ -1970,6 +1972,7 @@ impl TableWriteSession {
         self.object_path.as_ref()
     }
 
+    #[tracing::instrument(name = "ducklake.write_session_finish", level = "info", skip_all)]
     pub async fn finish(mut self) -> Result<WriteResult> {
         // Rolling: finish the in-progress file, upload every file this session
         // produced, and commit them in ONE snapshot.
@@ -2182,6 +2185,7 @@ impl TableWriteSession {
     /// Finalise + upload the staged parquet and return its [`DataFileInfo`],
     /// leaving the metadata commit to the caller. Shared by
     /// [`finish`](Self::finish) and [`finish_with_deletes`](Self::finish_with_deletes).
+    #[tracing::instrument(name = "ducklake.upload_staged", level = "info", skip_all)]
     async fn upload_staged(&mut self) -> Result<DataFileInfo> {
         let writer = self.writer.take().ok_or_else(|| {
             crate::error::DuckLakeError::Internal("Writer already closed".to_string())

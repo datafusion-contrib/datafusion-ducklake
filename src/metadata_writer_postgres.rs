@@ -915,6 +915,12 @@ async fn recompute_table_column_stats(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "ducklake.finalize_snapshot",
+    level = "info",
+    skip_all,
+    fields(catalog_id, schema_name, table_name)
+)]
 async fn finalize_snapshot(
     catalog_id: i64,
     schema_name: &str,
@@ -1878,6 +1884,12 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "ducklake.register_data_files",
+        level = "info",
+        skip_all,
+        fields(table_id, schema_name, table_name, files = files.len(), columns = columns.len())
+    )]
     fn register_data_files_with_commit_metadata(
         &self,
         table_id: i64,
@@ -4079,6 +4091,12 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    #[tracing::instrument(
+        name = "ducklake.begin_write_transaction",
+        level = "info",
+        skip_all,
+        fields(schema_name, table_name, columns = columns.len())
+    )]
     fn begin_write_transaction(
         &self,
         schema_name: &str,
