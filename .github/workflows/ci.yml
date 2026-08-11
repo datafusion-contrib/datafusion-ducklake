@@ -194,6 +194,12 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         run: cargo clippy ${{ runner.os == 'Linux' && '--workspace' || '' }} --all-targets --all-features --no-deps -- -D warnings
 
+      # `--lib` excludes dev dependencies, so their DataFusion defaults and
+      # object_store `aws`/`fs` features cannot mask production dependencies.
+      - name: Check library without dev dependencies
+        if: steps.changes.outputs.code == 'true' && runner.os == 'Linux'
+        run: cargo check --locked --lib --no-default-features
+
       # macOS only. This step used to run on Linux too, as
       # `cargo test --features write-sqlite` — but `--features` keeps the default
       # features on, so that feature set (metadata-duckdb + duckdb-bundled +
