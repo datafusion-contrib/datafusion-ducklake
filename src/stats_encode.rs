@@ -14,15 +14,14 @@
 //! ## Coverage
 //!
 //! Encoded exactly (min/max emitted): signed/unsigned integers, `BOOLEAN`,
-//! `FLOAT`/`DOUBLE`, `DECIMAL(p,s)` (128-bit), `DATE`, and `TIMESTAMP` without a
-//! time zone (all Arrow time units).
+//! `FLOAT`/`DOUBLE`, `DECIMAL(p,s)` (128-bit), `DATE`, and `TIMESTAMP` with or
+//! without a time zone (all Arrow time units). Timezone-bearing timestamps are
+//! normalized to UTC so their encoding is independent of the DuckDB session
+//! time zone.
 //!
 //! Deliberately **not** encoded yet — [`encode_scalar`] returns `None`, so the
 //! caller stores `min_value`/`max_value` as `NULL` and the file is never pruned on
 //! that column (spec-safe: DuckLake keeps files whose stats are NULL). Deferred:
-//! - `TIMESTAMP WITH TIME ZONE` — DuckDB renders it in the *session* time zone, so
-//!   the stored string is not deterministic without pinning a zone; deferred until
-//!   we settle on UTC rendering. See `[[timestamptz-stats]]`.
 //! - `TIME`, `BLOB`/`BINARY` (DuckLake never prunes on blobs anyway), `UUID`,
 //!   `INTERVAL`, `DECIMAL256`, and all nested types (`STRUCT`/`LIST`/`MAP`).
 //! - Over-long strings (see [`MAX_STRING_STAT_BYTES`]) — DuckDB truncates and
@@ -71,12 +70,18 @@ pub fn encode_scalar(value: &ScalarValue) -> Option<String> {
 
         ScalarValue::Date32(Some(days)) => encode_date32(*days),
 
-        // TIMESTAMP without a time zone. WITH time zone (`tz.is_some()`) is
-        // deferred — see `[[timestamptz-stats]]` in the module docs.
-        ScalarValue::TimestampSecond(Some(v), None) => encode_timestamp(*v, 1),
-        ScalarValue::TimestampMillisecond(Some(v), None) => encode_timestamp(*v, 1_000),
-        ScalarValue::TimestampMicrosecond(Some(v), None) => encode_timestamp(*v, 1_000_000),
-        ScalarValue::TimestampNanosecond(Some(v), None) => encode_timestamp(*v, 1_000_000_000),
+        ScalarValue::TimestampSecond(Some(v), timezone) => {
+            encode_timestamp(*v, 1, timezone.is_some())
+        },
+        ScalarValue::TimestampMillisecond(Some(v), timezone) => {
+            encode_timestamp(*v, 1_000, timezone.is_some())
+        },
+        ScalarValue::TimestampMicrosecond(Some(v), timezone) => {
+            encode_timestamp(*v, 1_000_000, timezone.is_some())
+        },
+        ScalarValue::TimestampNanosecond(Some(v), timezone) => {
+            encode_timestamp(*v, 1_000_000_000, timezone.is_some())
+        },
 
         // Strings — stored verbatim, subject to the length guard and the NUL
         // rule. A `\0` byte is dropped (→ SQL NULL) exactly as official DuckLake's
@@ -122,10 +127,10 @@ pub fn is_encodable_type(value: &ScalarValue) -> bool {
             | ScalarValue::Utf8View(_)
     ) || matches!(
         value,
-        ScalarValue::TimestampSecond(_, None)
-            | ScalarValue::TimestampMillisecond(_, None)
-            | ScalarValue::TimestampMicrosecond(_, None)
-            | ScalarValue::TimestampNanosecond(_, None)
+        ScalarValue::TimestampSecond(_, _)
+            | ScalarValue::TimestampMillisecond(_, _)
+            | ScalarValue::TimestampMicrosecond(_, _)
+            | ScalarValue::TimestampNanosecond(_, _)
     )
 }
 
@@ -486,9 +491,9 @@ fn encode_date32(days: i32) -> Option<String> {
     Some(date.format("%Y-%m-%d").to_string())
 }
 
-/// Encode a naive timestamp given its value in `units_per_second` sub-second
-/// units (1 = seconds, 1_000 = millis, 1_000_000 = micros, 1e9 = nanos).
-fn encode_timestamp(value: i64, units_per_second: i64) -> Option<String> {
+/// Encode a timestamp given its value in `units_per_second` sub-second units
+/// (1 = seconds, 1_000 = millis, 1_000_000 = micros, 1e9 = nanos).
+fn encode_timestamp(value: i64, units_per_second: i64, timezone: bool) -> Option<String> {
     let secs = value.div_euclid(units_per_second);
     let sub = value.rem_euclid(units_per_second); // 0..units_per_second
     // Convert the sub-second remainder to nanoseconds for chrono.
@@ -506,11 +511,15 @@ fn encode_timestamp(value: i64, units_per_second: i64) -> Option<String> {
         _ => String::new(),
     };
     let frac = frac.trim_end_matches('0');
-    if frac.is_empty() {
-        Some(base)
+    let mut encoded = if frac.is_empty() {
+        base
     } else {
-        Some(format!("{base}.{frac}"))
+        format!("{base}.{frac}")
+    };
+    if timezone {
+        encoded.push_str("+00");
     }
+    Some(encoded)
 }
 
 #[cfg(test)]
@@ -643,6 +652,17 @@ mod tests {
             ScalarValue::TimestampSecond(Some(-1), None),
             "1969-12-31 23:59:59",
         );
+        golden(
+            ScalarValue::TimestampMicrosecond(Some(-876_544), Some(Arc::from("UTC"))),
+            "1969-12-31 23:59:59.123456+00",
+        );
+        golden(
+            ScalarValue::TimestampNanosecond(
+                Some(1_578_227_696_123_456_789),
+                Some(Arc::from("America/New_York")),
+            ),
+            "2020-01-05 12:34:56.123456789+00",
+        );
     }
 
     #[test]
@@ -662,14 +682,7 @@ mod tests {
     fn nulls_and_unsupported_are_none() {
         assert_eq!(encode_scalar(&ScalarValue::Int32(None)), None);
         assert_eq!(encode_scalar(&ScalarValue::Float64(None)), None);
-        // Time / tz-timestamp / binary are deferred ⇒ None.
-        assert_eq!(
-            encode_scalar(&ScalarValue::TimestampMicrosecond(
-                Some(0),
-                Some(Arc::from("UTC"))
-            )),
-            None
-        );
+        // Time and binary are deferred ⇒ None.
         assert_eq!(
             encode_scalar(&ScalarValue::Binary(Some(vec![0xAB, 0x01]))),
             None
@@ -808,7 +821,7 @@ mod tests {
         assert!(is_encodable_type(&ScalarValue::TimestampMicrosecond(
             None, None
         )));
-        assert!(!is_encodable_type(&ScalarValue::TimestampMicrosecond(
+        assert!(is_encodable_type(&ScalarValue::TimestampMicrosecond(
             None,
             Some(Arc::from("UTC"))
         )));

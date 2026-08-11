@@ -18,7 +18,11 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use datafusion_ducklake::{DuckLakeTableWriter, MetadataWriter, SqliteMetadataWriter};
+use datafusion::prelude::SessionContext;
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter,
+};
 use object_store::local::LocalFileSystem;
 use sqlx::{Row, SqlitePool};
 use tempfile::TempDir;
@@ -46,6 +50,11 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
         Field::new("id", DataType::Int32, false),
         Field::new("name", DataType::Utf8, true),
         Field::new("d", DataType::Date32, true),
+        Field::new(
+            "tsz",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+            false,
+        ),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -57,6 +66,14 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some(18266),
                 Some(18264),
             ])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![
+                    -876_544,
+                    1_705_321_800_123_456,
+                    1_578_227_696_123_456,
+                ])
+                .with_timezone("America/New_York"),
+            ),
         ],
     )
     .unwrap();
@@ -112,6 +129,12 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some(0),
                 Some(3)
             ),
+            (
+                Some("1969-12-31 23:59:59.123456+00".to_string()),
+                Some("2024-01-15 12:30:00.123456+00".to_string()),
+                Some(0),
+                Some(3)
+            ),
         ],
         "per-file zone maps must match DuckDB-canonical encodings"
     );
@@ -130,7 +153,7 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
             .collect();
     assert_eq!(
         sizes.len(),
-        3,
+        4,
         "one column_size_bytes row per written column"
     );
     for (i, s) in sizes.iter().enumerate() {
@@ -172,9 +195,185 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
                 Some("2020-01-01".to_string()),
                 Some("2020-01-05".to_string())
             ),
+            (
+                Some(false),
+                Some("1969-12-31 23:59:59.123456+00".to_string()),
+                Some("2024-01-15 12:30:00.123456+00".to_string())
+            ),
         ],
         "table-wide roll-up must reflect the single file's bounds"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamptz_stats_prune_disjoint_file() {
+    let (_temp, db_url, low_values, _) = write_timestamptz_files().await;
+    let ctx = timestamptz_context(&db_url).await;
+    let sql = "SELECT tsz FROM test.main.t WHERE tsz < TIMESTAMP '2025-01-01 00:00:00+00:00'";
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(
+        display.matches(".parquet").count(),
+        1,
+        "the disjoint 2030 file must be pruned:\n{display}",
+    );
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(timestamp_values(&batches), low_values);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamptz_catalog_without_bounds_remains_readable() {
+    let (_temp, db_url, low_values, high_values) = write_timestamptz_files().await;
+    let pool = SqlitePool::connect(&db_url).await.unwrap();
+    let file_rows = sqlx::query(
+        "UPDATE ducklake_file_column_stats
+         SET min_value = NULL, max_value = NULL
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'tsz')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    let table_rows = sqlx::query(
+        "UPDATE ducklake_table_column_stats
+         SET min_value = NULL, max_value = NULL
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'tsz')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(file_rows, 2);
+    assert_eq!(table_rows, 1);
+    let file_bounds: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT min_value, max_value
+         FROM ducklake_file_column_stats
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'tsz')
+         ORDER BY data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let table_bounds: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT min_value, max_value
+         FROM ducklake_table_column_stats
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'tsz')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(file_bounds, vec![(None, None), (None, None)]);
+    assert_eq!(table_bounds, (None, None));
+
+    let ctx = timestamptz_context(&db_url).await;
+    let all = ctx
+        .sql("SELECT tsz FROM test.main.t ORDER BY tsz")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut expected = low_values.clone();
+    expected.extend(high_values);
+    assert_eq!(timestamp_values(&all), expected);
+
+    let sql = "SELECT tsz FROM test.main.t
+               WHERE tsz < TIMESTAMP '2025-01-01 00:00:00+00:00'
+               ORDER BY tsz";
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let display = datafusion::physical_plan::displayable(plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert_eq!(
+        display.matches(".parquet").count(),
+        2,
+        "files without timestamp bounds must not be pruned:\n{display}",
+    );
+    let filtered = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(timestamp_values(&filtered), low_values);
+}
+
+async fn write_timestamptz_files() -> (TempDir, String, Vec<i64>, Vec<i64>) {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("stats.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    let db_url = format!("sqlite:{}", db_path.display());
+    let conn_str = format!("{db_url}?mode=rwc");
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "tsz",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )]));
+    let low_values = vec![1_705_321_800_123_456, 1_705_321_800_123_457];
+    let low = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(TimestampMicrosecondArray::from(low_values.clone()).with_timezone("UTC"))],
+    )
+    .unwrap();
+    let high_values = vec![1_894_710_600_000_000, 1_894_710_600_000_001];
+    let high = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(TimestampMicrosecondArray::from(high_values.clone()).with_timezone("UTC"))],
+    )
+    .unwrap();
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer), Arc::new(LocalFileSystem::new())).unwrap();
+    table_writer.write_table("main", "t", &[low]).await.unwrap();
+    table_writer
+        .append_table("main", "t", &[high])
+        .await
+        .unwrap();
+    (temp, db_url, low_values, high_values)
+}
+
+async fn timestamptz_context(db_url: &str) -> SessionContext {
+    let provider = SqliteMetadataProvider::new(db_url).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(catalog));
+    ctx
+}
+
+fn timestamp_values(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect()
 }
 
 /// Differential dump vs official DuckLake: writes the SAME diverse-typed data

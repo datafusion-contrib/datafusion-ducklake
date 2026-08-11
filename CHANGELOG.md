@@ -64,6 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed
+- Timezone-aware timestamp writes now record UTC min/max statistics for file pruning; catalogs
+  written before this change remain readable with absent bounds.
 - A keyed `DELETE` or `UPDATE` works on a data file that compaction has rewritten. The filtered
   delete path previously refused such a file outright — a v1 scope limit, documented as though
   position resolution depended on `rowid = row_id_start + physical position`. It does not:
