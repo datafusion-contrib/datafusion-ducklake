@@ -1,4 +1,4 @@
-#![cfg(feature = "metadata-postgres")]
+#![cfg(all(feature = "metadata-postgres", feature = "metadata-duckdb"))]
 //! PostgreSQL metadata provider tests
 //!
 //! This test suite verifies the PostgreSQL metadata provider implementation,

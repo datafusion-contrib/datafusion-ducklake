@@ -53,6 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableChangesTable`, `TableInsertionsTable` and `TableDeletionsTable` accept the table's columns
   through a new `with_columns` builder. No signature changed; without it the columns are read from
   the metadata provider on each scan.
+- **BREAKING**: PostgreSQL metadata features no longer select a TLS provider. Consumers that need
+  TLS must also enable one of `tls-native-tls`, `tls-rustls-aws-lc-rs`, or `tls-rustls-ring`.
+  Without one, SQLx rejects connections that require TLS and may try plaintext when `sslmode`
+  prefers TLS. No catalog or data migration is needed.
+- **BREAKING**: S3 support is no longer selected by the library. Consumers using
+  `object_store::aws` must enable `object_store/aws` in their application or register another
+  `ObjectStore` implementation with DataFusion. Local filesystem support remains available through
+  DataFusion without extra configuration. No catalog or data migration is needed.
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed

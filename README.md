@@ -33,16 +33,22 @@ Add the crate:
 cargo add datafusion-ducklake
 ```
 
-The default build includes the DuckDB catalog backend, statically bundled. Other
-backends and write support are opt-in via feature flags — see
-[COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
+The default build includes the statically bundled DuckDB catalog backend. Applications configure
+their object store implementation directly. Other catalog backends and write support are opt‑in
+via feature flags. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
 
 ```toml
 # Cargo.toml — read PostgreSQL catalogs
 # (for the experimental multi-catalog write path, use features = ["write-postgres"])
-[dependencies]
-datafusion-ducklake = { version = "0.5", features = ["metadata-postgres"] }
+[dependencies.datafusion-ducklake]
+version = "0.6"
+default-features = false
+features = ["metadata-postgres", "tls-rustls-aws-lc-rs"]
 ```
+
+`metadata-postgres`, `multicatalog-postgres`, and `write-postgres` do not select a TLS provider.
+Plain local connections work without one. For TLS, also enable one of `tls-native-tls`,
+`tls-rustls-aws-lc-rs`, or `tls-rustls-ring` on `datafusion-ducklake`.
 
 The examples below also use `datafusion`, `object_store`, and `url` directly — add them
 to your `[dependencies]` as well (this crate does not re-export them). The write example
@@ -55,6 +61,15 @@ Run a query against an existing PostgreSQL catalog with the bundled example:
 cargo run --example basic_query --features metadata-postgres -- \
   "postgresql://user:password@localhost:5432/database" "SELECT * FROM main.users"
 ```
+
+Configure `object_store` directly for local, S3, or MinIO data files. Applications can instead
+register another DataFusion `ObjectStore`, such as an OpenDAL‑backed connector.
+
+DataFusion enables local filesystem support. S3 and MinIO applications must enable
+`object_store/aws` themselves. That feature enables Ring through its HTTP client. If another
+dependency enables AWS‑LC, install the intended process‑wide Rustls
+[`CryptoProvider`](https://docs.rs/rustls/0.23/rustls/crypto/struct.CryptoProvider.html) before
+creating TLS clients.
 
 (The example also accepts DuckDB, SQLite, and MySQL connection strings with the matching
 `metadata-*` feature — see [COMPATIBILITY.md](COMPATIBILITY.md).)

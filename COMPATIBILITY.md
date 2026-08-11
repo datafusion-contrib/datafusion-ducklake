@@ -25,6 +25,10 @@ below) where tables are created via `DuckLakeTableWriter` and then appended to w
 | PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
 | MySQL      |  ✅  |  ❌   |      ❌       | `metadata-mysql`                                       |
 
+The listed PostgreSQL features do not select a TLS provider. Plain local connections work without
+one. For TLS, also enable one of `tls-native-tls`, `tls-rustls-aws-lc-rs`, or
+`tls-rustls-ring`.
+
 PostgreSQL has **two** writers, both behind `write-postgres`:
 
 | Writer | Layout | Spec-compliant | SQL `CREATE TABLE`/CTAS | Read back with |
@@ -60,9 +64,16 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 | Store                       | Supported | Notes                                              |
 |-----------------------------|:---------:|----------------------------------------------------|
 | Local filesystem            |    ✅     | Available by default via DataFusion's object store |
-| S3-compatible (S3, MinIO)   |    ✅     | Register with `RuntimeEnv::register_object_store`  |
+| S3-compatible (S3, MinIO)   |    ✅     | Enable `object_store/aws` in the application       |
 | Google Cloud Storage        |    ❌     | Not currently wired up                             |
 | Azure Blob Storage          |    ❌     | Not currently wired up                             |
+
+Applications configure `object_store` directly for local files, S3, or MinIO, or register another
+compatible `ObjectStore` implementation with DataFusion, including an OpenDAL‑backed connector.
+DuckLake enables the filesystem and AWS providers only for its own tests and examples.
+
+Enabling `object_store/aws` also enables Ring through its HTTP client. If another dependency enables
+AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before creating TLS clients.
 
 ---
 
@@ -79,6 +90,9 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 | `write-sqlite`           | Write to SQLite catalogs (`write` + `metadata-sqlite`)                   |         |
 | `write-postgres`         | Write to PostgreSQL catalogs (`write` + `metadata-postgres` + multi-catalog) |     |
 | `multicatalog-postgres`  | Read multiple catalogs from one PostgreSQL store                         |         |
+| `tls-native-tls`         | Use native TLS for SQLx PostgreSQL connections                           |         |
+| `tls-rustls-aws-lc-rs`   | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                   |         |
+| `tls-rustls-ring`        | Use Rustls with Ring for SQLx PostgreSQL connections                     |         |
 | `encryption`             | Parquet Modular Encryption (PME) reads                                   |         |
 | `skip-tests-with-docker` | CI-only: skip tests that require Docker                                  |         |
 
