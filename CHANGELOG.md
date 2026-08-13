@@ -64,8 +64,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
 
 ### Fixed
+- Hive partition directory names are percent-encoded, matching official DuckLake byte for byte.
+  The previous mapping replaced every character outside `[A-Za-z0-9-_.:]` with `_`, so a partition
+  value containing a space, `+`, or `/` produced a directory name official never writes and which
+  could not be decoded back to the value — `ts=2024-01-15_12:30:00_00` where official writes
+  `ts=2024-01-15%2012%3A30%3A00%2B00`. Partition key names are now escaped on the same terms, as
+  official does. Only newly written files are affected: existing files are located by the path
+  recorded in `ducklake_data_file`, and pruning has always used the authoritative
+  `ducklake_file_partition_value`, so no catalog was damaged and no repair is needed.
 - Timezone-aware timestamp writes now record UTC min/max statistics for file pruning; catalogs
-  written before this change remain readable with absent bounds.
+  written before this change remain readable with absent bounds. This also lets an identity
+  partition key be a `timestamptz` column, which previously failed every `INSERT` with an
+  unsupported-value error because the partition value could not be encoded.
 - A keyed `DELETE` or `UPDATE` works on a data file that compaction has rewritten. The filtered
   delete path previously refused such a file outright — a v1 scope limit, documented as though
   position resolution depended on `rowid = row_id_start + physical position`. It does not:

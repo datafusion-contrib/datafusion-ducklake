@@ -1378,3 +1378,155 @@ async fn empty_overwrite_truncates_partitioned_table() {
         "empty INSERT OVERWRITE must truncate the partitioned table, not conflict"
     );
 }
+
+/// An identity partition key on a `timestamptz` column: writable at all (the
+/// partition value could not be encoded before timezone-aware statistics landed),
+/// with the catalog value and the Hive directory name both matching what the
+/// official DuckLake extension produces for the same instants.
+///
+/// The goldens come from DuckDB v1.5.5 + the official `ducklake` extension:
+/// `ALTER TABLE p SET PARTITIONED BY (ts)` then inserting these two values wrote
+/// `ducklake_file_partition_value` rows `2024-01-15 12:30:00+00` /
+/// `2024-06-02 04:00:00.5+00` and file paths under
+/// `ts=2024-01-15%2012%3A30%3A00%2B00` / `ts=2024-06-02%2004%3A00%3A00.5%2B00`.
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_partition_on_timestamptz_matches_official_layout() {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("tz.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let ts_type = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("ts", &ts_type, true).unwrap(),
+    ];
+
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let s = writer
+        .begin_write_transaction("main", "tz_events", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "tz_events",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            s.table_id,
+            &[("ts".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+    let table_id = s.table_id;
+
+    // The two instants the official extension was measured with.
+    let a: i64 = 1_705_321_800_000_000; // 2024-01-15 12:30:00+00
+    let b: i64 = 1_717_300_800_500_000; // 2024-06-02 04:00:00.5+00
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("ts", ts_type, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![a, b]).with_timezone("UTC")) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
+    let mut session = table_writer
+        .begin_write("main", "tz_events", schema.as_ref(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    let result = session.finish().await.unwrap();
+    assert_eq!(result.records_written, 2);
+    assert_eq!(
+        result.files_written, 2,
+        "each distinct timestamptz identity value is its own partition"
+    );
+
+    // The authoritative catalog values, and the Hive directory names, must both
+    // match official byte for byte.
+    let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
+    let snap = provider.get_current_snapshot().unwrap();
+    let page = provider
+        .get_table_file_metadata_page(table_id, snap, None, 4096)
+        .unwrap();
+    assert_eq!(page.len(), 2);
+    let mut pairs: Vec<(String, String)> = page
+        .iter()
+        .map(|meta| {
+            let value = meta
+                .file
+                .partition_values
+                .first()
+                .and_then(|(_, v)| v.clone())
+                .expect("a timestamptz identity key must record a partition value");
+            (value, meta.file.file.path.clone())
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs[0].0, "2024-01-15 12:30:00+00");
+    assert_eq!(pairs[1].0, "2024-06-02 04:00:00.5+00");
+    assert!(
+        pairs[0].1.starts_with("ts=2024-01-15%2012%3A30%3A00%2B00/"),
+        "expected official's percent-encoded Hive path, got {}",
+        pairs[0].1
+    );
+    assert!(
+        pairs[1]
+            .1
+            .starts_with("ts=2024-06-02%2004%3A00%3A00.5%2B00/"),
+        "expected official's percent-encoded Hive path, got {}",
+        pairs[1].1
+    );
+
+    // Both rows read back, and a filter prunes to the single matching partition.
+    let ctx = read_ctx(&conn_str).await;
+    let rows = ctx
+        .sql("SELECT id FROM ducklake.main.tz_events ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    let pruned = ctx
+        .sql(
+            "SELECT id FROM ducklake.main.tz_events \
+             WHERE ts = '2024-01-15T12:30:00Z' ORDER BY id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        pruned.iter().map(|b| b.num_rows()).sum::<usize>(),
+        1,
+        "filtering on the partition key must return exactly the matching row"
+    );
+}

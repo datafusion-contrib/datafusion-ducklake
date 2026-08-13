@@ -353,20 +353,25 @@ impl PartitionWriteSpec {
 /// empty string when there are no keys (an unpartitioned file lives directly
 /// under the table directory).
 ///
-/// A `None` value (SQL NULL) uses DuckDB's `__HIVE_DEFAULT_PARTITION__` sentinel,
-/// matching official DuckLake's on-disk layout. The catalog
-/// (`ducklake_file_partition_value`) is the authoritative source for pruning, so
-/// this path is for human readability and interop only — values are sanitized for
-/// the filesystem without affecting correctness, and a sanitization collision
-/// between two distinct values is harmless (files carry distinct UUID names and
-/// distinct catalog values).
+/// A `None` value (SQL NULL) uses DuckDB's `__HIVE_DEFAULT_PARTITION__` sentinel.
+/// Key names and values are percent-encoded by [`escape_partition_path`], which
+/// reproduces official DuckLake's on-disk layout byte for byte. Official escapes
+/// both halves through `HivePartitioning::Escape` in
+/// `src/storage/ducklake_partition_data.cpp`, and its insert path delegates
+/// directory naming to DuckDB core's partitioned COPY, which applies that same
+/// escape.
+///
+/// The catalog (`ducklake_file_partition_value`) remains the authoritative source
+/// for pruning — nothing reads values back out of the path — but the encoding is
+/// reversible, so the directory name alone identifies the partition value the way
+/// official's `HivePartitioning::Unescape` expects.
 pub(crate) fn hive_subpath(key_names: &[String], values: &[Option<String>]) -> String {
     let mut rel = String::new();
     for (i, value) in values.iter().enumerate() {
-        let name = key_names.get(i).map(String::as_str).unwrap_or("key");
+        let name = escape_partition_path(key_names.get(i).map(String::as_str).unwrap_or("key"));
         let encoded = match value {
-            Some(v) => sanitize_partition_path(v),
-            None => "__HIVE_DEFAULT_PARTITION__".to_string(),
+            Some(v) => escape_partition_path(v),
+            None => escape_partition_path("__HIVE_DEFAULT_PARTITION__"),
         };
         if rel.is_empty() {
             rel = format!("{name}={encoded}");
@@ -377,19 +382,31 @@ pub(crate) fn hive_subpath(key_names: &[String], values: &[Option<String>]) -> S
     rel
 }
 
-/// Sanitize a partition value for use in a Hive-style directory name — see
-/// [`hive_subpath`] for why a lossy mapping is safe here.
-fn sanitize_partition_path(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// Percent-encode one Hive directory-name component, byte for byte identical to
+/// DuckDB's `StringUtil::URLEncode` with `encode_slash = true` — the escape
+/// official DuckLake applies to every partition key name and value.
+///
+/// `A-Z`, `a-z`, `0-9`, `_`, `-`, `~` and `.` pass through; every other byte
+/// becomes `%` plus two **uppercase** hex digits. Encoding per byte rather than
+/// per `char` is what keeps multi-byte UTF-8 identical to DuckDB, which walks the
+/// string a byte at a time. `/` is escaped rather than preserved, so a value can
+/// never introduce a directory level or escape the partition directory.
+fn escape_partition_path(value: &str) -> String {
+    const HEX_DIGIT: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'~' | b'.' => {
+                out.push(char::from(*byte))
+            },
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX_DIGIT[usize::from(byte >> 4)]));
+                out.push(char::from(HEX_DIGIT[usize::from(byte & 15)]));
+            },
+        }
+    }
+    out
 }
 
 /// One partition group of a partitioned write: the per-key partition values every
@@ -694,18 +711,58 @@ mod tests {
             hive_subpath(&keys, &[Some("us".into()), Some("3".into())]),
             "region=us/day=3"
         );
-        // A NULL partition value uses DuckDB's sentinel directory name.
+        // A NULL partition value uses DuckDB's sentinel directory name. Every
+        // byte of it is unreserved, so escaping leaves it verbatim.
         assert_eq!(
             hive_subpath(&keys, &[None, Some("3".into())]),
             "region=__HIVE_DEFAULT_PARTITION__/day=3"
         );
-        // Path separators in a value can never escape the partition directory.
+        // Path separators in a value can never introduce a directory level or
+        // escape the partition directory: `/` encodes to %2F.
         assert_eq!(
             hive_subpath(&keys[..1], &[Some("a/../b".into())]),
-            "region=a_.._b"
+            "region=a%2F..%2Fb"
+        );
+        // A key name is escaped on the same terms as a value.
+        assert_eq!(
+            hive_subpath(&["odd name".to_string()], &[Some("x".into())]),
+            "odd%20name=x"
         );
         // No keys: the file lives directly under the table directory.
         assert_eq!(hive_subpath(&[], &[]), "");
+    }
+
+    /// Golden directory names captured from the official DuckLake extension
+    /// (DuckDB v1.5.5): a `timestamptz`-partitioned table written by
+    /// `ALTER TABLE … SET PARTITIONED BY (ts)` produced exactly these paths in
+    /// `ducklake_data_file.path`. The stored `partition_value` was the
+    /// unescaped `2024-01-15 12:30:00+00`, so this pins only the path encoding.
+    #[test]
+    fn hive_subpath_matches_official_ducklake_paths() {
+        let keys = vec!["ts".to_string()];
+        assert_eq!(
+            hive_subpath(&keys, &[Some("2024-01-15 12:30:00+00".into())]),
+            "ts=2024-01-15%2012%3A30%3A00%2B00"
+        );
+        assert_eq!(
+            hive_subpath(&keys, &[Some("2024-06-02 04:00:00.5+00".into())]),
+            "ts=2024-06-02%2004%3A00%3A00.5%2B00"
+        );
+    }
+
+    #[test]
+    fn escape_partition_path_matches_duckdb_url_encode() {
+        // Unreserved set is exactly A-Za-z0-9 and `_ - ~ .`.
+        assert_eq!(
+            escape_partition_path("aZ09_-~."),
+            "aZ09_-~.",
+            "unreserved bytes must pass through"
+        );
+        // Uppercase hex, and `+` is escaped rather than treated as a space.
+        assert_eq!(escape_partition_path(" :+/=%"), "%20%3A%2B%2F%3D%25");
+        // Encoded per byte, not per char: 'é' is U+00E9 => C3 A9 in UTF-8.
+        assert_eq!(escape_partition_path("é"), "%C3%A9");
+        assert_eq!(escape_partition_path(""), "");
     }
 
     #[test]
