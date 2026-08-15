@@ -7,33 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-15
+
 ### Added
-- Recursive `list`, `struct`, and `map` columns use standard `ducklake_column` parent links and
-  matching Parquet field IDs across reads, writes, schema evolution, rewrites, and compaction.
-- `PostgresSingleCatalogMetadataWriter` — writes the **standard, spec-compliant** single-catalog DuckLake layout on PostgreSQL (no `catalog_id` columns, no `ducklake_catalog*` map tables, unscoped relative paths), so Postgres catalogs are interchangeable with the SQLite/MySQL backends and DuckDB's `ducklake` extension. SQL `CREATE TABLE AS SELECT` works on this path, unlike the multicatalog writer (#165).
-- Atomic append+delete commits accept SEVERAL appended data files: `MetadataWriter::register_data_files_with_deletes` (and its conditional `_and_commit_metadata` sibling) register N data files plus M positional delete files in ONE snapshot — matching the reference implementation, where one transaction carries both the new data files and the new delete files. A keyed mutation (update/upsert) therefore works on a partitioned table and on a write that rolled past `target_file_size` (#214).
-- SQL `UPDATE` on a PARTITIONED table: each rewritten row is routed by its own post-assignment key values, so an assignment that changes a partition key moves the row to its new partition (calendar transforms included). A rewrite spanning several partitions writes one file per partition and commits them all — with the positional deletes — in one snapshot, preserving every row's `rowid` lineage. Rewritten rows adopt the table's live spec, so a table that adopted partitioning after data was written partitions its updated rows (#214).
-- `DuckLakeTable::files_matching` — the data files a predicate could match, pruned by exactly the catalog statistics and partition bounds a `SELECT` with the same filter uses. A caller driving its own per-file work (a keyed update, an upsert, a positional delete resolved with `resolve_positions`) no longer has to open every data file in the table to find the ones holding a key. Pruning is fail-open: a file is dropped only when its own statistics prove it cannot match, and files are read in bounded pages so peak memory tracks the result rather than the table.
-- `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. It reports where a row's `rowid` comes from — the file's embedded row-id column when it has one, `row_id_start + physical position` otherwise. It is not a precondition for `resolve_positions` or for a keyed mutation; see the `### Fixed` note below.
+- Sort order: `ALTER TABLE … SET`/`RESET SORTED BY (col [ASC|DESC] [NULLS FIRST|LAST])`, recorded in `ducklake_sort_info`/`ducklake_sort_expression` and applied to insert, `UPDATE` rewrites, and compaction output so per-file statistics tighten (#206, #211).
+- `PostgresSingleCatalogMetadataWriter` — writes the **standard, spec-compliant** single-catalog DuckLake layout on PostgreSQL (no `catalog_id` columns, no `ducklake_catalog*` map tables, unscoped relative paths), so Postgres catalogs are interchangeable with the SQLite/MySQL backends and DuckDB's `ducklake` extension. SQL `CREATE TABLE AS SELECT` works on this path, unlike the multicatalog writer (#231).
+- Snapshot time travel: `DuckLakeCatalog::with_snapshot_at` and `ducklake_table_at()` select a snapshot by id or timestamp (#236).
+- Recursive `list`, `struct`, and `map` columns use standard `ducklake_column` parent links and matching Parquet field IDs across reads, writes, schema evolution, rewrites, and compaction (#230).
+- Partitioned writes on **every** writable backend: compaction, the low-level `write_rows`/`write_table`/`append_table` entry points, and `register_existing_data_file` (promote) all honour the table's live spec, and every commit path is fenced against it (#213).
+- Atomic append+delete commits accept SEVERAL appended data files: `MetadataWriter::register_data_files_with_deletes` (and its conditional `_and_commit_metadata` sibling) register N data files plus M positional delete files in ONE snapshot, matching the reference implementation. A keyed mutation therefore works on a partitioned table and on a write that rolled past `target_file_size` (#214, #223).
+- SQL `UPDATE` on a PARTITIONED table: each rewritten row is routed by its own post-assignment key values, so an assignment that changes a partition key moves the row to its new partition (calendar transforms included). A rewrite spanning several partitions writes one file per partition and commits them all — with the positional deletes — in one snapshot, preserving every row's `rowid` lineage (#239).
+- Snapshot metadata and write preconditions: one DuckLake change row per committed snapshot, optional author/message/opaque extra info, and conditional writes fenced against table generation changes, on SQLite and PostgreSQL (#209).
+- A streaming write rolls a new data file once the current one passes `target_file_size` (512 MiB default, floored at 4096 bytes) and commits them all in one snapshot, matching official DuckLake; `begin_write_single_file` opts out for sessions finished with `finish_with_deletes` (#224).
+- Targeted rewrites: `rewrite_data_files` accepts caller-selected live files without a delete threshold, and streams sort output through DataFusion's spill-capable operator (#211).
+- `DuckLakeTable::files_matching` — the data files a predicate could match, pruned by exactly the catalog statistics and partition bounds a `SELECT` with the same filter uses, so a caller driving its own per-file work no longer has to open every data file to find the ones holding a key. Pruning is fail-open and files are read in bounded pages (#240).
+- `DuckLakeTable::file_has_embedded_rowid` is now public, and available without the write features. It reports where a row's `rowid` comes from — the file's embedded row-id column when it has one, `row_id_start + physical position` otherwise (#258).
+- `column_size_bytes` is populated per column on write (summed from the parquet footer, no extra I/O), and `compute_column_stats` is exposed for callers that already hold a parsed footer (#201).
+- Tracing spans over the write path — `ducklake.begin_write_transaction`, `ducklake.register_data_files`, `ducklake.finalize_snapshot`, `ducklake.write_session_finish`, `ducklake.upload_staged_file` (#252).
 
 ### Changed
-- **BREAKING**: `ducklake_table_changes`, `ducklake_table_insertions` and
-  `ducklake_table_deletions` resolve each data file's columns **by field id**, as of the window's
-  end snapshot, instead of by current name — matching official DuckLake. Output changes, silently,
-  on any table whose columns were renamed or dropped and re-added:
-  - a renamed column returned NULL for rows in files written before the rename, and now returns
-    those rows' values;
-  - a column dropped and re-added under the same name returned the DROPPED column's values for
-    rows in files written before the re-add, and now returns NULL there (the re-added column has
-    its own field id, and those files predate it);
-  - two columns whose names were swapped returned each other's values, and now return their own;
-  - a field renamed inside a `STRUCT` behaves the same way as a top-level one.
+- **BREAKING**: `ducklake_table_changes`, `ducklake_table_insertions` and `ducklake_table_deletions` resolve each data file's columns **by field id**, as of the window's end snapshot, instead of by current name — matching official DuckLake. Output changes, silently, on any table whose columns were renamed or dropped and re-added: a renamed column returned NULL for rows in files written before the rename and now returns those rows' values; a column dropped and re-added under the same name returned the DROPPED column's values and now returns NULL there; two columns whose names were swapped returned each other's values and now return their own; a field renamed inside a `STRUCT` behaves the same way as a top-level one.
 
-  The fix is **not retroactive**: it changes what the feeds return from now on, and nothing in the
-  catalog was damaged, so no repair tooling is needed — but anything derived from earlier feed
-  output on an affected table is still wrong. **Re-derive anything built from change-feed output on
-  a table whose columns were renamed, or dropped and re-added.** To find those tables, look for a
-  `column_id` with more than one row, or a name shared by two `column_id`s:
+  The fix is **not retroactive**: nothing in the catalog was damaged, so no repair tooling is needed — but anything derived from earlier feed output on an affected table is still wrong. **Re-derive anything built from change-feed output on a table whose columns were renamed, or dropped and re-added.** To find those tables:
 
   ```sql
   SELECT table_id, column_id, count(*) AS generations
@@ -43,70 +38,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   FROM ducklake_column GROUP BY table_id, column_name HAVING count(DISTINCT column_id) > 1;
   ```
 
-  Field ids come from each file's parquet footer, so the feeds now read one footer per data file —
-  the insert-only feed previously read none — and each per-file scan carries one more plan node.
-  On a table with **encrypted** files the footers cannot be read, so a feed whose window spans a
-  rename or a drop-and-re-add is refused with an error rather than served by name. That refusal is
-  conservative and catches some column changes that would have been safe to match by name, and only
-  `ducklake_table_changes` / `ducklake_table_insertions` give the explanatory error; see
-  COMPATIBILITY.md.
-- `TableChangesTable`, `TableInsertionsTable` and `TableDeletionsTable` accept the table's columns
-  through a new `with_columns` builder. No signature changed; without it the columns are read from
-  the metadata provider on each scan.
-- **BREAKING**: PostgreSQL metadata features no longer select a TLS provider. Consumers that need
-  TLS must also enable one of `tls-native-tls`, `tls-rustls-aws-lc-rs`, or `tls-rustls-ring`.
-  Without one, SQLx rejects connections that require TLS and may try plaintext when `sslmode`
-  prefers TLS. No catalog or data migration is needed.
-- **BREAKING**: S3 support is no longer selected by the library. Consumers using
-  `object_store::aws` must enable `object_store/aws` in their application or register another
-  `ObjectStore` implementation with DataFusion. Local filesystem support remains available through
-  DataFusion without extra configuration. No catalog or data migration is needed.
+  Field ids come from each file's parquet footer, so the feeds now read one footer per data file — the insert-only feed previously read none. On a table with **encrypted** files the footers cannot be read, so a feed whose window spans a rename or a drop-and-re-add is refused with an error rather than served by name; see COMPATIBILITY.md (#253).
+- **BREAKING**: PostgreSQL metadata features no longer select a TLS provider. Consumers that need TLS must also enable one of `tls-native-tls`, `tls-rustls-aws-lc-rs`, or `tls-rustls-ring`. Without one, SQLx rejects connections that require TLS and may try plaintext when `sslmode` prefers TLS. No catalog or data migration is needed (#247).
+- **BREAKING**: S3 support is no longer selected by the library. Consumers using `object_store::aws` must enable `object_store/aws` in their application or register another `ObjectStore` implementation with DataFusion. Local filesystem support remains available through DataFusion without extra configuration. No catalog or data migration is needed (#247).
+- **BREAKING**: DataFusion is depended on with `default-features = false` (only `parquet`, `recursive_protection`, and `sql`). Consumers relying on a DataFusion feature that used to arrive transitively must enable it themselves (#265).
+- **BREAKING**: the minimum supported Rust version is now 1.94, the floor set by sqlx 0.9 (#205).
 - `TableWriteSession::finish_with_deletes` no longer refuses a session that produced more than one appended file; it commits them all in the snapshot that carries the deletes (#214).
+- `TableChangesTable`, `TableInsertionsTable` and `TableDeletionsTable` accept the table's columns through a new `with_columns` builder. No signature changed; without it the columns are read from the metadata provider on each scan (#253).
+- The multicatalog Postgres writer sends per-column statistics as one `UNNEST` insert per table instead of a statement per column, removing a round trip per column from every commit (#252).
 
 ### Fixed
-- Timezone-aware timestamp writes now record UTC min/max statistics for file pruning; catalogs
-  written before this change remain readable with absent bounds.
-- A keyed `DELETE` or `UPDATE` works on a data file that compaction has rewritten. The filtered
-  delete path previously refused such a file outright — a v1 scope limit, documented as though
-  position resolution depended on `rowid = row_id_start + physical position`. It does not:
-  `resolve_positions` reads a file's true physical row positions, and a delete file's `pos` is a
-  physical index, which a rewrite leaves meaningful (the rewritten rows sit at `0..n-1`). What a
-  rewrite disturbs is the rowid *sequence* — `rewrite_data_files` drops deleted rows, so the
-  survivors' rowids carry holes and the catalog records no `row_id_start` at all, making that
-  arithmetic not merely unreliable but uncomputable. DuckLake itself performs keyed mutations
-  against merged, reordered and partition-merged files, so this brings the crate in line with the
-  reference implementation. The consequence for callers: a table can be compacted and still take
-  `DELETE`/`UPDATE`/upsert, which previously required choosing one or the other.
-- `types::build_read_schema_with_field_id_mapping` declares the `PARQUET:field_id` of every nested
-  node the data file tags — list elements, struct children, map key/value, at any depth. A nested
-  node's field id is part of its parent's Arrow type, so a read schema that omitted it disagreed with
-  the batches the parquet reader produces from the very file it describes ("column types must match
-  schema types"). Callers that pair that schema with arrow-rs themselves hit the error directly;
-  scans through this crate's `TableProvider` were unaffected, because DataFusion's parquet opener
-  casts a metadata-only difference away. Files without nested field ids (external, or written before
-  nested nodes were tagged) are still described without them, and the table's catalog schema stays
-  free of storage metadata. Dropping the ids on the way out is a relabel rather than a conversion, so
-  a scan over a nested column keeps its filter and limit pushdown.
-- A write upgrades legacy single‑row `list<T>` metadata to recursive list and element rows without
-  changing the existing list column ID or invalidating historical snapshots.
-- Reads null‑fill fields added inside structs, including non‑nullable fields and structs nested in
-  lists, while preserving field‑ID‑based nested renames and drops.
-- The CDC table functions resolve the TABLE and its schema at the window's end snapshot, not at the
-  catalog's current snapshot. A window over a table that was dropped afterwards failed with
-  "Table 'main.t' not found in catalog" even though every snapshot in the window still had the
-  table; it now returns that window's changes, and a window whose end snapshot is past the drop
-  reports that the table does not exist at that snapshot — matching official DuckLake. One window
-  changes the other way: a window ending BEFORE the table was created used to resolve the table at
-  the current snapshot and return an empty feed, and now reports that the table does not exist at
-  that snapshot. Official DuckLake errors on that window too, so this is convergence rather than a
-  new restriction (#196).
-- A `SELECT` over a table whose struct child was added or renamed by DDL no longer fails with
-  "Cannot cast nullable struct field … to non-nullable field". DuckLake records such a child as
-  non-nullable while the physical parquet node stays optional, and a file written before the change
-  does not carry the child at all; `build_read_schema_with_field_id_mapping` now relaxes nested
-  nullability exactly as the sibling `build_arrow_schema` does. Map keys stay non-nullable. The read
-  schema is then type-identical to the catalog schema, so the rename layer above the scan is a
-  relabel and filters and limits reach the parquet reader's pruning on tables with nested columns.
+- `ducklake_table_deletions` silently missed deletions, or emitted the wrong row's content and rowid, whenever DataFusion parallelized its scans: `DeletedRowsExec` inherited the data scan's partitioning, so the optimizer inserted round-robin repartitions and the per-stream offset counted arrival order rather than physical position. It now reports single partitioning, keeps its internal scans away from the optimizer, and matches deleted rows by true physical position (#178, #200).
+- Float pruning is NaN-aware. Catalog float min/max exclude NaN while NaN sorts above every value, so a file whose NaN state was unknown or positive could be wrongly pruned on `x > C` while holding matching rows. Stored float maxima are now gated on `contains_nan = false` at every consumption point, and NaN-unsafe predicates no longer reach the parquet reader's row-group and page pruning (#203).
+- `decimal(P)` with `P > 38` maps to `Decimal256` instead of an invalid `Decimal128`, which could panic or truncate on decode; and a parquet file carrying two columns with the same `field_id` drops both from the field-id map — the reader null-fills instead of binding the wrong column on the renamed-column read path (#193, #198, #202).
+- Timezone-aware timestamp writes now record UTC min/max statistics for file pruning; catalogs written before this change remain readable with absent bounds (#260).
+- A keyed `DELETE` or `UPDATE` works on a data file that compaction has rewritten. The filtered delete path previously refused such a file outright — a v1 scope limit documented as though position resolution depended on `rowid = row_id_start + physical position`. It does not: `resolve_positions` reads a file's true physical row positions, and a delete file's `pos` is a physical index, which a rewrite leaves meaningful. A table can now be compacted and still take `DELETE`/`UPDATE`/upsert, which previously required choosing one or the other (#258).
+- PostgreSQL `commit_compaction` persists partition metadata, so a merged or rewritten file of a partitioned table keeps its `partition_id` and `ducklake_file_partition_value` rows. Reads stayed correct because zone maps still prune, which is what made this quiet — partition-value pruning was permanently gone while queries still returned the right rows (#246).
+- PostgreSQL `register_data_file_with_deletes` persists partition metadata, so the append+delete (update/upsert) path no longer leaves an appended file that can never be partition-pruned again (#225).
+- Multicatalog data paths are scoped per catalog: each catalog's root is stored on the registry and resolved for writer, reader, and maintenance paths, with the global metadata path kept as a migration fallback (#266).
+- Pruning survives missing statistics. An absent per-file bound is now a typed null, so one file without statistics no longer makes a column unusable for the whole candidate set; files with unknown bounds are kept and exactly-non-matching files are still dropped (#250).
+- Conjunctive pruning predicates are applied repeatedly over bounded pages of file metadata, so partition pruning can expose usable range statistics without loading the full file list (#207).
+- A data file the catalog records as holding exactly zero rows is dropped before statistics are consulted, saving a pruning pass and closing the residual case where such a file carries no per-column statistics row at all and defeats pruning on that column for the whole page. Only a recorded count of exactly 0 counts as proof; an unset `record_count` keeps the file (#244).
+- `types::build_read_schema_with_field_id_mapping` declares the `PARQUET:field_id` of every nested node the data file tags — list elements, struct children, map key/value, at any depth. A nested node's field id is part of its parent's Arrow type, so a read schema that omitted it disagreed with the batches the parquet reader produces from the very file it describes ("column types must match schema types"). Scans through this crate's `TableProvider` were unaffected; callers pairing that schema with arrow-rs themselves hit the error directly (#249).
+- A `SELECT` over a table whose struct child was added or renamed by DDL no longer fails with "Cannot cast nullable struct field … to non-nullable field". DuckLake records such a child as non-nullable while the physical parquet node stays optional; nested nullability is now relaxed exactly as the sibling `build_arrow_schema` does, and map keys stay non-nullable (#253).
+- Reads null-fill fields added inside structs, including non-nullable fields and structs nested in lists, while preserving field-ID-based nested renames and drops; and a write upgrades legacy single-row `list<T>` metadata to recursive list and element rows without changing the existing list column ID or invalidating historical snapshots (#230).
+- The CDC table functions resolve the TABLE and its schema at the window's end snapshot, not at the catalog's current snapshot. A window over a table that was dropped afterwards failed with "Table 'main.t' not found in catalog" even though every snapshot in the window still had the table; it now returns that window's changes. A window whose end snapshot is past the drop — or before the create — reports that the table does not exist at that snapshot, matching official DuckLake (#196, #253).
 
 ## [0.6.0] - 2026-07-20
 
@@ -299,7 +255,9 @@ Initial release.
 - Filter pushdown to Parquet
 - Query-scoped snapshot isolation
 
-[Unreleased]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.3.0...v0.3.1

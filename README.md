@@ -39,9 +39,9 @@ via feature flags. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
 
 ```toml
 # Cargo.toml — read PostgreSQL catalogs
-# (for the experimental multi-catalog write path, use features = ["write-postgres"])
+# (to write them too, use features = ["write-postgres"])
 [dependencies.datafusion-ducklake]
-version = "0.6"
+version = "0.7"
 default-features = false
 features = ["metadata-postgres", "tls-rustls-aws-lc-rs"]
 ```
@@ -197,9 +197,11 @@ byte size). See [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake) for
 writer options.
 
 > Writing to a **standard, single-catalog** DuckLake store (the spec-compliant layout) is
-> supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`),
-> where SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
-> [`tests/it/sql_write_tests.rs`](tests/it/sql_write_tests.rs).
+> supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`) and for
+> **PostgreSQL** via `PostgresSingleCatalogMetadataWriter` (feature `write-postgres`), where
+> SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
+> [`tests/it/sql_write_tests.rs`](tests/it/sql_write_tests.rs) and
+> [`tests/it/postgres_single_catalog_write_tests.rs`](tests/it/postgres_single_catalog_write_tests.rs).
 
 ---
 
@@ -222,9 +224,33 @@ Writes split rows into one Parquet file per partition value; reads then prune no
 files automatically. Supported transforms are `identity` (the raw value) and
 `year`/`month`/`day`/`hour`; pruning currently applies to `identity` and `year`
 (`month`/`day`/`hour` are recorded but not yet used to skip files). Partitioned **writes**
-are supported on **SQLite** today; **read + pruning** work on all backends. `RESET
-PARTITIONED BY` turns it off. See [COMPATIBILITY.md](COMPATIBILITY.md) and
+work on every writable backend — SQL `INSERT`/`UPDATE`, the low-level write entry points,
+the streaming session, compaction, and promote all honour the live spec — and **read +
+pruning** work on all backends. `RESET PARTITIONED BY` turns it off. See
+[COMPATIBILITY.md](COMPATIBILITY.md) and
 [`tests/it/partition_write_tests.rs`](tests/it/partition_write_tests.rs).
+
+---
+
+## Sort order
+
+Order the rows inside each written file so that per-file statistics stay tight and
+range-filtered scans skip more:
+
+```rust
+execute_ducklake_sql(
+    &ctx,
+    &catalog,
+    "ALTER TABLE ducklake.main.sales SET SORTED BY (sale_date DESC NULLS LAST)",
+)
+.await?;
+```
+
+The spec is recorded in the catalog (`ducklake_sort_info` / `ducklake_sort_expression`) and
+applied on insert, to `UPDATE` rewrites, and to compaction output; rows are sorted before the
+partition split, so each per-partition file stays a sorted subsequence. Bare-column keys are
+produced; other expressions are tolerated on read but never produced. `RESET SORTED BY`
+turns it off.
 
 ---
 
@@ -237,8 +263,9 @@ useful for multi-tenant deployments or keeping many logical lakehouses in one da
 > DuckLake specification** and is not (yet) supported or accepted upstream. Catalogs
 > written this way are read back only through this crate's `MulticatalogProvider` — they
 > are **not** interchangeable with a standard single-catalog DuckLake store. The API and
-> on-disk/in-catalog layout may change. PostgreSQL write support currently depends on this
-> path, so treat it as a preview.
+> on-disk/in-catalog layout may change, so treat it as a preview. PostgreSQL writes no
+> longer require this path — use `PostgresSingleCatalogMetadataWriter` for the
+> spec-compliant layout.
 
 - **Create and manage** catalogs with `MulticatalogManager` (feature `write-postgres`):
   `initialize_multicatalog_schema` bootstraps the shared tables, then `create_catalog`,
@@ -289,9 +316,10 @@ A few highlights worth knowing up front:
 
 - Reads work on DuckDB, SQLite, PostgreSQL, and MySQL; **writes are SQLite/PostgreSQL only**.
 - Object stores: local filesystem and S3-compatible (S3, MinIO).
-- Snapshots can be selected through `DuckLakeCatalog` or per query with
+- Snapshots can be selected through `DuckLakeCatalog` (by id or timestamp) or per query with
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
-- Table partitioning: read + file pruning on all backends; partitioned writes on SQLite.
+- Table partitioning: read + file pruning on all backends; partitioned writes on every
+  writable backend.
 - Data inlined by DuckDB's ducklake extension is **not read** — see COMPATIBILITY.md for
   the `COUNT(*)` undercount caveat and how to avoid it.
 
