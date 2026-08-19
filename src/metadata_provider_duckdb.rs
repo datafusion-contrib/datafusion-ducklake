@@ -1262,8 +1262,38 @@ fn parse_partial_file_info_max(info: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod partial_file_info_tests {
-    use super::parse_partial_file_info_max;
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field};
+    use duckdb::arrow::array::{Int32Builder, ListBuilder};
+    use duckdb::types::{ListType, ValueRef};
+
+    use super::{duckdb_inlined_scalar, parse_partial_file_info_max};
+
+    #[test]
+    fn nested_inlined_value_reports_recovery() {
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.values().append_value(1);
+        builder.values().append_value(2);
+        builder.values().append_value(3);
+        builder.append(true);
+        let values = builder.finish();
+        let target = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let error = duckdb_inlined_scalar(
+            ValueRef::List(ListType::Regular(&values), 0),
+            &target,
+            "tags",
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Unsupported feature: inlined data for column 'tags' has DuckDB type List(Int), \
+             which cannot be decoded as List(Int32); flush inlined data to Parquet (or disable \
+             data inlining at write time)"
+        );
+    }
 
     #[test]
     fn parses_multi_pair_info() {
