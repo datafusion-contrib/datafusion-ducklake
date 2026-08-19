@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB,
+  PostgreSQL, and MySQL metadata catalogs. DuckLake inlines inserts of up to 10
+  rows by default, so affected queries previously omitted them without warning;
+  unsupported non‑scalar inline values now report how to flush or disable
+  inlining (#261).
+
 ## [0.7.0] - 2026-08-15
 
 ### Added

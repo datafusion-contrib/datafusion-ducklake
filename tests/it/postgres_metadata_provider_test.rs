@@ -1068,8 +1068,8 @@ async fn test_query_with_filter() {
 
 /// Bring the minimal fixture schema up to a fully-migrated catalog: every
 /// optional capability the provider probes (`partial_max` columns, the
-/// `ducklake_schema_versions` ledger) plus the file columns the scan
-/// projection reads.
+/// `ducklake_schema_versions` ledger, and the inlined-data registry) plus the
+/// file columns the scan projection reads.
 async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::query(
         "ALTER TABLE ducklake_data_file
@@ -1095,6 +1095,15 @@ async fn migrate_fixture_to_current_schema(pool: &PgPool) -> anyhow::Result<()> 
              begin_snapshot BIGINT NOT NULL,
              schema_version BIGINT NOT NULL,
              table_id BIGINT NOT NULL
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+             table_id BIGINT NOT NULL,
+             table_name VARCHAR NOT NULL,
+             schema_version BIGINT NOT NULL
          )",
     )
     .execute(pool)

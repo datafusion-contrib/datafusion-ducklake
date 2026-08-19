@@ -280,8 +280,10 @@ Known edges:
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Data inlining (SQLite backend): now read.** DuckDB inlines small INSERTs into the
-  catalog instead of Parquet; on SQLite these are now unioned into scans (snapshot
-  visibility honored), so `SELECT` / `COUNT(*)` are correct. Not yet on the DuckDB /
-  PostgreSQL / MySQL backends, for inlined *Parquet-row* deletes, the `rowid` path, or
-  non-scalar inlined column types.
+- **Data inlining: scalar rows are read on every metadata backend.** DuckLake
+  inlines `INSERT`s of up to 10 rows into the catalog by default. SQLite,
+  DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
+  `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes and the
+  `rowid` path remain unsupported. Non‑scalar inlined columns fail with an
+  error that directs users to flush the rows to Parquet or disable inlining at
+  write time.

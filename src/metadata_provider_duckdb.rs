@@ -150,23 +150,25 @@ fn decode_duckdb_text(value: &[u8], column: &str) -> crate::Result<String> {
     })
 }
 
-/// Optional catalog-schema capabilities probed before CDC queries.
+/// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
 ///
-/// Older catalogs (spec 0.2) may lack the `partial_max` columns; the CDC
-/// queries fall back to the old-spec `partial_file_info` string (data files)
-/// or degrade the predicate to NULL (delete files) when a capability is
-/// absent.
+/// Older catalogs (spec 0.2) may lack the `partial_max` columns and the
+/// inlined-data registry. CDC queries fall back to the old-spec
+/// `partial_file_info` string (data files) or degrade the predicate to NULL
+/// (delete files); inlined-data reads return empty when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max
+        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
     }
 }
 
@@ -226,18 +228,25 @@ impl DuckdbMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let (data_file_partial_max, delete_file_partial_max): (bool, bool) = conn.query_row(
+        let (data_file_partial_max, delete_file_partial_max, inlined_data_tables): (
+            bool,
+            bool,
+            bool,
+        ) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_delete_file')
-                WHERE name = 'partial_max') > 0",
+                WHERE name = 'partial_max') > 0,
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_name = 'ducklake_inlined_data_tables') > 0",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let caps = SchemaCapabilities {
             data_file_partial_max,
             delete_file_partial_max,
+            inlined_data_tables,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -831,13 +840,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
         columns: &[DuckLakeTableColumn],
     ) -> crate::Result<Vec<RecordBatch>> {
         let conn = self.connection();
-        let mut registry = match conn
-            .prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-        {
-            Ok(statement) => statement,
-            Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
+        if !self.schema_capabilities(&conn)?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let mut registry =
+            conn.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
         let tables = registry
             .query_map([table_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

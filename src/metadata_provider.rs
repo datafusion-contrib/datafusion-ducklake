@@ -616,7 +616,9 @@ pub(crate) fn parse_inlined_rows(
                         )
                         .ok_or_else(|| {
                             crate::DuckLakeError::Unsupported(format!(
-                                "inlined data for column '{}' cannot decode value '{}' as {}",
+                                "inlined data for column '{}' cannot decode value '{}' as {}; \
+                                 flush inlined data to Parquet (or disable data inlining at write \
+                                 time)",
                                 columns[index].column_name,
                                 value,
                                 field.data_type()
@@ -1421,6 +1423,12 @@ mod tests {
             error
                 .to_string()
                 .contains("inlined data for column 'items' cannot decode value '[1, 2]' as List"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("flush inlined data to Parquet (or disable data inlining at write time)"),
             "unexpected error: {error}"
         );
     }

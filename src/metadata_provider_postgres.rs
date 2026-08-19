@@ -107,11 +107,13 @@ macro_rules! bind_repeat {
     };
 }
 
-/// Optional catalog-schema capabilities probed before scan / CDC queries.
+/// Optional catalog-schema capabilities probed before scan / CDC / inlined-data
+/// queries.
 ///
-/// Minimal / pre-v1.0 catalogs may lack the `partial_max` columns and the
-/// `ducklake_schema_versions` ledger; the queries degrade the corresponding
-/// projections to NULL when a capability is absent.
+/// Minimal / pre-v1.0 catalogs may lack the `partial_max` columns, the
+/// `ducklake_schema_versions` ledger, and the inlined-data registry. Queries
+/// degrade the corresponding projections to NULL or skip inlined-data reads
+/// when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
@@ -122,6 +124,8 @@ struct SchemaCapabilities {
     schema_versions: bool,
     /// `ducklake_data_file.partition_id` exists.
     data_file_partition_id: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
@@ -130,6 +134,7 @@ impl SchemaCapabilities {
             && self.delete_file_partial_max
             && self.schema_versions
             && self.data_file_partition_id
+            && self.inlined_data_tables
     }
 }
 
@@ -186,7 +191,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -194,7 +199,8 @@ impl PostgresMetadataProvider {
                        WHERE table_name = 'ducklake_delete_file' AND column_name = 'partial_max'),
                to_regclass('ducklake_schema_versions') IS NOT NULL,
                EXISTS (SELECT 1 FROM information_schema.columns
-                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id')",
+                       WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
+               to_regclass('ducklake_inlined_data_tables') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -203,6 +209,7 @@ impl PostgresMetadataProvider {
             delete_file_partial_max: row.1,
             schema_versions: row.2,
             data_file_partition_id: row.3,
+            inlined_data_tables: row.4,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -959,17 +966,15 @@ impl MetadataProvider for PostgresMetadataProvider {
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
         block_on(async {
-            let registry = match sqlx::query(
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let registry = sqlx::query(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
             )
             .bind(table_id)
             .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
-            };
+            .await?;
             let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
             let mut batches = Vec::new();
 

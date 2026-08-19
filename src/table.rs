@@ -4683,10 +4683,18 @@ mod tests {
             parse_statistic_scalar("1", &boolean, &DataType::Boolean),
             Some(ScalarValue::Boolean(Some(true)))
         );
+        assert_eq!(
+            parse_statistic_scalar("FALSE", &boolean, &DataType::Boolean),
+            Some(ScalarValue::Boolean(Some(false)))
+        );
 
         let blob = DuckLakeTableColumn::new(2, "bytes".to_string(), "blob".to_string(), true);
         assert_eq!(
             parse_statistic_scalar("68656C6C6F", &blob, &DataType::BinaryView),
+            Some(ScalarValue::BinaryView(Some(b"hello".to_vec())))
+        );
+        assert_eq!(
+            parse_statistic_scalar("\\x68656C6C6F", &blob, &DataType::BinaryView),
             Some(ScalarValue::BinaryView(Some(b"hello".to_vec())))
         );
 

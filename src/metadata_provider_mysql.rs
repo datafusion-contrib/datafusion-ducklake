@@ -71,22 +71,24 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
     })
 }
 
-/// Optional catalog-schema capabilities probed before CDC queries.
+/// Optional catalog-schema capabilities probed before CDC / inlined-data queries.
 ///
-/// Older catalogs may lack the `partial_max` columns; the CDC queries degrade
-/// the corresponding projections/predicates to NULL when a capability is
-/// absent.
+/// Older catalogs may lack the `partial_max` columns and the inlined-data
+/// registry. CDC queries degrade the corresponding projections/predicates to
+/// NULL, and inlined-data reads return empty when a capability is absent.
 #[derive(Debug, Clone, Copy)]
 struct SchemaCapabilities {
     /// `ducklake_data_file.partial_max` exists.
     data_file_partial_max: bool,
     /// `ducklake_delete_file.partial_max` exists.
     delete_file_partial_max: bool,
+    /// The `ducklake_inlined_data_tables` registry exists.
+    inlined_data_tables: bool,
 }
 
 impl SchemaCapabilities {
     fn all(&self) -> bool {
-        self.data_file_partial_max && self.delete_file_partial_max
+        self.data_file_partial_max && self.delete_file_partial_max && self.inlined_data_tables
     }
 }
 
@@ -143,7 +145,7 @@ impl MySqlMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (i64, i64) = sqlx::query_as(
+        let row: (i64, i64, i64) = sqlx::query_as(
             "SELECT
                (SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_schema = DATABASE()
@@ -152,13 +154,17 @@ impl MySqlMetadataProvider {
                (SELECT COUNT(*) FROM information_schema.columns
                 WHERE table_schema = DATABASE()
                   AND table_name = 'ducklake_delete_file'
-                  AND column_name = 'partial_max')",
+                  AND column_name = 'partial_max'),
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'ducklake_inlined_data_tables')",
         )
         .fetch_one(&self.pool)
         .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.0 > 0,
             delete_file_partial_max: row.1 > 0,
+            inlined_data_tables: row.2 > 0,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -797,17 +803,15 @@ impl MetadataProvider for MySqlMetadataProvider {
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
         block_on(async {
-            let registry = match sqlx::query(
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let registry = sqlx::query(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
             )
             .bind(table_id)
             .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
-                Err(error) => return Err(error.into()),
-            };
+            .await?;
             let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
             let mut batches = Vec::new();
 

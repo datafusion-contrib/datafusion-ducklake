@@ -238,6 +238,9 @@ async fn postgres_inlined_rows_follow_the_catalog_encoding() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch("INSTALL postgres; LOAD postgres; LOAD ducklake;")
             .unwrap();
+        // The pinned DuckDB 1.4.1 extension predates PostgreSQL inline writes, so the
+        // test initializes its official catalog schema and inserts current encodings below:
+        // https://github.com/duckdb/ducklake/commit/824329a797f1214afa5bffad7151a31022163c2c
         conn.execute(
             &format!(
                 "ATTACH 'ducklake:postgres:{libpq}' AS lake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0)",
