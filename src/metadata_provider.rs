@@ -526,6 +526,9 @@ pub(crate) fn is_inlined_data_table(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+pub(crate) const INLINED_DATA_REMEDIATION: &str =
+    "flush inlined data to Parquet (or disable data inlining at write time)";
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InlinedDataBackend {
     Postgres,
@@ -617,8 +620,7 @@ pub(crate) fn parse_inlined_rows(
                         .ok_or_else(|| {
                             crate::DuckLakeError::Unsupported(format!(
                                 "inlined data for column '{}' cannot decode value '{}' as {}; \
-                                 flush inlined data to Parquet (or disable data inlining at write \
-                                 time)",
+                                 {INLINED_DATA_REMEDIATION}",
                                 columns[index].column_name,
                                 value,
                                 field.data_type()
@@ -1426,9 +1428,7 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            error
-                .to_string()
-                .contains("flush inlined data to Parquet (or disable data inlining at write time)"),
+            error.to_string().contains(INLINED_DATA_REMEDIATION),
             "unexpected error: {error}"
         );
     }

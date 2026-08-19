@@ -3,8 +3,9 @@ use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SQL_GET_DATA_FILES, SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS,
-    SQL_GET_DATA_PATH, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
+    INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
+    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
+    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
     SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
     SQL_GET_TABLE_COLUMNS, SQL_GET_TABLE_STATS, SQL_LIST_ALL_COLUMNS, SQL_LIST_ALL_FILES,
@@ -134,8 +135,9 @@ fn duckdb_inlined_scalar(
         },
         (data_type, value) => {
             return Err(crate::DuckLakeError::Unsupported(format!(
-                "inlined data for column '{column}' has DuckDB type {:?}, which cannot be decoded as {data_type}",
-                value.data_type()
+                "inlined data for column '{column}' has DuckDB type {:?}, which cannot be decoded \
+                 as {data_type}; {INLINED_DATA_REMEDIATION}",
+                value.data_type(),
             )));
         },
     };
