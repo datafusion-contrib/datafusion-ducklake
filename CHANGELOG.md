@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `files_matching` read physical rows without applying deletes, where those
   bounds still hold, so they are now restated as exact for this path. The live
   row count is withheld rather than restated, being the one figure deletes do
-  change (#275).
+  change (#276).
 
 - Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB,
   PostgreSQL, and MySQL metadata catalogs. DuckLake inlines inserts of up to 10
