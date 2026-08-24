@@ -1117,7 +1117,8 @@ impl DuckLakeTable {
 
         let mut matching = Vec::new();
         for metadata in self.file_metadata_pages("file matching") {
-            let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
+            let (table_files, mut file_statistics) = self.page_files_with_statistics(metadata?);
+            restate_in_physical_row_space(&mut file_statistics, &table_files);
             #[cfg(feature = "encryption")]
             self.collect_encryption_keys(&mut encryption_keys, &table_files)?;
             matching.extend(
@@ -3412,6 +3413,59 @@ fn sort_ordering_for(
     Ok(datafusion::physical_expr::LexOrdering::new(sort_exprs))
 }
 
+/// Re-state a page's per-file statistics in **physical row space**, for callers
+/// that read a data file without applying its delete file.
+///
+/// A file carrying a delete file has its parquet-derived bounds marked
+/// [`Precision::Inexact`] by [`build_datafusion_statistics`], and the pruning
+/// view surfaces only `Exact` values. So the first mutation that writes a delete
+/// file also stops that file contributing usable bounds — and every later
+/// mutation opens it regardless of key range. Nothing restores them either:
+/// compaction skips delete-bearing files.
+///
+/// Those bounds are inexact only for a reader that applies deletes. This caller
+/// does not. [`DuckLakeTable::resolve_positions`] scans physical rows and
+/// ignores delete files entirely, so a recorded min/max still bounds every row
+/// it can see, and `null_count` — harvested from the parquet footer — still
+/// counts them. Both are exact in the space this caller works in.
+///
+/// The live row count is the one figure that is not, because
+/// [`file_row_count`] subtracts `delete_count` from it. It is therefore withheld
+/// rather than promoted. Mixing a physical `null_count` with a live `row_count`
+/// would let DataFusion's `null_count == row_count` rewrite decide a column is
+/// entirely null when only its *surviving* rows are, and drop a file still
+/// holding physical rows the caller has to find — a key that then inserts
+/// instead of superseding, with nothing raised. Withholding the count leaves
+/// that rewrite inert, which is the conservative direction.
+fn restate_in_physical_row_space(
+    statistics: &mut HashMap<i64, Arc<Statistics>>,
+    files: &[DuckLakeTableFile],
+) {
+    fn physical<T: Clone + std::fmt::Debug + Eq + PartialOrd>(
+        value: &Precision<T>,
+    ) -> Precision<T> {
+        match value {
+            Precision::Inexact(value) => Precision::Exact(value.clone()),
+            other => other.clone(),
+        }
+    }
+
+    for file in files.iter().filter(|f| f.delete_file.is_some()) {
+        let Some(current) = statistics.get(&file.data_file_id) else {
+            continue;
+        };
+        let mut restated = current.as_ref().clone();
+        // Not physical: this is live rows, deletes already subtracted.
+        restated.num_rows = Precision::Absent;
+        for column in &mut restated.column_statistics {
+            column.min_value = physical(&column.min_value);
+            column.max_value = physical(&column.max_value);
+            column.null_count = physical(&column.null_count);
+        }
+        statistics.insert(file.data_file_id, Arc::new(restated));
+    }
+}
+
 struct FilePruningStatistics {
     base: PrunableStatistics,
     statistics: Vec<Arc<Statistics>>,
@@ -4063,6 +4117,55 @@ mod tests {
             .into_iter()
             .map(|file| file.data_file_id)
             .collect())
+    }
+
+    #[test]
+    fn files_matching_still_prunes_a_file_that_carries_deletes() -> Result<()> {
+        // `build_datafusion_statistics` marks a delete-bearing file's bounds
+        // Inexact, and the pruning view surfaces only Exact ones. So without the
+        // physical-space restatement, the first mutation that writes a delete
+        // file makes that file unprunable for every mutation after it — and
+        // permanently, because compaction skips delete-bearing files. Both
+        // directions are asserted: the file must still be dropped when its
+        // bounds exclude the value, and still kept when they do not.
+        let carrying_deletes = |data_file_id: i64, id_bounds: (i64, i64)| {
+            let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
+            // Leave live rows > 0, so the separate known-empty exclusion is not
+            // what drops the file.
+            entry.file.max_row_count = Some(10);
+            entry.file.delete_count = Some(1);
+            entry.file.delete_file_id = Some(data_file_id);
+            entry.file.delete_file = Some(DuckLakeFileData::new(
+                format!("delete-{data_file_id}.parquet"),
+                true,
+                1,
+            ));
+            entry
+        };
+
+        let table = fixed_table(
+            vec![
+                fixture_file(1, None, Some((1, 10))),
+                carrying_deletes(2, (100, 110)),
+                fixture_file(3, None, Some((200, 210))),
+            ],
+            None,
+        )?;
+
+        let inside = physical_predicate(&table, col("id").eq(lit(105_i64)));
+        assert_eq!(
+            matching_ids(&table, &inside)?,
+            vec![2],
+            "a delete-bearing file whose bounds admit the value must be kept"
+        );
+
+        let outside = physical_predicate(&table, col("id").eq(lit(5_i64)));
+        assert_eq!(
+            matching_ids(&table, &outside)?,
+            vec![1],
+            "a delete-bearing file whose bounds exclude the value must still prune"
+        );
+        Ok(())
     }
 
     #[test]

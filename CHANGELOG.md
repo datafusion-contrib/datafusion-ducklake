@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `files_matching` prunes a data file that carries a delete file. Its
+  parquet-derived bounds are marked inexact for readers that apply deletes, and
+  the pruning view surfaces only exact ones, so the first mutation to write a
+  delete file stopped that file contributing usable bounds to every later call —
+  permanently, since compaction skips delete-bearing files. Callers of
+  `files_matching` read physical rows without applying deletes, where those
+  bounds still hold, so they are now restated as exact for this path. The live
+  row count is withheld rather than restated, being the one figure deletes do
+  change (#275).
+
 - Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB,
   PostgreSQL, and MySQL metadata catalogs. DuckLake inlines inserts of up to 10
   rows by default, so affected queries previously omitted them without warning;
