@@ -243,6 +243,64 @@ async fn run_merge(temp: &TempDir, opts: MergeOptions) -> CompactionResult {
     .await
 }
 
+/// Run a merge with explicit table write options, as a catalog configured for a
+/// codec would produce.
+async fn run_merge_with_write_options(
+    temp: &TempDir,
+    write_options: datafusion_ducklake::DuckLakeWriteOptions,
+    opts: MergeOptions,
+) -> CompactionResult {
+    with_writable_table(temp, |table, state| async move {
+        table
+            .with_write_options(write_options)
+            .merge_adjacent_files(&state, opts)
+            .await
+            .unwrap()
+    })
+    .await
+}
+
+/// The same for a rewrite, so both writer sites are covered.
+async fn run_rewrite_with_write_options(
+    temp: &TempDir,
+    write_options: datafusion_ducklake::DuckLakeWriteOptions,
+    opts: RewriteOptions,
+) -> CompactionResult {
+    with_writable_table(temp, |table, state| async move {
+        table
+            .with_write_options(write_options)
+            .rewrite_data_files(&state, opts)
+            .await
+            .unwrap()
+    })
+    .await
+}
+
+/// Every column chunk's codec, and the row group count, of the single live file.
+fn live_file_parquet_facts(
+    temp: &TempDir,
+    pool_path: &str,
+) -> (Vec<parquet::basic::Compression>, usize) {
+    let file = std::fs::File::open(
+        temp.path()
+            .join("data")
+            .join("main")
+            .join("t")
+            .join(pool_path),
+    )
+    .unwrap();
+    let meta = ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .metadata()
+        .clone();
+    let codecs = meta
+        .row_groups()
+        .iter()
+        .flat_map(|rg| rg.columns().iter().map(|c| c.compression()))
+        .collect();
+    (codecs, meta.num_row_groups())
+}
+
 async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
     with_writable_table(temp, |table, state| async move {
         table.rewrite_data_files(&state, opts).await.unwrap()
@@ -1640,5 +1698,109 @@ async fn cdc_attributes_merged_rows_to_origin_snapshots() {
         changes(s3 + 1, s3 + 1).await,
         vec![],
         "merge emits no CDC events"
+    );
+}
+
+/// Compaction writes with the table's configured parquet settings, not the
+/// format defaults.
+///
+/// Compaction re-encodes data that already exists, so leaving the writer at its
+/// defaults does not merely fail to optimise — it *undoes* what the data was
+/// written with. A table written LZ4 with a bounded row group comes back
+/// uncompressed and, below a million rows, as one row group nothing can prune
+/// into.
+///
+/// Official DuckLake has no such gap: its compaction builds copy options through
+/// the same `DuckLakeInsert::GetCopyOptions` inserts use, so a merged file
+/// inherits the catalog's configured `parquet_compression`.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_inherits_the_tables_write_options() {
+    use datafusion_ducklake::DuckLakeWriteOptions;
+    use parquet::basic::Compression;
+
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+
+    let result = run_merge_with_write_options(
+        &temp,
+        DuckLakeWriteOptions {
+            compression: Some(Compression::LZ4),
+            // Two rows per group over six: enough that a single group is
+            // unmistakably the writer default rather than a coincidence.
+            max_row_group_rows: Some(2),
+            ..Default::default()
+        },
+        MergeOptions::default(),
+    )
+    .await;
+    assert_eq!(result.files_processed, 2);
+    assert_eq!(result.files_created, 1);
+
+    let p = pool(&temp).await;
+    let live_path: String =
+        sqlx::query_scalar("SELECT path FROM ducklake_data_file WHERE end_snapshot IS NULL")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    let (codecs, row_groups) = live_file_parquet_facts(&temp, &live_path);
+    assert!(
+        row_groups > 1,
+        "row group cap ignored: {row_groups} group(s) for 6 rows at 2 per group"
+    );
+    assert!(
+        codecs.iter().all(|c| *c == Compression::LZ4),
+        "merged file written {codecs:?}, not the table's configured codec"
+    );
+}
+
+/// The same for `rewrite_data_files`, which is a second writer construction and
+/// would otherwise be free to drift from the merge one.
+#[tokio::test(flavor = "multi_thread")]
+async fn rewrite_inherits_the_tables_write_options() {
+    use datafusion_ducklake::DuckLakeWriteOptions;
+    use parquet::basic::Compression;
+
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3, 4, 5, 6], vec![10, 20, 30, 40, 50, 60]).await;
+
+    let p = pool(&temp).await;
+    let file_id: i64 = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(&p)
+    .await
+    .unwrap();
+
+    // Naming the file rewrites it regardless of its delete fraction, which is
+    // what makes this a rewrite rather than a merge.
+    let result = run_rewrite_with_write_options(
+        &temp,
+        DuckLakeWriteOptions {
+            compression: Some(Compression::LZ4),
+            max_row_group_rows: Some(2),
+            ..Default::default()
+        },
+        RewriteOptions {
+            data_file_ids: Some(vec![file_id]),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(result.files_created, 1, "the named file is rewritten");
+
+    let live_path: String =
+        sqlx::query_scalar("SELECT path FROM ducklake_data_file WHERE end_snapshot IS NULL")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    let (codecs, row_groups) = live_file_parquet_facts(&temp, &live_path);
+    assert!(
+        row_groups > 1,
+        "row group cap ignored on rewrite: {row_groups} group(s) for 6 rows"
+    );
+    assert!(
+        codecs.iter().all(|c| *c == Compression::LZ4),
+        "rewritten file written {codecs:?}, not the table's configured codec"
     );
 }

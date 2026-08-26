@@ -381,7 +381,22 @@ impl DuckLakeTable {
         let object_store = state
             .runtime_env()
             .object_store(self.object_store_url().as_ref())?;
-        let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
+        // Inherit the table's write options, exactly as the insert path does
+        // (`insert_exec.rs`). Compaction re-encodes data that already exists, so
+        // writing with the format defaults does not merely fail to optimise — it
+        // *undoes* the settings the data was written with. A table written LZ4
+        // with a bounded row group comes back uncompressed and, below a million
+        // rows, as a single row group nothing can prune into.
+        //
+        // Official DuckLake has no such gap: its compaction builds its copy
+        // options through the same `DuckLakeInsert::GetCopyOptions` inserts use,
+        // so a merged file inherits the catalog's configured
+        // `parquet_compression` / `parquet_compression_level`
+        // (`ducklake_compaction_functions.cpp:655`, `ducklake_insert.cpp:511`).
+        // Taking them from the table rather than from a per-call option keeps
+        // that single source of truth: one catalog setting, both paths.
+        let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?
+            .with_options(&self.write_options);
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
@@ -565,7 +580,12 @@ impl DuckLakeTable {
         let object_store = state
             .runtime_env()
             .object_store(self.object_store_url().as_ref())?;
-        let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?;
+        // Inherit the table's write options, for the reasons given in
+        // `merge_adjacent_files`. A rewrite re-encodes just as a merge does, so
+        // it has to carry them too — the two writer constructions are the only
+        // places in this crate that could silently disagree about it.
+        let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?
+            .with_options(&self.write_options);
         let column_ids = self.column_ids();
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();

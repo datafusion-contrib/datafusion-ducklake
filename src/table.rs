@@ -899,7 +899,7 @@ pub struct DuckLakeTable {
     /// Write-layout options (compression, row-group caps, file-rollover target)
     /// applied to the writer built for an INSERT into this table.
     #[cfg(feature = "write")]
-    write_options: crate::table_writer::DuckLakeWriteOptions,
+    pub(crate) write_options: crate::table_writer::DuckLakeWriteOptions,
 }
 
 impl std::fmt::Debug for DuckLakeTable {
