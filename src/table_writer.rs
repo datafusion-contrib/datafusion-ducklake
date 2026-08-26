@@ -41,6 +41,22 @@ pub use crate::partition::PartitionGroup;
 /// descriptors and memory.
 pub const DEFAULT_MAX_OPEN_PARTITIONS: usize = 100;
 
+/// How many finished data files a write uploads to object storage concurrently.
+///
+/// A rolling write finishes each file to local disk and uploads them all in
+/// `finish`, so the uploads are independent I/O with no ordering requirement
+/// between them — only the *resulting* `DataFileInfo` order matters, because
+/// `register_data_files` assigns `row_id_start` by walking that list in order.
+/// Uploading them one at a time leaves the link idle for the whole write.
+///
+/// Kept modest rather than core-count-scaled, because the real cost is memory and
+/// sockets rather than CPU — and it is larger than "one buffer per upload" suggests.
+/// `object_store`'s `BufWriter` holds a 10 MiB buffer AND keeps up to 8 multipart
+/// requests in flight on its own, so N concurrent uploads of large files peak near
+/// `N * 9 * 10 MiB`: roughly 360 MiB at the default of 4, not 40 MiB. Raise this
+/// only against a memory budget that accounts for that multiplier.
+pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+
 /// Floor on the target data file size, matching official DuckLake's
 /// `MINIMUM_WRITE_FILE_SIZE` (`ducklake_insert.cpp`), which clamps with
 /// `MaxValue<idx_t>(target_file_size, 4096)`. A smaller request would roll a new file
@@ -72,6 +88,9 @@ pub struct DuckLakeWriteOptions {
     /// Max parquet files a partitioned streaming write keeps open at once; `None`
     /// leaves the writer default ([`DEFAULT_MAX_OPEN_PARTITIONS`]).
     pub max_open_partitions: Option<usize>,
+    /// How many finished data files to upload concurrently; `None` leaves the
+    /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
+    pub upload_concurrency: Option<usize>,
 }
 
 /// Options shared by streaming and partitioned table writes.
@@ -131,6 +150,10 @@ pub struct DuckLakeTableWriter {
     /// once, so a byte cap bounds reader memory for wide schemas (e.g. large
     /// vector columns). Set via [`DuckLakeTableWriter::with_max_row_group_bytes`].
     max_row_group_bytes: Option<usize>,
+    /// How many finished data files `finish` uploads concurrently. Defaults to
+    /// [`DEFAULT_UPLOAD_CONCURRENCY`]; override via
+    /// [`DuckLakeTableWriter::with_upload_concurrency`].
+    upload_concurrency: usize,
     /// Target data file size in approximate encoded bytes. A write rolls over to a
     /// new file once the current file's estimated encoded size reaches this, so a
     /// large write produces several files instead of one. Paired with a sort order,
@@ -160,6 +183,7 @@ impl DuckLakeTableWriter {
             compression: Compression::UNCOMPRESSED,
             max_row_group_rows: None,
             max_row_group_bytes: None,
+            upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
         })
@@ -213,9 +237,18 @@ impl DuckLakeTableWriter {
         self
     }
 
+    /// Override how many finished data files `finish` uploads concurrently.
+    /// Defaults to [`DEFAULT_UPLOAD_CONCURRENCY`]. Values below 1 are clamped to 1
+    /// (a write must still upload its files).
+    #[must_use]
+    pub fn with_upload_concurrency(mut self, files: usize) -> Self {
+        self.upload_concurrency = files.max(1);
+        self
+    }
+
     /// Apply a [`DuckLakeWriteOptions`] set (compression, row-group caps, rollover
-    /// target, open-partition cap). Each field overrides the corresponding setting
-    /// only when present.
+    /// target, open-partition cap, upload concurrency). Each field overrides the
+    /// corresponding setting only when present.
     pub fn with_options(mut self, options: &DuckLakeWriteOptions) -> Self {
         if let Some(compression) = options.compression {
             self.compression = compression;
@@ -231,6 +264,9 @@ impl DuckLakeTableWriter {
         }
         if let Some(files) = options.max_open_partitions {
             self.max_open_partitions = files.max(1);
+        }
+        if let Some(files) = options.upload_concurrency {
+            self.upload_concurrency = files.max(1);
         }
         self
     }
@@ -531,6 +567,7 @@ impl DuckLakeTableWriter {
                             props: self.build_writer_props(),
                             target_file_size: self.target_file_size,
                             max_open: self.max_open_partitions,
+                            upload_concurrency: self.upload_concurrency,
                             open: Vec::new(),
                             staged: Vec::new(),
                         })
@@ -584,6 +621,7 @@ impl DuckLakeTableWriter {
             partition_sink,
             roller,
             rolled: Vec::new(),
+            upload_concurrency: self.upload_concurrency,
             commit_metadata: SnapshotCommitMetadata::default(),
         })
     }
@@ -712,10 +750,7 @@ impl DuckLakeTableWriter {
         let local = tokio::fs::File::open(temp.path()).await?;
         let mut reader = tokio::io::BufReader::new(local);
         let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
-        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-            let _ = upload.abort().await;
-            return Err(e.into());
-        }
+        stream_to_upload(&mut reader, &mut upload).await?;
 
         // Registered relative to the table path (like data files); the reader
         // resolves it against the same table data dir.
@@ -881,10 +916,7 @@ impl DuckLakeTableWriter {
         let local = tokio::fs::File::open(temp.path()).await?;
         let mut reader = tokio::io::BufReader::new(local);
         let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
-        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-            let _ = upload.abort().await;
-            return Err(e.into());
-        }
+        stream_to_upload(&mut reader, &mut upload).await?;
 
         // Collect stats for catalog columns only. Track NaN values while
         // consuming the stream because the Parquet footer omits that signal.
@@ -1569,7 +1601,13 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
 
 /// Upload a finished staging file and harvest its per-column stats, returning the
 /// [`DataFileInfo`] for the catalog commit (relative path; the caller stamps any
-/// partition). On failure the multipart upload is aborted so no partial object is left.
+/// partition).
+///
+/// On a COPY failure the multipart upload is aborted, so no partial object is left.
+/// On a FLUSH failure it deliberately is not — `BufWriter::abort` panics once the
+/// writer has been shut down — so a rejected or unacknowledged
+/// `CompleteMultipartUpload` can leave the upload dangling for a bucket lifecycle
+/// rule to reclaim. See [`stream_to_upload`].
 #[tracing::instrument(name = "ducklake.upload_staged_file", level = "info", skip_all)]
 async fn upload_staged_file(
     staged: StagedFile,
@@ -1584,10 +1622,7 @@ async fn upload_staged_file(
     let local = tokio::fs::File::open(&staged.temp).await?;
     let mut reader = tokio::io::BufReader::new(local);
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
-    if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-        let _ = upload.abort().await;
-        return Err(e.into());
-    }
+    stream_to_upload(&mut reader, &mut upload).await?;
 
     let column_stats = crate::stats_collect::collect_column_stats(
         &staged.temp,
@@ -1644,6 +1679,8 @@ struct PartitionSink {
     /// One roller per partition with a file in progress, oldest first (eviction takes
     /// from the front). Paired with the partition values its files carry.
     open: Vec<(Vec<Option<String>>, RollingFileWriter)>,
+    /// How many finished partition files are uploaded concurrently.
+    upload_concurrency: usize,
     /// Finished files awaiting upload at `finish`, with the partition each belongs to.
     staged: Vec<(Vec<Option<String>>, StagedFile)>,
 }
@@ -1728,18 +1765,166 @@ impl PartitionSink {
                 self.staged.push((values, staged));
             }
         }
-        let mut infos = Vec::with_capacity(self.staged.len());
-        for (values, staged) in std::mem::take(&mut self.staged) {
-            let partition_values: Vec<(i32, Option<String>)> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as i32, v.clone()))
-                .collect();
-            let info = upload_staged_file(staged, object_store, &self.column_ids).await?;
-            infos.push(info.with_partition(self.spec.partition_id, partition_values));
-        }
+        // Uploaded concurrently but collected in order: `register_data_files`
+        // assigns `row_id_start` by walking this list, so the order is part of the
+        // committed result even though the uploads themselves are independent.
+        let (values, staged): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.staged).into_iter().unzip();
+        let uploaded = upload_staged_files_ordered(
+            staged,
+            object_store,
+            &self.column_ids,
+            self.upload_concurrency,
+        )
+        .await?;
+        // `zip` is positional and truncates silently; the helper asserts that it
+        // returns one info per input, which is what makes this pairing sound.
+        let infos = values
+            .into_iter()
+            .zip(uploaded)
+            .map(|(values, info)| {
+                let partition_values: Vec<(i32, Option<String>)> = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as i32, v))
+                    .collect();
+                info.with_partition(self.spec.partition_id, partition_values)
+            })
+            .collect();
         Ok(infos)
     }
+}
+
+/// Upload several finished data files concurrently, returning their
+/// [`DataFileInfo`]s **in the original order**.
+///
+/// Order is load-bearing and this is the reason `buffered` is used rather than
+/// `buffer_unordered`: `register_data_files` walks the slice assigning
+/// `row_id_start` from a running counter, so reordering the results would
+/// renumber rows. Official DuckLake assigns row ids in collection order too, so
+/// preserving it here is what keeps the two equivalent.
+///
+/// `concurrency` bounds how many uploads are in flight; each holds its own
+/// object-store write buffer, so this is a memory bound rather than a CPU one.
+///
+/// On failure, uploads already IN FLIGHT are awaited — dropping a future
+/// mid-multipart strands upload state that only a bucket lifecycle rule could
+/// reclaim — while uploads that have not yet STARTED are skipped. That bounds the
+/// cost of a failing batch by the concurrency setting rather than by its size, which
+/// matters because each upload carries the object store's own retry budget (minutes
+/// per request): draining unconditionally turns a store outage into an hours-long
+/// hang. The objects that did land are then removed.
+///
+/// Scope, precisely: this covers a failure WITHIN the upload batch. It does not
+/// cover a metadata/catalog commit that fails after every upload succeeded — those
+/// objects are still left behind. Official DuckLake cleans up the files a write
+/// created in both cases, so that second case remains a divergence; it is
+/// pre-existing and not addressed here.
+#[tracing::instrument(
+    name = "ducklake.upload_staged_files",
+    level = "info",
+    skip_all,
+    fields(files = staged.len(), concurrency)
+)]
+async fn upload_staged_files_ordered(
+    staged: Vec<StagedFile>,
+    object_store: &Arc<dyn ObjectStore>,
+    column_ids: &[i64],
+    concurrency: usize,
+) -> Result<Vec<DataFileInfo>> {
+    // Paired with its destination so a failed batch can remove what it wrote: the
+    // returned `DataFileInfo` carries a catalog-relative path, not the object key.
+    let targets: Vec<ObjectPath> = staged.iter().map(|s| s.object_path.clone()).collect();
+    // Once the batch has failed, uploads that have not STARTED are skipped. Draining
+    // them unconditionally is what makes a store outage catastrophic rather than slow:
+    // each upload carries the object store's own retry budget (minutes per request),
+    // so a large batch against an unreachable store would hold the caller for hours.
+    // Uploads already in flight are still awaited — dropping those is what strands a
+    // multipart upload — so the anti-strand property is unchanged.
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let results: Vec<Option<Result<DataFileInfo>>> =
+        futures::stream::iter(staged.into_iter().map(|s| {
+            let failed = Arc::clone(&failed);
+            async move {
+                if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
+                let outcome = upload_staged_file(s, object_store, column_ids).await;
+                if outcome.is_err() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some(outcome)
+            }
+        }))
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+
+    let mut infos = Vec::with_capacity(results.len());
+    let mut failure = None;
+    for (index, result) in results.into_iter().enumerate() {
+        let Some(result) = result else {
+            continue;
+        }; // never started
+        match result {
+            Ok(info) => infos.push(info),
+            Err(e) => {
+                // Keep the FIRST error in file order as the one returned, but do not
+                // swallow the rest: a batch can produce several failures before the skip takes
+                // effect, so a systemic cause (an expired credential, a store that went away) shows
+                // up as several failures of which only one would otherwise be visible.
+                if failure.is_none() {
+                    failure = Some(e);
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        file_index = index,
+                        "additional upload failure in the same batch"
+                    );
+                }
+            },
+        }
+    }
+    if let Some(e) = failure {
+        // EVERY path in the batch, not only those that reported success. An upload
+        // that fails at flush — a rejected or unacknowledged `CompleteMultipartUpload`
+        // — returns an error while its object may well exist, and that is precisely
+        // the case most likely to strand. Paths whose upload was skipped were never
+        // created, and deleting a key that does not exist is a harmless no-op.
+        //
+        // Best effort: the write is already failing, so a delete that also fails must
+        // not mask the original error. Anything surviving is reclaimable as an orphan,
+        // since no snapshot references it.
+        // `delete_stream`, not a loop of `delete`: it is a required trait method whose
+        // S3 implementation batches into `DeleteObjects` and whose other backends run
+        // deletes concurrently. A sequential loop costs one full retry budget per file
+        // precisely when the store is unhealthy.
+        let to_delete = futures::stream::iter(targets.into_iter().map(Ok));
+        let mut deletions = object_store.delete_stream(to_delete.boxed());
+        while let Some(outcome) = deletions.next().await {
+            match outcome {
+                Ok(_)
+                | Err(object_store::Error::NotFound {
+                    ..
+                }) => {},
+                Err(cleanup) => tracing::warn!(
+                    error = %cleanup,
+                    "failed to remove a data file after an aborted upload batch"
+                ),
+            }
+        }
+        return Err(e);
+    }
+    // The load-bearing invariant of the skip: a `None` (never started) is only
+    // possible once some future has already errored, so on the success path every
+    // input must have produced an info. If this ever broke, the commit would register
+    // FEWER files than were written — rows lost with no error.
+    debug_assert_eq!(
+        infos.len(),
+        targets.len(),
+        "a skipped upload must imply a returned error"
+    );
+    Ok(infos)
 }
 
 /// Streaming write session. Batches stream to a local staging file; the
@@ -1804,6 +1989,8 @@ pub struct TableWriteSession {
     roller: Option<RollingFileWriter>,
     /// Files the roller has finished, awaiting upload at `finish`.
     rolled: Vec<StagedFile>,
+    /// How many of those files `finish` uploads concurrently.
+    upload_concurrency: usize,
     commit_metadata: SnapshotCommitMetadata,
 }
 
@@ -1980,11 +2167,13 @@ impl TableWriteSession {
             if let Some(staged) = roller.finish()? {
                 self.rolled.push(staged);
             }
-            let mut file_infos = Vec::with_capacity(self.rolled.len());
-            for staged in std::mem::take(&mut self.rolled) {
-                file_infos
-                    .push(upload_staged_file(staged, &self.object_store, &self.column_ids).await?);
-            }
+            let file_infos = upload_staged_files_ordered(
+                std::mem::take(&mut self.rolled),
+                &self.object_store,
+                &self.column_ids,
+                self.upload_concurrency,
+            )
+            .await?;
             if file_infos.is_empty() {
                 // No rows arrived. Fall through to the single-file path, which
                 // registers the 0-row marker a Replace needs to retire the prior
@@ -2125,13 +2314,13 @@ impl TableWriteSession {
                 // partition fence) — same behaviour as a non-rolling session.
                 vec![self.upload_staged().await?]
             } else {
-                let mut file_infos = Vec::with_capacity(self.rolled.len());
-                for staged in std::mem::take(&mut self.rolled) {
-                    file_infos.push(
-                        upload_staged_file(staged, &self.object_store, &self.column_ids).await?,
-                    );
-                }
-                file_infos
+                upload_staged_files_ordered(
+                    std::mem::take(&mut self.rolled),
+                    &self.object_store,
+                    &self.column_ids,
+                    self.upload_concurrency,
+                )
+                .await?
             }
         } else {
             vec![self.upload_staged().await?]
@@ -2213,10 +2402,7 @@ impl TableWriteSession {
         let mut reader = tokio::io::BufReader::new(local);
         let mut upload =
             ObjectBufWriter::new(Arc::clone(&self.object_store), self.object_path.clone());
-        if let Err(e) = stream_to_upload(&mut reader, &mut upload).await {
-            let _ = upload.abort().await;
-            return Err(e.into());
-        }
+        stream_to_upload(&mut reader, &mut upload).await?;
 
         // Harvest per-column statistics from the parquet footer we just wrote
         // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
@@ -2250,9 +2436,18 @@ async fn stream_to_upload<R>(reader: &mut R, upload: &mut ObjectBufWriter) -> st
 where
     R: tokio::io::AsyncRead + Unpin + ?Sized,
 {
-    tokio::io::copy(reader, upload).await?;
-    upload.shutdown().await?;
-    Ok(())
+    // The abort decision lives here rather than at each call site, because only ONE
+    // of the two failure modes may be aborted and getting it wrong is a panic, not a
+    // wrong result: `BufWriter::abort` panics if the writer has already been shut
+    // down, and a failing `shutdown` leaves it in exactly that state. So aborting
+    // after a flush failure turns a recoverable upload error into a panicking task.
+    // Aborting after a copy failure is both safe and necessary — it releases the
+    // multipart upload instead of stranding it.
+    if let Err(e) = tokio::io::copy(reader, upload).await {
+        let _ = upload.abort().await;
+        return Err(e);
+    }
+    upload.shutdown().await
 }
 
 /// Read the parquet footer length (thrift metadata + 8-byte trailer) from the

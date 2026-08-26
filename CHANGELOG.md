@@ -9,9 +9,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeTableWriter::with_upload_concurrency` and
+  `DuckLakeWriteOptions::upload_concurrency` — how many finished data files a rolling
+  or partitioned write uploads at once, defaulting to `DEFAULT_UPLOAD_CONCURRENCY`
+  (4). Uploads are collected in write order, so `row_id_start`, per-file statistics
+  and partition labels are identical at any setting (#280).
+
 - Add read-only DuckLake views across metadata backends and writer-compatible view metadata (#264).
 
+### Changed
+
+- **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. It is a
+  plain `pub` struct, so an exhaustive struct literal — or a destructuring pattern
+  without `..` — stops compiling with "missing field `upload_concurrency`". Add
+  `..Default::default()` to the literal, or set `upload_concurrency: None` to keep the
+  writer default. No catalog or data migration is needed (#280).
+
+  Note this struct has now taken a breaking field addition more than once, and will
+  again for the next write option. Marking it `#[non_exhaustive]` does not fix that on
+  its own — for a struct it forbids struct expressions from other crates entirely,
+  including the `..Default::default()` form every caller currently uses — so a lasting
+  fix means pairing it with setter methods on the options type. That is a broader API
+  decision than this change should make, and is left to the maintainers.
+
+  ```rust
+  let options = DuckLakeWriteOptions {
+      target_file_size: Some(target_bytes),
+      ..Default::default()
+  };
+  ```
+
+- A write uploads up to 4 finished data files concurrently instead of one at a time,
+  raising peak **write memory roughly fourfold** on the paths that use it.
+  `object_store`'s `BufWriter` holds a 10 MiB buffer and keeps up to 8 multipart parts
+  in flight, so one upload of a large file peaks near 90 MiB and four near 360 MiB —
+  **per write session**, with no process-wide cap, so concurrent sessions multiply it.
+
+  Which paths are affected is narrower than it may appear, and worth checking against
+  your own usage rather than assuming. In-crate, the concurrent upload helper is
+  reached only from a streaming `begin_write` session (roll enabled) and from a
+  partitioned write's sink. SQL `INSERT`, compaction, and an unpartitioned SQL
+  `UPDATE` all still upload one file at a time and are unaffected. An embedder that
+  drives `begin_write` and streams batches — the shape a bulk load takes — gets both
+  the speedup and the memory cost.
+
+  Restore the previous behaviour with `DuckLakeTableWriter::with_upload_concurrency(1)`
+  on the writer you construct, or pin the previous release. Note that
+  `DuckLakeWriteOptions { upload_concurrency: Some(1), .. }` only takes effect if the
+  writer is built through `with_options`. The same multiplier applies to request rate —
+  up to 32 in-flight part uploads instead of 8 — worth checking against a rate-limited
+  store, gateway or proxy (#280).
+
+- A custom `ObjectStore` implementation now sees several `put_opts` /
+  `put_multipart_opts` calls from a single write overlapping in time. An
+  implementation that assumed this crate wrote one object at a time — a throttling or
+  ordering-sensitive wrapper, or a test double keyed on call sequence — must be made
+  concurrency-safe, or the writer set to `upload_concurrency: Some(1)` (#280).
+
+- A write whose uploads fail removes the objects from that batch, issuing `DELETE`
+  against the object store to do so. A writer role granted only put/list permissions
+  logs `failed to remove a data file after an aborted upload batch` and leaves the
+  orphans exactly as before; grant delete on the data prefix (`s3:DeleteObject`) to get
+  the cleanup. On a versioned bucket the removal leaves a delete marker rather than
+  reclaiming the bytes — including for files whose upload failed and which may never
+  have existed, since the cleanup covers every path in the batch. The cleanup covers a failure **within the upload batch** only —
+  objects from a write that uploaded everything and then failed to commit metadata are
+  still left behind (#280).
+
+- A failing write can surface its error later than before. Uploads already in flight
+  when the first error appears are awaited rather than dropped, because dropping a
+  future mid-multipart strands upload state that only a bucket lifecycle rule could
+  reclaim. Uploads that have not yet started are skipped, so the cost is bounded by
+  the concurrency setting rather than by the size of the batch. Cleanup of the objects
+  that did land is issued as a single batched delete rather than one request per file.
+  The first error in file order is the one returned; any others are logged (#280).
+
+- Staged-file uploads are wrapped in a new `ducklake.upload_staged_files` tracing span,
+  and the existing per-file `ducklake.upload_staged_file` spans now overlap in
+  wall-clock time. Summing their durations no longer approximates a write's upload
+  time (#280).
+
 ### Fixed
+
+- An upload whose final flush failed panicked with "Already shut down" instead of
+  returning the error. `BufWriter::shutdown` leaves the writer shut down even when it
+  fails, and `BufWriter::abort` panics in that state, so the abort the writer ran on
+  every upload error turned a recoverable object-store failure — an expired credential,
+  a rejected `CompleteMultipartUpload` — into a panicking task. The abort decision now
+  lives inside the upload helper, which aborts a copy failure (where it releases the
+  multipart upload) and returns a flush failure as `DuckLakeError::Io`. No error type
+  or variant changed; code that observed this as a task panic now sees an ordinary
+  `Err`. The fix covers every upload the writer performs — data files, delete files and
+  the single-file write path — not only the concurrent one (#280).
 
 - `files_matching` prunes a data file that carries a delete file. Its recorded
   bounds are marked inexact for readers that apply deletes, and the pruning view

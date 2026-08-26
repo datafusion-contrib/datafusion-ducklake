@@ -1378,3 +1378,147 @@ async fn empty_overwrite_truncates_partitioned_table() {
         "empty INSERT OVERWRITE must truncate the partitioned table, not conflict"
     );
 }
+
+/// `PartitionSink::into_file_infos` zips each file's partition values onto the
+/// concurrent upload results positionally, so a desynchronisation mislabels which
+/// partition a file belongs to — no error, no change in row count.
+///
+/// SCOPE, stated precisely, because the previous version of this comment overstated
+/// it. This is a SMOKE TEST for the partitioned concurrent path, not a proven
+/// regression guard: flipping the shared helper to `buffer_unordered` does not
+/// reliably fail it, because on a local store these uploads complete in submission
+/// order however they are polled. The proven ordering guards are the two tests in
+/// `concurrent_staged_upload_tests`, which do fail under that mutation and exercise
+/// the same helper this path calls.
+///
+/// The single-run assertion below is a genuine but PARTIAL check: the fixture gives
+/// the `us` partition 3000-row files and the others 600-row files, so it catches a
+/// label that crossed between `us` and any other partition. A mislabel confined to
+/// `{eu, apac, latam}` is invisible to it, since those three are indistinguishable
+/// by row count.
+///
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_staged_uploads_are_order_stable_across_concurrency() {
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch, TimestampMicrosecondArray};
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_ducklake::table_writer::DuckLakeTableWriter;
+
+    /// One streaming partitioned write at the given upload concurrency. Returns the
+    /// committed `(partition key index, partition value, row_id_start,
+    /// record_count)` in data_file_id order — everything the ordering could corrupt.
+    async fn write_at(concurrency: usize) -> Vec<(Option<i32>, Option<String>, Option<i64>, i64)> {
+        let env = setup().await; // partitioned by (region, year(ts))
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("ts", ts_type, true),
+        ]));
+        let y2023: i64 = 1_673_776_800_000_000;
+        // Several partitions, each large enough to roll, so the sink finishes many
+        // staged files and the uploads genuinely overlap.
+        // Partition sizes are skewed so the uploads differ in duration, and so that
+        // `us` files are distinguishable from the rest by row count — which is what
+        // the assertion at the end relies on. The skew was NOT enough to make
+        // completion order diverge on a local store; see the scope note on this test.
+        let regions = ["us", "eu", "apac", "latam"];
+        let mut next_id = 0i32;
+        let batches: Vec<RecordBatch> = (0..40)
+            .map(|b: i32| {
+                let region = regions[(b as usize) % regions.len()];
+                let count = if region == "us" {
+                    3000
+                } else {
+                    60
+                };
+                let ids: Vec<i32> = (next_id..next_id + count).collect();
+                next_id += count;
+                let n = ids.len();
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(ids)) as ArrayRef,
+                        Arc::new(arrow::array::StringArray::from(vec![region; n])) as ArrayRef,
+                        Arc::new(TimestampMicrosecondArray::from(vec![y2023; n])) as ArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+            .await
+            .unwrap();
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new());
+        let mut session = DuckLakeTableWriter::new(Arc::new(writer), object_store)
+            .unwrap()
+            .with_target_file_size(8 * 1024)
+            .with_upload_concurrency(concurrency)
+            .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
+            .unwrap();
+        for batch in &batches {
+            session.write_batch(batch).unwrap();
+        }
+        let result = session.finish().await.unwrap();
+        assert_eq!(result.records_written, i64::from(next_id));
+        assert!(
+            result.files_written > 4,
+            "the write must span several files per partition or concurrency is \
+             untested, got {}",
+            result.files_written
+        );
+
+        let pool = sqlx::sqlite::SqlitePool::connect(&env.conn_str)
+            .await
+            .unwrap();
+        sqlx::query_as(
+            // Both partition keys: the table is partitioned by (region, year(ts)),
+            // and a positional mix-up could corrupt either. Checking only index 0
+            // would miss a file whose year landed on the wrong row.
+            "SELECT p.partition_key_index, p.partition_value, d.row_id_start,
+                    d.record_count
+               FROM ducklake_data_file d
+               LEFT JOIN ducklake_file_partition_value p
+                      ON p.data_file_id = d.data_file_id
+              WHERE d.end_snapshot IS NULL
+              ORDER BY d.data_file_id, p.partition_key_index",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    }
+
+    let serial = write_at(1).await;
+    let concurrent = write_at(4).await;
+
+    // Absolute check within ONE run: a `us` file must hold 3000 rows and any other
+    // partition's file 600. This catches a label that crossed between `us` and the
+    // rest — which a 1-vs-4 comparison cannot, since a reordering applying to both
+    // runs cancels out. It does NOT distinguish eu/apac/latam from each other.
+    for rows in [&serial, &concurrent] {
+        for (key_index, value, _start, count) in rows.iter() {
+            if *key_index != Some(0) {
+                continue;
+            }
+            let expected = if value.as_deref() == Some("us") {
+                3000
+            } else {
+                600
+            };
+            assert_eq!(
+                *count, expected,
+                "partition {value:?} holds {expected}-row files by construction; a \
+                 different count means this file's partition label came from another \
+                 file's slot"
+            );
+        }
+    }
+
+    assert_eq!(
+        serial, concurrent,
+        "partition values, row_id_start and record_count must be identical at \
+         concurrency 1 and 4 — a difference means the sink registered its files out \
+         of order, so partition labels or row ids landed on the wrong file"
+    );
+}

@@ -24,6 +24,7 @@ mod column_stats_tests;
 mod common;
 mod compaction_postgres_tests;
 mod compaction_sqlite_tests;
+mod concurrent_staged_upload_tests;
 mod concurrent_tests;
 mod concurrent_write_tests;
 mod delete_filter_tests;
