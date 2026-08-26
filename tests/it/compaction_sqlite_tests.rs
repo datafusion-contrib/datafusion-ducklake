@@ -196,6 +196,57 @@ fn file_values(temp: &TempDir, path: &str) -> Vec<i32> {
         .concat()
 }
 
+/// One live data file's catalog row, as `merge_reads_a_whole_bin_in_one_pass`
+/// reads it back.
+#[derive(Debug)]
+struct MergedFile {
+    path: String,
+    partition_id: Option<i64>,
+    partition_value: Option<String>,
+    begin_snapshot: Option<i64>,
+    partial_max: Option<i64>,
+}
+
+/// The embedded lineage columns of a compaction output — `(rowid, origin
+/// snapshot)` per row, in the file's PHYSICAL order. Read from the parquet
+/// itself, so it shows the layout on disk rather than what the read path
+/// reconstructs. The snapshot column is absent unless the file is partial.
+fn file_lineage(temp: &TempDir, path: &str) -> Vec<(i64, Option<i64>)> {
+    let file =
+        std::fs::File::open(temp.path().join("data").join("main").join("t").join(path)).unwrap();
+    let mut out = Vec::new();
+    for batch in ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap()
+    {
+        let batch = batch.unwrap();
+        let rowids = batch
+            .column_by_name("_ducklake_internal_row_id")
+            .expect("a compaction output embeds its rowids")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
+        let snapshots = batch
+            .column_by_name("_ducklake_internal_snapshot_id")
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone()
+            });
+        for i in 0..batch.num_rows() {
+            out.push((
+                rowids.value(i),
+                snapshots.as_ref().map(|column| column.value(i)),
+            ));
+        }
+    }
+    out
+}
+
 /// Downcast the writable `main.t` provider to a `DuckLakeTable` and run `op` on
 /// it (the compaction ops are `DuckLakeTable` methods). A fresh writable catalog
 /// is opened so the table binds to the latest snapshot.
@@ -479,6 +530,175 @@ async fn merge_only_within_a_partition_and_preserves_assignment() {
     assert_eq!(
         read_rows(&temp).await,
         vec![(1, 1), (2, 1), (11, 2), (12, 2)]
+    );
+}
+
+/// A merge reads the WHOLE bin with one plan — every source at once, each row's
+/// lineage carried as a column of that scan, the shape official DuckLake
+/// compaction uses. This pins what that has to produce for a bin far wider than
+/// one file: the same rows, the same rowids, the same partition assignment and
+/// the same per-row origin snapshots the old file-at-a-time reads produced, with
+/// the sources' order still visible in the merged file's physical layout.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_reads_a_whole_bin_in_one_pass() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, WriteMode};
+
+    // Wide enough that a serialized read would be doing something visibly
+    // different from one plan over the set, and deep enough in snapshots that
+    // every source has its own origin.
+    const APPENDS: i32 = 12;
+
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let table_id = {
+        let s = writer
+            .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                s.table_id,
+                "main",
+                "t",
+                s.snapshot_id,
+                WriteMode::Replace,
+                s.base_snapshot_id,
+                &cols,
+                &s.column_ids,
+            )
+            .unwrap();
+        writer
+            .set_partition_spec(
+                s.table_id,
+                &[("val".to_string(), PartitionTransform::Identity)],
+            )
+            .unwrap();
+        s.table_id
+    };
+
+    // Each append is its own snapshot and touches both partitions, so the merge
+    // sees APPENDS x 2 sources spread over APPENDS origin snapshots, binned into
+    // one output per partition.
+    append(&temp, vec![1, 101], vec![1, 2]).await;
+    let p = pool(&temp).await;
+    let first_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    for id in 2..=APPENDS {
+        append(&temp, vec![id, id + 100], vec![1, 2]).await;
+    }
+    let last_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        i64::from(APPENDS) * 2,
+    );
+
+    let rows_before = read_rows(&temp).await;
+    let rowids_before = read_id_rowid(&temp).await;
+
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: 1 << 30,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: usize::try_from(APPENDS).unwrap() * 2,
+            files_created: 2,
+            rows_written: i64::from(APPENDS) * 2,
+        },
+    );
+    assert_eq!(read_rows(&temp).await, rows_before, "same rows");
+    assert_eq!(read_id_rowid(&temp).await, rowids_before, "same rowids");
+
+    // One merged file per partition, each keeping its sources' assignment, and
+    // each recording the bin's origin span: begin at the MIN origin so time
+    // travel back to it still sees the file, partial_max at the MAX.
+    let live: Vec<MergedFile> = sqlx::query(
+        "SELECT df.path, df.partition_id, fpv.partition_value, df.begin_snapshot, df.partial_max
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = ? AND df.end_snapshot IS NULL
+         ORDER BY fpv.partition_value",
+    )
+    .bind(table_id)
+    .fetch_all(&p)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| MergedFile {
+        path: r.try_get(0).unwrap(),
+        partition_id: r.try_get(1).unwrap(),
+        partition_value: r.try_get(2).unwrap(),
+        begin_snapshot: r.try_get(3).unwrap(),
+        partial_max: r.try_get(4).unwrap(),
+    })
+    .collect();
+
+    assert_eq!(live.len(), 2, "one merged file per partition: {live:?}");
+    for (index, file) in live.iter().enumerate() {
+        let expected_partition_value = if index == 0 {
+            "1"
+        } else {
+            "2"
+        };
+        assert!(
+            file.partition_id.is_some(),
+            "a merged file of a partitioned table keeps its partition_id"
+        );
+        assert_eq!(
+            file.partition_value.as_deref(),
+            Some(expected_partition_value),
+            "each merged file keeps its sources' partition value"
+        );
+        assert_eq!(
+            file.begin_snapshot,
+            Some(first_snapshot),
+            "begin_snapshot is the MIN origin of the bin"
+        );
+        assert_eq!(
+            file.partial_max,
+            Some(last_snapshot),
+            "partial_max is the MAX origin of the bin"
+        );
+
+        // The physical layout: rowids ascending in source (data_file_id) order,
+        // each stamped with the origin snapshot of the file it came from. Read
+        // straight from the parquet, so this is the bytes on disk, not what the
+        // read path reconstructs.
+        let lineage = file_lineage(&temp, &file.path);
+        let expected: Vec<(i64, Option<i64>)> = (0..APPENDS)
+            .map(|append_index| {
+                (
+                    i64::from(append_index) * 2 + index as i64,
+                    Some(first_snapshot + i64::from(append_index)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lineage, expected,
+            "merged rows keep their rowid and origin snapshot, in source order"
+        );
+    }
+
+    // Time travel to the first append still sees exactly its rows, served by the
+    // merged partial file.
+    assert_eq!(
+        read_rows_at(&temp, first_snapshot).await,
+        vec![(1, 1), (101, 2)],
     );
 }
 

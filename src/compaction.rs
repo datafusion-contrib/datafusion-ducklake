@@ -37,12 +37,22 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
-use datafusion::physical_plan::{ExecutionPlan, sorts::sort::SortExec};
+use datafusion::physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
+};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
+    PlanProperties, sorts::sort::SortExec,
+};
+use futures::{StreamExt, TryStreamExt};
 
 use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::DuckLakeTableFile;
@@ -50,7 +60,9 @@ use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceR
 use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
 use crate::sort::{SortDirection, SortSpec};
-use crate::table::DuckLakeTable;
+use crate::table::{
+    DuckLakeTable, RewrittenBatch, UpdateSourceScan, rewrite_output_schema, rewrite_scanned_batch,
+};
 use crate::table_writer::DuckLakeTableWriter;
 use crate::{DuckLakeError, Result};
 
@@ -133,28 +145,324 @@ impl CompactionResult {
     }
 }
 
+/// The Arrow field for the constant `_ducklake_internal_snapshot_id` column a
+/// merged partial file embeds. Field-id metadata is deliberately absent: only
+/// the column order matters here, and `write_compacted_file_stream` re-imposes
+/// the field-id-tagged parquet schema.
+fn snapshot_column_field() -> Field {
+    Field::new(EMBEDDED_SNAPSHOT_ID_COLUMN_NAME, DataType::Int64, true)
+}
+
 /// Append a constant `_ducklake_internal_snapshot_id` column (every value =
-/// `origin`) to a `[data columns..., rowid]` batch, yielding
-/// `[data columns..., rowid, snapshot_id]` for a merged partial file. Only the
-/// column order matters here; `write_compacted_file` re-imposes the
-/// field-id-tagged parquet schema.
-fn append_snapshot_column(batch: &RecordBatch, origin: i64) -> Result<RecordBatch> {
-    let n = batch.num_rows();
-    let snap: ArrayRef = Arc::new(Int64Array::from(vec![origin; n]));
+/// `origin`) to a `[data columns..., rowid]` batch, yielding the
+/// `[data columns..., rowid, snapshot_id]` `schema` of a merged partial file.
+fn append_snapshot_column(
+    batch: &RecordBatch,
+    origin: i64,
+    schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let snap: ArrayRef = Arc::new(Int64Array::from(vec![origin; batch.num_rows()]));
     let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
     cols.push(snap);
-    let mut fields: Vec<Field> = batch
-        .schema()
-        .fields()
-        .iter()
-        .map(|f| f.as_ref().clone())
-        .collect();
-    fields.push(Field::new(
-        EMBEDDED_SNAPSHOT_ID_COLUMN_NAME,
-        DataType::Int64,
-        true,
-    ));
-    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
+    Ok(RecordBatch::try_new(Arc::clone(schema), cols)?)
+}
+
+/// One source file of a compaction, as a leaf of the compaction plan.
+///
+/// Wraps that file's positional read plan and rewrites each batch it produces
+/// into `[physical columns (catalog types)..., rowid]` — the same per-row
+/// transformation an `UPDATE` applies, via the shared [`rewrite_scanned_batch`]
+/// — appending the constant `_ducklake_internal_snapshot_id` column when
+/// `origin` is set (a merge whose bin spans more than one origin snapshot).
+///
+/// Carrying provenance as columns OF THE SCAN is what lets a whole bin be read
+/// by one execution rather than one file at a time: nothing downstream needs to
+/// know which source a batch came from. Official DuckLake compaction has the
+/// same shape — a single scan over the compaction set that projects the row-id
+/// and snapshot-id virtual columns
+/// (`InsertVirtualColumns::WRITE_ROW_ID_AND_SNAPSHOT_ID` in
+/// `ducklake_compaction_functions.cpp`).
+#[derive(Debug)]
+struct CompactionSourceExec {
+    /// The source file's positional read plan and its lineage metadata. Shared
+    /// rather than cloned: every scan partition reads the same metadata, and it
+    /// carries the file's already-deleted position set.
+    scan: Arc<UpdateSourceScan>,
+    /// The table's physical (data) columns in catalog types.
+    physical_schema: SchemaRef,
+    /// `[physical columns..., rowid]` — what [`rewrite_scanned_batch`] emits.
+    rewrite_schema: SchemaRef,
+    /// This exec's output schema: [`Self::rewrite_schema`] plus the embedded
+    /// snapshot-id column when [`Self::origin`] is set.
+    schema: SchemaRef,
+    /// Origin snapshot to stamp on every row of this file, for a partial merge
+    /// output; `None` leaves the batch at `[physical columns..., rowid]`.
+    origin: Option<i64>,
+    properties: Arc<PlanProperties>,
+}
+
+impl CompactionSourceExec {
+    fn new(scan: Arc<UpdateSourceScan>, physical_schema: SchemaRef, origin: Option<i64>) -> Self {
+        let rewrite_schema = rewrite_output_schema(&physical_schema);
+        let schema = if origin.is_some() {
+            let mut fields: Vec<Arc<Field>> = rewrite_schema.fields().iter().cloned().collect();
+            fields.push(Arc::new(snapshot_column_field()));
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::clone(&rewrite_schema)
+        };
+        // Row-for-row: same partitioning as the file's scan, and no reordering.
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            scan.scan.output_partitioning().clone(),
+            scan.scan.pipeline_behavior(),
+            scan.scan.boundedness(),
+        ));
+        Self {
+            scan,
+            physical_schema,
+            rewrite_schema,
+            schema,
+            origin,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for CompactionSourceExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "CompactionSourceExec: file={}, origin={}",
+            self.scan.source_path,
+            self.origin
+                .map_or_else(|| "none".to_string(), |origin| origin.to_string())
+        )
+    }
+}
+
+impl ExecutionPlan for CompactionSourceExec {
+    fn name(&self) -> &str {
+        "CompactionSourceExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.scan.scan]
+    }
+
+    /// Order-preserving: every row in, one row out, in order.
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|_| {
+            DataFusionError::Internal("CompactionSourceExec expects exactly one child".into())
+        })?;
+        let mut scan = UpdateSourceScan::clone(&self.scan);
+        scan.scan = child;
+        Ok(Arc::new(CompactionSourceExec::new(
+            Arc::new(scan),
+            Arc::clone(&self.physical_schema),
+            self.origin,
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let input = self.scan.scan.execute(partition, context)?;
+        let scan = Arc::clone(&self.scan);
+        let physical_schema = Arc::clone(&self.physical_schema);
+        let rewrite_schema = Arc::clone(&self.rewrite_schema);
+        let schema = Arc::clone(&self.schema);
+        let origin = self.origin;
+        let stream = input
+            .map(move |batch| -> DataFusionResult<Option<RecordBatch>> {
+                let batch = batch?;
+                // Compaction keeps every live row exactly as it is: no predicate
+                // to select with, no assignments to apply.
+                let Some(RewrittenBatch {
+                    batch,
+                    ..
+                }) = rewrite_scanned_batch(
+                    &physical_schema,
+                    &rewrite_schema,
+                    &scan,
+                    &batch,
+                    None,
+                    &[],
+                )?
+                else {
+                    // An empty batch contributes nothing; drop it rather than
+                    // pass it on, so the parquet writer only ever sees rows.
+                    return Ok(None);
+                };
+                Ok(Some(match origin {
+                    Some(origin) => append_snapshot_column(&batch, origin, &schema)?,
+                    None => batch,
+                }))
+            })
+            .try_filter_map(|batch| std::future::ready(Ok(batch)));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            stream,
+        )))
+    }
+}
+
+/// Funnel a multi-partition compaction scan into ONE stream that keeps the
+/// input's partition order: every batch of partition 0, then partition 1, and
+/// so on.
+///
+/// The partitions are still read CONCURRENTLY — each runs on its own spawned
+/// task, `concurrency` of them in flight at a time — so the object-store round
+/// trips of a whole compaction set overlap. Only the hand-off is ordered.
+///
+/// Ordering costs buffering: a partition is collected in full, then waits its
+/// turn, so up to `concurrency` partitions' rows are resident at once. That is
+/// bounded by construction and no worse than reading the set file by file was,
+/// which held the whole set — but it does mean the compaction pipeline below is
+/// only as streaming as `concurrency` partitions are small.
+///
+/// DataFusion's own `CoalescePartitionsExec` would be one line instead, and
+/// would stream, but it emits partitions interleaved by arrival — the physical
+/// row order of a merged file would then depend on which object-store request
+/// returned first. Keeping the sources' order makes the layout reproducible from
+/// the same inputs — an unsorted merge of adjacent files stays rowid-ordered,
+/// and under a table sort order the ties within a sort key resolve the same way
+/// every time. Row lineage does not depend on it (every row carries its own
+/// rowid and origin snapshot), so this is about the output being predictable.
+#[derive(Debug)]
+struct OrderedCoalesceExec {
+    input: Arc<dyn ExecutionPlan>,
+    /// How many input partitions to read at once.
+    concurrency: usize,
+    properties: Arc<PlanProperties>,
+}
+
+impl OrderedCoalesceExec {
+    fn new(input: Arc<dyn ExecutionPlan>, concurrency: usize) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(input.schema()),
+            Partitioning::UnknownPartitioning(1),
+            input.pipeline_behavior(),
+            input.boundedness(),
+        ));
+        Self {
+            input,
+            concurrency: concurrency.max(1),
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for OrderedCoalesceExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "OrderedCoalesceExec: concurrency={}", self.concurrency)
+    }
+}
+
+impl ExecutionPlan for OrderedCoalesceExec {
+    fn name(&self) -> &str {
+        "OrderedCoalesceExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|_| {
+            DataFusionError::Internal("OrderedCoalesceExec expects exactly one child".into())
+        })?;
+        Ok(Arc::new(OrderedCoalesceExec::new(child, self.concurrency)))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Internal(format!(
+                "OrderedCoalesceExec produces a single partition, got {partition}"
+            )));
+        }
+        let schema = self.schema();
+        let input = Arc::clone(&self.input);
+        let partitions = input.output_partitioning().partition_count();
+        let stream = futures::stream::iter(0..partitions)
+            .map(move |index| {
+                let input = Arc::clone(&input);
+                let context = Arc::clone(&context);
+                // Spawned, not merely polled: reading every partition on this
+                // one task would serialize each file's parquet decode onto a
+                // single core, which is the cost this operator exists to avoid.
+                // Dropping the output stream drops the task, which aborts it.
+                let task = SpawnedTask::spawn(async move {
+                    let mut stream = input.execute(index, context)?;
+                    let mut batches = Vec::new();
+                    while let Some(batch) = stream.next().await {
+                        batches.push(batch?);
+                    }
+                    Ok::<Vec<RecordBatch>, DataFusionError>(batches)
+                });
+                async move {
+                    task.join()
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?
+                }
+            })
+            .buffered(self.concurrency)
+            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+            .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+/// Pull from `stream` until the first batch that carries rows, then hand back
+/// the stream with that batch put in front of it. `None` means the whole stream
+/// was empty, so the compaction has nothing to write and must create no file.
+///
+/// Replaces the old "collect the whole output, then check the batches are not
+/// all empty" guard: one batch is enough to decide.
+async fn first_nonempty(
+    mut stream: SendableRecordBatchStream,
+) -> Result<Option<SendableRecordBatchStream>> {
+    let schema = stream.schema();
+    while let Some(batch) = stream.next().await {
+        let batch = batch?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let head = futures::stream::once(std::future::ready(Ok(batch)));
+        return Ok(Some(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            head.chain(stream),
+        ))));
+    }
+    Ok(None)
 }
 
 /// A file's partition identity, normalized for grouping and comparison: the spec
@@ -182,25 +490,20 @@ fn partition_value_pairs(values: &[Option<String>]) -> Vec<(i32, Option<String>)
         .collect()
 }
 
-/// Stream compaction output through DataFusion's spilling sort.
+/// Resolve a table's live sort specification into the ordering compaction and
+/// `UPDATE` apply to their rewritten rows, against `data_schema` — the table's
+/// data columns, which are the LEADING columns of a rewrite batch. `None` means
+/// "write unsorted".
 ///
-/// Batches may carry trailing embedded columns beyond `data_schema`. Sort keys
-/// resolve to the leading data columns, so embedded row lineage stays attached.
-/// An absent sort specification returns the input stream. An unsupported expression
-/// or missing sort column fails before any rewritten file is committed.
-pub(crate) fn sorted_rewrite_output(
-    context: Arc<TaskContext>,
-    batches: Vec<RecordBatch>,
+/// Resolved ONCE per operation, before any source file is read, so a
+/// specification this crate cannot honour fails the whole compaction rather
+/// than depending on which bin happened to contain rows.
+pub(crate) fn compaction_ordering(
     data_schema: &Schema,
     sort_spec: Option<&SortSpec>,
-) -> Result<SendableRecordBatchStream> {
-    let schema = batches
-        .first()
-        .ok_or_else(|| DuckLakeError::Internal("cannot sort empty compaction input".to_string()))?
-        .schema();
-    let input = MemorySourceConfig::try_new_exec(&[batches], Arc::clone(&schema), None)?;
+) -> Result<Option<LexOrdering>> {
     let Some(sort_spec) = sort_spec else {
-        return Ok(input.execute(0, Arc::clone(&context))?);
+        return Ok(None);
     };
     let keys = sort_spec.producible_columns().ok_or_else(|| {
         DuckLakeError::InvalidConfig(format!(
@@ -217,7 +520,7 @@ pub(crate) fn sorted_rewrite_output(
     // `LexOrdering::new` would instead fail a compaction that official completes; the
     // SQL INSERT path already returns "no ordering" for this case.
     if keys.is_empty() {
-        return Ok(input.execute(0, Arc::clone(&context))?);
+        return Ok(None);
     }
 
     let mut expressions = Vec::with_capacity(keys.len());
@@ -235,9 +538,57 @@ pub(crate) fn sorted_rewrite_output(
             },
         ));
     }
-    let ordering = LexOrdering::new(expressions)
-        .ok_or_else(|| DuckLakeError::Internal("sort order is empty".to_string()))?;
-    let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering, input));
+    Ok(Some(LexOrdering::new(expressions).ok_or_else(|| {
+        DuckLakeError::Internal("sort order is empty".to_string())
+    })?))
+}
+
+/// Stream already-materialized rewrite output through the same path as a
+/// compaction plan. `UPDATE` holds its rewritten rows in memory (it interleaves
+/// them with per-file delete authoring), so it enters here rather than at
+/// [`sorted_rewrite_output`].
+pub(crate) fn sorted_rewrite_batches(
+    context: Arc<TaskContext>,
+    batches: Vec<RecordBatch>,
+    ordering: Option<&LexOrdering>,
+) -> Result<SendableRecordBatchStream> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| DuckLakeError::Internal("cannot sort empty compaction input".to_string()))?
+        .schema();
+    let input = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+    sorted_rewrite_output(context, input, ordering)
+}
+
+/// Stream compaction output through DataFusion's spilling sort.
+///
+/// `input` carries `[data columns..., rowid]` and, for a partial merge, the
+/// embedded snapshot-id column. `ordering` (from [`compaction_ordering`])
+/// resolves against the leading data columns, so the embedded row lineage stays
+/// attached to its row; `None` streams the input through unsorted.
+///
+/// `input` is normally multi-partition — one partition per source file, plus one
+/// per row-group chunk of a large file — because that is how the compaction set
+/// is read in parallel. [`OrderedCoalesceExec`] funnels those partitions back
+/// into the single stream the compaction writer consumes, in order.
+pub(crate) fn sorted_rewrite_output(
+    context: Arc<TaskContext>,
+    input: Arc<dyn ExecutionPlan>,
+    ordering: Option<&LexOrdering>,
+) -> Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+        Arc::new(OrderedCoalesceExec::new(
+            input,
+            context.session_config().target_partitions(),
+        ))
+    } else {
+        input
+    };
+    let Some(ordering) = ordering else {
+        return Ok(input.execute(0, context)?);
+    };
+    let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering.clone(), input));
     let output = Arc::new(ColumnRenameExec::new(sorted, schema, HashMap::new()));
     Ok(output.execute(0, context)?)
 }
@@ -378,6 +729,31 @@ impl DuckLakeTable {
             return Ok(CompactionResult::empty());
         }
 
+        // Safety: the merged output is written at the table's CURRENT schema, so
+        // a source carrying a column dropped since it was written would lose
+        // that column's data (and its source is then removed). Drop any such bin
+        // entirely — those files are left uncompacted rather than silently
+        // losing data. (The common case — files at the current schema, or an
+        // older schema that only ADDED columns — is unaffected.) Settled before
+        // anything else, so a table with only such bins stays a pure no-op.
+        let mut viable: Vec<Vec<&DuckLakeTableFile>> = Vec::with_capacity(bins.len());
+        for bin in bins {
+            let mut drops_columns = false;
+            for tf in &bin {
+                if self.file_drops_current_columns(state, &tf.file).await? {
+                    drops_columns = true;
+                    break;
+                }
+            }
+            if !drops_columns {
+                viable.push(bin);
+            }
+        }
+        let bins = viable;
+        if bins.is_empty() {
+            return Ok(CompactionResult::empty());
+        }
+
         let object_store = state
             .runtime_env()
             .object_store(self.object_store_url().as_ref())?;
@@ -407,6 +783,7 @@ impl DuckLakeTable {
         // bounds each output near target_file_size, so no extra file rollover is
         // needed here.
         let sort_spec = self.live_sort_spec()?;
+        let ordering = compaction_ordering(physical_schema.as_ref(), sort_spec.as_ref())?;
         // Only for naming the output's Hive directory; the partition identity a
         // merged file carries comes from its sources, not from this.
         let live_partition_spec = self.live_partition_spec()?;
@@ -417,43 +794,9 @@ impl DuckLakeTable {
         let mut rows_written = 0i64;
 
         for bin in &bins {
-            // Safety: the merged output is written at the table's CURRENT schema,
-            // so a source carrying a column dropped since it was written would
-            // lose that column's data (and its source is then removed). Skip any
-            // such group entirely — those files are left uncompacted rather than
-            // silently losing data. (The common case — files at the current
-            // schema, or an older schema that only ADDED columns — is unaffected.)
-            let mut bin_would_drop_columns = false;
-            for tf in bin {
-                if self.file_drops_current_columns(state, &tf.file).await? {
-                    bin_would_drop_columns = true;
-                    break;
-                }
-            }
-            if bin_would_drop_columns {
-                continue;
-            }
-
-            // Read each source's live rows (with original rowids) and its origin.
-            let mut per_source: Vec<(Vec<RecordBatch>, i64)> = Vec::with_capacity(bin.len());
-            for tf in bin {
-                let scan = self.build_update_scan(state, tf).await?;
-                let batches =
-                    datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx())
-                        .await?;
-                let out = self.apply_update_to_batches(&scan, &batches, None, &[])?;
-                let origin = tf.begin_snapshot.ok_or_else(|| {
-                    DuckLakeError::Internal("merge candidate missing begin_snapshot".to_string())
-                })?;
-                rows_written += out.matched_count as i64;
-                per_source.push((out.updated_batches, origin));
-                sources.push(CompactionSourceFile {
-                    data_file_id: tf.data_file_id,
-                    delete_file_id: None,
-                });
-                files_processed += 1;
-            }
-
+            // Every source's origin snapshot is catalog metadata, so the shape
+            // of the output is settled before a single row is read.
+            //
             // A group spanning >1 origin snapshot is a partial file: embed the
             // per-row snapshot column, record the max origin as partial_max, and
             // set begin_snapshot to the MIN origin so historical reads back to
@@ -461,7 +804,13 @@ impl DuckLakeTable {
             // redundant for every snapshot, so the commit removes + schedules
             // them. A single-origin group needs no per-row column (all rows share
             // one origin), and begins at that origin.
-            let origins: HashSet<i64> = per_source.iter().map(|(_, o)| *o).collect();
+            let mut file_origins: Vec<i64> = Vec::with_capacity(bin.len());
+            for tf in bin {
+                file_origins.push(tf.begin_snapshot.ok_or_else(|| {
+                    DuckLakeError::Internal("merge candidate missing begin_snapshot".to_string())
+                })?);
+            }
+            let origins: HashSet<i64> = file_origins.iter().copied().collect();
             let partial = origins.len() > 1;
             let min_origin = origins.iter().copied().min();
             let partial_max = if partial {
@@ -470,28 +819,37 @@ impl DuckLakeTable {
                 None
             };
 
-            let mut merged: Vec<RecordBatch> = Vec::new();
-            for (batches, origin) in per_source {
-                for b in batches {
-                    if b.num_rows() == 0 {
-                        continue;
-                    }
-                    merged.push(if partial {
-                        append_snapshot_column(&b, origin)?
-                    } else {
-                        b
-                    });
-                }
+            // ONE execution over the whole bin, so DataFusion reads every source
+            // concurrently instead of one object-store round trip at a time.
+            // Each source contributes a leaf that carries its own rowid lineage
+            // (and, for a partial merge, its origin snapshot) as columns, which
+            // is what makes the single scan possible — the same shape official
+            // DuckLake compaction uses.
+            let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(bin.len());
+            for (tf, origin) in bin.iter().zip(&file_origins) {
+                let scan = self.build_update_scan(state, tf).await?;
+                leaves.push(Arc::new(CompactionSourceExec::new(
+                    Arc::new(scan),
+                    Arc::clone(&physical_schema),
+                    partial.then_some(*origin),
+                )));
+                sources.push(CompactionSourceFile {
+                    data_file_id: tf.data_file_id,
+                    delete_file_id: None,
+                });
+                files_processed += 1;
             }
-            if merged.is_empty() {
-                continue;
-            }
+
             let merged = sorted_rewrite_output(
                 state.task_ctx(),
-                merged,
-                physical_schema.as_ref(),
-                sort_spec.as_ref(),
+                UnionExec::try_new(leaves)?,
+                ordering.as_ref(),
             )?;
+            // A bin whose sources hold no rows at all writes no file; its
+            // sources are still retired by the commit below.
+            let Some(merged) = first_nonempty(merged).await? else {
+                continue;
+            };
             // Every file in the bin shares one partition identity (that is the
             // grouping key), so the merged output inherits it: same Hive directory,
             // same `partition_id` + values in the catalog.
@@ -516,6 +874,7 @@ impl DuckLakeTable {
                     subpath.as_deref(),
                 )
                 .await?;
+            rows_written += file.record_count;
             let file = match partition_id {
                 Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
                 None => file,
@@ -590,9 +949,35 @@ impl DuckLakeTable {
         let top_level_column_ids = self.top_level_column_ids();
         let physical_schema = self.physical_schema();
 
+        // Select the files to rewrite up front, so a table with nothing over the
+        // threshold stays a pure no-op — it must not fail on, say, a sort order
+        // this crate cannot honour.
+        let selected_ids = opts
+            .data_file_ids
+            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
+        let table_files = self.files()?;
+        let candidates: Vec<&DuckLakeTableFile> = table_files
+            .iter()
+            .filter(|tf| match &selected_ids {
+                Some(selected_ids) => selected_ids.contains(&tf.data_file_id),
+                // Threshold selection only applies to files with live deletes.
+                None => {
+                    let record_count = tf.max_row_count.unwrap_or(0);
+                    tf.delete_file_id.is_some()
+                        && record_count > 0
+                        && tf.delete_count.unwrap_or(0) as f64 / record_count as f64
+                            >= opts.delete_threshold
+                },
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(CompactionResult::empty());
+        }
+
         // Re-apply the table's live sort order to each rewritten file so its rows
         // stay ordered (tight min/max) after the delete-driven rewrite.
         let sort_spec = self.live_sort_spec()?;
+        let ordering = compaction_ordering(physical_schema.as_ref(), sort_spec.as_ref())?;
         // Only for naming the output's Hive directory (see `partition_path_names`);
         // a rewritten file inherits its partition identity from the file it replaces.
         let live_partition_spec = self.live_partition_spec()?;
@@ -602,33 +987,22 @@ impl DuckLakeTable {
         let mut files_processed = 0usize;
         let mut rows_written = 0i64;
 
-        let selected_ids = opts
-            .data_file_ids
-            .map(|ids| ids.into_iter().collect::<HashSet<_>>());
-        let table_files = self.files()?;
-        for tf in &table_files {
-            let record_count = tf.max_row_count.unwrap_or(0);
-            let delete_count = tf.delete_count.unwrap_or(0);
-            if let Some(selected_ids) = &selected_ids {
-                if !selected_ids.contains(&tf.data_file_id) {
-                    continue;
-                }
-            } else {
-                // Threshold selection only applies to files with live deletes.
-                if tf.delete_file_id.is_none() || record_count <= 0 {
-                    continue;
-                }
-                let ratio = delete_count as f64 / record_count as f64;
-                if ratio < opts.delete_threshold {
-                    continue;
-                }
-            }
-
+        for tf in candidates {
+            // A rewrite replaces ONE source file, so its scan is already the
+            // whole set; the file's own row groups are what DataFusion reads in
+            // parallel. Rowid lineage rides out of the scan as a column, so the
+            // sort and the parquet write consume the plan directly instead of a
+            // fully collected `Vec<RecordBatch>`.
             let scan = self.build_update_scan(state, tf).await?;
-            let batches =
-                datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx())
-                    .await?;
-            let out = self.apply_update_to_batches(&scan, &batches, None, &[])?;
+            let sorted = sorted_rewrite_output(
+                state.task_ctx(),
+                Arc::new(CompactionSourceExec::new(
+                    Arc::new(scan),
+                    Arc::clone(&physical_schema),
+                    None,
+                )),
+                ordering.as_ref(),
+            )?;
 
             files_processed += 1;
             sources.push(CompactionSourceFile {
@@ -636,52 +1010,48 @@ impl DuckLakeTable {
                 delete_file_id: tf.delete_file_id,
             });
 
-            let live_rows = out.matched_count;
-            if live_rows > 0 {
-                let sorted = sorted_rewrite_output(
-                    state.task_ctx(),
-                    out.updated_batches,
+            // Every row deleted: the source is retired with no replacement.
+            let Some(sorted) = first_nonempty(sorted).await? else {
+                continue;
+            };
+
+            // The rewrite drops deleted rows from ONE source file, so the output
+            // holds a subset of that file's rows and therefore its exact
+            // partition: inherit the identity and the Hive directory.
+            let (partition_id, partition_values) = partition_key(tf);
+            let subpath = partition_id.map(|pid| {
+                let names = self.partition_path_names(
+                    live_partition_spec.as_ref(),
+                    pid,
+                    &top_level_column_ids,
+                );
+                crate::partition::hive_subpath(&names, &partition_values)
+            });
+            let file = table_writer
+                .write_compacted_file_stream(
+                    schema_name,
+                    self.table_name(),
                     physical_schema.as_ref(),
-                    sort_spec.as_ref(),
-                )?;
-                // The rewrite drops deleted rows from ONE source file, so the output
-                // holds a subset of that file's rows and therefore its exact
-                // partition: inherit the identity and the Hive directory.
-                let (partition_id, partition_values) = partition_key(tf);
-                let subpath = partition_id.map(|pid| {
-                    let names = self.partition_path_names(
-                        live_partition_spec.as_ref(),
-                        pid,
-                        &top_level_column_ids,
-                    );
-                    crate::partition::hive_subpath(&names, &partition_values)
-                });
-                let file = table_writer
-                    .write_compacted_file_stream(
-                        schema_name,
-                        self.table_name(),
-                        physical_schema.as_ref(),
-                        &column_ids,
-                        &top_level_column_ids,
-                        sorted,
-                        false,
-                        subpath.as_deref(),
-                    )
-                    .await?;
-                let file = match partition_id {
-                    Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
-                    None => file,
-                };
-                rows_written += live_rows as i64;
-                // A rewrite output holds only currently-live rows and begins at
-                // the compaction snapshot (begin_snapshot = None); its
-                // pre-compaction history is served by the retained sources.
-                outputs.push(CompactionOutputFile {
-                    file,
-                    partial_max: None,
-                    begin_snapshot: None,
-                });
-            }
+                    &column_ids,
+                    &top_level_column_ids,
+                    sorted,
+                    false,
+                    subpath.as_deref(),
+                )
+                .await?;
+            rows_written += file.record_count;
+            let file = match partition_id {
+                Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
+                None => file,
+            };
+            // A rewrite output holds only currently-live rows and begins at
+            // the compaction snapshot (begin_snapshot = None); its
+            // pre-compaction history is served by the retained sources.
+            outputs.push(CompactionOutputFile {
+                file,
+                partial_max: None,
+                begin_snapshot: None,
+            });
         }
 
         if sources.is_empty() {
@@ -710,14 +1080,60 @@ mod tests {
     use arrow::array::Int64Array;
     use datafusion::prelude::SessionContext;
 
+    /// The compaction plan reads every source partition at once, so its output
+    /// must still be the partitions concatenated IN ORDER — that is what keeps a
+    /// merged file's physical layout a function of its inputs rather than of
+    /// which object-store request happened to return first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ordered_coalesce_concatenates_partitions_in_order() {
+        const PARTITIONS: i64 = 8;
+        const ROWS_PER_PARTITION: usize = 4;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let partitions: Vec<Vec<RecordBatch>> = (0..PARTITIONS)
+            .map(|index| {
+                let column: ArrayRef = Arc::new(Int64Array::from(vec![index; ROWS_PER_PARTITION]));
+                vec![RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap()]
+            })
+            .collect();
+        let input: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None).unwrap();
+        assert_eq!(
+            input.output_partitioning().partition_count(),
+            PARTITIONS as usize,
+        );
+
+        // A concurrency below the partition count exercises the buffering: a
+        // later partition can finish while an earlier one is still in flight.
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(OrderedCoalesceExec::new(input, 3));
+        assert_eq!(exec.output_partitioning().partition_count(), 1);
+        let batches = datafusion::physical_plan::collect(exec, SessionContext::new().task_ctx())
+            .await
+            .unwrap();
+
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            values,
+            (0..PARTITIONS)
+                .flat_map(|index| std::iter::repeat_n(index, ROWS_PER_PARTITION))
+                .collect::<Vec<i64>>(),
+        );
+    }
+
     #[test]
-    fn sorted_rewrite_output_rejects_expression_sort_key() {
+    fn compaction_ordering_rejects_expression_sort_key() {
         let data_schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(data_schema.clone()),
-            vec![Arc::new(Int64Array::from(vec![2, 1]))],
-        )
-        .unwrap();
         let sort_spec = SortSpec {
             sort_id: 7,
             fields: vec![SortField {
@@ -729,12 +1145,7 @@ mod tests {
             }],
         };
 
-        let result = sorted_rewrite_output(
-            SessionContext::new().task_ctx(),
-            vec![batch],
-            &data_schema,
-            Some(&sort_spec),
-        );
+        let result = compaction_ordering(&data_schema, Some(&sort_spec));
         let err = match result {
             Ok(_) => panic!("expression sort key must be rejected"),
             Err(e) => e,

@@ -61,7 +61,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 
-use crate::compaction::sorted_rewrite_output;
+use crate::compaction::sorted_rewrite_batches;
 use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
 use crate::table_writer::DuckLakeTableWriter;
@@ -275,13 +275,14 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let sort_spec = table
                 .live_sort_spec()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let mut updated_batches = sorted_rewrite_output(
-                Arc::clone(&context),
-                updated_batches,
+            let ordering = crate::compaction::compaction_ordering(
                 physical_schema.as_ref(),
                 sort_spec.as_ref(),
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let mut updated_batches =
+                sorted_rewrite_batches(Arc::clone(&context), updated_batches, ordering.as_ref())
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let mut session = table_writer
                 .begin_write_with_embedded_rowid(
                     &schema_name,
