@@ -39,18 +39,18 @@ use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::common::runtime::SpawnedTask;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, sorts::sort::SortExec,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    sorts::sort::SortExec,
 };
 use futures::{StreamExt, TryStreamExt};
 
@@ -320,127 +320,6 @@ impl ExecutionPlan for CompactionSourceExec {
     }
 }
 
-/// Funnel a multi-partition compaction scan into ONE stream that keeps the
-/// input's partition order: every batch of partition 0, then partition 1, and
-/// so on.
-///
-/// The partitions are still read CONCURRENTLY — each runs on its own spawned
-/// task, `concurrency` of them in flight at a time — so the object-store round
-/// trips of a whole compaction set overlap. Only the hand-off is ordered.
-///
-/// Ordering costs buffering: a partition is collected in full, then waits its
-/// turn, so up to `concurrency` partitions' rows are resident at once. That is
-/// bounded by construction and no worse than reading the set file by file was,
-/// which held the whole set — but it does mean the compaction pipeline below is
-/// only as streaming as `concurrency` partitions are small.
-///
-/// DataFusion's own `CoalescePartitionsExec` would be one line instead, and
-/// would stream, but it emits partitions interleaved by arrival — the physical
-/// row order of a merged file would then depend on which object-store request
-/// returned first. Keeping the sources' order makes the layout reproducible from
-/// the same inputs — an unsorted merge of adjacent files stays rowid-ordered,
-/// and under a table sort order the ties within a sort key resolve the same way
-/// every time. Row lineage does not depend on it (every row carries its own
-/// rowid and origin snapshot), so this is about the output being predictable.
-#[derive(Debug)]
-struct OrderedCoalesceExec {
-    input: Arc<dyn ExecutionPlan>,
-    /// How many input partitions to read at once.
-    concurrency: usize,
-    properties: Arc<PlanProperties>,
-}
-
-impl OrderedCoalesceExec {
-    fn new(input: Arc<dyn ExecutionPlan>, concurrency: usize) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(input.schema()),
-            Partitioning::UnknownPartitioning(1),
-            input.pipeline_behavior(),
-            input.boundedness(),
-        ));
-        Self {
-            input,
-            concurrency: concurrency.max(1),
-            properties,
-        }
-    }
-}
-
-impl DisplayAs for OrderedCoalesceExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "OrderedCoalesceExec: concurrency={}", self.concurrency)
-    }
-}
-
-impl ExecutionPlan for OrderedCoalesceExec {
-    fn name(&self) -> &str {
-        "OrderedCoalesceExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [child] = <[Arc<dyn ExecutionPlan>; 1]>::try_from(children).map_err(|_| {
-            DataFusionError::Internal("OrderedCoalesceExec expects exactly one child".into())
-        })?;
-        Ok(Arc::new(OrderedCoalesceExec::new(child, self.concurrency)))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Internal(format!(
-                "OrderedCoalesceExec produces a single partition, got {partition}"
-            )));
-        }
-        let schema = self.schema();
-        let input = Arc::clone(&self.input);
-        let partitions = input.output_partitioning().partition_count();
-        let stream = futures::stream::iter(0..partitions)
-            .map(move |index| {
-                let input = Arc::clone(&input);
-                let context = Arc::clone(&context);
-                // Spawned, not merely polled: reading every partition on this
-                // one task would serialize each file's parquet decode onto a
-                // single core, which is the cost this operator exists to avoid.
-                // Dropping the output stream drops the task, which aborts it.
-                let task = SpawnedTask::spawn(async move {
-                    let mut stream = input.execute(index, context)?;
-                    let mut batches = Vec::new();
-                    while let Some(batch) = stream.next().await {
-                        batches.push(batch?);
-                    }
-                    Ok::<Vec<RecordBatch>, DataFusionError>(batches)
-                });
-                async move {
-                    task.join()
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))?
-                }
-            })
-            .buffered(self.concurrency)
-            .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
-            .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
 /// Pull from `stream` until the first batch that carries rows, then hand back
 /// the stream with that batch put in front of it. `None` means the whole stream
 /// was empty, so the compaction has nothing to write and must create no file.
@@ -569,8 +448,25 @@ pub(crate) fn sorted_rewrite_batches(
 ///
 /// `input` is normally multi-partition — one partition per source file, plus one
 /// per row-group chunk of a large file — because that is how the compaction set
-/// is read in parallel. [`OrderedCoalesceExec`] funnels those partitions back
-/// into the single stream the compaction writer consumes, in order.
+/// is read in parallel. `CoalescePartitionsExec` funnels those partitions back
+/// into the single stream the compaction writer consumes.
+///
+/// That coalesce emits partitions interleaved by arrival, so an unsorted merge's
+/// physical row order depends on which object-store request returned first. This
+/// matches official DuckLake, which sets `DONT_PRESERVE_ORDER` on exactly this
+/// copy (`ducklake_compaction_functions.cpp`), and costs nothing that is load
+/// bearing: a compaction output carries each row's rowid and origin snapshot as
+/// columns and records no `row_id_start`, so nothing downstream derives lineage
+/// from where a row sits. Delete files ARE written in position space, but a
+/// mutation resolves those positions by rescanning the file it is targeting, so
+/// they describe that file's actual layout whatever it turned out to be.
+///
+/// Preserving order instead means holding a partition until its turn to be
+/// emitted. The custom operator that did so buffered each one into a `Vec`
+/// outside the memory pool's accounting, which is memory a streaming coalesce
+/// does not need and the pool could not see. Note the coalesce starts every
+/// input partition at once rather than capping concurrency; the count is
+/// bounded by the bin, which `MergeOptions::max_merged_files` already limits.
 pub(crate) fn sorted_rewrite_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,
@@ -578,10 +474,7 @@ pub(crate) fn sorted_rewrite_output(
 ) -> Result<SendableRecordBatchStream> {
     let schema = input.schema();
     let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
-        Arc::new(OrderedCoalesceExec::new(
-            input,
-            context.session_config().target_partitions(),
-        ))
+        Arc::new(CoalescePartitionsExec::new(input))
     } else {
         input
     };
@@ -1073,63 +966,11 @@ impl DuckLakeTable {
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sort::{DUCKDB_DIALECT, NullOrder, SortDirection, SortField};
-    use arrow::array::Int64Array;
-    use datafusion::prelude::SessionContext;
-
-    /// The compaction plan reads every source partition at once, so its output
-    /// must still be the partitions concatenated IN ORDER — that is what keeps a
-    /// merged file's physical layout a function of its inputs rather than of
-    /// which object-store request happened to return first.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn ordered_coalesce_concatenates_partitions_in_order() {
-        const PARTITIONS: i64 = 8;
-        const ROWS_PER_PARTITION: usize = 4;
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let partitions: Vec<Vec<RecordBatch>> = (0..PARTITIONS)
-            .map(|index| {
-                let column: ArrayRef = Arc::new(Int64Array::from(vec![index; ROWS_PER_PARTITION]));
-                vec![RecordBatch::try_new(Arc::clone(&schema), vec![column]).unwrap()]
-            })
-            .collect();
-        let input: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&partitions, Arc::clone(&schema), None).unwrap();
-        assert_eq!(
-            input.output_partitioning().partition_count(),
-            PARTITIONS as usize,
-        );
-
-        // A concurrency below the partition count exercises the buffering: a
-        // later partition can finish while an earlier one is still in flight.
-        let exec: Arc<dyn ExecutionPlan> = Arc::new(OrderedCoalesceExec::new(input, 3));
-        assert_eq!(exec.output_partitioning().partition_count(), 1);
-        let batches = datafusion::physical_plan::collect(exec, SessionContext::new().task_ctx())
-            .await
-            .unwrap();
-
-        let values: Vec<i64> = batches
-            .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .unwrap()
-                    .values()
-                    .to_vec()
-            })
-            .collect();
-        assert_eq!(
-            values,
-            (0..PARTITIONS)
-                .flat_map(|index| std::iter::repeat_n(index, ROWS_PER_PARTITION))
-                .collect::<Vec<i64>>(),
-        );
-    }
 
     #[test]
     fn compaction_ordering_rejects_expression_sort_key() {

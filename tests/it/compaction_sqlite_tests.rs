@@ -537,8 +537,12 @@ async fn merge_only_within_a_partition_and_preserves_assignment() {
 /// lineage carried as a column of that scan, the shape official DuckLake
 /// compaction uses. This pins what that has to produce for a bin far wider than
 /// one file: the same rows, the same rowids, the same partition assignment and
-/// the same per-row origin snapshots the old file-at-a-time reads produced, with
-/// the sources' order still visible in the merged file's physical layout.
+/// the same per-row origin snapshots the old file-at-a-time reads produced.
+///
+/// Not the physical row order: the sources are read concurrently and handed on
+/// as they arrive, which is what official does too. Nothing reads that order --
+/// every row carries its own rowid and origin snapshot -- so the assertions
+/// below compare lineage as a set.
 #[tokio::test(flavor = "multi_thread")]
 async fn merge_reads_a_whole_bin_in_one_pass() {
     use datafusion_ducklake::partition::PartitionTransform;
@@ -675,12 +679,18 @@ async fn merge_reads_a_whole_bin_in_one_pass() {
             "partial_max is the MAX origin of the bin"
         );
 
-        // The physical layout: rowids ascending in source (data_file_id) order,
-        // each stamped with the origin snapshot of the file it came from. Read
-        // straight from the parquet, so this is the bytes on disk, not what the
-        // read path reconstructs.
-        let lineage = file_lineage(&temp, &file.path);
-        let expected: Vec<(i64, Option<i64>)> = (0..APPENDS)
+        // Every row keeps its own rowid and the origin snapshot of the file it
+        // came from. Read straight from the parquet, so this is the bytes on
+        // disk, not what the read path reconstructs.
+        //
+        // Compared as a set: the bin's sources are read concurrently and handed
+        // on as they arrive, so physical order is not fixed -- and nothing reads
+        // it, because each row carries its own lineage rather than deriving it
+        // from position. Sorting by rowid is what makes the assertion about the
+        // pairing, which is the part that must hold.
+        let mut lineage = file_lineage(&temp, &file.path);
+        lineage.sort_unstable();
+        let mut expected: Vec<(i64, Option<i64>)> = (0..APPENDS)
             .map(|append_index| {
                 (
                     i64::from(append_index) * 2 + index as i64,
@@ -688,9 +698,10 @@ async fn merge_reads_a_whole_bin_in_one_pass() {
                 )
             })
             .collect();
+        expected.sort_unstable();
         assert_eq!(
             lineage, expected,
-            "merged rows keep their rowid and origin snapshot, in source order"
+            "merged rows keep their rowid and origin snapshot"
         );
     }
 
