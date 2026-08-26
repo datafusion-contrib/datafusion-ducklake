@@ -464,9 +464,18 @@ pub(crate) fn sorted_rewrite_batches(
 /// Preserving order instead means holding a partition until its turn to be
 /// emitted. The custom operator that did so buffered each one into a `Vec`
 /// outside the memory pool's accounting, which is memory a streaming coalesce
-/// does not need and the pool could not see. Note the coalesce starts every
-/// input partition at once rather than capping concurrency; the count is
-/// bounded by the bin, which `MergeOptions::max_merged_files` already limits.
+/// does not need and the pool could not see.
+///
+/// The coalesce starts every input partition at once rather than capping
+/// concurrency, so the fan-out is worth being explicit about. Partitions are the
+/// bin's row groups, not its files, and two limits bound that from opposite
+/// directions: `MergeOptions::max_merged_files` caps how many files a pass
+/// considers, and the bin's byte budget caps how much data one plan covers — so
+/// many tiny files means many partitions of one row group each, and large files
+/// means few files each contributing several. They cannot both be at maximum.
+/// The batches in flight are bounded too: `CoalescePartitionsExec` feeds a
+/// `tokio::sync::mpsc` channel sized to the partition count, so a producer that
+/// outruns the writer blocks on send rather than accumulating.
 pub(crate) fn sorted_rewrite_output(
     context: Arc<TaskContext>,
     input: Arc<dyn ExecutionPlan>,

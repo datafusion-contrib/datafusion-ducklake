@@ -19,10 +19,16 @@
 //! under a sort order that runs position and rowid in opposite directions, and
 //! `keyed_mutation_after_rewrite_with_rowid_holes`, where the rowid run has
 //! gaps — the positions are asserted exactly, and those two are the decisive
-//! coverage. The merge tests instead choose a row whose rowid cannot be a valid
-//! slot of the file, so a rowid-keyed resolver cannot return a plausible answer
-//! by chance, and check that the DELETE records the position the resolver
-//! found.
+//! coverage.
+//!
+//! Of the merge tests, only `delete_after_partitioned_merge` can rule out a
+//! rowid-keyed resolver: it deletes a row whose rowid is outside the file's slot
+//! range, so no rowid it returned could look like a valid position.
+//! `delete_after_merge_of_multi_origin_files` cannot — its three rows occupy
+//! slots 0..=2 and carry rowids 0..=2, so every rowid is also a valid slot — and
+//! it stands as a consistency case instead: the DELETE must record the position
+//! the resolver reported, and the surviving rows and their rowids must be
+//! exactly right.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
