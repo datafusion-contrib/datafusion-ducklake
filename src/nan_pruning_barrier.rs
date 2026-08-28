@@ -29,7 +29,8 @@ use datafusion::physical_plan::filter_pushdown::{
 };
 use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
+    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, Statistics,
+    StatisticsArgs,
 };
 
 /// Pass-through node that blocks filter pushdown for predicates referencing
@@ -69,6 +70,13 @@ impl DisplayAs for NanPruningBarrierExec {
 }
 
 impl ExecutionPlan for NanPruningBarrierExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "NanPruningBarrierExec"
     }
@@ -170,7 +178,15 @@ impl ExecutionPlan for NanPruningBarrierExec {
         self.input.execute(partition, context)
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 }

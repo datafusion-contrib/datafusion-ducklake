@@ -30,6 +30,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -432,7 +433,12 @@ impl TableDeletionsTable {
         let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
         let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
             .with_file_group(FileGroup::new(vec![pf]))
-            .with_partitioned_by_file_group(true);
+            // One file group == one output partition, so the scan is neither
+            // repartitioned nor work-stolen and `FileRowNumberExec` sees true
+            // physical positions.
+            .with_output_partitioning(Some(
+                datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            ));
         let scan = DataSourceExec::from_data_source(builder.build());
         let table_fields: Vec<FieldRef> = self.table_schema.fields().iter().cloned().collect();
         Ok(present_catalog_schema(
@@ -627,6 +633,13 @@ impl DisplayAs for DeletedRowsExec {
 }
 
 impl ExecutionPlan for DeletedRowsExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "DeletedRowsExec"
     }

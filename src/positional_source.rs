@@ -24,6 +24,7 @@ use std::fmt::{self, Formatter};
 use std::sync::Arc;
 
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::physical_plan::{FileOpener, FileScanConfig, FileSource};
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::Result as DataFusionResult;
@@ -57,6 +58,13 @@ impl PositionalFileSource {
 }
 
 impl FileSource for PositionalFileSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
+
     // ---- delegate: actual file reading and read-only accessors ----
 
     fn create_file_opener(

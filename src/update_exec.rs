@@ -53,10 +53,12 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
@@ -167,6 +169,14 @@ impl DisplayAs for DuckLakeUpdateExec {
 }
 
 impl ExecutionPlan for DuckLakeUpdateExec {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        let assignments = self.assignments.iter().map(|(_, expr)| expr);
+        apply_expression_roots(assignments.chain(self.predicate.iter()), f)
+    }
+
     fn name(&self) -> &str {
         "DuckLakeUpdateExec"
     }

@@ -39,9 +39,11 @@ use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
@@ -242,6 +244,13 @@ impl DisplayAs for CompactionSourceExec {
 }
 
 impl ExecutionPlan for CompactionSourceExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "CompactionSourceExec"
     }

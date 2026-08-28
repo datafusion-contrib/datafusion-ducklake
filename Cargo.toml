@@ -22,10 +22,10 @@ exclude = ["datafusion-ducklake.iml", "target", "tests/test_data"]
 autotests = false
 
 [dependencies]
-datafusion = { version = "54", default-features = false, features = ["parquet", "recursive_protection", "sql"] }
-datafusion-datasource = { version = "54", default-features = false }
-arrow = "58"
-parquet = { version = "58", features = ["async"] }
+datafusion = { version = "55", default-features = false, features = ["parquet", "recursive_protection", "sql"] }
+datafusion-datasource = { version = "55", default-features = false }
+arrow = "59.2"
+parquet = { version = "59.2", features = ["async"] }
 object_store = { version = "0.13", default-features = false }
 url = "2.5"
 percent-encoding = "2"
@@ -51,7 +51,7 @@ duckdb = { version = "1.4.1", optional = true }
 sqlx = { version = "0.9", features = ["runtime-tokio"], optional = true }
 
 [dev-dependencies]
-datafusion = "54"
+datafusion = "55"
 object_store = { version = "0.13", features = ["aws", "fs"] }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio", "postgres", "mysql"] }

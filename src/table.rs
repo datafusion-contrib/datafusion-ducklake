@@ -40,7 +40,7 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 #[cfg(feature = "write")]
 use datafusion::physical_expr::expressions::BinaryExpr;
-use datafusion::physical_optimizer::pruning::PruningPredicate;
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -63,8 +63,14 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::StreamExt;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+// Deprecated in parquet 59 in favour of a hand-rolled `AsyncFileReader`. The
+// call sites below read a footer once each, so the replacement (a custom
+// reader with its own I/O coalescing) buys nothing here.
+// See https://github.com/apache/arrow-rs/issues/10308.
+#[allow(deprecated)]
 use parquet::arrow::async_reader::ParquetObjectReader;
 
 #[cfg(feature = "encryption")]
@@ -725,6 +731,7 @@ pub(crate) async fn read_parquet_footer_facts(
 ) -> DataFusionResult<ParquetFooterFacts> {
     let object_store = state.runtime_env().object_store(object_store_url)?;
     let object_path = ObjectPath::from(resolved_path);
+    #[allow(deprecated)]
     let reader = ParquetObjectReader::new(object_store, object_path);
 
     #[cfg(feature = "encryption")]
@@ -1411,7 +1418,11 @@ impl DuckLakeTable {
     ) -> DataFusionResult<Vec<PruningPredicate>> {
         conjuncts
             .into_iter()
-            .map(|conjunct| PruningPredicate::try_new(conjunct, Arc::clone(&self.physical_schema)))
+            .map(|conjunct| {
+                PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&self.physical_schema))
+                    .try_build(conjunct)
+            })
             .collect()
     }
 
@@ -1513,6 +1524,7 @@ impl DuckLakeTable {
             .object_store(self.object_store_url.as_ref())?;
         let object_path = ObjectPath::from(resolved_path.as_str());
 
+        #[allow(deprecated)]
         let reader = ParquetObjectReader::new(object_store, object_path);
 
         // Build the ParquetRecordBatchStreamBuilder with decryption if needed
@@ -1623,10 +1635,13 @@ impl DuckLakeTable {
         // Physical data columns only (logical order); embedded/rowid columns are
         // not needed to evaluate the predicate or read positions.
         let physical_proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
+        let num_file_groups = file_groups.len();
         let scan = DataSourceExec::from_data_source(
             FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
                 .with_file_groups(file_groups)
-                .with_partitioned_by_file_group(true)
+                .with_output_partitioning(Some(
+                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
+                ))
                 .with_projection_indices(Some(physical_proj))?
                 .build(),
         );
@@ -1661,6 +1676,44 @@ impl DuckLakeTable {
             }
         }
         Ok(positions)
+    }
+
+    /// Turn a failed delete-file scan into a caller-facing error, replacing the
+    /// raw parquet failure with a "delete file is missing" message when the file
+    /// really is absent from the object store.
+    ///
+    /// The absence cannot be read off the error alone: DataFusion's parquet
+    /// reader flattens the metadata-fetch failure into a `ParquetError::General`
+    /// string, so the underlying `object_store::Error::NotFound` is no longer in
+    /// the source chain. Probing the store is only done once a scan has already
+    /// failed, so the happy path pays nothing.
+    async fn classify_delete_file_read_error(
+        &self,
+        state: &dyn Session,
+        resolved_delete_path: &str,
+        err: DataFusionError,
+    ) -> DataFusionError {
+        let missing = if is_object_store_not_found(&err) {
+            true
+        } else {
+            match state
+                .runtime_env()
+                .object_store(self.object_store_url.as_ref())
+            {
+                Ok(store) => matches!(
+                    store.head(&ObjectPath::from(resolved_delete_path)).await,
+                    Err(object_store::Error::NotFound { .. })
+                ),
+                Err(_) => false,
+            }
+        };
+        if missing {
+            DataFusionError::Execution(format!(
+                "Delete file '{resolved_delete_path}' referenced in catalog metadata was not found. This may indicate catalog corruption or that the file was deleted outside of DuckLake."
+            ))
+        } else {
+            err
+        }
     }
 
     /// Read a delete file and return the set of physical row positions it marks
@@ -1708,21 +1761,19 @@ impl DuckLakeTable {
         let task_ctx = state.task_ctx();
         let stream = exec.execute(0, task_ctx)?;
 
-        let batches: Vec<RecordBatch> = stream
+        let collected = stream
             .collect::<Vec<_>>()
             .await
             .into_iter()
-            .collect::<DataFusionResult<Vec<_>>>()
-            .map_err(|e| {
-                if is_object_store_not_found(&e) {
-                    DataFusionError::Execution(format!(
-                        "Delete file '{}' referenced in catalog metadata was not found. This may indicate catalog corruption or that the file was deleted outside of DuckLake.",
-                        resolved_delete_path
-                    ))
-                } else {
-                    e
-                }
-            })?;
+            .collect::<DataFusionResult<Vec<_>>>();
+        let batches: Vec<RecordBatch> = match collected {
+            Ok(batches) => batches,
+            Err(e) => {
+                return Err(self
+                    .classify_delete_file_read_error(state, &resolved_delete_path, e)
+                    .await);
+            },
+        };
 
         // Extract all positions from all batches
         let mut positions = HashSet::new();
@@ -1972,14 +2023,21 @@ impl DuckLakeTable {
             let source = PositionalFileSource::wrap(Arc::new(
                 self.create_parquet_source(file_cfg.read_schema.clone()),
             ));
+            let num_file_groups = file_groups.len();
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
                     .with_file_groups(file_groups)
                     // FileRowNumberExec seeds row positions from the scan
                     // partition index, so each partition must read exactly
-                    // its configured row-group chunk. DF 54's shared work
-                    // queue can otherwise let sibling partitions steal chunks.
-                    .with_partitioned_by_file_group(true);
+                    // its configured row-group chunk. Declaring the output
+                    // partitioning pins the file-group-to-partition mapping;
+                    // otherwise DataFusion's shared work queue lets sibling
+                    // partitions steal chunks.
+                    .with_output_partitioning(Some(
+                        datafusion::physical_expr::Partitioning::UnknownPartitioning(
+                            num_file_groups,
+                        ),
+                    ));
             builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -2251,14 +2309,21 @@ impl DuckLakeTable {
             let source = PositionalFileSource::wrap(Arc::new(
                 self.create_parquet_source(file_cfg.read_schema.clone()),
             ));
+            let num_file_groups = file_groups.len();
             let mut builder =
                 FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
                     .with_file_groups(file_groups)
                     // FileRowNumberExec seeds row positions from the scan
                     // partition index, so each partition must read exactly
-                    // its configured row-group chunk. DF 54's shared work
-                    // queue can otherwise let sibling partitions steal chunks.
-                    .with_partitioned_by_file_group(true);
+                    // its configured row-group chunk. Declaring the output
+                    // partitioning pins the file-group-to-partition mapping;
+                    // otherwise DataFusion's shared work queue lets sibling
+                    // partitions steal chunks.
+                    .with_output_partitioning(Some(
+                        datafusion::physical_expr::Partitioning::UnknownPartitioning(
+                            num_file_groups,
+                        ),
+                    ));
             builder = builder.with_projection_indices(Some(parquet_projection))?;
             let scan = DataSourceExec::from_data_source(builder.build());
 
@@ -2626,10 +2691,13 @@ impl DuckLakeTable {
         } else {
             None
         };
+        let num_file_groups = file_groups.len();
         let scan = DataSourceExec::from_data_source(
             FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
                 .with_file_groups(file_groups)
-                .with_partitioned_by_file_group(true)
+                .with_output_partitioning(Some(
+                    datafusion::physical_expr::Partitioning::UnknownPartitioning(num_file_groups),
+                ))
                 .with_projection_indices(Some(proj))?
                 .build(),
         );

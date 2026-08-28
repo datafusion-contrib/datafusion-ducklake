@@ -33,7 +33,7 @@ datafusion-ducklake = { path = "..", features = ["metadata-duckdb"] }
 # datafusion-ducklake = { version = "0.1.0", features = ["metadata-duckdb"] }
 
 # Core dependencies
-datafusion = "54"
+datafusion = "55"
 duckdb = { version = "1.4.1", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

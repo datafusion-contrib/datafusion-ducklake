@@ -20,6 +20,7 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
@@ -279,6 +280,13 @@ impl DisplayAs for PrependCDCColumnsExec {
 }
 
 impl ExecutionPlan for PrependCDCColumnsExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "PrependCDCColumnsExec"
     }
@@ -904,7 +912,13 @@ impl TableChangesTable {
                 let builder =
                     FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
                         .with_file_group(FileGroup::new(vec![pf]))
-                        .with_partitioned_by_file_group(true);
+                        // One file group == one output partition: declaring the
+                        // partitioning keeps DataFusion from repartitioning the
+                        // file or letting sibling streams steal its work, which
+                        // `FileRowNumberExec` needs for true physical positions.
+                        .with_output_partitioning(Some(
+                            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+                        ));
                 let scan = DataSourceExec::from_data_source(builder.build());
                 Arc::new(FileRowNumberExec::new(scan, vec![0]))
             },
@@ -944,7 +958,10 @@ impl TableChangesTable {
         let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
         let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
             .with_file_group(FileGroup::new(vec![pf]))
-            .with_partitioned_by_file_group(true);
+            // One file group == one output partition; see the note above.
+            .with_output_partitioning(Some(
+                datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
+            ));
         let scan = DataSourceExec::from_data_source(builder.build());
         Ok(present_catalog_schema(
             Arc::new(FileRowNumberExec::new(scan, vec![0])),
@@ -1614,6 +1631,13 @@ impl DisplayAs for TableChangesExec {
 }
 
 impl ExecutionPlan for TableChangesExec {
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "TableChangesExec"
     }
