@@ -405,11 +405,21 @@ impl ExecutionPlan for CompactionSourceExec {
                         )?;
                         // What the output records has to be what it wrote, not
                         // what the catalog said the sources held.
-                        if let Some(batch_max) = origins
+                        let typed = origins
                             .as_any()
                             .downcast_ref::<arrow::array::Int64Array>()
-                            .and_then(arrow::compute::max)
-                        {
+                            .ok_or_else(|| {
+                                // Understating the bound is the defect this
+                                // whole path exists to prevent, so a type the
+                                // max cannot be taken from is an error rather
+                                // than a skipped update.
+                                DataFusionError::Internal(format!(
+                                    "compaction origin column for \"{}\" is {:?}, not Int64",
+                                    scan.source_path,
+                                    origins.data_type()
+                                ))
+                            })?;
+                        if let Some(batch_max) = arrow::compute::max(typed) {
                             observed_max_origin.fetch_max(batch_max, Ordering::Relaxed);
                         }
                         append_snapshot_column(&batch, origins, &schema)?
@@ -755,21 +765,6 @@ impl DuckLakeTable {
         // into a new output, and commit them against a base snapshot that never
         // contained them. Refuse loudly rather than compact from a historical
         // handle: the caller wants a head handle.
-        for bin in &bins {
-            for tf in bin {
-                if let Some(partial_max) = tf.partial_max
-                    && self.base_snapshot() < partial_max
-                {
-                    return Err(DuckLakeError::InvalidConfig(format!(
-                        "merge_adjacent_files: source \"{}\" is a partial file whose rows reach \
-                         snapshot {partial_max}, but this table is opened at snapshot {}; \
-                         re-open the catalog at the current snapshot to merge it",
-                        tf.file.path,
-                        self.base_snapshot()
-                    )));
-                }
-            }
-        }
 
         // Safety, from each source's parquet footer:
         //
@@ -806,6 +801,21 @@ impl DuckLakeTable {
                         partial_max = ?tf.partial_max,
                         "skipping merge bin: the catalog records this file as partial but it \
                          carries no embedded snapshot-id column"
+                    );
+                    mergeable = false;
+                } else if tf.partial_max.is_some_and(|pm| self.base_snapshot() < pm) {
+                    // A handle opened below the file's reach would fold rows it
+                    // cannot see into the output and commit them against a base
+                    // that never held them. Cost the bin rather than the sweep:
+                    // a compactor on a slightly stale handle should still make
+                    // progress on everything else, which is the failure this
+                    // branch exists to end.
+                    tracing::warn!(
+                        file = %tf.file.path,
+                        partial_max = ?tf.partial_max,
+                        base_snapshot = self.base_snapshot(),
+                        "skipping merge bin: this table is opened below the snapshot the \
+                         source's rows reach; re-open at the current snapshot to merge it"
                     );
                     mergeable = false;
                 }

@@ -2293,4 +2293,18 @@ async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
          held origin {written_max}; the output must record what it wrote, or a read \
          below {written_max} skips the row filter and serves rows that did not exist yet"
     );
+
+    // The bookkeeping is only a proxy. What the bound protects is the read: at a
+    // snapshot inside the gap the catalog claimed, the row that arrived later
+    // must not be visible. `needs_snapshot_filter` is `snapshot_id < partial_max`,
+    // so an understated bound is exactly the case where no filter is installed.
+    let at_two = read_rows_at(&temp, 2).await;
+    assert!(
+        !at_two.iter().any(|(id, _)| *id == 9002),
+        "the row appended at snapshot 3 must not be visible at snapshot 2: {at_two:?}"
+    );
+    assert!(
+        at_two.iter().any(|(id, _)| *id == 9001),
+        "the row appended at snapshot 2 must still be visible at snapshot 2: {at_two:?}"
+    );
 }
