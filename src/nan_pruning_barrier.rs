@@ -189,4 +189,16 @@ impl ExecutionPlan for NanPruningBarrierExec {
     ) -> DataFusionResult<Arc<Statistics>> {
         Ok(Arc::clone(&input_stats[0]))
     }
+
+    /// Kept alongside the `StatisticsContext` methods above. DataFusion 55
+    /// deprecated this in favour of `child_stats_requests` /
+    /// `statistics_from_inputs`, but the trait method is still called directly
+    /// by out-of-tree code (datafusion-ffi, third-party optimizer rules).
+    /// Without this override such a caller would get `Statistics::new_unknown`
+    /// from the default body for any plan containing the barrier, silently
+    /// discarding the child's statistics rather than passing them through.
+    #[allow(deprecated)]
+    fn partition_statistics(&self, partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        self.input.partition_statistics(partition)
+    }
 }
