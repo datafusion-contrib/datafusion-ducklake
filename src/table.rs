@@ -2618,21 +2618,20 @@ impl DuckLakeTable {
         self.columns.iter().map(|column| column.column_id).collect()
     }
 
-    /// Whether `file` carries a data column that is no longer in the table's
-    /// current schema (dropped since it was written). `merge_adjacent_files`
-    /// refuses to compact such a file — merged output is written at the current
-    /// schema, which would drop that column's data. Reads the parquet footer
-    /// (memoized in the per-file read-config cache).
+    /// What `merge_adjacent_files` needs from one candidate's PARQUET FOOTER.
+    /// Both facts come from the same footer read (memoized in the per-file
+    /// read-config cache), so asking for them together costs one lookup.
     #[cfg(feature = "write")]
-    pub(crate) async fn file_drops_current_columns(
+    pub(crate) async fn merge_source_facts(
         &self,
         state: &dyn Session,
         file: &DuckLakeFileData,
-    ) -> DataFusionResult<bool> {
-        Ok(self
-            .build_file_read_config(state, file)
-            .await?
-            .drops_current_columns)
+    ) -> DataFusionResult<MergeSourceFacts> {
+        let cfg = self.build_file_read_config(state, file).await?;
+        Ok(MergeSourceFacts {
+            drops_current_columns: cfg.drops_current_columns,
+            has_embedded_snapshot: cfg.embedded_snapshot_parquet_name.is_some(),
+        })
     }
 
     /// Build the positional read plan (and the metadata needed to interpret it)
@@ -2654,6 +2653,30 @@ impl DuckLakeTable {
         state: &dyn Session,
         table_file: &DuckLakeTableFile,
     ) -> DataFusionResult<UpdateSourceScan> {
+        self.build_update_scan_with_snapshot(state, table_file, false)
+            .await
+    }
+
+    /// [`Self::build_update_scan`], additionally projecting the file's embedded
+    /// per-row `_ducklake_internal_snapshot_id` column when `want_snapshot_id`.
+    ///
+    /// Only a merge re-reading a source that PHYSICALLY carries that column sets
+    /// it: such a source's rows each hold their own origin snapshot, so the
+    /// merged output must copy the column through rather than stamp one origin
+    /// on every row. Errors when the file carries no such column — the caller
+    /// decides from the footer, so asking for a column that is not there is a
+    /// bug, and inventing origins would silently re-attribute history.
+    ///
+    /// The column is appended to a LOCAL read schema rather than to the cached
+    /// [`FileReadConfig::read_schema`], which ends with the embedded rowid that
+    /// the other read paths index from the end.
+    #[cfg(feature = "write")]
+    pub(crate) async fn build_update_scan_with_snapshot(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        want_snapshot_id: bool,
+    ) -> DataFusionResult<UpdateSourceScan> {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
         let has_embedded = file_cfg.embedded_rowid_parquet_name.is_some();
 
@@ -2673,6 +2696,29 @@ impl DuckLakeTable {
             HashSet::new()
         };
 
+        // The scan schema is the cached per-file one, plus the embedded
+        // snapshot-id column when this caller asked for it. Appending here (and
+        // not in `build_file_read_config`) keeps the cached schema's invariant
+        // that the embedded rowid, when present, is its LAST field.
+        let read_schema = if want_snapshot_id {
+            let snap_name = file_cfg
+                .embedded_snapshot_parquet_name
+                .clone()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "File \"{}\" carries no embedded `_ducklake_internal_snapshot_id` \
+                         column, so its rows' origin snapshots cannot be read",
+                        table_file.file.path
+                    ))
+                })?;
+            let mut fields: Vec<Arc<Field>> =
+                file_cfg.read_schema.fields().iter().cloned().collect();
+            fields.push(Arc::new(Field::new(&snap_name, DataType::Int64, true)));
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::clone(&file_cfg.read_schema)
+        };
+
         // Positional scan: row-group-aligned partitions + a non-repartition,
         // non-pruning source so `FileRowNumberExec` yields true physical
         // positions. Project the physical columns (logical order) and, for an
@@ -2681,16 +2727,21 @@ impl DuckLakeTable {
         let target_partitions = state.config().target_partitions();
         let (file_groups, partition_starts) =
             self.build_row_group_partitions(&table_file.file, &file_cfg, target_partitions)?;
-        let source = PositionalFileSource::wrap(Arc::new(
-            self.create_parquet_source(file_cfg.read_schema.clone()),
-        ));
+        let source =
+            PositionalFileSource::wrap(Arc::new(self.create_parquet_source(read_schema.clone())));
+        // Built by pushing, so each appended column records the index it actually
+        // landed at. Arithmetic off `physical_len` would silently misalign the two
+        // appended columns for a file that has one but not the other, and both are
+        // Int64 — nothing downstream would fail to downcast.
         let mut proj: Vec<usize> = (0..physical_len).collect();
-        let embedded_batch_idx = if has_embedded {
+        let embedded_batch_idx = has_embedded.then(|| {
             proj.push(file_cfg.read_schema.fields().len() - 1);
-            Some(physical_len)
-        } else {
-            None
-        };
+            proj.len() - 1
+        });
+        let embedded_snapshot_batch_idx = want_snapshot_id.then(|| {
+            proj.push(read_schema.fields().len() - 1);
+            proj.len() - 1
+        });
         let num_file_groups = file_groups.len();
         let scan = DataSourceExec::from_data_source(
             FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
@@ -2716,6 +2767,7 @@ impl DuckLakeTable {
             scan: plan,
             physical_len,
             embedded_batch_idx,
+            embedded_snapshot_batch_idx,
             pos_index,
             row_id_start: table_file.row_id_start,
             existing_deleted,
@@ -2785,6 +2837,26 @@ impl DuckLakeTable {
     }
 }
 
+/// What one merge candidate's parquet footer says about it, from
+/// [`DuckLakeTable::merge_source_facts`].
+#[cfg(feature = "write")]
+#[derive(Clone, Copy)]
+pub(crate) struct MergeSourceFacts {
+    /// The file carries a data column that is no longer in the table's current
+    /// schema (dropped since it was written). Merged output is written at the
+    /// current schema, so merging such a file would lose that column's data —
+    /// and remove the file that still holds it.
+    pub(crate) drops_current_columns: bool,
+    /// The file physically embeds the per-row `_ducklake_internal_snapshot_id`
+    /// column, so its rows' origin snapshots are read from it rather than taken
+    /// as the file's single catalog `begin_snapshot`. This is the ONLY thing
+    /// that decides where a merge source's origins come from — the catalog's
+    /// `partial_max` can be NULL on a file that carries the column (providers
+    /// that do not read the field, catalogs predating it), and keying off it
+    /// would re-stamp every row with one origin and drop the column.
+    pub(crate) has_embedded_snapshot: bool,
+}
+
 /// Output schema of a rewritten source file: the table's physical columns (in
 /// catalog types) followed by the preserved `rowid`. `UPDATE` and compaction
 /// share it so both emit exactly the same shape.
@@ -2803,6 +2875,11 @@ pub(crate) struct RewrittenBatch {
     /// Physical positions of the matched rows within the source file, in batch
     /// order — the positions the source file's new cumulative delete must mask.
     pub(crate) positions: Vec<i64>,
+    /// The matched rows' embedded per-row origin snapshots, present exactly when
+    /// the scan projected them ([`UpdateSourceScan::embedded_snapshot_batch_idx`]).
+    /// Filtered with the same mask as the data columns, so each value still
+    /// travels with its own row.
+    pub(crate) origin_snapshots: Option<ArrayRef>,
 }
 
 /// Rewrite ONE batch read from an [`UpdateSourceScan`] into its
@@ -2924,9 +3001,21 @@ pub(crate) fn rewrite_scanned_batch(
     };
     out_cols.push(rowid_col);
 
+    // Carried through under the SAME mask as the data columns: taking it from
+    // the unfiltered batch would hand each surviving row a different row's
+    // origin whenever a predicate selected a subset.
+    let origin_snapshots = match scan.embedded_snapshot_batch_idx {
+        Some(idx) => Some(
+            arrow::compute::filter(batch.column(idx).as_ref(), &mask)
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?,
+        ),
+        None => None,
+    };
+
     Ok(Some(RewrittenBatch {
         batch: RecordBatch::try_new(Arc::clone(out_schema), out_cols)?,
         positions: matched_pos.values().to_vec(),
+        origin_snapshots,
     }))
 }
 
@@ -2946,6 +3035,11 @@ pub(crate) struct UpdateSourceScan {
     /// the file has no embedded rowid (rowids are synthesized from
     /// `row_id_start + position`).
     pub(crate) embedded_batch_idx: Option<usize>,
+    /// Column index of the embedded per-row `_ducklake_internal_snapshot_id` in
+    /// each scanned batch, or `None` when the scan did not project it. Set only
+    /// by [`DuckLakeTable::build_update_scan_with_snapshot`], for a merge source
+    /// whose per-row origins must survive into the merged output.
+    pub(crate) embedded_snapshot_batch_idx: Option<usize>,
     /// Column index of the internal physical-position column in each batch.
     pub(crate) pos_index: usize,
     /// The source file's catalog `row_id_start` (used to synthesize rowids for a
