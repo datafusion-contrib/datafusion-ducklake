@@ -1636,13 +1636,12 @@ async fn merge_respects_schema_version_boundary() {
     );
 }
 
-/// A partial file must NEVER be re-merged: the read path that reconstructs a
-/// source's rows does not surface the embedded per-row origin column, so
-/// re-merging would collapse every row onto the file's single begin_snapshot and
-/// corrupt time travel. `merge_adjacent_files` therefore excludes partial files
-/// from its candidates.
+/// A partial file IS a merge candidate, and a re-merge must carry every row's
+/// OWN origin snapshot through: its scan projects the embedded
+/// `_ducklake_internal_snapshot_id` column, so the output keeps the distinct
+/// origins rather than collapsing them onto one `begin_snapshot`.
 #[tokio::test(flavor = "multi_thread")]
-async fn merge_never_remerges_a_partial_file() {
+async fn merge_remerges_a_partial_file_preserving_per_row_origins() {
     let temp = TempDir::new().unwrap();
     seed(&temp, vec![1], vec![10]).await; // snapshot 1
     append(&temp, vec![2], vec![20]).await; // snapshot 2
@@ -1662,29 +1661,190 @@ async fn merge_never_remerges_a_partial_file() {
         "merge produced a partial file"
     );
 
-    append(&temp, vec![4], vec![40]).await; // snapshot 5 (one more small file, D)
+    append(&temp, vec![4], vec![40]).await; // one more small file, D
+    let s_d = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
 
-    // Merge #2: P is excluded (partial), leaving only D — a single file, so no
-    // group of >= 2 forms and nothing is merged. Crucially, P is not re-merged.
+    // Merge #2 re-merges P together with D into one file.
     let r2 = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(r2.files_processed, 2, "P and D merge together");
+    assert_eq!(r2.files_created, 1);
     assert_eq!(
-        r2.files_processed, 0,
-        "the partial file P is not a candidate; D alone cannot merge"
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        1,
+        "the re-merge leaves exactly one live file"
     );
 
-    // Time travel to snapshot 2 must still return exactly rows from origins <= 2.
-    // If P had been re-merged, its rows would all carry origin 1 and (3,30) would
-    // wrongly reappear here.
+    // The output spans [MIN begin_snapshot, MAX(partial_max ?? begin_snapshot)]
+    // of its sources — P's interval [1, 3] unioned with D's point — matching
+    // official DuckLake's `GetCompactionChanges`.
+    let merged_path: String = sqlx::query(AssertSqlSafe(
+        "SELECT path FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    ))
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .try_get::<String, _>(0)
+    .unwrap();
     assert_eq!(
-        read_rows_at(&temp, 2).await,
-        vec![(1, 10), (2, 20)],
-        "time travel intact: no origins collapsed by a re-merge"
+        opt_i64(
+            &p,
+            "SELECT begin_snapshot FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        Some(1),
+        "output begins at the minimum origin of its sources"
     );
-    // Current snapshot sees everything.
+    assert_eq!(
+        opt_i64(
+            &p,
+            "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        Some(s_d),
+        "output partial_max is the maximum origin any of its rows carries"
+    );
+
+    // On disk, P's four rows keep their four DISTINCT origins. Keying the
+    // decision on the catalog instead would have stamped P's rows with its
+    // single begin_snapshot and left only {1, s_d} here.
+    let mut origins: Vec<i64> = file_lineage(&temp, &merged_path)
+        .into_iter()
+        .map(|(_, origin)| origin.expect("a re-merged output embeds per-row origins"))
+        .collect();
+    origins.sort_unstable();
+    assert_eq!(origins, vec![1, 2, 3, s_d]);
+
+    // Time travel therefore still attributes each row to its own origin.
+    assert_eq!(read_rows_at(&temp, 1).await, vec![(1, 10)]);
+    assert_eq!(read_rows_at(&temp, 2).await, vec![(1, 10), (2, 20)]);
+    assert_eq!(
+        read_rows_at(&temp, 3).await,
+        vec![(1, 10), (2, 20), (3, 30)]
+    );
     assert_eq!(
         read_rows(&temp).await,
         vec![(1, 10), (2, 20), (3, 30), (4, 40)]
     );
+}
+
+/// The convergence property, in the shape that actually occurs: appends
+/// INTERLEAVED with merge passes. Every merge whose sources span more than one
+/// origin snapshot writes a partial file, so on a table taking frequent appends
+/// nearly every output is partial. If partial files were excluded from the
+/// candidates, each pass would strand its own output and the live file count
+/// would climb by one per pass (1, 2, 3, …) with no bound — the partition would
+/// accumulate a floor of files nothing can reduce.
+///
+/// Merging repeatedly on a STATIC table does not exercise this: the first pass
+/// consumes everything and later passes have nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn interleaved_appends_and_merges_keep_the_live_file_count_flat() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![0], vec![0]).await;
+    let p = pool(&temp).await;
+
+    // Each pass appends one small file and then merges, so every pass after the
+    // first has a partial file among its sources.
+    let mut origins: Vec<(i64, i32)> = Vec::new();
+    for id in 1..=6i32 {
+        append(&temp, vec![id], vec![id * 10]).await;
+        origins.push((
+            scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await,
+            id,
+        ));
+        let result = run_merge(&temp, MergeOptions::default()).await;
+        assert_eq!(
+            scalar_i64(
+                &p,
+                "SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL"
+            )
+            .await,
+            1,
+            "pass {id}: the live file count must not climb"
+        );
+        assert_eq!(
+            result.files_processed, 2,
+            "pass {id}: the previous output and the new append merged together"
+        );
+    }
+
+    // Every row is still attributed to the snapshot that appended it.
+    for (snapshot, id) in &origins {
+        let expected: Vec<(i32, i32)> = std::iter::once((0, 0))
+            .chain((1..=*id).map(|i| (i, i * 10)))
+            .collect();
+        assert_eq!(
+            read_rows_at(&temp, *snapshot).await,
+            expected,
+            "time travel to snapshot {snapshot} sees exactly the rows appended by then"
+        );
+    }
+}
+
+/// Whether a merge source carries per-row origins is decided by the PHYSICAL
+/// presence of the embedded column, never by the catalog's `partial_max`. The
+/// two can disagree: a provider that does not read the column substitutes NULL,
+/// as does a catalog predating it. Keying off the catalog would re-stamp every
+/// row of such a file with one origin and drop the embedded column — history
+/// lost irreversibly, since the same commit removes the sources.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_reads_per_row_origins_from_the_file_not_the_catalog() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await; // snapshot 1
+    append(&temp, vec![2], vec![20]).await; // snapshot 2
+
+    // Merge #1 -> partial file P (origins {1, 2}).
+    assert_eq!(
+        run_merge(&temp, MergeOptions::default())
+            .await
+            .files_created,
+        1
+    );
+
+    // Simulate a catalog that lost the field: P still physically embeds its
+    // per-row origins, but its catalog row now says it is not partial.
+    let writable = SqlitePool::connect(&db_url(&temp)).await.unwrap();
+    sqlx::query(AssertSqlSafe(
+        "UPDATE ducklake_data_file SET partial_max = NULL WHERE end_snapshot IS NULL",
+    ))
+    .execute(&writable)
+    .await
+    .unwrap();
+
+    append(&temp, vec![3], vec![30]).await;
+    let p = pool(&temp).await;
+    let s3 = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
+
+    let result = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(result.files_processed, 2, "P is still a candidate");
+
+    // P's rows kept their own origins, so the output holds three distinct ones.
+    let merged_path: String = sqlx::query(AssertSqlSafe(
+        "SELECT path FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    ))
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .try_get::<String, _>(0)
+    .unwrap();
+    let mut origins: Vec<i64> = file_lineage(&temp, &merged_path)
+        .into_iter()
+        .map(|(_, origin)| origin.expect("the output embeds per-row origins"))
+        .collect();
+    origins.sort_unstable();
+    assert_eq!(
+        origins,
+        vec![1, 2, s3],
+        "origins came from P's embedded column, not from its catalog begin_snapshot"
+    );
+
+    assert_eq!(read_rows_at(&temp, 1).await, vec![(1, 10)]);
+    assert_eq!(read_rows_at(&temp, 2).await, vec![(1, 10), (2, 20)]);
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20), (3, 30)]);
 }
 
 /// Merge must not silently drop a column's data. When a column has been dropped
@@ -2033,5 +2193,104 @@ async fn rewrite_inherits_the_tables_write_options() {
     assert!(
         codecs.iter().all(|c| *c == Compression::LZ4),
         "rewritten file written {codecs:?}, not the table's configured codec"
+    );
+}
+
+/// The recorded `partial_max` must be what the merge WROTE, not what the catalog
+/// claimed its sources held.
+///
+/// A source can physically embed origins above the `partial_max` its catalog row
+/// reports: providers substitute NULL on catalogs predating the column, the MySQL
+/// provider hardcodes it, and the migration that added it NULL-filled every
+/// existing row. Deriving the output's bound from those rows records a maximum
+/// below one the output physically contains — and `needs_snapshot_filter` only
+/// installs the row filter below `partial_max`, so the unfiltered rows are served
+/// at snapshots before they existed. The sources are retired in the same commit,
+/// so the true bound is gone with them.
+///
+/// The shape needs the understating source to hold the highest origin of the bin,
+/// which is why the first merge deliberately leaves the seed file alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
+    let temp = TempDir::new().unwrap();
+    // A big seed so it can be held out of the first merge by size alone.
+    let ids: Vec<i32> = (0..4000).collect();
+    let vals: Vec<i32> = (0..4000).map(|i| i * 2).collect();
+    seed(&temp, ids, vals).await; // snapshot 1, file A
+    append(&temp, vec![9001], vec![1]).await; // snapshot 2, file B
+    append(&temp, vec![9002], vec![2]).await; // snapshot 3, file C
+
+    let p = pool(&temp).await;
+    let small = scalar_i64(
+        &p,
+        "SELECT MIN(file_size_bytes) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    let big = scalar_i64(
+        &p,
+        "SELECT MAX(file_size_bytes) FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await;
+    assert!(big > small * 2, "the seed must be separable by size");
+
+    // Merge B+C only: A is at or above the target, so it is left alone.
+    run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: big as u64,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+
+    // P now embeds origins {2, 3}. Make its catalog row understate that, the way
+    // a NULL-filling migration or a provider that cannot read the column does.
+    let writable = SqlitePool::connect(&db_url(&temp)).await.unwrap();
+    sqlx::query(AssertSqlSafe(
+        "UPDATE ducklake_data_file SET partial_max = NULL          WHERE end_snapshot IS NULL AND partial_max IS NOT NULL",
+    ))
+    .execute(&writable)
+    .await
+    .unwrap();
+
+    // A (begin 1) + P (begin 2, catalog says not partial, really holds 3).
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            target_file_size: 1 << 30,
+            max_merged_files: 1024,
+            min_file_size: 0,
+        },
+    )
+    .await;
+    assert_eq!(result.files_processed, 2, "A and P merge together");
+
+    let recorded = opt_i64(
+        &p,
+        "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    )
+    .await
+    .expect("the output is partial: it embeds per-row origins");
+
+    let merged_path: String = sqlx::query(AssertSqlSafe(
+        "SELECT path FROM ducklake_data_file WHERE end_snapshot IS NULL",
+    ))
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .try_get::<String, _>(0)
+    .unwrap();
+    let written_max = file_lineage(&temp, &merged_path)
+        .into_iter()
+        .filter_map(|(_, origin)| origin)
+        .max()
+        .expect("the output embeds per-row origins");
+
+    assert_eq!(
+        recorded, written_max,
+        "the catalog understated P (partial_max NULL, begin 2) while it physically \
+         held origin {written_max}; the output must record what it wrote, or a read \
+         below {written_max} skips the row filter and serves rows that did not exist yet"
     );
 }

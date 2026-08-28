@@ -10,7 +10,10 @@
 //!    row's original rowid AND a per-row `_ducklake_internal_snapshot_id` column,
 //!    and its catalog row records `partial_max` (the maximum origin snapshot id
 //!    among its rows), so time travel / change feeds can still attribute every
-//!    merged row to its origin snapshot.
+//!    merged row to its origin snapshot. A partial file is itself a merge
+//!    candidate: its scan projects that embedded column, so each row keeps its
+//!    own origin through a re-merge and a partition never accumulates a floor of
+//!    files it can no longer reduce.
 //! 2. [`DuckLakeTable::rewrite_data_files`] rewrites a data file whose deleted
 //!    fraction exceeds a threshold (DuckDB's default is 0.95): it reads only the
 //!    file's LIVE rows (delete-aware), writes them to a new file preserving each
@@ -34,8 +37,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -61,7 +65,8 @@ use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
 use crate::sort::{SortDirection, SortSpec};
 use crate::table::{
-    DuckLakeTable, RewrittenBatch, UpdateSourceScan, rewrite_output_schema, rewrite_scanned_batch,
+    DuckLakeTable, MergeSourceFacts, RewrittenBatch, UpdateSourceScan, rewrite_output_schema,
+    rewrite_scanned_batch,
 };
 use crate::table_writer::DuckLakeTableWriter;
 use crate::{DuckLakeError, Result};
@@ -145,25 +150,83 @@ impl CompactionResult {
     }
 }
 
-/// The Arrow field for the constant `_ducklake_internal_snapshot_id` column a
-/// merged partial file embeds. Field-id metadata is deliberately absent: only
+/// The Arrow field for the `_ducklake_internal_snapshot_id` column a merged
+/// partial file embeds. Field-id metadata is deliberately absent: only
 /// the column order matters here, and `write_compacted_file_stream` re-imposes
 /// the field-id-tagged parquet schema.
 fn snapshot_column_field() -> Field {
     Field::new(EMBEDDED_SNAPSHOT_ID_COLUMN_NAME, DataType::Int64, true)
 }
 
-/// Append a constant `_ducklake_internal_snapshot_id` column (every value =
-/// `origin`) to a `[data columns..., rowid]` batch, yielding the
+/// Where one merge source's per-row origin snapshots come from.
+///
+/// Decided from the PHYSICAL presence of the embedded column in the source's
+/// parquet footer, mirroring `DuckLakeMultiFileReader::GetVirtualColumnExpression`'s
+/// rule for `COLUMN_IDENTIFIER_SNAPSHOT_ID` (`ducklake_multi_file_reader.cpp`):
+/// a source carrying the column keeps its OWN per-row origins, and any other
+/// source contributes its single catalog `begin_snapshot` as a constant.
+#[derive(Debug, Clone, Copy)]
+enum OriginSource {
+    /// Every row of this source originates in one snapshot.
+    Constant(i64),
+    /// This source physically carries `_ducklake_internal_snapshot_id`: its
+    /// rows' origins are read from that column, row by row.
+    Embedded,
+}
+
+/// Resolve one rewritten batch's per-row origin snapshots into the column a
+/// merged partial file embeds.
+///
+/// For [`OriginSource::Embedded`] the origins come from the source's own
+/// embedded column, already filtered alongside its rows by
+/// [`rewrite_scanned_batch`]; for [`OriginSource::Constant`] every row of the
+/// source shares one origin.
+fn resolve_origin_column(
+    origin: OriginSource,
+    carried: Option<&ArrayRef>,
+    rows: usize,
+    source_path: &str,
+) -> DataFusionResult<ArrayRef> {
+    if let OriginSource::Constant(origin) = origin {
+        return Ok(Arc::new(Int64Array::from(vec![origin; rows])));
+    }
+    let carried = carried.ok_or_else(|| {
+        DataFusionError::Internal(format!(
+            "merge source \"{source_path}\" was planned with per-row origins but its scan did \
+             not project the embedded snapshot-id column"
+        ))
+    })?;
+    let origins = carried
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "embedded snapshot-id column of \"{source_path}\" is not Int64"
+            ))
+        })?;
+    // A NULL origin leaves the row's visibility undefined — the time-travel and
+    // change-feed comparisons on it disagree, so the same row can appear in one
+    // and not the other. Refuse rather than write it: this same commit removes
+    // the sources, so there would be nothing left to recover the origin from.
+    if origins.null_count() > 0 {
+        return Err(DataFusionError::Execution(format!(
+            "merge source \"{source_path}\" has NULL values in its embedded \
+             `_ducklake_internal_snapshot_id` column; refusing to merge rows whose origin \
+             snapshot is unknown"
+        )));
+    }
+    Ok(Arc::clone(carried))
+}
+
+/// Append `origins` to a `[data columns..., rowid]` batch, yielding the
 /// `[data columns..., rowid, snapshot_id]` `schema` of a merged partial file.
 fn append_snapshot_column(
     batch: &RecordBatch,
-    origin: i64,
+    origins: ArrayRef,
     schema: &SchemaRef,
 ) -> DataFusionResult<RecordBatch> {
-    let snap: ArrayRef = Arc::new(Int64Array::from(vec![origin; batch.num_rows()]));
     let mut cols: Vec<ArrayRef> = batch.columns().to_vec();
-    cols.push(snap);
+    cols.push(origins);
     Ok(RecordBatch::try_new(Arc::clone(schema), cols)?)
 }
 
@@ -172,8 +235,9 @@ fn append_snapshot_column(
 /// Wraps that file's positional read plan and rewrites each batch it produces
 /// into `[physical columns (catalog types)..., rowid]` — the same per-row
 /// transformation an `UPDATE` applies, via the shared [`rewrite_scanned_batch`]
-/// — appending the constant `_ducklake_internal_snapshot_id` column when
-/// `origin` is set (a merge whose bin spans more than one origin snapshot).
+/// — appending the `_ducklake_internal_snapshot_id` column when `origin` is set
+/// (a merge whose output is a partial file), resolved per row or as a per-file
+/// constant according to [`OriginSource`].
 ///
 /// Carrying provenance as columns OF THE SCAN is what lets a whole bin be read
 /// by one execution rather than one file at a time: nothing downstream needs to
@@ -195,14 +259,31 @@ struct CompactionSourceExec {
     /// This exec's output schema: [`Self::rewrite_schema`] plus the embedded
     /// snapshot-id column when [`Self::origin`] is set.
     schema: SchemaRef,
-    /// Origin snapshot to stamp on every row of this file, for a partial merge
+    /// Where this file's rows' origin snapshots come from, for a partial merge
     /// output; `None` leaves the batch at `[physical columns..., rowid]`.
-    origin: Option<i64>,
+    origin: Option<OriginSource>,
+    /// The greatest origin this exec has actually emitted, shared across every
+    /// leaf of one bin so the bin can record what it wrote.
+    ///
+    /// The catalog cannot answer this. A source may physically embed origins
+    /// above the `partial_max` its catalog row claims — providers substitute
+    /// NULL on catalogs predating the column, the MySQL provider hardcodes it,
+    /// and the migration that added it NULL-filled every existing row. Deriving
+    /// the output's bound from those rows would record a maximum below one the
+    /// merge physically wrote, and `needs_snapshot_filter` only filters below
+    /// `partial_max` — so rows would be served at snapshots before they
+    /// existed, with the sources retired in the same commit.
+    observed_max_origin: Arc<AtomicI64>,
     properties: Arc<PlanProperties>,
 }
 
 impl CompactionSourceExec {
-    fn new(scan: Arc<UpdateSourceScan>, physical_schema: SchemaRef, origin: Option<i64>) -> Self {
+    fn new(
+        scan: Arc<UpdateSourceScan>,
+        physical_schema: SchemaRef,
+        origin: Option<OriginSource>,
+        observed_max_origin: Arc<AtomicI64>,
+    ) -> Self {
         let rewrite_schema = rewrite_output_schema(&physical_schema);
         let schema = if origin.is_some() {
             let mut fields: Vec<Arc<Field>> = rewrite_schema.fields().iter().cloned().collect();
@@ -224,6 +305,7 @@ impl CompactionSourceExec {
             rewrite_schema,
             schema,
             origin,
+            observed_max_origin,
             properties,
         }
     }
@@ -235,8 +317,11 @@ impl DisplayAs for CompactionSourceExec {
             f,
             "CompactionSourceExec: file={}, origin={}",
             self.scan.source_path,
-            self.origin
-                .map_or_else(|| "none".to_string(), |origin| origin.to_string())
+            match self.origin {
+                None => "none".to_string(),
+                Some(OriginSource::Constant(origin)) => origin.to_string(),
+                Some(OriginSource::Embedded) => "embedded".to_string(),
+            }
         )
     }
 }
@@ -272,6 +357,7 @@ impl ExecutionPlan for CompactionSourceExec {
             Arc::new(scan),
             Arc::clone(&self.physical_schema),
             self.origin,
+            Arc::clone(&self.observed_max_origin),
         )))
     }
 
@@ -286,6 +372,7 @@ impl ExecutionPlan for CompactionSourceExec {
         let rewrite_schema = Arc::clone(&self.rewrite_schema);
         let schema = Arc::clone(&self.schema);
         let origin = self.origin;
+        let observed_max_origin = Arc::clone(&self.observed_max_origin);
         let stream = input
             .map(move |batch| -> DataFusionResult<Option<RecordBatch>> {
                 let batch = batch?;
@@ -293,6 +380,7 @@ impl ExecutionPlan for CompactionSourceExec {
                 // to select with, no assignments to apply.
                 let Some(RewrittenBatch {
                     batch,
+                    origin_snapshots,
                     ..
                 }) = rewrite_scanned_batch(
                     &physical_schema,
@@ -308,7 +396,24 @@ impl ExecutionPlan for CompactionSourceExec {
                     return Ok(None);
                 };
                 Ok(Some(match origin {
-                    Some(origin) => append_snapshot_column(&batch, origin, &schema)?,
+                    Some(origin) => {
+                        let origins = resolve_origin_column(
+                            origin,
+                            origin_snapshots.as_ref(),
+                            batch.num_rows(),
+                            &scan.source_path,
+                        )?;
+                        // What the output records has to be what it wrote, not
+                        // what the catalog said the sources held.
+                        if let Some(batch_max) = origins
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .and_then(arrow::compute::max)
+                        {
+                            observed_max_origin.fetch_max(batch_max, Ordering::Relaxed);
+                        }
+                        append_snapshot_column(&batch, origins, &schema)?
+                    },
                     None => batch,
                 }))
             })
@@ -546,10 +651,21 @@ impl DuckLakeTable {
     /// preserving it keeps them prunable exactly as before.
     ///
     /// Each source file's live rows are read with their original rowids
-    /// preserved; a merged file that spans more than one origin snapshot is
+    /// preserved; a merged file whose rows span more than one origin snapshot is
     /// written as a partial file (embedding the per-row
     /// `_ducklake_internal_snapshot_id` column and recording `partial_max`). The
     /// sources are retired and scheduled for deletion in the same commit.
+    ///
+    /// A source may itself be a partial file. Whether its rows carry their own
+    /// origins is decided by the PHYSICAL presence of the embedded column in its
+    /// parquet footer — never by the catalog's `partial_max`, which providers may
+    /// leave NULL on a file that has the column — so those origins are copied
+    /// into the output instead of being replaced by one file-level
+    /// `begin_snapshot`. Merging a partial source requires this table to be
+    /// opened at a snapshot at or above its `partial_max` (all its rows must be
+    /// visible to the handle doing the merge); that is an error, while a bin
+    /// whose catalog calls a source partial that carries no such column is
+    /// skipped.
     ///
     /// Returns no-op metrics (and commits no snapshot) when nothing qualifies.
     /// Errors if the table is read-only (open the catalog with a writer) or if a
@@ -572,17 +688,19 @@ impl DuckLakeTable {
         // Candidates: live, delete-free, below-target files with a known origin
         // snapshot + schema version, ordered so adjacency and same-version
         // grouping fall out of the sort.
+        //
+        // A partial file IS a candidate: its scan projects the embedded
+        // `_ducklake_internal_snapshot_id` column, so each of its rows keeps its
+        // own origin through the merge. Official DuckLake likewise applies no
+        // `partial_max` filter to its compaction candidates
+        // (`GetFilesForCompaction`). Excluding them instead strands every merge
+        // output on a table taking appends between merge passes, leaving each
+        // partition a floor of files nothing can reduce.
         let table_files = self.files()?;
         let mut candidates: Vec<&DuckLakeTableFile> = table_files
             .iter()
             .filter(|f| {
                 f.delete_file_id.is_none()
-                    // Never re-merge an existing partial file: its rows carry
-                    // per-row origins in the embedded `_ducklake_internal_snapshot_id`
-                    // column, which the read path used to reconstruct them does NOT
-                    // surface — re-merging would collapse every row onto the file's
-                    // single begin_snapshot and corrupt time travel.
-                    && f.partial_max.is_none()
                     && f.begin_snapshot.is_some()
                     && f.schema_version.is_some()
                     && (f.file.file_size_bytes as u64) >= opts.min_file_size
@@ -631,23 +749,71 @@ impl DuckLakeTable {
             return Ok(CompactionResult::empty());
         }
 
-        // Safety: the merged output is written at the table's CURRENT schema, so
-        // a source carrying a column dropped since it was written would lose
-        // that column's data (and its source is then removed). Drop any such bin
-        // entirely — those files are left uncompacted rather than silently
-        // losing data. (The common case — files at the current schema, or an
-        // older schema that only ADDED columns — is unaffected.) Settled before
-        // anything else, so a table with only such bins stays a pure no-op.
+        // A partial source's rows are ALL visible only at a snapshot at or above
+        // its `partial_max`, and a merge reads every live row of its sources. A
+        // handle pinned below that would fold rows the handle itself cannot see
+        // into a new output, and commit them against a base snapshot that never
+        // contained them. Refuse loudly rather than compact from a historical
+        // handle: the caller wants a head handle.
+        for bin in &bins {
+            for tf in bin {
+                if let Some(partial_max) = tf.partial_max
+                    && self.base_snapshot() < partial_max
+                {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "merge_adjacent_files: source \"{}\" is a partial file whose rows reach \
+                         snapshot {partial_max}, but this table is opened at snapshot {}; \
+                         re-open the catalog at the current snapshot to merge it",
+                        tf.file.path,
+                        self.base_snapshot()
+                    )));
+                }
+            }
+        }
+
+        // Safety, from each source's parquet footer:
+        //
+        // - The merged output is written at the table's CURRENT schema, so a
+        //   source carrying a column dropped since it was written would lose that
+        //   column's data (and its source is then removed).
+        // - A source the catalog calls partial must physically carry the
+        //   `_ducklake_internal_snapshot_id` column its rows' origins live in.
+        //   Without it the catalog and the file disagree about the file's own
+        //   history, and the read path already refuses such a file below
+        //   `partial_max` (`build_exec_for_partial_file`); merging it would carry
+        //   that disagreement into a new file and remove the evidence.
+        //
+        // Either way the bin is dropped entirely — those files are left
+        // uncompacted rather than silently losing data or lineage. (The common
+        // case — files at the current schema, or an older schema that only ADDED
+        // columns — is unaffected.) Settled before anything else, so a table with
+        // only such bins stays a pure no-op.
+        //
+        // The facts are kept because the per-bin planning below needs
+        // `has_embedded_snapshot` again, and re-asking would re-walk the footers.
+        let mut source_facts: HashMap<i64, MergeSourceFacts> = HashMap::new();
         let mut viable: Vec<Vec<&DuckLakeTableFile>> = Vec::with_capacity(bins.len());
         for bin in bins {
-            let mut drops_columns = false;
+            let mut mergeable = true;
             for tf in &bin {
-                if self.file_drops_current_columns(state, &tf.file).await? {
-                    drops_columns = true;
+                let facts = self.merge_source_facts(state, &tf.file).await?;
+                source_facts.insert(tf.data_file_id, facts);
+                if facts.drops_current_columns {
+                    mergeable = false;
+                } else if tf.partial_max.is_some() && !facts.has_embedded_snapshot {
+                    tracing::warn!(
+                        file = %tf.file.path,
+                        partial_max = ?tf.partial_max,
+                        "skipping merge bin: the catalog records this file as partial but it \
+                         carries no embedded snapshot-id column"
+                    );
+                    mergeable = false;
+                }
+                if !mergeable {
                     break;
                 }
             }
-            if !drops_columns {
+            if mergeable {
                 viable.push(bin);
             }
         }
@@ -696,30 +862,46 @@ impl DuckLakeTable {
         let mut rows_written = 0i64;
 
         for bin in &bins {
-            // Every source's origin snapshot is catalog metadata, so the shape
+            // Every source's snapshot bounds are catalog metadata, so the shape
             // of the output is settled before a single row is read.
             //
-            // A group spanning >1 origin snapshot is a partial file: embed the
-            // per-row snapshot column, record the max origin as partial_max, and
-            // set begin_snapshot to the MIN origin so historical reads back to
-            // that point see it (row-filtered by origin). The sources are then
-            // redundant for every snapshot, so the commit removes + schedules
-            // them. A single-origin group needs no per-row column (all rows share
-            // one origin), and begins at that origin.
-            let mut file_origins: Vec<i64> = Vec::with_capacity(bin.len());
+            // A source spans the snapshot RANGE `[begin_snapshot, partial_max]` —
+            // a point for an ordinary file, a genuine interval for a partial one
+            // — so the output spans the union of those ranges: it begins at the
+            // MINIMUM origin (so historical reads back to that point see it,
+            // row-filtered by origin) and its `partial_max` is the maximum origin
+            // any of its rows carries. `GetCompactionChanges`
+            // (`ducklake_transaction_state.cpp`) derives the same two values the
+            // same way. The sources are then redundant for every snapshot, so the
+            // commit removes + schedules them.
+            //
+            // The output is partial whenever its rows do not all share one
+            // origin, and ALSO whenever any source physically carries the
+            // embedded column. That second disjunct is what keeps a re-merge
+            // lossless when the catalog understates a source: writing a
+            // non-partial output would drop the snapshot column AND record
+            // `partial_max` NULL, so no reader would look for those origins
+            // again — and this same commit removes the sources.
+            let mut range_mins: Vec<i64> = Vec::with_capacity(bin.len());
+            let mut range_maxes: Vec<i64> = Vec::with_capacity(bin.len());
             for tf in bin {
-                file_origins.push(tf.begin_snapshot.ok_or_else(|| {
+                let begin = tf.begin_snapshot.ok_or_else(|| {
                     DuckLakeError::Internal("merge candidate missing begin_snapshot".to_string())
-                })?);
+                })?;
+                range_mins.push(begin);
+                range_maxes.push(tf.partial_max.unwrap_or(begin));
             }
-            let origins: HashSet<i64> = file_origins.iter().copied().collect();
-            let partial = origins.len() > 1;
-            let min_origin = origins.iter().copied().min();
-            let partial_max = if partial {
-                origins.iter().copied().max()
-            } else {
-                None
+            let min_origin = range_mins.iter().copied().min();
+            let max_origin = range_maxes.iter().copied().max();
+            let embeds_origins = |tf: &DuckLakeTableFile| {
+                source_facts
+                    .get(&tf.data_file_id)
+                    .is_some_and(|facts| facts.has_embedded_snapshot)
             };
+            let partial = min_origin != max_origin || bin.iter().any(|tf| embeds_origins(tf));
+            // Seeded from the catalog so a bin that embeds nothing still reports
+            // its range; every leaf raises it to what it actually emitted.
+            let observed_max_origin = Arc::new(AtomicI64::new(max_origin.unwrap_or(i64::MIN)));
 
             // ONE execution over the whole bin, so DataFusion reads every source
             // concurrently instead of one object-store round trip at a time.
@@ -728,12 +910,27 @@ impl DuckLakeTable {
             // is what makes the single scan possible — the same shape official
             // DuckLake compaction uses.
             let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(bin.len());
-            for (tf, origin) in bin.iter().zip(&file_origins) {
-                let scan = self.build_update_scan(state, tf).await?;
+            for (tf, begin) in bin.iter().zip(&range_mins) {
+                // One fact — does this file physically carry the embedded column
+                // — decides both the scan's projection and where the exec reads
+                // origins from, so the two can never disagree and stamp a
+                // per-row-origin source with a single `begin_snapshot`. A source
+                // that carries it forces `partial`, so the column always has
+                // somewhere to go.
+                let source_embeds_origins = embeds_origins(tf);
+                let origin = partial.then_some(if source_embeds_origins {
+                    OriginSource::Embedded
+                } else {
+                    OriginSource::Constant(*begin)
+                });
+                let scan = self
+                    .build_update_scan_with_snapshot(state, tf, source_embeds_origins)
+                    .await?;
                 leaves.push(Arc::new(CompactionSourceExec::new(
                     Arc::new(scan),
                     Arc::clone(&physical_schema),
-                    partial.then_some(*origin),
+                    origin,
+                    Arc::clone(&observed_max_origin),
                 )));
                 sources.push(CompactionSourceFile {
                     data_file_id: tf.data_file_id,
@@ -781,6 +978,9 @@ impl DuckLakeTable {
                 Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),
                 None => file,
             };
+            // Read after the write has drained the stream: the bound the
+            // catalog claimed, raised to whatever the merge actually emitted.
+            let partial_max = partial.then(|| observed_max_origin.load(Ordering::Relaxed));
             outputs.push(CompactionOutputFile {
                 file,
                 partial_max,
@@ -901,7 +1101,10 @@ impl DuckLakeTable {
                 Arc::new(CompactionSourceExec::new(
                     Arc::new(scan),
                     Arc::clone(&physical_schema),
+                    // A delete-rewrite emits no origin column, so nothing raises
+                    // this and nothing reads it.
                     None,
+                    Arc::new(AtomicI64::new(i64::MIN)),
                 )),
                 ordering.as_ref(),
             )?;
