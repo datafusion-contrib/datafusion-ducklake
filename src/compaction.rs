@@ -592,7 +592,8 @@ pub(crate) fn sorted_rewrite_batches(
 ///
 /// The coalesce starts every input partition at once rather than capping
 /// concurrency, so the fan-out is worth being explicit about. Partitions are the
-/// bin's files, one each, and two limits bound that from opposite directions:
+/// bin's files, each split across byte ranges, and two limits bound that from
+/// opposite directions:
 /// `MergeOptions::max_merged_files` caps how many files a pass considers, and
 /// the bin's byte budget caps how much data one plan covers. They cannot both be
 /// at maximum.
@@ -1122,11 +1123,11 @@ impl DuckLakeTable {
 
         for tf in candidates {
             // A rewrite replaces ONE source file, so its scan is already the
-            // whole set — and a single file group, executed directly rather than
-            // through the physical optimizer, so it reads on one thread. Rowid
-            // lineage rides out of the scan as a column, so the sort and the
-            // parquet write consume the plan directly instead of a fully
-            // collected `Vec<RecordBatch>`.
+            // whole set; `build_update_scan` splits it across partitions itself,
+            // since this plan is executed directly and never reaches the
+            // optimizer's repartition rule. Rowid lineage rides out of the scan
+            // as a column, so the sort and the parquet write consume the plan
+            // directly instead of a fully collected `Vec<RecordBatch>`.
             let scan = self
                 .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
                 .await?;

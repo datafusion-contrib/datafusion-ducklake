@@ -1708,6 +1708,7 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
+        let plan = self.split_across_partitions(plan, state)?;
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
@@ -2039,6 +2040,35 @@ impl DuckLakeTable {
             }
         }
         Arc::new(unsafe_columns)
+    }
+
+    /// Split a freshly built scan across `target_partitions` byte ranges.
+    ///
+    /// The read paths get this from the physical optimizer's
+    /// `repartition_file_scans` rule. The paths that build a plan and run it
+    /// themselves — `resolve_positions`, the UPDATE source scan, the compaction
+    /// rewrite — never reach that rule (they go straight to
+    /// `physical_plan::collect` / `execute`), so they ask for the split here.
+    ///
+    /// Safe because the physical row position comes from the reader, not from
+    /// arrival order: every consumer on these paths reads positions out of the
+    /// column, so a byte-range split cannot move a row's position. The scan this
+    /// replaced did its own row-group-aligned splitting for the same reason, and
+    /// dropping it without this would have made these paths single-threaded.
+    ///
+    /// Falls back to `plan` unchanged if the source declines to split.
+    fn split_across_partitions(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let target = state.config().target_partitions();
+        if target <= 1 {
+            return Ok(plan);
+        }
+        Ok(plan
+            .repartitioned(target, state.config_options())?
+            .unwrap_or(plan))
     }
 
     /// Whether `predicate` may be pushed into the parquet reader for a
@@ -2877,7 +2907,7 @@ impl DuckLakeTable {
         proj.push(pos_table_idx);
         let pos_index = proj.len() - 1;
 
-        let mut plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+        let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
             self.scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
@@ -2885,6 +2915,7 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
+        let mut plan = self.split_across_partitions(scan, state)?;
         // Mask with BOTH delete sources (#262): inlined positions and prior
         // Parquet ones. Only `existing_parquet_deleted` is carried forward into
         // the replacement delete file.

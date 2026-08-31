@@ -148,10 +148,11 @@ is a simplification, not a new capability. What it could not do was **prune**: a
 5M-row DuckDB-written file (41 row groups) shows selective `rowid` queries 2.4-3x faster, while a
 full scan with no prunable predicate is unchanged.
 
-The parallelism substitution holds only on **read** paths, which run through the physical optimizer
-where `repartition_file_scans` splits a file group. `resolve_positions`,
-`build_update_scan_with_snapshot` and the compaction sources are executed directly
-(`physical_plan::collect`, `input.execute(0, ..)`), so no optimizer rule ever sees them: a
-`DELETE`, a single-file `UPDATE`, and a single-file `rewrite_data_files` now read one file on one
-thread where they previously used the hand-rolled split. `merge_adjacent_files` is unaffected — it
-keeps file-level parallelism, one source exec per file.
+Read paths get their split from the physical optimizer's `repartition_file_scans` rule.
+`resolve_positions`, `build_update_scan_with_snapshot` and the compaction rewrite build a plan and
+run it themselves (`physical_plan::collect`, `input.execute(0, ..)`), so no optimizer rule ever
+sees them — they call `DuckLakeTable::split_across_partitions` at construction instead. Without
+that, removing the hand-rolled row-group partitioning would have left `DELETE`, `UPDATE` and
+single-file `rewrite_data_files` reading one file on one thread, a regression every result would
+have hidden. `merge_adjacent_files` needs nothing extra: it already has file-level parallelism, one
+source exec per file.
