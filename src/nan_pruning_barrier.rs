@@ -5,7 +5,7 @@
 //! file's NaN state is unknown or positive, a predicate like `x > C` pushed
 //! into the parquet scan can row-group-prune a group whose footer max is below
 //! `C` while it still holds matching NaN rows — silently dropping them. The
-//! catalog-level gate (see `float_max_is_bound` in `table.rs`) protects only
+//! catalog-level gate (see `float_bound_is_usable` in `table.rs`) protects only
 //! plan-time file pruning; this node protects execution-time row-group/page/
 //! bloom pruning by refusing to push such predicates into the scan.
 //!

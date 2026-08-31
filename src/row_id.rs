@@ -149,8 +149,8 @@ pub(crate) fn row_pos_virtual_field(name: &str) -> FieldRef {
     Arc::new(Field::new(name, DataType::Int64, false).with_extension_type(RowNumber))
 }
 
-/// Pick a name for the internal position column that no field of `read_schema`
-/// already uses.
+/// Pick a name for the internal position column that collides with nothing in
+/// `read_schema` nor with any name in `also_reserved`.
 ///
 /// [`ROW_POS_COLUMN_NAME`] is not reserved: DuckLake places no restriction on
 /// column names (official DuckLake validates none either), so a table may
@@ -158,14 +158,30 @@ pub(crate) fn row_pos_virtual_field(name: &str) -> FieldRef {
 /// the scan's table schema is only a `debug_assert!` in DataFusion, so a release
 /// build would silently resolve the wrong column. Suffix until unused, the same
 /// way DataFusion disambiguates its own internal row-index column.
-pub(crate) fn unique_row_pos_name(read_schema: &Schema) -> String {
-    if read_schema.field_with_name(ROW_POS_COLUMN_NAME).is_err() {
+///
+/// `also_reserved` exists because the file's own schema is not always the whole
+/// story. The CDC feeds present their scans under the **catalog** names
+/// (`table_changes::present_catalog_schema`) and `ColumnRenameExec` binds each
+/// output field by name, so a catalog column named `__ducklake_row_pos` whose
+/// physical name in this file differs — renamed after the file was written, or
+/// absent from it — would not clash in `read_schema` yet would still capture the
+/// position column downstream. Callers that re-present a scan under other names
+/// must pass those names here.
+pub(crate) fn unique_row_pos_name<'a>(
+    read_schema: &Schema,
+    also_reserved: impl Iterator<Item = &'a str> + Clone,
+) -> String {
+    let taken = |name: &str| {
+        read_schema.field_with_name(name).is_ok()
+            || also_reserved.clone().any(|other| other == name)
+    };
+    if !taken(ROW_POS_COLUMN_NAME) {
         return ROW_POS_COLUMN_NAME.to_string();
     }
     let mut suffix = 1;
     loop {
         let candidate = format!("{ROW_POS_COLUMN_NAME}_{suffix}");
-        if read_schema.field_with_name(&candidate).is_err() {
+        if !taken(&candidate) {
             return candidate;
         }
         suffix += 1;
@@ -175,17 +191,28 @@ pub(crate) fn unique_row_pos_name(read_schema: &Schema) -> String {
 /// Build the scan schema for a *positional* read of `read_schema`: the file's
 /// own columns plus the reader-produced physical-position column appended last.
 ///
-/// Returns the [`TableSchema`] to hand [`ParquetSource`] and the position
-/// column's index within it, which is what a caller appends to its projection.
+/// Returns the [`TableSchema`] to hand [`ParquetSource`], the position column's
+/// index within it (what a caller appends to its projection), and the name it
+/// was given — which is [`ROW_POS_COLUMN_NAME`] unless it had to be
+/// disambiguated (see [`unique_row_pos_name`]).
 ///
 /// [`ParquetSource`]: datafusion::datasource::physical_plan::ParquetSource
-pub(crate) fn positional_table_schema(read_schema: SchemaRef) -> (TableSchema, usize) {
-    let name = unique_row_pos_name(read_schema.as_ref());
+pub(crate) fn positional_table_schema(read_schema: SchemaRef) -> (TableSchema, usize, String) {
+    positional_table_schema_reserving(read_schema, std::iter::empty())
+}
+
+/// [`positional_table_schema`], additionally keeping the position column's name
+/// clear of `also_reserved`. See [`unique_row_pos_name`] for when that matters.
+pub(crate) fn positional_table_schema_reserving<'a>(
+    read_schema: SchemaRef,
+    also_reserved: impl Iterator<Item = &'a str> + Clone,
+) -> (TableSchema, usize, String) {
+    let name = unique_row_pos_name(read_schema.as_ref(), also_reserved);
     let pos_index = read_schema.fields().len();
     let table_schema = TableSchema::builder(read_schema)
         .with_virtual_columns(Fields::from(vec![row_pos_virtual_field(&name)]))
         .build();
-    (table_schema, pos_index)
+    (table_schema, pos_index, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,10 +254,17 @@ impl RowIdExec {
         pos_index: usize,
     ) -> DataFusionResult<Self> {
         let input_schema = input.schema();
-        if input_schema.field(pos_index).data_type() != &DataType::Int64 {
+        let field = input_schema.fields().get(pos_index).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "RowIdExec: position index {pos_index} is out of range for an input of \
+                 {} columns",
+                input_schema.fields().len()
+            ))
+        })?;
+        if field.data_type() != &DataType::Int64 {
             return Err(DataFusionError::Internal(format!(
                 "RowIdExec: column {pos_index} (`{}`) is not the Int64 physical-position column",
-                input_schema.field(pos_index).name()
+                field.name()
             )));
         }
 
@@ -498,14 +532,24 @@ mod tests {
         // DuckLake reserves no column names, so a table may legitimately have a
         // column called `__ducklake_row_pos`.
         let plain = Schema::new(vec![Field::new("v", DataType::Int32, false)]);
-        assert_eq!(unique_row_pos_name(&plain), ROW_POS_COLUMN_NAME);
+        assert_eq!(
+            unique_row_pos_name(&plain, std::iter::empty()),
+            ROW_POS_COLUMN_NAME
+        );
 
         let clash = Schema::new(vec![
             Field::new("v", DataType::Int32, false),
             Field::new(ROW_POS_COLUMN_NAME, DataType::Utf8, true),
         ]);
         assert_eq!(
-            unique_row_pos_name(&clash),
+            unique_row_pos_name(&clash, std::iter::empty()),
+            format!("{ROW_POS_COLUMN_NAME}_1")
+        );
+
+        // A name reserved by a caller (a catalog name the scan will later be
+        // presented under) counts even when the file's own schema is clear.
+        assert_eq!(
+            unique_row_pos_name(&plain, [ROW_POS_COLUMN_NAME].into_iter()),
             format!("{ROW_POS_COLUMN_NAME}_1")
         );
 
@@ -514,7 +558,7 @@ mod tests {
             Field::new(format!("{ROW_POS_COLUMN_NAME}_1"), DataType::Utf8, true),
         ]);
         assert_eq!(
-            unique_row_pos_name(&clash_twice),
+            unique_row_pos_name(&clash_twice, std::iter::empty()),
             format!("{ROW_POS_COLUMN_NAME}_2")
         );
     }
@@ -525,8 +569,9 @@ mod tests {
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Utf8, true),
         ]));
-        let (table_schema, pos_index) = positional_table_schema(read_schema);
+        let (table_schema, pos_index, name) = positional_table_schema(read_schema);
         assert_eq!(pos_index, 2);
+        assert_eq!(name, ROW_POS_COLUMN_NAME);
         let full = table_schema.table_schema();
         assert_eq!(full.fields().len(), 3);
         assert_eq!(full.field(2).name(), ROW_POS_COLUMN_NAME);

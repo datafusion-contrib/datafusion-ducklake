@@ -60,11 +60,18 @@ impl DeleteFilterExec {
         pos_index: usize,
     ) -> DataFusionResult<Self> {
         let schema = input.schema();
-        if schema.field(pos_index).data_type() != &arrow::datatypes::DataType::Int64 {
+        let field = schema.fields().get(pos_index).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "DeleteFilterExec: position index {pos_index} is out of range for an \
+                 input of {} columns",
+                schema.fields().len()
+            ))
+        })?;
+        if field.data_type() != &arrow::datatypes::DataType::Int64 {
             return Err(DataFusionError::Internal(format!(
                 "DeleteFilterExec: column {pos_index} (`{}`) is not the Int64 \
                  physical-position column",
-                schema.field(pos_index).name()
+                field.name()
             )));
         }
         // Filtering only drops rows; partitioning/ordering are preserved.

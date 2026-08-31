@@ -782,11 +782,15 @@ async fn barrier_blocks_only_float_predicates() {
 }
 
 /// Catalog rows shaped like official DuckLake's `ducklake_add_data_files`
-/// (register-by-reference): float min/max present, contains_nan NULL. The max
-/// must not be trusted at either pruning level, while the min still prunes —
-/// NaN can only hide above the max, never below the min.
+/// (register-by-reference): float min/max present, contains_nan NULL. **Neither**
+/// bound may be trusted at either pruning level.
+///
+/// DataFusion orders floats with `total_cmp`, which is signed on NaN: positive
+/// NaN sorts above every value, negative NaN below every value — below
+/// `-Infinity` included. `contains_nan` does not record the sign, so an unknown
+/// NaN state invalidates the min exactly as it invalidates the max.
 #[tokio::test(flavor = "multi_thread")]
-async fn nan_unknown_bounds_prune_only_below_min() {
+async fn nan_unknown_bounds_are_untrusted_in_both_directions() {
     let (_temp, db_url, ctx) =
         setup_float_table(&[(vec![7, 8, 9], vec![f64::NAN, 1.0, 2.0])]).await;
 
@@ -817,12 +821,14 @@ async fn nan_unknown_bounds_prune_only_below_min() {
         "barrier expected while NaN state is unknown:\n{plan}"
     );
 
-    // min stays trustworthy: a predicate strictly below it prunes the file
-    // outright (EmptyExec), NaN notwithstanding.
+    // The min is equally untrustworthy: a negative NaN would sit beneath it, so
+    // the file must NOT be pruned away on `x < 0.5`. (This file holds a positive
+    // NaN, so the answer is still zero rows — but by evaluating the predicate,
+    // not by discarding the file unread.)
     let plan = physical_plan(&ctx, "SELECT x FROM test.main.t WHERE x < 0.5").await;
     assert!(
-        plan.contains("EmptyExec"),
-        "file should be pruned via its float min even with NaN unknown:\n{plan}"
+        !plan.contains("EmptyExec"),
+        "a float min must not prune a file whose NaN state is unknown:\n{plan}"
     );
     assert_eq!(
         row_count(&ctx, "SELECT x FROM test.main.t WHERE x < 0.5").await,
@@ -857,5 +863,65 @@ async fn nan_multi_file_scan_blocks_float_pruning() {
     assert!(
         plan.contains("NanPruningBarrierExec: unsafe_columns=[x]"),
         "one unsafe file must make x unsafe for the scan group:\n{plan}"
+    );
+}
+
+/// A recorded float `min` is NOT a lower bound when the file may hold NaN.
+///
+/// The max side is gated on `contains_nan` because NaN sorts above every value.
+/// The min side was left ungated on the reasoning that "NaN can never sit below
+/// it" — but that only holds for *positive* NaN. DataFusion compares floats with
+/// `total_cmp`, under which **negative** NaN sorts below every value, including
+/// `-Infinity`:
+///
+/// ```text
+/// SELECT (-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)  -- true
+/// ```
+///
+/// So for a catalog whose stats came from a writer that records bounds alongside
+/// `contains_nan = true` (official DuckLake's INSERT does), plan-time file
+/// pruning on the min can drop a file that really does contain matching rows.
+/// This crate's own writer suppresses both bounds when NaN is present, so the
+/// exposure is foreign catalogs — exactly the population the gate exists for.
+#[tokio::test(flavor = "multi_thread")]
+async fn negative_nan_rows_survive_min_based_file_pruning() {
+    let (_temp, db_url, ctx) =
+        setup_float_table(&[(vec![1, 2, 3], vec![-f64::NAN, 1.0, 2.0])]).await;
+
+    // Record bounds the way a foreign writer does: finite min/max computed with
+    // NaN excluded, plus contains_nan = true.
+    let pool = SqlitePool::connect(&db_url).await.unwrap();
+    sqlx::query(
+        "UPDATE ducklake_file_column_stats
+         SET min_value = '1.0', max_value = '2.0', contains_nan = true
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'x')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ducklake_table_column_stats
+         SET min_value = '1.0', max_value = '2.0', contains_nan = true
+         WHERE column_id IN
+             (SELECT column_id FROM ducklake_column WHERE column_name = 'x')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // -NaN sorts below every finite value, so it matches a bound they all fail.
+    // Pruning the file on min = 1.0 would silently lose it.
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x < -1e300").await,
+        1,
+        "the -NaN row must not be pruned away by a recorded min"
+    );
+    // The max side is already gated; assert it stays that way.
+    assert_eq!(
+        row_count(&ctx, "SELECT x FROM test.main.t WHERE x > 1e300").await,
+        0,
+        "-NaN does not match a greater-than bound"
     );
 }

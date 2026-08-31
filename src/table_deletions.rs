@@ -52,7 +52,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::row_id::{ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema};
+use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
     validated_record_count,
@@ -442,7 +442,13 @@ impl TableDeletionsTable {
             None => Arc::clone(&layout.read_schema),
         };
 
-        let (table_schema, _) = positional_table_schema(read_schema);
+        // The scan is re-presented under the catalog names below, and
+        // `ColumnRenameExec` binds by name, so the position column's name must
+        // clear those too — not only the file's physical ones.
+        let (table_schema, _, _) = positional_table_schema_reserving(
+            read_schema,
+            self.table_schema.fields().iter().map(|f| f.name().as_str()),
+        );
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             Arc::new(ParquetSource::new(table_schema)),
@@ -850,9 +856,9 @@ fn filter_batch(
         .as_any()
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| {
-            DataFusionError::Internal(format!(
-                "physical-position column {ROW_POS_COLUMN_NAME} is missing or not Int64"
-            ))
+            DataFusionError::Internal(
+                "physical-position column is missing or not Int64".to_string(),
+            )
         })?;
 
     // Resolve each deleted row's rowid: the embedded rowid column when the

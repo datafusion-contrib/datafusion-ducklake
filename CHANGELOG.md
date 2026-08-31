@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
 - Row lineage and positional deletes take the physical row position from the Parquet reader's
-  `row_number` virtual column, matching official DuckLake. Those scans now split one file across
-  partitions and push predicates into row-group / page / bloom pruning, which the previous
-  design had to refuse; `DELETE` / `UPDATE` position resolution prunes too (#130).
+  `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
+  into row-group / page / bloom pruning, which the previous design had to refuse — measured
+  2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
+  resolution prunes too. Byte-range splitting replaces the hand-rolled row-group partitioning
+  it removes (#130).
 
 ### Changed
 

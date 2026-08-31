@@ -297,17 +297,23 @@ fn validate_column_defaults(columns: &[DuckLakeTableColumn]) -> Result<HashMap<S
     Ok(defaults)
 }
 
-/// Whether a stored float `max_value` is a usable upper bound.
+/// Whether a stored float `min_value` / `max_value` is a usable bound.
 ///
-/// Catalog min/max exclude NaN, and NaN sorts above every value in both DuckDB
-/// and DataFusion (IEEE 754 totalOrder) — so a float column whose NaN state is
-/// unknown (`None`, e.g. register-by-reference loads) or positive (`Some(true)`,
-/// e.g. stats written by official DuckLake's INSERT) may hold values above its
-/// recorded max, and pruning `x > C` on that max would wrongly drop rows. The
-/// recorded min needs no such gate: NaN can never sit below it, so `min <= v`
-/// holds for every value including NaN. Mirrors official DuckLake, which ORs
-/// `contains_nan` into its greater-than filter SQL.
-fn float_max_is_bound(data_type: &DataType, contains_nan: Option<bool>) -> bool {
+/// Catalog min/max exclude NaN, so a float column whose NaN state is unknown
+/// (`None`, e.g. register-by-reference loads) or positive (`Some(true)`, e.g.
+/// stats written by official DuckLake's INSERT) may hold values outside its
+/// recorded bounds, and pruning on them would wrongly drop rows.
+///
+/// **Both** bounds need the gate, because DataFusion compares floats with
+/// `total_cmp`, which is signed on NaN: positive NaN sorts above every value,
+/// and negative NaN sorts *below* every value — below `-Infinity` included. So
+/// a recorded min is no more a lower bound than a recorded max is an upper one:
+/// `SELECT (-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)` is `true`.
+/// `contains_nan` does not record the sign, so neither bound can be trusted.
+///
+/// Mirrors official DuckLake, which ORs `contains_nan` into its comparison
+/// filter SQL.
+fn float_bound_is_usable(data_type: &DataType, contains_nan: Option<bool>) -> bool {
     !matches!(
         data_type,
         DataType::Float16 | DataType::Float32 | DataType::Float64
@@ -421,9 +427,13 @@ fn build_datafusion_statistics(
                     }
                 })
                 .unwrap_or(Precision::Absent);
-            column_statistics.min_value =
-                scalar_precision(raw.min_value.as_deref(), column, field_type, exact);
-            column_statistics.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+            let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);
+            column_statistics.min_value = if bounds_usable {
+                scalar_precision(raw.min_value.as_deref(), column, field_type, exact)
+            } else {
+                Precision::Absent
+            };
+            column_statistics.max_value = if bounds_usable {
                 scalar_precision(raw.max_value.as_deref(), column, field_type, exact)
             } else {
                 Precision::Absent
@@ -491,13 +501,18 @@ fn build_datafusion_statistics(
             if raw.contains_null == Some(false) {
                 output.null_count = Precision::Exact(0);
             }
-            output.min_value = scalar_precision(
-                raw.min_value.as_deref(),
-                column,
-                field_type,
-                raw.bounds_are_exact,
-            );
-            output.max_value = if float_max_is_bound(field_type, raw.contains_nan) {
+            let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);
+            output.min_value = if bounds_usable {
+                scalar_precision(
+                    raw.min_value.as_deref(),
+                    column,
+                    field_type,
+                    raw.bounds_are_exact,
+                )
+            } else {
+                Precision::Absent
+            };
+            output.max_value = if bounds_usable {
                 scalar_precision(
                     raw.max_value.as_deref(),
                     column,
@@ -563,11 +578,14 @@ fn build_datafusion_statistics(
 
             let all_null =
                 matches!((raw.value_count, raw.null_count), (Some(v), Some(n)) if v == n);
-            match raw
+            // An unusable float min (NaN state unknown/positive) is treated the
+            // same way as an unusable max below: negative NaN sorts beneath
+            // every value, so the recorded min is not a lower bound.
+            let usable_min = raw
                 .min_value
                 .as_deref()
-                .and_then(|value| parse_statistic_scalar(value, column, field_type))
-            {
+                .filter(|_| float_bound_is_usable(field_type, raw.contains_nan));
+            match usable_min.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     min_value = match min_value {
                         Some(current) => current.partial_cmp(&value).map(|ordering| {
@@ -584,13 +602,13 @@ fn build_datafusion_statistics(
                 None if all_null => {},
                 None => min_complete = false,
             }
-            // An unusable float max (NaN state unknown/positive) is treated as
-            // absent: with `all_null` it contributes nothing, otherwise it
-            // poisons `max_complete` so the aggregate max degrades to unknown.
+            // An unusable float bound is treated as absent: with `all_null` it
+            // contributes nothing, otherwise it poisons `max_complete` so the
+            // aggregate degrades to unknown.
             let usable_max = raw
                 .max_value
                 .as_deref()
-                .filter(|_| float_max_is_bound(field_type, raw.contains_nan));
+                .filter(|_| float_bound_is_usable(field_type, raw.contains_nan));
             match usable_max.and_then(|value| parse_statistic_scalar(value, column, field_type)) {
                 Some(value) => {
                     max_value = match max_value {
@@ -1619,10 +1637,11 @@ impl DuckLakeTable {
     /// by a delete file's `pos` column and
     /// [`crate::metadata_writer::MetadataWriter::set_delete_file`].
     ///
-    /// Scans the whole file; pushing `predicate` down for row-group/bloom pruning
-    /// is a possible optimization — but any such pushdown must exclude float
-    /// predicates unless the file is known NaN-free (footer bounds exclude NaN;
-    /// see `NanPruningBarrierExec`), or a DELETE/UPDATE could miss NaN rows.
+    /// `predicate` is pushed into the reader for row-group/bloom pruning only
+    /// when `predicate_is_prunable` allows: never for a float predicate
+    /// (footer bounds exclude NaN, and a hidden NaN row is one a DELETE fails to
+    /// delete), and never for a file carrying a physical rename. Otherwise the
+    /// whole file is scanned.
     ///
     /// Valid for every data file, including one rewritten by an UPDATE or by
     /// compaction. A delete file's `pos` is the row's **physical** index in the
@@ -1659,7 +1678,8 @@ impl DuckLakeTable {
         // Physical data columns only (logical order), then the reader-produced
         // position column. Embedded/rowid columns are not needed to evaluate the
         // predicate or read positions.
-        let (table_schema, pos_table_idx) = positional_table_schema(file_cfg.read_schema.clone());
+        let (table_schema, pos_table_idx, _pos_name) =
+            positional_table_schema(file_cfg.read_schema.clone());
         let mut proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
         proj.push(pos_table_idx);
         let pos_idx = proj.len() - 1;
@@ -1981,7 +2001,7 @@ impl DuckLakeTable {
     /// exclude NaN) must not drive row-group/page pruning for predicates on
     /// them. Detected via the already-gated per-file statistics: a float
     /// column with an `Absent` max is exactly one whose `contains_nan` isn't
-    /// known false (see `float_max_is_bound`); a file with no statistics entry
+    /// known false (see `float_bound_is_usable`); a file with no statistics entry
     /// is unknown across the board.
     fn nan_unsafe_float_columns(
         &self,
@@ -2117,8 +2137,7 @@ impl DuckLakeTable {
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
 
         // Deletes filter by physical row position, so this is a positional path:
-        // it must read the file in row-group-aligned, non-repartitionable,
-        // non-pruning partitions and synthesize positions before filtering.
+        // the scan must also read the reader-produced position column.
         let deleted_positions = self
             .deleted_positions_for_file(state, table_file, inlined_positions)
             .await?;
@@ -2143,7 +2162,7 @@ impl DuckLakeTable {
             // Positional path: read the physical position alongside the data so
             // deletes are matched by position. No scan-level limit (it would drop
             // rows before the delete filter); DataFusion enforces LIMIT above.
-            let (table_schema, pos_table_idx) =
+            let (table_schema, pos_table_idx, _pos_name) =
                 positional_table_schema(file_cfg.read_schema.clone());
             let mut proj = proj_indices.clone();
             proj.push(pos_table_idx);
@@ -2351,7 +2370,7 @@ impl DuckLakeTable {
             // feeds delete filtering and/or rowid synthesis. No scan-level limit
             // (it would drop rows before delete filtering); DataFusion enforces
             // LIMIT above.
-            let (table_schema, pos_table_idx) =
+            let (table_schema, pos_table_idx, _pos_name) =
                 positional_table_schema(file_cfg.read_schema.clone());
             let mut proj = parquet_projection;
             proj.push(pos_table_idx);
@@ -2492,6 +2511,21 @@ impl DuckLakeTable {
         }
 
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+
+        // Same contract as every other rowid path, and as the C++ extension: a
+        // file with neither an embedded rowid nor a catalog `row_id_start` has
+        // no reconstructable lineage. A merged partial file always carries the
+        // embedded column, so this is a guard rather than a live case — but
+        // without it the failure is a confusing "no field named rowid" from the
+        // rename layer instead of a statement of what is actually missing.
+        if file_cfg.embedded_rowid_parquet_name.is_none() && table_file.row_id_start.is_none() {
+            return Err(DataFusionError::Execution(format!(
+                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
+                 `row_id_start` set in the catalog — row lineage cannot be reconstructed",
+                table_file.file.path
+            )));
+        }
+
         let snap_name = file_cfg
             .embedded_snapshot_parquet_name
             .clone()
@@ -2534,7 +2568,8 @@ impl DuckLakeTable {
         } else {
             // Positional: the reader appends the physical row position, which the
             // delete filter matches the delete set against.
-            let (table_schema, pos_table_idx) = positional_table_schema(read_schema.clone());
+            let (table_schema, pos_table_idx, _pos_name) =
+                positional_table_schema(read_schema.clone());
             let mut proj = projection;
             proj.push(pos_table_idx);
             let pos_index = proj.len() - 1;
@@ -2801,7 +2836,7 @@ impl DuckLakeTable {
         // physical columns (logical order), then for an embedded file the
         // embedded rowid column, then the position column.
         let physical_len = self.physical_schema.fields().len();
-        let (table_schema, pos_table_idx) = positional_table_schema(read_schema.clone());
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema(read_schema.clone());
         // Built by pushing, so each appended column records the index it actually
         // landed at. Arithmetic off `physical_len` would silently misalign the
         // appended columns for a file that has one but not another, and all are
@@ -4973,18 +5008,24 @@ mod tests {
                 true,
             );
 
-            // min is a valid lower bound regardless of NaN state — NaN sorts
-            // above every value, so it can never undercut the recorded min.
+            // Neither bound survives an unknown/positive NaN state: DataFusion
+            // orders floats with `total_cmp`, under which negative NaN sits
+            // below every value (below -Infinity included), so a recorded min is
+            // no more trustworthy than a recorded max. `contains_nan` does not
+            // record the sign, so both must go.
             let per_file = &file_stats[&7].column_statistics[0];
             let table_col = &table_stats.column_statistics[0];
+            let expected_min = if contains_nan == Some(false) {
+                Precision::Exact(ScalarValue::Float64(Some(1.0)))
+            } else {
+                Precision::Absent
+            };
             assert_eq!(
-                per_file.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                per_file.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
             assert_eq!(
-                table_col.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                table_col.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
 
@@ -5034,9 +5075,16 @@ mod tests {
             );
 
             let column = &statistics.column_statistics[0];
+            // Both bounds are gated: negative NaN sits below a recorded min just
+            // as positive NaN sits above a recorded max, and `contains_nan`
+            // does not record the sign.
+            let expected_min = if max_usable {
+                Precision::Exact(ScalarValue::Float64(Some(1.0)))
+            } else {
+                Precision::Absent
+            };
             assert_eq!(
-                column.min_value,
-                Precision::Exact(ScalarValue::Float64(Some(1.0))),
+                column.min_value, expected_min,
                 "contains_nan={contains_nan:?}"
             );
             let expected_max = if max_usable {
@@ -5102,13 +5150,12 @@ mod tests {
             Precision::Exact(ScalarValue::Float64(Some(3.0)))
         );
 
-        // One file NaN-unknown: its max is untrusted, so the aggregate max
-        // degrades to unknown; the min still folds from both files.
+        // One file NaN-unknown: NEITHER of its bounds is trusted, so both
+        // aggregates degrade to unknown. A negative NaN in that file would sit
+        // below the folded min exactly as a positive one would sit above the
+        // folded max.
         let statistics = build(None);
-        assert_eq!(
-            statistics.column_statistics[0].min_value,
-            Precision::Exact(ScalarValue::Float64(Some(0.5)))
-        );
+        assert_eq!(statistics.column_statistics[0].min_value, Precision::Absent);
         assert_eq!(statistics.column_statistics[0].max_value, Precision::Absent);
         Ok(())
     }

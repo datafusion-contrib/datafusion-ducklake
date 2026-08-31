@@ -40,7 +40,7 @@ use futures::{Stream, StreamExt};
 use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::row_id::{ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema};
+use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts,
     validated_file_size, validated_record_count,
@@ -910,7 +910,13 @@ impl TableChangesTable {
             // partial file whose real rowids feed the update correlation): scan
             // positionally to synthesize rowid = row_id_start + position.
             None if need_rowid_resolution => {
-                let (table_schema, _) = positional_table_schema(read_schema);
+                // Re-presented under the catalog names below, where
+                // `ColumnRenameExec` binds by name; keep the position column
+                // clear of those as well as of the file's own names.
+                let (table_schema, _, _) = positional_table_schema_reserving(
+                    read_schema,
+                    self.table_schema.fields().iter().map(|f| f.name().as_str()),
+                );
                 let builder = FileScanConfigBuilder::new(
                     self.object_store_url.as_ref().clone(),
                     Arc::new(ParquetSource::new(table_schema)),
@@ -951,7 +957,11 @@ impl TableChangesTable {
             pf = pf.with_metadata_size_hint(hint);
         }
         let read_schema = self.read_schema_with_embedded(layout, embedded_name, &None);
-        let (table_schema, _) = positional_table_schema(read_schema);
+        // See `build_insert_scan`: the catalog names are reserved too.
+        let (table_schema, _, _) = positional_table_schema_reserving(
+            read_schema,
+            self.table_schema.fields().iter().map(|f| f.name().as_str()),
+        );
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             Arc::new(ParquetSource::new(table_schema)),
@@ -1781,7 +1791,7 @@ async fn correlate_changes(
                                 .to_string(),
                         )
                     })?;
-                    let pos = int64_column(&b, pos_idx, ROW_POS_COLUMN_NAME)?;
+                    let pos = int64_column(&b, pos_idx, "physical position")?;
                     Int64Array::from(
                         (0..n)
                             .map(|i| row_id_start + pos.value(i))
@@ -1908,7 +1918,7 @@ async fn correlate_changes(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
-                    DataFusionError::Internal(format!("{ROW_POS_COLUMN_NAME} column is not Int64"))
+                    DataFusionError::Internal("physical-position column is not Int64".to_string())
                 })?;
             let embedded = match unit.embedded_col_idx {
                 Some(idx) => Some(

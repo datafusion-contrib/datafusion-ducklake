@@ -37,6 +37,10 @@ use datafusion_ducklake::{
 /// something to work with.
 const ROWS: i32 = 60_000;
 
+/// Rows per parquet row group in the fixtures. Small enough that `ROWS` spans
+/// several, so pruning and splitting are real rather than nominal.
+const ROWS_PER_ROW_GROUP: usize = 5_000;
+
 /// Session config that splits single files across partitions, so every test
 /// runs the parallel case rather than the incidental single-partition one.
 fn split_ctx() -> SessionContext {
@@ -81,6 +85,59 @@ async fn ctx_for(temp: &TempDir, lineage: bool, writable: bool) -> SessionContex
     ctx
 }
 
+/// Record a column rename the way a real catalog does: close the existing
+/// generation and open another under the SAME column id, so the id is the stable
+/// key and the name is not. Parquet files keep the old physical name, which is
+/// exactly what populates `name_mapping` on read.
+async fn rename_column(temp: &TempDir, from: &str, to: &str, column_type: &str) {
+    let url = format!("sqlite:{}", temp.path().join("test.db").display());
+    let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    let next: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) + 1 FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (table_id, column_id, column_order): (i64, i64, i64) = sqlx::query_as(
+        "SELECT table_id, column_id, column_order FROM ducklake_column
+         WHERE column_name = ? AND end_snapshot IS NULL",
+    )
+    .bind(from)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
+         SELECT ?, snapshot_time, schema_version FROM ducklake_snapshot
+         ORDER BY snapshot_id DESC LIMIT 1",
+    )
+    .bind(next)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE ducklake_column SET end_snapshot = ? WHERE column_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(next)
+    .bind(column_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_column
+           (column_id, table_id, column_name, column_type, column_order, begin_snapshot, nulls_allowed)
+         VALUES (?, ?, ?, ?, ?, ?, false)",
+    )
+    .bind(column_id)
+    .bind(table_id)
+    .bind(to)
+    .bind(column_type)
+    .bind(column_order)
+    .bind(next)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+}
+
 fn float_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
@@ -92,7 +149,13 @@ fn float_schema() -> Arc<Schema> {
 /// `id = nan_at`. Written in several batches so the file spans row groups.
 async fn seed_float_table(temp: &TempDir, nan_at: Option<i32>) {
     let writer = Arc::new(new_writer(temp).await);
-    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    // Small row groups on purpose. The parquet default is 1Mi rows, which would
+    // put this whole fixture in ONE row group — and then neither row-group
+    // pruning nor byte-range splitting has anything to bite on, so tests that
+    // claim to exercise them would pass vacuously.
+    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_max_row_group_rows(ROWS_PER_ROW_GROUP);
 
     let mut batches = Vec::new();
     let chunk = 10_000;
@@ -423,62 +486,6 @@ async fn a_user_column_named_like_the_internal_position_column_is_safe() {
     );
 }
 
-/// The previous design built its own `PartitionedFile`s for positional scans and
-/// never attached the catalog's per-file statistics; a plain scan did. Positional
-/// scans go through ordinary scan construction now, so the two must agree.
-///
-/// This asserts *parity*, not that statistics are populated: whether DataFusion
-/// surfaces them at all depends on `collect_statistics`, which is off by default.
-/// Parity is the invariant this change is responsible for.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn positional_scans_carry_the_same_statistics_as_plain_scans() {
-    use datafusion::common::stats::Precision;
-    use datafusion::physical_plan::ExecutionPlan;
-    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
-
-    let temp = TempDir::new().unwrap();
-    seed_float_table(&temp, None).await;
-    let ctx = ctx_for(&temp, true, false).await;
-
-    let plain = ctx
-        .sql("SELECT id FROM ducklake.main.t")
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let plan = ctx
-        .sql("SELECT rowid, id FROM ducklake.main.t")
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-
-    fn row_count_of(plan: &Arc<dyn ExecutionPlan>) -> Precision<usize> {
-        if plan.name() == "DataSourceExec" {
-            let ctx = StatisticsContext::new();
-            return ctx
-                .compute(plan.as_ref(), &StatisticsArgs::new())
-                .unwrap()
-                .num_rows;
-        }
-        for child in plan.children() {
-            let found = row_count_of(child);
-            if !matches!(found, Precision::Absent) {
-                return found;
-            }
-        }
-        Precision::Absent
-    }
-
-    assert_eq!(
-        row_count_of(&plan),
-        row_count_of(&plain),
-        "a positional scan must carry the same per-file statistics as a plain one"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // DELETE/UPDATE position resolution
 // ---------------------------------------------------------------------------
@@ -569,53 +576,7 @@ async fn delete_after_a_column_rename_removes_the_right_rows() {
     let temp = TempDir::new().unwrap();
     seed_float_table(&temp, None).await;
 
-    // Record the rename the way a real catalog does: close the existing
-    // generation and open another under the SAME column id, so the id is the
-    // stable key and the name is not. The parquet files keep the old name, which
-    // is exactly what populates `name_mapping`.
-    {
-        let url = format!("sqlite:{}", temp.path().join("test.db").display());
-        let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
-        let next: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) + 1 FROM ducklake_snapshot")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let (table_id, column_id, column_order): (i64, i64, i64) = sqlx::query_as(
-            "SELECT table_id, column_id, column_order FROM ducklake_column
-             WHERE column_name = 'id' AND end_snapshot IS NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
-             SELECT ?, snapshot_time, schema_version FROM ducklake_snapshot
-             ORDER BY snapshot_id DESC LIMIT 1",
-        )
-        .bind(next)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE ducklake_column SET end_snapshot = ? WHERE column_id = ? AND end_snapshot IS NULL")
-            .bind(next)
-            .bind(column_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO ducklake_column
-               (column_id, table_id, column_name, column_type, column_order, begin_snapshot, nulls_allowed)
-             VALUES (?, ?, 'ident', 'int32', ?, ?, false)",
-        )
-        .bind(column_id)
-        .bind(table_id)
-        .bind(column_order)
-        .bind(next)
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-    }
+    rename_column(&temp, "id", "ident", "int32").await;
 
     let read_ctx = ctx_for(&temp, false, false).await;
     assert_eq!(
@@ -703,4 +664,268 @@ async fn the_internal_position_column_never_reaches_a_user_visible_schema() {
         }
     }
     assert_eq!(checked, 5, "every surface must actually have been queried");
+}
+
+/// The collision guard must consider the CATALOG names, not only the file's
+/// physical ones.
+///
+/// `present_catalog_schema` puts catalog names in front of the scan's trailing
+/// internal columns and lets `ColumnRenameExec` bind every output field **by
+/// name**. So a catalog column called `__ducklake_row_pos` whose physical name
+/// in this file differs — because it was renamed after the file was written —
+/// slips past a guard that only inspects the file's schema: no clash is seen,
+/// the internal column keeps the plain name, and both output fields then resolve
+/// to the user's data column. Every internal column is Int64, so nothing fails
+/// to downcast; the CDC feeds just report the wrong rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cdc_is_safe_when_a_catalog_column_is_renamed_onto_the_internal_name() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+
+    // Physical names are `x`, `v`. Values of `x` are deliberately far from any
+    // physical position, so binding the wrong column is unmistakable.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let n = 200i64;
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| i * -1000).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())) as _,
+        ],
+    )
+    .unwrap();
+    table_writer
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+
+    // Catalog name becomes `__ducklake_row_pos`; the file still calls it `x`.
+    rename_column(&temp, "x", "__ducklake_row_pos", "int64").await;
+
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("DELETE FROM ducklake.main.t WHERE v IN (3, 5, 11)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = ctx_for(&temp, true, false).await;
+
+    // The plain read must still be right.
+    let remaining = row_count(&ctx, "SELECT v FROM ducklake.main.t").await;
+    assert_eq!(remaining, n as usize - 3);
+
+    // And the deletions feed must name exactly the rows that were deleted.
+    let mut deleted: Vec<i64> = rows(
+        &ctx,
+        "SELECT v FROM ducklake_table_deletions('main.t', 1, 100)",
+    )
+    .await
+    .iter()
+    .flat_map(|b| {
+        let idx = b.schema().index_of("v").expect("v column");
+        let c = b
+            .column(idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("v is Int64");
+        (0..b.num_rows()).map(|i| c.value(i)).collect::<Vec<_>>()
+    })
+    .collect();
+    deleted.sort_unstable();
+    assert_eq!(
+        deleted,
+        vec![3, 5, 11],
+        "the deletions feed must match rows by physical position, not by a \
+         catalog column that happens to share the internal column's name"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The optimisations actually happen (not just "the plan mentions them")
+// ---------------------------------------------------------------------------
+
+/// `EXPLAIN ANALYZE` output for `sql`, which carries the parquet reader's
+/// execution metrics.
+async fn analyze(ctx: &SessionContext, sql: &str) -> String {
+    let batches = rows(ctx, &format!("EXPLAIN ANALYZE {sql}")).await;
+    datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string()
+}
+
+/// Parse a `name=<total> total → <matched> matched` metric out of an
+/// EXPLAIN ANALYZE blob.
+fn pruning_metric(plan: &str, name: &str) -> Option<(usize, usize)> {
+    let at = plan.find(&format!("{name}="))? + name.len() + 1;
+    let rest = &plan[at..];
+    let total: usize = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let arrow = rest.find('→')? + '→'.len_utf8();
+    let matched: usize = rest[arrow..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((total, matched))
+}
+
+/// Parse `output_rows_skew=N%`.
+fn skew_percent(plan: &str) -> Option<usize> {
+    let at = plan.find("output_rows_skew=")? + "output_rows_skew=".len();
+    plan[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// Row groups are really skipped on a positional path. Every other pushdown test
+/// asserts on the plan *string*, which would still say `predicate=` if pruning
+/// silently stopped working; this asserts the reader's own counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_positional_scan_really_prunes_row_groups() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+    let ctx = ctx_for(&temp, true, false).await;
+
+    let plan = analyze(
+        &ctx,
+        "SELECT rowid, id FROM ducklake.main.t WHERE id >= 55000",
+    )
+    .await;
+    let (total, matched) = pruning_metric(&plan, "row_groups_pruned_statistics")
+        .unwrap_or_else(|| panic!("no row-group metric in:\n{plan}"));
+    assert!(
+        total > 1,
+        "the fixture must span several row groups, or pruning proves nothing \
+         (got {total}):\n{plan}"
+    );
+    // `id >= 55000` selects the last 5000 of 60000 rows, i.e. one 5000-row group.
+    assert!(
+        matched < total,
+        "a selective predicate must actually prune row groups, got \
+         {matched}/{total}:\n{plan}"
+    );
+    assert_eq!(
+        matched, 1,
+        "only the last row group can hold id >= 55000:\n{plan}"
+    );
+}
+
+/// One file really is read by more than one partition. `" groups:"` in the plan
+/// says the file was *split*; it does not say rows reached more than one
+/// partition, which is the property that makes reader-derived positions
+/// load-bearing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_positional_scan_really_uses_more_than_one_partition() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+    let ctx = ctx_for(&temp, true, false).await;
+
+    let plan = analyze(&ctx, "SELECT rowid, id FROM ducklake.main.t").await;
+    let skew =
+        skew_percent(&plan).unwrap_or_else(|| panic!("no output_rows_skew metric in:\n{plan}"));
+    assert!(
+        skew < 100,
+        "100% skew means a single partition read the whole file, so byte-range \
+         splitting is not actually being exercised:\n{plan}"
+    );
+    // And the answer is still right under that split.
+    assert_eq!(
+        row_count(&ctx, "SELECT rowid FROM ducklake.main.t").await,
+        ROWS as usize
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Predicates over renamed and synthetic columns
+// ---------------------------------------------------------------------------
+
+/// The read side of a rename, which is new code: `ColumnRenameExec` rewrites a
+/// pushed predicate's column *names* to the file's physical ones. Get that wrong
+/// and the reader cannot bind the column, the predicate folds to false, and
+/// every row group prunes — returning nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_predicate_on_a_renamed_column_is_pushed_correctly() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+    rename_column(&temp, "id", "ident", "int32").await;
+
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("DELETE FROM ducklake.main.t WHERE ident = 55000")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = ctx_for(&temp, true, false).await;
+    // With a delete file (positional path) and rowid projected.
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT rowid, ident FROM ducklake.main.t WHERE ident >= 55000"
+        )
+        .await,
+        (ROWS - 55_000) as usize - 1,
+        "a predicate on a renamed column must bind to its physical name"
+    );
+    // And without rowid, still on the delete path.
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT ident FROM ducklake.main.t WHERE ident >= 55000"
+        )
+        .await,
+        (ROWS - 55_000) as usize - 1
+    );
+}
+
+/// A predicate on the synthetic `rowid` column must never be pushed: `rowid` is
+/// derived from a virtual column, and DataFusion refuses a pushed predicate that
+/// references one. `RowIdExec` rejects it, and the answer must still be right.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_predicate_on_rowid_is_answered_without_being_pushed() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+    let ctx = ctx_for(&temp, true, false).await;
+
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM ducklake.main.t WHERE rowid >= 59000").await,
+        1_000
+    );
+    // Mixed conjunct: the data-column half may be pushed, the rowid half not.
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT id FROM ducklake.main.t WHERE rowid = 12345 AND id = 12345"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT id FROM ducklake.main.t WHERE rowid = 12345 AND id = 999"
+        )
+        .await,
+        0
+    );
 }

@@ -141,3 +141,9 @@ with a `FileRowNumberExec` above a deliberately constrained scan: row-group-alig
 plan-time seeds, wrapped in a `PositionalFileSource` that refused repartitioning, filter pushdown and
 sort pushdown, because any of those would have shifted the positions it was counting. That machinery
 is gone; `FileRowNumberExec` and `PositionalFileSource` no longer exist.
+
+Note what that design did and did not cost. It **did** parallelize — `build_row_group_partitions`
+split a file into `min(target_partitions, row_group_count)` chunks by hand — so byte-range splitting
+is a simplification here, not a new capability. What it could not do was **prune**: a measured A/B
+over a 5M-row DuckDB-written file (41 row groups) shows selective `rowid` queries 2.4-3x faster,
+while a full scan with no prunable predicate is unchanged.
