@@ -983,14 +983,16 @@ impl DuckLakeTable {
             // grouping key), so the merged output inherits it: same Hive directory,
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
-            let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &top_level_column_ids,
-                );
-                crate::partition::hive_subpath(&names, &partition_values)
-            });
+            let subpath = partition_id
+                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                .map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
             let file = table_writer
                 .write_compacted_file_stream(
                     schema_name,
@@ -1161,14 +1163,16 @@ impl DuckLakeTable {
             // holds a subset of that file's rows and therefore its exact
             // partition: inherit the identity and the Hive directory.
             let (partition_id, partition_values) = partition_key(tf);
-            let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &top_level_column_ids,
-                );
-                crate::partition::hive_subpath(&names, &partition_values)
-            });
+            let subpath = partition_id
+                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                .map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
             let file = table_writer
                 .write_compacted_file_stream(
                     schema_name,

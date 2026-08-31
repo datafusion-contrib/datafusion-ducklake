@@ -62,8 +62,7 @@ fn official_connection(path: &Path) -> DataFusionResult<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory().map_err(box_err)?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", []).map_err(box_err)?;
-    conn.execute(&format!("ATTACH 'ducklake:{}' AS c;", path.display()), [])
-        .map_err(box_err)?;
+    crate::common::attach_catalog_without_inlining(&conn, path, "c").map_err(box_err)?;
     Ok(conn)
 }
 

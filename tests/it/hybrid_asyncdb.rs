@@ -75,7 +75,7 @@ impl HybridDuckLakeDB {
 
         let ducklake_path = format!("ducklake:{}", catalog_path.display());
         let attach_sql = format!(
-            "ATTACH '{}' AS ducklake (DATA_PATH '{}')",
+            "ATTACH '{}' AS ducklake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0)",
             ducklake_path,
             data_path.display()
         );

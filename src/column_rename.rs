@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -40,6 +41,8 @@ pub struct ColumnRenameExec {
     name_mapping: HashMap<String, String>,
     /// Reverse mapping: new name -> old name, for looking up input columns
     reverse_mapping: Arc<HashMap<String, String>>,
+    /// Per-file values synthesized from Hive path segments.
+    constants: Arc<HashMap<String, ScalarValue>>,
     /// Cached plan properties with updated schema
     properties: Arc<PlanProperties>,
 }
@@ -49,6 +52,15 @@ impl ColumnRenameExec {
         input: Arc<dyn ExecutionPlan>,
         output_schema: SchemaRef,
         name_mapping: HashMap<String, String>,
+    ) -> Self {
+        Self::new_with_constants(input, output_schema, name_mapping, HashMap::new())
+    }
+
+    pub fn new_with_constants(
+        input: Arc<dyn ExecutionPlan>,
+        output_schema: SchemaRef,
+        name_mapping: HashMap<String, String>,
+        constants: HashMap<String, ScalarValue>,
     ) -> Self {
         // PlanProperties must use output schema for DataFusion schema validation
         let eq_props = EquivalenceProperties::new(Arc::clone(&output_schema));
@@ -70,6 +82,7 @@ impl ColumnRenameExec {
             output_schema,
             name_mapping,
             reverse_mapping: Arc::new(reverse_mapping),
+            constants: Arc::new(constants),
             properties,
         }
     }
@@ -85,7 +98,8 @@ impl ColumnRenameExec {
     /// pushdown.
     pub fn is_pure_type_preserving_rename(&self) -> bool {
         let input_schema = self.input.schema();
-        input_schema.fields().len() == self.output_schema.fields().len()
+        self.constants.is_empty()
+            && input_schema.fields().len() == self.output_schema.fields().len()
             && input_schema
                 .fields()
                 .iter()
@@ -178,7 +192,12 @@ impl ColumnRenameExec {
 
 impl DisplayAs for ColumnRenameExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "ColumnRenameExec: renames={}", self.name_mapping.len())
+        write!(
+            f,
+            "ColumnRenameExec: renames={}, constants={}",
+            self.name_mapping.len(),
+            self.constants.len()
+        )
     }
 }
 
@@ -213,10 +232,11 @@ impl ExecutionPlan for ColumnRenameExec {
         }
 
         // Must call new() to rebuild properties from new child's partitioning
-        Ok(Arc::new(ColumnRenameExec::new(
+        Ok(Arc::new(ColumnRenameExec::new_with_constants(
             Arc::clone(&children[0]),
             Arc::clone(&self.output_schema),
             self.name_mapping.clone(),
+            self.constants.as_ref().clone(),
         )))
     }
 
@@ -257,6 +277,7 @@ impl ExecutionPlan for ColumnRenameExec {
             input: input_stream,
             output_schema: Arc::clone(&self.output_schema),
             reverse_mapping: Arc::clone(&self.reverse_mapping),
+            constants: Arc::clone(&self.constants),
         }))
     }
 }
@@ -267,6 +288,7 @@ struct ColumnRenameStream {
     output_schema: SchemaRef,
     /// Mapping from output column name -> input column name (for renamed columns only)
     reverse_mapping: Arc<HashMap<String, String>>,
+    constants: Arc<HashMap<String, ScalarValue>>,
 }
 
 impl Stream for ColumnRenameStream {
@@ -299,6 +321,9 @@ impl Stream for ColumnRenameStream {
                             .fields()
                             .iter()
                             .map(|output_field| {
+                                if let Some(value) = self.constants.get(output_field.name()) {
+                                    return value.to_array_of_size(batch.num_rows());
+                                }
                                 // Check if this column was renamed (new_name -> old_name)
                                 let input_name = self
                                     .reverse_mapping
@@ -541,6 +566,7 @@ mod tests {
             input: Box::pin(EmptyRecordBatchStream::new(input_schema)),
             output_schema: Arc::clone(&output_schema),
             reverse_mapping: Arc::new(reverse_mapping),
+            constants: Arc::new(HashMap::new()),
         };
 
         // The stream should report the output schema

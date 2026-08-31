@@ -15,7 +15,6 @@ use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::table::DuckLakeTable;
 use crate::table_changes::{TableChangesTable, TableInsertionsTable};
 use crate::table_deletions::TableDeletionsTable;
-use crate::types::build_arrow_schema;
 
 #[derive(Debug)]
 pub struct DucklakeSnapshotsFunction {
@@ -343,11 +342,13 @@ fn parse_cdc_args(
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let table_path = resolve_path(&schema_path, &table.path, table.path_is_relative)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-    let columns = provider
-        .get_table_structure(table.table_id, end_snapshot)
+    let fields = provider
+        .get_table_fields(table.table_id, end_snapshot)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+    let columns = crate::types::top_level_columns(&fields)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let table_schema = Arc::new(
-        build_arrow_schema(&columns)
+        crate::types::build_arrow_schema_from_fields(&fields)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
     );
 

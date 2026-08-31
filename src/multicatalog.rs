@@ -11,7 +11,7 @@ use crate::metadata_writer_postgres::execute_ddl_statements;
 use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgRow};
+use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
 /// root (file → table → schema → data_path). An absolute path anywhere in the chain
@@ -58,11 +58,31 @@ pub struct MulticatalogManager {
 }
 
 impl MulticatalogManager {
+    /// Connect to PostgreSQL and initialize the multicatalog schema.
+    pub async fn connect(connection_string: &str, max_connections: u32) -> Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .connect(connection_string)
+            .await?;
+        initialize_multicatalog_schema(&pool).await?;
+        Ok(Self::new(pool))
+    }
+
     /// Construct a manager bound to a Postgres pool.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
         }
+    }
+
+    /// Build a catalog-scoped provider sharing this manager's pool.
+    pub async fn provider(&self, catalog_id: i64) -> Result<crate::MulticatalogProvider> {
+        crate::MulticatalogProvider::with_pool_and_id(self.pool.clone(), catalog_id).await
+    }
+
+    /// Build a catalog-scoped writer sharing this manager's pool.
+    pub async fn writer(&self, catalog_id: i64) -> Result<crate::PostgresMetadataWriter> {
+        crate::PostgresMetadataWriter::with_pool(self.pool.clone(), catalog_id).await
     }
 
     /// Create a catalog with the given name, returning its `catalog_id`.

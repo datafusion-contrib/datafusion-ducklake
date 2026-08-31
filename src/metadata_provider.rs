@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::inlined_filter::{InlinedDataScan, InlinedFilter};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -61,7 +62,8 @@ pub const SQL_GET_DATA_FILES: &str = "
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        del.delete_count,
+        data.mapping_id
     FROM ducklake_data_file AS data
     LEFT JOIN ducklake_delete_file AS del
         ON data.data_file_id = del.data_file_id
@@ -71,6 +73,18 @@ pub const SQL_GET_DATA_FILES: &str = "
     WHERE data.table_id = ?
       AND ? >= data.begin_snapshot
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
+
+/// Read one name mapping and its recursively-linked entries. The mapping id is
+/// globally unique within a DuckLake catalog.
+pub const SQL_GET_NAME_MAPPING: &str = "
+    SELECT mapping.mapping_id, mapping.table_id, mapping.type,
+           name.column_id, name.source_name, name.target_field_id,
+           name.parent_column, name.is_partition
+    FROM ducklake_column_mapping AS mapping
+    LEFT JOIN ducklake_name_mapping AS name
+      ON name.mapping_id = mapping.mapping_id
+    WHERE mapping.mapping_id = ?
+    ORDER BY name.parent_column NULLS FIRST, name.column_id";
 
 /// Read a table's active partition spec (partition_info joined to its key
 /// columns) visible at a snapshot. `?` placeholders (duckdb/sqlite/mysql style):
@@ -383,6 +397,23 @@ pub struct SnapshotMetadata {
     pub timestamp: Option<String>,
 }
 
+/// Change ledger entry associated with a DuckLake snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotChangeMetadata {
+    /// Unique identifier for the snapshot.
+    pub snapshot_id: i64,
+    /// Timestamp when the snapshot was created.
+    pub timestamp: Option<String>,
+    /// Comma-separated DuckLake change tokens.
+    pub changes_made: String,
+    /// Optional commit author.
+    pub author: Option<String>,
+    /// Optional commit message.
+    pub commit_message: Option<String>,
+    /// Optional application-defined commit metadata.
+    pub commit_extra_info: Option<String>,
+}
+
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
     let mut timestamp = raw.trim();
     for suffix in ["Z", " UTC", "+00:00", "+00"] {
@@ -620,7 +651,9 @@ pub fn inlined_delete_table_name(table_id: i64) -> Result<String> {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InlinedDataBackend {
+    #[cfg_attr(not(feature = "metadata-postgres"), allow(dead_code))]
     Postgres,
+    #[cfg_attr(not(feature = "metadata-mysql"), allow(dead_code))]
     MySql,
 }
 
@@ -684,10 +717,20 @@ pub(crate) fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_inlined_rows(
     schema: SchemaRef,
     columns: &[DuckLakeTableColumn],
     rows: Vec<Vec<Option<String>>>,
+) -> Result<RecordBatch> {
+    parse_inlined_rows_with_present(schema, columns, rows, None)
+}
+
+pub(crate) fn parse_inlined_rows_with_present(
+    schema: SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    rows: Vec<Vec<Option<String>>>,
+    present: Option<&HashSet<String>>,
 ) -> Result<RecordBatch> {
     let rows = rows
         .into_iter()
@@ -701,6 +744,11 @@ pub(crate) fn parse_inlined_rows(
                 .enumerate()
                 .map(|(index, value)| {
                     let field = schema.field(index);
+                    if present.is_some_and(|present| {
+                        !present.contains(columns[index].column_name.as_str())
+                    }) {
+                        return inlined_missing_scalar(&columns[index], field.data_type());
+                    }
                     match value {
                         Some(value) => crate::types::parse_ducklake_scalar(
                             &value,
@@ -722,6 +770,88 @@ pub(crate) fn parse_inlined_rows(
         })
         .collect::<Result<Vec<_>>>()?;
     build_inlined_batch(schema, columns, &rows)
+}
+
+pub(crate) fn inlined_missing_scalar(
+    column: &DuckLakeTableColumn,
+    data_type: &DataType,
+) -> Result<ScalarValue> {
+    let Some(value) = column
+        .initial_default
+        .as_deref()
+        .filter(|value| !value.eq_ignore_ascii_case("NULL"))
+    else {
+        return Ok(ScalarValue::try_from(data_type)?);
+    };
+    crate::types::parse_ducklake_scalar(value, data_type).ok_or_else(|| {
+        crate::DuckLakeError::InvalidConfig(format!(
+            "Cannot decode initial_default '{value}' for inlined column '{}' as {data_type}",
+            column.column_name,
+        ))
+    })
+}
+
+/// One row from `ducklake_column`, including its place in the nested field tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeTableField {
+    pub column_id: i64,
+    pub column_name: String,
+    pub column_type: String,
+    pub is_nullable: bool,
+    pub parent_column: Option<i64>,
+}
+
+impl DuckLakeTableField {
+    pub fn top_level(column: DuckLakeTableColumn) -> Self {
+        Self {
+            column_id: column.column_id,
+            column_name: column.column_name,
+            column_type: column.column_type,
+            is_nullable: column.is_nullable,
+            parent_column: None,
+        }
+    }
+
+    pub fn column(&self) -> DuckLakeTableColumn {
+        DuckLakeTableColumn::new(
+            self.column_id,
+            self.column_name.clone(),
+            self.column_type.clone(),
+            self.is_nullable,
+        )
+    }
+}
+
+/// A flattened row from `ducklake_name_mapping`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeNameMappingEntry {
+    pub column_id: i64,
+    pub source_name: String,
+    pub target_field_id: i64,
+    pub parent_column: Option<i64>,
+    pub is_partition: bool,
+}
+
+/// One `ducklake_column_mapping` and all of its name-mapping rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeNameMapping {
+    pub mapping_id: i64,
+    pub table_id: i64,
+    pub mapping_type: String,
+    pub entries: Vec<DuckLakeNameMappingEntry>,
+}
+
+/// One physical inlined-data table's visible rows with their stable row ids.
+#[derive(Debug, Clone)]
+pub struct DuckLakeInlinedData {
+    /// Catalog physical table that owns the rows.
+    pub table_name: String,
+    /// Stable DuckLake row ids, aligned with `batch` rows.
+    pub row_ids: Vec<i64>,
+    /// Snapshot that introduced each row, aligned with `batch` rows.
+    pub begin_snapshots: Vec<i64>,
+    /// Physical table columns in catalog order.
+    pub batch: arrow::record_batch::RecordBatch,
 }
 
 impl DuckLakeTableColumn {
@@ -994,6 +1124,9 @@ pub struct DuckLakeFileData {
     pub file_size_bytes: i64,
     /// Size of the Parquet footer in bytes (optional optimization hint)
     pub footer_size: Option<i64>,
+    /// Name mapping used to adapt this data file's physical columns.
+    /// Delete files do not use column mappings.
+    pub mapping_id: Option<i64>,
 }
 
 impl DuckLakeFileData {
@@ -1004,6 +1137,7 @@ impl DuckLakeFileData {
             encryption_key: None,
             file_size_bytes,
             footer_size: None,
+            mapping_id: None,
         }
     }
 }
@@ -1224,6 +1358,60 @@ pub struct DeleteFileChange {
     pub snapshot_id: i64,
 }
 
+#[derive(Debug)]
+pub(crate) struct MetadataSetting {
+    pub key: String,
+    pub value: String,
+    pub scope: Option<String>,
+    pub scope_id: Option<i64>,
+}
+
+pub(crate) fn resolve_metadata_settings(
+    rows: Vec<MetadataSetting>,
+    schema_id: Option<i64>,
+    table_id: Option<i64>,
+) -> Result<HashMap<String, String>> {
+    let mut global = HashMap::new();
+    let mut schema = HashMap::new();
+    let mut table = HashMap::new();
+
+    for row in rows {
+        match row.scope.as_deref() {
+            None => {
+                global.insert(row.key, row.value);
+            },
+            Some("schema") if row.scope_id.is_none() => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "ducklake_metadata schema setting '{}' has no scope_id",
+                    row.key
+                )));
+            },
+            Some("schema") if row.scope_id == schema_id => {
+                schema.insert(row.key, row.value);
+            },
+            Some("table") if row.scope_id.is_none() => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "ducklake_metadata table setting '{}' has no scope_id",
+                    row.key
+                )));
+            },
+            Some("table") if row.scope_id == table_id => {
+                table.insert(row.key, row.value);
+            },
+            Some("schema") | Some("table") => {},
+            Some(scope) => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Unsupported ducklake_metadata scope '{scope}'; expected schema or table"
+                )));
+            },
+        }
+    }
+
+    global.extend(schema);
+    global.extend(table);
+    Ok(global)
+}
+
 pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// Get the current snapshot ID (dynamic, not cached)
     fn get_current_snapshot(&self) -> Result<i64>;
@@ -1231,8 +1419,34 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// Get the data path from catalog metadata (not snapshot-dependent)
     fn get_data_path(&self) -> Result<String>;
 
+    /// Resolve catalog settings for an optional schema and table. Implementations
+    /// apply DuckLake's per-key precedence: Table, then Schema, then Global.
+    /// External providers default to no stored settings.
+    fn get_metadata_settings(
+        &self,
+        _schema_id: Option<i64>,
+        _table_id: Option<i64>,
+    ) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
+
     /// List all snapshots in the catalog
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>>;
+
+    /// List snapshot change-ledger entries in snapshot order.
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        Ok(Vec::new())
+    }
+
+    /// Find the first snapshot with live data files whose `commit_extra_info`
+    /// equals or contains `needle`.
+    ///
+    /// `commit_extra_info` is opaque to DuckLake; the caller owns its format
+    /// and supplies the exact needle to match (including any delimiters its
+    /// own convention uses to make substring matches unambiguous).
+    fn find_snapshot_by_commit_extra_info(&self, _needle: &str) -> Result<Option<i64>> {
+        Ok(None)
+    }
 
     /// List schemas for a specific snapshot
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>>;
@@ -1256,6 +1470,28 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableColumn>>;
+
+    /// Get the complete nested field tree visible at `snapshot_id`.
+    ///
+    /// External providers that only expose top-level fields retain their
+    /// existing behavior through this default. Built-in providers override it
+    /// with the raw `ducklake_column.parent_column` rows.
+    fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
+        self.get_table_structure(table_id, snapshot_id)
+            .map(|columns| {
+                columns
+                    .into_iter()
+                    .map(DuckLakeTableField::top_level)
+                    .collect()
+            })
+    }
+
+    /// Load a data file's `map_by_name` mapping.
+    fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
+        Err(crate::DuckLakeError::Unsupported(format!(
+            "metadata provider does not support DuckLake name mapping {mapping_id}"
+        )))
+    }
 
     /// Get table files for a specific snapshot
     fn get_table_files_for_select(
@@ -1385,6 +1621,27 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// Read visible inlined rows for a table scan with an optional conservative
+    /// metadata-catalog filter.
+    ///
+    /// The default preserves source compatibility for external providers by
+    /// delegating to [`Self::get_inlined_data`] and reporting the rows it
+    /// materialized. Implementations may omit unsupported filter nodes but must
+    /// never exclude a row which could satisfy the original DataFusion filter.
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        _filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
+        Ok(InlinedDataScan::from_batches(self.get_inlined_data(
+            table_id,
+            snapshot_id,
+            columns,
+        )?))
+    }
+
     /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
     /// that are visible at `snapshot_id`.
     ///
@@ -1396,6 +1653,18 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _table_id: i64,
         _snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
+        Ok(Vec::new())
+    }
+
+    /// Read visible inlined rows together with their physical table and stable
+    /// row ids for mutation planning. Backends that only support read-only
+    /// inlined scans may keep the empty default.
+    fn get_inlined_data_with_row_ids(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+        _columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
         Ok(Vec::new())
     }
 
@@ -1579,25 +1848,86 @@ mod tests {
     }
 
     #[test]
-    fn inlined_rows_reject_unsupported_nested_encoding() {
+    fn resolve_metadata_settings_uses_per_key_scope_precedence() {
+        let rows = vec![
+            MetadataSetting {
+                key: "compression".into(),
+                value: "global".into(),
+                scope: None,
+                scope_id: None,
+            },
+            MetadataSetting {
+                key: "rows".into(),
+                value: "global-rows".into(),
+                scope: None,
+                scope_id: None,
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "schema".into(),
+                scope: Some("schema".into()),
+                scope_id: Some(7),
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "other-schema".into(),
+                scope: Some("schema".into()),
+                scope_id: Some(8),
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "table".into(),
+                scope: Some("table".into()),
+                scope_id: Some(11),
+            },
+        ];
+
+        let settings = resolve_metadata_settings(rows, Some(7), Some(11)).unwrap();
+
+        assert_eq!(
+            settings,
+            HashMap::from([
+                ("compression".to_string(), "table".to_string()),
+                ("rows".to_string(), "global-rows".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn inlined_rows_parse_nested_encoding() {
         let columns = vec![column("items", "list<int32>")];
         let schema = Arc::new(Schema::new(vec![Field::new_list(
             "items",
             Field::new("item", DataType::Int32, true),
             true,
         )]));
-        let error = parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]])
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("inlined data for column 'items' cannot decode value '[1, 2]' as List"),
-            "unexpected error: {error}"
+        let batch =
+            parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]]).unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), 0)
+                .unwrap()
+                .to_string(),
+            "[1, 2]"
         );
-        assert!(
-            error.to_string().contains(INLINED_DATA_REMEDIATION),
-            "unexpected error: {error}"
+    }
+
+    #[test]
+    fn resolve_metadata_settings_rejects_scoped_row_without_id() {
+        let error = resolve_metadata_settings(
+            vec![MetadataSetting {
+                key: "compression".into(),
+                value: "zstd".into(),
+                scope: Some("table".into()),
+                scope_id: None,
+            }],
+            Some(7),
+            Some(11),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: ducklake_metadata table setting 'compression' has no scope_id"
         );
     }
 

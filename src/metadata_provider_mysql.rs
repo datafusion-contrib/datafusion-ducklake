@@ -1,15 +1,20 @@
 //! MySQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::inlined_filter::{
+    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics,
-    FileWithTable, InlinedDataBackend, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES,
-    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
-    inlined_text_projection, is_inlined_data_table, parse_inlined_rows, reconstruct_columns,
-    reconstruct_columns_with_table,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
+    FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
+    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
+    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -55,6 +60,7 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
                 file_size_bytes: row.try_get(11)?,
                 footer_size: row.try_get(12)?,
                 encryption_key: row.try_get(13)?,
+                mapping_id: None,
             }),
             row.try_get(14)?,
         )
@@ -69,6 +75,7 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
             file_size_bytes: row.try_get(3)?,
             footer_size: row.try_get(4)?,
             encryption_key: row.try_get(5)?,
+            mapping_id: row.try_get(15).unwrap_or(None),
         },
         delete_file_id,
         delete_file,
@@ -206,22 +213,60 @@ impl MetadataProvider for MySqlMetadataProvider {
     }
 
     fn get_data_path(&self) -> Result<String> {
-        block_on(async {
-            let row = sqlx::query(
-                "SELECT value FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL",
-            )
-            .bind("data_path")
-            .fetch_optional(&self.pool)
-            .await?;
-
-            match row {
-                Some(r) => Ok(r.try_get(0)?),
-                None => Err(crate::error::DuckLakeError::InvalidConfig(
+        self.get_metadata_settings(None, None)?
+            .remove("data_path")
+            .ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(
                     "Missing required catalog metadata: 'data_path' not configured. \
                      The catalog may be uninitialized or corrupted."
                         .to_string(),
-                )),
-            }
+                )
+            })
+    }
+
+    fn get_metadata_settings(
+        &self,
+        schema_id: Option<i64>,
+        table_id: Option<i64>,
+    ) -> Result<HashMap<String, String>> {
+        block_on(async {
+            let has_scope_id: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = 'ducklake_metadata' \
+                 AND column_name = 'scope_id'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let rows = if has_scope_id > 0 {
+                sqlx::query("SELECT `key`, value, scope, scope_id FROM ducklake_metadata")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: row.try_get(2)?,
+                            scope_id: row.try_get(3)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                sqlx::query("SELECT `key`, value FROM ducklake_metadata WHERE scope IS NULL")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: None,
+                            scope_id: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            resolve_metadata_settings(rows, schema_id, table_id)
         })
     }
 
@@ -329,20 +374,12 @@ impl MetadataProvider for MySqlMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableColumn>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
-                        initial_default, default_value, default_value_type, default_value_dialect
-                 FROM ducklake_column
-                 WHERE table_id = ?
-                   AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)
-                 ORDER BY column_order",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+            let rows = sqlx::query(SQL_GET_TABLE_COLUMNS)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             let raw: Result<Vec<(DuckLakeTableColumn, Option<i64>)>> = rows
                 .into_iter()
@@ -370,6 +407,76 @@ impl MetadataProvider for MySqlMetadataProvider {
         })
     }
 
+    fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+                 FROM ducklake_column
+                 WHERE table_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeTableField {
+                        column_id: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        column_type: row.try_get(2)?,
+                        is_nullable: row.try_get::<Option<bool>, _>(3)?.unwrap_or(true),
+                        parent_column: row.try_get(4)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT mapping.mapping_id, mapping.table_id, mapping.type,
+                        name.column_id, name.source_name, name.target_field_id,
+                        name.parent_column, name.is_partition
+                 FROM ducklake_column_mapping AS mapping
+                 LEFT JOIN ducklake_name_mapping AS name
+                   ON name.mapping_id = mapping.mapping_id
+                 WHERE mapping.mapping_id = ?
+                 ORDER BY name.parent_column IS NOT NULL, name.parent_column, name.column_id",
+            )
+            .bind(mapping_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let first = rows.first().ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "DuckLake name mapping {mapping_id} does not exist"
+                ))
+            })?;
+            let mut entries = Vec::new();
+            for row in &rows {
+                if let Some(column_id) = row.try_get::<Option<i64>, _>(3)? {
+                    entries.push(DuckLakeNameMappingEntry {
+                        column_id,
+                        source_name: row.try_get(4)?,
+                        target_field_id: row.try_get(5)?,
+                        parent_column: row.try_get(6)?,
+                        is_partition: row.try_get::<Option<bool>, _>(7)?.unwrap_or(false),
+                    });
+                }
+            }
+            Ok(DuckLakeNameMapping {
+                mapping_id: first.try_get(0)?,
+                table_id: first.try_get(1)?,
+                mapping_type: first.try_get(2)?,
+                entries,
+            })
+        })
+    }
+
     fn get_table_files_for_select(
         &self,
         table_id: i64,
@@ -392,7 +499,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.mapping_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -511,7 +619,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                         data.row_id_start, data.record_count,
                         del.delete_file_id, del.path, del.path_is_relative,
                         del.file_size_bytes, del.footer_size, del.encryption_key,
-                        del.delete_count
+                        del.delete_count,
+                        data.mapping_id
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -851,9 +960,21 @@ impl MetadataProvider for MySqlMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
         block_on(async {
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
+                return Ok(InlinedDataScan::default());
             }
             let registry = sqlx::query(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
@@ -865,6 +986,120 @@ impl MetadataProvider for MySqlMetadataProvider {
             let mut batches = Vec::new();
 
             for entry in registry {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
+                let physical_columns = sqlx::query(
+                    "SELECT column_name, column_type FROM information_schema.columns
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?;
+                let present = physical_columns
+                    .iter()
+                    .map(|row| row.try_get::<String, _>(0))
+                    .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let physical_types = physical_columns
+                    .iter()
+                    .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+                    .collect::<std::result::Result<HashMap<_, _>, sqlx::Error>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::MySql,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rendered = filter.and_then(|filter| {
+                    render_inlined_filter(
+                        filter,
+                        InlinedSqlDialect::MySql,
+                        schema.as_ref(),
+                        &physical_types,
+                        2,
+                    )
+                });
+                let pushed = rendered
+                    .as_ref()
+                    .map(|rendered| format!(" AND ({})", rendered.sql))
+                    .unwrap_or_default();
+                let sql = format!(
+                    "SELECT {projected} FROM {} \
+                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL){pushed} \
+                 ORDER BY row_id",
+                    quote_ident(&table)
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id);
+                if let Some(rendered) = rendered {
+                    for bind in rendered.binds {
+                        query = match bind {
+                            InlinedSqlBind::Bool(value) => query.bind(value),
+                            InlinedSqlBind::I64(value) => query.bind(value),
+                            InlinedSqlBind::U64(value) => query.bind(value),
+                            InlinedSqlBind::F64(value) => query.bind(value),
+                            InlinedSqlBind::Text(value) => query.bind(value),
+                            InlinedSqlBind::Bytes(value) => query.bind(value),
+                        };
+                    }
+                }
+                let rows = query.fetch_all(&self.pool).await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(parse_inlined_rows_with_present(
+                    schema.clone(),
+                    columns,
+                    rows,
+                    Some(&present),
+                )?);
+            }
+            Ok(InlinedDataScan::from_batches(batches))
+        })
+    }
+
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let entries = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in entries {
                 let table: String = entry.try_get("table_name")?;
                 if !is_inlined_data_table(&table) {
                     continue;
@@ -898,9 +1133,9 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT {projected} FROM {} \
-                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
-                     ORDER BY row_id",
+                    "SELECT row_id, begin_snapshot, {projected} FROM {}
+                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)
+                     ORDER BY begin_snapshot, row_id",
                     quote_ident(&table)
                 );
                 let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
@@ -911,15 +1146,33 @@ impl MetadataProvider for MySqlMetadataProvider {
                 if rows.is_empty() {
                     continue;
                 }
-                let rows = rows
-                    .into_iter()
+                let row_ids = rows
+                    .iter()
+                    .map(|row| row.try_get("row_id"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let begin_snapshots = rows
+                    .iter()
+                    .map(|row| row.try_get("begin_snapshot"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let values = rows
+                    .iter()
                     .map(|row| {
                         (0..columns.len())
-                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .map(|index| row.try_get::<Option<String>, _>(index + 2))
                             .collect::<std::result::Result<Vec<_>, _>>()
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                batches.push(parse_inlined_rows(schema.clone(), columns, rows)?);
+                batches.push(DuckLakeInlinedData {
+                    table_name: table,
+                    row_ids,
+                    begin_snapshots,
+                    batch: parse_inlined_rows_with_present(
+                        schema.clone(),
+                        columns,
+                        values,
+                        Some(&present),
+                    )?,
+                });
             }
             Ok(batches)
         })
@@ -1258,6 +1511,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         file_size_bytes: row.try_get(5)?,
                         footer_size: row.try_get(6)?,
                         encryption_key: row.try_get(7)?,
+                        mapping_id: None,
                     };
 
                     let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
@@ -1267,6 +1521,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                             file_size_bytes: row.try_get(11)?,
                             footer_size: row.try_get(12)?,
                             encryption_key: row.try_get(13)?,
+                            mapping_id: None,
                         })
                     } else {
                         None

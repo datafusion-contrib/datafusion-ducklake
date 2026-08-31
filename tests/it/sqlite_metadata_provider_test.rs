@@ -41,6 +41,28 @@ async fn init_schema(pool: &SqlitePool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+            mapping_id INTEGER PRIMARY KEY,
+            table_id INTEGER NOT NULL,
+            type TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+            mapping_id INTEGER NOT NULL,
+            column_id INTEGER NOT NULL,
+            source_name TEXT NOT NULL,
+            target_field_id INTEGER NOT NULL,
+            parent_column INTEGER,
+            is_partition INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_schema (
             schema_id INTEGER PRIMARY KEY,
             schema_name TEXT NOT NULL,
@@ -799,6 +821,44 @@ async fn test_get_table_structure() {
     assert_eq!(columns[2].column_name, "email");
     assert_eq!(columns[2].column_type, "varchar");
     assert!(columns[2].is_nullable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_name_mapping() -> anyhow::Result<()> {
+    let provider = create_sqlite_provider().await?;
+    populate_test_data(&provider).await?;
+    sqlx::query(
+        "INSERT INTO ducklake_column_mapping(mapping_id, table_id, type)
+         VALUES (7, 1, 'map_by_name')",
+    )
+    .execute(&provider.pool)
+    .await?;
+    sqlx::query("UPDATE ducklake_data_file SET mapping_id = 7 WHERE table_id = 1")
+        .execute(&provider.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_name_mapping(
+            mapping_id, column_id, source_name, target_field_id, parent_column, is_partition
+         ) VALUES
+            (7, 1, 'nested', 3, NULL, 0),
+            (7, 2, 'child', 4, 1, 0),
+            (7, 3, 'part', 5, NULL, 1)",
+    )
+    .execute(&provider.pool)
+    .await?;
+
+    let mapping = provider.get_name_mapping(7)?;
+    assert_eq!(mapping.mapping_id, 7);
+    assert_eq!(mapping.table_id, 1);
+    assert_eq!(mapping.mapping_type, "map_by_name");
+    assert_eq!(mapping.entries.len(), 3);
+    assert_eq!(mapping.entries[1].parent_column, None);
+    assert!(mapping.entries[1].is_partition);
+    assert_eq!(mapping.entries[2].parent_column, Some(1));
+    let files = provider.get_table_files_for_select(1, 2)?;
+    assert!(!files.is_empty());
+    assert!(files.iter().all(|file| file.file.mapping_id == Some(7)));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

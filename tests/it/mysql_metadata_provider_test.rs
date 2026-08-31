@@ -43,6 +43,28 @@ async fn init_schema(pool: &MySqlPool) -> anyhow::Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_column_mapping (
+            mapping_id BIGINT PRIMARY KEY,
+            table_id BIGINT NOT NULL,
+            type VARCHAR(255) NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ducklake_name_mapping (
+            mapping_id BIGINT NOT NULL,
+            column_id BIGINT NOT NULL,
+            source_name TEXT NOT NULL,
+            target_field_id BIGINT NOT NULL,
+            parent_column BIGINT,
+            is_partition BOOLEAN NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "CREATE TABLE IF NOT EXISTS ducklake_schema (
             schema_id BIGINT PRIMARY KEY,
             schema_name VARCHAR(255) NOT NULL,
@@ -810,6 +832,36 @@ async fn test_get_table_structure() {
 
     assert_eq!(columns[2].column_name, "email");
     assert_eq!(columns[2].column_type, "varchar");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_name_mapping() -> anyhow::Result<()> {
+    let (provider, _container) = create_mysql_provider().await?;
+    sqlx::query(
+        "INSERT INTO ducklake_column_mapping(mapping_id, table_id, type)
+         VALUES (7, 1, 'map_by_name')",
+    )
+    .execute(&provider.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_name_mapping(
+            mapping_id, column_id, source_name, target_field_id, parent_column, is_partition
+         ) VALUES
+            (7, 1, 'nested', 3, NULL, false),
+            (7, 2, 'child', 4, 1, false),
+            (7, 3, 'part', 5, NULL, true)",
+    )
+    .execute(&provider.pool)
+    .await?;
+
+    let mapping = provider.get_name_mapping(7)?;
+    assert_eq!(mapping.mapping_id, 7);
+    assert_eq!(mapping.table_id, 1);
+    assert_eq!(mapping.mapping_type, "map_by_name");
+    assert_eq!(mapping.entries.len(), 3);
+    assert!(mapping.entries[1].is_partition);
+    assert_eq!(mapping.entries[2].parent_column, Some(1));
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -234,6 +234,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
             let table_writer = DuckLakeTableWriter::new(writer, object_store)
+                .map(|writer| writer.with_options(table.write_options()))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Rewrite each source file's matching rows and author its cumulative
