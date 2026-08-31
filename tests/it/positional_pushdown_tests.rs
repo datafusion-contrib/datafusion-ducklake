@@ -29,7 +29,7 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter,
+    SqliteMetadataWriter, register_ducklake_functions,
 };
 
 /// Rows per file: enough to span several parquet row groups once the writer's
@@ -73,6 +73,11 @@ async fn ctx_for(temp: &TempDir, lineage: bool, writable: bool) -> SessionContex
     .with_row_lineage(lineage);
     let ctx = split_ctx();
     ctx.register_catalog("ducklake", Arc::new(catalog));
+    // The table functions need their own handle on the catalog metadata.
+    register_ducklake_functions(
+        &ctx,
+        Arc::new(SqliteMetadataProvider::new(&conn).await.unwrap()),
+    );
     ctx
 }
 
@@ -642,4 +647,60 @@ async fn delete_after_a_column_rename_removes_the_right_rows() {
         .await,
         0
     );
+}
+
+/// The internal position column must never reach a user-visible schema — not
+/// through `SELECT *`, not through the CDC feeds, not through
+/// `information_schema`. It is an implementation detail of one scan, and
+/// official DuckLake has no such column in any of its outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_internal_position_column_never_reaches_a_user_visible_schema() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id < 5")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = ctx_for(&temp, true, false).await;
+    let mut checked = 0;
+    for sql in [
+        "SELECT * FROM ducklake.main.t LIMIT 1",
+        "SELECT * FROM ducklake_table_changes('main.t', 1, 3) LIMIT 1",
+        "SELECT * FROM ducklake_table_deletions('main.t', 1, 3) LIMIT 1",
+        "SELECT * FROM ducklake_table_insertions('main.t', 1, 3) LIMIT 1",
+        "SELECT * FROM ducklake.information_schema.columns",
+    ] {
+        let df = ctx
+            .sql(sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must be queryable: {e}"));
+        checked += 1;
+        let names: Vec<String> = df
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("__ducklake_row_pos")),
+            "internal position column leaked into `{sql}`: {names:?}"
+        );
+
+        // And it must not appear as a *value* either, e.g. via a column listing.
+        for batch in df.collect().await.unwrap() {
+            let rendered =
+                datafusion::arrow::util::pretty::pretty_format_batches(&[batch]).unwrap();
+            assert!(
+                !rendered.to_string().contains("__ducklake_row_pos"),
+                "internal position column leaked into the rows of `{sql}`"
+            );
+        }
+    }
+    assert_eq!(checked, 5, "every surface must actually have been queried");
 }

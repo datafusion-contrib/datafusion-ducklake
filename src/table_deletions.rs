@@ -45,7 +45,7 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, collect,
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties, collect,
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
@@ -752,8 +752,21 @@ async fn deleted_rows_stream(
     }
 
     // 3. Stream the data file and keep the rows whose PHYSICAL position is in
-    //    the deleted set. The positional scan is a single partition covering
-    //    the whole file, so no row can end up out of reach of the position set.
+    //    the deleted set.
+    //
+    //    Only partition 0 is executed, so the scan MUST have exactly one: this
+    //    exec has no DataFusion children (see the module docs), so nothing
+    //    repartitions it, and it is built from a single `FileGroup`. If that
+    //    ever stops holding, every row in the other partitions would be
+    //    silently dropped — a deletion feed that quietly omits deletions — so
+    //    refuse rather than under-report.
+    let partitions = unit.data_file_scan.output_partitioning().partition_count();
+    if partitions != 1 {
+        return Err(DataFusionError::Internal(format!(
+            "deletions data-file scan must be a single partition covering the whole \
+             file, found {partitions}"
+        )));
+    }
     let data_stream = unit.data_file_scan.execute(0, context)?;
     Ok(data_stream
         .try_filter_map(move |batch| {

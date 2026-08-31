@@ -187,3 +187,68 @@ async fn rust_added_default_fills_old_and_omitted_rows() -> Result<()> {
     );
     Ok(())
 }
+
+/// A rowid-projected scan is a *positional* path, and since positional paths
+/// gained filter pushdown a predicate on a column the file predates now reaches
+/// the parquet reader. There is no such column in the file, so the expression
+/// adapter substitutes the DuckLake `initial_default` before pruning — the same
+/// value the read path materializes. Getting that wrong prunes away rows that
+/// do match.
+///
+/// The catalog here is written by **official DuckDB DuckLake**, so this is also
+/// a differential check: our read of an official catalog must agree with what
+/// official itself returns.
+#[tokio::test]
+async fn positional_scan_pushes_a_predicate_on_a_defaulted_column() -> Result<()> {
+    let temp = TempDir::new()?;
+    let catalog_path = temp.path().join("column_defaults.ducklake");
+    // items(id) rows 1,2 predate `priority INTEGER DEFAULT 7`; row 3 follows it.
+    let official_rows = create_official_default_catalog(&catalog_path)?;
+    assert_eq!(official_rows, vec![(1, 7), (2, 7), (3, 7)]);
+
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy())?;
+    let catalog = DuckLakeCatalog::new(provider)?.with_row_lineage(true);
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+
+    let ids_for = |sql: &'static str| {
+        let context = context.clone();
+        async move {
+            let batches = context.sql(sql).await?.collect().await?;
+            let mut ids: Vec<i32> = Vec::new();
+            for batch in &batches {
+                let column = batch
+                    .column(batch.schema().index_of("id")?)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .clone();
+                ids.extend((0..batch.num_rows()).map(|i| column.value(i)));
+            }
+            ids.sort_unstable();
+            anyhow::Ok(ids)
+        }
+    };
+
+    // Matches the default: every row qualifies, including the two in the file
+    // written before the column existed.
+    assert_eq!(
+        ids_for("SELECT rowid, id FROM ducklake.main.items WHERE priority = 7").await?,
+        vec![1, 2, 3],
+        "rows in a file predating the column must match its default"
+    );
+
+    // Does not match: pruning the old file away is correct here, and is exactly
+    // what a pushed `7 = 9` lets the reader do.
+    assert_eq!(
+        ids_for("SELECT rowid, id FROM ducklake.main.items WHERE priority = 9").await?,
+        Vec::<i32>::new()
+    );
+
+    // NULL semantics are unaffected.
+    assert_eq!(
+        ids_for("SELECT rowid, id FROM ducklake.main.items WHERE priority IS NULL").await?,
+        Vec::<i32>::new()
+    );
+    Ok(())
+}
