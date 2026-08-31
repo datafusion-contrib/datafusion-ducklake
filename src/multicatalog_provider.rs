@@ -14,10 +14,11 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics, DuckLakeTableColumn,
-    DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable,
-    MetadataProvider, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, ViewWithSchema, block_on, reconstruct_columns, reconstruct_columns_with_table,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping, DuckLakeNameMappingEntry,
+    DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
+    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
+    reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -55,6 +56,7 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
                 file_size_bytes: row.try_get(11)?,
                 footer_size: row.try_get(12)?,
                 encryption_key: row.try_get(13)?,
+                mapping_id: None,
             }),
             row.try_get(14)?,
         )
@@ -69,6 +71,7 @@ fn decode_table_file(row: &PgRow, snapshot_id: i64) -> Result<DuckLakeTableFile>
             file_size_bytes: row.try_get(3)?,
             footer_size: row.try_get(4)?,
             encryption_key: row.try_get(5)?,
+            mapping_id: row.try_get(19).unwrap_or(None),
         },
         delete_file_id,
         delete_file,
@@ -424,6 +427,76 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
+    fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+                 FROM ducklake_column
+                 WHERE table_id = $1
+                   AND $2 >= begin_snapshot
+                   AND ($3 < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeTableField {
+                        column_id: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        column_type: row.try_get(2)?,
+                        is_nullable: row.try_get::<Option<bool>, _>(3)?.unwrap_or(true),
+                        parent_column: row.try_get(4)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT mapping.mapping_id, mapping.table_id, mapping.type,
+                        name.column_id, name.source_name, name.target_field_id,
+                        name.parent_column, name.is_partition
+                 FROM ducklake_column_mapping AS mapping
+                 JOIN ducklake_name_mapping AS name
+                   ON name.mapping_id = mapping.mapping_id
+                 WHERE mapping.mapping_id = $1
+                 ORDER BY name.parent_column NULLS FIRST, name.column_id",
+            )
+            .bind(mapping_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let first = rows.first().ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "DuckLake name mapping {mapping_id} does not exist"
+                ))
+            })?;
+            let mut entries = Vec::new();
+            for row in &rows {
+                if let Some(column_id) = row.try_get::<Option<i64>, _>(3)? {
+                    entries.push(DuckLakeNameMappingEntry {
+                        column_id,
+                        source_name: row.try_get(4)?,
+                        target_field_id: row.try_get(5)?,
+                        parent_column: row.try_get(6)?,
+                        is_partition: row.try_get::<Option<bool>, _>(7)?.unwrap_or(false),
+                    });
+                }
+            }
+            Ok(DuckLakeNameMapping {
+                mapping_id: first.try_get(0)?,
+                table_id: first.try_get(1)?,
+                mapping_type: first.try_get(2)?,
+                entries,
+            })
+        })
+    }
+
     fn get_table_files_for_select(
         &self,
         table_id: i64,
@@ -480,7 +553,8 @@ impl MetadataProvider for MulticatalogProvider {
                     data.begin_snapshot::bigint AS data_begin_snapshot,
                     {partial_max_expr} AS data_partial_max,
                     {schema_version_expr} AS data_schema_version,
-                    {partition_id_expr} AS data_partition_id
+                    {partition_id_expr} AS data_partition_id,
+                    data.mapping_id::bigint AS data_mapping_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -679,7 +753,9 @@ impl MetadataProvider for MulticatalogProvider {
                         del.delete_file_id, del.path, del.path_is_relative,
                         del.file_size_bytes, del.footer_size, del.encryption_key,
                         del.delete_count, data.begin_snapshot::bigint,
-                        {partial_max_expr}, {schema_version_expr}
+                        {partial_max_expr}, {schema_version_expr},
+                        NULL::bigint AS data_partition_id,
+                        data.mapping_id::bigint
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -1338,6 +1414,7 @@ impl MetadataProvider for MulticatalogProvider {
                         file_size_bytes: row.try_get(5)?,
                         footer_size: row.try_get(6)?,
                         encryption_key: row.try_get(7)?,
+                        mapping_id: None,
                     };
                     let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
                         Some(DuckLakeFileData {
@@ -1346,6 +1423,7 @@ impl MetadataProvider for MulticatalogProvider {
                             file_size_bytes: row.try_get(11)?,
                             footer_size: row.try_get(12)?,
                             encryption_key: row.try_get(13)?,
+                            mapping_id: None,
                         })
                     } else {
                         None
@@ -1399,7 +1477,8 @@ impl MetadataProvider for MulticatalogProvider {
                     data.footer_size,
                     data.encryption_key,
                     data.row_id_start,
-                    {pm}
+                    {pm},
+                    data.mapping_id
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = $1
                   AND data.begin_snapshot <= $3
@@ -1424,6 +1503,7 @@ impl MetadataProvider for MulticatalogProvider {
                         encryption_key: row.try_get(5)?,
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
+                        mapping_id: row.try_get(8)?,
                     })
                 })
                 .collect()

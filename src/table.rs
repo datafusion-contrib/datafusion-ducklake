@@ -7,20 +7,22 @@ use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
-    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile,
-    FILE_METADATA_BATCH_SIZE, MetadataProvider,
+    DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
+    DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
+    DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
 use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::row_id::{
     ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, SNAPSHOT_ID_PARQUET_FIELD_ID,
-    positional_table_schema, rowid_field,
+    positional_table_schema, positional_table_schema_reserving, rowid_field,
 };
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::types::{
-    DuckLakeDefaultExprAdapterFactory, build_arrow_schema, build_read_schema_with_field_id_mapping,
+    DuckLakeDefaultExprAdapterFactory, INITIAL_DEFAULT_METADATA_KEY,
+    build_arrow_schema_from_fields, build_read_schema_with_field_id_mapping,
+    build_read_schema_with_field_id_mapping_from_schema, build_read_schema_with_name_mapping,
     ducklake_to_arrow_type, extract_parquet_field_ids, parse_ducklake_default_scalar,
     parse_ducklake_scalar,
 };
@@ -74,6 +76,7 @@ use parquet::arrow::ParquetRecordBatchStreamBuilder;
 // See https://github.com/apache/arrow-rs/issues/10308.
 #[allow(deprecated)]
 use parquet::arrow::async_reader::ParquetObjectReader;
+use percent_encoding::percent_decode_str;
 
 #[cfg(feature = "encryption")]
 use datafusion::execution::parquet_encryption::EncryptionFactory;
@@ -295,6 +298,37 @@ fn validate_column_defaults(columns: &[DuckLakeTableColumn]) -> Result<HashMap<S
         }
     }
     Ok(defaults)
+}
+
+pub(crate) fn apply_initial_default_metadata(
+    schema: &Schema,
+    columns: &[DuckLakeTableColumn],
+    name_mapping: &HashMap<String, String>,
+) -> Schema {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let logical_name = name_mapping
+                .get(field.name())
+                .map_or(field.name().as_str(), String::as_str);
+            let Some(initial_default) = columns
+                .iter()
+                .find(|column| column.column_name == logical_name)
+                .and_then(|column| column.initial_default.as_deref())
+                .filter(|value| !value.eq_ignore_ascii_case("NULL"))
+            else {
+                return Arc::clone(field);
+            };
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                INITIAL_DEFAULT_METADATA_KEY.to_string(),
+                initial_default.to_string(),
+            );
+            Arc::new(field.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Vec<_>>();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
 }
 
 /// Whether a stored float `min_value` / `max_value` is a usable bound.
@@ -697,8 +731,12 @@ pub fn delete_file_schema() -> SchemaRef {
     ]))
 }
 
-/// Cached schema mapping for renamed columns
-type SchemaMapping = (SchemaRef, HashMap<String, String>);
+/// Cached schema mapping for renamed and path-derived columns.
+type SchemaMapping = (
+    SchemaRef,
+    HashMap<String, String>,
+    HashMap<String, ScalarValue>,
+);
 
 /// Per-file read configuration computed for the row-lineage scan path.
 ///
@@ -732,6 +770,8 @@ struct FileReadConfig {
     /// [`DuckLakeTable::predicate_is_prunable`], which rejects only a predicate
     /// that actually references one of these.
     renamed_column_indices: Arc<HashSet<usize>>,
+    /// Logical column name -> value synthesized from this file's Hive path.
+    constants: HashMap<String, ScalarValue>,
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
@@ -779,6 +819,8 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) read_schema: SchemaRef,
     /// `physical name → catalog name`, for the columns whose names differ.
     pub(crate) name_mapping: HashMap<String, String>,
+    /// Logical column values synthesized from Hive path segments.
+    pub(crate) constants: HashMap<String, ScalarValue>,
     /// `Some(parquet_column_name)` if the file embeds the rowid column (tagged
     /// with [`ROW_ID_PARQUET_FIELD_ID`]).
     pub(crate) embedded_rowid_parquet_name: Option<String>,
@@ -898,11 +940,61 @@ pub(crate) async fn read_parquet_file_layout(
     Ok(Arc::new(ParquetFileLayout {
         read_schema,
         name_mapping,
+        constants: HashMap::new(),
         embedded_rowid_parquet_name: facts.field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
         embedded_snapshot_parquet_name: facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
         drops_current_columns,
         row_group_count: facts.row_group_count,
     }))
+}
+
+pub(crate) fn apply_name_mapping_to_layout(
+    provider: &dyn MetadataProvider,
+    table_id: i64,
+    snapshot_id: i64,
+    columns: &[DuckLakeTableColumn],
+    resolved_path: &str,
+    mapping_id: Option<i64>,
+    layout: Arc<ParquetFileLayout>,
+) -> DataFusionResult<Arc<ParquetFileLayout>> {
+    let Some(mapping_id) = mapping_id else {
+        return Ok(layout);
+    };
+    let mapping = provider
+        .get_name_mapping(mapping_id)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    if mapping.table_id != table_id {
+        return Err(DataFusionError::Execution(format!(
+            "DuckLake name mapping {mapping_id} belongs to table {}, not table {table_id}",
+            mapping.table_id
+        )));
+    }
+    let fields = provider
+        .get_table_fields(table_id, snapshot_id)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let mapped = build_read_schema_with_name_mapping(&fields, &mapping)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let constants = mapped
+        .partitions
+        .into_iter()
+        .map(|partition| {
+            DuckLakeTable::hive_partition_value(
+                resolved_path,
+                &partition.source_name,
+                &partition.data_type,
+            )
+            .map(|value| (partition.logical_name, value))
+        })
+        .collect::<DataFusionResult<HashMap<_, _>>>()?;
+    let mut layout = layout.as_ref().clone();
+    layout.read_schema = Arc::new(apply_initial_default_metadata(
+        &mapped.schema,
+        columns,
+        &mapped.names,
+    ));
+    layout.name_mapping = mapped.names;
+    layout.constants = constants;
+    Ok(Arc::new(layout))
 }
 
 /// DuckLake table provider
@@ -942,6 +1034,10 @@ pub struct DuckLakeTable {
     columns: Vec<DuckLakeTableColumn>,
     /// Literal defaults used by DataFusion when an INSERT omits a column
     column_defaults: HashMap<String, Expr>,
+    /// Complete nested `ducklake_column` tree used by name mappings.
+    fields: Vec<DuckLakeTableField>,
+    /// Immutable name mappings cached by `mapping_id` across scans and clones.
+    name_mapping_cache: Arc<std::sync::Mutex<HashMap<i64, Arc<DuckLakeNameMapping>>>>,
     /// Table-level statistics for the physical schema.
     table_statistics: Statistics,
     /// The table's active partition spec at `snapshot_id`, if any. Loaded once at
@@ -995,12 +1091,17 @@ impl DuckLakeTable {
     ) -> Result<Self> {
         // File metadata is deliberately deferred until scan(), where it can be
         // consumed and pruned in bounded pages.
+        let fields = provider.get_table_fields(table_id, snapshot_id)?;
         let columns = provider.get_table_structure(table_id, snapshot_id)?;
         let column_defaults = validate_column_defaults(&columns)?;
         // Active partition spec (if any) for pruning. Loaded once at the bound
         // snapshot; `None` for unpartitioned tables or catalogs without partitions.
         let partition_spec = provider.get_partition_spec(table_id, snapshot_id)?;
-        let physical_schema = Arc::new(build_arrow_schema(&columns)?);
+        let physical_schema = Arc::new(apply_initial_default_metadata(
+            &build_arrow_schema_from_fields(&fields)?,
+            &columns,
+            &HashMap::new(),
+        ));
         let schema = physical_schema.clone();
         let catalog_statistics = provider.get_table_summary_statistics(table_id, snapshot_id)?;
         // `ducklake_table_stats` and `ducklake_table_column_stats` describe the
@@ -1032,6 +1133,8 @@ impl DuckLakeTable {
             row_lineage: false,
             columns,
             column_defaults,
+            fields,
+            name_mapping_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             table_statistics,
             partition_spec,
             #[cfg(feature = "encryption")]
@@ -1222,6 +1325,215 @@ impl DuckLakeTable {
     fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn hive_partition_raw_value<'a>(resolved_path: &'a str, source_name: &str) -> Option<&'a str> {
+        // Match DuckDB v1.5.5 HivePartitioning::Parse: scan the raw object key,
+        // compare raw keys, and leave URL decoding to the value conversion
+        // https://github.com/duckdb/duckdb/blob/v1.5.5/src/common/hive_partitioning.cpp
+        let mut partition_start = 0;
+        let mut equality_sign = 0;
+        let mut candidate_partition = true;
+        for (index, byte) in resolved_path.bytes().enumerate() {
+            if matches!(byte, b'?' | b'\n') {
+                candidate_partition = false;
+            }
+            if matches!(byte, b'/' | b'\\') {
+                if candidate_partition && equality_sign > partition_start {
+                    let key = &resolved_path[partition_start..equality_sign];
+                    if key == source_name {
+                        return Some(&resolved_path[equality_sign + 1..index]);
+                    }
+                }
+                partition_start = index + 1;
+                candidate_partition = true;
+            } else if byte == b'=' {
+                if equality_sign > partition_start {
+                    candidate_partition = false;
+                }
+                equality_sign = index;
+            }
+        }
+        None
+    }
+
+    fn normalize_hive_hex_integer(value: &str, data_type: &DataType) -> Option<String> {
+        if !matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        ) {
+            return None;
+        }
+        let digits = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))?;
+        if digits.is_empty()
+            || digits
+                .split('_')
+                .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return None;
+        }
+        let digits = digits.replace('_', "");
+        u128::from_str_radix(&digits, 16)
+            .ok()
+            .map(|value| value.to_string())
+    }
+
+    fn normalize_hive_exponent_decimal(value: &str, data_type: &DataType) -> Option<String> {
+        let (precision, scale) = match data_type {
+            DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+                (*precision, *scale)
+            },
+            _ => return None,
+        };
+        let exponent_index = value.find(['e', 'E'])?;
+        if value[exponent_index + 1..].contains(['e', 'E']) {
+            return None;
+        }
+        let exponent = value[exponent_index + 1..].parse::<i32>().ok()?;
+        let mantissa = &value[..exponent_index];
+        let (negative, mantissa) = if let Some(mantissa) = mantissa.strip_prefix('-') {
+            (true, mantissa)
+        } else if let Some(mantissa) = mantissa.strip_prefix('+') {
+            (false, mantissa)
+        } else {
+            (false, mantissa)
+        };
+        let mut components = mantissa.split('.');
+        let whole = components.next()?;
+        let fraction = components.next().unwrap_or_default();
+        if components.next().is_some()
+            || (whole.is_empty() && fraction.is_empty())
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let digits = format!("{whole}{fraction}");
+        let decimal_index = i64::try_from(whole.len()).ok()? + i64::from(exponent);
+        let max_expansion = usize::from(precision)
+            .saturating_add(usize::from(scale.unsigned_abs()))
+            .saturating_add(digits.len())
+            .saturating_add(2);
+        let leading_zeros = usize::try_from((-decimal_index).max(0)).ok()?;
+        let trailing_zeros =
+            usize::try_from((decimal_index - i64::try_from(digits.len()).ok()?).max(0)).ok()?;
+        if leading_zeros > max_expansion || trailing_zeros > max_expansion {
+            return None;
+        }
+
+        let mut normalized = String::with_capacity(digits.len() + max_expansion.min(32));
+        if negative {
+            normalized.push('-');
+        }
+        if decimal_index <= 0 {
+            normalized.push_str("0.");
+            normalized.extend(std::iter::repeat_n('0', leading_zeros));
+            normalized.push_str(&digits);
+        } else if usize::try_from(decimal_index).ok()? >= digits.len() {
+            normalized.push_str(&digits);
+            normalized.extend(std::iter::repeat_n('0', trailing_zeros));
+        } else {
+            let decimal_index = usize::try_from(decimal_index).ok()?;
+            normalized.push_str(&digits[..decimal_index]);
+            normalized.push('.');
+            normalized.push_str(&digits[decimal_index..]);
+        }
+        Some(normalized)
+    }
+
+    pub(crate) fn hive_partition_value(
+        resolved_path: &str,
+        source_name: &str,
+        data_type: &DataType,
+    ) -> DataFusionResult<ScalarValue> {
+        let raw_value = Self::hive_partition_raw_value(resolved_path, source_name).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "column '{source_name}' uses a DuckLake Hive name mapping but is absent from file path '{resolved_path}'"
+            ))
+        })?;
+        let value = percent_decode_str(raw_value).decode_utf8().map_err(|e| {
+            DataFusionError::Execution(format!(
+                "invalid percent encoding in Hive partition value '{raw_value}': {e}"
+            ))
+        })?;
+        let value = value.into_owned();
+        let is_varchar = matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        if value == "__HIVE_DEFAULT_PARTITION__"
+            || value.eq_ignore_ascii_case("NULL")
+            || (value.is_empty() && !is_varchar)
+        {
+            return ScalarValue::try_from(data_type);
+        }
+        let scalar_input = Self::normalize_hive_hex_integer(&value, data_type)
+            .or_else(|| Self::normalize_hive_exponent_decimal(&value, data_type))
+            .unwrap_or_else(|| value.clone());
+        ScalarValue::try_from_string(scalar_input, data_type).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to parse Hive partition '{source_name}={value}' as {data_type}: {e}"
+            ))
+        })
+    }
+
+    fn mapped_schema(
+        &self,
+        mapping_id: i64,
+        resolved_path: &str,
+    ) -> DataFusionResult<SchemaMapping> {
+        let mapping = {
+            let cached = self.name_mapping_cache.lock().unwrap();
+            cached.get(&mapping_id).cloned()
+        };
+        let mapping = match mapping {
+            Some(mapping) => mapping,
+            None => {
+                let mapping = Arc::new(
+                    self.provider
+                        .get_name_mapping(mapping_id)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+                );
+                self.name_mapping_cache
+                    .lock()
+                    .unwrap()
+                    .insert(mapping_id, Arc::clone(&mapping));
+                mapping
+            },
+        };
+        if mapping.table_id != self.table_id {
+            return Err(DataFusionError::Execution(format!(
+                "DuckLake name mapping {mapping_id} belongs to table {}, not table {}",
+                mapping.table_id, self.table_id
+            )));
+        }
+        let mapped = build_read_schema_with_name_mapping(&self.fields, mapping.as_ref())
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let constants = mapped
+            .partitions
+            .into_iter()
+            .map(|partition| {
+                Self::hive_partition_value(
+                    resolved_path,
+                    &partition.source_name,
+                    &partition.data_type,
+                )
+                .map(|value| (partition.logical_name, value))
+            })
+            .collect::<DataFusionResult<HashMap<_, _>>>()?;
+        let schema = apply_initial_default_metadata(&mapped.schema, &self.columns, &mapped.names);
+        Ok((Arc::new(schema), mapped.names, constants))
     }
 
     /// Build a DataFusion file descriptor and attach the catalog's file-level
@@ -1647,19 +1959,43 @@ impl DuckLakeTable {
 
         let field_id_map = extract_parquet_field_ids(builder.metadata());
 
-        // No field_ids means external file - use current schema directly
-        if field_id_map.is_empty() {
-            return Ok((self.schema.clone(), HashMap::new()));
+        if let Some(mapping_id) = file.mapping_id {
+            return self.mapped_schema(mapping_id, &resolved_path);
         }
 
-        let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping(
+        // No field_ids means external file - use current schema directly
+        if field_id_map.is_empty() {
+            return Ok((self.schema.clone(), HashMap::new(), HashMap::new()));
+        }
+
+        let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping_from_schema(
             &self.columns,
+            self.physical_schema.as_ref(),
             &field_id_map,
             Some(builder.schema().as_ref()),
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        Ok((Arc::new(read_schema), name_mapping))
+        let read_schema =
+            apply_initial_default_metadata(&read_schema, &self.columns, &name_mapping);
+        Ok((Arc::new(read_schema), name_mapping, HashMap::new()))
+    }
+
+    fn present_file_read_config(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        file_cfg: &FileReadConfig,
+        physical_len: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let mut output_fields: Vec<Arc<Field>> =
+            self.physical_schema.fields().iter().cloned().collect();
+        output_fields.extend(plan.schema().fields().iter().skip(physical_len).cloned());
+        Arc::new(ColumnRenameExec::new_with_constants(
+            plan,
+            Arc::new(Schema::new(output_fields)),
+            file_cfg.name_mapping.clone(),
+            file_cfg.constants.clone(),
+        ))
     }
 
     /// Scan `data_file` and return the physical positions of rows matching
@@ -1708,8 +2044,13 @@ impl DuckLakeTable {
         // Physical data columns only (logical order), then the reader-produced
         // position column. Embedded/rowid columns are not needed to evaluate the
         // predicate or read positions.
-        let (table_schema, pos_table_idx, _pos_name) =
-            positional_table_schema(file_cfg.read_schema.clone());
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            file_cfg.read_schema.clone(),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
         let mut proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
         proj.push(pos_table_idx);
         let pos_idx = proj.len() - 1;
@@ -1731,6 +2072,9 @@ impl DuckLakeTable {
                 .build(),
         );
         let plan = self.split_across_partitions(plan, state, &file_cfg)?;
+
+        let plan =
+            self.present_file_read_config(plan, &file_cfg, self.physical_schema.fields().len());
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
@@ -1954,7 +2298,7 @@ impl DuckLakeTable {
             let pf = self.partitioned_data_file(table_file, false, file_statistics)?;
 
             // Group key: physical field names + types, then the rename mapping.
-            let (read_schema, name_mapping) = &mapping;
+            let (read_schema, name_mapping, constants) = &mapping;
             let mut key = String::new();
             for f in read_schema.fields() {
                 key.push_str(f.name());
@@ -1969,6 +2313,14 @@ impl DuckLakeTable {
                 key.push('\u{3}');
                 key.push_str(v);
                 key.push('\u{4}');
+            }
+            let mut constants: Vec<_> = constants.iter().collect();
+            constants.sort_by_key(|(name, _)| *name);
+            for (name, value) in constants {
+                key.push_str(name);
+                key.push('\u{5}');
+                key.push_str(&format!("{value:?}"));
+                key.push('\u{6}');
             }
 
             match group_index.get(&key) {
@@ -1993,7 +2345,7 @@ impl DuckLakeTable {
         // Build one scan per physical-schema group; ColumnRenameExec coerces each
         // group to the catalog schema (renamed columns or a differing Arrow type).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
-        for ((read_schema, name_mapping), partitioned_files) in groups {
+        for ((read_schema, name_mapping, constants), partitioned_files) in groups {
             let mut builder = self
                 .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
                 .with_limit(limit)
@@ -2007,10 +2359,11 @@ impl DuckLakeTable {
                 DataSourceExec::from_data_source(builder.build());
 
             let mut exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
-                Arc::new(ColumnRenameExec::new(
+                Arc::new(ColumnRenameExec::new_with_constants(
                     parquet_exec,
                     output_schema.clone(),
                     name_mapping,
+                    constants,
                 )) as Arc<dyn ExecutionPlan>
             } else {
                 parquet_exec
@@ -2283,16 +2636,19 @@ impl DuckLakeTable {
 
         // ColumnRenameExec presents the catalog schema and, on the positional
         // path, drops the internal physical-position column.
-        let mut exec: Arc<dyn ExecutionPlan> =
-            if !file_cfg.name_mapping.is_empty() || exec_after_delete.schema() != output_schema {
-                Arc::new(ColumnRenameExec::new(
-                    exec_after_delete,
-                    output_schema,
-                    file_cfg.name_mapping.clone(),
-                ))
-            } else {
-                exec_after_delete
-            };
+        let mut exec: Arc<dyn ExecutionPlan> = if !file_cfg.name_mapping.is_empty()
+            || !file_cfg.constants.is_empty()
+            || exec_after_delete.schema() != output_schema
+        {
+            Arc::new(ColumnRenameExec::new_with_constants(
+                exec_after_delete,
+                output_schema,
+                file_cfg.name_mapping.clone(),
+                file_cfg.constants.clone(),
+            ))
+        } else {
+            exec_after_delete
+        };
 
         // Both branches above can let a predicate reach the parquet reader's
         // pruning, so both need the NaN barrier: footer float bounds exclude
@@ -2341,13 +2697,23 @@ impl DuckLakeTable {
         )
         .await?;
 
-        let mut name_mapping = layout.name_mapping.clone();
+        let (physical_read_schema, mut name_mapping, constants) =
+            if let Some(mapping_id) = file.mapping_id {
+                self.mapped_schema(mapping_id, &resolved_path)?
+            } else {
+                (
+                    layout.read_schema.clone(),
+                    layout.name_mapping.clone(),
+                    HashMap::new(),
+                )
+            };
         let read_schema = if let Some(ref parquet_name) = layout.embedded_rowid_parquet_name {
             // Append the embedded rowid column to read_schema under its
             // parquet name; ParquetExec will project it by name from the
             // file. We add a `parquet_name → "rowid"` rename so the user
             // sees the column as `rowid` (only needed if the names differ).
-            let mut fields: Vec<Arc<Field>> = layout.read_schema.fields().iter().cloned().collect();
+            let mut fields: Vec<Arc<Field>> =
+                physical_read_schema.fields().iter().cloned().collect();
             fields.push(Arc::new(Field::new(
                 parquet_name.clone(),
                 DataType::Int64,
@@ -2358,17 +2724,17 @@ impl DuckLakeTable {
             }
             Arc::new(Schema::new(fields))
         } else {
-            layout.read_schema.clone()
+            physical_read_schema.clone()
         };
 
         // A catalog column reads under a different physical name when the file
-        // renamed it or predates it. `layout.read_schema` is one field per
+        // renamed it or predates it. `physical_read_schema` is one field per
         // current column in catalog order, so the comparison is positional.
         let renamed_column_indices: HashSet<usize> = self
             .physical_schema
             .fields()
             .iter()
-            .zip(layout.read_schema.fields())
+            .zip(physical_read_schema.fields())
             .enumerate()
             .filter(|(_, (catalog, physical))| catalog.name() != physical.name())
             .map(|(index, _)| index)
@@ -2379,6 +2745,7 @@ impl DuckLakeTable {
             row_group_count: layout.row_group_count,
             renamed_column_indices: Arc::new(renamed_column_indices),
             name_mapping,
+            constants,
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
             drops_current_columns: layout.drops_current_columns,
@@ -2518,16 +2885,19 @@ impl DuckLakeTable {
         // FixedSizeList vs the catalog's List). Coerces each column to
         // `output_schema`.
         let output_schema = self.output_schema_for_projection(user_proj, rowid_idx);
-        let mut exec =
-            if !file_cfg.name_mapping.is_empty() || after_deletes.schema() != output_schema {
-                Arc::new(ColumnRenameExec::new(
-                    after_deletes,
-                    output_schema,
-                    file_cfg.name_mapping.clone(),
-                )) as Arc<dyn ExecutionPlan>
-            } else {
-                after_deletes
-            };
+        let mut exec = if !file_cfg.name_mapping.is_empty()
+            || !file_cfg.constants.is_empty()
+            || after_deletes.schema() != output_schema
+        {
+            Arc::new(ColumnRenameExec::new_with_constants(
+                after_deletes,
+                output_schema,
+                file_cfg.name_mapping.clone(),
+                file_cfg.constants.clone(),
+            )) as Arc<dyn ExecutionPlan>
+        } else {
+            after_deletes
+        };
         // Every branch here can now let a predicate reach the parquet reader's
         // row-group/page/bloom pruning: the positional branch no longer blocks
         // pushdown, and `DeleteFilterExec` / `RowIdExec` / `ColumnRenameExec`
@@ -2701,10 +3071,11 @@ impl DuckLakeTable {
             snap_name,
             self.snapshot_id,
         )?);
-        Ok(Arc::new(ColumnRenameExec::new(
+        Ok(Arc::new(ColumnRenameExec::new_with_constants(
             filtered,
             output_schema,
             file_cfg.name_mapping.clone(),
+            file_cfg.constants.clone(),
         )))
     }
 
@@ -2727,6 +3098,8 @@ impl DuckLakeTable {
             row_lineage: false,
             columns: self.columns.clone(),
             column_defaults: self.column_defaults.clone(),
+            fields: self.fields.clone(),
+            name_mapping_cache: Arc::clone(&self.name_mapping_cache),
             table_statistics: self.table_statistics.clone(),
             partition_spec: self.partition_spec.clone(),
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
@@ -2937,7 +3310,13 @@ impl DuckLakeTable {
         // physical columns (logical order), then for an embedded file the
         // embedded rowid column, then the position column.
         let physical_len = self.physical_schema.fields().len();
-        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema(read_schema.clone());
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            read_schema.clone(),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
         // Built by pushing, so each appended column records the index it actually
         // landed at. Arithmetic off `physical_len` would silently misalign the
         // appended columns for a file that has one but not another, and all are
@@ -2974,6 +3353,8 @@ impl DuckLakeTable {
                 pos_index,
             )?);
         }
+
+        plan = self.present_file_read_config(plan, &file_cfg, physical_len);
 
         Ok(UpdateSourceScan {
             scan: plan,
@@ -4015,8 +4396,84 @@ mod tests {
         SnapshotMetadata, TableMetadata, TableWithSchema,
     };
     use crate::partition::{PartitionSpecColumn, PartitionTransform};
+    use crate::types::build_arrow_schema;
     use datafusion::prelude::{SessionContext, col, lit};
+    use rstest::rstest;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[rstest]
+    #[case("NULL", DataType::Utf8, ScalarValue::Utf8(None))]
+    #[case("null", DataType::Int32, ScalarValue::Int32(None))]
+    #[case("", DataType::Int32, ScalarValue::Int32(None))]
+    #[case("", DataType::Utf8, ScalarValue::Utf8(Some(String::new())))]
+    #[case("__HIVE_DEFAULT_PARTITION__", DataType::Int32, ScalarValue::Int32(None))]
+    #[case("0x10", DataType::Int32, ScalarValue::Int32(Some(16)))]
+    #[case("1e2", DataType::Decimal128(10, 2), ScalarValue::Decimal128(Some(10_000), 10, 2))]
+    #[case("1.25e-1", DataType::Decimal128(10, 3), ScalarValue::Decimal128(Some(125), 10, 3))]
+    fn hive_partition_values_match_duckdb(
+        #[case] encoded: &str,
+        #[case] data_type: DataType,
+        #[case] expected: ScalarValue,
+    ) {
+        let path = format!("file:///tmp/p={encoded}/data.parquet");
+
+        let actual = DuckLakeTable::hive_partition_value(&path, "p", &data_type).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case(
+        "s3://bucket/a=one/../p=7/file.parquet",
+        "a",
+        DataType::Utf8,
+        ScalarValue::Utf8(Some("one".to_string()))
+    )]
+    #[case(
+        "s3://bucket/p=a#b/file.parquet",
+        "p",
+        DataType::Utf8,
+        ScalarValue::Utf8(Some("a#b".to_string()))
+    )]
+    #[case(
+        "s3://bucket/not=a?b/p=7/file.parquet",
+        "p",
+        DataType::Int32,
+        ScalarValue::Int32(Some(7))
+    )]
+    #[case(r"s3:\bucket\p=7\file.parquet", "p", DataType::Int32, ScalarValue::Int32(Some(7)))]
+    #[case(
+        "s3://bucket/p%20q=7/file.parquet",
+        "p%20q",
+        DataType::Int32,
+        ScalarValue::Int32(Some(7))
+    )]
+    #[case(
+        "s3://bucket/p=a%20b/file.parquet",
+        "p",
+        DataType::Utf8,
+        ScalarValue::Utf8(Some("a b".to_string()))
+    )]
+    fn hive_partition_path_parsing_matches_duckdb(
+        #[case] path: &str,
+        #[case] source_name: &str,
+        #[case] data_type: DataType,
+        #[case] expected: ScalarValue,
+    ) {
+        let actual = DuckLakeTable::hive_partition_value(path, source_name, &data_type).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case("s3://bucket/p=7=8/file.parquet", "p")]
+    #[case("s3://bucket/p%20q=7/file.parquet", "p q")]
+    fn hive_partition_path_rejects_non_candidates(#[case] path: &str, #[case] source_name: &str) {
+        let error =
+            DuckLakeTable::hive_partition_value(path, source_name, &DataType::Int32).unwrap_err();
+
+        assert!(error.to_string().contains("absent from file path"));
+    }
 
     #[derive(Debug, Default)]
     struct LazyMillionFileProvider {
@@ -4600,6 +5057,7 @@ mod tests {
                 .into_iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
+            constants: HashMap::new(),
             row_group_count: 4,
             renamed_column_indices: Arc::new(renamed.into_iter().collect()),
             embedded_rowid_parquet_name: None,

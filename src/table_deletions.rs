@@ -54,8 +54,8 @@ use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataPr
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
-    ParquetFileLayout, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
-    validated_record_count,
+    ParquetFileLayout, apply_name_mapping_to_layout, read_parquet_file_layout,
+    read_parquet_footer_facts, validated_file_size, validated_record_count,
 };
 use crate::table_changes::{check_column_count, present_catalog_schema};
 
@@ -166,6 +166,7 @@ impl TableDeletionsTable {
         columns: &[DuckLakeTableColumn],
         path: &str,
         is_relative: bool,
+        mapping_id: Option<i64>,
     ) -> DataFusionResult<Arc<ParquetFileLayout>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -184,6 +185,15 @@ impl TableDeletionsTable {
             &self.table_schema,
         )
         .await?;
+        let layout = apply_name_mapping_to_layout(
+            self.provider.as_ref(),
+            self.table_id,
+            self.end_snapshot,
+            columns,
+            &resolved,
+            mapping_id,
+            layout,
+        )?;
         self.layout_cache
             .lock()
             .unwrap()
@@ -282,6 +292,7 @@ impl TableDeletionsTable {
                 columns,
                 &delete_file.data_file_path,
                 delete_file.data_file_path_is_relative,
+                delete_file.data_mapping_id,
             )
             .await?;
 
@@ -465,6 +476,7 @@ impl TableDeletionsTable {
             scan,
             &table_fields,
             &layout.name_mapping,
+            &layout.constants,
         ))
     }
 }

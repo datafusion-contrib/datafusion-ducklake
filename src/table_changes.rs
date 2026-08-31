@@ -42,8 +42,8 @@ use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProv
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
-    ParquetFileLayout, delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts,
-    validated_file_size, validated_record_count,
+    ParquetFileLayout, apply_name_mapping_to_layout, delete_file_schema, read_parquet_file_layout,
+    read_parquet_footer_facts, validated_file_size, validated_record_count,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
 
@@ -125,6 +125,7 @@ pub(crate) fn present_catalog_schema(
     scan: Arc<dyn ExecutionPlan>,
     table_fields: &[FieldRef],
     name_mapping: &HashMap<String, String>,
+    constants: &HashMap<String, datafusion::common::ScalarValue>,
 ) -> Arc<dyn ExecutionPlan> {
     let scan_schema = scan.schema();
     debug_assert!(scan_schema.fields().len() >= table_fields.len());
@@ -137,11 +138,12 @@ pub(crate) fn present_catalog_schema(
             .cloned(),
     );
     let output_schema: SchemaRef = Arc::new(Schema::new(fields));
-    if !name_mapping.is_empty() || scan_schema != output_schema {
-        Arc::new(ColumnRenameExec::new(
+    if !name_mapping.is_empty() || !constants.is_empty() || scan_schema != output_schema {
+        Arc::new(ColumnRenameExec::new_with_constants(
             scan,
             output_schema,
             name_mapping.clone(),
+            constants.clone(),
         ))
     } else {
         scan
@@ -541,6 +543,7 @@ impl TableChangesTable {
         columns: &[DuckLakeTableColumn],
         path: &str,
         is_relative: bool,
+        mapping_id: Option<i64>,
     ) -> DataFusionResult<Arc<ParquetFileLayout>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -561,6 +564,15 @@ impl TableChangesTable {
             &self.table_schema,
         )
         .await?;
+        let layout = apply_name_mapping_to_layout(
+            self.provider.as_ref(),
+            self.table_id,
+            self.end_snapshot,
+            columns,
+            &resolved,
+            mapping_id,
+            layout,
+        )?;
         self.layout_cache
             .lock()
             .unwrap()
@@ -768,7 +780,9 @@ impl TableChangesTable {
                 .map(|&i| Arc::clone(&self.table_schema.fields()[i]))
                 .collect();
             let name_mapping = layout.map(|l| l.name_mapping.clone()).unwrap_or_default();
-            parquet_exec = present_catalog_schema(parquet_exec, &table_fields, &name_mapping);
+            let constants = layout.map(|l| l.constants.clone()).unwrap_or_default();
+            parquet_exec =
+                present_catalog_schema(parquet_exec, &table_fields, &name_mapping, &constants);
         }
 
         // Build output schema for PrependCDCColumnsExec
@@ -937,6 +951,7 @@ impl TableChangesTable {
             scan,
             &self.catalog_table_fields(),
             &layout.name_mapping,
+            &layout.constants,
         ))
     }
 
@@ -978,6 +993,7 @@ impl TableChangesTable {
             scan,
             &self.catalog_table_fields(),
             &layout.name_mapping,
+            &layout.constants,
         ))
     }
 
@@ -1213,6 +1229,7 @@ impl TableChangesTable {
                         columns,
                         &dfc.data_file_path,
                         dfc.data_file_path_is_relative,
+                        dfc.data_mapping_id,
                     )
                     .await?;
                 let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
@@ -1446,8 +1463,14 @@ impl TableProvider for TableChangesTable {
             let mut layouts: Vec<Arc<ParquetFileLayout>> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
                 layouts.push(
-                    self.file_layout(state, &columns, &data_file.path, data_file.path_is_relative)
-                        .await?,
+                    self.file_layout(
+                        state,
+                        &columns,
+                        &data_file.path,
+                        data_file.path_is_relative,
+                        data_file.mapping_id,
+                    )
+                    .await?,
                 );
             }
             return self
@@ -1493,8 +1516,14 @@ impl TableProvider for TableChangesTable {
                 None
             } else {
                 Some(
-                    self.file_layout(state, &columns, &data_file.path, data_file.path_is_relative)
-                        .await?,
+                    self.file_layout(
+                        state,
+                        &columns,
+                        &data_file.path,
+                        data_file.path_is_relative,
+                        data_file.mapping_id,
+                    )
+                    .await?,
                 )
             };
             #[cfg(feature = "encryption")]

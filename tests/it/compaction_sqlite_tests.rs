@@ -294,6 +294,183 @@ async fn run_merge(temp: &TempDir, opts: MergeOptions) -> CompactionResult {
     .await
 }
 
+#[cfg(feature = "metadata-duckdb")]
+fn create_official_mapped_compaction_fixture(temp: &TempDir) -> anyhow::Result<()> {
+    let data_path = temp.path().join("data");
+    let first_partition = data_path.join("part=7");
+    let second_partition = data_path.join("part=8");
+    std::fs::create_dir_all(&first_partition)?;
+    std::fs::create_dir_all(&second_partition)?;
+
+    let conn = duckdb::Connection::open_in_memory()?;
+    crate::common::ensure_ducklake_installed();
+    conn.execute("INSTALL sqlite", [])?;
+    conn.execute("LOAD sqlite", [])?;
+    conn.execute("LOAD ducklake", [])?;
+    conn.execute(
+        &format!(
+            "ATTACH 'ducklake:sqlite:{}' AS lake \
+             (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0)",
+            temp.path().join("test.db").display(),
+            data_path.display()
+        ),
+        [],
+    )?;
+    conn.execute("CREATE TABLE lake.t(id INTEGER, part INTEGER)", [])?;
+    conn.execute(
+        &format!(
+            "COPY (SELECT 1 AS id) TO '{}' (FORMAT PARQUET)",
+            first_partition.join("first.parquet").display()
+        ),
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "COPY (SELECT 2 AS id) TO '{}' (FORMAT PARQUET)",
+            second_partition.join("second.parquet").display()
+        ),
+        [],
+    )?;
+    conn.execute(
+        &format!(
+            "CALL ducklake_add_data_files(\
+                 'lake', 't', '{}/**/*.parquet', hive_partitioning => true\
+             )",
+            data_path.display()
+        ),
+        [],
+    )?;
+    conn.execute("DETACH lake", [])?;
+    Ok(())
+}
+
+#[cfg(feature = "metadata-duckdb")]
+async fn read_mapped_rows(temp: &TempDir) -> anyhow::Result<Vec<(i32, i32)>> {
+    let provider = SqliteMetadataProvider::new(&ro_url(temp)).await?;
+    let catalog = DuckLakeCatalog::new(provider)?;
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id, part FROM ducklake.main.t ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let parts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        rows.extend((0..batch.num_rows()).map(|row| (ids.value(row), parts.value(row))));
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "metadata-duckdb")]
+async fn migrate_pinned_duckdb_fixture(temp: &TempDir) -> anyhow::Result<()> {
+    let pool = pool(temp).await;
+    SqliteMetadataWriter::new_with_init(&db_url(temp)).await?;
+    let schema_version_columns = sqlx::query("PRAGMA table_info(ducklake_schema_versions)")
+        .fetch_all(&pool)
+        .await?;
+    if !schema_version_columns
+        .iter()
+        .any(|row| row.get::<String, _>(1) == "table_id")
+    {
+        // The pinned DuckDB 1.4.1 test extension predates the per-table column
+        // that released DuckDB 1.5.5 writes; keep the fixture shape equivalent
+        sqlx::query("ALTER TABLE ducklake_schema_versions ADD COLUMN table_id INTEGER")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE ducklake_schema_versions
+             SET table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 't')",
+        )
+        .execute(&pool)
+        .await?;
+    }
+    let data_file_columns = sqlx::query("PRAGMA table_info(ducklake_data_file)")
+        .fetch_all(&pool)
+        .await?;
+    let data_file_id_type = data_file_columns
+        .iter()
+        .find(|row| row.get::<String, _>(1) == "data_file_id")
+        .map(|row| row.get::<String, _>(2))
+        .unwrap();
+    if data_file_id_type != "INTEGER" {
+        // SQLite auto-allocates only an exact INTEGER PRIMARY KEY; normalize the
+        // official BIGINT declaration to the crate writer's documented precondition
+        sqlx::query("ALTER TABLE ducklake_data_file RENAME TO ducklake_data_file__official")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "CREATE TABLE ducklake_data_file (
+                data_file_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                path VARCHAR NOT NULL,
+                path_is_relative BOOLEAN NOT NULL DEFAULT 1,
+                file_size_bytes INTEGER NOT NULL,
+                footer_size INTEGER,
+                encryption_key VARCHAR,
+                record_count INTEGER,
+                row_id_start INTEGER,
+                mapping_id INTEGER,
+                begin_snapshot INTEGER NOT NULL,
+                end_snapshot INTEGER,
+                partial_max INTEGER,
+                partition_id INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO ducklake_data_file (
+                data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                footer_size, encryption_key, record_count, row_id_start, mapping_id,
+                begin_snapshot, end_snapshot, partial_max, partition_id
+             )
+             SELECT data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                    footer_size, encryption_key, record_count, row_id_start, mapping_id,
+                    begin_snapshot, end_snapshot, partial_max, partition_id
+             FROM ducklake_data_file__official",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("DROP TABLE ducklake_data_file__official")
+            .execute(&pool)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn mapped_hive_values_survive_merge_adjacent_files() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    create_official_mapped_compaction_fixture(&temp)?;
+    migrate_pinned_duckdb_fixture(&temp).await?;
+    assert_eq!(read_mapped_rows(&temp).await?, vec![(1, 7), (2, 8)]);
+
+    let result = run_merge(&temp, MergeOptions::default()).await;
+
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: 2,
+            files_created: 1,
+            rows_written: 2,
+        }
+    );
+    assert_eq!(read_mapped_rows(&temp).await?, vec![(1, 7), (2, 8)]);
+    Ok(())
+}
+
 /// Run a merge with explicit table write options, as a catalog configured for a
 /// codec would produce.
 async fn run_merge_with_write_options(

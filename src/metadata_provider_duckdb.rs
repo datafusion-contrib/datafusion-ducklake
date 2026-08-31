@@ -1,18 +1,20 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
+    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
     SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
     SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
-    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_PARTITION_SPEC,
-    SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS,
-    SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES,
-    SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS,
-    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, ViewWithSchema, build_inlined_batch, inlined_delete_table_name,
-    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_NAME_MAPPING,
+    SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME,
+    SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_FILES,
+    SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
+    SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, ViewMetadata, ViewWithSchema, build_inlined_batch, inlined_delete_table_name,
+    inlined_missing_scalar, is_inlined_data_table, reconstruct_columns,
+    reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -545,6 +547,62 @@ impl MetadataProvider for DuckdbMetadataProvider {
         reconstruct_columns(raw_columns)
     }
 
+    fn get_table_fields(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Vec<DuckLakeTableField>> {
+        let conn = self.connection();
+        let sql = get_table_columns_sql(self.schema_capabilities(&conn)?);
+        let mut stmt = conn.prepare(&sql)?;
+        Ok(stmt
+            .query_map(params![table_id, snapshot_id, snapshot_id], |row| {
+                Ok(DuckLakeTableField {
+                    column_id: row.get(0)?,
+                    column_name: row.get(1)?,
+                    column_type: row.get(2)?,
+                    is_nullable: row.get::<_, Option<bool>>(3)?.unwrap_or(true),
+                    parent_column: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_name_mapping(&self, mapping_id: i64) -> crate::Result<DuckLakeNameMapping> {
+        let conn = self.connection();
+        let mut stmt = conn.prepare(SQL_GET_NAME_MAPPING)?;
+        let mut rows = stmt.query(params![mapping_id])?;
+        let mut header = None;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next()? {
+            header.get_or_insert((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ));
+            if let Some(column_id) = row.get::<_, Option<i64>>(3)? {
+                entries.push(DuckLakeNameMappingEntry {
+                    column_id,
+                    source_name: row.get(4)?,
+                    target_field_id: row.get(5)?,
+                    parent_column: row.get(6)?,
+                    is_partition: row.get::<_, Option<bool>>(7)?.unwrap_or(false),
+                });
+            }
+        }
+        let (mapping_id, table_id, mapping_type) = header.ok_or_else(|| {
+            crate::DuckLakeError::InvalidConfig(format!(
+                "DuckLake name mapping {mapping_id} does not exist"
+            ))
+        })?;
+        Ok(DuckLakeNameMapping {
+            mapping_id,
+            table_id,
+            mapping_type,
+            entries,
+        })
+    }
+
     fn get_table_files_for_select(
         &self,
         table_id: i64,
@@ -565,6 +623,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         file_size_bytes: row.get(3)?,
                         footer_size: row.get(4)?,
                         encryption_key: row.get(5)?,
+                        mapping_id: row.get(15)?,
                     };
                     let row_id_start: Option<i64> = row.get(6)?;
                     let record_count: Option<i64> = row.get(7)?;
@@ -579,6 +638,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                                     file_size_bytes: row.get(11)?,
                                     footer_size: row.get(12)?,
                                     encryption_key: row.get(13)?,
+                                    mapping_id: None,
                                 }),
                                 row.get(14)?,
                                 Some(dfid),
@@ -802,6 +862,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                                 file_size_bytes: row.get(11)?,
                                 footer_size: row.get(12)?,
                                 encryption_key: row.get(13)?,
+                                mapping_id: None,
                             }),
                             row.get(14)?,
                         )
@@ -816,6 +877,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             file_size_bytes: row.get(3)?,
                             footer_size: row.get(4)?,
                             encryption_key: row.get(5)?,
+                            mapping_id: row.get(15)?,
                         },
                         delete_file_id,
                         delete_file,
@@ -1059,6 +1121,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     .iter()
                     .enumerate()
                     .map(|(index, field)| {
+                        if !present.contains(&columns[index].column_name) {
+                            return inlined_missing_scalar(&columns[index], field.data_type());
+                        }
                         duckdb_inlined_scalar(
                             row.get_ref(index)?,
                             field.data_type(),
@@ -1311,6 +1376,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         file_size_bytes: row.get(5)?,
                         footer_size: row.get(6)?,
                         encryption_key: row.get(7)?,
+                        mapping_id: None,
                     };
 
                     // Column 8 is delete_file_id (NULL when no live delete file).
@@ -1323,6 +1389,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                                     file_size_bytes: row.get(11)?,
                                     footer_size: row.get(12)?,
                                     encryption_key: row.get(13)?,
+                                    mapping_id: None,
                                 }),
                                 Some(dfid),
                             )
@@ -1384,6 +1451,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         encryption_key: row.get(5)?,
                         row_id_start: row.get(6)?,
                         partial_max: row.get(7)?,
+                        mapping_id: row.get(8)?,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1401,7 +1469,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 data.footer_size,
                 data.encryption_key,
                 data.row_id_start,
-                data.partial_file_info
+                data.partial_file_info,
+                data.mapping_id
             FROM ducklake_data_file AS data
             WHERE data.table_id = $1
               AND data.begin_snapshot <= $3
@@ -1420,6 +1489,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     encryption_key: row.get(5)?,
                     row_id_start: row.get(6)?,
                     partial_max: info.as_deref().and_then(parse_partial_file_info_max),
+                    mapping_id: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?

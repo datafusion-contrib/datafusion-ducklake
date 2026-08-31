@@ -61,7 +61,8 @@ pub const SQL_GET_DATA_FILES: &str = "
         del.file_size_bytes AS delete_file_size,
         del.footer_size AS delete_footer_size,
         del.encryption_key AS delete_encryption_key,
-        del.delete_count
+        del.delete_count,
+        data.mapping_id
     FROM ducklake_data_file AS data
     LEFT JOIN ducklake_delete_file AS del
         ON data.data_file_id = del.data_file_id
@@ -71,6 +72,18 @@ pub const SQL_GET_DATA_FILES: &str = "
     WHERE data.table_id = ?
       AND ? >= data.begin_snapshot
       AND (? < data.end_snapshot OR data.end_snapshot IS NULL)";
+
+/// Read one name mapping and its recursively-linked entries. The mapping id is
+/// globally unique within a DuckLake catalog.
+pub const SQL_GET_NAME_MAPPING: &str = "
+    SELECT mapping.mapping_id, mapping.table_id, mapping.type,
+           name.column_id, name.source_name, name.target_field_id,
+           name.parent_column, name.is_partition
+    FROM ducklake_column_mapping AS mapping
+    JOIN ducklake_name_mapping AS name
+      ON name.mapping_id = mapping.mapping_id
+    WHERE mapping.mapping_id = ?
+    ORDER BY name.parent_column NULLS FIRST, name.column_id";
 
 /// Read a table's active partition spec (partition_info joined to its key
 /// columns) visible at a snapshot. `?` placeholders (duckdb/sqlite/mysql style):
@@ -171,7 +184,8 @@ pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
         data.footer_size,
         data.encryption_key,
         data.row_id_start,
-        data.partial_max
+        data.partial_max,
+        data.mapping_id
     FROM ducklake_data_file AS data
     WHERE data.table_id = $1
       AND data.begin_snapshot <= $3
@@ -684,10 +698,20 @@ pub(crate) fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_inlined_rows(
     schema: SchemaRef,
     columns: &[DuckLakeTableColumn],
     rows: Vec<Vec<Option<String>>>,
+) -> Result<RecordBatch> {
+    parse_inlined_rows_with_present(schema, columns, rows, None)
+}
+
+pub(crate) fn parse_inlined_rows_with_present(
+    schema: SchemaRef,
+    columns: &[DuckLakeTableColumn],
+    rows: Vec<Vec<Option<String>>>,
+    present: Option<&HashSet<String>>,
 ) -> Result<RecordBatch> {
     let rows = rows
         .into_iter()
@@ -701,6 +725,11 @@ pub(crate) fn parse_inlined_rows(
                 .enumerate()
                 .map(|(index, value)| {
                     let field = schema.field(index);
+                    if present.is_some_and(|present| {
+                        !present.contains(columns[index].column_name.as_str())
+                    }) {
+                        return inlined_missing_scalar(&columns[index], field.data_type());
+                    }
                     match value {
                         Some(value) => crate::types::parse_ducklake_scalar(
                             &value,
@@ -722,6 +751,75 @@ pub(crate) fn parse_inlined_rows(
         })
         .collect::<Result<Vec<_>>>()?;
     build_inlined_batch(schema, columns, &rows)
+}
+
+pub(crate) fn inlined_missing_scalar(
+    column: &DuckLakeTableColumn,
+    data_type: &DataType,
+) -> Result<ScalarValue> {
+    let Some(value) = column
+        .initial_default
+        .as_deref()
+        .filter(|value| !value.eq_ignore_ascii_case("NULL"))
+    else {
+        return Ok(ScalarValue::try_from(data_type)?);
+    };
+    crate::types::parse_ducklake_scalar(value, data_type).ok_or_else(|| {
+        crate::DuckLakeError::InvalidConfig(format!(
+            "Cannot decode initial_default '{value}' for inlined column '{}' as {data_type}",
+            column.column_name,
+        ))
+    })
+}
+
+/// One row from `ducklake_column`, including its place in the nested field tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeTableField {
+    pub column_id: i64,
+    pub column_name: String,
+    pub column_type: String,
+    pub is_nullable: bool,
+    pub parent_column: Option<i64>,
+}
+
+impl DuckLakeTableField {
+    pub fn top_level(column: DuckLakeTableColumn) -> Self {
+        Self {
+            column_id: column.column_id,
+            column_name: column.column_name,
+            column_type: column.column_type,
+            is_nullable: column.is_nullable,
+            parent_column: None,
+        }
+    }
+
+    pub fn column(&self) -> DuckLakeTableColumn {
+        DuckLakeTableColumn::new(
+            self.column_id,
+            self.column_name.clone(),
+            self.column_type.clone(),
+            self.is_nullable,
+        )
+    }
+}
+
+/// A flattened row from `ducklake_name_mapping`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeNameMappingEntry {
+    pub column_id: i64,
+    pub source_name: String,
+    pub target_field_id: i64,
+    pub parent_column: Option<i64>,
+    pub is_partition: bool,
+}
+
+/// One `ducklake_column_mapping` and all of its name-mapping rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeNameMapping {
+    pub mapping_id: i64,
+    pub table_id: i64,
+    pub mapping_type: String,
+    pub entries: Vec<DuckLakeNameMappingEntry>,
 }
 
 impl DuckLakeTableColumn {
@@ -982,7 +1080,8 @@ pub fn reconstruct_columns_with_table(
 }
 
 /// Metadata for a data file or delete file in DuckLake
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DuckLakeFileData {
     /// Path to the file (may be relative or absolute)
     pub path: String,
@@ -994,6 +1093,9 @@ pub struct DuckLakeFileData {
     pub file_size_bytes: i64,
     /// Size of the Parquet footer in bytes (optional optimization hint)
     pub footer_size: Option<i64>,
+    /// Name mapping used to adapt this data file's physical columns.
+    /// Delete files do not use column mappings.
+    pub mapping_id: Option<i64>,
 }
 
 impl DuckLakeFileData {
@@ -1004,6 +1106,7 @@ impl DuckLakeFileData {
             encryption_key: None,
             file_size_bytes,
             footer_size: None,
+            mapping_id: None,
         }
     }
 }
@@ -1168,7 +1271,8 @@ impl DuckLakeTableFile {
 
 // Change tracking structures for table_changes (CDC) functionality
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DataFileChange {
     pub begin_snapshot: i64,
     pub path: String,
@@ -1176,6 +1280,8 @@ pub struct DataFileChange {
     pub file_size_bytes: i64,
     pub footer_size: Option<i64>,
     pub encryption_key: Option<String>,
+    /// Name mapping used to adapt the data file's physical columns.
+    pub mapping_id: Option<i64>,
     /// First rowid assigned to this file (`row_id_start` in the catalog), or
     /// `None` when the catalog does not carry one (e.g. an embedded-rowid
     /// compaction/rewrite output, or an older catalog). Required only to
@@ -1256,6 +1362,28 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableColumn>>;
+
+    /// Get the complete nested field tree visible at `snapshot_id`.
+    ///
+    /// External providers that only expose top-level fields retain their
+    /// existing behavior through this default. Built-in providers override it
+    /// with the raw `ducklake_column.parent_column` rows.
+    fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
+        self.get_table_structure(table_id, snapshot_id)
+            .map(|columns| {
+                columns
+                    .into_iter()
+                    .map(DuckLakeTableField::top_level)
+                    .collect()
+            })
+    }
+
+    /// Load a data file's `map_by_name` mapping.
+    fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
+        Err(crate::DuckLakeError::Unsupported(format!(
+            "metadata provider does not support DuckLake name mapping {mapping_id}"
+        )))
+    }
 
     /// Get table files for a specific snapshot
     fn get_table_files_for_select(

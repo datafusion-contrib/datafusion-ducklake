@@ -277,6 +277,19 @@ Known edges:
   in DuckDB. This is inherited from arrow and affects results, not just pruning; float
   min/max statistics are gated on `contains_nan` in **both** directions to stay consistent
   with it, where official DuckLake gates only the max.
+- **Mapped Hive partition paths follow DuckDB 1.5.5 parsing.** The raw object key is
+  split on `/` and `\`; a query marker, newline, or second `=` invalidates that path
+  segment. Keys are compared without percent decoding, while values are decoded.
+- **Reachable mapped numeric literals match DuckDB.** Hexadecimal integers and
+  exponent-form decimals are normalized before Arrow parsing. DuckDB rejects boolean
+  words such as `on` and compact dates such as `20240102` while registering a file, so
+  this crate's acceptance of those forms cannot affect an official-produced catalog.
+  Timestamp-offset comparison remains blocked by the percent-encoded object-key issue
+  tracked in #288.
+- **Nested mapped Hive partition fields are rejected.** Top-level `is_partition`
+  fields are materialized on every read path. DuckDB's writer does not produce nested
+  partition mappings, but a hand-written or third-party catalog can; this crate returns
+  an explicit error instead of reading a physical value or NULL under that shape.
 - **No `AS OF` syntax:** select a catalog snapshot by ID with
   `DuckLakeCatalog::with_snapshot`, by UTC timestamp with
   `DuckLakeCatalog::with_snapshot_at`, or select one table per query with

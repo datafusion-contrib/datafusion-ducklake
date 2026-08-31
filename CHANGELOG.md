@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set how many finished data files a rolling or partitioned write uploads at once, default 4.
   Written output is identical at any setting (#280).
 - Read-only DuckLake views across metadata backends, with writer-compatible view metadata (#264).
+- Per-file DuckLake `map_by_name` mappings across scans, predicate-based mutations,
+  compaction rewrites, and change feeds, including typed Hive partition constants (#263).
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
 - Row lineage and positional deletes take the physical row position from the Parquet reader's
@@ -25,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / rewrite paths explicitly (#130).
 
 ### Changed
+
+- **BREAKING**: `DuckLakeFileData` and `DataFileChange` are now non-exhaustive and
+  implement `Default`; `DataFileChange` gains `mapping_id`. Downstream metadata
+  providers must preserve the per-file mapping identifier so change feeds adapt
+  physical columns correctly (#263).
 
 - **BREAKING**: `FileRowNumberExec` and `row_id::row_pos_field` are removed, and
   `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` naming a
@@ -59,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The internal physical-position column could bind to a catalog column of the same name in the
   CDC feeds, making them report the wrong rows (#130).
 - `NULL` sentinels, BLOB decoding, expression-default reads, and legacy schema migration (#259).
+- Name-mapped Hive columns retain values through `DELETE`, `UPDATE`, and compaction;
+  mapped CDC reads no longer return NULL after column renames. Map keys and nested
+  nullability also match Arrow's read-compatible schema requirements (#263).
+- Name-mapped Hive paths follow DuckDB's raw segment parser, including backslash
+  separators and invalid multiple-`=` segments. Hexadecimal integers and exponent-form
+  decimals read with DuckDB-compatible values (#263).
+- Field-ID-less Parquet files and inlined rows apply `initial_default` values, and
+  read schemas retain the default metadata needed for missing-field adaptation (#263).
 - An upload whose final flush failed panicked with "Already shut down" instead of returning
   the error (#280).
 - `files_matching` no longer stops pruning a data file once that file carries a delete

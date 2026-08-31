@@ -27,6 +27,58 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
     Ok((pool, container))
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn name_mapping_is_read_from_shared_metadata() -> anyhow::Result<()> {
+    let (pool, _container) = spin_up_postgres().await?;
+    sqlx::query(
+        "CREATE TABLE ducklake_column_mapping (
+            mapping_id BIGINT PRIMARY KEY,
+            table_id BIGINT NOT NULL,
+            type TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE ducklake_name_mapping (
+            mapping_id BIGINT NOT NULL,
+            column_id BIGINT NOT NULL,
+            source_name TEXT NOT NULL,
+            target_field_id BIGINT NOT NULL,
+            parent_column BIGINT,
+            is_partition BOOLEAN NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_column_mapping(mapping_id, table_id, type)
+         VALUES (7, 11, 'map_by_name')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_name_mapping(
+            mapping_id, column_id, source_name, target_field_id, parent_column, is_partition
+         ) VALUES
+            (7, 1, 'nested', 3, NULL, false),
+            (7, 2, 'child', 4, 1, false),
+            (7, 3, 'part', 5, NULL, true)",
+    )
+    .execute(&pool)
+    .await?;
+    let provider = MulticatalogProvider::with_pool_and_id(pool, 1).await?;
+
+    let mapping = provider.get_name_mapping(7)?;
+    assert_eq!(mapping.mapping_id, 7);
+    assert_eq!(mapping.table_id, 11);
+    assert_eq!(mapping.mapping_type, "map_by_name");
+    assert_eq!(mapping.entries.len(), 3);
+    assert!(mapping.entries[1].is_partition);
+    assert_eq!(mapping.entries[2].parent_column, Some(1));
+    Ok(())
+}
+
 fn users_cols() -> Vec<ColumnDef> {
     vec![
         ColumnDef::new("id", "int64", false).unwrap(),

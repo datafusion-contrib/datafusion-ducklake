@@ -3,7 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::metadata_provider::DuckLakeTableColumn;
+use crate::metadata_provider::{
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeTableColumn, DuckLakeTableField,
+};
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
@@ -18,7 +20,7 @@ use parquet::file::metadata::ParquetMetaData;
 
 pub(crate) const MAX_NESTED_TYPE_DEPTH: usize = 128;
 
-const INITIAL_DEFAULT_METADATA_KEY: &str = "ducklake.initial_default";
+pub(crate) const INITIAL_DEFAULT_METADATA_KEY: &str = "ducklake.initial_default";
 
 #[derive(Debug)]
 pub(crate) struct DuckLakeDefaultExprAdapterFactory;
@@ -820,6 +822,404 @@ fn read_compatible_data_type(data_type: &DataType, nullable_struct_fields: bool)
     }
 }
 
+#[derive(Debug)]
+struct TableFieldTree<'a> {
+    fields: &'a [DuckLakeTableField],
+    children: HashMap<Option<i64>, Vec<usize>>,
+}
+
+impl<'a> TableFieldTree<'a> {
+    fn new(fields: &'a [DuckLakeTableField]) -> Result<Self> {
+        let mut by_id = HashMap::with_capacity(fields.len());
+        let mut children: HashMap<Option<i64>, Vec<usize>> = HashMap::new();
+        for (index, field) in fields.iter().enumerate() {
+            if by_id.insert(field.column_id, index).is_some() {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "duplicate DuckLake column_id {}",
+                    field.column_id
+                )));
+            }
+            children.entry(field.parent_column).or_default().push(index);
+        }
+        for field in fields {
+            if let Some(parent) = field.parent_column
+                && !by_id.contains_key(&parent)
+            {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "DuckLake column {} references missing parent_column {}",
+                    field.column_id, parent
+                )));
+            }
+            let mut ancestors = HashSet::new();
+            let mut ancestor = Some(field.column_id);
+            while let Some(column_id) = ancestor {
+                if !ancestors.insert(column_id) {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "cycle in DuckLake column tree at column_id {column_id}"
+                    )));
+                }
+                ancestor = fields[by_id[&column_id]].parent_column;
+            }
+        }
+        Ok(Self {
+            fields,
+            children,
+        })
+    }
+
+    fn roots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.children.get(&None).into_iter().flatten().copied()
+    }
+
+    fn children(&self, column_id: i64) -> impl Iterator<Item = usize> + '_ {
+        self.children
+            .get(&Some(column_id))
+            .into_iter()
+            .flatten()
+            .copied()
+    }
+
+    fn arrow_field(&self, index: usize, visiting: &mut HashSet<i64>) -> Result<Field> {
+        let field = &self.fields[index];
+        if !visiting.insert(field.column_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "cycle in DuckLake column tree at column_id {}",
+                field.column_id
+            )));
+        }
+        let child_indices: Vec<_> = self.children(field.column_id).collect();
+        let normalized = field.column_type.trim().to_ascii_lowercase();
+        let data_type = match normalized.as_str() {
+            "struct" => {
+                let children = child_indices
+                    .into_iter()
+                    .map(|child| self.arrow_field(child, visiting).map(Arc::new))
+                    .collect::<Result<Vec<_>>>()?;
+                DataType::Struct(children.into())
+            },
+            "list" | "array" => {
+                if child_indices.len() != 1 {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "DuckLake list column {} has {} children; expected 1",
+                        field.column_id,
+                        child_indices.len()
+                    )));
+                }
+                let mut child = self.arrow_field(child_indices[0], visiting)?;
+                child = child.with_name("item");
+                DataType::List(Arc::new(child))
+            },
+            "map" => {
+                if child_indices.len() != 2 {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "DuckLake map column {} has {} children; expected key and value",
+                        field.column_id,
+                        child_indices.len()
+                    )));
+                }
+                let key = self
+                    .arrow_field(child_indices[0], visiting)?
+                    .with_nullable(false);
+                let value = self.arrow_field(child_indices[1], visiting)?;
+                if key.name() != "key" || value.name() != "value" {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "DuckLake map column {} children must be named key and value",
+                        field.column_id
+                    )));
+                }
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(vec![Arc::new(key), Arc::new(value)].into()),
+                        false,
+                    )),
+                    false,
+                )
+            },
+            _ => {
+                if !child_indices.is_empty() {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "DuckLake scalar column {} has nested children",
+                        field.column_id
+                    )));
+                }
+                ducklake_to_arrow_type(&field.column_type)?
+            },
+        };
+        visiting.remove(&field.column_id);
+        Ok(Field::new(
+            &field.column_name,
+            read_compatible_data_type(&data_type, true),
+            field.is_nullable,
+        ))
+    }
+}
+
+/// Build an Arrow schema from the complete `ducklake_column` field tree.
+pub fn build_arrow_schema_from_fields(fields: &[DuckLakeTableField]) -> Result<Schema> {
+    build_arrow_schema(&top_level_columns(fields)?)
+}
+
+/// Return the top-level column records in catalog order.
+pub fn top_level_columns(fields: &[DuckLakeTableField]) -> Result<Vec<DuckLakeTableColumn>> {
+    crate::metadata_provider::reconstruct_columns(
+        fields
+            .iter()
+            .map(|field| (field.column(), field.parent_column))
+            .collect(),
+    )
+}
+
+#[derive(Debug)]
+struct NameMappingTree<'a> {
+    entries: &'a [DuckLakeNameMappingEntry],
+    children: HashMap<Option<i64>, Vec<usize>>,
+}
+
+impl<'a> NameMappingTree<'a> {
+    fn new(mapping: &'a DuckLakeNameMapping) -> Result<Self> {
+        if mapping.mapping_type != "map_by_name" {
+            return Err(DuckLakeError::Unsupported(format!(
+                "DuckLake column mapping type '{}'",
+                mapping.mapping_type
+            )));
+        }
+        let mut by_id = HashMap::with_capacity(mapping.entries.len());
+        let mut children: HashMap<Option<i64>, Vec<usize>> = HashMap::new();
+        for (index, entry) in mapping.entries.iter().enumerate() {
+            if by_id.contains_key(&entry.column_id) {
+                continue;
+            }
+            by_id.insert(entry.column_id, index);
+            children.entry(entry.parent_column).or_default().push(index);
+        }
+        for index in by_id.values() {
+            let entry = &mapping.entries[*index];
+            if let Some(parent) = entry.parent_column
+                && !by_id.contains_key(&parent)
+            {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "name-mapping column {} references missing parent_column {}",
+                    entry.column_id, parent
+                )));
+            }
+            if entry.is_partition && entry.parent_column.is_some() {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "nested name-mapping column {} cannot be synthesized from a Hive path",
+                    entry.column_id
+                )));
+            }
+            let mut ancestors = HashSet::new();
+            let mut ancestor = Some(entry.column_id);
+            while let Some(column_id) = ancestor {
+                if !ancestors.insert(column_id) {
+                    return Err(DuckLakeError::InvalidConfig(format!(
+                        "cycle in DuckLake name mapping at column_id {column_id}"
+                    )));
+                }
+                ancestor = mapping.entries[by_id[&column_id]].parent_column;
+            }
+        }
+        Ok(Self {
+            entries: &mapping.entries,
+            children,
+        })
+    }
+
+    fn entry_for_target(
+        &self,
+        parent: Option<i64>,
+        target_field_id: i64,
+    ) -> Option<&DuckLakeNameMappingEntry> {
+        self.children.get(&parent)?.iter().find_map(|index| {
+            let entry = &self.entries[*index];
+            (entry.target_field_id == target_field_id).then_some(entry)
+        })
+    }
+}
+
+fn physical_mapped_field(
+    table: &TableFieldTree<'_>,
+    mapping: &NameMappingTree<'_>,
+    table_index: usize,
+    mapping_entry: &DuckLakeNameMappingEntry,
+) -> Result<Field> {
+    let logical = table.arrow_field(table_index, &mut HashSet::new())?;
+    let table_field = &table.fields[table_index];
+    let data_type = match logical.data_type() {
+        DataType::Struct(_) => {
+            let children = table
+                .children(table_field.column_id)
+                .map(|child_index| {
+                    let child = &table.fields[child_index];
+                    match mapping.entry_for_target(Some(mapping_entry.column_id), child.column_id) {
+                        Some(entry) => physical_mapped_field(table, mapping, child_index, entry),
+                        None => {
+                            let field = table.arrow_field(child_index, &mut HashSet::new())?;
+                            Ok(Field::new(
+                                format!("__ducklake_absent_field_{}", child.column_id),
+                                field.data_type().clone(),
+                                true,
+                            ))
+                        },
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            DataType::Struct(children.into())
+        },
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => {
+            let child_index = table
+                .children(table_field.column_id)
+                .next()
+                .ok_or_else(|| {
+                    DuckLakeError::InvalidConfig(format!(
+                        "DuckLake list column {} has no element",
+                        table_field.column_id
+                    ))
+                })?;
+            let child = &table.fields[child_index];
+            let mut element =
+                match mapping.entry_for_target(Some(mapping_entry.column_id), child.column_id) {
+                    Some(child_mapping) => {
+                        physical_mapped_field(table, mapping, child_index, child_mapping)?
+                    },
+                    None => table
+                        .arrow_field(child_index, &mut HashSet::new())?
+                        .with_name(format!("__ducklake_absent_field_{}", child.column_id))
+                        .with_nullable(true),
+                };
+            if matches!(element.name().as_str(), "array" | "element") {
+                element = element.with_name("list");
+            }
+            DataType::List(Arc::new(element))
+        },
+        DataType::Map(_, sorted) => {
+            let children = table
+                .children(table_field.column_id)
+                .enumerate()
+                .map(|(index, child_index)| {
+                    let child = &table.fields[child_index];
+                    let field = match mapping
+                        .entry_for_target(Some(mapping_entry.column_id), child.column_id)
+                    {
+                        Some(child_mapping) => {
+                            physical_mapped_field(table, mapping, child_index, child_mapping)?
+                        },
+                        None => table
+                            .arrow_field(child_index, &mut HashSet::new())?
+                            .with_name(format!("__ducklake_absent_field_{}", child.column_id))
+                            .with_nullable(true),
+                    };
+                    Ok(if index == 0 {
+                        field.with_nullable(false)
+                    } else {
+                        field
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(children.into()),
+                    false,
+                )),
+                *sorted,
+            )
+        },
+        data_type => data_type.clone(),
+    };
+    Ok(Field::new(
+        &mapping_entry.source_name,
+        data_type,
+        logical.is_nullable() || mapping_entry.parent_column.is_some(),
+    ))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HivePartitionField {
+    pub logical_name: String,
+    pub source_name: String,
+    pub data_type: DataType,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct NameMappingSchema {
+    pub schema: Schema,
+    pub names: HashMap<String, String>,
+    pub partitions: Vec<HivePartitionField>,
+}
+
+/// Build the per-file physical schema for a `map_by_name` mapping.
+///
+/// The returned partition fields identify Hive-derived values keyed by the
+/// current logical column name. The caller extracts and parses the path values
+/// because the resolved object-store path is available at scan planning time.
+pub fn build_read_schema_with_name_mapping(
+    fields: &[DuckLakeTableField],
+    mapping: &DuckLakeNameMapping,
+) -> Result<NameMappingSchema> {
+    let table = TableFieldTree::new(fields)?;
+    let mapping_tree = NameMappingTree::new(mapping)?;
+    let mut name_mapping = HashMap::new();
+    let mut partitions = Vec::new();
+    let read_fields = table
+        .roots()
+        .map(|table_index| {
+            let field = &table.fields[table_index];
+            let logical = table.arrow_field(table_index, &mut HashSet::new())?;
+            let Some(entry) = mapping_tree.entry_for_target(None, field.column_id) else {
+                let read_name = format!("__ducklake_absent_field_{}", field.column_id);
+                name_mapping.insert(read_name.clone(), field.column_name.clone());
+                return Ok(Field::new(read_name, logical.data_type().clone(), true));
+            };
+            if entry.is_partition {
+                let read_name = format!("__ducklake_partition_field_{}", field.column_id);
+                partitions.push(HivePartitionField {
+                    logical_name: field.column_name.clone(),
+                    source_name: entry.source_name.clone(),
+                    data_type: logical.data_type().clone(),
+                });
+                return Ok(Field::new(read_name, logical.data_type().clone(), true));
+            }
+            let physical = physical_mapped_field(&table, &mapping_tree, table_index, entry)?;
+            if physical.name() != &field.column_name {
+                name_mapping.insert(physical.name().clone(), field.column_name.clone());
+            }
+            Ok(physical)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(NameMappingSchema {
+        schema: Schema::new(read_fields),
+        names: name_mapping,
+        partitions,
+    })
+}
+
+/// Field-id mapping variant that takes the already-built logical schema. This
+/// supports recursive types without re-parsing their catalog type rows.
+pub fn build_read_schema_with_field_id_mapping_from_schema(
+    current_columns: &[DuckLakeTableColumn],
+    current_schema: &Schema,
+    parquet_field_ids: &HashMap<i32, String>,
+    file_schema: Option<&Schema>,
+) -> Result<(Schema, HashMap<String, String>)> {
+    if current_columns.len() != current_schema.fields().len() {
+        return Err(DuckLakeError::Internal(
+            "DuckLake columns and logical schema have different lengths".to_string(),
+        ));
+    }
+    let columns = current_columns
+        .iter()
+        .zip(current_schema.fields())
+        .map(|(column, logical)| {
+            let mut column = column.clone();
+            column.data_type = Some(logical.data_type().clone());
+            column
+        })
+        .collect::<Vec<_>>();
+    build_read_schema_with_field_id_mapping(&columns, parquet_field_ids, file_schema)
+}
+
 /// Extract field_id to column_name mapping from Parquet metadata.
 /// DuckLake column_id == Parquet field_id, enabling column matching after renames.
 pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, String> {
@@ -1159,6 +1559,260 @@ pub fn build_read_schema_with_field_id_mapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    fn mapped_fields() -> Vec<DuckLakeTableField> {
+        vec![
+            DuckLakeTableField {
+                column_id: 1,
+                column_name: "id".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: false,
+                parent_column: None,
+            },
+            DuckLakeTableField {
+                column_id: 2,
+                column_name: "nested".to_string(),
+                column_type: "struct".to_string(),
+                is_nullable: true,
+                parent_column: None,
+            },
+            DuckLakeTableField {
+                column_id: 3,
+                column_name: "a".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+                parent_column: Some(2),
+            },
+            DuckLakeTableField {
+                column_id: 4,
+                column_name: "b".to_string(),
+                column_type: "varchar".to_string(),
+                is_nullable: true,
+                parent_column: Some(2),
+            },
+            DuckLakeTableField {
+                column_id: 5,
+                column_name: "part".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+                parent_column: None,
+            },
+        ]
+    }
+
+    fn name_mapping(mapping_type: &str) -> DuckLakeNameMapping {
+        DuckLakeNameMapping {
+            mapping_id: 7,
+            table_id: 11,
+            mapping_type: mapping_type.to_string(),
+            entries: vec![
+                DuckLakeNameMappingEntry {
+                    column_id: 10,
+                    source_name: "source_id".to_string(),
+                    target_field_id: 1,
+                    parent_column: None,
+                    is_partition: false,
+                },
+                DuckLakeNameMappingEntry {
+                    column_id: 11,
+                    source_name: "source_nested".to_string(),
+                    target_field_id: 2,
+                    parent_column: None,
+                    is_partition: false,
+                },
+                DuckLakeNameMappingEntry {
+                    column_id: 12,
+                    source_name: "source_b".to_string(),
+                    target_field_id: 4,
+                    parent_column: Some(11),
+                    is_partition: false,
+                },
+                DuckLakeNameMappingEntry {
+                    column_id: 13,
+                    source_name: "source_a".to_string(),
+                    target_field_id: 3,
+                    parent_column: Some(11),
+                    is_partition: false,
+                },
+                DuckLakeNameMappingEntry {
+                    column_id: 14,
+                    source_name: "part".to_string(),
+                    target_field_id: 5,
+                    parent_column: None,
+                    is_partition: true,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn builds_recursive_name_mapping_schema() {
+        let fields = mapped_fields();
+        let logical = build_arrow_schema_from_fields(&fields).unwrap();
+        assert_eq!(logical.fields().len(), 3);
+        assert_eq!(logical.field(0).name(), "id");
+        let DataType::Struct(children) = logical.field(1).data_type() else {
+            panic!("nested must be a struct");
+        };
+        assert_eq!(children[0].name(), "a");
+        assert_eq!(children[1].name(), "b");
+
+        let mapped =
+            build_read_schema_with_name_mapping(&fields, &name_mapping("map_by_name")).unwrap();
+        assert_eq!(mapped.schema.fields().len(), 3);
+        assert_eq!(mapped.schema.field(0).name(), "source_id");
+        assert_eq!(
+            mapped.names.get("source_id").map(String::as_str),
+            Some("id")
+        );
+        let DataType::Struct(children) = mapped.schema.field(1).data_type() else {
+            panic!("mapped nested must be a struct");
+        };
+        assert_eq!(children[0].name(), "source_a");
+        assert_eq!(children[1].name(), "source_b");
+        assert_eq!(
+            mapped.partitions,
+            vec![HivePartitionField {
+                logical_name: "part".to_string(),
+                source_name: "part".to_string(),
+                data_type: DataType::Int32,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_name_mapping_type() {
+        let error =
+            build_read_schema_with_name_mapping(&mapped_fields(), &name_mapping("map_by_position"))
+                .unwrap_err();
+        assert!(error.to_string().contains("map_by_position"));
+    }
+
+    #[test]
+    fn rejects_missing_name_mapping_parent() {
+        let mut mapping = name_mapping("map_by_name");
+        mapping.entries[2].parent_column = Some(999);
+        let error = build_read_schema_with_name_mapping(&mapped_fields(), &mapping).unwrap_err();
+        assert!(error.to_string().contains("missing parent_column 999"));
+    }
+
+    #[rstest]
+    fn name_mapping_uses_first_duplicate_entry() {
+        let mut mapping = name_mapping("map_by_name");
+        mapping.entries.push(DuckLakeNameMappingEntry {
+            column_id: 10,
+            source_name: "ignored_column_id_duplicate".to_string(),
+            target_field_id: 5,
+            parent_column: Some(999),
+            is_partition: false,
+        });
+        mapping.entries.push(DuckLakeNameMappingEntry {
+            column_id: 15,
+            source_name: "ignored_target_duplicate".to_string(),
+            target_field_id: 1,
+            parent_column: None,
+            is_partition: false,
+        });
+
+        let mapped = build_read_schema_with_name_mapping(&mapped_fields(), &mapping).unwrap();
+
+        assert_eq!(mapped.schema.field(0).name(), "source_id");
+        assert_eq!(mapped.partitions.len(), 1);
+    }
+
+    #[rstest]
+    fn mapped_nested_fields_use_read_compatible_nullability() {
+        let mut fields = mapped_fields();
+        fields[2].is_nullable = false;
+
+        let mapped =
+            build_read_schema_with_name_mapping(&fields, &name_mapping("map_by_name")).unwrap();
+        let DataType::Struct(children) = mapped.schema.field(1).data_type() else {
+            panic!("mapped nested must be a struct");
+        };
+
+        assert!(children[0].is_nullable());
+    }
+
+    #[rstest]
+    fn mapped_list_and_map_allow_omitted_children() {
+        let fields = vec![
+            DuckLakeTableField {
+                column_id: 1,
+                column_name: "items".to_string(),
+                column_type: "list".to_string(),
+                is_nullable: true,
+                parent_column: None,
+            },
+            DuckLakeTableField {
+                column_id: 2,
+                column_name: "element".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+                parent_column: Some(1),
+            },
+            DuckLakeTableField {
+                column_id: 3,
+                column_name: "properties".to_string(),
+                column_type: "map".to_string(),
+                is_nullable: true,
+                parent_column: None,
+            },
+            DuckLakeTableField {
+                column_id: 4,
+                column_name: "key".to_string(),
+                column_type: "varchar".to_string(),
+                is_nullable: true,
+                parent_column: Some(3),
+            },
+            DuckLakeTableField {
+                column_id: 5,
+                column_name: "value".to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+                parent_column: Some(3),
+            },
+        ];
+        let mapping = DuckLakeNameMapping {
+            mapping_id: 1,
+            table_id: 1,
+            mapping_type: "map_by_name".to_string(),
+            entries: vec![
+                DuckLakeNameMappingEntry {
+                    column_id: 10,
+                    source_name: "source_items".to_string(),
+                    target_field_id: 1,
+                    parent_column: None,
+                    is_partition: false,
+                },
+                DuckLakeNameMappingEntry {
+                    column_id: 11,
+                    source_name: "source_properties".to_string(),
+                    target_field_id: 3,
+                    parent_column: None,
+                    is_partition: false,
+                },
+            ],
+        };
+
+        let mapped = build_read_schema_with_name_mapping(&fields, &mapping).unwrap();
+        let DataType::List(element) = mapped.schema.field(0).data_type() else {
+            panic!("items must be a list");
+        };
+        assert_eq!(element.name(), "__ducklake_absent_field_2");
+        assert!(element.is_nullable());
+        let DataType::Map(entries, _) = mapped.schema.field(1).data_type() else {
+            panic!("properties must be a map");
+        };
+        let DataType::Struct(children) = entries.data_type() else {
+            panic!("map entries must be a struct");
+        };
+        assert_eq!(children[0].name(), "__ducklake_absent_field_4");
+        assert!(!children[0].is_nullable());
+        assert_eq!(children[1].name(), "__ducklake_absent_field_5");
+        assert!(children[1].is_nullable());
+    }
 
     #[test]
     fn test_build_read_schema_with_renamed_columns() {

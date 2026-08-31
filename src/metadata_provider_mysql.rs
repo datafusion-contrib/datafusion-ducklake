@@ -3,13 +3,14 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableFile, DuckLakeTableStatistics,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
+    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, InlinedDataBackend, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES,
-    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
-    inlined_text_projection, is_inlined_data_table, parse_inlined_rows, reconstruct_columns,
-    reconstruct_columns_with_table,
+    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
+    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
+    parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -55,6 +56,7 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
                 file_size_bytes: row.try_get(11)?,
                 footer_size: row.try_get(12)?,
                 encryption_key: row.try_get(13)?,
+                mapping_id: None,
             }),
             row.try_get(14)?,
         )
@@ -69,6 +71,7 @@ fn decode_table_file(row: &MySqlRow, snapshot_id: i64) -> Result<DuckLakeTableFi
             file_size_bytes: row.try_get(3)?,
             footer_size: row.try_get(4)?,
             encryption_key: row.try_get(5)?,
+            mapping_id: row.try_get(15).unwrap_or(None),
         },
         delete_file_id,
         delete_file,
@@ -329,20 +332,12 @@ impl MetadataProvider for MySqlMetadataProvider {
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeTableColumn>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
-                        initial_default, default_value, default_value_type, default_value_dialect
-                 FROM ducklake_column
-                 WHERE table_id = ?
-                   AND ? >= begin_snapshot
-                   AND (? < end_snapshot OR end_snapshot IS NULL)
-                 ORDER BY column_order",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+            let rows = sqlx::query(SQL_GET_TABLE_COLUMNS)
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await?;
 
             let raw: Result<Vec<(DuckLakeTableColumn, Option<i64>)>> = rows
                 .into_iter()
@@ -370,6 +365,76 @@ impl MetadataProvider for MySqlMetadataProvider {
         })
     }
 
+    fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+                 FROM ducklake_column
+                 WHERE table_id = ?
+                   AND ? >= begin_snapshot
+                   AND (? < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY column_order",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeTableField {
+                        column_id: row.try_get(0)?,
+                        column_name: row.try_get(1)?,
+                        column_type: row.try_get(2)?,
+                        is_nullable: row.try_get::<Option<bool>, _>(3)?.unwrap_or(true),
+                        parent_column: row.try_get(4)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT mapping.mapping_id, mapping.table_id, mapping.type,
+                        name.column_id, name.source_name, name.target_field_id,
+                        name.parent_column, name.is_partition
+                 FROM ducklake_column_mapping AS mapping
+                 JOIN ducklake_name_mapping AS name
+                   ON name.mapping_id = mapping.mapping_id
+                 WHERE mapping.mapping_id = ?
+                 ORDER BY name.parent_column IS NOT NULL, name.parent_column, name.column_id",
+            )
+            .bind(mapping_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let first = rows.first().ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "DuckLake name mapping {mapping_id} does not exist"
+                ))
+            })?;
+            let mut entries = Vec::new();
+            for row in &rows {
+                if let Some(column_id) = row.try_get::<Option<i64>, _>(3)? {
+                    entries.push(DuckLakeNameMappingEntry {
+                        column_id,
+                        source_name: row.try_get(4)?,
+                        target_field_id: row.try_get(5)?,
+                        parent_column: row.try_get(6)?,
+                        is_partition: row.try_get::<Option<bool>, _>(7)?.unwrap_or(false),
+                    });
+                }
+            }
+            Ok(DuckLakeNameMapping {
+                mapping_id: first.try_get(0)?,
+                table_id: first.try_get(1)?,
+                mapping_type: first.try_get(2)?,
+                entries,
+            })
+        })
+    }
+
     fn get_table_files_for_select(
         &self,
         table_id: i64,
@@ -392,7 +457,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                     del.file_size_bytes AS delete_file_size,
                     del.footer_size AS delete_footer_size,
                     del.encryption_key AS delete_encryption_key,
-                    del.delete_count
+                    del.delete_count,
+                    data.mapping_id
                 FROM ducklake_data_file AS data
                 LEFT JOIN ducklake_delete_file AS del
                     ON data.data_file_id = del.data_file_id
@@ -511,7 +577,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                         data.row_id_start, data.record_count,
                         del.delete_file_id, del.path, del.path_is_relative,
                         del.file_size_bytes, del.footer_size, del.encryption_key,
-                        del.delete_count
+                        del.delete_count,
+                        data.mapping_id
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
                    ON data.data_file_id = del.data_file_id
@@ -919,7 +986,12 @@ impl MetadataProvider for MySqlMetadataProvider {
                             .collect::<std::result::Result<Vec<_>, _>>()
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                batches.push(parse_inlined_rows(schema.clone(), columns, rows)?);
+                batches.push(parse_inlined_rows_with_present(
+                    schema.clone(),
+                    columns,
+                    rows,
+                    Some(&present),
+                )?);
             }
             Ok(batches)
         })
@@ -1258,6 +1330,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         file_size_bytes: row.try_get(5)?,
                         footer_size: row.try_get(6)?,
                         encryption_key: row.try_get(7)?,
+                        mapping_id: None,
                     };
 
                     let delete_file = if row.try_get::<Option<i64>, _>(8)?.is_some() {
@@ -1267,6 +1340,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                             file_size_bytes: row.try_get(11)?,
                             footer_size: row.try_get(12)?,
                             encryption_key: row.try_get(13)?,
+                            mapping_id: None,
                         })
                     } else {
                         None
@@ -1319,7 +1393,8 @@ impl MetadataProvider for MySqlMetadataProvider {
                     data.footer_size,
                     data.encryption_key,
                     data.row_id_start,
-                    {pm}
+                    {pm},
+                    data.mapping_id
                 FROM ducklake_data_file AS data
                 WHERE data.table_id = ?
                   AND data.begin_snapshot <= ?
@@ -1345,6 +1420,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                         encryption_key: row.try_get(5)?,
                         row_id_start: row.try_get(6)?,
                         partial_max: row.try_get(7)?,
+                        mapping_id: row.try_get(8)?,
                     })
                 })
                 .collect()
