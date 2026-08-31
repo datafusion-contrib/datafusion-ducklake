@@ -576,7 +576,9 @@ pub(crate) fn sorted_rewrite_batches(
 /// the compaction writer consumes.
 ///
 /// That coalesce emits partitions interleaved by arrival, so an unsorted merge's
-/// physical row order depends on which object-store request returned first. This
+/// physical row order depends on which object-store request returned first. The
+/// same now applies to a single-file `rewrite_data_files`, whose scan is split
+/// across byte ranges: its output order is no longer the source order. This
 /// matches official DuckLake, which sets `DONT_PRESERVE_ORDER` on exactly this
 /// copy (`ducklake_compaction_functions.cpp`), and costs nothing that is load
 /// bearing: a compaction output carries each row's rowid and origin snapshot as

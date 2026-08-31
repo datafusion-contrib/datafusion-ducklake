@@ -308,15 +308,18 @@ impl TableDeletionsTable {
             &layout,
             &embedded_name,
         )?;
-        debug_assert!(
-            crate::row_id::validate_row_pos_field(
-                "correlate_deletions",
-                pos_col_idx,
-                &data_file_exec.schema().fields()[pos_col_idx]
-            )
-            .is_ok(),
-            "`pos_col_idx` arithmetic must land on the reader-produced position column"
-        );
+        #[cfg(debug_assertions)]
+        {
+            let schema = data_file_exec.schema();
+            let field = schema.fields().get(pos_col_idx).unwrap_or_else(|| {
+                panic!(
+                    "pos_col_idx {pos_col_idx} is out of range for a scan of {} columns",
+                    schema.fields().len()
+                )
+            });
+            crate::row_id::validate_row_pos_field("correlate_deletions", pos_col_idx, field)
+                .expect("`pos_col_idx` arithmetic must land on the position column");
+        }
 
         // Validate record_count before use — a negative value from corrupt metadata
         // would cause incorrect behavior (e.g., empty ranges in full-file deletes).

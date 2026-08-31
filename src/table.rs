@@ -719,14 +719,19 @@ struct FileReadConfig {
     /// Number of row groups in the file. A scan cannot usefully be split into
     /// more partitions than this — see [`DuckLakeTable::split_across_partitions`].
     row_group_count: usize,
-    /// True when the FILE gives at least one catalog column a different physical
-    /// name — i.e. a real rename or an absent-column placeholder.
+    /// Catalog column indices whose physical name in THIS file differs from the
+    /// catalog name — a rename, or the placeholder given to a column the file
+    /// predates.
     ///
-    /// Distinct from `!name_mapping.is_empty()`, which is also true for the
-    /// synthetic `_ducklake_internal_row_id -> rowid` entry every embedded-rowid
-    /// file gets. Callers that care whether a *data* column is renamed (see
-    /// [`DuckLakeTable::predicate_is_prunable`]) must use this instead.
-    renames_data_columns: bool,
+    /// Indices rather than a flag, and derived positionally rather than from
+    /// `name_mapping`, for two reasons. `name_mapping` also carries the
+    /// synthetic `_ducklake_internal_row_id -> rowid` entry that every
+    /// embedded-rowid file gets, so its emptiness says nothing about data
+    /// columns. And a whole-file flag would refuse pushdown for every predicate
+    /// on a file that has had any `ADD COLUMN`, however unrelated — see
+    /// [`DuckLakeTable::predicate_is_prunable`], which rejects only a predicate
+    /// that actually references one of these.
+    renamed_column_indices: Arc<HashSet<usize>>,
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
@@ -2118,20 +2123,20 @@ impl DuckLakeTable {
     ///   handed a bare [`DuckLakeFileData`] and has none. Plumbing them through
     ///   would let float predicates prune here too.
     ///
-    /// - **A file that gives any data column a different physical name
-    ///   disqualifies every predicate.** The predicate carries catalog column
-    ///   *names*, and the reader resolves a pushed predicate by name against the
-    ///   file's schema, which uses the physical names. There is no
-    ///   `ColumnRenameExec` on this path to rewrite them (`resolve_positions`
-    ///   evaluates positionally instead), so a renamed column would simply fail
-    ///   to bind — and an unbindable column folds the predicate to false, which
-    ///   prunes every row group and deletes nothing.
+    /// - **A predicate referencing a column this file names differently is
+    ///   disqualified.** The predicate carries catalog column *names*, and the
+    ///   reader resolves a pushed predicate by name against the file's schema,
+    ///   which uses the physical names. There is no `ColumnRenameExec` on this
+    ///   path to rewrite them (`resolve_positions` evaluates positionally
+    ///   instead), so such a column would fail to bind — and an unbindable
+    ///   column folds the predicate to false, which prunes every row group and
+    ///   deletes nothing.
     ///
-    ///   This reads [`FileReadConfig::renames_data_columns`], not
-    ///   `name_mapping`: the latter also carries the synthetic
-    ///   `_ducklake_internal_row_id -> rowid` entry that EVERY file written by
-    ///   `UPDATE` or compaction has, which would disable pruning on exactly the
-    ///   files most likely to be mutated again.
+    ///   Only the columns the predicate actually references matter, hence
+    ///   [`FileReadConfig::renamed_column_indices`] rather than a per-file flag:
+    ///   a file older than any `ADD COLUMN` names that column with a
+    ///   placeholder, and refusing every predicate on such a file would give up
+    ///   pruning on the whole history of a table that has ever gained a column.
     ///
     /// Both rejections fall back to scanning the whole file, which is what this
     /// path always did — never to a wrong answer.
@@ -2143,27 +2148,23 @@ impl DuckLakeTable {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
         use datafusion::physical_expr::expressions::Column;
 
-        if file_cfg.renames_data_columns {
-            return false;
-        }
-
         let mut prunable = true;
         predicate
             .apply(|expr| {
                 let Some(column) = expr.downcast_ref::<Column>() else {
                     return Ok(TreeNodeRecursion::Continue);
                 };
-                let is_float = self
-                    .physical_schema
-                    .fields()
-                    .get(column.index())
-                    .is_some_and(|field| {
-                        matches!(
-                            field.data_type(),
-                            DataType::Float16 | DataType::Float32 | DataType::Float64
-                        )
-                    });
-                if is_float {
+                // An index outside the physical schema cannot be resolved, so
+                // treat it as unsafe rather than assuming it is fine.
+                let Some(field) = self.physical_schema.fields().get(column.index()) else {
+                    prunable = false;
+                    return Ok(TreeNodeRecursion::Stop);
+                };
+                let is_float = matches!(
+                    field.data_type(),
+                    DataType::Float16 | DataType::Float32 | DataType::Float64
+                );
+                if is_float || file_cfg.renamed_column_indices.contains(&column.index()) {
                     prunable = false;
                     return Ok(TreeNodeRecursion::Stop);
                 }
@@ -2360,10 +2361,23 @@ impl DuckLakeTable {
             layout.read_schema.clone()
         };
 
+        // A catalog column reads under a different physical name when the file
+        // renamed it or predates it. `layout.read_schema` is one field per
+        // current column in catalog order, so the comparison is positional.
+        let renamed_column_indices: HashSet<usize> = self
+            .physical_schema
+            .fields()
+            .iter()
+            .zip(layout.read_schema.fields())
+            .enumerate()
+            .filter(|(_, (catalog, physical))| catalog.name() != physical.name())
+            .map(|(index, _)| index)
+            .collect();
+
         let cfg = Arc::new(FileReadConfig {
             read_schema,
             row_group_count: layout.row_group_count,
-            renames_data_columns: !layout.name_mapping.is_empty(),
+            renamed_column_indices: Arc::new(renamed_column_indices),
             name_mapping,
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
@@ -4580,18 +4594,19 @@ mod tests {
         )?;
         let predicate = physical_predicate(&table, col("id").eq(lit(5_i64)));
 
-        let cfg = |renames_data_columns, mapping: Vec<(&str, &str)>| FileReadConfig {
+        let cfg = |renamed: Vec<usize>, mapping: Vec<(&str, &str)>| FileReadConfig {
             read_schema: table.physical_schema.clone(),
             name_mapping: mapping
                 .into_iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
             row_group_count: 4,
-            renames_data_columns,
+            renamed_column_indices: Arc::new(renamed.into_iter().collect()),
             embedded_rowid_parquet_name: None,
             embedded_snapshot_parquet_name: None,
             drops_current_columns: false,
         };
+        let id_index = table.physical_schema.index_of("id").unwrap();
 
         // A file written by UPDATE / compaction: one mapping entry, but no data
         // column is renamed. Must still prune.
@@ -4599,7 +4614,7 @@ mod tests {
             table.predicate_is_prunable(
                 &predicate,
                 &cfg(
-                    false,
+                    vec![],
                     vec![(
                         crate::row_id::EMBEDDED_ROW_ID_COLUMN_NAME,
                         ROWID_COLUMN_NAME
@@ -4609,15 +4624,25 @@ mod tests {
             "the synthetic rowid rename must not disable pruning"
         );
 
-        // A real rename: the predicate carries catalog names the file does not
-        // have, so it must not be pushed.
+        // The predicate's own column reads under a different physical name, so
+        // it cannot bind in the reader and must not be pushed.
         assert!(
-            !table.predicate_is_prunable(&predicate, &cfg(true, vec![("old_id", "id")])),
-            "a renamed data column must disable pruning"
+            !table.predicate_is_prunable(&predicate, &cfg(vec![id_index], vec![])),
+            "a predicate on a renamed column must disable pruning"
         );
 
-        // No mapping at all: prunable.
-        assert!(table.predicate_is_prunable(&predicate, &cfg(false, vec![])));
+        // A DIFFERENT column is renamed or absent — the shape a file older than
+        // an `ADD COLUMN` has. The predicate never references it, so pruning
+        // stands. (This fixture's table has one column, so the unrelated index
+        // is synthetic; what matters is that it is not the one the predicate
+        // references.)
+        assert!(
+            table.predicate_is_prunable(&predicate, &cfg(vec![id_index + 1], vec![])),
+            "an unrelated renamed/absent column must not disable pruning"
+        );
+
+        // Nothing renamed: prunable.
+        assert!(table.predicate_is_prunable(&predicate, &cfg(vec![], vec![])));
         Ok(())
     }
 

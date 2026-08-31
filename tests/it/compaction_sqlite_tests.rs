@@ -2444,3 +2444,73 @@ async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
         "the row appended at snapshot 2 must still be visible at snapshot 2: {at_two:?}"
     );
 }
+
+/// Compaction under a scan split across partitions.
+///
+/// `merge_adjacent_files` builds one source scan per file in the bin, and each
+/// of those now asks for its own byte-range split — so the fan-out is the
+/// product, and this is the path where a positional error would be widest.
+/// Nothing else in the suite runs compaction with splitting on: the other
+/// fixtures are far below `repartition_file_min_size`, so their plans stay
+/// single-partition however the config is set.
+///
+/// Every rowid must survive the merge, and every row must be present exactly
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn merge_preserves_lineage_when_sources_are_split_across_partitions() {
+    let temp = TempDir::new().unwrap();
+
+    // Files large enough that DataFusion will actually split them, and written
+    // in small row groups so a split has boundaries to land on.
+    const PER_FILE: i32 = 60_000;
+    let ids: Vec<i32> = (0..PER_FILE).collect();
+    let vals: Vec<i32> = ids.iter().map(|i| i * 2).collect();
+    seed(&temp, ids.clone(), vals.clone()).await;
+    let ids2: Vec<i32> = (PER_FILE..PER_FILE * 2).collect();
+    let vals2: Vec<i32> = ids2.iter().map(|i| i * 2).collect();
+    append(&temp, ids2.clone(), vals2.clone()).await;
+
+    let mut cfg = datafusion::config::ConfigOptions::new();
+    cfg.execution.target_partitions = 8;
+    cfg.optimizer.repartition_file_scans = true;
+    cfg.optimizer.repartition_file_min_size = 1;
+    let ctx = SessionContext::new_with_config(datafusion::prelude::SessionConfig::from(cfg));
+
+    let result = with_writable_table_context(&temp, ctx, |table, state| async move {
+        table
+            .merge_adjacent_files(&state, MergeOptions::default())
+            .await
+            .unwrap()
+    })
+    .await;
+    assert_eq!(
+        result.files_processed, 2,
+        "both source files must be merged"
+    );
+    assert!(
+        result.files_created > 0,
+        "the merge must actually write output"
+    );
+    assert_eq!(result.rows_written, i64::from(PER_FILE) * 2);
+
+    // Every row survives exactly once, with its value intact.
+    let mut rows = read_rows(&temp).await;
+    rows.sort_unstable();
+    let mut expected: Vec<(i32, i32)> =
+        ids.iter().chain(ids2.iter()).map(|&i| (i, i * 2)).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        rows, expected,
+        "merge under a split scan must not lose or duplicate rows"
+    );
+
+    // And rowid lineage is intact: each id keeps a distinct rowid.
+    let id_rowid = read_id_rowid(&temp).await;
+    assert_eq!(id_rowid.len(), (PER_FILE * 2) as usize);
+    let distinct: std::collections::HashSet<i64> = id_rowid.iter().map(|(_, r)| *r).collect();
+    assert_eq!(
+        distinct.len(),
+        id_rowid.len(),
+        "every merged row must keep a distinct rowid"
+    );
+}

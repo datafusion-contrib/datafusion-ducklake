@@ -1170,15 +1170,18 @@ impl TableChangesTable {
                 });
             let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
             let scan = self.build_insert_scan(df, layout, resolve_rowid)?;
-            debug_assert!(
-                pos_col_idx.is_none_or(|idx| crate::row_id::validate_row_pos_field(
-                    "build_insert_units",
-                    idx,
-                    &scan.schema().fields()[idx]
-                )
-                .is_ok()),
-                "`pos_col_idx` arithmetic must land on the reader-produced position column"
-            );
+            #[cfg(debug_assertions)]
+            if let Some(idx) = pos_col_idx {
+                let schema = scan.schema();
+                let field = schema.fields().get(idx).unwrap_or_else(|| {
+                    panic!(
+                        "pos_col_idx {idx} is out of range for a scan of {} columns",
+                        schema.fields().len()
+                    )
+                });
+                crate::row_id::validate_row_pos_field("build_insert_units", idx, field)
+                    .expect("`pos_col_idx` arithmetic must land on the position column");
+            }
             insert_units.push(InsertUnit {
                 snapshot_id: df.begin_snapshot,
                 scan,
@@ -1269,15 +1272,18 @@ impl TableChangesTable {
                 // The positional scan reads every column in order:
                 // `[table columns, embedded rowid?, position]`.
                 let pos_col_idx = table_len + usize::from(old_embedded.is_some());
-                debug_assert!(
-                    crate::row_id::validate_row_pos_field(
-                        "build_delete_units",
-                        pos_col_idx,
-                        &data_scan.schema().fields()[pos_col_idx]
-                    )
-                    .is_ok(),
-                    "`pos_col_idx` arithmetic must land on the reader-produced position column"
-                );
+                #[cfg(debug_assertions)]
+                {
+                    let schema = data_scan.schema();
+                    let field = schema.fields().get(pos_col_idx).unwrap_or_else(|| {
+                        panic!(
+                            "pos_col_idx {pos_col_idx} is out of range for a scan of {} columns",
+                            schema.fields().len()
+                        )
+                    });
+                    crate::row_id::validate_row_pos_field("build_delete_units", pos_col_idx, field)
+                        .expect("`pos_col_idx` arithmetic must land on the position column");
+                }
                 delete_units.push(DeleteUnit {
                     snapshot_id: dfc.snapshot_id,
                     data_scan,
