@@ -282,3 +282,19 @@ cargo test concurrent         # Concurrency tests only
 cargo test --ignored          # Performance benchmarks
 cargo test --test it foo::     # One former test file, by module prefix
 ```
+
+### CHANGELOG entries
+
+Keep `CHANGELOG.md` short. One entry is one line — the user-visible change plus its issue
+refs, wrapping at the file's ~95-column width. Two lines is the ceiling.
+
+- No mechanism, no root-cause narrative, no "why this was quiet", no code blocks. That
+  belongs in the PR body and the commit message, which is where it is already written.
+- A **BREAKING** entry may add one sentence naming the migration (what to change, and
+  whether a catalog or data migration is needed) — not a rationale for the design.
+- Open questions and maintainer decisions do not go here. File an issue.
+- Group entries under `Added` / `Changed` / `Fixed` as now. Several entries from one PR are
+  fine when each is a distinct user-visible fact; don't restate the same fact per surface.
+
+A reader scans a changelog to find whether a release affects them. Anything they cannot act
+on makes that slower.
