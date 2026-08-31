@@ -101,20 +101,53 @@ impl ColumnRenameExec {
                 })
     }
 
+    /// Returns whether every output column is a type-preserving relabel of an
+    /// input column, allowing input columns the output does not carry to be
+    /// **dropped**.
+    ///
+    /// Weaker than [`Self::is_pure_type_preserving_rename`], which additionally
+    /// requires equal field counts. On a positional scan this node drops the
+    /// internal physical-position column, so the counts always differ — yet a
+    /// predicate over the columns that *do* survive still means exactly the same
+    /// thing on either side of the node, because each is a relabel of one input
+    /// column at an unchanged type.
+    ///
+    /// Sufficient for filter pushdown. NOT used for limit pushdown, which keeps
+    /// the stricter predicate: there is no need to widen it, and a `LIMIT` would
+    /// stop at `DeleteFilterExec` below regardless.
+    pub fn is_type_preserving_projection(&self) -> bool {
+        let input_schema = self.input.schema();
+        self.output_schema.fields().iter().all(|output| {
+            let input_name = self
+                .reverse_mapping
+                .get(output.name())
+                .map(String::as_str)
+                .unwrap_or(output.name());
+            input_schema.field_with_name(input_name).is_ok_and(|input| {
+                types_equal_ignoring_field_metadata(input.data_type(), output.data_type())
+            })
+        })
+    }
+
     /// Remap a predicate over the catalog schema to the physical child schema.
     ///
-    /// This is intentionally available only for a pure, type-preserving rename:
-    /// pushing predicates through casts can change errors and comparison
-    /// semantics, while projections and synthetic columns need richer mapping.
+    /// Rewrites column **names** only. Column indices are left as they are
+    /// because [`ChildFilterDescription::from_child`] re-resolves every column
+    /// against the child schema by name; the output and input indices differ
+    /// whenever this node drops or reorders columns, so rewriting them here
+    /// would be both redundant and wrong.
+    ///
+    /// Available only for a type-preserving projection: pushing predicates
+    /// through casts can change errors and comparison semantics, and a filter
+    /// referencing a column this node synthesizes has nothing to bind to below.
     pub fn remap_filter_to_input(
         &self,
         filter: Arc<dyn PhysicalExpr>,
     ) -> DataFusionResult<Option<Arc<dyn PhysicalExpr>>> {
-        if !self.is_pure_type_preserving_rename() {
+        if !self.is_type_preserving_projection() {
             return Ok(None);
         }
 
-        let input_schema = self.input.schema();
         let output_schema = Arc::clone(&self.output_schema);
         let mut valid = true;
         let transformed = filter.transform_down(|expr| {
@@ -131,10 +164,12 @@ impl ColumnRenameExec {
                 return Ok(Transformed::complete(expr));
             }
 
-            Ok(Transformed::yes(Arc::new(Column::new(
-                input_schema.field(index).name(),
-                index,
-            ))))
+            let input_name = self
+                .reverse_mapping
+                .get(column.name())
+                .map(String::as_str)
+                .unwrap_or(column.name());
+            Ok(Transformed::yes(Arc::new(Column::new(input_name, index))))
         })?;
 
         Ok(valid.then_some(transformed.data))
@@ -195,7 +230,7 @@ impl ExecutionPlan for ColumnRenameExec {
         parent_filters: Vec<Arc<dyn PhysicalExpr>>,
         _config: &ConfigOptions,
     ) -> DataFusionResult<FilterDescription> {
-        if !self.is_pure_type_preserving_rename() {
+        if !self.is_type_preserving_projection() {
             return Ok(FilterDescription::new()
                 .with_child(ChildFilterDescription::all_unsupported(&parent_filters)));
         }

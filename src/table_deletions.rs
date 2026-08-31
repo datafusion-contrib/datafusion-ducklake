@@ -14,11 +14,11 @@
 //! internal and executed directly — the delete files are fully collected (the
 //! position set must be complete before any data row can be classified), then
 //! the data file is streamed batch-by-batch through the filter. Deleted rows
-//! are matched by TRUE physical file position (`PositionalFileSource` +
-//! [`FileRowNumberExec`]) rather than stream arrival order. Exposing the scans
-//! as children lets the optimizer repartition them (round-robin or byte-range
-//! splits), which desynchronizes the delete-position set from the data rows —
-//! deletions were silently missed or mis-attributed (issue #178).
+//! are matched by TRUE physical file position — the column the parquet reader
+//! produces — rather than stream arrival order. Exposing the scans as children
+//! lets the optimizer repartition them (round-robin or byte-range splits),
+//! which desynchronizes the delete-position set from the data rows — deletions
+//! were silently missed or mis-attributed (issue #178).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -52,8 +52,7 @@ use futures::{StreamExt, TryStreamExt};
 
 use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::positional_source::PositionalFileSource;
-use crate::row_id::{FileRowNumberExec, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::row_id::{ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema};
 use crate::table::{
     ParquetFileLayout, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
     validated_record_count,
@@ -309,6 +308,13 @@ impl TableDeletionsTable {
             &layout,
             &embedded_name,
         )?;
+        debug_assert_eq!(
+            data_file_exec.schema().fields().len() - 1,
+            pos_col_idx,
+            "the positional scan appends the physical-position column last, which \
+             must be where `pos_col_idx` arithmetic expects it; all the internal \
+             columns are Int64, so a misalignment would read the wrong one silently"
+        );
 
         // Validate record_count before use — a negative value from corrupt metadata
         // would cause incorrect behavior (e.g., empty ranges in full-file deletes).
@@ -397,13 +403,19 @@ impl TableDeletionsTable {
     }
 
     /// Positional scan of the source data file: table columns, the embedded
-    /// rowid column when `embedded_name` is `Some`, and the internal
-    /// physical-position column ([`ROW_POS_COLUMN_NAME`]). [`PositionalFileSource`]
-    /// and [`FileRowNumberExec`] guarantee true physical positions, so deleted
-    /// rows are matched to the delete file's `pos` set regardless of how the
-    /// file is read (issue #178).
-    /// The table columns are read under the physical names THIS file gives them
-    /// and presented back under the catalog schema, above [`FileRowNumberExec`] so
+    /// rowid column when `embedded_name` is `Some`, and the reader-produced
+    /// physical-position column ([`ROW_POS_COLUMN_NAME`]) appended last.
+    ///
+    /// Positions come from the parquet reader, so deleted rows are matched to
+    /// the delete file's `pos` set regardless of how the file is read — pruned,
+    /// filtered, split or reordered (issue #178).
+    ///
+    /// The scan takes no explicit projection, so it reads every column of the
+    /// table schema in order: `[table columns, embedded rowid?, position]`. That
+    /// puts the position column at `table_len + embedded`, which is exactly what
+    /// `pos_col_idx` in `correlate_deletions` computes; see the debug assertion
+    /// there. The table columns are read under the physical names THIS file
+    /// gives them and presented back under the catalog schema, above the scan so
     /// the position column passes through.
     fn build_data_file_scan(
         &self,
@@ -430,19 +442,16 @@ impl TableDeletionsTable {
             None => Arc::clone(&layout.read_schema),
         };
 
-        let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
-        let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-            .with_file_group(FileGroup::new(vec![pf]))
-            // One file group == one output partition, so the scan is neither
-            // repartitioned nor work-stolen and `FileRowNumberExec` sees true
-            // physical positions.
-            .with_output_partitioning(Some(
-                datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-            ));
+        let (table_schema, _) = positional_table_schema(read_schema);
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(ParquetSource::new(table_schema)),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
         let table_fields: Vec<FieldRef> = self.table_schema.fields().iter().cloned().collect();
         Ok(present_catalog_schema(
-            Arc::new(FileRowNumberExec::new(scan, vec![0])),
+            scan,
             &table_fields,
             &layout.name_mapping,
         ))

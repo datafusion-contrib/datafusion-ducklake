@@ -205,9 +205,11 @@ fn create_catalog_with_encrypted_file(
         &base64::engine::general_purpose::STANDARD,
         encryption_key.as_bytes(),
     );
+    // `row_id_start` is recorded so a rowid-projected read has a real base to
+    // synthesize `row_id_start + physical position` from.
     conn.execute(
-        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, encryption_key, begin_snapshot)
-         VALUES (1, 1, ?, false, ?, ?, 1)",
+        "INSERT INTO ducklake_data_file (data_file_id, table_id, path, path_is_relative, file_size_bytes, encryption_key, begin_snapshot, row_id_start)
+         VALUES (1, 1, ?, false, ?, ?, 1, 0)",
         duckdb::params![parquet_abs_path, file_size as i64, key_base64],
     )?;
 
@@ -457,5 +459,56 @@ async fn test_change_feed_refuses_evolved_encrypted_table() -> anyhow::Result<()
         .await?;
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3, "the pre-rename window must still be readable");
+    Ok(())
+}
+
+/// A rowid-projected read of an encrypted file: the parquet reader must produce
+/// the virtual physical-position column *and* decrypt the data columns in the
+/// same scan.
+///
+/// DataFusion's opener stacks `with_virtual_columns` and
+/// `with_file_decryption_properties` onto one `ArrowReaderOptions`, and that
+/// combination has no upstream coverage — so pin it here rather than assume it.
+#[tokio::test]
+async fn test_rowid_on_pme_encrypted_parquet() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let parquet_path = temp_dir.path().join("encrypted_data.parquet");
+    let catalog_path = temp_dir.path().join("catalog.duckdb");
+
+    let file_size = create_encrypted_parquet_file(&parquet_path, TEST_ENCRYPTION_KEY)?;
+    let key_str = std::str::from_utf8(TEST_ENCRYPTION_KEY)?;
+    create_catalog_with_encrypted_file(&catalog_path, &parquet_path, file_size, key_str)?;
+
+    let ctx = SessionContext::new();
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
+    let catalog = DuckLakeCatalog::new(provider)?.with_row_lineage(true);
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    let batches = ctx
+        .sql("SELECT rowid, id FROM ducklake.main.encrypted_users ORDER BY id")
+        .await?
+        .collect()
+        .await?;
+
+    let mut pairs = Vec::new();
+    for batch in &batches {
+        let rowid = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .expect("rowid is Int64");
+        let id = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id is Int32");
+        for i in 0..batch.num_rows() {
+            pairs.push((rowid.value(i), id.value(i)));
+        }
+    }
+
+    // Rows were written in id order, so physical position is 0,1,2 and
+    // row_id_start is 0.
+    assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3)]);
     Ok(())
 }

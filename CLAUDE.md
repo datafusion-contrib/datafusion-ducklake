@@ -66,7 +66,9 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
    - `column_rename.rs`: reads Parquet files whose physical column names predate a rename
    - `table_changes.rs` / `table_deletions.rs`: change-data-capture between snapshots
-   - `positional_source.rs`: preserves physical row positions (used by rowid and delete filtering)
+   - physical row positions (used by rowid and delete filtering) come from the parquet
+     reader's `row_number` virtual column — see `row_id.rs::positional_table_schema` and
+     `docs/physical-row-positions.md`
 
 5. **Path Resolution** (`src/path_resolver.rs`)
    - Centralized utilities for parsing object store URLs and resolving hierarchical paths

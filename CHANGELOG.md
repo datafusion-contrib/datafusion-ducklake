@@ -15,9 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Read-only DuckLake views across metadata backends, with writer-compatible view metadata (#264).
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
+- Row lineage and positional deletes take the physical row position from the Parquet reader's
+  `row_number` virtual column, matching official DuckLake. Those scans now split one file across
+  partitions and push predicates into row-group / page / bloom pruning, which the previous
+  design had to refuse; `DELETE` / `UPDATE` position resolution prunes too (#130).
 
 ### Changed
 
+- **BREAKING**: `FileRowNumberExec` is removed and `DeleteFilterExec::try_new` /
+  `RowIdExec::try_new` take a trailing `pos_index: usize`. Pass the index of the scan's
+  physical-position column, which is its last (#130).
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory
@@ -35,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A float `min_value` was trusted as a lower bound even when the column's NaN state was unknown
+  or positive; negative NaN sorts below every value, so a matching row could be pruned away
+  unread by `SELECT` and left behind by `DELETE`. Both bounds are now gated on `contains_nan`
+  (#130).
+- Float predicates could reach the Parquet reader's pruning on a scan of a file carrying a
+  delete file, with no `NanPruningBarrierExec` above it, silently dropping NaN rows (#130).
+- The internal physical-position column could bind to a catalog column of the same name in the
+  CDC feeds, making them report the wrong rows (#130).
 - `NULL` sentinels, BLOB decoding, expression-default reads, and legacy schema migration (#259).
 - An upload whose final flush failed panicked with "Already shut down" instead of returning
   the error (#280).

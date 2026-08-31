@@ -3,12 +3,11 @@
 //! file position (not stream arrival order).
 //!
 //! These tests use files large enough that DataFusion splits the scan across
-//! multiple byte-range partitions — the condition under which the legacy
-//! arrival-order counters in `RowIdExec` / `DeleteFilterExec` produce wrong
-//! answers. They are the gate for the physical-position fix; several FAIL on
-//! the pre-fix code (documented per-test).
+//! multiple byte-range partitions — the condition under which any arrival-order
+//! counting produces wrong answers. Positions come from the parquet reader, so
+//! they survive that splitting; these tests are the gate on that holding.
 //!
-//! See docs/rowid-lineage-physical-position-plan.md.
+//! See docs/physical-row-positions.md.
 
 use crate::common;
 
@@ -351,12 +350,12 @@ async fn count_star_with_deletes_on_split_file() -> DataFusionResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// 8b. plan-shape invariant: nothing drops/reorders/re-splits rows below
-//     FileRowNumberExec on a positional path.
+// 8b. plan shape: positions come from the reader, so the scan is free to
+//     parallelize and prune.
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn positional_plan_shape_is_safe() -> DataFusionResult<()> {
+/// EXPLAIN output for `sql` against a fresh `BIG`-row table, as lines.
+async fn explain_positional(sql: &str) -> DataFusionResult<String> {
     let temp = temp()?;
     let path = temp.path().join("plan.ducklake");
     {
@@ -374,12 +373,7 @@ async fn positional_plan_shape_is_safe() -> DataFusionResult<()> {
     ctx.register_catalog("c", catalog(&path.to_string_lossy(), true)?);
 
     let mut plan = String::new();
-    for b in ctx
-        .sql("EXPLAIN SELECT rowid, i FROM c.main.t")
-        .await?
-        .collect()
-        .await?
-    {
+    for b in ctx.sql(sql).await?.collect().await? {
         if let Some(c) = b
             .column(1)
             .as_any()
@@ -391,34 +385,49 @@ async fn positional_plan_shape_is_safe() -> DataFusionResult<()> {
             }
         }
     }
+    Ok(plan)
+}
 
-    let lines: Vec<&str> = plan.lines().collect();
-    let frn = lines
-        .iter()
-        .position(|l| l.contains("FileRowNumberExec"))
-        .unwrap_or_else(|| panic!("plan has no FileRowNumberExec:\n{plan}"));
+/// The physical position is a column the parquet reader produces, not something
+/// an exec synthesizes above the scan. So the plan carries no position-
+/// synthesizing node, and the scan simply projects the position column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn positional_scan_reads_position_from_the_reader() -> DataFusionResult<()> {
+    let plan = explain_positional("EXPLAIN SELECT rowid, i FROM c.main.t").await?;
 
-    // The file was split into multiple row-group-aligned partitions (parallel).
+    assert!(
+        !plan.contains("FileRowNumberExec"),
+        "positions come from the reader; nothing should synthesize them:\n{plan}"
+    );
+    assert!(
+        plan.contains("__ducklake_row_pos"),
+        "the scan must project the reader's physical-position column:\n{plan}"
+    );
+    Ok(())
+}
+
+/// Reader-derived positions stay true under byte-range splitting, so a
+/// positional scan is no longer pinned to one partition per row-group chunk.
+/// This is the parallelism the old synthesis had to give up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn positional_scan_splits_one_file_across_partitions() -> DataFusionResult<()> {
+    let plan = explain_positional("EXPLAIN SELECT rowid, i FROM c.main.t").await?;
     assert!(
         plan.contains(" groups:"),
-        "scan should be split into >1 group:\n{plan}"
+        "a positional scan should split one file across partitions:\n{plan}"
     );
+    Ok(())
+}
 
-    // CRITICAL invariant: the scan is *directly* below FileRowNumberExec — nothing
-    // reshuffles, coalesces, or re-splits rows between them (which would break the
-    // per-partition seed). A RepartitionExec ABOVE FileRowNumberExec is fine: the
-    // position is already materialized into the data and travels with each row.
+/// A predicate now reaches the parquet reader on a positional path: positions
+/// are absolute, so pruning rows cannot shift them. The old design had to refuse
+/// all pushdown here, because synthesis counted stream arrivals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn positional_scan_pushes_a_predicate_to_the_reader() -> DataFusionResult<()> {
+    let plan = explain_positional("EXPLAIN SELECT rowid, i FROM c.main.t WHERE i > 500000").await?;
     assert!(
-        lines
-            .get(frn + 1)
-            .is_some_and(|l| l.contains("DataSourceExec")),
-        "DataSourceExec must be the direct child of FileRowNumberExec:\n{plan}"
-    );
-
-    // No reader-side predicate (would prune rows before position synthesis).
-    assert!(
-        !plan.contains("predicate="),
-        "no reader predicate on positional scan:\n{plan}"
+        plan.contains("predicate="),
+        "the predicate must reach the reader through RowIdExec/ColumnRenameExec:\n{plan}"
     );
     Ok(())
 }

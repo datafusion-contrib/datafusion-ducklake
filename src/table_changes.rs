@@ -40,8 +40,7 @@ use futures::{Stream, StreamExt};
 use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
-use crate::positional_source::PositionalFileSource;
-use crate::row_id::{FileRowNumberExec, ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID};
+use crate::row_id::{ROW_POS_COLUMN_NAME, SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema};
 use crate::table::{
     ParquetFileLayout, delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts,
     validated_file_size, validated_record_count,
@@ -854,14 +853,17 @@ impl TableChangesTable {
 
     /// Scan of an inserted data file for the correlated feed. A file with an
     /// embedded rowid (an UPDATE / compaction postimage) is scanned plainly — its
-    /// rowid IS the embedded column. A plain insert is scanned positionally
-    /// (`PositionalFileSource` + `FileRowNumberExec`) so its rowid can be
-    /// synthesized as `row_id_start + position` — but only when `need_rowid`;
+    /// rowid IS the embedded column. A plain insert is scanned positionally —
+    /// the parquet reader appends the physical position — so its rowid can be
+    /// synthesized as `row_id_start + position`; but only when `need_rowid`,
     /// otherwise it is a plain scan with no position column.
     ///
-    /// Either way the plan is presented under the catalog schema, ABOVE
-    /// `FileRowNumberExec` so the position column it appends passes straight
-    /// through.
+    /// The positional scan takes no explicit projection, so the position column
+    /// lands last, after the table columns and any embedded columns — the index
+    /// `pos_col_idx` computes in `build_insert_units`.
+    ///
+    /// Either way the plan is presented under the catalog schema, ABOVE the scan
+    /// so the position column passes straight through.
     fn build_insert_scan(
         &self,
         data_file: &DataFileChange,
@@ -908,19 +910,13 @@ impl TableChangesTable {
             // partial file whose real rowids feed the update correlation): scan
             // positionally to synthesize rowid = row_id_start + position.
             None if need_rowid_resolution => {
-                let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
-                let builder =
-                    FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-                        .with_file_group(FileGroup::new(vec![pf]))
-                        // One file group == one output partition: declaring the
-                        // partitioning keeps DataFusion from repartitioning the
-                        // file or letting sibling streams steal its work, which
-                        // `FileRowNumberExec` needs for true physical positions.
-                        .with_output_partitioning(Some(
-                            datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-                        ));
-                let scan = DataSourceExec::from_data_source(builder.build());
-                Arc::new(FileRowNumberExec::new(scan, vec![0]))
+                let (table_schema, _) = positional_table_schema(read_schema);
+                let builder = FileScanConfigBuilder::new(
+                    self.object_store_url.as_ref().clone(),
+                    Arc::new(ParquetSource::new(table_schema)),
+                )
+                .with_file_group(FileGroup::new(vec![pf]));
+                DataSourceExec::from_data_source(builder.build())
             },
             // Plain insert, rowid not needed: a plain scan, no positions.
             None => plain_scan(pf, read_schema),
@@ -933,10 +929,10 @@ impl TableChangesTable {
     }
 
     /// Positional scan of a delete's source data file: table columns, the
-    /// embedded rowid column when present, and the internal physical-position
-    /// column. `PositionalFileSource` + `FileRowNumberExec` guarantee true
-    /// physical positions so deleted rows can be matched to the delete file's
-    /// `pos` set regardless of scan partitioning.
+    /// embedded rowid column when present, and the reader-produced
+    /// physical-position column appended last. Positions come from the parquet
+    /// reader, so deleted rows can be matched to the delete file's `pos` set
+    /// regardless of how the scan is pruned, split or reordered.
     fn build_delete_data_scan(
         &self,
         resolved_path: &str,
@@ -955,16 +951,15 @@ impl TableChangesTable {
             pf = pf.with_metadata_size_hint(hint);
         }
         let read_schema = self.read_schema_with_embedded(layout, embedded_name, &None);
-        let source = PositionalFileSource::wrap(Arc::new(ParquetSource::new(read_schema)));
-        let builder = FileScanConfigBuilder::new(self.object_store_url.as_ref().clone(), source)
-            .with_file_group(FileGroup::new(vec![pf]))
-            // One file group == one output partition; see the note above.
-            .with_output_partitioning(Some(
-                datafusion::physical_expr::Partitioning::UnknownPartitioning(1),
-            ));
+        let (table_schema, _) = positional_table_schema(read_schema);
+        let builder = FileScanConfigBuilder::new(
+            self.object_store_url.as_ref().clone(),
+            Arc::new(ParquetSource::new(table_schema)),
+        )
+        .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
         Ok(present_catalog_schema(
-            Arc::new(FileRowNumberExec::new(scan, vec![0])),
+            scan,
             &self.catalog_table_fields(),
             &layout.name_mapping,
         ))
@@ -1127,7 +1122,7 @@ impl TableChangesTable {
         for (df, layout) in data_files.iter().zip(layouts.iter()) {
             // Column layout of the scan batch after the `table_len` table
             // columns: [embedded rowid?][embedded snapshot? (partial files
-            // only)][position? (appended by FileRowNumberExec)].
+            // only)][position? (appended by the positional scan)].
             let is_partial = df.partial_max.is_some();
             if is_partial && layout.embedded_snapshot_parquet_name.is_none() {
                 return Err(DataFusionError::External(
@@ -1158,9 +1153,17 @@ impl TableChangesTable {
                     i
                 });
             let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
+            let scan = self.build_insert_scan(df, layout, resolve_rowid)?;
+            debug_assert_eq!(
+                pos_col_idx.map(|_| scan.schema().fields().len() - 1),
+                pos_col_idx,
+                "the positional scan appends the physical-position column last, which \
+                 must be where `pos_col_idx` arithmetic expects it; all the internal \
+                 columns are Int64, so a misalignment would read the wrong one silently"
+            );
             insert_units.push(InsertUnit {
                 snapshot_id: df.begin_snapshot,
-                scan: self.build_insert_scan(df, layout, resolve_rowid)?,
+                scan,
                 embedded_col_idx,
                 snapshot_col_idx,
                 pos_col_idx,
@@ -1245,10 +1248,21 @@ impl TableChangesTable {
                     )?),
                     _ => None,
                 };
+                // The positional scan reads every column in order:
+                // `[table columns, embedded rowid?, position]`.
+                let pos_col_idx = table_len + usize::from(old_embedded.is_some());
+                debug_assert_eq!(
+                    data_scan.schema().fields().len() - 1,
+                    pos_col_idx,
+                    "the positional scan appends the physical-position column last, which \
+                     must be where `pos_col_idx` arithmetic expects it; all the internal \
+                     columns are Int64, so a misalignment would read the wrong one silently"
+                );
                 delete_units.push(DeleteUnit {
                     snapshot_id: dfc.snapshot_id,
                     data_scan,
                     embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
+                    pos_col_idx,
                     current_delete_scan,
                     previous_delete_scan,
                     cumulative,
@@ -1523,6 +1537,11 @@ struct DeleteUnit {
     /// Column index of the source file's embedded rowid, or `None` (rowids are
     /// then `row_id_start + position`).
     embedded_col_idx: Option<usize>,
+    /// Column index of the reader-produced physical-position column. Carried
+    /// explicitly rather than looked up by name: the position column's name is
+    /// per-scan, and a name lookup would bind a catalog column that happens to
+    /// share it.
+    pos_col_idx: usize,
     /// Scan of the current delete file, or `None` for a full-file delete.
     current_delete_scan: Option<Arc<dyn ExecutionPlan>>,
     /// Scan of the delete file this one superseded, if any.
@@ -1884,9 +1903,8 @@ async fn correlate_changes(
             if n == 0 {
                 continue;
             }
-            let pos_idx = b.schema().index_of(ROW_POS_COLUMN_NAME)?;
             let pos = b
-                .column(pos_idx)
+                .column(unit.pos_col_idx)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {

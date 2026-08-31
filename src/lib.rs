@@ -46,7 +46,6 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 pub mod partition;
 pub mod path_resolver;
-pub(crate) mod positional_source;
 pub mod row_id;
 pub mod schema;
 pub mod snapshot_filter;

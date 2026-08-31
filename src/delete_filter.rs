@@ -2,11 +2,12 @@
 //!
 //! Wraps a positional scan and drops rows whose **physical file position**
 //! appears in a positional delete file. The physical position is read from the
-//! internal [`ROW_POS_COLUMN_NAME`] column materialized by
-//! [`FileRowNumberExec`](crate::row_id::FileRowNumberExec) — never from stream
-//! arrival order — so filtering is correct regardless of how the scan is
-//! partitioned or merged. The position column is passed through unchanged for
-//! any downstream consumer (e.g. `RowIdExec`); the final projection drops it.
+//! reader-produced position column (see
+//! `row_id::positional_table_schema`) — never
+//! from stream arrival order — so filtering is correct regardless of how the
+//! scan is pruned, filtered, partitioned or merged. The position column is
+//! passed through unchanged for any downstream consumer (e.g. `RowIdExec`); the
+//! final projection drops it.
 
 use std::collections::HashSet;
 use std::pin::Pin;
@@ -16,10 +17,14 @@ use std::task::{Context, Poll};
 use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildFilterDescription, FilterDescription, FilterPushdownPhase,
+};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
@@ -34,25 +39,34 @@ pub struct DeleteFilterExec {
     file_path: String,
     /// Set of deleted physical row positions for this file (shared across streams).
     deleted_positions: Arc<HashSet<i64>>,
-    /// Index of [`ROW_POS_COLUMN_NAME`] in the input schema.
+    /// Index of the physical-position column in the input schema.
     pos_index: usize,
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
 }
 
 impl DeleteFilterExec {
-    /// Build a `DeleteFilterExec`. The input must carry the
-    /// [`ROW_POS_COLUMN_NAME`] column (from `FileRowNumberExec`); errors otherwise.
+    /// Build a `DeleteFilterExec` over an input whose column `pos_index` is the
+    /// reader-produced physical row position.
+    ///
+    /// The index is passed in rather than looked up by name because the position
+    /// column's name is per-scan (see
+    /// `row_id::unique_row_pos_name`), and because
+    /// a name lookup would silently bind a user column of the same name.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         file_path: String,
         deleted_positions: Arc<HashSet<i64>>,
+        pos_index: usize,
     ) -> DataFusionResult<Self> {
-        let pos_index = input.schema().index_of(ROW_POS_COLUMN_NAME).map_err(|_| {
-            DataFusionError::Internal(format!(
-                "DeleteFilterExec input is missing the `{ROW_POS_COLUMN_NAME}` column"
-            ))
-        })?;
+        let schema = input.schema();
+        if schema.field(pos_index).data_type() != &arrow::datatypes::DataType::Int64 {
+            return Err(DataFusionError::Internal(format!(
+                "DeleteFilterExec: column {pos_index} (`{}`) is not the Int64 \
+                 physical-position column",
+                schema.field(pos_index).name()
+            )));
+        }
         // Filtering only drops rows; partitioning/ordering are preserved.
         let properties = input.properties().clone();
         Ok(Self {
@@ -101,6 +115,26 @@ impl ExecutionPlan for DeleteFilterExec {
         vec![true]
     }
 
+    /// Forward filter pushdown unchanged: this node's output schema is its input
+    /// schema, so a predicate means the same thing on either side of it.
+    ///
+    /// Soundness rests on `filter(delete(R)) == delete(filter(R))`. Deletion is
+    /// keyed by **absolute physical position**, which the parquet reader derives
+    /// from row-group offsets in the footer, so dropping non-matching rows in the
+    /// reader cannot change which surviving row sits at which position. That is
+    /// specifically what reader-produced positions buy: when positions were
+    /// synthesized by counting stream arrivals, pruning a single row shifted
+    /// every position after it and this forwarding would have been corrupting.
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> DataFusionResult<FilterDescription> {
+        let child = ChildFilterDescription::from_child(&parent_filters, &self.input)?;
+        Ok(FilterDescription::new().with_child(child))
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -114,6 +148,7 @@ impl ExecutionPlan for DeleteFilterExec {
             children.into_iter().next().unwrap(),
             self.file_path.clone(),
             self.deleted_positions.clone(),
+            self.pos_index,
         )?))
     }
 
@@ -210,8 +245,8 @@ mod tests {
     /// Build a batch with a value column and a `__ducklake_row_pos` column.
     fn batch(values: &[i32], positions: &[i64]) -> (SchemaRef, RecordBatch) {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            crate::row_id::row_pos_field(),
+            Arc::new(Field::new("id", DataType::Int32, false)),
+            crate::row_id::row_pos_virtual_field(ROW_POS_COLUMN_NAME),
         ]));
         let b = RecordBatch::try_new(
             schema.clone(),
