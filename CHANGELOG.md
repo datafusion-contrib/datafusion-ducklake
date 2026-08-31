@@ -20,14 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into row-group / page / bloom pruning, which the previous design had to refuse — measured
   2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
   resolution prunes too. On read paths byte-range splitting replaces the hand-rolled row-group
-  partitioning this removes; a single-file `UPDATE` or `rewrite_files`, which is executed
-  directly rather than through the optimizer, now reads on one thread (#130).
+  partitioning this removes; the paths executed directly rather than through the optimizer —
+  `DELETE`/`UPDATE` position resolution and single-file `rewrite_data_files` — now read one
+  file on one thread (#130).
 
 ### Changed
 
-- **BREAKING**: `FileRowNumberExec` is removed and `DeleteFilterExec::try_new` /
-  `RowIdExec::try_new` take a trailing `pos_index: usize`. Pass the index of the scan's
-  physical-position column, which is its last (#130).
+- **BREAKING**: `FileRowNumberExec` and `row_id::row_pos_field` are removed, and
+  `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` — pass
+  the index of the scan's physical-position column, which is its last. `ROW_POS_COLUMN_NAME` is
+  now only a *base* name: a scan whose file already has a column of that name uses a suffixed
+  variant, so locating the column by name is no longer reliable (#130).
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory

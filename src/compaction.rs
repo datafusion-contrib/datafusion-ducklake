@@ -570,10 +570,10 @@ pub(crate) fn sorted_rewrite_batches(
 /// resolves against the leading data columns, so the embedded row lineage stays
 /// attached to its row; `None` streams the input through unsorted.
 ///
-/// `input` is normally multi-partition — one partition per source file, plus one
-/// per row-group chunk of a large file — because that is how the compaction set
-/// is read in parallel. `CoalescePartitionsExec` funnels those partitions back
-/// into the single stream the compaction writer consumes.
+/// `input` is normally multi-partition — one partition per source file — because
+/// that is how the compaction set is read in parallel.
+/// `CoalescePartitionsExec` funnels those partitions back into the single stream
+/// the compaction writer consumes.
 ///
 /// That coalesce emits partitions interleaved by arrival, so an unsorted merge's
 /// physical row order depends on which object-store request returned first. This
@@ -592,11 +592,10 @@ pub(crate) fn sorted_rewrite_batches(
 ///
 /// The coalesce starts every input partition at once rather than capping
 /// concurrency, so the fan-out is worth being explicit about. Partitions are the
-/// bin's row groups, not its files, and two limits bound that from opposite
-/// directions: `MergeOptions::max_merged_files` caps how many files a pass
-/// considers, and the bin's byte budget caps how much data one plan covers — so
-/// many tiny files means many partitions of one row group each, and large files
-/// means few files each contributing several. They cannot both be at maximum.
+/// bin's files, one each, and two limits bound that from opposite directions:
+/// `MergeOptions::max_merged_files` caps how many files a pass considers, and
+/// the bin's byte budget caps how much data one plan covers. They cannot both be
+/// at maximum.
 /// The batches in flight are bounded too: `CoalescePartitionsExec` feeds a
 /// `tokio::sync::mpsc` channel sized to the partition count, so a producer that
 /// outruns the writer blocks on send rather than accumulating.
@@ -1123,10 +1122,11 @@ impl DuckLakeTable {
 
         for tf in candidates {
             // A rewrite replaces ONE source file, so its scan is already the
-            // whole set; the file's own row groups are what DataFusion reads in
-            // parallel. Rowid lineage rides out of the scan as a column, so the
-            // sort and the parquet write consume the plan directly instead of a
-            // fully collected `Vec<RecordBatch>`.
+            // whole set — and a single file group, executed directly rather than
+            // through the physical optimizer, so it reads on one thread. Rowid
+            // lineage rides out of the scan as a column, so the sort and the
+            // parquet write consume the plan directly instead of a fully
+            // collected `Vec<RecordBatch>`.
             let scan = self
                 .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
                 .await?;

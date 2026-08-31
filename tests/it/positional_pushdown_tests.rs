@@ -365,6 +365,52 @@ async fn rowids_survive_pruning_and_splitting_together() {
     assert!(plan.contains("predicate="), "expected pushdown:\n{plan}");
 }
 
+/// Same as `rowids_survive_pruning_and_splitting_together`, but with
+/// `pushdown_filters` on so the reader builds a row-level `RowSelection` inside
+/// a surviving row group.
+///
+/// That is the sparse case the old synthesis could not survive at all, and it is
+/// off by default — so without this a downstream flipping one config option is
+/// the first to exercise it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn rowids_survive_row_level_filter_pushdown() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+
+    let conn = format!("sqlite:{}", temp.path().join("test.db").display());
+    let catalog = DuckLakeCatalog::new(SqliteMetadataProvider::new(&conn).await.unwrap())
+        .unwrap()
+        .with_row_lineage(true);
+    let mut cfg = ConfigOptions::new();
+    cfg.execution.target_partitions = 8;
+    cfg.optimizer.repartition_file_scans = true;
+    cfg.optimizer.repartition_file_min_size = 1;
+    cfg.execution.parquet.pushdown_filters = true;
+    let ctx = SessionContext::new_with_config(SessionConfig::from(cfg));
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    // A predicate that survives row-group pruning but selects sparsely within
+    // the groups it keeps.
+    let sql = "SELECT rowid, id FROM ducklake.main.t WHERE id % 1000 = 7 ORDER BY id";
+    let batches = rows(&ctx, sql).await;
+    let mut pairs: Vec<(i64, i32)> = Vec::new();
+    for b in &batches {
+        let r = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let i = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        for k in 0..b.num_rows() {
+            pairs.push((r.value(k), i.value(k)));
+        }
+    }
+    assert_eq!(pairs.len(), (ROWS / 1000) as usize);
+    for (rowid, id) in pairs {
+        assert_eq!(
+            rowid,
+            i64::from(id),
+            "rowid must survive a row-level RowSelection"
+        );
+    }
+}
+
 /// Deletes are matched by absolute position, so pruning rows in the reader
 /// cannot shift which rows the delete file names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -927,5 +973,60 @@ async fn a_predicate_on_rowid_is_answered_without_being_pushed() {
         )
         .await,
         0
+    );
+}
+
+/// A `DELETE` against a file written by `UPDATE` (so it embeds row ids) must
+/// still prune.
+///
+/// Such a file always carries a synthetic `_ducklake_internal_row_id -> rowid`
+/// entry in its name mapping, so a "does this file rename anything?" guard that
+/// keys off the mapping being non-empty disables pruning on exactly the files
+/// most likely to be mutated again — silently, since falling back to a full scan
+/// is still correct.
+///
+/// Asserted on bytes actually read, because a row-count assertion passes either
+/// way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn delete_prunes_on_a_file_that_embeds_row_ids() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+
+    // Rewrite the file through UPDATE so the output embeds row ids.
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("UPDATE ducklake.main.t SET x = x + 1 WHERE id < 10")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = ctx_for(&temp, true, false).await;
+    let plan = analyze(
+        &ctx,
+        "SELECT rowid, id FROM ducklake.main.t WHERE id >= 55000",
+    )
+    .await;
+    let (total, matched) = pruning_metric(&plan, "row_groups_pruned_statistics")
+        .unwrap_or_else(|| panic!("no row-group metric in:\n{plan}"));
+    assert!(
+        total > 1 && matched < total,
+        "an embedded-rowid file must still prune ({matched}/{total}):\n{plan}"
+    );
+
+    // And the DELETE itself is correct.
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id >= 55000 AND id < 55010")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ctx = ctx_for(&temp, false, false).await;
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM ducklake.main.t").await,
+        ROWS as usize - 10
     );
 }

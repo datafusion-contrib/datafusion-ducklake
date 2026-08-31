@@ -55,6 +55,11 @@ use parquet::arrow::RowNumber;
 /// Name of the synthetic rowid column exposed when row lineage is enabled.
 pub const ROWID_COLUMN_NAME: &str = "rowid";
 
+/// Arrow extension type name identifying a parquet virtual row-number column.
+/// Mirrors arrow-rs's `RowNumber::NAME`, spelled out so a consumer can check a
+/// field without depending on the parquet crate.
+pub const ROW_NUMBER_EXTENSION_TYPE: &str = "parquet.virtual.row_number";
+
 /// Base name of the internal physical-row-position column: a parquet virtual
 /// column consumed by [`RowIdExec`] / `DeleteFilterExec`. Projected away before
 /// the table's output schema (by `ColumnRenameExec`), so it never reaches the
@@ -145,6 +150,31 @@ pub fn rowid_field() -> Field {
 ///
 /// `name` is normally [`ROW_POS_COLUMN_NAME`]; see [`unique_row_pos_name`] for
 /// why it is not always.
+/// Check that `field` really is the reader-produced physical-position column.
+///
+/// The extension type is the discriminator, not the data type: the embedded
+/// rowid and embedded snapshot-id columns are Int64 too, so an Int64 check
+/// passes on exactly the columns a misalignment would land on. The type
+/// survives projection — `ProjectionExprs` copies field metadata verbatim — so
+/// this holds on the scan's output schema, which makes it a release-build
+/// guarantee rather than a debug assertion.
+pub(crate) fn validate_row_pos_field(
+    node: &str,
+    index: usize,
+    field: &FieldRef,
+) -> DataFusionResult<()> {
+    if field.data_type() != &DataType::Int64
+        || field.extension_type_name() != Some(ROW_NUMBER_EXTENSION_TYPE)
+    {
+        return Err(DataFusionError::Internal(format!(
+            "{node}: column {index} (`{}`) is not the reader-produced physical-position \
+             column (expected Int64 carrying `{ROW_NUMBER_EXTENSION_TYPE}`)",
+            field.name()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn row_pos_virtual_field(name: &str) -> FieldRef {
     Arc::new(Field::new(name, DataType::Int64, false).with_extension_type(RowNumber))
 }
@@ -261,12 +291,7 @@ impl RowIdExec {
                 input_schema.fields().len()
             ))
         })?;
-        if field.data_type() != &DataType::Int64 {
-            return Err(DataFusionError::Internal(format!(
-                "RowIdExec: column {pos_index} (`{}`) is not the Int64 physical-position column",
-                field.name()
-            )));
-        }
+        validate_row_pos_field("RowIdExec", pos_index, field)?;
 
         let mut fields: Vec<Arc<Field>> = input_schema.fields().iter().cloned().collect();
         fields.push(Arc::new(rowid_field()));

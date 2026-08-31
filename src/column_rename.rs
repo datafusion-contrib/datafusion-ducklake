@@ -115,7 +115,7 @@ impl ColumnRenameExec {
     /// Sufficient for filter pushdown. NOT used for limit pushdown, which keeps
     /// the stricter predicate: there is no need to widen it, and a `LIMIT` would
     /// stop at `DeleteFilterExec` below regardless.
-    pub fn is_type_preserving_projection(&self) -> bool {
+    pub(crate) fn is_type_preserving_projection(&self) -> bool {
         let input_schema = self.input.schema();
         self.output_schema.fields().iter().all(|output| {
             let input_name = self

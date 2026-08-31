@@ -1170,12 +1170,14 @@ impl TableChangesTable {
                 });
             let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
             let scan = self.build_insert_scan(df, layout, resolve_rowid)?;
-            debug_assert_eq!(
-                pos_col_idx.map(|_| scan.schema().fields().len() - 1),
-                pos_col_idx,
-                "the positional scan appends the physical-position column last, which \
-                 must be where `pos_col_idx` arithmetic expects it; all the internal \
-                 columns are Int64, so a misalignment would read the wrong one silently"
+            debug_assert!(
+                pos_col_idx.is_none_or(|idx| crate::row_id::validate_row_pos_field(
+                    "build_insert_units",
+                    idx,
+                    &scan.schema().fields()[idx]
+                )
+                .is_ok()),
+                "`pos_col_idx` arithmetic must land on the reader-produced position column"
             );
             insert_units.push(InsertUnit {
                 snapshot_id: df.begin_snapshot,
@@ -1267,12 +1269,14 @@ impl TableChangesTable {
                 // The positional scan reads every column in order:
                 // `[table columns, embedded rowid?, position]`.
                 let pos_col_idx = table_len + usize::from(old_embedded.is_some());
-                debug_assert_eq!(
-                    data_scan.schema().fields().len() - 1,
-                    pos_col_idx,
-                    "the positional scan appends the physical-position column last, which \
-                     must be where `pos_col_idx` arithmetic expects it; all the internal \
-                     columns are Int64, so a misalignment would read the wrong one silently"
+                debug_assert!(
+                    crate::row_id::validate_row_pos_field(
+                        "build_delete_units",
+                        pos_col_idx,
+                        &data_scan.schema().fields()[pos_col_idx]
+                    )
+                    .is_ok(),
+                    "`pos_col_idx` arithmetic must land on the reader-produced position column"
                 );
                 delete_units.push(DeleteUnit {
                     snapshot_id: dfc.snapshot_id,

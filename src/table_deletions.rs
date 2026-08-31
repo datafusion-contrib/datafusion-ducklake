@@ -308,12 +308,14 @@ impl TableDeletionsTable {
             &layout,
             &embedded_name,
         )?;
-        debug_assert_eq!(
-            data_file_exec.schema().fields().len() - 1,
-            pos_col_idx,
-            "the positional scan appends the physical-position column last, which \
-             must be where `pos_col_idx` arithmetic expects it; all the internal \
-             columns are Int64, so a misalignment would read the wrong one silently"
+        debug_assert!(
+            crate::row_id::validate_row_pos_field(
+                "correlate_deletions",
+                pos_col_idx,
+                &data_file_exec.schema().fields()[pos_col_idx]
+            )
+            .is_ok(),
+            "`pos_col_idx` arithmetic must land on the reader-produced position column"
         );
 
         // Validate record_count before use — a negative value from corrupt metadata

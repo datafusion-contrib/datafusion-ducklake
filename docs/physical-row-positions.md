@@ -131,8 +131,8 @@ negotiation and no barrier node above it. It pushes the predicate into the reade
   every row group prunes, and the `DELETE` removes nothing.
 
 Both rejections fall back to scanning the whole file — what this path always did — never to a wrong
-answer. `positional_pushdown_tests` pins both by disabling the guard and observing a `DELETE` that
-removes zero rows.
+answer. `positional_pushdown_tests` pins both: with either guard removed, the corresponding
+`DELETE` reports zero rows affected and removes nothing.
 
 ## History
 
@@ -149,8 +149,9 @@ is a simplification, not a new capability. What it could not do was **prune**: a
 full scan with no prunable predicate is unchanged.
 
 The parallelism substitution holds only on **read** paths, which run through the physical optimizer
-where `repartition_file_scans` splits a file group. `build_update_scan_with_snapshot` and the
-compaction sources are executed directly (`physical_plan::collect`, `input.execute(0, ..)`), so no
-optimizer rule ever sees them: a single-file `UPDATE` or `rewrite_files` now reads on one thread
-where it previously used the hand-rolled split. `merge_adjacent_files` is unaffected — it keeps
-file-level parallelism, one source exec per file.
+where `repartition_file_scans` splits a file group. `resolve_positions`,
+`build_update_scan_with_snapshot` and the compaction sources are executed directly
+(`physical_plan::collect`, `input.execute(0, ..)`), so no optimizer rule ever sees them: a
+`DELETE`, a single-file `UPDATE`, and a single-file `rewrite_data_files` now read one file on one
+thread where they previously used the hand-rolled split. `merge_adjacent_files` is unaffected — it
+keeps file-level parallelism, one source exec per file.

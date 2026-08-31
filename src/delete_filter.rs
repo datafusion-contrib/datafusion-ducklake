@@ -67,13 +67,7 @@ impl DeleteFilterExec {
                 schema.fields().len()
             ))
         })?;
-        if field.data_type() != &arrow::datatypes::DataType::Int64 {
-            return Err(DataFusionError::Internal(format!(
-                "DeleteFilterExec: column {pos_index} (`{}`) is not the Int64 \
-                 physical-position column",
-                field.name()
-            )));
-        }
+        crate::row_id::validate_row_pos_field("DeleteFilterExec", pos_index, field)?;
         // Filtering only drops rows; partitioning/ordering are preserved.
         let properties = input.properties().clone();
         Ok(Self {

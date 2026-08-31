@@ -709,6 +709,14 @@ struct FileReadConfig {
     /// (parquet column → `"rowid"`) when the file has an embedded column with
     /// a different name.
     name_mapping: HashMap<String, String>,
+    /// True when the FILE gives at least one catalog column a different physical
+    /// name — i.e. a real rename or an absent-column placeholder.
+    ///
+    /// Distinct from `!name_mapping.is_empty()`, which is also true for the
+    /// synthetic `_ducklake_internal_row_id -> rowid` entry every embedded-rowid
+    /// file gets. Callers that care whether a *data* column is renamed (see
+    /// [`DuckLakeTable::predicate_is_prunable`]) must use this instead.
+    renames_data_columns: bool,
     /// `Some(parquet_column_name)` if the file embeds the rowid column
     /// (tagged with [`ROW_ID_PARQUET_FIELD_ID`]); `None` otherwise.
     embedded_rowid_parquet_name: Option<String>,
@@ -2048,12 +2056,20 @@ impl DuckLakeTable {
     ///   handed a bare [`DuckLakeFileData`] and has none. Plumbing them through
     ///   would let float predicates prune here too.
     ///
-    /// - **A file with any physical rename disqualifies every predicate.** The
-    ///   predicate carries catalog column *names*, and the reader resolves a
-    ///   pushed predicate by name against the file's schema, which uses the
-    ///   physical names. There is no `ColumnRenameExec` on this path to rewrite
-    ///   them (`resolve_positions` evaluates positionally instead), so a renamed
-    ///   column would simply fail to bind.
+    /// - **A file that gives any data column a different physical name
+    ///   disqualifies every predicate.** The predicate carries catalog column
+    ///   *names*, and the reader resolves a pushed predicate by name against the
+    ///   file's schema, which uses the physical names. There is no
+    ///   `ColumnRenameExec` on this path to rewrite them (`resolve_positions`
+    ///   evaluates positionally instead), so a renamed column would simply fail
+    ///   to bind — and an unbindable column folds the predicate to false, which
+    ///   prunes every row group and deletes nothing.
+    ///
+    ///   This reads [`FileReadConfig::renames_data_columns`], not
+    ///   `name_mapping`: the latter also carries the synthetic
+    ///   `_ducklake_internal_row_id -> rowid` entry that EVERY file written by
+    ///   `UPDATE` or compaction has, which would disable pruning on exactly the
+    ///   files most likely to be mutated again.
     ///
     /// Both rejections fall back to scanning the whole file, which is what this
     /// path always did — never to a wrong answer.
@@ -2065,7 +2081,7 @@ impl DuckLakeTable {
         use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
         use datafusion::physical_expr::expressions::Column;
 
-        if !file_cfg.name_mapping.is_empty() {
+        if file_cfg.renames_data_columns {
             return false;
         }
 
@@ -2284,6 +2300,7 @@ impl DuckLakeTable {
 
         let cfg = Arc::new(FileReadConfig {
             read_schema,
+            renames_data_columns: !layout.name_mapping.is_empty(),
             name_mapping,
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
