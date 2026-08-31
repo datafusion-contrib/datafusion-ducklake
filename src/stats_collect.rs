@@ -179,10 +179,11 @@ pub fn compute_column_stats(
         let contains_nan = contains_nan_flags.get(idx).copied().flatten();
 
         // When NaN is present, suppress min/max entirely (store NULL), matching
-        // official DuckLake. The Parquet footer's min/max exclude NaN, but under
-        // DuckDB's NaN ordering (NaN sorts above every value) a reader that
-        // pruned on the NaN-excluded max could wrongly drop the NaN row for a
-        // predicate like `x > 100`. NULL bounds => the file is never pruned on
+        // official DuckLake. The Parquet footer's min/max exclude NaN, and NaN
+        // is ordered by sign: a positive NaN sits above the recorded max, a
+        // negative one below the recorded min. A reader pruning on either bound
+        // could therefore drop a matching NaN row — `x > 100` on the max side,
+        // `x < -100` on the min side. NULL bounds => the file is never pruned on
         // this column, which is always sound.
         let (min_scalar, max_scalar) = if contains_nan == Some(true) {
             (None, None)

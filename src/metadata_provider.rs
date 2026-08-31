@@ -1097,9 +1097,11 @@ pub struct DuckLakeTableColumnStatistics {
     /// Tri-state NaN flag for float columns: `Some(false)` = known NaN-free,
     /// `Some(true)` = contains NaN, `None` = unknown (e.g. register-by-reference
     /// loads, where the parquet footer carries no NaN signal). Stored min/max
-    /// exclude NaN, and NaN sorts above every value in both DuckDB and
-    /// DataFusion — so a float `max_value` is only a true upper bound when this
-    /// is `Some(false)`. `min_value` is unaffected (NaN can never lower it).
+    /// exclude NaN, and DataFusion orders floats with `total_cmp`, which is
+    /// signed on NaN: positive NaN sorts above every value and negative NaN
+    /// below every value, `-Infinity` included. Since this flag does not record
+    /// the sign, **neither** bound is trustworthy unless it is `Some(false)` —
+    /// see `float_bound_is_usable` in `table.rs`.
     pub contains_nan: Option<bool>,
     /// Sum of compressed bytes reported by every visible file for this column.
     pub column_size_bytes: Option<i64>,

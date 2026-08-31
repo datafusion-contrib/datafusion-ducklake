@@ -2512,20 +2512,6 @@ impl DuckLakeTable {
 
         let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
 
-        // Same contract as every other rowid path, and as the C++ extension: a
-        // file with neither an embedded rowid nor a catalog `row_id_start` has
-        // no reconstructable lineage. A merged partial file always carries the
-        // embedded column, so this is a guard rather than a live case — but
-        // without it the failure is a confusing "no field named rowid" from the
-        // rename layer instead of a statement of what is actually missing.
-        if file_cfg.embedded_rowid_parquet_name.is_none() && table_file.row_id_start.is_none() {
-            return Err(DataFusionError::Execution(format!(
-                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
-                 `row_id_start` set in the catalog — row lineage cannot be reconstructed",
-                table_file.file.path
-            )));
-        }
-
         let snap_name = file_cfg
             .embedded_snapshot_parquet_name
             .clone()
@@ -2535,6 +2521,27 @@ impl DuckLakeTable {
                     table_file.file.path
                 ))
             })?;
+
+        // Same contract as every other rowid path, and as the C++ extension: a
+        // file with neither an embedded rowid nor a catalog `row_id_start` has no
+        // reconstructable lineage. Gated on the output actually carrying `rowid`,
+        // because this function serves two callers: the rowid-projected read and
+        // an ordinary time-travel read, which projects the embedded column away
+        // and needs no lineage at all. A merged partial file always carries the
+        // embedded column, so this is a guard against a foreign catalog rather
+        // than a live case — but without it the rowid caller's failure is a
+        // confusing "no field named rowid" from the rename layer instead of a
+        // statement of what is actually missing.
+        if output_schema.field_with_name(ROWID_COLUMN_NAME).is_ok()
+            && file_cfg.embedded_rowid_parquet_name.is_none()
+            && table_file.row_id_start.is_none()
+        {
+            return Err(DataFusionError::Execution(format!(
+                "File \"{}\" has no embedded `_ducklake_internal_row_id` column and no \
+                 `row_id_start` set in the catalog — row lineage cannot be reconstructed",
+                table_file.file.path
+            )));
+        }
 
         // Append the embedded snapshot-id column to the file's read schema so the
         // scan materializes it. It is deliberately absent from the cached

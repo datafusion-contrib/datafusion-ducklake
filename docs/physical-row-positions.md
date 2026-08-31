@@ -144,6 +144,13 @@ is gone; `FileRowNumberExec` and `PositionalFileSource` no longer exist.
 
 Note what that design did and did not cost. It **did** parallelize — `build_row_group_partitions`
 split a file into `min(target_partitions, row_group_count)` chunks by hand — so byte-range splitting
-is a simplification here, not a new capability. What it could not do was **prune**: a measured A/B
-over a 5M-row DuckDB-written file (41 row groups) shows selective `rowid` queries 2.4-3x faster,
-while a full scan with no prunable predicate is unchanged.
+is a simplification, not a new capability. What it could not do was **prune**: a measured A/B over a
+5M-row DuckDB-written file (41 row groups) shows selective `rowid` queries 2.4-3x faster, while a
+full scan with no prunable predicate is unchanged.
+
+The parallelism substitution holds only on **read** paths, which run through the physical optimizer
+where `repartition_file_scans` splits a file group. `build_update_scan_with_snapshot` and the
+compaction sources are executed directly (`physical_plan::collect`, `input.execute(0, ..)`), so no
+optimizer rule ever sees them: a single-file `UPDATE` or `rewrite_files` now reads on one thread
+where it previously used the hand-rolled split. `merge_adjacent_files` is unaffected — it keeps
+file-level parallelism, one source exec per file.

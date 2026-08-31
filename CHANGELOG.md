@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
   into row-group / page / bloom pruning, which the previous design had to refuse — measured
   2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
-  resolution prunes too. Byte-range splitting replaces the hand-rolled row-group partitioning
-  it removes (#130).
+  resolution prunes too. On read paths byte-range splitting replaces the hand-rolled row-group
+  partitioning this removes; a single-file `UPDATE` or `rewrite_files`, which is executed
+  directly rather than through the optimizer, now reads on one thread (#130).
 
 ### Changed
 

@@ -108,13 +108,19 @@ impl fmt::Display for ChangeType {
 ///   state (`ADD COLUMN … NOT NULL` is refused as "Adding columns with constraints
 ///   not yet supported"), but this crate's writer and third-party implementations
 ///   can.
-/// - The internal column names are not reserved: nothing stops a table column from
-///   being called [`ROW_POS_COLUMN_NAME`], and nothing stops an older file from
+/// - The internal column names are not reserved: nothing stops a table column
+///   from being called `__ducklake_row_pos`, and nothing stops an older file from
 ///   physically carrying a column called `__ducklake_absent_field_<id>`. Either
 ///   makes two fields of one schema share a name, and the by-name lookup then
 ///   binds the first — reading the table column where the position was meant, or
-///   real data where a null-fill was meant. Reserving the names belongs with the
-///   writer's name validation, not here.
+///   real data where a null-fill was meant.
+///
+///   The position column is handled: its callers pass the catalog names to
+///   `positional_table_schema_reserving`, which suffixes the internal name until
+///   it clears both name spaces. The `__ducklake_absent_field_<id>` case, and the
+///   embedded rowid / snapshot-id columns (whose names come from the file footer
+///   and so cannot be suffixed), are not — binding those by index rather than by
+///   name is the durable fix.
 pub(crate) fn present_catalog_schema(
     scan: Arc<dyn ExecutionPlan>,
     table_fields: &[FieldRef],
