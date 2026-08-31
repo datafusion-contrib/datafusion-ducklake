@@ -270,6 +270,13 @@ Known edges:
 ## Limitations
 
 - **Write backends:** DuckDB and MySQL are read-only; writes require SQLite or PostgreSQL.
+- **Negative NaN orders differently than in DuckDB.** DuckDB normalizes NaN — `-NaN = NaN`
+  is true and either sign sorts above every value. DataFusion compares floats with arrow's
+  `total_cmp`, which is sign-sensitive, so `-NaN` sorts *below* every value including
+  `-Infinity`. A query like `WHERE x < -1e308` therefore returns `-NaN` rows here and none
+  in DuckDB. This is inherited from arrow and affects results, not just pruning; float
+  min/max statistics are gated on `contains_nan` in **both** directions to stay consistent
+  with it, where official DuckLake gates only the max.
 - **No `AS OF` syntax:** select a catalog snapshot by ID with
   `DuckLakeCatalog::with_snapshot`, by UTC timestamp with
   `DuckLakeCatalog::with_snapshot_at`, or select one table per query with

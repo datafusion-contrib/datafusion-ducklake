@@ -19,17 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
   into row-group / page / bloom pruning, which the previous design had to refuse — measured
   2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
-  resolution prunes too. Byte-range splitting replaces the hand-rolled row-group partitioning
+  resolution prunes too (`DELETE`; an `UPDATE`'s source scan pushes no predicate). Byte-range
+  splitting replaces the hand-rolled row-group partitioning
   this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
   / rewrite paths explicitly (#130).
 
 ### Changed
 
 - **BREAKING**: `FileRowNumberExec` and `row_id::row_pos_field` are removed, and
-  `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` — pass
-  the index of the scan's physical-position column, which is its last. `ROW_POS_COLUMN_NAME` is
-  now only a *base* name: a scan whose file already has a column of that name uses a suffixed
-  variant, so locating the column by name is no longer reliable (#130).
+  `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` naming a
+  column that must carry the `parquet.virtual.row_number` extension type (new
+  `row_id::ROW_NUMBER_EXTENSION_TYPE`) — an Int64 column no longer suffices, and the crate
+  offers no public constructor for one, so these two execs are effectively crate-internal now.
+  `ROW_POS_COLUMN_NAME` is also only a *base* name: a scan whose file already has a column of
+  that name uses a suffixed variant, so locating the column by name is no longer reliable (#130).
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory

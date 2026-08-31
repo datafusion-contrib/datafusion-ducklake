@@ -154,5 +154,6 @@ run it themselves (`physical_plan::collect`, `input.execute(0, ..)`), so no opti
 sees them — they call `DuckLakeTable::split_across_partitions` at construction instead. Without
 that, removing the hand-rolled row-group partitioning would have left `DELETE`, `UPDATE` and
 single-file `rewrite_data_files` reading one file on one thread, a regression every result would
-have hidden. `merge_adjacent_files` needs nothing extra: it already has file-level parallelism, one
-source exec per file.
+have hidden. `merge_adjacent_files` builds one such scan per file in the bin, so its fan-out is the product of
+the bin size and the per-file split — which is why the split is capped at the file's row-group
+count rather than taken as `target_partitions` outright.

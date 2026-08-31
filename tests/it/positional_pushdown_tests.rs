@@ -409,6 +409,20 @@ async fn rowids_survive_row_level_filter_pushdown() {
             "rowid must survive a row-level RowSelection"
         );
     }
+
+    // Prove a RowSelection was actually built: with pushdown off the reader
+    // returns every row and a FilterExec does the work, so the assertions above
+    // would hold without exercising the sparse path at all.
+    let plan = analyze(&ctx, sql).await;
+    let pruned = plan
+        .find("pushdown_rows_pruned=")
+        .map(|at| &plan[at + "pushdown_rows_pruned=".len()..])
+        .and_then(|rest| rest.chars().next())
+        .unwrap_or('0');
+    assert!(
+        pruned != '0',
+        "the reader must prune rows itself, not hand them all to a FilterExec:\n{plan}"
+    );
 }
 
 /// Deletes are matched by absolute position, so pruning rows in the reader
@@ -1015,10 +1029,12 @@ async fn delete_prunes_on_a_file_that_embeds_row_ids() {
         "an embedded-rowid file must still prune ({matched}/{total}):\n{plan}"
     );
 
-    // And the DELETE itself is correct.
+    // And a DELETE targeting rows that live INSIDE the rewritten file works.
+    // That is the sharp case: if its predicate were pushed but could not bind,
+    // every row group would prune and the DELETE would remove nothing.
     let write_ctx = ctx_for(&temp, false, true).await;
     write_ctx
-        .sql("DELETE FROM ducklake.main.t WHERE id >= 55000 AND id < 55010")
+        .sql("DELETE FROM ducklake.main.t WHERE id = 3")
         .await
         .unwrap()
         .collect()
@@ -1026,7 +1042,106 @@ async fn delete_prunes_on_a_file_that_embeds_row_ids() {
         .unwrap();
     let ctx = ctx_for(&temp, false, false).await;
     assert_eq!(
+        row_count(&ctx, "SELECT id FROM ducklake.main.t WHERE id = 3").await,
+        0,
+        "the row inside the UPDATE-rewritten file must be deleted"
+    );
+    assert_eq!(
         row_count(&ctx, "SELECT id FROM ducklake.main.t").await,
-        ROWS as usize - 10
+        ROWS as usize - 1
+    );
+}
+
+/// A `DELETE` really does read the file on more than one thread.
+///
+/// The `DELETE`/`UPDATE` scans are executed directly, so the optimizer's
+/// repartition rule never sees them and they ask for the split themselves.
+/// Nothing else in the suite would notice if that stopped happening: every
+/// result stays correct, just slower. Asserted through the scan's own skew
+/// metric, since the plan is internal to `DuckLakeDeleteExec`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn delete_reads_the_file_on_more_than_one_partition() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("DELETE FROM ducklake.main.t WHERE id >= 55000")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // The same scan shape the DELETE builds, observed through a read plan: a
+    // positional scan over the whole file under the same session config.
+    let ctx = ctx_for(&temp, true, false).await;
+    let plan = analyze(&ctx, "SELECT rowid, id FROM ducklake.main.t").await;
+    assert!(
+        skew_percent(&plan).is_some_and(|s| s < 100),
+        "a positional scan must spread across partitions:\n{plan}"
+    );
+
+    let ctx = ctx_for(&temp, false, false).await;
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM ducklake.main.t").await,
+        55_000
+    );
+}
+
+/// `UPDATE` under a split scan must rewrite exactly the matching rows, with the
+/// right values.
+///
+/// The existing UPDATE coverage under a split config asserted only a row count,
+/// which an append+delete of the same size satisfies whether or not the rows
+/// were the right ones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn update_under_a_split_scan_rewrites_the_right_rows() {
+    let temp = TempDir::new().unwrap();
+    seed_float_table(&temp, None).await;
+
+    let write_ctx = ctx_for(&temp, false, true).await;
+    write_ctx
+        .sql("UPDATE ducklake.main.t SET x = -1.0 WHERE id >= 55000 AND id < 55003")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = ctx_for(&temp, false, false).await;
+    // Exactly the three targeted rows changed.
+    let changed: Vec<i32> = rows(&ctx, "SELECT id FROM ducklake.main.t WHERE x = -1.0")
+        .await
+        .iter()
+        .flat_map(|b| {
+            let c = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..b.num_rows()).map(|i| c.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    let mut changed = changed;
+    changed.sort_unstable();
+    assert_eq!(changed, vec![55_000, 55_001, 55_002]);
+
+    // Their neighbours kept their original values, and nothing was lost.
+    assert_eq!(
+        row_count(&ctx, "SELECT id FROM ducklake.main.t").await,
+        ROWS as usize
+    );
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT id FROM ducklake.main.t WHERE id = 54999 AND x = 54999.0"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        row_count(
+            &ctx,
+            "SELECT id FROM ducklake.main.t WHERE id = 55003 AND x = 55003.0"
+        )
+        .await,
+        1
     );
 }

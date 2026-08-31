@@ -304,15 +304,22 @@ fn validate_column_defaults(columns: &[DuckLakeTableColumn]) -> Result<HashMap<S
 /// stats written by official DuckLake's INSERT) may hold values outside its
 /// recorded bounds, and pruning on them would wrongly drop rows.
 ///
-/// **Both** bounds need the gate, because DataFusion compares floats with
-/// `total_cmp`, which is signed on NaN: positive NaN sorts above every value,
-/// and negative NaN sorts *below* every value — below `-Infinity` included. So
-/// a recorded min is no more a lower bound than a recorded max is an upper one:
-/// `SELECT (-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)` is `true`.
-/// `contains_nan` does not record the sign, so neither bound can be trusted.
+/// **Both** bounds need the gate here, which is where this deliberately differs
+/// from official DuckLake — an engine-layer difference, not a format one.
 ///
-/// Mirrors official DuckLake, which ORs `contains_nan` into its comparison
-/// filter SQL.
+/// Official gates only the max, and that is correct for DuckDB, which
+/// normalizes NaN: `-NaN = NaN` is true and either sign sorts above every
+/// value, so NaN can only ever hide above a recorded max. DataFusion compares
+/// floats with arrow's `total_cmp`, which is sign-sensitive:
+/// `(-CAST('NaN' AS DOUBLE)) < CAST('-Infinity' AS DOUBLE)` is `true` here and
+/// `false` in DuckDB. A negative NaN therefore sits *below* a recorded min in
+/// this engine, and `contains_nan` does not record the sign — so neither bound
+/// can be trusted.
+///
+/// Gating both is what keeps pruning consistent with the filter semantics this
+/// engine actually has. The underlying `total_cmp`-vs-DuckDB ordering
+/// difference is inherited from arrow and predates this gate; it is visible in
+/// query *results* for `±NaN` comparisons, not only in pruning.
 fn float_bound_is_usable(data_type: &DataType, contains_nan: Option<bool>) -> bool {
     !matches!(
         data_type,
@@ -709,6 +716,9 @@ struct FileReadConfig {
     /// (parquet column → `"rowid"`) when the file has an embedded column with
     /// a different name.
     name_mapping: HashMap<String, String>,
+    /// Number of row groups in the file. A scan cannot usefully be split into
+    /// more partitions than this — see [`DuckLakeTable::split_across_partitions`].
+    row_group_count: usize,
     /// True when the FILE gives at least one catalog column a different physical
     /// name — i.e. a real rename or an absent-column placeholder.
     ///
@@ -748,6 +758,9 @@ pub(crate) struct ParquetFooterFacts {
     pub(crate) field_ids: HashMap<i32, String>,
     /// The arrow schema the parquet reader derives for this file.
     pub(crate) arrow_schema: SchemaRef,
+    /// Number of row groups in the file. Bounds how far a scan of it can
+    /// usefully be split across partitions.
+    pub(crate) row_group_count: usize,
 }
 
 /// A file's footer resolved against a table's CURRENT columns: the schema to
@@ -771,6 +784,8 @@ pub(crate) struct ParquetFileLayout {
     /// True if the file carries a data column that is NOT in the table's current
     /// schema — a column dropped since the file was written.
     pub(crate) drops_current_columns: bool,
+    /// Number of row groups in the file.
+    pub(crate) row_group_count: usize,
 }
 
 /// Read `resolved_path`'s parquet footer once. `encryption_key` is the file's
@@ -826,6 +841,7 @@ pub(crate) async fn read_parquet_footer_facts(
     Ok(ParquetFooterFacts {
         field_ids,
         arrow_schema: builder.schema().clone(),
+        row_group_count: builder.metadata().row_groups().len(),
     })
 }
 
@@ -880,6 +896,7 @@ pub(crate) async fn read_parquet_file_layout(
         embedded_rowid_parquet_name: facts.field_ids.get(&ROW_ID_PARQUET_FIELD_ID).cloned(),
         embedded_snapshot_parquet_name: facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
         drops_current_columns,
+        row_group_count: facts.row_group_count,
     }))
 }
 
@@ -1708,7 +1725,7 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let plan = self.split_across_partitions(plan, state)?;
+        let plan = self.split_across_partitions(plan, state, &file_cfg)?;
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
@@ -2056,19 +2073,34 @@ impl DuckLakeTable {
     /// replaced did its own row-group-aligned splitting for the same reason, and
     /// dropping it without this would have made these paths single-threaded.
     ///
+    /// Capped at the file's row-group count, because DataFusion splits purely by
+    /// byte size and has no idea how many row groups a file has: asking for 8
+    /// partitions of a 2-row-group file yields 6 that read nothing and 8 that
+    /// each fetch the footer, since these scans install no shared metadata
+    /// cache. The partitioning this replaced capped the same way.
+    ///
+    /// Skipped entirely when `optimizer.repartition_file_scans` is off, so these
+    /// paths honour the setting the read paths get from the optimizer rule.
+    ///
     /// Falls back to `plan` unchanged if the source declines to split.
     fn split_across_partitions(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         state: &dyn Session,
+        file_cfg: &FileReadConfig,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let target = state.config().target_partitions();
+        let options = state.config_options();
+        if !options.optimizer.repartition_file_scans {
+            return Ok(plan);
+        }
+        let target = state
+            .config()
+            .target_partitions()
+            .min(file_cfg.row_group_count.max(1));
         if target <= 1 {
             return Ok(plan);
         }
-        Ok(plan
-            .repartitioned(target, state.config_options())?
-            .unwrap_or(plan))
+        Ok(plan.repartitioned(target, options)?.unwrap_or(plan))
     }
 
     /// Whether `predicate` may be pushed into the parquet reader for a
@@ -2330,6 +2362,7 @@ impl DuckLakeTable {
 
         let cfg = Arc::new(FileReadConfig {
             read_schema,
+            row_group_count: layout.row_group_count,
             renames_data_columns: !layout.name_mapping.is_empty(),
             name_mapping,
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
@@ -2915,7 +2948,7 @@ impl DuckLakeTable {
                 .with_projection_indices(Some(proj))?
                 .build(),
         );
-        let mut plan = self.split_across_partitions(scan, state)?;
+        let mut plan = self.split_across_partitions(scan, state, &file_cfg)?;
         // Mask with BOTH delete sources (#262): inlined positions and prior
         // Parquet ones. Only `existing_parquet_deleted` is carried forward into
         // the replacement delete file.
@@ -4526,6 +4559,68 @@ mod tests {
 
     /// The physical expression a caller would build for a scan, and hand to both
     /// `files_matching` and `resolve_positions`.
+    /// `predicate_is_prunable` must distinguish a REAL physical rename from the
+    /// synthetic `_ducklake_internal_row_id -> rowid` entry that every file
+    /// written by `UPDATE` or compaction carries.
+    ///
+    /// This is asserted here rather than end-to-end because the guard is read
+    /// only inside `resolve_positions`, whose plan is built and executed by
+    /// `DuckLakeDeleteExec` and never surfaces in `EXPLAIN ANALYZE`. An
+    /// integration test can observe that a `DELETE` is correct, but not that it
+    /// pruned.
+    #[test]
+    fn predicate_is_prunable_ignores_the_synthetic_rowid_rename() -> Result<()> {
+        let table = DuckLakeTable::new(
+            1,
+            "events",
+            Arc::new(LazyMillionFileProvider::default()),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )?;
+        let predicate = physical_predicate(&table, col("id").eq(lit(5_i64)));
+
+        let cfg = |renames_data_columns, mapping: Vec<(&str, &str)>| FileReadConfig {
+            read_schema: table.physical_schema.clone(),
+            name_mapping: mapping
+                .into_iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            row_group_count: 4,
+            renames_data_columns,
+            embedded_rowid_parquet_name: None,
+            embedded_snapshot_parquet_name: None,
+            drops_current_columns: false,
+        };
+
+        // A file written by UPDATE / compaction: one mapping entry, but no data
+        // column is renamed. Must still prune.
+        assert!(
+            table.predicate_is_prunable(
+                &predicate,
+                &cfg(
+                    false,
+                    vec![(
+                        crate::row_id::EMBEDDED_ROW_ID_COLUMN_NAME,
+                        ROWID_COLUMN_NAME
+                    )]
+                )
+            ),
+            "the synthetic rowid rename must not disable pruning"
+        );
+
+        // A real rename: the predicate carries catalog names the file does not
+        // have, so it must not be pushed.
+        assert!(
+            !table.predicate_is_prunable(&predicate, &cfg(true, vec![("old_id", "id")])),
+            "a renamed data column must disable pruning"
+        );
+
+        // No mapping at all: prunable.
+        assert!(table.predicate_is_prunable(&predicate, &cfg(false, vec![])));
+        Ok(())
+    }
+
     fn physical_predicate(table: &DuckLakeTable, expr: Expr) -> Arc<dyn PhysicalExpr> {
         let df_schema = DFSchema::try_from(table.physical_schema.as_ref().clone()).unwrap();
         SessionContext::new()

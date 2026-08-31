@@ -138,18 +138,6 @@ pub fn rowid_field() -> Field {
     Field::new(ROWID_COLUMN_NAME, DataType::Int64, true)
 }
 
-/// Build the Arrow field for the internal physical-position column, tagged with
-/// the parquet `RowNumber` virtual extension type.
-///
-/// A field carrying this extension type is what tells DataFusion's parquet
-/// opener to have the reader itself produce each row's absolute position in the
-/// file (`ArrowReaderOptions::with_virtual_columns`). Values are therefore true
-/// physical positions under row-group pruning, row-level selection, byte-range
-/// splitting and reverse-order reads alike — the property every consumer of
-/// [`ROW_POS_COLUMN_NAME`] depends on.
-///
-/// `name` is normally [`ROW_POS_COLUMN_NAME`]; see [`unique_row_pos_name`] for
-/// why it is not always.
 /// Check that `field` really is the reader-produced physical-position column.
 ///
 /// The extension type is the discriminator, not the data type: the embedded
@@ -175,6 +163,18 @@ pub(crate) fn validate_row_pos_field(
     Ok(())
 }
 
+/// Build the Arrow field for the internal physical-position column, tagged with
+/// the parquet `RowNumber` virtual extension type.
+///
+/// A field carrying this extension type is what tells DataFusion's parquet
+/// opener to have the reader itself produce each row's absolute position in the
+/// file (`ArrowReaderOptions::with_virtual_columns`). Values are therefore true
+/// physical positions under row-group pruning, row-level selection, byte-range
+/// splitting and reverse-order reads alike — the property every consumer of
+/// [`ROW_POS_COLUMN_NAME`] depends on.
+///
+/// `name` is normally [`ROW_POS_COLUMN_NAME`]; see [`unique_row_pos_name`] for
+/// why it is not always.
 pub(crate) fn row_pos_virtual_field(name: &str) -> FieldRef {
     Arc::new(Field::new(name, DataType::Int64, false).with_extension_type(RowNumber))
 }
@@ -549,6 +549,28 @@ mod tests {
         assert!(
             RowIdExec::try_new(mem, Some(0), 0).is_err(),
             "RowIdExec must reject a non-Int64 position column"
+        );
+    }
+
+    #[test]
+    fn rowid_rejects_a_plain_int64_column_as_the_position() {
+        // The discriminating case: the embedded rowid and snapshot-id columns
+        // are Int64 too, so an Int64-only check passes on exactly the columns a
+        // misalignment would land on. Only the extension type separates them.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int32, false),
+            Field::new(
+                crate::row_id::EMBEDDED_ROW_ID_COLUMN_NAME,
+                DataType::Int64,
+                true,
+            ),
+        ]));
+        let mem = MemorySourceConfig::try_new_exec(&[vec![]], schema, None).unwrap();
+        let err = RowIdExec::try_new(mem, Some(0), 1)
+            .expect_err("a plain Int64 column must not pass as the position column");
+        assert!(
+            err.to_string().contains(ROW_NUMBER_EXTENSION_TYPE),
+            "the error should name the extension type it wanted: {err}"
         );
     }
 
