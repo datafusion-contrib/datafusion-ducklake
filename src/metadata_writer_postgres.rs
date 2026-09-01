@@ -14,16 +14,17 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
+    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
+    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
+    live_inlined_index_columns, parse_inlined_index_columns, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
-    StringArray,
+    Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, IntervalMonthDayNanoArray,
+    LargeBinaryArray, LargeStringArray, StringArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -40,7 +41,7 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn inlined_postgres_type(data_type: &DataType) -> String {
+fn inlined_postgres_type(data_type: &DataType, ducklake_type: &str) -> String {
     match data_type {
         DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Int8 | DataType::Int16 => "SMALLINT".to_string(),
@@ -48,15 +49,21 @@ fn inlined_postgres_type(data_type: &DataType) -> String {
         DataType::Int64 => "BIGINT".to_string(),
         DataType::UInt8 | DataType::UInt16 => "INTEGER".to_string(),
         DataType::UInt32 => "BIGINT".to_string(),
+        DataType::UInt64 => "NUMERIC(20,0)".to_string(),
         DataType::Float32 => "REAL".to_string(),
         DataType::Float64 => "DOUBLE PRECISION".to_string(),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
         | DataType::Decimal128(precision, scale)
         | DataType::Decimal256(precision, scale) => format!("DECIMAL({precision},{scale})"),
+        DataType::Date32 => "DATE".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => "BIGINT".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
         DataType::Interval(_) => "INTERVAL".to_string(),
-        DataType::FixedSizeBinary(16) => "UUID".to_string(),
+        DataType::FixedSizeBinary(16) if ducklake_type.trim().eq_ignore_ascii_case("uuid") => {
+            "UUID".to_string()
+        },
         DataType::Utf8
         | DataType::LargeUtf8
         | DataType::Utf8View
@@ -68,11 +75,10 @@ fn inlined_postgres_type(data_type: &DataType) -> String {
     }
 }
 
-/// Scalar types the PostgreSQL inline path preserves through catalog
-/// normalization. Nested values remain on the Parquet path until their SQL
-/// representation has a matching parser.
+// Nested values use reference DuckDB literal text so the shared parser and external readers
+// agree.
 fn postgres_type_inlines(data_type: &DataType) -> bool {
-    crate::metadata_writer::scalar_type_supports_inlining(data_type)
+    crate::nested_inline::type_supports_inlining(data_type)
 }
 
 fn push_inlined_postgres_value(
@@ -81,6 +87,40 @@ fn push_inlined_postgres_value(
     row: usize,
     sql_type: &str,
 ) -> Result<()> {
+    if array.data_type() == &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
+        || matches!(
+            array.data_type(),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some(_))
+        )
+    {
+        if array.is_null(row) {
+            query.push_bind(Option::<i64>::None);
+        } else {
+            query.push_bind(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row),
+            );
+        }
+        return Ok(());
+    }
+    if array.data_type() == &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+        && !array.is_null(row)
+    {
+        let value = array
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .expect("Arrow data type and array implementation agree")
+            .value(row);
+        if value.nanoseconds % 1_000 != 0 {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "PostgreSQL INTERVAL cannot inline sub-microsecond nanoseconds: {}",
+                value.nanoseconds
+            )));
+        }
+    }
     if sql_type == "BYTEA" {
         if array.is_null(row) {
             query.push_bind(Option::<Vec<u8>>::None);
@@ -138,6 +178,99 @@ fn push_inlined_postgres_value(
         query.push_bind(crate::metadata_writer::inlined_text_value(array, row)?);
     }
     query.push(" AS ").push(sql_type).push(')');
+    Ok(())
+}
+
+async fn postgres_inlined_index_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+) -> Result<Vec<String>> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM ducklake_metadata
+         WHERE key = $1 AND scope = 'table' AND scope_id = $2",
+    )
+    .bind(INLINED_INDEX_COLUMNS_SETTING)
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let declared = parse_inlined_index_columns(value.as_deref().unwrap_or_default())?;
+    let available = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+    Ok(live_inlined_index_columns(declared, &available))
+}
+
+async fn ensure_postgres_physical_indexes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    physical_name: &str,
+) -> Result<()> {
+    let declared = postgres_inlined_index_columns(tx, table_id).await?;
+    let uint64_columns = sqlx::query(
+        "SELECT column_name, column_type FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .filter_map(|row| {
+        let name = row.try_get::<String, _>(0).ok()?;
+        let column_type = row.try_get::<String, _>(1).ok()?;
+        matches!(
+            column_type.trim().to_ascii_lowercase().as_str(),
+            "uint64" | "ubigint"
+        )
+        .then_some(name)
+    })
+    .collect::<std::collections::HashSet<_>>();
+    let physical_rows = sqlx::query(
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(physical_name)
+    .fetch_all(&mut **tx)
+    .await?;
+    let present = physical_rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>(0).ok())
+        .collect::<std::collections::HashSet<_>>();
+    for row in physical_rows {
+        let column_name: String = row.try_get(0)?;
+        let data_type: String = row.try_get(1)?;
+        if uint64_columns.contains(&column_name)
+            && matches!(data_type.as_str(), "character varying" | "text")
+        {
+            sqlx::query(AssertSqlSafe(format!(
+                "ALTER TABLE {} ALTER COLUMN {} TYPE NUMERIC(20,0) USING {}::numeric",
+                quote_ident(physical_name),
+                quote_ident(&column_name),
+                quote_ident(&column_name),
+            )))
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+        if !present.contains(column) {
+            continue;
+        }
+        let index_name = format!("{physical_name}_{column}_idx");
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+            quote_ident(&index_name),
+            quote_ident(physical_name),
+            quote_ident(column),
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -1896,11 +2029,11 @@ async fn commit_inlined_at_snapshot(
         "ducklake_inlined_data_{}_{}",
         write.table_id, schema_version
     );
-    let sql_types = batches[0]
-        .schema()
-        .fields()
+    let sql_types = write
+        .columns
         .iter()
-        .map(|field| inlined_postgres_type(field.data_type()))
+        .zip(batches[0].schema().fields())
+        .map(|(column, field)| inlined_postgres_type(field.data_type(), column.ducklake_type()))
         .collect::<Vec<_>>();
     let mut ddl = format!(
         "CREATE TABLE IF NOT EXISTS {} (\
@@ -1920,6 +2053,7 @@ async fn commit_inlined_at_snapshot(
     }
     ddl.push(')');
     sqlx::query(AssertSqlSafe(ddl)).execute(&mut **tx).await?;
+    ensure_postgres_physical_indexes(tx, write.table_id, &physical_name).await?;
     sqlx::query(
         "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
          SELECT $1, $2, $3
@@ -2130,6 +2264,79 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        block_on(async {
+            // Fast path without the catalog lock: callers re-declare the same
+            // columns on every catalog open, and a matching stored value needs
+            // neither the lock nor a DELETE+INSERT rewrite.
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata
+                 WHERE key = $1 AND scope = 'table' AND scope_id = $2",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if existing.as_deref() == Some(value.as_str()) {
+                return Ok(());
+            }
+            let mut transaction = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut transaction).await?;
+            let available = sqlx::query_scalar::<_, String>(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+            validate_inlined_index_columns(columns, &available)?;
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = $1 AND scope = 'table' AND scope_id = $2",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES ($1, $2, 'table', $3)",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
+            assert_table_in_catalog(self.catalog_id, table_id, &mut transaction).await?;
+            let physical_tables = sqlx::query_scalar::<_, String>(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            postgres_inlined_index_columns(&mut transaction, table_id).await?;
+            for physical_table in physical_tables {
+                ensure_postgres_physical_indexes(&mut transaction, table_id, &physical_table)
+                    .await?;
+            }
             transaction.commit().await?;
             Ok(())
         })
@@ -2954,11 +3161,12 @@ impl MetadataWriter for PostgresMetadataWriter {
             .fetch_one(&mut *tx)
             .await?;
             let physical_name = format!("ducklake_inlined_data_{table_id}_{schema_version}");
-            let sql_types = batches[0]
-                .schema()
-                .fields()
+            let sql_types = columns
                 .iter()
-                .map(|field| inlined_postgres_type(field.data_type()))
+                .zip(batches[0].schema().fields())
+                .map(|(column, field)| {
+                    inlined_postgres_type(field.data_type(), column.ducklake_type())
+                })
                 .collect::<Vec<_>>();
             let mut ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {} (\
@@ -2977,6 +3185,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             }
             ddl.push(')');
             sqlx::query(AssertSqlSafe(ddl)).execute(&mut *tx).await?;
+            ensure_postgres_physical_indexes(&mut tx, table_id, &physical_name).await?;
             sqlx::query(
                 "INSERT INTO ducklake_inlined_data_tables
                      (table_id, table_name, schema_version)
@@ -5882,33 +6091,89 @@ impl MetadataWriter for PostgresMetadataWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::inlined_postgres_type;
+    use super::{inlined_postgres_type, push_inlined_postgres_value};
     use crate::metadata_writer::{ColumnDef, columns_differ};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::array::types::IntervalMonthDayNano;
+    use arrow::array::{Array, FixedSizeBinaryArray, IntervalMonthDayNanoArray, UInt64Array};
+    use arrow::datatypes::{DataType, Field, IntervalUnit};
+    use sqlx::{Postgres, QueryBuilder};
     use std::sync::Arc;
 
     #[test]
     fn postgres_inlined_types_follow_ducklake_encodings() {
-        assert_eq!(inlined_postgres_type(&DataType::Int8), "SMALLINT");
-        assert_eq!(inlined_postgres_type(&DataType::UInt32), "BIGINT");
-        assert_eq!(inlined_postgres_type(&DataType::UInt64), "VARCHAR");
-        assert_eq!(inlined_postgres_type(&DataType::Utf8), "BYTEA");
+        assert_eq!(inlined_postgres_type(&DataType::Int8, "int8"), "SMALLINT");
+        assert_eq!(inlined_postgres_type(&DataType::UInt32, "uint32"), "BIGINT");
         assert_eq!(
-            inlined_postgres_type(&DataType::FixedSizeBinary(16)),
+            inlined_postgres_type(&DataType::UInt64, "uint64"),
+            "NUMERIC(20,0)"
+        );
+        assert_eq!(inlined_postgres_type(&DataType::Utf8, "varchar"), "BYTEA");
+        assert_eq!(
+            inlined_postgres_type(&DataType::FixedSizeBinary(16), "uuid"),
             "UUID"
         );
         assert_eq!(
-            inlined_postgres_type(&DataType::FixedSizeBinary(32)),
+            inlined_postgres_type(&DataType::FixedSizeBinary(16), "fixed_size_binary(16)"),
             "BYTEA"
         );
-        assert_eq!(inlined_postgres_type(&DataType::Date32), "VARCHAR");
         assert_eq!(
-            inlined_postgres_type(&DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Int32,
-                true,
-            )))),
+            inlined_postgres_type(&DataType::FixedSizeBinary(32), "fixed_size_binary(32)"),
+            "BYTEA"
+        );
+        assert_eq!(inlined_postgres_type(&DataType::Date32, "date"), "DATE");
+        assert_eq!(
+            inlined_postgres_type(
+                &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                "timestamp_ns",
+            ),
+            "BIGINT"
+        );
+        assert_eq!(
+            inlined_postgres_type(
+                &DataType::List(Arc::new(Field::new("item", DataType::Int32, true,))),
+                "list"
+            ),
             "VARCHAR"
+        );
+    }
+
+    #[test]
+    fn postgres_uint64_inline_insert_casts_the_parameter() {
+        let values = UInt64Array::from(vec![u64::MAX]);
+        let mut query = QueryBuilder::<Postgres>::new("VALUES (");
+        push_inlined_postgres_value(&mut query, &values, 0, "NUMERIC(20,0)").unwrap();
+        query.push(')');
+
+        assert_eq!(query.sql(), "VALUES (CAST($1 AS NUMERIC(20,0)))");
+    }
+
+    #[test]
+    fn postgres_rejects_submicrosecond_interval_inlining() {
+        let values = IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNano::new(0, 0, 1)]);
+        let mut query = QueryBuilder::<Postgres>::new("VALUES (");
+        let error = push_inlined_postgres_value(&mut query, &values, 0, "INTERVAL").unwrap_err();
+
+        assert!(matches!(error, crate::DuckLakeError::Unsupported(_)));
+        assert!(error.to_string().contains("sub-microsecond"));
+        assert_eq!(
+            values.data_type(),
+            &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+    }
+
+    #[test]
+    fn postgres_non_uuid_fixed_16_binds_raw_bytes() {
+        let bytes = [0x00_u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let bytes = [bytes.as_slice(), bytes.as_slice()].concat();
+        let values = FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter()).unwrap();
+        let mut query = QueryBuilder::<Postgres>::new("VALUES (");
+        push_inlined_postgres_value(&mut query, &values, 0, "BYTEA").unwrap();
+        query.push(')');
+
+        assert_eq!(query.sql(), "VALUES ($1)");
+        assert_eq!(
+            inlined_postgres_type(values.data_type(), "fixed_size_binary(16)"),
+            "BYTEA"
         );
     }
 

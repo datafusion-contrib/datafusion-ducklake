@@ -111,7 +111,7 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
          CREATE TABLE raw.ducklake_tag( \
              object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, key VARCHAR, value VARCHAR \
          ); \
-             CREATE TABLE IF NOT EXISTS raw.ducklake_inlined_data_tables( \
+         CREATE TABLE IF NOT EXISTS raw.ducklake_inlined_data_tables( \
              table_id BIGINT, table_name VARCHAR, schema_version BIGINT \
          ); \
          CREATE TABLE raw.ducklake_column_tag( \

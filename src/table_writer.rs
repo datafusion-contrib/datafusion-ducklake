@@ -1474,7 +1474,7 @@ impl DuckLakeTableWriter {
                 mode,
                 setup.base_snapshot_id,
                 &columns,
-                &setup.column_ids,
+                &setup.field_ids,
                 &options.commit_metadata,
                 options.expected_base_snapshot_id,
             )?;
@@ -1631,7 +1631,7 @@ impl DuckLakeTableWriter {
                 mode,
                 setup.base_snapshot_id,
                 &columns,
-                &setup.column_ids,
+                &setup.field_ids,
                 &SnapshotCommitMetadata::new(),
                 None,
             )?;
@@ -1774,7 +1774,7 @@ impl DuckLakeTableWriter {
                     base_snapshot_id: setup.base_snapshot_id,
                     mode,
                     columns,
-                    column_ids: setup.column_ids,
+                    column_ids: setup.field_ids,
                     data: StagedTableData::Inlined(batches.to_vec()),
                     snapshot_id_columns: Vec::new(),
                     positional_deletes: Vec::new(),
@@ -1892,8 +1892,12 @@ impl DuckLakeTableWriter {
         Ok(ObjectPath::from(path.trim_start_matches('/')))
     }
 
-    fn should_inline(&self, _rows: usize, _arrow_schema: &Schema) -> bool {
-        false
+    fn should_inline(&self, rows: usize, arrow_schema: &Schema) -> bool {
+        rows > 0
+            && self
+                .data_inlining_row_limit
+                .is_some_and(|limit| rows <= limit)
+            && self.metadata.supports_data_inlining(arrow_schema)
     }
 
     /// Resolve the table's live partition spec against the columns this write is

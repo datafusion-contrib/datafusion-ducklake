@@ -28,6 +28,7 @@ fn create_official_default_catalog(path: &Path) -> Result<Vec<(i32, i32)>> {
         &format!("ATTACH 'ducklake:{}' AS official", path.display()),
         [],
     )?;
+    conn.execute("CALL official.set_option('data_inlining_row_limit', 0)", [])?;
     conn.execute("CREATE TABLE official.items (id INTEGER)", [])?;
     conn.execute("INSERT INTO official.items VALUES (1), (2)", [])?;
     conn.execute(

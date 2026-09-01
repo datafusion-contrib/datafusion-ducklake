@@ -109,7 +109,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Strings / dates / timestamps          |    ✅     |                                                              |
 | Decimal (precision & scale)           |    ✅     |                                                              |
 | Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
-| Complex / nested (list, struct, map)  | Supported | Recursive types and nullable‑field evolution; no pruning     |
+| Complex / nested (list, struct, map)  | Supported | Recursive types, nullable evolution, inlining; no pruning       |
 
 ### Column defaults
 
@@ -129,6 +129,37 @@ Writer initialization migrates missing default-metadata columns on SQLite,
 MySQL, and PostgreSQL. DuckDB read providers project missing fields as `NULL`.
 For a legacy SQLite, MySQL, or PostgreSQL catalog opened through a read-only
 provider, run writer initialization with a schema-migration role before reading.
+
+### Inlined physical storage
+
+New inlined physical tables use lossless, ordered backend types for values used
+in filters:
+
+- **DuckDB:** Native unsigned integers and DuckDB temporal types, including
+  nanosecond timestamps.
+- **PostgreSQL:** `NUMERIC(20,0)` for `UInt64`; native `DATE`, `TIME`,
+  and second-to-microsecond `TIMESTAMP`; `BIGINT` for nanosecond timestamps.
+- **MySQL:** `BIGINT UNSIGNED` for `UInt64`; native `DATE`, `TIME(6)`,
+  and second-to-microsecond `DATETIME(6)` (year range 1000-9999, no
+  session-time-zone conversion); `BIGINT` for nanosecond timestamps.
+- **SQLite:** Zero-padded, 20-digit `TEXT` for `UInt64`; integer epoch values
+  in the declared Arrow unit for temporal columns.
+
+MySQL also stores floats and `Decimal128(p,s)` as native `FLOAT`/`DOUBLE`
+and `DECIMAL(p,s)`. PostgreSQL maps a 16-byte fixed binary column to `UUID`
+only when its DuckLake logical type is `uuid`; other fixed binary values use
+`BYTEA`. PostgreSQL and DuckDB reject inlined `Interval(MonthDayNano)` values
+with sub-microsecond precision instead of truncating them.
+
+Call `MetadataWriter::set_inlined_index_columns(table_id, columns)` to persist
+the top-level columns that should be indexed, then call
+`ensure_inlined_indexes(table_id)` to backfill existing physical tables. Every
+physical inlined table receives a `row_id` index, including tables created after
+the declaration. Repeated ensure calls are safe. PostgreSQL ensure calls also
+migrate legacy text-encoded `UInt64` columns to `NUMERIC(20,0)`; SQLite retains
+legacy column types. Declarations validate strictly when set; write and ensure
+paths skip declared columns a later schema migration removed or renamed, so a
+stale declaration never fails an inlined commit.
 
 ---
 
@@ -169,6 +200,8 @@ files written by `INSERT`, `UPDATE`, `DELETE`, and maintenance. When the setting
 is absent, this crate retains its existing Parquet V2 default; DuckDB `COPY`
 defaults to Parquet V1. Set `parquet_version = V1` explicitly when identical
 absent-setting behavior is required.
+Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
+multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 
 ### Views
 
@@ -370,15 +403,25 @@ Known edges:
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Data inlining: scalar rows are read on every metadata backend.** DuckLake
+- **Data inlining: supported rows are read on every metadata backend.** DuckLake
   inlines `INSERT`s of up to 10 rows into the catalog by default. SQLite,
   DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
   `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
   (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
   `DELETE`, and compaction on all four backends; the `rowid` path remains
-  unsupported for inlined rows. Non‑scalar inlined columns fail with an
-  error that directs users to flush the rows to Parquet or disable inlining at
-  write time.
+  unsupported for inlined rows. Lists, structs, and maps inline on every
+  writable backend when every field passes the shared nested-type gate.
+  Unsupported schemas fall back to Parquet. Inlined rows containing
+  `Interval(MonthDayNano)` remain readable, but Arrow 59 cannot flush that
+  interval type to Parquet.
+  Inlined scans conservatively push equality, range, null, conjunction,
+  disjunction, and case-sensitive prefix predicates into parameterized catalog
+  SQL. Supported `AND` children push independently; `OR` pushes only when every
+  branch is supported. DataFusion reapplies every filter. A physical schema or
+  backend encoding that cannot preserve DataFusion comparison semantics falls
+  back to materializing those rows. Projection pushdown is automatic. Declared
+  physical indexes are described under
+  [Inlined physical storage](#inlined-physical-storage).
 - **The change feed does not surface inlined deletes.** `ducklake_table_changes`
   and `ducklake_table_deletions` read delete *files* added in the window; a
   snapshot whose only change is an inlined Parquet‑row delete emits no `delete`

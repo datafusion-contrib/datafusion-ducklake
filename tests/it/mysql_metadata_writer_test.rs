@@ -9,16 +9,22 @@
 //! as `tests/it/mysql_metadata_provider_test.rs`: it is ignored under
 //! `skip-tests-with-docker` on macOS (Docker unavailable there).
 
-use arrow::array::Int32Array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::types::IntervalMonthDayNano;
+use arrow::array::{
+    Array, ArrayRef, BinaryViewArray, Int32Array, Int64Array, IntervalMonthDayNanoArray, ListArray,
+    MapArray, StringViewArray, StructArray,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
 use datafusion_ducklake::maintenance::ExpireCriteria;
 use datafusion_ducklake::metadata_writer::InlinedRowRef;
 use datafusion_ducklake::{
     ColumnDef, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider,
-    MetadataWriter, MySqlMetadataProvider, MySqlMetadataWriter, SnapshotCommitMetadata,
-    SourceRetirement, WriteMode, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, DuckLakeCatalog, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MetadataProvider, MetadataWriter, MySqlMetadataProvider, MySqlMetadataWriter,
+    SnapshotCommitMetadata, SourceRetirement, WriteMode, WriteSetupResult,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::{AssertSqlSafe, Row};
@@ -42,6 +48,79 @@ async fn start_writer() -> (ContainerAsync<Mysql>, MySqlMetadataWriter, sqlx::My
 
 fn int_column() -> Vec<ColumnDef> {
     vec![ColumnDef::new("id", "int32", false).unwrap()]
+}
+
+fn nested_batch() -> RecordBatch {
+    let payload_fields = Fields::from(vec![
+        Field::new("raw", DataType::BinaryView, true),
+        Field::new(
+            "interval",
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            true,
+        ),
+        Field::new("label", DataType::Utf8View, true),
+    ]);
+    let payload = StructArray::new(
+        payload_fields.clone(),
+        vec![
+            Arc::new(BinaryViewArray::from(vec![
+                Some(b"\x00\xff".as_ref()),
+                Some(b"\x10\x80".as_ref()),
+            ])) as ArrayRef,
+            Arc::new(IntervalMonthDayNanoArray::from(vec![
+                IntervalMonthDayNano::new(1, 2, 3_001),
+                IntervalMonthDayNano::new(-1, 4, 5_007),
+            ])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["東京😀", "café🦀"])) as ArrayRef,
+        ],
+        None,
+    );
+    let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let values = ListArray::new(
+        item_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3])),
+        Arc::new(Int32Array::from(vec![10, 20, 30])),
+        None,
+    );
+    let map_fields = Fields::from(vec![
+        Field::new("key", DataType::Utf8View, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let map_entries = StructArray::new(
+        map_fields.clone(),
+        vec![
+            Arc::new(StringViewArray::from(vec!["a", "β", "emoji😀"])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        ],
+        None,
+    );
+    let map_field = Arc::new(Field::new("entries", DataType::Struct(map_fields), false));
+    let attributes = MapArray::new(
+        map_field,
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 3])),
+        map_entries,
+        None,
+        false,
+    );
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("payload", DataType::Struct(payload_fields), false),
+            Field::new("values", values.data_type().clone(), false),
+            Field::new("attributes", attributes.data_type().clone(), false),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(payload),
+            Arc::new(values),
+            Arc::new(attributes),
+        ],
+    )
+    .unwrap()
+}
+
+fn flushable_nested_batch() -> RecordBatch {
+    nested_batch().project(&[0, 2, 3]).unwrap()
 }
 
 fn append(writer: &MySqlMetadataWriter, path: &str, rows: i64) -> (WriteSetupResult, CommitIds) {
@@ -113,6 +192,184 @@ async fn changes_made(pool: &sqlx::MySqlPool, snapshot_id: i64) -> Option<String
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn mysql_table_batches(pool: sqlx::MySqlPool, table_name: &str) -> Vec<RecordBatch> {
+    let catalog = DuckLakeCatalog::new(MySqlMetadataProvider::from_pool(pool)).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    context
+        .sql(&format!(
+            "SELECT * FROM ducklake.main.`{}` ORDER BY id",
+            table_name.replace('`', "``")
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+}
+
+async fn mysql_table_count(pool: sqlx::MySqlPool, table_name: &str) -> i64 {
+    let catalog = DuckLakeCatalog::new(MySqlMetadataProvider::from_pool(pool)).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    let batches = context
+        .sql(&format!(
+            "SELECT COUNT(*) FROM ducklake.main.`{}`",
+            table_name.replace('`', "``")
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_nested_inlined_rows_round_trip_flush_and_skip_text_indexes() {
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(MySqlMetadataWriter::new_with_init(&conn_str).await.unwrap());
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let pool = sqlx::MySqlPool::connect(&conn_str).await.unwrap();
+    let expected = nested_batch();
+    let written = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(2))
+        .write_table("main", "nested_values", std::slice::from_ref(&expected))
+        .await
+        .unwrap();
+    assert_eq!(written.files_written, 0);
+    assert_eq!(written.records_written, 2);
+
+    writer
+        .set_inlined_index_columns(written.table_id, &["payload".to_string(), "id".to_string()])
+        .unwrap();
+    writer.ensure_inlined_indexes(written.table_id).unwrap();
+    writer.ensure_inlined_indexes(written.table_id).unwrap();
+    let physical = inlined_table(&pool, written.table_id).await;
+    let payload_type: String = sqlx::query_scalar(
+        "SELECT column_type FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = ? AND column_name = 'payload'",
+    )
+    .bind(&physical)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(payload_type, "longtext");
+    let index_names = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT index_name FROM information_schema.statistics
+         WHERE table_schema = DATABASE() AND table_name = ? AND index_name <> 'PRIMARY'
+         ORDER BY index_name",
+    )
+    .bind(&physical)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        index_names,
+        vec![format!("{physical}_id_idx"), format!("{physical}_row_id_idx"),]
+    );
+
+    let provider = MySqlMetadataProvider::from_pool(pool.clone());
+    let columns = provider
+        .get_table_structure(written.table_id, written.snapshot_id)
+        .unwrap();
+    assert_eq!(
+        provider
+            .get_inlined_data(written.table_id, written.snapshot_id, &columns)
+            .unwrap(),
+        vec![expected.clone()]
+    );
+    let inlined = provider
+        .get_inlined_data_with_row_ids(written.table_id, written.snapshot_id, &columns)
+        .unwrap();
+    assert_eq!(inlined.len(), 1);
+    assert_eq!(inlined[0].row_ids, vec![0, 1]);
+    assert_eq!(inlined[0].batch, expected);
+    assert_eq!(mysql_table_count(pool.clone(), "nested_values").await, 2);
+    assert_eq!(
+        mysql_table_batches(pool.clone(), "nested_values").await,
+        vec![expected.clone()]
+    );
+
+    let flush_expected = flushable_nested_batch();
+    let flush_write = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(2))
+        .write_table(
+            "main",
+            "nested_flush",
+            std::slice::from_ref(&flush_expected),
+        )
+        .await
+        .unwrap();
+    assert_eq!(flush_write.files_written, 0);
+    let provider = MySqlMetadataProvider::from_pool(pool.clone());
+    let flush_columns = provider
+        .get_table_structure(flush_write.table_id, flush_write.snapshot_id)
+        .unwrap();
+    let flush_inlined = provider
+        .get_inlined_data_with_row_ids(
+            flush_write.table_id,
+            flush_write.snapshot_id,
+            &flush_columns,
+        )
+        .unwrap();
+    assert_eq!(flush_inlined.len(), 1);
+    assert_eq!(flush_inlined[0].batch, flush_expected);
+
+    let flushed = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .flush_inlined_data(
+            "main",
+            "nested_flush",
+            &flush_inlined,
+            flush_write.snapshot_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flushed.records_written, 2);
+    assert_eq!(flushed.files_written, 1);
+    let provider = MySqlMetadataProvider::from_pool(pool.clone());
+    assert!(
+        provider
+            .get_inlined_data_with_row_ids(
+                flush_write.table_id,
+                flushed.snapshot_id,
+                &flush_columns,
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        provider
+            .get_inlined_data(
+                flush_write.table_id,
+                flush_write.snapshot_id,
+                &flush_columns,
+            )
+            .unwrap(),
+        vec![flush_expected.clone()]
+    );
+    assert_eq!(mysql_table_count(pool.clone(), "nested_flush").await, 2);
+    assert_eq!(
+        mysql_table_batches(pool, "nested_flush").await,
+        vec![flush_expected]
+    );
 }
 
 /// Full write -> read round-trip through both a data-file commit
@@ -970,6 +1227,79 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
         changes_made(&pool, compact_commit.snapshot_id).await,
         Some(format!("compacted_table:{}", setup.table_id))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_multi_table_write_commits_nested_inlined_rows_atomically() {
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(MySqlMetadataWriter::new_with_init(&conn_str).await.unwrap());
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let pool = sqlx::MySqlPool::connect(&conn_str).await.unwrap();
+    let expected = nested_batch();
+    let columns = expected
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            ColumnDef::from_arrow(field.name(), field.data_type(), field.is_nullable()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    for table_name in ["nested_a", "nested_b"] {
+        let setup = writer
+            .begin_write_transaction("main", table_name, &columns, WriteMode::Append)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                setup.table_id,
+                "main",
+                table_name,
+                setup.snapshot_id,
+                WriteMode::Append,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.field_ids,
+            )
+            .unwrap();
+    }
+
+    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    let mut transaction = table_writer.transaction();
+    for table_name in ["nested_a", "nested_b"] {
+        transaction
+            .stage_write_with_options(
+                "main",
+                table_name,
+                expected.schema().as_ref(),
+                WriteMode::Append,
+                std::slice::from_ref(&expected),
+                &DuckLakeWriteOptions::default().with_data_inlining_row_limit(2),
+            )
+            .await
+            .unwrap();
+    }
+    let committed = transaction.commit().await.unwrap();
+    assert_eq!(committed.len(), 2);
+    assert_eq!(committed[0].snapshot_id, committed[1].snapshot_id);
+    assert!(committed.iter().all(|result| result.files_written == 0));
+
+    let provider = MySqlMetadataProvider::from_pool(pool);
+    for result in &committed {
+        let table_columns = provider
+            .get_table_structure(result.table_id, result.snapshot_id)
+            .unwrap();
+        assert_eq!(
+            provider
+                .get_inlined_data(result.table_id, result.snapshot_id, &table_columns)
+                .unwrap(),
+            vec![expected.clone()]
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

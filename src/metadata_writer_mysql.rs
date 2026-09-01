@@ -37,18 +37,20 @@ use crate::maintenance::{ExpireCriteria, ExpiredSnapshot, format_sql_timestamp};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite,
-    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING,
+    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, SourceRetirement,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, live_inlined_index_columns,
+    parse_inlined_index_columns, quote_snapshot_name, quote_snapshot_table, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
-    UInt16Array, UInt32Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -79,7 +81,14 @@ fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-fn inlined_mysql_type(data_type: &DataType) -> &'static str {
+fn mysql_type_supports_index(physical_type: &str) -> bool {
+    !matches!(
+        physical_type.to_ascii_lowercase().as_str(),
+        "longtext" | "longblob"
+    )
+}
+
+fn inlined_mysql_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Boolean
         | DataType::Int8
@@ -88,24 +97,36 @@ fn inlined_mysql_type(data_type: &DataType) -> &'static str {
         | DataType::Int64
         | DataType::UInt8
         | DataType::UInt16
-        | DataType::UInt32 => "BIGINT",
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "LONGBLOB",
-        DataType::FixedSizeBinary(size) if *size != 16 => "LONGBLOB",
-        _ => "LONGTEXT",
+        | DataType::UInt32 => "BIGINT".to_string(),
+        DataType::UInt64 => "BIGINT UNSIGNED".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Decimal32(precision, scale)
+        | DataType::Decimal64(precision, scale)
+        | DataType::Decimal128(precision, scale) => format!("DECIMAL({precision},{scale})"),
+        DataType::Date32 => "DATE".to_string(),
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => "TIME(6)".to_string(),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => "BIGINT".to_string(),
+        // DATETIME, not TIMESTAMP: TIMESTAMP is capped to [1970-01-01 00:00:01,
+        // 2038-01-19] UTC and converts through the session time zone on
+        // store/retrieve, so epoch-adjacent and post-2038 values would fail or
+        // shift between sessions.
+        DataType::Timestamp(_, _) => "DATETIME(6)".to_string(),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "LONGBLOB".to_string(),
+        DataType::FixedSizeBinary(size) if *size != 16 => "LONGBLOB".to_string(),
+        _ => "LONGTEXT".to_string(),
     }
 }
 
-/// Scalar types the MySQL inline path preserves through catalog normalization.
-/// Nested values remain on the Parquet path until their SQL representation has
-/// a matching parser.
 fn mysql_type_inlines(data_type: &DataType) -> bool {
-    crate::metadata_writer::scalar_type_supports_inlining(data_type)
+    crate::nested_inline::type_supports_inlining(data_type)
 }
 
 fn push_inlined_mysql_value(
     query: &mut QueryBuilder<MySql>,
     array: &dyn Array,
     row: usize,
+    sql_type: &str,
 ) -> Result<()> {
     if array.is_null(row) {
         query.push_bind(Option::<String>::None);
@@ -149,6 +170,49 @@ fn push_inlined_mysql_value(
         DataType::UInt8 => unsigned!(UInt8Array),
         DataType::UInt16 => unsigned!(UInt16Array),
         DataType::UInt32 => unsigned!(UInt32Array),
+        DataType::UInt64 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query
+                .push("CAST(CAST(")
+                .push_bind(value.to_string())
+                .push(" AS DECIMAL(20,0)) AS UNSIGNED)");
+        },
+        DataType::Float32 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(value);
+        },
+        DataType::Float64 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(value);
+        },
+        DataType::Decimal32(_, _) | DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => {
+            query
+                .push("CAST(")
+                .push_bind(crate::metadata_writer::inlined_text_value(array, row)?)
+                .push(" AS ")
+                .push(sql_type)
+                .push(')');
+        },
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            let value = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(value);
+        },
         DataType::Utf8 => {
             query.push_bind(
                 array
@@ -789,10 +853,6 @@ async fn detect_replace_conflict(
     Ok(())
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id` and
-/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
-/// files registered for *this* snapshot, so a multi-file write does not retire
-/// its own siblings. `next_row_id` is left untouched (rowids stay monotonic).
 async fn detect_new_inlined_deletes(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -844,6 +904,10 @@ async fn detect_new_inlined_deletes(
     Ok(())
 }
 
+/// Retire the prior generation's still-visible data files at `snapshot_id` and
+/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
+/// files registered for *this* snapshot, so a multi-file write does not retire
+/// its own siblings. `next_row_id` is left untouched (rowids stay monotonic).
 async fn retire_prior_generation(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
@@ -1789,10 +1853,91 @@ fn inlined_mysql_table_ddl(
         ddl.push_str(", ");
         ddl.push_str(&quote_ident(column.name()));
         ddl.push(' ');
-        ddl.push_str(inlined_mysql_type(field.data_type()));
+        ddl.push_str(&inlined_mysql_type(field.data_type()));
     }
     ddl.push_str(") ENGINE = InnoDB");
     ddl
+}
+
+async fn mysql_inlined_index_columns(pool: &MySqlPool, table_id: i64) -> Result<Vec<String>> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM ducklake_metadata
+         WHERE `key` = ? AND scope = 'table' AND scope_id = ?",
+    )
+    .bind(INLINED_INDEX_COLUMNS_SETTING)
+    .bind(table_id)
+    .fetch_optional(pool)
+    .await?;
+    let declared = parse_inlined_index_columns(value.as_deref().unwrap_or_default())?;
+    let available = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+    Ok(live_inlined_index_columns(declared, &available))
+}
+
+async fn ensure_mysql_physical_indexes(
+    pool: &MySqlPool,
+    table_id: i64,
+    physical_name: &str,
+) -> Result<()> {
+    let declared = mysql_inlined_index_columns(pool, table_id).await?;
+    let physical_types = sqlx::query_as::<_, (String, String)>(
+        "SELECT column_name, column_type FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = ?",
+    )
+    .bind(physical_name)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashMap<_, _>>();
+    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+        let Some(physical_type) = physical_types.get(column) else {
+            continue;
+        };
+        if !mysql_type_supports_index(physical_type) {
+            continue;
+        }
+        let index_name = format!("{physical_name}_{column}_idx");
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.statistics
+             WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+        )
+        .bind(physical_name)
+        .bind(&index_name)
+        .fetch_one(pool)
+        .await?;
+        if exists > 0 {
+            continue;
+        }
+        let create = sqlx::query(AssertSqlSafe(format!(
+            "CREATE INDEX {} ON {}({})",
+            quote_ident(&index_name),
+            quote_ident(physical_name),
+            quote_ident(column),
+        )))
+        .execute(pool)
+        .await;
+        if let Err(error) = create {
+            let exists: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.statistics
+                 WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+            )
+            .bind(physical_name)
+            .bind(&index_name)
+            .fetch_one(pool)
+            .await?;
+            if exists == 0 {
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn commit_staged_inline(
@@ -1886,7 +2031,12 @@ async fn commit_staged_inline(
                 {
                     query.push_bind(snapshot_id);
                 } else {
-                    push_inlined_mysql_value(&mut query, array.as_ref(), batch_row)?;
+                    push_inlined_mysql_value(
+                        &mut query,
+                        array.as_ref(),
+                        batch_row,
+                        &inlined_mysql_type(array.data_type()),
+                    )?;
                 }
             }
             query.push(')');
@@ -1971,6 +2121,108 @@ impl MetadataWriter for MySqlMetadataWriter {
     fn supports_update(&self) -> bool {
         true
     }
+    fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let exists: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) > 0 FROM ducklake_table
+                 WHERE table_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !exists {
+                return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE `key` = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(key)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id)
+                 VALUES (?, ?, 'table', ?)",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let available = sqlx::query_scalar::<_, String>(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+            if available.is_empty() {
+                return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+            validate_inlined_index_columns(columns, &available)?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata
+                 WHERE `key` = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if existing.as_deref() == Some(value.as_str()) {
+                transaction.commit().await?;
+                return Ok(());
+            }
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE `key` = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (`key`, value, scope, scope_id)
+                 VALUES (?, ?, 'table', ?)",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
+        block_on(async {
+            let physical_tables = sqlx::query_scalar::<_, String>(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            mysql_inlined_index_columns(&self.pool, table_id).await?;
+            for physical_table in physical_tables {
+                ensure_mysql_physical_indexes(&self.pool, table_id, &physical_table).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -3277,6 +3529,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 let ddl =
                     inlined_mysql_table_ddl(&physical_name, batches[0].schema().fields(), columns);
                 sqlx::query(AssertSqlSafe(ddl)).execute(&self.pool).await?;
+                ensure_mysql_physical_indexes(&self.pool, table_id, &physical_name).await?;
 
                 let mut tx = self.pool.begin().await?;
                 let snapshot_id =
@@ -3354,7 +3607,12 @@ impl MetadataWriter for MySqlMetadataWriter {
                     query.push(", NULL");
                     for array in batch.columns() {
                         query.push(", ");
-                        push_inlined_mysql_value(&mut query, array.as_ref(), batch_row)?;
+                        push_inlined_mysql_value(
+                            &mut query,
+                            array.as_ref(),
+                            batch_row,
+                            &inlined_mysql_type(array.data_type()),
+                        )?;
                     }
                     query.push(')');
                     query.build().execute(&mut *tx).await?;
@@ -3450,6 +3708,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                         &write.columns,
                     );
                     sqlx::query(AssertSqlSafe(ddl)).execute(&self.pool).await?;
+                    ensure_mysql_physical_indexes(&self.pool, write.table_id, &physical_name)
+                        .await?;
                 }
             }
 
@@ -4390,10 +4650,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mysql_inlining_gate_accepts_nested_types() {
+        let nested = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int32,
+            true,
+        )));
+
+        assert!(mysql_type_inlines(&nested));
+        assert_eq!(inlined_mysql_type(&nested), "LONGTEXT");
+    }
+
+    #[test]
     fn mysql_inlined_types_follow_sqlite_style_encodings() {
         assert_eq!(inlined_mysql_type(&DataType::Int32), "BIGINT");
-        assert_eq!(inlined_mysql_type(&DataType::UInt64), "LONGTEXT");
-        assert_eq!(inlined_mysql_type(&DataType::Float64), "LONGTEXT");
+        assert_eq!(inlined_mysql_type(&DataType::UInt64), "BIGINT UNSIGNED");
+        assert_eq!(inlined_mysql_type(&DataType::Float32), "FLOAT");
+        assert_eq!(inlined_mysql_type(&DataType::Float64), "DOUBLE");
+        assert_eq!(
+            inlined_mysql_type(&DataType::Decimal128(20, 4)),
+            "DECIMAL(20,4)"
+        );
         assert_eq!(inlined_mysql_type(&DataType::Binary), "LONGBLOB");
         assert_eq!(
             inlined_mysql_type(&DataType::FixedSizeBinary(16)),
@@ -4403,6 +4680,47 @@ mod tests {
             inlined_mysql_type(&DataType::FixedSizeBinary(32)),
             "LONGBLOB"
         );
-        assert_eq!(inlined_mysql_type(&DataType::Date32), "LONGTEXT");
+        assert_eq!(inlined_mysql_type(&DataType::Date32), "DATE");
+        assert_eq!(
+            inlined_mysql_type(&DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                None,
+            )),
+            "BIGINT"
+        );
+        assert_eq!(
+            inlined_mysql_type(&DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            )),
+            "DATETIME(6)"
+        );
+    }
+
+    #[test]
+    fn mysql_indexes_skip_unbounded_text_and_binary_columns() {
+        assert!(!mysql_type_supports_index("LONGTEXT"));
+        assert!(!mysql_type_supports_index("longblob"));
+        assert!(mysql_type_supports_index("BIGINT UNSIGNED"));
+    }
+
+    #[test]
+    fn mysql_native_inline_inserts_cast_parameters_only_when_needed() {
+        let uint64 = UInt64Array::from(vec![u64::MAX]);
+        let mut query = QueryBuilder::<MySql>::new("VALUES (");
+        push_inlined_mysql_value(&mut query, &uint64, 0, "BIGINT UNSIGNED").unwrap();
+        query.push(')');
+        assert_eq!(
+            query.sql(),
+            "VALUES (CAST(CAST(? AS DECIMAL(20,0)) AS UNSIGNED))"
+        );
+
+        let decimal = arrow::array::Decimal128Array::from(vec![123_456_i128])
+            .with_precision_and_scale(20, 4)
+            .unwrap();
+        let mut query = QueryBuilder::<MySql>::new("VALUES (");
+        push_inlined_mysql_value(&mut query, &decimal, 0, "DECIMAL(20,4)").unwrap();
+        query.push(')');
+        assert_eq!(query.sql(), "VALUES (CAST(? AS DECIMAL(20,4)))");
     }
 }

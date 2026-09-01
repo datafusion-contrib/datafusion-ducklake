@@ -1,18 +1,25 @@
 #![cfg(all(feature = "write-sqlite", feature = "write-postgres"))]
+
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use arrow::array::{ArrayRef, Int64Array};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Int64Array, ListArray, StructArray, TimestampNanosecondArray,
+    UInt32Array, UInt64Array,
+};
+use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
 use datafusion_ducklake::maintenance::{
     CleanupCriteria, ExpireCriteria, cleanup_old_files_duckdb, delete_orphaned_files_duckdb,
 };
 use datafusion_ducklake::{
-    ColumnDef, DataFileInfo, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions,
-    DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataProvider, MetadataWriter,
-    MulticatalogManager, SnapshotCommitMetadata, SqliteMetadataProvider, SqliteMetadataWriter,
-    WriteMode,
+    ColumnDef, DataFileInfo, DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter,
+    DuckLakeWriteOptions, DuckdbMetadataProvider, DuckdbMetadataWriter, MetadataProvider,
+    MetadataWriter, MulticatalogManager, SnapshotCommitMetadata, SqliteMetadataProvider,
+    SqliteMetadataWriter, WriteMode,
 };
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
@@ -29,6 +36,50 @@ fn batch(values: Vec<i64>) -> RecordBatch {
         "value",
         Arc::new(Int64Array::from(values)) as ArrayRef,
     )])
+    .unwrap()
+}
+
+fn nested_batch() -> RecordBatch {
+    let fields = Fields::from(vec![
+        Field::new("price", DataType::Decimal128(10, 2), true),
+        Field::new(
+            "event_time",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+            true,
+        ),
+        Field::new("count", DataType::UInt32, true),
+        Field::new("order_id", DataType::UInt64, true),
+    ]);
+    let values = StructArray::new(
+        fields.clone(),
+        vec![
+            Arc::new(
+                Decimal128Array::from(vec![12_345, 67_890])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ) as ArrayRef,
+            Arc::new(
+                TimestampNanosecondArray::from(vec![1_000_002, 2_000_003]).with_timezone("UTC"),
+            ) as ArrayRef,
+            Arc::new(UInt32Array::from(vec![1, 2])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![11, 22])) as ArrayRef,
+        ],
+        None,
+    );
+    let depths = ListArray::new(
+        Arc::new(Field::new("item", DataType::Struct(fields), true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+        Arc::new(values),
+        None,
+    );
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "depths",
+            depths.data_type().clone(),
+            true,
+        )])),
+        vec![Arc::new(depths)],
+    )
     .unwrap()
 }
 
@@ -240,6 +291,105 @@ async fn duckdb_metadata_contract() {
             .unwrap()
             .values(),
         &[99],
+    );
+}
+
+#[tokio::test]
+async fn duckdb_flush_inlined_data() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("flush.ducklake");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(DuckdbMetadataWriter::new_with_init(path.to_str().unwrap()).unwrap());
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let object_store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), Arc::clone(&object_store))
+        .unwrap()
+        .with_options(&options);
+    let inline_write = table_writer
+        .append_table("main", "events", &[batch(vec![7, 11])])
+        .await
+        .unwrap();
+    drop(table_writer);
+    drop(writer);
+
+    let provider = DuckdbMetadataProvider::new(path.to_str().unwrap()).unwrap();
+    let schema = provider
+        .get_schema_by_name("main", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "events", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, inline_write.snapshot_id)
+        .unwrap();
+    let inlined = provider
+        .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
+        .unwrap();
+    assert_eq!(
+        inlined
+            .iter()
+            .map(|data| data.batch.num_rows())
+            .sum::<usize>(),
+        2,
+    );
+    drop(provider);
+
+    let writer = Arc::new(DuckdbMetadataWriter::new(path.to_str().unwrap()).unwrap());
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
+    let flushed = table_writer
+        .flush_inlined_data("main", "events", &inlined, inline_write.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(table_writer);
+    drop(writer);
+
+    let provider = DuckdbMetadataProvider::new(path.to_str().unwrap()).unwrap();
+    assert!(
+        provider
+            .get_inlined_data_with_row_ids(table.table_id, flushed.snapshot_id, &columns)
+            .unwrap()
+            .is_empty(),
+    );
+    assert_eq!(
+        provider
+            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns,)
+            .unwrap()
+            .iter()
+            .map(|data| data.batch.num_rows())
+            .sum::<usize>(),
+        2,
+    );
+    assert_eq!(
+        provider
+            .get_table_files_for_select(table.table_id, flushed.snapshot_id)
+            .unwrap()
+            .len(),
+        1,
+    );
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    let batches = context
+        .sql("SELECT value FROM ducklake.main.events ORDER BY value")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[7, 11],
     );
 }
 
@@ -476,4 +626,44 @@ async fn postgres_flush_inlined_data() {
             .sum::<usize>(),
         2,
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_round_trips_nested_inlined_rows() {
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let manager = MulticatalogManager::connect(&url, 5).await.unwrap();
+    let catalog_id = manager.create_catalog("nested_contract").await.unwrap();
+    let writer = Arc::new(manager.writer(catalog_id).await.unwrap());
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let expected = nested_batch();
+    let written = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(1))
+        .write_table("main", "depths", std::slice::from_ref(&expected))
+        .await
+        .unwrap();
+    assert_eq!(written.files_written, 0);
+
+    let provider = manager.provider(catalog_id).await.unwrap();
+    let schema = provider
+        .get_schema_by_name("main", written.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "depths", written.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, written.snapshot_id)
+        .unwrap();
+    let batches = provider
+        .get_inlined_data(table.table_id, written.snapshot_id, &columns)
+        .unwrap();
+    assert_eq!(batches, vec![expected]);
 }

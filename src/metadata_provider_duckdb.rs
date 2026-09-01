@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use duckdb::AccessMode::ReadOnly;
-use duckdb::types::{TimeUnit as DuckdbTimeUnit, ValueRef};
+use duckdb::types::{TimeUnit as DuckdbTimeUnit, Value, ValueRef};
 use duckdb::{Config, Connection, OptionalExt, params};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -520,6 +520,12 @@ fn duckdb_inlined_scalar(
         {
             ScalarValue::FixedSizeBinary(*size, Some(value.to_vec()))
         },
+        (DataType::List(_) | DataType::LargeList(_), value @ ValueRef::List(_, _))
+        | (DataType::FixedSizeList(_, _), value @ ValueRef::Array(_, _))
+        | (DataType::Struct(_), value @ ValueRef::Struct(_, _))
+        | (DataType::Map(_, _), value @ ValueRef::Map(_, _)) => {
+            duckdb_owned_scalar(Value::from(value), data_type, column)?
+        }
         (data_type, value) => {
             return Err(crate::DuckLakeError::Unsupported(format!(
                 "inlined data for column '{column}' has DuckDB type {:?}, which cannot be decoded \
@@ -529,6 +535,157 @@ fn duckdb_inlined_scalar(
         },
     };
     Ok(scalar)
+}
+
+fn duckdb_owned_scalar(
+    value: Value,
+    data_type: &DataType,
+    column: &str,
+) -> crate::Result<ScalarValue> {
+    // duckdb-rs currently returns nested values through its Arrow 58 types, while this crate uses
+    // Arrow 59. Remove this owned-value bridge once duckdb-rs upgrades to Arrow 59 and its nested
+    // arrays can be passed directly to ScalarValue::try_from_array.
+    if matches!(value, Value::Null) {
+        return Ok(ScalarValue::try_from(data_type)?);
+    }
+
+    match (data_type, value) {
+        (DataType::List(field) | DataType::LargeList(field), Value::List(values))
+        | (DataType::FixedSizeList(field, _), Value::List(values))
+        | (DataType::FixedSizeList(field, _), Value::Array(values)) => {
+            let values = values
+                .into_iter()
+                .map(|value| duckdb_owned_scalar(value, field.data_type(), column))
+                .collect::<crate::Result<Vec<_>>>()?;
+            crate::nested_inline::build_list_scalar(data_type, values).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' cannot rebuild {data_type} from DuckDB list"
+                ))
+            })
+        },
+        (DataType::Struct(fields), Value::Struct(values)) => {
+            let values = fields
+                .iter()
+                .map(|field| {
+                    let value = values.get(field.name()).cloned().ok_or_else(|| {
+                        crate::DuckLakeError::Unsupported(format!(
+                            "inlined data column '{column}' DuckDB struct is missing field '{}'",
+                            field.name()
+                        ))
+                    })?;
+                    duckdb_owned_scalar(value, field.data_type(), column)
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            crate::nested_inline::build_struct_scalar(data_type, values).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' cannot rebuild {data_type} from DuckDB struct"
+                ))
+            })
+        },
+        (DataType::Map(entries, _), Value::Map(values)) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' has invalid Arrow map entries"
+                )));
+            };
+            let length = values.iter().count();
+            let mut keys = Vec::with_capacity(length);
+            let mut mapped_values = Vec::with_capacity(length);
+            for (key, value) in values.iter() {
+                keys.push(duckdb_owned_scalar(
+                    key.clone(),
+                    fields[0].data_type(),
+                    column,
+                )?);
+                mapped_values.push(duckdb_owned_scalar(
+                    value.clone(),
+                    fields[1].data_type(),
+                    column,
+                )?);
+            }
+            crate::nested_inline::build_map_scalar(data_type, keys, mapped_values).ok_or_else(
+                || {
+                    crate::DuckLakeError::Unsupported(format!(
+                        "inlined data column '{column}' cannot rebuild {data_type} from DuckDB map"
+                    ))
+                },
+            )
+        },
+        (DataType::Boolean, Value::Boolean(value)) => Ok(ScalarValue::Boolean(Some(value))),
+        (DataType::Int8, Value::TinyInt(value)) => Ok(ScalarValue::Int8(Some(value))),
+        (DataType::Int16, Value::SmallInt(value)) => Ok(ScalarValue::Int16(Some(value))),
+        (DataType::Int32, Value::Int(value)) => Ok(ScalarValue::Int32(Some(value))),
+        (DataType::Int64, Value::BigInt(value)) => Ok(ScalarValue::Int64(Some(value))),
+        (DataType::UInt8, Value::UTinyInt(value)) => Ok(ScalarValue::UInt8(Some(value))),
+        (DataType::UInt16, Value::USmallInt(value)) => Ok(ScalarValue::UInt16(Some(value))),
+        (DataType::UInt32, Value::UInt(value)) => Ok(ScalarValue::UInt32(Some(value))),
+        (DataType::UInt64, Value::UBigInt(value)) => Ok(ScalarValue::UInt64(Some(value))),
+        (DataType::Float32, Value::Float(value)) => Ok(ScalarValue::Float32(Some(value))),
+        (DataType::Float64, Value::Double(value)) => Ok(ScalarValue::Float64(Some(value))),
+        (DataType::Decimal128(_, _), Value::Decimal(value)) => {
+            crate::types::parse_ducklake_scalar_leaf(&value.to_string(), data_type).ok_or_else(
+                || {
+                    crate::DuckLakeError::Unsupported(format!(
+                        "inlined data column '{column}' cannot decode nested decimal '{value}'"
+                    ))
+                },
+            )
+        },
+        (DataType::Date32, Value::Date32(value)) => Ok(ScalarValue::Date32(Some(value))),
+        (DataType::Time64(to), Value::Time64(from, value)) => {
+            let value = convert_time(value, from, *to).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' has out-of-range nested time"
+                ))
+            })?;
+            match to {
+                TimeUnit::Microsecond => Ok(ScalarValue::Time64Microsecond(Some(value))),
+                TimeUnit::Nanosecond => Ok(ScalarValue::Time64Nanosecond(Some(value))),
+                _ => Err(crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' has unsupported nested time unit {to:?}"
+                ))),
+            }
+        },
+        (DataType::Timestamp(to, timezone), Value::Timestamp(from, value)) => {
+            let value = convert_time(value, from, *to).ok_or_else(|| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "inlined data column '{column}' has out-of-range nested timestamp"
+                ))
+            })?;
+            Ok(match to {
+                TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), timezone.clone()),
+                TimeUnit::Millisecond => {
+                    ScalarValue::TimestampMillisecond(Some(value), timezone.clone())
+                },
+                TimeUnit::Microsecond => {
+                    ScalarValue::TimestampMicrosecond(Some(value), timezone.clone())
+                },
+                TimeUnit::Nanosecond => {
+                    ScalarValue::TimestampNanosecond(Some(value), timezone.clone())
+                },
+            })
+        },
+        (
+            DataType::Interval(_),
+            Value::Interval {
+                months,
+                days,
+                nanos,
+            },
+        ) => Ok(ScalarValue::new_interval_mdn(months, days, nanos)),
+        (DataType::Utf8, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value))),
+        (DataType::LargeUtf8, Value::Text(value)) => Ok(ScalarValue::LargeUtf8(Some(value))),
+        (DataType::Utf8View, Value::Text(value)) => Ok(ScalarValue::Utf8View(Some(value))),
+        (DataType::Binary, Value::Blob(value)) => Ok(ScalarValue::Binary(Some(value))),
+        (DataType::LargeBinary, Value::Blob(value)) => Ok(ScalarValue::LargeBinary(Some(value))),
+        (DataType::BinaryView, Value::Blob(value)) => Ok(ScalarValue::BinaryView(Some(value))),
+        (DataType::FixedSizeBinary(size), Value::Blob(value)) if value.len() == *size as usize => {
+            Ok(ScalarValue::FixedSizeBinary(*size, Some(value)))
+        },
+        (data_type, value) => Err(crate::DuckLakeError::Unsupported(format!(
+            "inlined data column '{column}' DuckDB nested value {value:?} cannot decode as {data_type}"
+        ))),
+    }
 }
 
 fn decode_duckdb_text(value: &[u8], column: &str) -> crate::Result<String> {
@@ -1697,7 +1854,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let tables = registry
             .query_map([table_id], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+        let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
         let mut batches = Vec::new();
         for table in tables {
             if !is_inlined_data_table(&table) {
@@ -2482,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_inlined_value_reports_recovery() {
+    fn nested_inlined_value_converts_between_arrow_versions() {
         let mut builder = ListBuilder::new(Int32Builder::new());
         builder.values().append_value(1);
         builder.values().append_value(2);
@@ -2490,19 +2647,13 @@ mod tests {
         builder.append(true);
         let values = builder.finish();
         let target = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
-        let error = duckdb_inlined_scalar(
+        let value = duckdb_inlined_scalar(
             ValueRef::List(ListType::Regular(&values), 0),
             &target,
             "tags",
         )
-        .unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Unsupported feature: inlined data for column 'tags' has DuckDB type List(Int), \
-             which cannot be decoded as List(Int32); flush inlined data to Parquet (or disable \
-             data inlining at write time)"
-        );
+        .unwrap();
+        assert_eq!(value.to_string(), "[1, 2, 3]");
     }
 
     #[test]

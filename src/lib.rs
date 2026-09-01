@@ -44,6 +44,7 @@ pub mod error;
 pub mod information_schema;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
+mod nested_inline;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;

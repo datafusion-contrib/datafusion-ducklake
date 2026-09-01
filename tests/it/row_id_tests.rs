@@ -26,8 +26,7 @@ fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "c")?;
 
     conn.execute("CREATE TABLE c.t(i INTEGER);", [])?;
     // First file: rows 0..3
@@ -45,8 +44,7 @@ fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "c")?;
 
     conn.execute("CREATE TABLE c.t(i INTEGER);", [])?;
     conn.execute("INSERT INTO c.t SELECT i FROM range(0, 3) t(i);", [])?;
@@ -77,8 +75,7 @@ fn create_catalog_rowid_with_update(catalog_path: &Path) -> Result<()> {
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "c")?;
 
     conn.execute("CREATE TABLE c.t(i INTEGER);", [])?;
     conn.execute("INSERT INTO c.t SELECT i FROM range(0, 3) t(i);", [])?;

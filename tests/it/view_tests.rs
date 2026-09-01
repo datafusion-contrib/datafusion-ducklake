@@ -107,8 +107,11 @@ fn normalize_current_view_sql(catalog_path: &Path) -> anyhow::Result<()> {
     let connection = duckdb::Connection::open(catalog_path)?;
     connection.execute(
         "UPDATE ducklake_view
-         SET sql = replace(sql, 'lake.', '{DUCKLAKE_CATALOG}.')
-         WHERE view_name <> 'legacy_qualified'",
+         SET sql = CASE
+             WHEN view_name = 'legacy_qualified'
+                 THEN replace(sql, '{DUCKLAKE_CATALOG}.', 'lake.')
+             ELSE replace(sql, 'lake.', '{DUCKLAKE_CATALOG}.')
+         END",
         [],
     )?;
     Ok(())
@@ -187,7 +190,7 @@ async fn duckdb_views_are_listed_and_queryable() -> anyhow::Result<()> {
         &data_path,
         "SELECT CAST(rowid AS VARCHAR) AS rowid_text FROM lake.rowids ORDER BY rowid",
     )?;
-    assert!(stored_view_sql(&catalog_path, "filtered")?.contains("lake.users"));
+    assert!(stored_view_sql(&catalog_path, "filtered")?.contains("{DUCKLAKE_CATALOG}.users"));
     normalize_current_view_sql(&catalog_path)?;
     assert!(stored_view_sql(&catalog_path, "filtered")?.contains("{DUCKLAKE_CATALOG}.users"));
     assert!(stored_view_sql(&catalog_path, "legacy_qualified")?.contains("lake.users"));

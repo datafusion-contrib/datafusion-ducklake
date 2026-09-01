@@ -17,17 +17,20 @@ use crate::maintenance::{
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
+    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
+    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
+    live_inlined_index_columns, parse_inlined_index_columns, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -52,6 +55,10 @@ fn inlined_sqlite_type(data_type: &DataType) -> &'static str {
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32 => "BIGINT",
+        DataType::UInt64 => "TEXT",
+        DataType::Date32
+        | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+        | DataType::Timestamp(_, _) => "BIGINT",
         // DOUBLE has numeric affinity, so a bound f64 stays REAL; a VARCHAR
         // column's TEXT affinity would coerce it to text, which the inline
         // reader (which expects REAL) cannot decode.
@@ -62,11 +69,10 @@ fn inlined_sqlite_type(data_type: &DataType) -> &'static str {
     }
 }
 
-/// Scalar types the SQLite inline path preserves through catalog normalization.
-/// Nested values remain on the Parquet path until their SQL representation has
-/// a matching parser.
+// Nested values use reference DuckDB literal text so the shared parser and external readers
+// agree.
 fn sqlite_type_inlines(data_type: &DataType) -> bool {
-    crate::metadata_writer::scalar_type_supports_inlining(data_type)
+    crate::nested_inline::type_supports_inlining(data_type)
 }
 
 fn push_inlined_sqlite_value(
@@ -123,14 +129,30 @@ fn push_inlined_sqlite_value(
         DataType::UInt16 => unsigned!(UInt16Array),
         DataType::UInt32 => unsigned!(UInt32Array),
         DataType::UInt64 => {
-            query.push_bind(
+            query.push_bind(format!(
+                "{:020}",
                 array
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .expect("Arrow data type and array implementation agree")
-                    .value(row)
-                    .to_string(),
-            );
+                    .value(row),
+            ));
+        },
+        DataType::Date32 => signed!(Date32Array),
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+            signed!(Time64MicrosecondArray)
+        },
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => {
+            signed!(TimestampSecondArray)
+        },
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => {
+            signed!(TimestampMillisecondArray)
+        },
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
+            signed!(TimestampMicrosecondArray)
+        },
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            signed!(TimestampNanosecondArray)
         },
         DataType::Float32 => {
             query.push_bind(f64::from(
@@ -214,6 +236,71 @@ fn push_inlined_sqlite_value(
             query.push_bind(crate::metadata_writer::inlined_text_value(array, row)?);
         },
     };
+    Ok(())
+}
+
+async fn sqlite_inlined_index_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<Vec<String>> {
+    let value: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM ducklake_metadata
+         WHERE key = ? AND scope = 'table' AND scope_id = ?",
+    )
+    .bind(INLINED_INDEX_COLUMNS_SETTING)
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let declared = parse_inlined_index_columns(value.as_deref().unwrap_or_default())?;
+    let available = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect::<std::collections::HashSet<_>>();
+    Ok(live_inlined_index_columns(declared, &available))
+}
+
+async fn ensure_sqlite_physical_indexes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    physical_name: &str,
+) -> Result<()> {
+    let declared = sqlite_inlined_index_columns(tx, table_id).await?;
+    let present = sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info(?)")
+        .bind(physical_name)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+        if !present.contains(column) {
+            continue;
+        }
+        let index_name = format!("{physical_name}_{column}_idx");
+        let exists: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM sqlite_master
+             WHERE type = 'index' AND name = ? AND tbl_name = ?",
+        )
+        .bind(&index_name)
+        .bind(physical_name)
+        .fetch_one(&mut **tx)
+        .await?;
+        if exists {
+            continue;
+        }
+        sqlx::query(AssertSqlSafe(format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+            quote_ident(&index_name),
+            quote_ident(physical_name),
+            quote_ident(column),
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2360,6 +2447,7 @@ async fn commit_inlined_at_snapshot(
     }
     ddl.push(')');
     sqlx::query(AssertSqlSafe(ddl)).execute(&mut **tx).await?;
+    ensure_sqlite_physical_indexes(tx, write.table_id, &physical_name).await?;
     sqlx::query(
         "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
          SELECT ?, ?, ?
@@ -2475,6 +2563,75 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *transaction)
             .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let available = sqlx::query_scalar::<_, String>(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+            if available.is_empty() {
+                return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+            validate_inlined_index_columns(columns, &available)?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata
+                 WHERE key = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if existing.as_deref() == Some(value.as_str()) {
+                transaction.commit().await?;
+                return Ok(());
+            }
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = ? AND scope = 'table' AND scope_id = ?",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES (?, ?, 'table', ?)",
+            )
+            .bind(INLINED_INDEX_COLUMNS_SETTING)
+            .bind(value)
+            .bind(table_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let physical_tables = sqlx::query_scalar::<_, String>(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *transaction)
+            .await?;
+            sqlite_inlined_index_columns(&mut transaction, table_id).await?;
+            for physical_table in physical_tables {
+                ensure_sqlite_physical_indexes(&mut transaction, table_id, &physical_table).await?;
+            }
             transaction.commit().await?;
             Ok(())
         })
@@ -3576,6 +3733,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
             ddl.push(')');
             sqlx::query(AssertSqlSafe(ddl)).execute(&mut *tx).await?;
+            ensure_sqlite_physical_indexes(&mut tx, table_id, &physical_name).await?;
             sqlx::query(
                 "INSERT INTO ducklake_inlined_data_tables
                      (table_id, table_name, schema_version)
@@ -5621,7 +5779,7 @@ mod tests {
     #[test]
     fn sqlite_inlined_types_follow_ducklake_encodings() {
         assert_eq!(inlined_sqlite_type(&DataType::Int32), "BIGINT");
-        assert_eq!(inlined_sqlite_type(&DataType::UInt64), "VARCHAR");
+        assert_eq!(inlined_sqlite_type(&DataType::UInt64), "TEXT");
         assert_eq!(inlined_sqlite_type(&DataType::Float64), "DOUBLE");
         assert_eq!(inlined_sqlite_type(&DataType::Float32), "DOUBLE");
         assert_eq!(inlined_sqlite_type(&DataType::Binary), "BLOB");
@@ -5631,7 +5789,14 @@ mod tests {
             "VARCHAR"
         );
         assert_eq!(inlined_sqlite_type(&DataType::FixedSizeBinary(32)), "BLOB");
-        assert_eq!(inlined_sqlite_type(&DataType::Date32), "VARCHAR");
+        assert_eq!(inlined_sqlite_type(&DataType::Date32), "BIGINT");
+        assert_eq!(
+            inlined_sqlite_type(&DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                None,
+            )),
+            "BIGINT"
+        );
     }
 
     async fn create_test_writer() -> (SqliteMetadataWriter, TempDir) {

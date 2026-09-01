@@ -1911,25 +1911,20 @@ mod tests {
     }
 
     #[test]
-    fn inlined_rows_reject_unsupported_nested_encoding() {
+    fn inlined_rows_parse_nested_encoding() {
         let columns = vec![column("items", "list<int32>")];
         let schema = Arc::new(Schema::new(vec![Field::new_list(
             "items",
             Field::new("item", DataType::Int32, true),
             true,
         )]));
-        let error = parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]])
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("inlined data for column 'items' cannot decode value '[1, 2]' as List"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains(INLINED_DATA_REMEDIATION),
-            "unexpected error: {error}"
+        let batch =
+            parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]]).unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), 0)
+                .unwrap()
+                .to_string(),
+            "[1, 2]"
         );
     }
 
