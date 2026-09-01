@@ -41,6 +41,7 @@ mod inlined_delete_tests;
 mod insert_partitioning_tests;
 mod keyed_mutation_after_compaction_tests;
 mod maintenance_sqlite_tests;
+mod metadata_contract_tests;
 mod missing_delete_file_tests;
 mod multicatalog_hardening_tests;
 mod multicatalog_postgres_tests;

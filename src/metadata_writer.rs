@@ -1042,6 +1042,104 @@ pub struct InlinedRowRef {
     pub row_id: i64,
 }
 
+/// Row storage staged for one table in a multi-table write.
+#[derive(Debug, Clone)]
+pub enum StagedTableData {
+    /// Parquet data files already uploaded to object storage.
+    Files(Vec<DataFileInfo>),
+    /// Record batches to store in DuckLake's metadata catalog.
+    Inlined(Vec<RecordBatch>),
+    /// No inserted rows; the stage contains only deletes.
+    None,
+}
+
+/// One table's staged changes in a multi-table write.
+#[derive(Debug, Clone)]
+pub struct StagedTableWrite {
+    pub(crate) table_id: i64,
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+    pub(crate) base_snapshot_id: i64,
+    pub(crate) mode: WriteMode,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) column_ids: Vec<i64>,
+    pub(crate) data: StagedTableData,
+    pub(crate) snapshot_id_columns: Vec<String>,
+    pub(crate) positional_deletes: Vec<DeleteFileEntry>,
+    pub(crate) inlined_deletes: Vec<InlinedRowRef>,
+}
+
+impl StagedTableWrite {
+    /// Returns the target table id reserved during write setup.
+    #[must_use]
+    pub const fn table_id(&self) -> i64 {
+        self.table_id
+    }
+
+    /// Returns the target schema name.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// Returns the target table name.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the table snapshot observed during write setup.
+    #[must_use]
+    pub const fn base_snapshot_id(&self) -> i64 {
+        self.base_snapshot_id
+    }
+
+    /// Returns the staged write mode.
+    #[must_use]
+    pub const fn mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    /// Returns the staged catalog columns.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
+    /// Returns the catalog column ids paired with the staged columns.
+    #[must_use]
+    pub fn column_ids(&self) -> &[i64] {
+        &self.column_ids
+    }
+
+    /// Returns the staged row storage.
+    #[must_use]
+    pub const fn data(&self) -> &StagedTableData {
+        &self.data
+    }
+
+    /// Returns the staged positional deletes.
+    #[must_use]
+    pub fn positional_deletes(&self) -> &[DeleteFileEntry] {
+        &self.positional_deletes
+    }
+
+    /// Returns the staged inlined-row deletes.
+    #[must_use]
+    pub fn inlined_deletes(&self) -> &[InlinedRowRef] {
+        &self.inlined_deletes
+    }
+}
+
+/// Result of one atomic multi-table write.
+#[derive(Debug, Clone)]
+pub struct MultiTableCommit {
+    /// Snapshot shared by every committed table change.
+    pub snapshot_id: i64,
+    /// Authoritative schema and table ids for each staged table.
+    pub tables: Vec<CommitIds>,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
@@ -1078,6 +1176,38 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn set_global_setting(&self, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "global-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Replace a table-scoped catalog setting.
+    fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "table-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Run an operation while holding a backend-appropriate commit lock.
+    ///
+    /// A coordination utility for callers that want to serialize a multi-step
+    /// commit workflow (e.g. read staged state, dedup, commit) under one
+    /// `identity` across processes. Correctness does not depend on it: the
+    /// optimistic `expected_base_snapshot_id` fence remains the conflict
+    /// mechanism, and this lock only avoids duplicate concurrent work.
+    ///
+    /// Contract: the lock is held for the duration of `operation` and released
+    /// on both success and error before this returns; an `operation` error
+    /// propagates and takes precedence over a release error. A crashed holder
+    /// must not leave the lock held (backends use self-releasing mechanisms:
+    /// an advisory transaction lock, a file lock released on close). Keep
+    /// critical sections short — implementations may pin a connection while
+    /// the lock is held.
+    fn with_commit_lock(
+        &self,
+        _identity: &str,
+        _operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "commit locking is not supported by this metadata backend".to_string(),
         ))
     }
 
@@ -1463,6 +1593,22 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(
             "data inlining is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Commit staged changes for multiple tables in one metadata transaction.
+    ///
+    /// Implementations allocate one snapshot, evaluate the optional table-state
+    /// fence once for the complete write, and make every table change visible
+    /// together. A returned error must leave no staged metadata visible.
+    fn commit_multi_table(
+        &self,
+        _writes: &[StagedTableWrite],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        Err(DuckLakeError::InvalidConfig(
+            "multi-table writes are not supported by this metadata writer".to_string(),
         ))
     }
 

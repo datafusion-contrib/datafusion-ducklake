@@ -1,8 +1,8 @@
 use crate::DuckLakeError;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
-    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, MetadataSetting, SQL_GET_DATA_FILES,
     SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS,
@@ -11,9 +11,10 @@ use crate::metadata_provider::{
     SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME,
     SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS,
     SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
-    build_inlined_batch, inlined_delete_table_name, inlined_missing_scalar, is_inlined_data_table,
-    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
+    ViewWithSchema, build_inlined_batch, inlined_delete_table_name, inlined_missing_scalar,
+    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
+    resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -23,7 +24,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use duckdb::AccessMode::ReadOnly;
 use duckdb::types::{TimeUnit as DuckdbTimeUnit, ValueRef};
-use duckdb::{Config, Connection, params};
+use duckdb::{Config, Connection, OptionalExt, params};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -456,7 +457,15 @@ fn duckdb_inlined_scalar(
                     "inlined data for column '{column}' has an out-of-range time value"
                 ))
             })?;
-            ScalarValue::Time64Microsecond(Some(value))
+            match to {
+                TimeUnit::Microsecond => ScalarValue::Time64Microsecond(Some(value)),
+                TimeUnit::Nanosecond => ScalarValue::Time64Nanosecond(Some(value)),
+                _ => {
+                    return Err(crate::DuckLakeError::Unsupported(format!(
+                        "inlined data column '{column}' has unsupported time unit {to:?}"
+                    )));
+                },
+            }
         },
         (DataType::Timestamp(to, timezone), ValueRef::Timestamp(from, value)) => {
             let value = convert_time(value, from, *to).ok_or_else(|| {
@@ -504,7 +513,12 @@ fn duckdb_inlined_scalar(
                 crate::DuckLakeError::Unsupported(format!(
                     "inlined data for column '{column}' cannot decode '{value}' as fixed-size binary {size}"
                 ))
-            })?
+                })?
+        },
+        (DataType::FixedSizeBinary(size), ValueRef::Blob(value))
+            if value.len() == *size as usize =>
+        {
+            ScalarValue::FixedSizeBinary(*size, Some(value.to_vec()))
         },
         (data_type, value) => {
             return Err(crate::DuckLakeError::Unsupported(format!(
@@ -683,6 +697,17 @@ impl DuckdbMetadataProvider {
             catalog_path,
             schema_capabilities: Arc::new(OnceLock::new()),
         })
+    }
+
+    pub(crate) fn from_shared_connection(
+        conn: Arc<Mutex<Connection>>,
+        catalog_path: String,
+    ) -> Self {
+        Self {
+            conn,
+            catalog_path,
+            schema_capabilities: Arc::new(OnceLock::new()),
+        }
     }
 
     /// Get a reference to the shared connection
@@ -867,6 +892,58 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(snapshots)
+    }
+
+    fn list_snapshot_changes(&self) -> crate::Result<Vec<SnapshotChangeMetadata>> {
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT snapshot.snapshot_id,
+                    CAST(snapshot.snapshot_time AS VARCHAR),
+                    changes.changes_made,
+                    changes.author,
+                    changes.commit_message,
+                    changes.commit_extra_info
+             FROM ducklake_snapshot AS snapshot
+             JOIN ducklake_snapshot_changes AS changes
+               ON changes.snapshot_id = snapshot.snapshot_id
+             ORDER BY snapshot.snapshot_id",
+        )?;
+        let changes = statement
+            .query_map([], |row| {
+                Ok(SnapshotChangeMetadata {
+                    snapshot_id: row.get(0)?,
+                    timestamp: row.get(1)?,
+                    changes_made: row.get(2)?,
+                    author: row.get(3)?,
+                    commit_message: row.get(4)?,
+                    commit_extra_info: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(changes)
+    }
+
+    fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> crate::Result<Option<i64>> {
+        let conn = self.connection();
+        let snapshot_id = conn
+            .query_row(
+                "SELECT changes.snapshot_id
+                 FROM ducklake_snapshot_changes AS changes
+                 WHERE (changes.commit_extra_info = ?
+                        OR strpos(changes.commit_extra_info, ?) > 0)
+                   AND EXISTS (
+                       SELECT 1
+                       FROM ducklake_data_file AS files
+                       WHERE files.begin_snapshot = changes.snapshot_id
+                         AND files.end_snapshot IS NULL
+                   )
+                 ORDER BY changes.snapshot_id
+                 LIMIT 1",
+                params![needle, needle],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(snapshot_id)
     }
 
     fn list_schemas(&self, snapshot_id: i64) -> crate::Result<Vec<SchemaMetadata>> {
@@ -1602,6 +1679,101 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> crate::Result<Vec<DuckLakeInlinedData>> {
+        let conn = self.connection();
+        if !self.schema_capabilities(&conn)?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+
+        let mut registry =
+            conn.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
+        let tables = registry
+            .query_map([table_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+        let mut batches = Vec::new();
+        for table in tables {
+            if !is_inlined_data_table(&table) {
+                continue;
+            }
+
+            let info_sql = format!("SELECT name FROM pragma_table_info('{table}')");
+            let mut info = conn.prepare(&info_sql)?;
+            let present = info
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            let projected = columns
+                .iter()
+                .zip(schema.fields())
+                .map(|(column, field)| {
+                    if !present.contains(&column.column_name) {
+                        return "NULL".to_string();
+                    }
+                    let ident = quote_ident(&column.column_name);
+                    if matches!(
+                        field.data_type(),
+                        DataType::Utf8
+                            | DataType::LargeUtf8
+                            | DataType::Utf8View
+                            | DataType::FixedSizeBinary(_)
+                    ) {
+                        format!("CAST({ident} AS VARCHAR)")
+                    } else {
+                        ident
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT row_id, begin_snapshot, {projected} FROM {} \
+                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                 ORDER BY begin_snapshot, row_id",
+                quote_ident(&table),
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let mut query = statement.query(params![snapshot_id, snapshot_id])?;
+            let mut row_ids = Vec::new();
+            let mut begin_snapshots = Vec::new();
+            let mut rows = Vec::new();
+            while let Some(row) = query.next()? {
+                row_ids.push(row.get(0)?);
+                begin_snapshots.push(row.get(1)?);
+                rows.push(
+                    schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| {
+                            if !present.contains(&columns[index].column_name) {
+                                return inlined_missing_scalar(&columns[index], field.data_type());
+                            }
+                            duckdb_inlined_scalar(
+                                row.get_ref(index + 2)?,
+                                field.data_type(),
+                                &columns[index].column_name,
+                            )
+                        })
+                        .collect::<crate::Result<Vec<_>>>()?,
+                );
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            batches.push(DuckLakeInlinedData {
+                table_name: table,
+                row_ids,
+                begin_snapshots,
+                batch: build_inlined_batch(schema.clone(), columns, &rows)?,
+            });
+        }
+        Ok(batches)
     }
 
     fn get_schema_by_name(

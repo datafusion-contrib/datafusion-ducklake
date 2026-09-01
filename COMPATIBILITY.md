@@ -204,6 +204,15 @@ observe another writer's uncommitted schema, a transient empty table, or a torn 
 On Postgres multi-catalog the begin step only *reserves* ids (via the IDENTITY sequence) and
 reads existing state; it writes nothing.
 
+`DuckLakeWriteTransaction` applies one optional table‑state precondition before it mutates any
+target, then commits every staged Parquet file, inlined row, positional delete, and inline delete
+in one snapshot. Use it after the target tables exist; table creation remains a normal writer
+commit. If the shared precondition or metadata commit is rejected before the commit point (a
+conflict, validation, or unsupported‑operation error), the metadata transaction rolls back and
+the writer removes all staged Parquet data and delete objects. An ambiguous failure — such as a
+lost COMMIT acknowledgement on a network backend — leaves the staged objects to the guarded
+vacuum, which reclaims only files no committed snapshot references.
+
 `WriteMode::Replace` (SQL `INSERT OVERWRITE`, and the first write of a table) is
 **abort-on-conflict** under concurrency, matching DuckLake's snapshot isolation:
 
