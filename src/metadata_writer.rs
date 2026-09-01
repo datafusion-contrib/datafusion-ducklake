@@ -5,7 +5,9 @@
 
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, FixedSizeBinaryArray};
+use arrow::datatypes::{DataType, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
@@ -144,6 +146,50 @@ impl SnapshotCommitMetadata {
         }
         Ok(())
     }
+}
+
+pub(crate) fn inlined_text_value(array: &dyn Array, row: usize) -> Result<String> {
+    if array.data_type() == &DataType::FixedSizeBinary(16) {
+        let bytes = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("Arrow data type and array implementation agree")
+            .value(row);
+        return uuid::Uuid::from_slice(bytes)
+            .map(|value| value.to_string())
+            .map_err(|error| DuckLakeError::InvalidConfig(format!("invalid UUID bytes: {error}")));
+    }
+    Ok(arrow::util::display::array_value_to_string(array, row)?)
+}
+
+pub(crate) fn scalar_type_supports_inlining(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+            | DataType::Timestamp(_, _)
+            | DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
 }
 
 /// Column definition for creating or updating a table's schema.
@@ -987,6 +1033,15 @@ pub struct CommitIds {
     pub table_id: i64,
 }
 
+/// Stable identity of one visible inlined row selected for deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InlinedRowRef {
+    /// Physical `ducklake_inlined_data_*` table registered for the table.
+    pub table_name: String,
+    /// Stable DuckLake row id within that table.
+    pub row_id: i64,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
@@ -1369,6 +1424,48 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         )
     }
 
+    /// Whether this writer can store a small insert with `schema`'s column
+    /// types inlined in the catalog ([`Self::register_inlined_data`]) such that
+    /// its own inline read path decodes them back exactly. The write path
+    /// consults this before routing a row-bearing write at or below the scoped
+    /// `data_inlining_row_limit`: a writer that returns `false` keeps the
+    /// Parquet path instead of failing the write (or corrupting a round trip),
+    /// since when to inline is writer policy under the DuckLake specification.
+    fn supports_data_inlining(&self, _schema: &ArrowSchema) -> bool {
+        false
+    }
+
+    /// Store a small insert in the catalog instead of writing a Parquet file.
+    ///
+    /// Implementations create or reuse the per-`(table_id, schema_version)`
+    /// physical table, register it in `ducklake_inlined_data_tables`, insert the
+    /// rows with their stable row ids and snapshot bounds, update table stats,
+    /// record `commit_metadata` and the snapshot change ledger (appending to any
+    /// DDL entries already recorded for the snapshot), and — when
+    /// `expected_base_snapshot_id` is set and `mode` is not Replace — abort with
+    /// [`crate::DuckLakeError::Conflict`] if the table's data-file generation
+    /// changed since that snapshot, all in the same transaction as the snapshot
+    /// commit.
+    #[allow(clippy::too_many_arguments)]
+    fn register_inlined_data(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _batches: &[RecordBatch],
+        _mode: WriteMode,
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "data inlining is not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Register a positional delete file for a single data file, superseding any
     /// prior live delete file for it (at most one is live per data file).
     ///
@@ -1598,6 +1695,59 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Err(DuckLakeError::InvalidConfig(
             "positional DELETE is not supported on this metadata backend".to_string(),
         ))
+    }
+
+    /// End visible inlined rows in one new snapshot. Implementations must fence
+    /// every row against `base_snapshot`, set `end_snapshot` only while it is
+    /// still live, and decrement the current table row count atomically.
+    fn commit_inlined_deletes(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+        _rows: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "inlined-row DELETE is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Apply positional and inlined-row deletes in one snapshot. The default
+    /// dispatches when only one storage form is present; backends supporting a
+    /// table that mixes both forms override this for an atomic combined commit.
+    fn commit_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        positional: &[DeleteFileEntry],
+        inlined: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        match (positional.is_empty(), inlined.is_empty()) {
+            (false, true) => self.commit_positional_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                positional,
+            ),
+            (true, false) => self.commit_inlined_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                inlined,
+            ),
+            (false, false) => Err(DuckLakeError::InvalidConfig(
+                "combined positional and inlined-row DELETE is not supported on this metadata backend"
+                    .to_string(),
+            )),
+            (true, true) => Err(DuckLakeError::InvalidConfig(
+                "commit_deletes requires at least one delete".to_string(),
+            )),
+        }
     }
 
     /// Commit a compaction (`merge_adjacent_files` / `rewrite_data_files`) in
@@ -1886,6 +2036,30 @@ mod tests {
     /// case, so these tests exercise arity/index/transform rules in isolation.
     fn utf8_types(n: usize) -> Vec<Option<DataType>> {
         vec![Some(DataType::Utf8); n]
+    }
+
+    #[test]
+    fn scalar_inlining_support_matches_round_trip_contract() {
+        for data_type in [
+            DataType::Int8,
+            DataType::Float64,
+            DataType::Decimal128(38, 16),
+            DataType::Date32,
+            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+            DataType::LargeUtf8,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(16),
+        ] {
+            assert!(scalar_type_supports_inlining(&data_type), "{data_type}");
+        }
+        assert!(!scalar_type_supports_inlining(&DataType::Time64(
+            arrow::datatypes::TimeUnit::Nanosecond,
+        )));
+        assert!(!scalar_type_supports_inlining(&DataType::List(Arc::new(
+            Field::new("item", DataType::Int64, true),
+        ))));
     }
 
     #[test]
