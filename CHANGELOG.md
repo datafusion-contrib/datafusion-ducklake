@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live file (#293).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
+- Embedding APIs expose snapshot changes, opaque commit lookup, table-scoped
+  setting upserts, and backend commit coordination locks on SQLite and
+  PostgreSQL, with unsupported defaults elsewhere (#274).
+
+- `DuckLakeWriteTransaction` stages Parquet files, inlined rows, and deletes
+  across tables, then publishes them in one snapshot on DuckDB, SQLite,
+  PostgreSQL, or MySQL (#274).
+
 - SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
   snapshot on all four write backends; DuckDB and MySQL now implement combined
   deletes and exact inline-aware truncate counts (#273).
@@ -61,6 +69,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers no public constructor for one, so these two execs are effectively crate-internal now.
   `ROW_POS_COLUMN_NAME` is also only a *base* name: a scan whose file already has a column of
   that name uses a suffixed variant, so locating the column by name is no longer reliable (#130).
+- Failed multi-table commits remove staged objects only on definite pre-commit
+  rejection; ambiguous network commit failures leave them for guarded vacuum
+  rather than risking deletion of committed files (#274).
+
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory
@@ -96,6 +108,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete file, with no `NanPruningBarrierExec` above it, silently dropping NaN rows (#130).
 - The internal physical-position column could bind to a catalog column of the same name in the
   CDC feeds, making them report the wrong rows (#130).
+- MySQL multi-table commits allocate the serializing snapshot before fence and
+  liveness reads, preventing stale read views and overlapping row IDs (#274).
+- Fresh multi-table creation records each `created_schema:` ledger entry exactly
+  once (#274).
+
 - MySQL allocates data and delete file IDs consistently from catalog counters,
   avoiding collisions across append, update, delete, and compaction paths (#273).
 - DuckDB and MySQL mutation flows now record `changes_made` entries for every
