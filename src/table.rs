@@ -11,7 +11,7 @@ use crate::delete_filter::DeleteFilterExec;
 use crate::metadata_provider::{
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
-    DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, MetadataProvider,
+    DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, INLINED_DATA_REMEDIATION, MetadataProvider,
 };
 use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::partition::PartitionSpec;
@@ -1474,6 +1474,13 @@ impl DuckLakeTable {
         #[cfg(feature = "encryption")]
         self.install_encryption_keys(encryption_keys);
         Ok(matching)
+    }
+
+    pub(crate) fn inlined_data_with_row_ids(
+        &self,
+    ) -> Result<Vec<crate::metadata_provider::DuckLakeInlinedData>> {
+        self.provider
+            .get_inlined_data_with_row_ids(self.table_id, self.snapshot_id, &self.columns)
     }
 
     /// Page the catalog's file metadata, optionally handing the provider a
@@ -3984,6 +3991,22 @@ impl TableProvider for DuckLakeTable {
             (None, _) => false,
         };
 
+        // The rowid plan below unions per-file scans only, so visible inlined
+        // rows would silently vanish from a row-lineage read. Refuse loudly
+        // instead until inlined rowid scans are supported.
+        if rowid_in_proj {
+            let inlined =
+                self.provider
+                    .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
+            if inlined.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "row-lineage (rowid) scan on a table with inlined rows is not supported; \
+                     {INLINED_DATA_REMEDIATION}"
+                ))
+                .into());
+            }
+        }
+
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let inlined_deletes = self.inlined_deletes_by_file()?;
         // One physical form of the filters feeds both pruning paths; see
@@ -4288,6 +4311,19 @@ impl TableProvider for DuckLakeTable {
             return Err(DataFusionError::NotImplemented(
                 "UPDATE not supported on this metadata backend".to_string(),
             ));
+        }
+
+        // UPDATE rewrites Parquet-resident rows only; visible inlined rows would
+        // be silently skipped. Refuse loudly instead (same detection DELETE uses).
+        let inlined =
+            self.provider
+                .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
+        if inlined.iter().any(|batch| batch.num_rows() > 0) {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "UPDATE on a table with inlined rows is not supported; \
+                 {INLINED_DATA_REMEDIATION}"
+            ))
+            .into());
         }
 
         // Assignment / filter expressions reference the table's DATA columns

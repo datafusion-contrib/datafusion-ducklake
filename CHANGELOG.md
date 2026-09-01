@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
+  `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
 - A pushed-down filter never changes a query's answer, checked by a generated sweep over
   hostile catalog statistics on every backend (#293).
 - Pushed-down filters narrow the DuckLake file listing in the catalog query itself, using
@@ -22,10 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MySQL, and both PostgreSQL layouts (#274).
 - Commit staged writes across new or existing tables in one snapshot on all
   metadata backends; empty staging calls do not publish snapshots (#274).
-- `DuckLakeWriteOptions::data_inlining_row_limit` reserves the automatic limit;
-  high-level writes use Parquet and leave the stored limit unparsed (#274).
 - Validate snapshot-column staging before uploading files, and reject settings
   for unknown options or dropped tables (#274).
+- MySQL inlines supported list, struct, and map batches under the row limit and
+  skips declared indexes on `LONGTEXT`/`LONGBLOB` columns (#272).
+- Inlined values use native backend storage types, with declared per-table
+  indexes and a mandatory `row_id` index (#272).
 
 - SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
   snapshot on all four write backends; DuckDB and MySQL now implement combined
@@ -39,16 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compaction rewrites, and change feeds, including typed Hive partition constants (#263).
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
-- Row lineage and positional deletes take the physical row position from the Parquet reader's
-  `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
-  into row-group / page / bloom pruning, which the previous design had to refuse — measured
-  2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
-  resolution prunes too (`DELETE`; an `UPDATE`'s source scan pushes no predicate). Byte-range
-  splitting replaces the hand-rolled row-group partitioning
-  this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
-  / rewrite paths explicitly (#130).
 
 ### Changed
+
+- Small writes inline only when `supports_data_inlining` accepts the schema; unsupported schemas fall back to Parquet.
+  `UPDATE` and row-lineage scans reject visible inlined rows with a clear flush-or-disable remedy (#272).
 - Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining (#273).
 - **BREAKING**: Default features are now `metadata-sqlite` alone, so a default build no longer
   compiles DuckDB; add `features = ["duckdb-bundled"]` for the DuckDB provider and writer (#304).
@@ -91,6 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
 
 ### Fixed
+
+- SQLite and MySQL inline encodings now round-trip floats and binary values exactly (#272).
+- Inline commits honor expected-base, commit-metadata, and partition-spec fences and preserve existing snapshot-change
+  tokens (#272).
+- MySQL creates inline-table DDL before opening the write transaction, avoiding implicit partial commits (#272).
 - Read legacy global schema-version ledgers without assuming per-table provenance (#273).
 
 - Fix DuckDB compaction skipping eligible data files and retain historical row visibility (#273).

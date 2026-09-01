@@ -201,10 +201,21 @@ The `DuckLakeTable` provider handles URL resolution by:
 - DataFusion automatically reapplies filters after `DeleteFilterExec` for correctness
 
 ### Type System
+
 - DuckLake types are stored as strings in catalog
-- Type mapping handles SQL type aliases (e.g., "bigint" -> Int64, "text" -> Utf8)
+- Type mapping handles SQL type aliases (e.g., "bigint" -> Int64,
+  "text" -> Utf8)
 - Geometry types are mapped to Binary (WKB format)
-- Complex types (nested lists, structs, maps) return descriptive errors instead of silently failing
+- Complex types (nested lists, structs, maps) return descriptive errors
+  instead of silently failing
+- Inlined writers preserve backend-native numeric and temporal types where
+  lossless. SQLite stores `UInt64` as zero-padded 20-digit text and temporal
+  values as integers; PostgreSQL and MySQL store nanosecond timestamps as
+  `BIGINT`.
+- `MetadataWriter::set_inlined_index_columns()` persists per-table top-level
+  index declarations. `ensure_inlined_indexes()` backfills them idempotently,
+  and every physical inlined table always has a `row_id` index.
+
 
 ## Development Notes
 
