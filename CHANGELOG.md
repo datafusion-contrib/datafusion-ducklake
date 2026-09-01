@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Catalog-inlined scans push safe equality, range, null, boolean, and prefix
+  filters into metadata queries, retaining DataFusion residual filters (#277).
+
 - Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
   `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
 - A pushed-down filter never changes a query's answer, checked by a generated sweep over

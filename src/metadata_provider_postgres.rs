@@ -1,6 +1,9 @@
 //! PostgreSQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::inlined_filter::{
+    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -1621,9 +1624,21 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
         block_on(async {
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
+                return Ok(InlinedDataScan::default());
             }
             let registry = sqlx::query(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
@@ -1639,17 +1654,21 @@ impl MetadataProvider for PostgresMetadataProvider {
                 if !is_inlined_data_table(&table) {
                     continue;
                 }
-
-                let present = sqlx::query(
-                    "SELECT column_name FROM information_schema.columns
-                     WHERE table_schema = current_schema() AND table_name = $1",
+                let physical_columns = sqlx::query(
+                    "SELECT column_name, data_type FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1",
                 )
                 .bind(&table)
                 .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| row.try_get::<String, _>(0))
-                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                .await?;
+                let present = physical_columns
+                    .iter()
+                    .map(|row| row.try_get::<String, _>(0))
+                    .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let physical_types = physical_columns
+                    .iter()
+                    .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+                    .collect::<std::result::Result<HashMap<_, _>, sqlx::Error>>()?;
                 let projected = columns
                     .iter()
                     .zip(schema.fields())
@@ -1668,17 +1687,41 @@ impl MetadataProvider for PostgresMetadataProvider {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let rendered = filter.and_then(|filter| {
+                    render_inlined_filter(
+                        filter,
+                        InlinedSqlDialect::Postgres,
+                        schema.as_ref(),
+                        &physical_types,
+                        2,
+                    )
+                });
+                let pushed = rendered
+                    .as_ref()
+                    .map(|rendered| format!(" AND ({})", rendered.sql))
+                    .unwrap_or_default();
                 let sql = format!(
                     "SELECT {projected} FROM {} \
-                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL) \
+                 WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL){pushed} \
                      ORDER BY row_id",
                     quote_ident(&table)
                 );
-                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
                     .bind(snapshot_id)
-                    .bind(snapshot_id)
-                    .fetch_all(&self.pool)
-                    .await?;
+                    .bind(snapshot_id);
+                if let Some(rendered) = rendered {
+                    for bind in rendered.binds {
+                        query = match bind {
+                            InlinedSqlBind::Bool(value) => query.bind(value),
+                            InlinedSqlBind::I64(value) => query.bind(value),
+                            InlinedSqlBind::U64(value) => query.bind(value.to_string()),
+                            InlinedSqlBind::F64(value) => query.bind(value),
+                            InlinedSqlBind::Text(value) => query.bind(value),
+                            InlinedSqlBind::Bytes(value) => query.bind(value),
+                        };
+                    }
+                }
+                let rows = query.fetch_all(&self.pool).await?;
                 if rows.is_empty() {
                     continue;
                 }
@@ -1697,7 +1740,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                     Some(&present),
                 )?);
             }
-            Ok(batches)
+            Ok(InlinedDataScan::from_batches(batches))
         })
     }
 
