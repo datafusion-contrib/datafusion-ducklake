@@ -1,6 +1,9 @@
 //! SQLite metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::inlined_filter::{
+    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -1775,11 +1778,23 @@ impl MetadataProvider for SqliteMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
         block_on(async {
             // Most catalogs have no inlined data — the registry table is absent.
             // Detect and return empty so they (and older catalogs) are unaffected.
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
+                return Ok(InlinedDataScan::default());
             }
 
             // Every physical inlined table for this table (one per schema version).
@@ -1790,7 +1805,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             .fetch_all(&self.pool)
             .await?;
             if regs.is_empty() {
-                return Ok(Vec::new());
+                return Ok(InlinedDataScan::default());
             }
 
             let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
@@ -1840,17 +1855,47 @@ impl MetadataProvider for SqliteMetadataProvider {
                 } else {
                     projected.join(", ")
                 };
+                let rendered = filter.and_then(|filter| {
+                    render_inlined_filter(
+                        filter,
+                        InlinedSqlDialect::Sqlite,
+                        schema.as_ref(),
+                        &physical_types,
+                        2,
+                    )
+                });
+                let pushed = rendered
+                    .as_ref()
+                    .map(|rendered| format!(" AND ({})", rendered.sql))
+                    .unwrap_or_default();
                 let sql = format!(
                     "SELECT {select_list} FROM {} \
-                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
-                     ORDER BY row_id",
+                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL){pushed} \
+                 ORDER BY row_id",
                     quote_ident(&phys)
                 );
-                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
                     .bind(snapshot_id)
-                    .bind(snapshot_id)
-                    .fetch_all(&self.pool)
-                    .await?;
+                    .bind(snapshot_id);
+                if let Some(rendered) = rendered {
+                    for bind in rendered.binds {
+                        query = match bind {
+                        InlinedSqlBind::Bool(value) => query.bind(value),
+                        InlinedSqlBind::I64(value) => query.bind(value),
+                        InlinedSqlBind::U64(value) => query.bind(i64::try_from(value).map_err(
+                            |_| {
+                                crate::DuckLakeError::Unsupported(format!(
+                                    "SQLite inlined filter cannot represent unsigned value {value}"
+                                ))
+                            },
+                        )?),
+                        InlinedSqlBind::F64(value) => query.bind(value),
+                        InlinedSqlBind::Text(value) => query.bind(value),
+                        InlinedSqlBind::Bytes(value) => query.bind(value),
+                    };
+                    }
+                }
+                let rows = query.fetch_all(&self.pool).await?;
                 if rows.is_empty() {
                     continue;
                 }
@@ -1862,7 +1907,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     &rows,
                 )?);
             }
-            Ok(batches)
+            Ok(InlinedDataScan::from_batches(batches))
         })
     }
 

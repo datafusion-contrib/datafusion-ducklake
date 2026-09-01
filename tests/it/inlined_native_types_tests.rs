@@ -17,6 +17,7 @@ use arrow::datatypes::IntervalUnit;
 #[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 #[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
 #[cfg(feature = "write-postgres")]
 use datafusion_ducklake::{ColumnDef, SnapshotCommitMetadata, WriteMode};
 #[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
@@ -182,6 +183,20 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, vec![0, i64::MAX as u64 + 1, u64::MAX, u64::MAX]);
+    let filtered = provider
+        .scan_inlined_data(
+            u64_result.table_id,
+            u64_result.snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "value".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::U64(i64::MAX as u64 + 1),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 3);
+
     let mut connection = pool.acquire().await.unwrap();
     sqlx::query("SET enable_seqscan = off")
         .execute(&mut *connection)
@@ -508,4 +523,17 @@ async fn mysql_native_inlined_types_and_indexes_round_trip() {
             .values(),
         &[1_000_002_003, 2_000_003_004, 3_000_004_005]
     );
+    let filtered = provider
+        .scan_inlined_data(
+            result.table_id,
+            result.snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "u64_value".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::U64(i64::MAX as u64 + 1),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 2);
 }

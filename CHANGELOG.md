@@ -16,11 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live file (#293).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
-- MySQL inlines supported list, struct, and map batches under the row limit and skips
-  declared indexes on `LONGTEXT`/`LONGBLOB` columns.
-
-- Inlined values use lossless native backend storage types, and declared per-table indexes
-  plus a mandatory `row_id` index accelerate inlined filters and deletes on all four backends.
+- MySQL inlines supported list, struct, and map batches, including strict
+  maintenance reads and atomic multi-table writes (#277).
+- Inlined writers store numeric and temporal values in native backend types, and
+  declared per-table indexes plus a mandatory `row_id` index accelerate inlined
+  filters and deletes on all four backends.
+- MySQL skips declared indexes on `LONGTEXT` and `LONGBLOB`, while retaining
+  numeric declarations and mandatory `row_id` indexes.
 
 - Catalog-inlined scans push safe equality, range, null, boolean, and prefix
   filters into parameterized metadata queries on all four backends while keeping
@@ -50,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compaction rewrites, and change feeds, including typed Hive partition constants (#263).
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
+- Row lineage and positional deletes take the physical row position from the Parquet reader's
+  `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
+  into row-group / page / bloom pruning, which the previous design had to refuse — measured
+  2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
+  resolution prunes too (`DELETE`; an `UPDATE`'s source scan pushes no predicate). Byte-range
+  splitting replaces the hand-rolled row-group partitioning
+  this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
+  / rewrite paths explicitly (#130).
 
 ### Changed
 

@@ -42,6 +42,7 @@ pub mod delete_filter;
 pub mod encryption;
 pub mod error;
 pub mod information_schema;
+pub mod inlined_filter;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;

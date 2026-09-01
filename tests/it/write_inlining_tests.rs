@@ -14,6 +14,7 @@ use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
+use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
 use datafusion_ducklake::{
     ColumnDef, DuckLakeTableWriter, DuckLakeWriteOptions, DuckdbMetadataProvider,
     DuckdbMetadataWriter, InlinedRowRef, MetadataProvider, MetadataWriter, WriteMode,
@@ -232,7 +233,7 @@ async fn duckdb_writer_rejects_submicrosecond_interval_inlining() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn duckdb_writer_round_trips_uint64_boundaries_and_indexes() {
+async fn duckdb_writer_round_trips_uint64_boundaries_and_filters() {
     let temp = TempDir::new().unwrap();
     let catalog_path = temp.path().join("uint64-metadata.duckdb");
     let data_path = temp.path().join("uint64-data");
@@ -279,6 +280,19 @@ async fn duckdb_writer_round_trips_uint64_boundaries_and_indexes() {
         .downcast_ref::<UInt64Array>()
         .unwrap();
     assert_eq!(actual.values(), &values);
+    let filtered = provider
+        .scan_inlined_data(
+            result.table_id,
+            snapshot,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "value".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::U64(i64::MAX as u64 + 1),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 2);
     drop(provider);
     let connection = duckdb::Connection::open(&catalog_path).unwrap();
     let physical: String = connection

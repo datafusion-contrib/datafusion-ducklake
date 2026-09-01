@@ -2,6 +2,7 @@
 
 #![cfg(feature = "metadata-duckdb")]
 
+use std::any::Any;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -10,8 +11,11 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
+use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
 use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
-use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider, MetadataProvider};
+use datafusion_ducklake::{
+    DuckLakeCatalog, DuckLakeTable, DuckdbMetadataProvider, MetadataProvider,
+};
 use tempfile::TempDir;
 
 use crate::common;
@@ -205,6 +209,32 @@ async fn duckdb_inlined_rows_match_the_extension() {
         .unwrap();
     assert_binary_encodings(&inlined[0]);
     assert_typed_encodings(&inlined[0]);
+    let filtered = provider
+        .scan_inlined_data(
+            table.table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::I64(7),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 1);
+    let case_mismatch = provider
+        .scan_inlined_data(
+            table.table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "note".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::Utf8("ALPHA".to_string()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(case_mismatch.materialized_row_count, 0);
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("lake", Arc::new(catalog));
@@ -214,6 +244,42 @@ async fn duckdb_inlined_rows_match_the_extension() {
         datafusion_count(&ctx, "lake.main.items").await,
         expected.len() as i64
     );
+    let table_provider = ctx.table_provider("lake.main.items").await.unwrap();
+    ctx.register_table("filtered_items", Arc::clone(&table_provider))
+        .unwrap();
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE id = 7").await,
+        vec![(Some(7), Some("alpha".to_string()), Some(true))]
+    );
+    let ducklake_table = (table_provider.as_ref() as &dyn Any)
+        .downcast_ref::<DuckLakeTable>()
+        .expect("DuckLakeTable");
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 1);
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE id >= 7").await,
+        vec![(Some(7), Some("alpha".to_string()), Some(true)), (Some(11), None, Some(false)),]
+    );
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 2);
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE note IS NULL").await,
+        vec![(Some(11), None, Some(false))]
+    );
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 1);
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE note LIKE 'al%'").await,
+        vec![(Some(7), Some("alpha".to_string()), Some(true))]
+    );
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 1);
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE starts_with(note, 'al')").await,
+        vec![(Some(7), Some("alpha".to_string()), Some(true))]
+    );
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 1);
+    assert_eq!(
+        datafusion_rows(&ctx, "filtered_items WHERE id = 7 OR abs(id) = 11").await,
+        vec![(Some(7), Some("alpha".to_string()), Some(true)), (Some(11), None, Some(false)),]
+    );
+    assert_eq!(ducklake_table.inlined_materialized_row_count(), 3);
 }
 
 #[cfg(feature = "metadata-postgres")]
@@ -330,6 +396,57 @@ async fn postgres_inlined_rows_decode_catalog_encodings() {
         .unwrap();
     assert_binary_encodings(&batches[0]);
     assert_typed_encodings(&batches[0]);
+    let filtered = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "note".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::Utf8("alpha".to_string()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 1);
+    let case_mismatch = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "note".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::Utf8("ALPHA".to_string()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(case_mismatch.materialized_row_count, 0);
+    let literal_wildcards = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Prefix {
+                column: "note".to_string(),
+                prefix: "a%_".to_string(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(literal_wildcards.materialized_row_count, 0);
+    let range = provider
+        .scan_inlined_data(
+            table_id,
+            snapshot_id,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::I64(7),
+            }),
+        )
+        .unwrap();
+    assert_eq!(range.materialized_row_count, 1);
     let table = MemTable::try_new(batches[0].schema(), vec![batches]).unwrap();
     let ctx = SessionContext::new();
     ctx.register_table("items", Arc::new(table)).unwrap();
@@ -408,7 +525,7 @@ async fn mysql_sqlite_style_inlined_rows_are_visible() {
         .unwrap();
     }
     sqlx::query(
-        "CREATE TABLE ducklake_inlined_data_tables(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables(
              table_id BIGINT, table_name VARCHAR(255), schema_version BIGINT)",
     )
     .execute(&pool)
@@ -459,6 +576,70 @@ async fn mysql_sqlite_style_inlined_rows_are_visible() {
     let batches = provider.get_inlined_data(1, 2, &columns).unwrap();
     assert_binary_encodings(&batches[0]);
     assert_typed_encodings(&batches[0]);
+    let filtered = provider
+        .scan_inlined_data(
+            1,
+            2,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "note".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::Utf8("alpha".to_string()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(filtered.materialized_row_count, 1);
+    let case_mismatch = provider
+        .scan_inlined_data(
+            1,
+            2,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "note".to_string(),
+                op: InlinedComparison::Eq,
+                value: InlinedValue::Utf8("ALPHA".to_string()),
+            }),
+        )
+        .unwrap();
+    assert_eq!(case_mismatch.materialized_row_count, 0);
+    let literal_wildcards = provider
+        .scan_inlined_data(
+            1,
+            2,
+            &columns,
+            Some(&InlinedFilter::Prefix {
+                column: "note".to_string(),
+                prefix: "a%_".to_string(),
+            }),
+        )
+        .unwrap();
+    assert_eq!(literal_wildcards.materialized_row_count, 0);
+    let range = provider
+        .scan_inlined_data(
+            1,
+            2,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "id".to_string(),
+                op: InlinedComparison::GtEq,
+                value: InlinedValue::I64(7),
+            }),
+        )
+        .unwrap();
+    assert_eq!(range.materialized_row_count, 1);
+    let unsafe_text_range = provider
+        .scan_inlined_data(
+            1,
+            2,
+            &columns,
+            Some(&InlinedFilter::Comparison {
+                column: "score".to_string(),
+                op: InlinedComparison::Gt,
+                value: InlinedValue::F64(0.0),
+            }),
+        )
+        .unwrap();
+    assert_eq!(unsafe_text_range.materialized_row_count, 2);
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("lake", Arc::new(catalog));

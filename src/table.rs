@@ -1,11 +1,15 @@
 //! DuckLake table provider implementation
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
+use crate::inlined_filter::translate_inlined_filters;
 use crate::metadata_provider::{
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
@@ -1067,6 +1071,8 @@ pub struct DuckLakeTable {
     /// scans don't re-fetch. `Arc`-wrapped so a cloned table (see `delete_from`)
     /// shares the same memoized configs.
     file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
+    /// Rows materialized by the most recent inlined scan before residual filters.
+    inlined_materialized_row_count: Arc<AtomicUsize>,
     /// Decryption keys for the encrypted files this table has listed, and the
     /// factory built from them. Shared with every clone of the table, so a key
     /// one of them installs is available to all of them.
@@ -1218,6 +1224,7 @@ impl DuckLakeTable {
             #[cfg(feature = "encryption")]
             encryption_keys,
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(feature = "write")]
             schema_name: None,
             #[cfg(feature = "write")]
@@ -1241,6 +1248,12 @@ impl DuckLakeTable {
             self.physical_schema.clone()
         };
         self
+    }
+
+    /// Rows materialized by the most recent metadata-catalog inlined scan.
+    #[must_use]
+    pub fn inlined_materialized_row_count(&self) -> usize {
+        self.inlined_materialized_row_count.load(Ordering::Relaxed)
     }
 
     /// Index of the synthetic `rowid` column in `self.schema`, when enabled.
@@ -3249,6 +3262,7 @@ impl DuckLakeTable {
             // `snapshot_id`/cache match the post-#163 struct (Arc-wrapped cache,
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             #[cfg(feature = "encryption")]
             encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,
@@ -3868,6 +3882,8 @@ impl TableProvider for DuckLakeTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let inlined_filter = translate_inlined_filters(filters);
+
         // Row-lineage detour: when the synthetic `rowid` column is projected,
         // every file needs its own scan because each has a distinct
         // `row_id_start`. `projection == None` with row lineage on means "all
@@ -3883,10 +3899,15 @@ impl TableProvider for DuckLakeTable {
         // rows would silently vanish from a row-lineage read. Refuse loudly
         // instead until inlined rowid scans are supported.
         if rowid_in_proj {
-            let inlined =
-                self.provider
-                    .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
-            if inlined.iter().any(|batch| batch.num_rows() > 0) {
+            let inlined = self.provider.scan_inlined_data(
+                self.table_id,
+                self.snapshot_id,
+                &self.columns,
+                inlined_filter.as_ref(),
+            )?;
+            self.inlined_materialized_row_count
+                .store(inlined.materialized_row_count, Ordering::Relaxed);
+            if inlined.batches.iter().any(|batch| batch.num_rows() > 0) {
                 return Err(crate::DuckLakeError::Unsupported(format!(
                     "row-lineage (rowid) scan on a table with inlined rows is not supported; \
                      {INLINED_DATA_REMEDIATION}"
@@ -4033,14 +4054,17 @@ impl TableProvider for DuckLakeTable {
         // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
         // include them. Providers without inlined data — or that don't implement
         // the read — return empty, so this is a no-op for ordinary catalogs.
-        // (Phase 1: applies on this non-rowid read path; only the SQLite provider
-        // surfaces inlined rows today.)
-        let inlined =
-            self.provider
-                .get_inlined_data(self.table_id, self.snapshot_id, &self.columns)?;
-        if inlined.iter().any(|b| b.num_rows() > 0) {
+        let inlined = self.provider.scan_inlined_data(
+            self.table_id,
+            self.snapshot_id,
+            &self.columns,
+            inlined_filter.as_ref(),
+        )?;
+        self.inlined_materialized_row_count
+            .store(inlined.materialized_row_count, Ordering::Relaxed);
+        if inlined.batches.iter().any(|b| b.num_rows() > 0) {
             let exec = MemorySourceConfig::try_new_exec(
-                &[inlined],
+                &[inlined.batches],
                 self.physical_schema.clone(),
                 projection.cloned(),
             )?;

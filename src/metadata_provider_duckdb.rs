@@ -1,4 +1,7 @@
 use crate::DuckLakeError;
+use crate::inlined_filter::{
+    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
@@ -24,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use duckdb::AccessMode::ReadOnly;
 use duckdb::types::{TimeUnit as DuckdbTimeUnit, Value, ValueRef};
-use duckdb::{Config, Connection, OptionalExt, params};
+use duckdb::{Config, Connection, OptionalExt, params, params_from_iter};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -1735,9 +1738,21 @@ impl MetadataProvider for DuckdbMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> crate::Result<Vec<RecordBatch>> {
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> crate::Result<InlinedDataScan> {
         let conn = self.connection();
         if !self.schema_capabilities(&conn)?.inlined_data_tables {
-            return Ok(Vec::new());
+            return Ok(InlinedDataScan::default());
         }
         let mut registry =
             conn.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
@@ -1751,11 +1766,18 @@ impl MetadataProvider for DuckdbMetadataProvider {
             if !is_inlined_data_table(&table) {
                 continue;
             }
-            let info_sql = format!("SELECT name FROM pragma_table_info('{table}')");
+            let info_sql = format!("SELECT name, type FROM pragma_table_info('{table}')");
             let mut info = conn.prepare(&info_sql)?;
-            let present = info
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            let physical_columns = info
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let present = physical_columns
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<HashSet<_>>();
+            let physical_types = physical_columns.into_iter().collect::<HashMap<_, _>>();
             let projected = columns
                 .iter()
                 .zip(schema.fields())
@@ -1778,14 +1800,38 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let rendered = filter.and_then(|filter| {
+                render_inlined_filter(
+                    filter,
+                    InlinedSqlDialect::DuckDb,
+                    schema.as_ref(),
+                    &physical_types,
+                    2,
+                )
+            });
+            let pushed = rendered
+                .as_ref()
+                .map(|rendered| format!(" AND ({})", rendered.sql))
+                .unwrap_or_default();
             let sql = format!(
                 "SELECT {projected} FROM {} \
-                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
+                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL){pushed} \
                  ORDER BY row_id",
                 quote_ident(&table)
             );
             let mut statement = conn.prepare(&sql)?;
-            let mut query = statement.query(params![snapshot_id, snapshot_id])?;
+            let mut values = vec![Value::BigInt(snapshot_id), Value::BigInt(snapshot_id)];
+            if let Some(rendered) = rendered {
+                values.extend(rendered.binds.into_iter().map(|bind| match bind {
+                    InlinedSqlBind::Bool(value) => Value::Boolean(value),
+                    InlinedSqlBind::I64(value) => Value::BigInt(value),
+                    InlinedSqlBind::U64(value) => Value::UBigInt(value),
+                    InlinedSqlBind::F64(value) => Value::Double(value),
+                    InlinedSqlBind::Text(value) => Value::Text(value),
+                    InlinedSqlBind::Bytes(value) => Value::Blob(value),
+                }));
+            }
+            let mut query = statement.query(params_from_iter(values.iter()))?;
             let mut rows = Vec::new();
             while let Some(row) = query.next()? {
                 let values = schema
@@ -1809,7 +1855,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 batches.push(build_inlined_batch(schema.clone(), columns, &rows)?);
             }
         }
-        Ok(batches)
+        Ok(InlinedDataScan::from_batches(batches))
     }
 
     fn get_inlined_deletes(

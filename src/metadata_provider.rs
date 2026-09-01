@@ -1,4 +1,5 @@
 use crate::Result;
+use crate::inlined_filter::{InlinedDataScan, InlinedFilter};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -1657,6 +1658,27 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<arrow::record_batch::RecordBatch>> {
         Ok(Vec::new())
+    }
+
+    /// Read visible inlined rows for a table scan with an optional conservative
+    /// metadata-catalog filter.
+    ///
+    /// The default preserves source compatibility for external providers by
+    /// delegating to [`Self::get_inlined_data`] and reporting the rows it
+    /// materialized. Implementations may omit unsupported filter nodes but must
+    /// never exclude a row which could satisfy the original DataFusion filter.
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        _filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
+        Ok(InlinedDataScan::from_batches(self.get_inlined_data(
+            table_id,
+            snapshot_id,
+            columns,
+        )?))
     }
 
     /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`

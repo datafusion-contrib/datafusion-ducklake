@@ -177,6 +177,7 @@ stale declaration never fails an inlined commit.
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
 | Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file | ✅ |
+| Filter pushdown to catalog-inlined rows (equality, range, null, AND, OR, and prefix) | ✅ |
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
 | Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
 | SQL-queryable `information_schema`                      |   ✅   |
