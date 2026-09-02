@@ -70,10 +70,8 @@ async fn main() {
     // small target so sort + rollover yields several tight-range files.
     let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
     let iwriter = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
-    let options = DuckLakeWriteOptions {
-        target_file_size: Some(target_bytes),
-        ..Default::default()
-    };
+    let mut options = DuckLakeWriteOptions::default();
+    options.target_file_size = Some(target_bytes);
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(iwriter))
         .unwrap()
         .with_write_options(options);

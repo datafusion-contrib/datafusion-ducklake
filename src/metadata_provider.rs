@@ -1330,12 +1330,77 @@ pub struct DeleteFileChange {
     pub snapshot_id: i64,
 }
 
+#[derive(Debug)]
+pub(crate) struct MetadataSetting {
+    pub key: String,
+    pub value: String,
+    pub scope: Option<String>,
+    pub scope_id: Option<i64>,
+}
+
+pub(crate) fn resolve_metadata_settings(
+    rows: Vec<MetadataSetting>,
+    schema_id: Option<i64>,
+    table_id: Option<i64>,
+) -> Result<HashMap<String, String>> {
+    let mut global = HashMap::new();
+    let mut schema = HashMap::new();
+    let mut table = HashMap::new();
+
+    for row in rows {
+        match row.scope.as_deref() {
+            None => {
+                global.insert(row.key, row.value);
+            },
+            Some("schema") if row.scope_id.is_none() => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "ducklake_metadata schema setting '{}' has no scope_id",
+                    row.key
+                )));
+            },
+            Some("schema") if row.scope_id == schema_id => {
+                schema.insert(row.key, row.value);
+            },
+            Some("table") if row.scope_id.is_none() => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "ducklake_metadata table setting '{}' has no scope_id",
+                    row.key
+                )));
+            },
+            Some("table") if row.scope_id == table_id => {
+                table.insert(row.key, row.value);
+            },
+            Some("schema") | Some("table") => {},
+            Some(scope) => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Unsupported ducklake_metadata scope '{scope}'; expected schema or table"
+                )));
+            },
+        }
+    }
+
+    global.extend(schema);
+    global.extend(table);
+    Ok(global)
+}
+
 pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// Get the current snapshot ID (dynamic, not cached)
     fn get_current_snapshot(&self) -> Result<i64>;
 
     /// Get the data path from catalog metadata (not snapshot-dependent)
     fn get_data_path(&self) -> Result<String>;
+
+    /// Resolve catalog settings for an optional schema and table. Implementations
+    /// apply DuckLake's per-key precedence: Table, then Schema, then Global.
+    /// External providers default to no stored settings.
+    fn get_metadata_settings(
+        &self,
+        _schema_id: Option<i64>,
+        _table_id: Option<i64>,
+    ) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
 
     /// List all snapshots in the catalog
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>>;
@@ -1741,6 +1806,52 @@ mod tests {
     }
 
     #[test]
+    fn resolve_metadata_settings_uses_per_key_scope_precedence() {
+        let rows = vec![
+            MetadataSetting {
+                key: "compression".into(),
+                value: "global".into(),
+                scope: None,
+                scope_id: None,
+            },
+            MetadataSetting {
+                key: "rows".into(),
+                value: "global-rows".into(),
+                scope: None,
+                scope_id: None,
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "schema".into(),
+                scope: Some("schema".into()),
+                scope_id: Some(7),
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "other-schema".into(),
+                scope: Some("schema".into()),
+                scope_id: Some(8),
+            },
+            MetadataSetting {
+                key: "compression".into(),
+                value: "table".into(),
+                scope: Some("table".into()),
+                scope_id: Some(11),
+            },
+        ];
+
+        let settings = resolve_metadata_settings(rows, Some(7), Some(11)).unwrap();
+
+        assert_eq!(
+            settings,
+            HashMap::from([
+                ("compression".to_string(), "table".to_string()),
+                ("rows".to_string(), "global-rows".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn inlined_rows_reject_unsupported_nested_encoding() {
         let columns = vec![column("items", "list<int32>")];
         let schema = Arc::new(Schema::new(vec![Field::new_list(
@@ -1760,6 +1871,26 @@ mod tests {
         assert!(
             error.to_string().contains(INLINED_DATA_REMEDIATION),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolve_metadata_settings_rejects_scoped_row_without_id() {
+        let error = resolve_metadata_settings(
+            vec![MetadataSetting {
+                key: "compression".into(),
+                value: "zstd".into(),
+                scope: Some("table".into()),
+                scope_id: None,
+            }],
+            Some(7),
+            Some(11),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid configuration: ducklake_metadata table setting 'compression' has no scope_id"
         );
     }
 

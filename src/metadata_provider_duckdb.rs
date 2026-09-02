@@ -4,17 +4,16 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
     DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, SQL_GET_DATA_FILES,
-    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DATA_PATH,
-    SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_FILE_COLUMN_STATS,
-    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT, SQL_GET_NAME_MAPPING,
-    SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC, SQL_GET_TABLE_BY_NAME,
-    SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME, SQL_LIST_ALL_FILES,
-    SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES,
-    SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, ViewWithSchema, build_inlined_batch, inlined_delete_table_name,
-    inlined_missing_scalar, is_inlined_data_table, reconstruct_columns,
-    reconstruct_columns_with_table,
+    FileWithTable, INLINED_DATA_REMEDIATION, MetadataProvider, MetadataSetting, SQL_GET_DATA_FILES,
+    SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS, SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS,
+    SQL_GET_FILE_COLUMN_STATS, SQL_GET_FILE_PARTITION_VALUES, SQL_GET_LATEST_SNAPSHOT,
+    SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SCHEMA_BY_NAME, SQL_GET_SORT_SPEC,
+    SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME,
+    SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_SCHEMAS,
+    SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS, SQL_TABLE_EXISTS, SchemaMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
+    build_inlined_batch, inlined_delete_table_name, inlined_missing_scalar, is_inlined_data_table,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -802,9 +801,54 @@ impl MetadataProvider for DuckdbMetadataProvider {
     }
 
     fn get_data_path(&self) -> crate::Result<String> {
+        self.get_metadata_settings(None, None)?
+            .remove("data_path")
+            .ok_or_else(|| {
+                DuckLakeError::InvalidConfig(
+                    "Missing required catalog metadata: 'data_path' not configured. \
+                     The catalog may be uninitialized or corrupted."
+                        .to_string(),
+                )
+            })
+    }
+
+    fn get_metadata_settings(
+        &self,
+        schema_id: Option<i64>,
+        table_id: Option<i64>,
+    ) -> crate::Result<HashMap<String, String>> {
         let conn = self.connection();
-        let data_path: String = conn.query_row(SQL_GET_DATA_PATH, [], |row| row.get(0))?;
-        Ok(data_path)
+        let has_scope_columns: bool = conn.query_row(
+            "SELECT COUNT(*) = 2 FROM pragma_table_info('ducklake_metadata') \
+             WHERE name IN ('scope', 'scope_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        let rows = if has_scope_columns {
+            let mut stmt =
+                conn.prepare("SELECT key, value, scope, scope_id FROM ducklake_metadata")?;
+            stmt.query_map([], |row| {
+                Ok(MetadataSetting {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                    scope: row.get(2)?,
+                    scope_id: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = conn.prepare("SELECT key, value FROM ducklake_metadata")?;
+            stmt.query_map([], |row| {
+                Ok(MetadataSetting {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                    scope: None,
+                    scope_id: None,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        resolve_metadata_settings(rows, schema_id, table_id)
     }
 
     fn list_snapshots(&self) -> crate::Result<Vec<SnapshotMetadata>> {

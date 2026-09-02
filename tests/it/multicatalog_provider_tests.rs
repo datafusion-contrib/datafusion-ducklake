@@ -16,6 +16,7 @@ use datafusion_ducklake::{
     MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
     initialize_multicatalog_schema,
 };
+use rstest::rstest;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::sync::Arc;
 use testcontainers::ContainerAsync;
@@ -675,4 +676,30 @@ async fn file_listing_filter_falls_open_on_a_catalog_without_statistics() {
 
 fn listed_ids(files: &[DuckLakeFileMetadata]) -> Vec<i64> {
     files.iter().map(|file| file.file.data_file_id).collect()
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn catalog_setting_deterministically_overrides_shared_global_setting() -> anyhow::Result<()> {
+    let (pool, _container) = spin_up_postgres().await?;
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("settings_test").await?;
+    sqlx::query(
+        "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES \
+         ('parquet_compression', 'snappy', NULL, NULL), \
+         ('parquet_compression', 'zstd', 'catalog', $1)",
+    )
+    .bind(catalog_id)
+    .execute(&pool)
+    .await?;
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool, catalog_id).await?;
+    let settings = provider.get_metadata_settings(None, None)?;
+
+    assert_eq!(
+        settings.get("parquet_compression").map(String::as_str),
+        Some("zstd")
+    );
+    Ok(())
 }

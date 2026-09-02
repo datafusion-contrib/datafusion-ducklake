@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pushed-down filters narrow the DuckLake file listing in the catalog query itself, using
   per-column statistics, so planning a selective scan or keyed mutation no longer lists
   every live file (#293).
+- Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
+  every metadata backend; SQL writes and compaction honour the resolved values (#271).
 - `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
   set how many finished data files a rolling or partitioned write uploads at once, default 4.
   Written output is identical at any setting (#280).
@@ -35,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Files carrying a live delete file are now pruned by their statistics, matching official
   DuckLake; previously they were kept regardless of the predicate (#293).
+- **BREAKING**: `DuckLakeWriteOptions` is non-exhaustive and gains `parquet_version`,
+  `auto_compact` and `rewrite_delete_threshold`; add `..Default::default()` to literals (#271).
+- Catalog-backed writes now default to Snappy compression, 122,880-row row groups and 512 MB
+  target files, changing Parquet layout and file size versus the previous defaults (#271).
 
 - **BREAKING**: `DuckLakeFileData` and `DataFileChange` are now non-exhaustive and
   implement `Default`; `DataFileChange` gains `mapping_id`. Downstream metadata
@@ -64,6 +70,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
 
 ### Fixed
+
+- Invalid write-only catalog settings no longer block table reads; they fail when a write or
+  maintenance operation is planned (#271).
+- Legacy two-column `ducklake_metadata` tables migrate both scope columns losslessly (#271).
+- Multicatalog catalog-scoped settings deterministically override shared globals (#271).
+- ZSTD compression level `0` maps to the Parquet library default; non-ZSTD codecs ignore the
+  setting (#271).
+- Fixed `UPDATE` and `DELETE` to retain scoped Parquet options (#271).
 
 - A float `min_value` was trusted as a lower bound even when the column's NaN state was unknown
   or positive; negative NaN sorts below every value, so a matching row could be pruned away

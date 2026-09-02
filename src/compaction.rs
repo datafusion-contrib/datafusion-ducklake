@@ -705,6 +705,10 @@ impl DuckLakeTable {
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
+        self.write_options().validate()?;
+        if !self.write_options().auto_compact.unwrap_or(true) {
+            return Ok(CompactionResult::empty());
+        }
 
         // Candidates: live, delete-free, below-target files with a known origin
         // snapshot + schema version, ordered so adjacency and same-version
@@ -983,14 +987,16 @@ impl DuckLakeTable {
             // grouping key), so the merged output inherits it: same Hive directory,
             // same `partition_id` + values in the catalog.
             let (partition_id, partition_values) = partition_key(bin[0]);
-            let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &top_level_column_ids,
-                );
-                crate::partition::hive_subpath(&names, &partition_values)
-            });
+            let subpath = partition_id
+                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                .map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
             let file = table_writer
                 .write_compacted_file_stream(
                     schema_name,
@@ -1050,8 +1056,18 @@ impl DuckLakeTable {
     pub async fn rewrite_data_files(
         &self,
         state: &dyn Session,
-        opts: RewriteOptions,
+        mut opts: RewriteOptions,
     ) -> Result<CompactionResult> {
+        self.write_options().validate()?;
+        if !self.write_options().auto_compact.unwrap_or(true) {
+            return Ok(CompactionResult::empty());
+        }
+        if opts.delete_threshold == RewriteOptions::default().delete_threshold {
+            opts.delete_threshold = self
+                .write_options()
+                .rewrite_delete_threshold
+                .unwrap_or(opts.delete_threshold);
+        }
         if !(0.0..=1.0).contains(&opts.delete_threshold) {
             return Err(DuckLakeError::InvalidConfig(format!(
                 "rewrite_data_files: delete_threshold must be in [0.0, 1.0], got {}",
@@ -1161,14 +1177,16 @@ impl DuckLakeTable {
             // holds a subset of that file's rows and therefore its exact
             // partition: inherit the identity and the Hive directory.
             let (partition_id, partition_values) = partition_key(tf);
-            let subpath = partition_id.map(|pid| {
-                let names = self.partition_path_names(
-                    live_partition_spec.as_ref(),
-                    pid,
-                    &top_level_column_ids,
-                );
-                crate::partition::hive_subpath(&names, &partition_values)
-            });
+            let subpath = partition_id
+                .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
+                .map(|pid| {
+                    let names = self.partition_path_names(
+                        live_partition_spec.as_ref(),
+                        pid,
+                        &top_level_column_ids,
+                    );
+                    crate::partition::hive_subpath(&names, &partition_values)
+                });
             let file = table_writer
                 .write_compacted_file_stream(
                     schema_name,

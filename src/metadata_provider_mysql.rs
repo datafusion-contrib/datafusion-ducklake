@@ -6,11 +6,12 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
     DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    FileWithTable, InlinedDataBackend, MetadataProvider, SQL_GET_FILE_PARTITION_VALUES,
-    SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
-    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
-    parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
+    FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
+    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
+    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -562,22 +563,60 @@ impl MetadataProvider for MySqlMetadataProvider {
     }
 
     fn get_data_path(&self) -> Result<String> {
-        block_on(async {
-            let row = sqlx::query(
-                "SELECT value FROM ducklake_metadata WHERE `key` = ? AND scope IS NULL",
-            )
-            .bind("data_path")
-            .fetch_optional(&self.pool)
-            .await?;
-
-            match row {
-                Some(r) => Ok(r.try_get(0)?),
-                None => Err(crate::error::DuckLakeError::InvalidConfig(
+        self.get_metadata_settings(None, None)?
+            .remove("data_path")
+            .ok_or_else(|| {
+                crate::error::DuckLakeError::InvalidConfig(
                     "Missing required catalog metadata: 'data_path' not configured. \
                      The catalog may be uninitialized or corrupted."
                         .to_string(),
-                )),
-            }
+                )
+            })
+    }
+
+    fn get_metadata_settings(
+        &self,
+        schema_id: Option<i64>,
+        table_id: Option<i64>,
+    ) -> Result<HashMap<String, String>> {
+        block_on(async {
+            let scope_column_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = 'ducklake_metadata' \
+                 AND column_name IN ('scope', 'scope_id')",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let rows = if scope_column_count == 2 {
+                sqlx::query("SELECT `key`, value, scope, scope_id FROM ducklake_metadata")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: row.try_get(2)?,
+                            scope_id: row.try_get(3)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                sqlx::query("SELECT `key`, value FROM ducklake_metadata")
+                    .fetch_all(&self.pool)
+                    .await?
+                    .into_iter()
+                    .map(|row| {
+                        Ok(MetadataSetting {
+                            key: row.try_get(0)?,
+                            value: row.try_get(1)?,
+                            scope: None,
+                            scope_id: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            resolve_metadata_settings(rows, schema_id, table_id)
         })
     }
 

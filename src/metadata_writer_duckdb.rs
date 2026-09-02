@@ -69,7 +69,8 @@ CREATE SEQUENCE IF NOT EXISTS ducklake_sort_id_seq START 1;
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
     value VARCHAR NOT NULL,
-    scope VARCHAR
+    scope VARCHAR,
+    scope_id BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS ducklake_snapshot (
@@ -859,6 +860,21 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let (snapshot_id, _schema_version) = insert_snapshot(&tx)?;
         tx.commit()?;
         Ok(snapshot_id)
+    }
+
+    fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL",
+            params![key],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+            params![key, value],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn get_or_create_schema(
@@ -1664,6 +1680,10 @@ impl MetadataWriter for DuckdbMetadataWriter {
     fn initialize_schema(&self) -> Result<()> {
         let conn = self.connection();
         conn.execute_batch(SQL_CREATE_SCHEMA)?;
+        conn.execute_batch("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")?;
+        conn.execute_batch(
+            "ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT",
+        )?;
         // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
         // (CREATE TABLE IF NOT EXISTS never alters an existing table). DuckDB supports
         // ADD COLUMN IF NOT EXISTS, so this is idempotent and lossless (NULL means

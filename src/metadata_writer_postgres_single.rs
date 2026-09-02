@@ -42,7 +42,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
         value VARCHAR NOT NULL,
-        scope VARCHAR
+        scope VARCHAR,
+        scope_id BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
@@ -1004,6 +1005,26 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         })
     }
 
+    fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
+                .bind(key)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES ($1, $2, NULL, NULL)",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
     fn get_or_create_schema(
         &self,
         name: &str,
@@ -1904,6 +1925,12 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for ddl in SQL_CREATE_TABLES {
                 sqlx::query(*ddl).execute(&self.pool).await?;
             }
+            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")
+                .execute(&self.pool)
+                .await?;
             sqlx::query(
                 "ALTER TABLE ducklake_column
                  ADD COLUMN IF NOT EXISTS initial_default VARCHAR,

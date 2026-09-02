@@ -1019,6 +1019,13 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;
 
+    /// Replace a global-scoped catalog setting.
+    fn set_global_setting(&self, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "global-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
     /// Get or create a schema, returning `(schema_id, was_created)`.
     fn get_or_create_schema(
         &self,

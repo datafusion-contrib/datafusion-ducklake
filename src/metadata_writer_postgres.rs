@@ -34,7 +34,8 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
         value VARCHAR NOT NULL,
-        scope VARCHAR
+        scope VARCHAR,
+        scope_id BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1746,6 +1747,32 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = $1 AND scope = 'catalog' AND scope_id = $2",
+            )
+            .bind(key)
+            .bind(self.catalog_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES ($1, $2, 'catalog', $3)",
+            )
+            .bind(key)
+            .bind(value)
+            .bind(self.catalog_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
         })
     }
 
@@ -4392,6 +4419,12 @@ impl MetadataWriter for PostgresMetadataWriter {
             execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
             execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
             migrate_column_default_metadata(&self.pool).await?;
+            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope VARCHAR")
+                .execute(&self.pool)
+                .await?;
+            sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN IF NOT EXISTS scope_id BIGINT")
+                .execute(&self.pool)
+                .await?;
             // Upgrade a pre-existing store's ducklake_column to the composite PK
             // (legacy single-row column_id PK → versioned-capable). Idempotent.
             migrate_ducklake_column_to_composite_pk(&self.pool).await?;
