@@ -13,7 +13,9 @@ use crate::metadata_provider::{
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
-use arrow::datatypes::SchemaRef;
+use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
+use crate::stats_filter::{RenderedColumnFilter, StatsFilter, StatsLiteral, StatsSqlDialect};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
@@ -173,6 +175,14 @@ struct SchemaCapabilities {
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
     views: bool,
+    /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
+    /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
+    ///
+    /// A server capability rather than a catalog one, so it is deliberately not
+    /// part of [`Self::all`]: gating the memo on it would make an otherwise
+    /// fully-migrated catalog on an older server re-probe on every call, and a
+    /// stale `false` only costs pruning.
+    soft_input_validation: bool,
 }
 
 impl SchemaCapabilities {
@@ -184,6 +194,315 @@ impl SchemaCapabilities {
             && self.inlined_data_tables
             && self.views
     }
+}
+
+/// Run one page of the data-file listing.
+///
+/// Returns the raw `sqlx::Error` so the caller can retry unfiltered when the
+/// narrowed form of the query is what the catalog could not run. The bind order
+/// is the listing query's, filtered or not: statistics literals are inlined by
+/// [`crate::stats_filter`], so narrowing the query adds no parameter.
+pub(crate) async fn fetch_data_file_page(
+    pool: &PgPool,
+    sql: &str,
+    table_id: i64,
+    snapshot_id: i64,
+    after_data_file_id: i64,
+    limit: i64,
+) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(table_id)
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .bind(table_id)
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .bind(after_data_file_id)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+}
+
+/// Statistics SQL for a catalog queried natively as PostgreSQL.
+///
+/// Shared with [`crate::multicatalog_provider`], which speaks the same dialect
+/// to the same server; a divergence between two copies of the constructs below
+/// would be a silent correctness difference between the two readers.
+///
+/// PostgreSQL has no `TRY_CAST`, and a plain `CAST` of a stat string it cannot
+/// parse raises an error that aborts the whole listing query — one malformed or
+/// foreign-written `min_value` would turn a scan into a hard failure. The two
+/// constructs below are what stand in for `TRY_CAST`, and which one is used
+/// depends on the server:
+///
+/// - PostgreSQL 16 and later have `pg_input_is_valid(text, type)`, which runs a
+///   type's input function in soft-error mode. It is exact: it rejects garbage,
+///   out-of-range integers, overflowing and underflowing floats, and impossible
+///   calendar dates like `2020-02-31`, all of which a plain `CAST` would raise
+///   on.
+/// - Older servers get a regular-expression validity test instead. A regex
+///   cannot decide a calendar date, so temporal types are declined outright
+///   there rather than risking an abort; see [`postgres_castable_pattern`].
+///
+/// Both are wrapped in a `CASE`, whose arms PostgreSQL evaluates lazily, so the
+/// `CAST` never runs on a value the test rejected.
+pub(crate) struct PostgresStatsDialect {
+    /// `pg_input_is_valid` exists (PostgreSQL 16+).
+    pub(crate) soft_input_validation: bool,
+}
+
+impl StatsSqlDialect for PostgresStatsDialect {
+    /// Both sides are inspected, for different reasons.
+    ///
+    /// The validity test built below covers only the *stat*, which is a value
+    /// read from a row. The constant is a different matter: it is spliced into
+    /// the statement as a bare literal on the other side of the comparison, and
+    /// PostgreSQL coerces that unknown-type literal to the cast target while
+    /// *parsing*, before a single row is read. A constant the target's input
+    /// function refuses is therefore a syntax-time error that aborts the entire
+    /// listing query — it fires on `EXPLAIN` against an empty table. Only a
+    /// temporal constant can do that, and a temporal comparison never reaches a
+    /// cast: it is compared as text, gated on both sides by
+    /// [`postgres_canonical_temporal_pattern`].
+    ///
+    /// Declining drops that one comparison and costs pruning. Emitting a
+    /// constant PostgreSQL cannot read costs the scan.
+    fn try_cast(&self, expr: &str, literal: &StatsLiteral, data_type: &DataType) -> Option<String> {
+        if let Some(pattern) = postgres_canonical_temporal_pattern(data_type, literal.text()) {
+            // Compared as text, not cast. PostgreSQL's temporal types hold
+            // microseconds and *round* a longer fraction, which is monotonic but
+            // not injective — two distinct nanosecond instants can land on one
+            // microsecond, making a strict comparison that holds of the stored
+            // values come back false. Casting also needs the input function,
+            // which decides a calendar no pattern can, and which is only
+            // interrogable through `pg_input_is_valid` on PostgreSQL 16 and
+            // later.
+            //
+            // Text sidesteps all of it. The canonical encoding is
+            // chronologically ordered byte-wise, so comparing the two strings
+            // answers the same question a cast would, exactly, at full
+            // precision, on every server version — and nothing is parsed, so an
+            // impossible date cannot raise.
+            let text = self.collate_binary(expr);
+            return Some(format!("CASE WHEN {text} ~ '{pattern}' THEN {text} END"));
+        }
+        // Past the temporal branch every constant is a bare number or quoted
+        // `true` / `false`, and no encoding of those aborts the statement while
+        // PostgreSQL parses it — so from here only the stat needs vetting.
+        let _ = literal;
+        let target = postgres_cast_type(data_type)?;
+        // The shape test is required on every server version. `pg_input_is_valid`
+        // is not a substitute for it: it answers "can the input function read
+        // this", and that function is deliberately permissive. It accepts
+        // `today`, `now`, `epoch` and `infinity` for a date, `NaN` and
+        // `Infinity` for a numeric, `nan` for a float, and `0x10` and `+5` for
+        // an integer — none of which this crate or official DuckLake writes, and
+        // each of which casts to a *value* that then prunes files. A stat of
+        // `today` on a date column would make pruning depend on the wall clock.
+        //
+        // `COLLATE "C"` so the pattern's character ranges are ASCII and nothing
+        // else, whatever the database's collation. Without it `[0-9]` is a
+        // locale-dependent range, and a locale that widened it would feed the
+        // `CAST` a digit its input function rejects.
+        let pattern = postgres_castable_pattern(target)?;
+        let shape = format!("({expr} COLLATE \"C\") ~ '{pattern}'");
+        let guard = if self.soft_input_validation {
+            // Shape proves the text is one this crate could have written;
+            // `pg_input_is_valid` proves the value is in range. Neither is
+            // redundant: the shape rejects `NaN` and `0x10`, which the input
+            // function reads, and the input function rejects an overflowing
+            // 300-digit numeric, which the shape admits.
+            format!("{shape} AND pg_input_is_valid({expr}, '{target}')")
+        } else {
+            shape
+        };
+        Some(format!(
+            "CASE WHEN {guard} THEN CAST({expr} AS {target}) END"
+        ))
+    }
+
+    /// PostgreSQL compares `text` in the database's collation, which for any
+    /// ICU or libc locale is neither byte-wise nor even a fixed order across
+    /// servers. DataFusion compares `Utf8` byte-wise, so a raw stat comparison
+    /// is forced into `C` — the one collation defined to be byte-wise.
+    fn collate_binary(&self, expr: &str) -> String {
+        format!("({expr} COLLATE \"C\")")
+    }
+
+    fn boolean_is_not_false(&self, expr: &str) -> String {
+        format!("{expr} IS NULL OR {expr} <> false")
+    }
+}
+
+/// The PostgreSQL type a statistic is cast to for comparison against a constant
+/// of `data_type`, or `None` when there is none that orders the constant's
+/// values the way this engine does.
+///
+/// Arrow's `Display` is not SQL, so the mapping is written out. Declining a type
+/// drops that one comparison, which costs pruning and never rows.
+///
+/// Every integer width and `DECIMAL` maps to `numeric` rather than to
+/// `smallint` / `integer` / `bigint`. `numeric` holds all of them exactly, it
+/// compares exactly against the integer or fixed-point literal on the other
+/// side, and it has no range a stat written by another engine could overflow —
+/// a narrower target would decline such a stat and lose the pruning, and the
+/// stats table is small enough that the arithmetic is not what this query
+/// costs. Floats map to `double precision` for the same reason: both sides are
+/// the shortest round-trip *text* of the value, so parsing them at higher
+/// precision than the column preserves both equality and order.
+///
+/// Absent types are ones [`crate::stats_encode::encode_scalar`] has no
+/// canonical text for (`TIME`, `INTERVAL`, `Decimal256`, `UUID`, blobs, nested
+/// types), so no literal of that type ever reaches here.
+pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Boolean => "boolean",
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Decimal128(_, _) => "numeric",
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => "double precision",
+        _ => return None,
+    })
+}
+
+/// A pattern that admits only text `CAST(... AS <target>)` is guaranteed to
+/// accept, for servers without `pg_input_is_valid`. `None` declines the type.
+///
+/// Each pattern is deliberately narrower than the type's input function. It
+/// admits exactly the shapes [`crate::stats_encode`] writes — and DuckDB with
+/// it — and rejects everything else, including forms PostgreSQL would in fact
+/// accept (`+5`, `nan`, hexadecimal `numeric`, leading whitespace). A rejected
+/// stat yields SQL `NULL` and the file is kept, so being strict costs pruning
+/// and nothing else, whereas being one case too loose aborts the query.
+///
+/// The digit-count bounds are what make that guarantee. 255 is also the largest
+/// repetition count PostgreSQL's regex engine accepts:
+///
+/// - `numeric`: at most 255 digits either side of the point, far short of the
+///   131072 at which `numeric` input overflows.
+/// - `double precision`: fixed-point is bounded to ±1e255 and, away from zero,
+///   1e-255, well inside the ±1.8e308 range and nowhere near underflow;
+///   scientific notation is bounded to a single leading digit and a two-digit
+///   exponent, so at most ~1e100. A magnitude beyond that is declined rather
+///   than risking the overflow error a plain `CAST` raises. `inf` and `-inf`
+///   are admitted because they are how a stored bound spells an infinity, and
+///   `float8` parses both on every server; no *constant* reaches here as one,
+///   since [`crate::stats_filter`] refuses a non-finite literal outright.
+///
+/// Temporal types have no pattern. `2020-02-31` matches every plausible date
+/// regex and `CAST`ing it raises, and no regular expression decides a calendar,
+/// so on these servers a date or timestamp comparison pushes down nothing.
+pub(crate) fn postgres_castable_pattern(target: &str) -> Option<&'static str> {
+    Some(match target {
+        "boolean" => r"^(true|false)$",
+        "numeric" => r"^-?[0-9]{1,255}(\.[0-9]{1,255})?$",
+        // `inf` is a value this crate writes and PostgreSQL orders correctly.
+        // `nan` is not: it parses, and comparing against it prunes a file whose
+        // other rows may well match.
+        "double precision" => {
+            r"^-?(inf|[0-9]{1,255}(\.[0-9]{1,255})?|[0-9](\.[0-9]{1,255})?e[-+][0-9]{1,2})$"
+        },
+        _ => return None,
+    })
+}
+
+/// The pattern gating a temporal stat compared as text, or `None` when this is
+/// not a temporal type or the constant is not canonically encoded.
+///
+/// Both sides have to be in the one encoding whose byte order is chronological.
+/// The constant is checked here in Rust; the returned pattern checks the stat in
+/// SQL. A fraction ending in `0` is refused on both sides: as text `.50` sorts
+/// above `.5` while naming the same instant.
+fn postgres_canonical_temporal_pattern(
+    data_type: &DataType,
+    constant: &str,
+) -> Option<&'static str> {
+    const DATE: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$";
+    const TIMESTAMP: &str =
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]*[1-9])?$";
+    const TIMESTAMPTZ: &str =
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]*[1-9])?[+]00$";
+
+    match data_type {
+        DataType::Date32 | DataType::Date64 if is_canonical_date(constant) => Some(DATE),
+        DataType::Timestamp(_, None) if is_canonical_timestamp(constant) => Some(TIMESTAMP),
+        DataType::Timestamp(_, Some(_)) if is_canonical_timestamptz(constant) => Some(TIMESTAMPTZ),
+        _ => None,
+    }
+}
+
+/// The three fragments that narrow a file listing by catalog statistics: the
+/// `WITH` prefix, the joins that bring each column's stats in, and the extra
+/// `WHERE` conjuncts. `None` when there is nothing to narrow by.
+pub(crate) struct StatsFilterSql {
+    pub(crate) with_prefix: String,
+    pub(crate) joins: String,
+    pub(crate) conditions: String,
+}
+
+/// Build the statistics fragments for `filters`, exactly as official DuckLake
+/// assembles them: one CTE per column selecting only the stats its condition
+/// reads, one `LEFT JOIN` on `data_file_id`, and the conditions ANDed onto the
+/// listing's existing `WHERE`.
+///
+/// Every literal is already inlined by [`crate::stats_filter`], so the listing
+/// query's bind placeholders are untouched and its `.bind()` chain does not move.
+pub(crate) fn stats_filter_sql(
+    table_id: i64,
+    filters: &[RenderedColumnFilter],
+) -> Option<StatsFilterSql> {
+    if filters.is_empty() {
+        return None;
+    }
+    let ctes = filters
+        .iter()
+        .map(|filter| {
+            format!(
+                "{alias} AS (
+                     SELECT data_file_id, {stats}
+                     FROM ducklake_file_column_stats
+                     WHERE column_id = {column_id} AND table_id = {table_id}
+                 )",
+                alias = filter.alias,
+                stats = filter.stats.join(", "),
+                column_id = filter.column_id,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n                 ");
+    let joins = filters
+        .iter()
+        .map(|filter| {
+            format!(
+                "\n                 LEFT JOIN {alias} ON {alias}.data_file_id = data.data_file_id",
+                alias = filter.alias
+            )
+        })
+        .collect::<String>();
+    // Each condition already carries its own fail-open guards — the no-stats-row
+    // `data_file_id IS NULL`, the per-stat `IS NULL` disjuncts, and
+    // `StatsSqlDialect::keep_when_unknown` for a comparison that lands on NULL
+    // because a present stat would not parse. They are spliced verbatim.
+    let conditions = filters
+        .iter()
+        .map(|filter| {
+            format!(
+                "\n                   AND {condition}",
+                condition = filter.condition
+            )
+        })
+        .collect::<String>();
+    Some(StatsFilterSql {
+        with_prefix: format!("WITH {ctes}\n                 "),
+        joins,
+        conditions,
+    })
 }
 
 /// PostgreSQL-based metadata provider for DuckLake catalogs.
@@ -239,7 +558,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -249,7 +568,8 @@ impl PostgresMetadataProvider {
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
-               to_regclass('ducklake_view') IS NOT NULL",
+               to_regclass('ducklake_view') IS NOT NULL,
+               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -260,11 +580,266 @@ impl PostgresMetadataProvider {
             data_file_partition_id: row.3,
             inlined_data_tables: row.4,
             views: row.5,
+            soft_input_validation: row.6,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
         }
         Ok(caps)
+    }
+
+    /// One page of the visible file listing, optionally narrowed inside SQL by
+    /// catalog statistics.
+    ///
+    /// Backs both [`MetadataProvider::get_table_file_metadata_page`] (`filter`
+    /// `None`) and [`MetadataProvider::get_table_file_metadata_page_filtered`],
+    /// so the paging contract is written once.
+    fn file_metadata_page(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
+        })?;
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
+                "data.partial_max::bigint"
+            } else {
+                "NULL::bigint"
+            };
+            let schema_version_expr = if caps.schema_versions {
+                "(SELECT sv.schema_version::bigint
+                  FROM ducklake_schema_versions sv
+                  WHERE sv.table_id = data.table_id
+                    AND sv.begin_snapshot <= data.begin_snapshot
+                  ORDER BY sv.begin_snapshot DESC LIMIT 1)"
+            } else {
+                "NULL::bigint"
+            };
+            let dialect = PostgresStatsDialect {
+                soft_input_validation: caps.soft_input_validation,
+            };
+            let rendered = filter.and_then(|filter| filter.render(&dialect));
+            let stats_sql = rendered
+                .as_deref()
+                .and_then(|filters| stats_filter_sql(table_id, filters));
+
+            // The statistics conditions go inside the query, ahead of the
+            // LIMIT, with the keyset ordering untouched. Filtering a page after
+            // fetching it would break the cursor `FileMetadataPages` drives: a
+            // page whose candidates all failed the filter would come back
+            // empty, which ends the iteration and hides every matching file
+            // beyond it.
+            let listing_sql = |stats_sql: Option<&StatsFilterSql>| {
+                let (with_prefix, joins, conditions) = stats_sql
+                    .map(|sql| {
+                        (
+                            sql.with_prefix.as_str(),
+                            sql.joins.as_str(),
+                            sql.conditions.as_str(),
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{with_prefix}SELECT data.data_file_id, data.path, data.path_is_relative,
+                        data.file_size_bytes, data.footer_size, data.encryption_key,
+                        data.row_id_start, data.record_count,
+                        del.delete_file_id, del.path, del.path_is_relative,
+                        del.file_size_bytes, del.footer_size, del.encryption_key,
+                        del.delete_count, data.begin_snapshot::bigint,
+                        {partial_max_expr}, {schema_version_expr},
+                        NULL::bigint AS data_partition_id,
+                        data.mapping_id::bigint
+                 FROM ducklake_data_file AS data
+                 LEFT JOIN ducklake_delete_file AS del
+                   ON data.data_file_id = del.data_file_id
+                  AND del.table_id = $1
+                  AND $2 >= del.begin_snapshot
+                  AND ($3 < del.end_snapshot OR del.end_snapshot IS NULL){joins}
+                 WHERE data.table_id = $4
+                   AND $5 >= data.begin_snapshot
+                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
+                   AND data.data_file_id > $7{conditions}
+                 ORDER BY data.data_file_id
+                 LIMIT $8"
+                )
+            };
+
+            let after = after_data_file_id.unwrap_or(i64::MIN);
+            let rows = match fetch_data_file_page(
+                &self.pool,
+                &listing_sql(stats_sql.as_ref()),
+                table_id,
+                snapshot_id,
+                after,
+                limit,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                // The filter is advisory, so a catalog the narrowed query
+                // cannot run — one predating `ducklake_file_column_stats`,
+                // where joining it is a hard error, or one whose stats provoke
+                // an error the dialect did not anticipate — still lists its
+                // files. Any error retries, not just the missing table: the
+                // narrowed query is the only thing this arm adds, and listing
+                // every live file is always correct. The retry uses the same
+                // parameters, and a failure that is not the filter's fault
+                // surfaces from it.
+                Err(error) if stats_sql.is_some() => {
+                    tracing::debug!(
+                        %error,
+                        table_id,
+                        "statistics-filtered file listing failed; listing every file"
+                    );
+                    fetch_data_file_page(
+                        &self.pool,
+                        &listing_sql(None),
+                        table_id,
+                        snapshot_id,
+                        after,
+                        limit,
+                    )
+                    .await?
+                },
+                Err(error) => return Err(error.into()),
+            };
+            let files = rows
+                .iter()
+                .map(|row| decode_table_file(row, snapshot_id))
+                .collect::<Result<Vec<_>>>()?;
+            let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
+                return Ok(Vec::new());
+            };
+            // A filtered page's ids are sparse within `(after, last]`, so the
+            // two enrichment queries below are restricted to the ids actually
+            // returned instead of to that whole range — otherwise a selective
+            // filter would read the per-column stats of every file it just
+            // pruned, which is the cost the filter exists to avoid.
+            //
+            // The ids are bound as one array parameter rather than spelled out
+            // in the SQL. Inlining a page's worth of them gives every page a
+            // distinct query string, and sqlx keys its per-connection
+            // prepared-statement cache on that string: each page would pay a
+            // Parse/Describe round trip and evict the other statements the
+            // connection had cached. The listing query's own `$1..$8` are fixed
+            // by `fetch_data_file_page` and untouched by this; the two
+            // enrichment queries number their parameters independently.
+            let page_ids: Option<Vec<i64>> = stats_sql
+                .as_ref()
+                .map(|_| files.iter().map(|file| file.data_file_id).collect());
+            let page_id_filter = |column: &str, parameter: usize| {
+                page_ids.as_ref().map_or_else(String::new, |_| {
+                    format!("\n                   AND {column} = ANY(${parameter}::bigint[])")
+                })
+            };
+            let statistics_sql = format!(
+                "SELECT stats.data_file_id, stats.column_id,
+                        stats.column_size_bytes, stats.value_count, stats.null_count,
+                        stats.min_value, stats.max_value, stats.contains_nan
+                 FROM ducklake_file_column_stats AS stats
+                 INNER JOIN ducklake_data_file AS data
+                   ON data.data_file_id = stats.data_file_id
+                  AND data.table_id = stats.table_id
+                 WHERE stats.table_id = $1
+                   AND $2 >= data.begin_snapshot
+                   AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)
+                   AND stats.data_file_id > $4
+                   AND stats.data_file_id <= $5{}
+                 ORDER BY stats.data_file_id, stats.column_id",
+                page_id_filter("stats.data_file_id", 6)
+            );
+            let mut statistics_query = sqlx::query(AssertSqlSafe(statistics_sql))
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(after_data_file_id.unwrap_or(i64::MIN))
+                .bind(last_data_file_id);
+            if let Some(ids) = page_ids.as_deref() {
+                statistics_query = statistics_query.bind(ids);
+            }
+            let statistics = match statistics_query.fetch_all(&self.pool).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeFileColumnStatistics {
+                            data_file_id: row.try_get(0)?,
+                            column_id: row.try_get(1)?,
+                            column_size_bytes: row.try_get(2)?,
+                            value_count: row.try_get(3)?,
+                            null_count: row.try_get(4)?,
+                            min_value: row.try_get(5)?,
+                            max_value: row.try_get(6)?,
+                            contains_nan: row.try_get(7)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
+            for statistic in statistics {
+                statistics_by_file
+                    .entry(statistic.data_file_id)
+                    .or_default()
+                    .push(statistic);
+            }
+
+            // Enrich with per-file partition values (for pruning), scoped to the
+            // page's data_file_id range. Missing partition table => no enrichment.
+            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+            let partition_values_sql = format!(
+                "SELECT data_file_id, partition_key_index, partition_value
+                 FROM ducklake_file_partition_value
+                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3{}",
+                page_id_filter("data_file_id", 4)
+            );
+            let mut partition_values_query = sqlx::query(AssertSqlSafe(partition_values_sql))
+                .bind(table_id)
+                .bind(after_data_file_id.unwrap_or(i64::MIN))
+                .bind(last_data_file_id);
+            if let Some(ids) = page_ids.as_deref() {
+                partition_values_query = partition_values_query.bind(ids);
+            }
+            match partition_values_query.fetch_all(&self.pool).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let data_file_id: i64 = row.try_get(0)?;
+                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let value: Option<String> = row.try_get(2)?;
+                        values_by_file
+                            .entry(data_file_id)
+                            .or_default()
+                            .push((key_index, value));
+                    }
+                },
+                Err(error) if is_missing_statistics_table(&error) => {},
+                Err(error) => return Err(error.into()),
+            }
+
+            Ok(files
+                .into_iter()
+                .map(|mut file| {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                    DuckLakeFileMetadata {
+                        column_statistics: statistics_by_file
+                            .remove(&file.data_file_id)
+                            .unwrap_or_default(),
+                        file,
+                    }
+                })
+                .collect())
+        })
     }
 }
 
@@ -717,162 +1292,18 @@ impl MetadataProvider for PostgresMetadataProvider {
         after_data_file_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<DuckLakeFileMetadata>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let limit = i64::try_from(limit).map_err(|_| {
-            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
-        })?;
-        block_on(async {
-            let caps = self.schema_capabilities().await?;
-            let partial_max_expr = if caps.data_file_partial_max {
-                "data.partial_max::bigint"
-            } else {
-                "NULL::bigint"
-            };
-            let schema_version_expr = if caps.schema_versions {
-                "(SELECT sv.schema_version::bigint
-                  FROM ducklake_schema_versions sv
-                  WHERE sv.table_id = data.table_id
-                    AND sv.begin_snapshot <= data.begin_snapshot
-                  ORDER BY sv.begin_snapshot DESC LIMIT 1)"
-            } else {
-                "NULL::bigint"
-            };
-            let sql = format!(
-                "SELECT data.data_file_id, data.path, data.path_is_relative,
-                        data.file_size_bytes, data.footer_size, data.encryption_key,
-                        data.row_id_start, data.record_count,
-                        del.delete_file_id, del.path, del.path_is_relative,
-                        del.file_size_bytes, del.footer_size, del.encryption_key,
-                        del.delete_count, data.begin_snapshot::bigint,
-                        {partial_max_expr}, {schema_version_expr},
-                        NULL::bigint AS data_partition_id,
-                        data.mapping_id::bigint
-                 FROM ducklake_data_file AS data
-                 LEFT JOIN ducklake_delete_file AS del
-                   ON data.data_file_id = del.data_file_id
-                  AND del.table_id = $1
-                  AND $2 >= del.begin_snapshot
-                  AND ($3 < del.end_snapshot OR del.end_snapshot IS NULL)
-                 WHERE data.table_id = $4
-                   AND $5 >= data.begin_snapshot
-                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND data.data_file_id > $7
-                 ORDER BY data.data_file_id
-                 LIMIT $8"
-            );
-            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(after_data_file_id.unwrap_or(i64::MIN))
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
-            let files = rows
-                .iter()
-                .map(|row| decode_table_file(row, snapshot_id))
-                .collect::<Result<Vec<_>>>()?;
-            let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
-                return Ok(Vec::new());
-            };
-            let statistics = match sqlx::query(
-                "SELECT stats.data_file_id, stats.column_id,
-                        stats.column_size_bytes, stats.value_count, stats.null_count,
-                        stats.min_value, stats.max_value, stats.contains_nan
-                 FROM ducklake_file_column_stats AS stats
-                 INNER JOIN ducklake_data_file AS data
-                   ON data.data_file_id = stats.data_file_id
-                  AND data.table_id = stats.table_id
-                 WHERE stats.table_id = $1
-                   AND $2 >= data.begin_snapshot
-                   AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND stats.data_file_id > $4
-                   AND stats.data_file_id <= $5
-                 ORDER BY stats.data_file_id, stats.column_id",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(last_data_file_id)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| {
-                        Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.try_get(0)?,
-                            column_id: row.try_get(1)?,
-                            column_size_bytes: row.try_get(2)?,
-                            value_count: row.try_get(3)?,
-                            null_count: row.try_get(4)?,
-                            min_value: row.try_get(5)?,
-                            max_value: row.try_get(6)?,
-                            contains_nan: row.try_get(7)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
-            let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
-            for statistic in statistics {
-                statistics_by_file
-                    .entry(statistic.data_file_id)
-                    .or_default()
-                    .push(statistic);
-            }
+        self.file_metadata_page(table_id, snapshot_id, after_data_file_id, limit, None)
+    }
 
-            // Enrich with per-file partition values (for pruning), scoped to the
-            // page's data_file_id range. Missing partition table => no enrichment.
-            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-            match sqlx::query(
-                "SELECT data_file_id, partition_key_index, partition_value
-                 FROM ducklake_file_partition_value
-                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3",
-            )
-            .bind(table_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(last_data_file_id)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => {
-                    for row in rows {
-                        let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                        let value: Option<String> = row.try_get(2)?;
-                        values_by_file
-                            .entry(data_file_id)
-                            .or_default()
-                            .push((key_index, value));
-                    }
-                },
-                Err(error) if is_missing_statistics_table(&error) => {},
-                Err(error) => return Err(error.into()),
-            }
-
-            Ok(files
-                .into_iter()
-                .map(|mut file| {
-                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
-                        file.partition_values = values;
-                    }
-                    DuckLakeFileMetadata {
-                        column_statistics: statistics_by_file
-                            .remove(&file.data_file_id)
-                            .unwrap_or_default(),
-                        file,
-                    }
-                })
-                .collect())
-        })
+    fn get_table_file_metadata_page_filtered(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        self.file_metadata_page(table_id, snapshot_id, after_data_file_id, limit, filter)
     }
 
     fn get_table_summary_statistics(
@@ -1750,5 +2181,297 @@ WHERE data.table_id = $1
                 })
                 .collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
+
+    use super::{PostgresStatsDialect, StatsFilterSql, stats_filter_sql};
+    use crate::metadata_provider::DuckLakeTableColumn;
+    use crate::stats_filter::lower_predicate;
+
+    fn column(name: &str, data_type: DataType, column_id: i64) -> (Field, DuckLakeTableColumn) {
+        (
+            Field::new(name, data_type, true),
+            DuckLakeTableColumn {
+                column_id,
+                column_name: name.to_string(),
+                column_type: "int32".to_string(),
+                is_nullable: true,
+                data_type: None,
+                nested_column_ids: Vec::new(),
+                initial_default: None,
+                default_value: None,
+                default_value_type: None,
+                default_value_dialect: None,
+            },
+        )
+    }
+
+    /// Lower `predicate` over one column and splice it, or `None` when nothing
+    /// pushes down for this server.
+    fn splice(
+        predicate: Arc<dyn PhysicalExpr>,
+        field: (Field, DuckLakeTableColumn),
+        table_id: i64,
+        soft_input_validation: bool,
+    ) -> Option<StatsFilterSql> {
+        let schema = Schema::new(vec![field.0]);
+        let rendered = lower_predicate(&predicate, &schema, &[field.1])
+            .expect("predicate lowers")
+            .render(&PostgresStatsDialect {
+                soft_input_validation,
+            })?;
+        stats_filter_sql(table_id, &rendered)
+    }
+
+    fn int_range_predicate() -> Arc<dyn PhysicalExpr> {
+        // a > 5 AND a < 10
+        let a = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(Arc::clone(&a), Operator::Gt, lit(5i32))),
+            Operator::And,
+            Arc::new(BinaryExpr::new(a, Operator::Lt, lit(10i32))),
+        ))
+    }
+
+    /// The shape official assembles — one CTE selecting only the stats the
+    /// condition reads, one LEFT JOIN, the condition ANDed onto the existing
+    /// WHERE — with `pg_input_is_valid` standing in for `TRY_CAST`.
+    #[test]
+    fn two_conjunct_integer_filter_renders_the_official_shape() {
+        let spliced = splice(
+            int_range_predicate(),
+            column("a", DataType::Int32, 7),
+            3,
+            true,
+        )
+        .expect("filter splices");
+        assert_eq!(
+            spliced.with_prefix,
+            "WITH col_7_stats AS (
+                     SELECT data_file_id, min_value, max_value, value_count
+                     FROM ducklake_file_column_stats
+                     WHERE column_id = 7 AND table_id = 3
+                 )
+                 "
+        );
+        assert_eq!(
+            spliced.joins,
+            "\n                 LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id"
+        );
+        assert_eq!(
+            spliced.conditions,
+            "\n                   AND ((col_7_stats.data_file_id IS NULL OR \
+             ((col_7_stats.value_count IS NULL OR col_7_stats.value_count > 0) AND \
+             (col_7_stats.min_value IS NULL OR col_7_stats.max_value IS NULL OR \
+             (CASE WHEN (col_7_stats.max_value COLLATE \"C\") ~ \
+             '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' AND \
+             pg_input_is_valid(col_7_stats.max_value, 'numeric') \
+             THEN CAST(col_7_stats.max_value AS numeric) END > 5) AND \
+             (CASE WHEN (col_7_stats.min_value COLLATE \"C\") ~ \
+             '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' AND \
+             pg_input_is_valid(col_7_stats.min_value, 'numeric') \
+             THEN CAST(col_7_stats.min_value AS numeric) END < 10))))) IS NOT FALSE"
+        );
+    }
+
+    /// A server without `pg_input_is_valid` validates by pattern instead, and
+    /// still pushes the same comparison down.
+    #[test]
+    fn integer_filter_falls_back_to_a_pattern_before_postgresql_16() {
+        let spliced = splice(
+            int_range_predicate(),
+            column("a", DataType::Int32, 7),
+            3,
+            false,
+        )
+        .expect("filter splices");
+        assert!(
+            spliced.conditions.contains(
+                "CASE WHEN (col_7_stats.max_value COLLATE \"C\") ~ \
+                 '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' \
+                 THEN CAST(col_7_stats.max_value AS numeric) END > 5"
+            ),
+            "unexpected condition:\n{}",
+            spliced.conditions
+        );
+        assert!(!spliced.conditions.contains("pg_input_is_valid"));
+    }
+
+    /// Soft validation never stands alone: the stat's shape is required too.
+    ///
+    /// `pg_input_is_valid` answers "can the input function read this", and that
+    /// function is permissive by design — it accepts `today`, `now`, `epoch` and
+    /// `infinity` for a date, `NaN` for a numeric, and `nan` for a float. Each
+    /// casts to a *value* that then prunes files, and a stat of `today` would
+    /// make pruning depend on the wall clock. So a shape pattern gates every
+    /// comparison on every server version, and soft validation only adds the
+    /// calendar check on top.
+    #[test]
+    fn soft_validation_still_requires_the_stat_shape() {
+        let float_filter = |soft| {
+            let f = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+            let predicate =
+                Arc::new(BinaryExpr::new(f, Operator::Eq, lit(5.0f64))) as Arc<dyn PhysicalExpr>;
+            splice(predicate, column("a", DataType::Float64, 2), 3, soft)
+                .expect("a float equality pushes down")
+                .conditions
+        };
+
+        for soft in [false, true] {
+            let sql = float_filter(soft);
+            // The shape pattern is present whether or not the server can soft-validate.
+            assert!(
+                sql.contains("COLLATE \"C\") ~ '^-?(inf|"),
+                "no shape gate (soft_input_validation = {soft}): {sql}"
+            );
+            // `inf` is admitted, `nan` is not: `nan` parses on PostgreSQL 16 and
+            // comparing against it prunes a file whose other rows can match.
+            assert!(!sql.contains("nan"), "nan admitted: {sql}");
+        }
+    }
+
+    /// A temporal comparison happens in the text domain, on every server
+    /// version and at every precision.
+    ///
+    /// This is where PostgreSQL stops needing `pg_input_is_valid`: nothing is
+    /// parsed, so no calendar has to be decided and no fraction is rounded away.
+    /// Both are real gains — a pre-16 server pruned nothing at all on a date
+    /// column, and a nanosecond column pruned nothing on any version because
+    /// `timestamp` holds microseconds and rounds.
+    #[test]
+    fn temporal_is_compared_as_text_on_every_server_version() {
+        let render = |value: ScalarValue, data_type: DataType, soft| {
+            let t = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+            let predicate =
+                Arc::new(BinaryExpr::new(t, Operator::Lt, lit(value))) as Arc<dyn PhysicalExpr>;
+            splice(predicate, column("a", data_type, 2), 3, soft).map(|sql| sql.conditions)
+        };
+
+        for soft in [false, true] {
+            let date = render(ScalarValue::Date32(Some(19_723)), DataType::Date32, soft)
+                .expect("a date pushes down");
+            assert!(
+                date.contains(
+                    "(col_2_stats.min_value COLLATE \"C\") ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'"
+                ),
+                "date not compared as text (soft = {soft}): {date}"
+            );
+            // No cast, and therefore no dependence on the input function.
+            assert!(!date.contains("CAST("), "date was cast: {date}");
+            assert!(!date.contains("pg_input_is_valid"), "date parsed: {date}");
+
+            // Nanosecond precision, which a microsecond cast could not order.
+            let nanos = render(
+                ScalarValue::TimestampNanosecond(Some(1_577_836_800_123_456_700), None),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                soft,
+            )
+            .expect("a nanosecond timestamp pushes down");
+            assert!(nanos.contains("'2020-01-01 00:00:00.1234567'"), "{nanos}");
+            assert!(!nanos.contains("CAST("), "nanosecond was cast: {nanos}");
+
+            // Zoned, carrying the `+00` suffix on both sides.
+            let zoned = render(
+                ScalarValue::TimestampMicrosecond(
+                    Some(1_577_836_800_000_000),
+                    Some("+00:00".into()),
+                ),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                soft,
+            )
+            .expect("a zoned timestamp pushes down");
+            assert!(zoned.contains("[+]00$"), "{zoned}");
+        }
+    }
+
+    /// An encoding whose bytes do not order chronologically is declined.
+    ///
+    /// Text comparison is only sound for the one shape `stats_encode` writes.
+    /// `chrono` renders a year past 9999 as `+12345` and one before the common
+    /// era as `-0044`, and both sort below every digit; `.50` sorts above `.5`
+    /// while naming the same instant; and `12:00:00+01` sorts above
+    /// `12:00:00+00` while being earlier.
+    #[test]
+    fn temporal_declines_encodings_that_do_not_order_as_text() {
+        let declines = |value: ScalarValue, data_type: DataType| {
+            let t = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+            let predicate =
+                Arc::new(BinaryExpr::new(t, Operator::Lt, lit(value))) as Arc<dyn PhysicalExpr>;
+            splice(predicate, column("a", data_type, 2), 3, true).is_none()
+        };
+
+        // 4_000_000 days after the epoch renders `+12921-08-18`; -800_000 gives
+        // `-0221-09-04`.
+        assert!(declines(
+            ScalarValue::Date32(Some(4_000_000)),
+            DataType::Date32
+        ));
+        assert!(declines(
+            ScalarValue::Date32(Some(-800_000)),
+            DataType::Date32
+        ));
+
+        // Year zero orders fine as text, so unlike the cast path this admits it.
+        assert!(!declines(
+            ScalarValue::Date32(Some(-719_528)),
+            DataType::Date32
+        ));
+
+        // A constant at another offset cannot be built: `encode_scalar`
+        // normalizes to UTC and appends `+00` whatever the zone says. The
+        // offset guard therefore protects the stat side, where a foreign
+        // catalog may hold `+01` — and that is the emitted pattern's job, which
+        // `temporal_is_compared_as_text_on_every_server_version` pins.
+
+        // The stat side is pinned by the emitted pattern, which admits no
+        // fraction ending in `0`.
+        let t = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            t,
+            Operator::Lt,
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(1_577_836_800_500_000),
+                None,
+            )),
+        )) as Arc<dyn PhysicalExpr>;
+        let sql = splice(
+            predicate,
+            column("a", DataType::Timestamp(TimeUnit::Microsecond, None), 2),
+            3,
+            true,
+        )
+        .expect("a canonical timestamp pushes down")
+        .conditions;
+        assert!(sql.contains("([.][0-9]*[1-9])?$"), "{sql}");
+    }
+
+    /// A string bound is compared raw, forced to the one collation PostgreSQL
+    /// defines as byte-wise so it agrees with DataFusion's `Utf8` ordering.
+    #[test]
+    fn string_bounds_are_compared_under_the_c_collation() {
+        let s = Arc::new(Column::new("s", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(s, Operator::Eq, lit("abc"))) as Arc<dyn PhysicalExpr>;
+        let spliced =
+            splice(predicate, column("s", DataType::Utf8, 1), 3, true).expect("filter splices");
+        assert!(
+            spliced.conditions.contains(
+                "'abc' BETWEEN (col_1_stats.min_value COLLATE \"C\") \
+                 AND (col_1_stats.max_value COLLATE \"C\")"
+            ),
+            "unexpected condition:\n{}",
+            spliced.conditions
+        );
+        assert!(!spliced.conditions.contains("CAST"));
     }
 }

@@ -522,6 +522,72 @@ fn encode_timestamp(value: i64, units_per_second: i64, timezone: bool) -> Option
     Some(encoded)
 }
 
+/// Whether `text` matches `shape`, where `N` stands for any ASCII digit and
+/// every other byte must match exactly.
+fn matches_shape(text: &str, shape: &str) -> bool {
+    text.len() == shape.len()
+        && text
+            .bytes()
+            .zip(shape.bytes())
+            .all(|(actual, expected)| match expected {
+                b'N' => actual.is_ascii_digit(),
+                _ => actual == expected,
+            })
+}
+
+/// Whether `text` is a date exactly as [`encode_scalar`] writes one.
+///
+/// `YYYY-MM-DD`, fixed width, so byte order is chronological order. A dialect
+/// with no date type can compare two of these as text; one that casts still
+/// wants the check, because a cast is only as good as what it is given.
+///
+/// The width is what matters, not the calendar. `chrono` renders a year past
+/// 9999 as `+12345` and one before the common era as `-0044`, and both `+` and
+/// `-` sort below every digit — so admitting either would invert a comparison
+/// against an ordinary date.
+pub fn is_canonical_date(text: &str) -> bool {
+    matches_shape(text, "NNNN-NN-NN")
+}
+
+/// Whether `text` is a naive timestamp exactly as [`encode_scalar`] writes one.
+///
+/// `YYYY-MM-DD HH:MM:SS` with an optional fraction. The time unit does not
+/// matter — only the written shape does. A shorter string is a prefix of a
+/// longer one and so sorts below it, which is correct: no fraction is a zero
+/// fraction.
+///
+/// A fraction ending in `0` is refused. `encode_scalar` trims trailing zeros, so
+/// `.5` and `.50` cannot both be written for the same instant — but a foreign
+/// writer might emit `.50`, and as text that sorts *above* `.5` while naming an
+/// earlier-or-equal instant.
+pub fn is_canonical_timestamp(text: &str) -> bool {
+    let Some((base, fraction)) = text.split_at_checked(19) else {
+        return false;
+    };
+    if !matches_shape(base, "NNNN-NN-NN NN:NN:NN") {
+        return false;
+    }
+    match fraction.strip_prefix('.') {
+        None => fraction.is_empty(),
+        Some(digits) => {
+            !digits.is_empty()
+                && digits.bytes().all(|digit| digit.is_ascii_digit())
+                && !digits.ends_with('0')
+        },
+    }
+}
+
+/// Whether `text` is a zoned timestamp exactly as [`encode_scalar`] writes one.
+///
+/// [`is_canonical_timestamp`] plus the `+00` suffix `encode_scalar` appends
+/// after normalizing to UTC. The suffix is constant across everything this
+/// admits, so it does not disturb the ordering; a value at another offset is
+/// refused rather than compared, since `12:00:00+01` sorts above `12:00:00+00`
+/// and names an earlier instant.
+pub fn is_canonical_timestamptz(text: &str) -> bool {
+    text.strip_suffix("+00").is_some_and(is_canonical_timestamp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

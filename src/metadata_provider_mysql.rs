@@ -14,7 +14,9 @@ use crate::metadata_provider::{
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
-use arrow::datatypes::SchemaRef;
+use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
+use crate::stats_filter::{StatsFilter, StatsLiteral, StatsSqlDialect};
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
@@ -32,6 +34,331 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
 
 fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
+}
+
+/// MySQL spelling of the statistics comparisons in [`crate::stats_filter`].
+///
+/// Two engine facts shape everything here.
+///
+/// MySQL has no `TRY_CAST`, and `CAST` to a number does not fail: `CAST('abc' AS
+/// DOUBLE)` and `CAST('abc' AS DECIMAL)` are `0` with a warning, so casting a
+/// malformed bound unconditionally would compare it as zero and could prune a
+/// file that matches. Every numeric cast below is therefore gated on a `REGEXP`
+/// that the text really is a number of that shape, and yields SQL `NULL`
+/// otherwise; [`StatsSqlDialect::keep_when_unknown`] turns that `NULL` back into
+/// "keep the file". The temporal casts need no gate — MySQL already returns
+/// `NULL` for a datetime it cannot parse.
+///
+/// MySQL's default collation is `utf8mb4_0900_ai_ci`, which is case- *and*
+/// accent-insensitive: with it, `'Apple' = 'apple'` and `'cafe' = 'café'` are
+/// both true. DataFusion compares `Utf8` byte-wise, so a raw string bound
+/// compared under that collation can place a value inside a range the engine
+/// puts outside it, and drop a file that matches. [`Self::collate_binary`]
+/// forces byte-wise comparison on every uncast string comparison.
+struct MySqlStatsDialect;
+
+impl StatsSqlDialect for MySqlStatsDialect {
+    /// A type not listed here is declined, which drops the comparison and
+    /// prunes nothing: `TIMESTAMP` in nanoseconds, because `DATETIME` holds
+    /// microseconds and MySQL *rounds* the extra digits (`.123456789` becomes
+    /// `.123457`), which can move a bound outward past the constant; a
+    /// timezone-bearing `TIMESTAMP`, because `stats_encode` writes it with a
+    /// `+00` suffix that MySQL's datetime parser rejects; and `DECIMAL` with a
+    /// scale past 30, MySQL's maximum.
+    ///
+    /// A temporal constant is inspected as well as its type. MySQL converts the
+    /// constant to the stat's type to compare them, and one it cannot convert is
+    /// an *error* — `CAST('2024-01-01' AS DATE) <= '12345-01-01'` raises 1525 —
+    /// not a NULL. That would cost the whole listing its filter (the unfiltered
+    /// retry catches it), so a constant outside the canonical four-digit-year
+    /// encoding is declined here instead.
+    fn try_cast(&self, expr: &str, literal: &StatsLiteral, data_type: &DataType) -> Option<String> {
+        match data_type {
+            // Every integer bound is read as DECIMAL(65, 0) rather than SIGNED:
+            // `CAST(... AS SIGNED)` saturates at `i64::MAX`, which would read a
+            // `u64` bound above it as a smaller number, while DECIMAL(65, 0)
+            // holds the whole unsigned range exactly and compares exactly
+            // against the constant. The 20-digit cap is what keeps a longer
+            // string from saturating DECIMAL(65, 0) in turn.
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => Some(mysql_guarded_cast(
+                expr,
+                "^-?[0-9]{1,20}$",
+                "DECIMAL(65, 0)",
+            )),
+            // `stats_encode` writes a finite double as its shortest round-trip
+            // decimal, in fixed or exponent form, so parsing it back as DOUBLE
+            // recovers the exact value the writer had. The pattern also rejects
+            // the `inf` / `-inf` bounds the encoder writes for infinities, which
+            // MySQL would otherwise read as `0`.
+            //
+            // Both digit runs are bounded, and that bound is load-bearing. A
+            // magnitude MySQL cannot represent does not fail the cast — it
+            // *saturates*, silently: on 8.x `CAST('1e+400' AS DOUBLE)` is
+            // `1.7976931348623157e308`, `CAST('1e-400' AS DOUBLE)` is `0`, and
+            // 400 nines is DBL_MAX again. Saturation moves a bound inward or
+            // outward without a warning the guard can see, which is the
+            // "coerces it to a number" failure this dialect exists to prevent.
+            // The bounds mirror the PostgreSQL dialect's: fixed point to ±1e255,
+            // and scientific to one leading digit with a two-digit exponent, so
+            // roughly 1e100 — both far inside the ±1.8e308 a DOUBLE holds, and
+            // far outside anything a real bound of a float column is. A larger
+            // magnitude is declined rather than read, which costs pruning only.
+            DataType::Float32 | DataType::Float64 => Some(mysql_guarded_cast(
+                expr,
+                "^-?([0-9]{1,255}([.][0-9]{1,255})?|[0-9]([.][0-9]{1,255})?e[-+][0-9]{1,2})$",
+                "DOUBLE",
+            )),
+            DataType::Decimal128(precision, scale) => {
+                let scale = usize::try_from(*scale).ok().filter(|scale| *scale <= 30)?;
+                // A DECIMAL(p, s) value has at most p - s integer digits, and
+                // `encode_decimal128` always writes at least one ("0.5"). More
+                // than that is not a value of the constant's type, and more
+                // fractional digits than the scale would be *rounded* by the
+                // cast, which can move a bound past the constant.
+                let integer_digits = usize::from(*precision).saturating_sub(scale).max(1);
+                let pattern = if scale == 0 {
+                    format!("^-?[0-9]{{1,{integer_digits}}}$")
+                } else {
+                    format!("^-?[0-9]{{1,{integer_digits}}}([.][0-9]{{1,{scale}}})?$")
+                };
+                Some(mysql_guarded_cast(
+                    expr,
+                    &pattern,
+                    &format!("DECIMAL(65, {scale})"),
+                ))
+            },
+            // Shape first, then the cast — both are load-bearing, and neither
+            // covers the other. MySQL's `DATE` parser is lenient in a way that
+            // turns a stat no writer of ours produces into a definite bound:
+            // `' 2020-01-01 '`, `2020/01/01`, `20200101`, `2020.01.01` and
+            // `2020-1-1` all convert to 2020-01-01, so a catalog carrying one
+            // would prune on a bound this crate never wrote. The shape test
+            // refuses them. The cast then refuses what a shape cannot judge —
+            // `2020-02-31` is `NNNN-NN-NN` and no calendar has it, and MySQL
+            // reads it as NULL.
+            //
+            // The constant is checked in Rust for the same reason it is
+            // everywhere else: one outside MySQL's year range makes the
+            // comparison's implicit conversion an *error* rather than a NULL,
+            // and only the unfiltered retry in
+            // `get_table_file_metadata_page_filtered` would keep that from
+            // failing the listing.
+            DataType::Date32 if is_canonical_date(literal.text()) => {
+                let guarded = self.collate_binary(expr);
+                Some(format!(
+                    "CAST(CASE WHEN {} THEN {guarded} END AS DATE)",
+                    mysql_matches_whole(&guarded, MYSQL_CANONICAL_DATE)
+                ))
+            },
+            // Every timestamp is compared as text rather than cast, at every
+            // precision. `DATETIME(6)` holds microseconds and *rounds* a longer
+            // fraction, which is monotonic but not injective: two distinct
+            // nanosecond instants can land on one microsecond, so a strict
+            // comparison that holds of the stored values comes back false.
+            // Guarding only the constant does not help, because it is the
+            // *stat* that gets rounded — `CAST('…00.1234566' AS DATETIME(6))`
+            // is `…123457`, which is not less than `…123457`.
+            //
+            // The canonical encoding is chronologically ordered byte-wise, so
+            // comparing the two strings answers the same question exactly and
+            // at full precision. Byte-collated so the server's case-insensitive
+            // default cannot equate two different instants.
+            DataType::Timestamp(_, None) if is_canonical_timestamp(literal.text()) => {
+                let text = self.collate_binary(expr);
+                Some(mysql_guarded_text(&text, MYSQL_CANONICAL_TIMESTAMP))
+            },
+            // The same, plus the `+00` suffix `stats_encode` appends after
+            // normalizing to UTC. No temporal type parses it — `CAST('… +00' AS
+            // DATETIME)` is NULL — and it is constant across everything the
+            // guard admits, so it does not disturb the ordering.
+            DataType::Timestamp(_, Some(_)) if is_canonical_timestamptz(literal.text()) => {
+                let text = self.collate_binary(expr);
+                Some(mysql_guarded_text(&text, MYSQL_CANONICAL_TIMESTAMPTZ))
+            },
+            // A boolean bound is the text `true` / `false` and the constant is
+            // rendered quoted, so comparing them as text is well-defined and
+            // correctly ordered ('false' < 'true'). The guard is applied to the
+            // binary-collated form so that a catalog holding some other
+            // spelling — `TRUE`, which the default collation would accept here —
+            // is declined rather than mis-compared.
+            DataType::Boolean => {
+                let text = self.collate_binary(expr);
+                Some(format!(
+                    "CASE WHEN {text} IN ('true', 'false') THEN {text} END"
+                ))
+            },
+            _ => None,
+        }
+    }
+
+    /// `utf8mb4_0900_bin`, not `utf8mb4_bin`: the latter is a PAD SPACE
+    /// collation, so it compares `'a'` and `'a '` as equal and orders neither
+    /// below the other. DataFusion compares `Utf8` byte-wise, where `'a'` is
+    /// less than `'a '` — so under the padded collation a file whose bound is
+    /// `'a'` is pruned from `WHERE s < 'a '` though it holds a matching row.
+    /// `utf8mb4_0900_bin` is NO PAD and byte-wise. A server without it raises,
+    /// and the unfiltered retry lists every file rather than pruning wrongly.
+    ///
+    /// `CONVERT ... USING utf8mb4` before the collation, not a bare
+    /// `COLLATE`: naming a collation from another character set is
+    /// error 1253, which would fail the whole listing query on a catalog whose
+    /// `min_value` / `max_value` are, say, `latin1`. Transcoding first also
+    /// makes the comparison byte-wise over *UTF-8* bytes, which is the order
+    /// DataFusion compares `Utf8` in.
+    fn collate_binary(&self, expr: &str) -> String {
+        format!("CONVERT({expr} USING utf8mb4) COLLATE utf8mb4_0900_bin")
+    }
+
+    /// `contains_nan` is a `BOOLEAN` column, which MySQL stores as `TINYINT(1)`,
+    /// so the `FALSE` keyword compares against it correctly.
+    fn boolean_is_not_false(&self, expr: &str) -> String {
+        format!("{expr} IS NULL OR {expr} <> FALSE")
+    }
+
+    /// MySQL gives `\` a second meaning inside a quoted string: unless the
+    /// server's `sql_mode` carries `NO_BACKSLASH_ESCAPES` it opens an escape
+    /// sequence. `stats_encode` passes `Utf8` through verbatim, so a value
+    /// holding a backslash reaches this text, and the standard rendering of a
+    /// constant `a\` is `'a\'` — whose closing quote the server reads as
+    /// escaped, taking the rest of the statement with it (error 1064).
+    ///
+    /// Doubling the backslash repairs that under the default mode only. Under
+    /// `NO_BACKSLASH_ESCAPES`, which the `ORACLE` mode sets, `'a\\'` is the
+    /// two-character string `a\\`; comparing it against a file whose bounds are
+    /// both `a\` is false, and the file is pruned though it matches. That is the
+    /// one outcome this module never accepts, so backslash-bearing text is
+    /// rendered as a hexadecimal literal instead, which has a single meaning in
+    /// both modes. The `_utf8mb4` introducer keeps it a character string rather
+    /// than a binary one; the explicit `COLLATE` on the stat side of every raw
+    /// string comparison has the stronger coercibility and still decides the
+    /// collation.
+    ///
+    /// Text with no backslash — every temporal and boolean constant, and nearly
+    /// every string one — takes the ordinary quoted form, quotes doubled.
+    fn quote_literal(&self, text: &str) -> String {
+        if !text.contains('\\') {
+            return format!("'{}'", text.replace('\'', "''"));
+        }
+        let hex: String = text.bytes().map(|byte| format!("{byte:02X}")).collect();
+        format!("_utf8mb4 X'{hex}'")
+    }
+}
+
+/// The date shape [`crate::stats_encode`] writes, as a MySQL regular expression
+/// — unanchored at the end; see [`mysql_matches_whole`].
+const MYSQL_CANONICAL_DATE: &str = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}";
+
+/// The naive timestamp shape [`crate::stats_encode`] writes, as a MySQL regular
+/// expression — deliberately *unanchored at the end*; see
+/// [`mysql_matches_whole`].
+///
+/// A fraction must not end in `0`: as text `.50` sorts above `.5` while naming
+/// the same instant, so admitting both would misorder them.
+const MYSQL_CANONICAL_TIMESTAMP: &str =
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]*[1-9])?";
+
+/// The same, plus the `+00` suffix. Another offset is refused rather than
+/// compared: `12:00:00+01` sorts above `12:00:00+00` and names an earlier
+/// instant.
+const MYSQL_CANONICAL_TIMESTAMPTZ: &str =
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]*[1-9])?[+]00";
+
+/// A collated stat, or SQL `NULL` when it is not the encoding this comparison
+/// expects.
+fn mysql_guarded_text(collated: &str, pattern: &str) -> String {
+    format!(
+        "CASE WHEN {} THEN {collated} END",
+        mysql_matches_whole(collated, pattern)
+    )
+}
+
+/// Whether `expr` matches `pattern` over its *whole* value.
+///
+/// `$` will not do it. MySQL 8's `REGEXP` is ICU, where `$` matches before a
+/// final line terminator, so a pattern ending in `$` also admits a stat with a
+/// trailing newline, carriage return, U+0085, U+2028 or U+2029. That is not
+/// cosmetic: U+2028's UTF-8 lead byte is `0xE2` and U+0085's is `0xC2`, both of
+/// which sort *above* `.` (0x2E), so such a stat compares as though it were
+/// later than any fractional timestamp and a file holding matching rows is
+/// pruned.
+///
+/// `\z` is the usual answer and is unusable here — under `NO_BACKSLASH_ESCAPES`
+/// the server reads the pattern literally, `\z` matches nothing, and every
+/// temporal comparison would silently stop pruning. Comparing the value against
+/// its own leading match needs no escape and means the same thing in both modes.
+fn mysql_matches_whole(expr: &str, pattern: &str) -> String {
+    format!("{expr} = REGEXP_SUBSTR({expr}, '{pattern}')")
+}
+
+/// `CAST(<expr> AS <sql_type>)` for text matching `pattern`, SQL `NULL`
+/// otherwise.
+///
+/// `pattern` is a MySQL regular expression anchored at both ends. It is written
+/// with `[.]` rather than `\.` deliberately: a backslash in MySQL's `REGEXP`
+/// argument is a string escape as well as a regex one, and doubling it once more
+/// through `format!` is a well-known way to end up matching any character.
+fn mysql_guarded_cast(expr: &str, pattern: &str, sql_type: &str) -> String {
+    format!("CASE WHEN {expr} REGEXP '{pattern}' THEN CAST({expr} AS {sql_type}) END")
+}
+
+/// The SQL a lowered statistics filter contributes to the file-listing query.
+struct StatsFilterSql {
+    /// `WITH col_<id>_stats AS (...), ...`, newline-terminated so it can be
+    /// prefixed straight onto the `SELECT`.
+    cte: String,
+    /// One `LEFT JOIN` per column CTE.
+    joins: String,
+    /// The rendered per-column conditions, each already prefixed with `AND`.
+    conditions: String,
+}
+
+/// Render `filter` for MySQL, or `None` when it contributes nothing.
+///
+/// Adds no bind parameters: [`crate::stats_filter`] inlines every literal, and
+/// the only other values spliced in are `i64`s this process computed. The
+/// caller's parameter list and its order are therefore untouched.
+fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<StatsFilterSql> {
+    let rendered = filter?.render(&MySqlStatsDialect)?;
+    let mut cte = String::from("WITH ");
+    let mut joins = String::new();
+    let mut conditions = String::new();
+    for (index, column) in rendered.iter().enumerate() {
+        if index > 0 {
+            cte.push_str(",\n     ");
+        }
+        let alias = &column.alias;
+        let stats = column.stats.join(", ");
+        let column_id = column.column_id;
+        cte.push_str(&format!(
+            "{alias} AS (SELECT data_file_id, {stats}
+                        FROM ducklake_file_column_stats
+                        WHERE column_id = {column_id} AND table_id = {table_id})"
+        ));
+        joins.push_str(&format!(
+            "
+                 LEFT JOIN {alias} ON {alias}.data_file_id = data.data_file_id"
+        ));
+        // The condition arrives already wrapped in its no-stats, per-stat and
+        // unknown guards, so it is spliced verbatim.
+        conditions.push_str(&format!(
+            "
+                   AND {}",
+            column.condition
+        ));
+    }
+    cte.push('\n');
+    Some(StatsFilterSql {
+        cte,
+        joins,
+        conditions,
+    })
 }
 
 fn decode_view(row: &MySqlRow) -> Result<ViewMetadata> {
@@ -195,6 +522,32 @@ impl MySqlMetadataProvider {
             let _ = self.schema_capabilities.set(caps);
         }
         Ok(caps)
+    }
+
+    /// Bind and run one page of the file-listing query.
+    ///
+    /// The parameter list is identical for the filtered and unfiltered
+    /// spellings of that query — `stats_filter_sql` inlines everything it needs
+    /// — which is what lets the caller retry with the filter dropped.
+    async fn fetch_file_page(
+        &self,
+        sql: &str,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: i64,
+    ) -> std::result::Result<Vec<MySqlRow>, sqlx::Error> {
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(after_data_file_id.unwrap_or(i64::MIN))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
     }
 }
 
@@ -564,6 +917,23 @@ impl MetadataProvider for MySqlMetadataProvider {
         after_data_file_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<DuckLakeFileMetadata>> {
+        self.get_table_file_metadata_page_filtered(
+            table_id,
+            snapshot_id,
+            after_data_file_id,
+            limit,
+            None,
+        )
+    }
+
+    fn get_table_file_metadata_page_filtered(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -571,8 +941,23 @@ impl MetadataProvider for MySqlMetadataProvider {
             crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
         })?;
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT data.data_file_id, data.path, data.path_is_relative,
+            // The statistics filter narrows the list inside this query, before
+            // LIMIT and with the `ORDER BY data.data_file_id` keyset ordering
+            // intact. Filtering a fetched page instead would break the cursor in
+            // `crate::table::FileMetadataPages`: a page whose candidates all
+            // fail the filter comes back empty, which reads as "no files left",
+            // and every matching file beyond it is never visited.
+            let filter_sql = stats_filter_sql(filter, table_id);
+            let build_sql = |filter_sql: Option<&StatsFilterSql>| {
+                let (cte, joins, conditions) = filter_sql.map_or(("", "", ""), |sql| {
+                    (
+                        sql.cte.as_str(),
+                        sql.joins.as_str(),
+                        sql.conditions.as_str(),
+                    )
+                });
+                format!(
+                    "{cte}SELECT data.data_file_id, data.path, data.path_is_relative,
                         data.file_size_bytes, data.footer_size, data.encryption_key,
                         data.row_id_start, data.record_count,
                         del.delete_file_id, del.path, del.path_is_relative,
@@ -584,24 +969,48 @@ impl MetadataProvider for MySqlMetadataProvider {
                    ON data.data_file_id = del.data_file_id
                   AND del.table_id = ?
                   AND ? >= del.begin_snapshot
-                  AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
+                  AND (? < del.end_snapshot OR del.end_snapshot IS NULL){joins}
                  WHERE data.table_id = ?
                    AND ? >= data.begin_snapshot
                    AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND data.data_file_id > ?
+                   AND data.data_file_id > ?{conditions}
                  ORDER BY data.data_file_id
-                 LIMIT ?",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+                 LIMIT ?"
+                )
+            };
+            let rows = match self
+                .fetch_file_page(
+                    &build_sql(filter_sql.as_ref()),
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                // The filter is advisory, so a catalog the narrowed query cannot
+                // run — most importantly one predating
+                // `ducklake_file_column_stats`, where joining it is a hard error
+                // — still lists its files. The retry uses the same parameters,
+                // and a failure that is not the filter's fault surfaces from it.
+                Err(error) if filter_sql.is_some() => {
+                    tracing::debug!(
+                        %error,
+                        table_id,
+                        "statistics-filtered file listing failed; listing every file"
+                    );
+                    self.fetch_file_page(
+                        &build_sql(None),
+                        table_id,
+                        snapshot_id,
+                        after_data_file_id,
+                        limit,
+                    )
+                    .await?
+                },
+                Err(error) => return Err(error.into()),
+            };
             let files = rows
                 .iter()
                 .map(|row| decode_table_file(row, snapshot_id))
@@ -609,7 +1018,49 @@ impl MetadataProvider for MySqlMetadataProvider {
             let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
                 return Ok(Vec::new());
             };
-            let statistics = match sqlx::query(
+            // A filtered page's ids are sparse within `(after, last]`, so the
+            // two enrichment queries below are restricted to the ids actually
+            // returned rather than to that whole range. Unfiltered the range
+            // holds at most one page of files, but a selective filter can put a
+            // handful of survivors at the far end of a million-file table, and
+            // the range would then pull back the statistics of every file the
+            // filter just pruned — the exact cost the pushdown exists to remove,
+            // and unbounded resident memory besides.
+            //
+            // The ids are inlined rather than bound as one parameter, which is
+            // what the PostgreSQL provider does. That is a dialect difference,
+            // not a disagreement: `= ANY($n::bigint[])` needs an array type,
+            // and PostgreSQL is the only one of these engines that has one (and
+            // the only one sqlx 0.9 can bind a `Vec<i64>` to). MySQL's
+            // single-parameter shapes are worse than the inlining: `FIND_IN_SET`
+            // over a comma-separated string is a per-row scan that no index on
+            // `data_file_id` can serve, and a `JSON_TABLE` join would raise the
+            // server floor to MySQL 8.0.4. Ids are `i64`, so inlining them adds
+            // no bind parameter and the parameter lists stay as they are.
+            //
+            // Inlining does give every page a distinct query string, and sqlx
+            // keys its per-connection prepared-statement cache on that string.
+            // A fresh string costs a `COM_STMT_PREPARE` round trip that nothing
+            // can amortize, since it will never be reused — so both queries
+            // below are non-persistent whenever they carry ids, which has sqlx
+            // close the statement after executing it instead of caching it. The
+            // cache holds 100 statements by default and would otherwise fill
+            // with per-page strings, evicting the listing query and everything
+            // else the connection had prepared, adding a second prepare per
+            // page to the one already paid.
+            let page_ids = filter_sql.as_ref().map(|_| {
+                files
+                    .iter()
+                    .map(|file| file.data_file_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            let page_id_filter = |column: &str| {
+                page_ids.as_ref().map_or_else(String::new, |ids| {
+                    format!("\n                   AND {column} IN ({ids})")
+                })
+            };
+            let statistics = match sqlx::query(AssertSqlSafe(format!(
                 "SELECT stats.data_file_id, stats.column_id,
                         stats.column_size_bytes, stats.value_count, stats.null_count,
                         stats.min_value, stats.max_value, stats.contains_nan
@@ -621,14 +1072,17 @@ impl MetadataProvider for MySqlMetadataProvider {
                    AND ? >= data.begin_snapshot
                    AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
                    AND stats.data_file_id > ?
-                   AND stats.data_file_id <= ?
+                   AND stats.data_file_id <= ?{}
                  ORDER BY stats.data_file_id, stats.column_id",
-            )
+                page_id_filter("stats.data_file_id")
+            )))
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(after_data_file_id.unwrap_or(i64::MIN))
             .bind(last_data_file_id)
+            // Cacheable only while the text is stable; see the note above.
+            .persistent(page_ids.is_none())
             .fetch_all(&self.pool)
             .await
             {
@@ -661,12 +1115,17 @@ impl MetadataProvider for MySqlMetadataProvider {
             // Enrich with per-file partition values (for pruning), scoped to the
             // page's data_file_id range. Missing partition table => no enrichment.
             let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-            match sqlx::query(SQL_GET_FILE_PARTITION_VALUES)
-                .bind(table_id)
-                .bind(after_data_file_id.unwrap_or(i64::MIN))
-                .bind(last_data_file_id)
-                .fetch_all(&self.pool)
-                .await
+            match sqlx::query(AssertSqlSafe(format!(
+                "{SQL_GET_FILE_PARTITION_VALUES}{}",
+                page_id_filter("data_file_id")
+            )))
+            .bind(table_id)
+            .bind(after_data_file_id.unwrap_or(i64::MIN))
+            .bind(last_data_file_id)
+            // Cacheable only while the text is stable; see the note above.
+            .persistent(page_ids.is_none())
+            .fetch_all(&self.pool)
+            .await
             {
                 Ok(rows) => {
                     for row in rows {
@@ -1589,5 +2048,240 @@ WHERE data.table_id = ?
                 })
                 .collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats_filter::lower_predicate;
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
+
+    /// The shape of `a > 5 AND a < 10` on an `INTEGER` column, as the listing
+    /// query splices it. Both conjuncts read a bound and neither reads
+    /// `null_count`, so the CTE also selects `value_count` for the guard.
+    #[test]
+    fn renders_a_two_conjunct_integer_filter() {
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::Gt,
+                lit(5i32),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column, Operator::Lt, lit(10i32))),
+        )) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 42).expect("rendered");
+        println!("CTE:\n{}", sql.cte);
+        println!("JOINS:{}", sql.joins);
+        println!("CONDITIONS:{}", sql.conditions);
+
+        assert!(
+            sql.cte
+                .starts_with("WITH col_7_stats AS (SELECT data_file_id, ")
+        );
+        assert!(sql.cte.contains("min_value, max_value, value_count"));
+        assert!(sql.cte.contains("WHERE column_id = 7 AND table_id = 42)"));
+        assert!(
+            sql.joins
+                .contains("LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id")
+        );
+        assert!(sql.conditions.contains(
+            "CASE WHEN col_7_stats.max_value REGEXP '^-?[0-9]{1,20}$' \
+             THEN CAST(col_7_stats.max_value AS DECIMAL(65, 0)) END > 5"
+        ));
+        assert!(sql.conditions.trim_end().ends_with(") IS NOT FALSE"));
+    }
+
+    /// A raw string bound is compared byte-wise, never under the connection's
+    /// default case- and accent-insensitive collation.
+    #[test]
+    fn compares_string_bounds_byte_wise() {
+        let column = Arc::new(Column::new("s", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit("apple"))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let columns =
+            vec![DuckLakeTableColumn::new(3, "s".to_string(), "varchar".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        assert!(sql.conditions.contains(
+            "'apple' BETWEEN CONVERT(col_3_stats.min_value USING utf8mb4) COLLATE utf8mb4_0900_bin \
+             AND CONVERT(col_3_stats.max_value USING utf8mb4) COLLATE utf8mb4_0900_bin"
+        ));
+    }
+
+    /// A date constant MySQL would refuse to convert is declined here instead:
+    /// comparing a `DATE` against `'+12921-08-18'` is error 1525, which would
+    /// cost the listing its filter entirely.
+    #[test]
+    fn declines_a_date_constant_outside_the_canonical_encoding() {
+        let column = Arc::new(Column::new("d", 0)) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(1, "d".to_string(), "date".to_string(), true)];
+        let lower = |days: i32| {
+            let predicate = Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::Lt,
+                datafusion::physical_expr::expressions::lit(
+                    datafusion::common::ScalarValue::Date32(Some(days)),
+                ),
+            )) as Arc<dyn PhysicalExpr>;
+            lower_predicate(&predicate, &schema, &columns).expect("lowered")
+        };
+
+        // 19_723 days after the epoch is 2024-01-01; 4_000_000 is +12921-08-18.
+        let sql = stats_filter_sql(Some(&lower(19_723)), 1).expect("rendered");
+        // Shape-guarded before the cast: MySQL's DATE parser normalises
+        // `' 2020-01-01 '`, `2020/01/01` and `20200101`, so the stat has to be
+        // pinned to the encoder's spelling before it is converted.
+        assert!(
+            sql.conditions.contains("REGEXP_SUBSTR(")
+                && sql.conditions.contains("AS DATE) < '2024-01-01'"),
+            "unexpected date condition: {}",
+            sql.conditions
+        );
+        assert!(stats_filter_sql(Some(&lower(4_000_000)), 1).is_none());
+    }
+
+    /// A nanosecond timestamp is compared as text, not cast.
+    ///
+    /// `DATETIME(6)` holds microseconds and rounds a longer fraction, which is
+    /// monotonic but not injective — two distinct nanosecond instants can land
+    /// on one microsecond, so a strict comparison that holds of the stored
+    /// values comes back false. The encoded text is chronologically ordered at
+    /// full precision, so comparing the strings answers the same question
+    /// exactly. `stats_encode` trims trailing zeros, and the pattern refuses a
+    /// fraction ending in `0`, because as text `.50` sorts above `.5` while
+    /// naming the same instant.
+    #[test]
+    fn nanosecond_timestamps_are_compared_as_text() {
+        let column = Arc::new(Column::new("t", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            column,
+            Operator::Lt,
+            datafusion::physical_expr::expressions::lit(
+                datafusion::common::ScalarValue::TimestampNanosecond(Some(1), None),
+            ),
+        )) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]);
+        let columns =
+            vec![DuckLakeTableColumn::new(1, "t".to_string(), "timestamp_ns".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 1)
+            .expect("a nanosecond timestamp pushes down")
+            .conditions;
+
+        // The constant keeps all nine digits, and nothing is cast.
+        assert!(sql.contains("'1970-01-01 00:00:00.000000001'"), "{sql}");
+        assert!(!sql.contains("CAST("), "nanosecond was cast: {sql}");
+        // The stat side is pinned to the same encoding, byte-collated.
+        assert!(
+            sql.contains("= REGEXP_SUBSTR(") && sql.contains("([.][0-9]*[1-9])?'"),
+            "the stat must be matched over its whole value, not to a `$` anchor: {sql}"
+        );
+        assert!(sql.contains("COLLATE utf8mb4_0900_bin"), "{sql}");
+    }
+
+    /// A constant holding a backslash never reaches the SQL as an escape.
+    ///
+    /// `'a\'` — the standard rendering — makes MySQL read the closing quote as
+    /// escaped and the statement dies with error 1064. Doubling the backslash
+    /// repairs that only under the default `sql_mode`: with
+    /// `NO_BACKSLASH_ESCAPES` set, `'a\\'` is the two-character string `a\\`,
+    /// which does not equal the value the writer stored and would prune a file
+    /// that matches. The hexadecimal form has one meaning under both.
+    #[test]
+    fn backslash_bearing_constants_render_as_hex_literals() {
+        let dialect = MySqlStatsDialect;
+        assert_eq!(dialect.quote_literal("apple"), "'apple'");
+        assert_eq!(dialect.quote_literal("a'b"), "'a''b'");
+        assert_eq!(dialect.quote_literal("a\\"), "_utf8mb4 X'615C'");
+        assert_eq!(dialect.quote_literal("a\\'"), "_utf8mb4 X'615C27'");
+        // UTF-8 bytes, not code points: `é` is 0xC3 0xA9.
+        assert_eq!(dialect.quote_literal("\u{e9}\\"), "_utf8mb4 X'C3A95C'");
+
+        let column = Arc::new(Column::new("s", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit("a\\"))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+        let columns =
+            vec![DuckLakeTableColumn::new(3, "s".to_string(), "varchar".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        assert!(
+            sql.conditions.contains(
+                "_utf8mb4 X'615C' BETWEEN CONVERT(col_3_stats.min_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin"
+            ),
+            "unexpected condition: {}",
+            sql.conditions
+        );
+        assert!(
+            !sql.conditions.contains('\\'),
+            "a backslash reached the SQL text: {}",
+            sql.conditions
+        );
+    }
+
+    /// The float guard bounds both digit runs, because `CAST` does not fail on a
+    /// magnitude no `DOUBLE` holds — it saturates. Measured on MySQL 8:
+    /// `CAST('1e+400' AS DOUBLE)` is `1.7976931348623157e308`,
+    /// `CAST('1e-400' AS DOUBLE)` is `0`, and 400 nines is DBL_MAX again, all
+    /// without an error the guard could see. Reading a bound that way is the
+    /// "coerces it to a number" failure this dialect exists to prevent.
+    #[test]
+    fn the_float_guard_declines_magnitudes_mysql_would_saturate() {
+        let column = Arc::new(Column::new("f", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Gt, lit(1.0f64))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        let columns =
+            vec![DuckLakeTableColumn::new(9, "f".to_string(), "double".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+
+        // Read the pattern out of the SQL the dialect actually emitted, so this
+        // cannot drift from it.
+        let (_, after) = sql
+            .conditions
+            .split_once("REGEXP '")
+            .expect("the float cast is guarded by a REGEXP");
+        let (pattern, _) = after.split_once("' THEN").expect("guarded cast");
+        let guard = regex::Regex::new(pattern).expect("a valid pattern");
+
+        for admitted in
+            ["0.0", "-1.5", "1e+16", "1e-20", "1.2345678901234568e+16", &"9".repeat(255)]
+        {
+            assert!(guard.is_match(admitted), "{admitted} should be admitted");
+        }
+        for declined in [
+            // Saturating magnitudes: the reason the bounds exist.
+            "1e+400",
+            "1e-400",
+            &"9".repeat(400),
+            // Representable but past the margin, so declined rather than read.
+            "1e+100",
+            // The encoder's infinities, which MySQL would read as 0.
+            "inf",
+            "-inf",
+            // Not this encoding at all.
+            "nan",
+            "0x10",
+            " 1.0",
+        ] {
+            assert!(!guard.is_match(declined), "{declined} should be declined");
+        }
     }
 }

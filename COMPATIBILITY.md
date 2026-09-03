@@ -146,6 +146,7 @@ provider, run writer initialization with a schema-migration role before reading.
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; SQLite & PostgreSQL) | ✅ |
 | Snapshot-based consistency (bound at catalog creation)  |   ✅   |
 | Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
+| Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file | ✅ |
 | Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
 | Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
 | SQL-queryable `information_schema`                      |   ✅   |
@@ -270,13 +271,30 @@ Known edges:
 ## Limitations
 
 - **Write backends:** DuckDB and MySQL are read-only; writes require SQLite or PostgreSQL.
-- **Negative NaN orders differently than in DuckDB.** DuckDB normalizes NaN — `-NaN = NaN`
-  is true and either sign sorts above every value. DataFusion compares floats with arrow's
-  `total_cmp`, which is sign-sensitive, so `-NaN` sorts *below* every value including
-  `-Infinity`. A query like `WHERE x < -1e308` therefore returns `-NaN` rows here and none
-  in DuckDB. This is inherited from arrow and affects results, not just pruning; float
-  min/max statistics are gated on `contains_nan` in **both** directions to stay consistent
-  with it, where official DuckLake gates only the max.
+- **Catalog-side filter pushdown declines a few type/backend combinations.** A
+  pushed-down filter narrows the file-listing query using per-column statistics,
+  but the comparison runs in the catalog engine, so some types decline it and
+  fall back to listing every file and pruning in memory: `DECIMAL` bounds on
+  SQLite (its only fractional numeric is `REAL`, and a `DECIMAL(38, s)` constant
+  can carry more significant digits than a double); `inf` / `-inf` bounds on
+  SQLite, which reads either as `0.0`; and float magnitudes with a three-digit
+  exponent on PostgreSQL and MySQL, where widening the guard to admit `1e+308`
+  would also admit `1e+400`, which both engines silently saturate rather than
+  reject. Declining costs pruning only and never changes results.
+
+  Temporal comparisons are made on the encoded text rather than by casting,
+  which is what lets them prune on every PostgreSQL version and at nanosecond
+  precision — PostgreSQL and MySQL both store microseconds and round a longer
+  fraction, which is not order-preserving. Only the canonical encoding is
+  compared: a year outside `0000`-`9999`, which `chrono` writes with a sign
+  prefix, and a zone offset other than `+00` are declined rather than
+  mis-compared.
+
+  Official DuckLake has no equivalent limits because it evaluates every filter
+  inside DuckDB even against a foreign catalog, pulling raw statistics rows out
+  of it; this crate queries each catalog natively instead, which removes the
+  DuckDB dependency at the cost of that dialect fidelity.
+
 - **Mapped Hive partition paths follow DuckDB 1.5.5 parsing.** The raw object key is
   split on `/` and `\`; a query marker, newline, or second `=` invalidates that path
   segment. Keys are compared without percent decoding, while values are decoded.

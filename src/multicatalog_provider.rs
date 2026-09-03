@@ -20,8 +20,12 @@ use crate::metadata_provider::{
     SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
     reconstruct_columns, reconstruct_columns_with_table,
 };
+use crate::metadata_provider_postgres::{
+    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, stats_filter_sql,
+};
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use crate::stats_filter::StatsFilter;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -110,6 +114,14 @@ struct SchemaCapabilities {
     data_file_partition_id: bool,
     /// The `ducklake_view` table exists.
     views: bool,
+    /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
+    /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
+    ///
+    /// A server capability rather than a catalog one, so it is deliberately not
+    /// part of [`Self::all`]: gating the memo on it would make an otherwise
+    /// fully-migrated catalog on an older server re-probe on every call, and a
+    /// stale `false` only costs pruning.
+    soft_input_validation: bool,
 }
 
 impl SchemaCapabilities {
@@ -198,7 +210,7 @@ impl MulticatalogProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -207,7 +219,8 @@ impl MulticatalogProvider {
                to_regclass('ducklake_schema_versions') IS NOT NULL,
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
-               to_regclass('ducklake_view') IS NOT NULL",
+               to_regclass('ducklake_view') IS NOT NULL,
+               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -217,11 +230,267 @@ impl MulticatalogProvider {
             schema_versions: row.2,
             data_file_partition_id: row.3,
             views: row.4,
+            soft_input_validation: row.5,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
         }
         Ok(caps)
+    }
+
+    /// One page of the visible file listing, optionally narrowed inside SQL by
+    /// catalog statistics.
+    ///
+    /// Backs both [`MetadataProvider::get_table_file_metadata_page`] (`filter`
+    /// `None`) and [`MetadataProvider::get_table_file_metadata_page_filtered`],
+    /// so the paging contract is written once.
+    fn file_metadata_page(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|_| {
+            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
+        })?;
+        block_on(async {
+            let caps = self.schema_capabilities().await?;
+            let partial_max_expr = if caps.data_file_partial_max {
+                "data.partial_max::bigint"
+            } else {
+                "NULL::bigint"
+            };
+            let schema_version_expr = if caps.schema_versions {
+                "(SELECT sv.schema_version::bigint
+                  FROM ducklake_schema_versions sv
+                  WHERE sv.table_id = data.table_id
+                    AND sv.begin_snapshot <= data.begin_snapshot
+                  ORDER BY sv.begin_snapshot DESC LIMIT 1)"
+            } else {
+                "NULL::bigint"
+            };
+            let dialect = PostgresStatsDialect {
+                soft_input_validation: caps.soft_input_validation,
+            };
+            let rendered = filter.and_then(|filter| filter.render(&dialect));
+            let stats_sql = rendered
+                .as_deref()
+                .and_then(|filters| stats_filter_sql(table_id, filters));
+
+            // The statistics conditions go inside the query, ahead of the
+            // LIMIT, with the keyset ordering untouched. Filtering a page after
+            // fetching it would break the cursor `FileMetadataPages` drives: a
+            // page whose candidates all failed the filter would come back
+            // empty, which ends the iteration and hides every matching file
+            // beyond it.
+            let listing_sql = |stats_sql: Option<&StatsFilterSql>| {
+                let (with_prefix, joins, conditions) = stats_sql
+                    .map(|sql| {
+                        (
+                            sql.with_prefix.as_str(),
+                            sql.joins.as_str(),
+                            sql.conditions.as_str(),
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{with_prefix}SELECT data.data_file_id, data.path, data.path_is_relative,
+                        data.file_size_bytes, data.footer_size, data.encryption_key,
+                        data.row_id_start, data.record_count,
+                        del.delete_file_id, del.path, del.path_is_relative,
+                        del.file_size_bytes, del.footer_size, del.encryption_key,
+                        del.delete_count, data.begin_snapshot::bigint,
+                        {partial_max_expr}, {schema_version_expr},
+                        NULL::bigint AS data_partition_id,
+                        data.mapping_id::bigint
+                 FROM ducklake_data_file AS data
+                 LEFT JOIN ducklake_delete_file AS del
+                   ON data.data_file_id = del.data_file_id
+                  AND del.table_id = $1
+                  AND $2 >= del.begin_snapshot
+                  AND ($3 < del.end_snapshot OR del.end_snapshot IS NULL){joins}
+                 WHERE data.table_id = $4
+                   AND $5 >= data.begin_snapshot
+                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
+                   AND data.data_file_id > $7{conditions}
+                 ORDER BY data.data_file_id
+                 LIMIT $8"
+                )
+            };
+
+            let after = after_data_file_id.unwrap_or(i64::MIN);
+            let rows = match fetch_data_file_page(
+                &self.pool,
+                &listing_sql(stats_sql.as_ref()),
+                table_id,
+                snapshot_id,
+                after,
+                limit,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                // The filter is advisory, so a catalog the narrowed query
+                // cannot run — one predating `ducklake_file_column_stats`,
+                // where joining it is a hard error, or one whose stats provoke
+                // an error the dialect did not anticipate — still lists its
+                // files. Any error retries, not just the missing table: the
+                // narrowed query is the only thing this arm adds, and listing
+                // every live file is always correct. The retry uses the same
+                // parameters, and a failure that is not the filter's fault
+                // surfaces from it.
+                Err(error) if stats_sql.is_some() => {
+                    tracing::debug!(
+                        %error,
+                        table_id,
+                        "statistics-filtered file listing failed; listing every file"
+                    );
+                    fetch_data_file_page(
+                        &self.pool,
+                        &listing_sql(None),
+                        table_id,
+                        snapshot_id,
+                        after,
+                        limit,
+                    )
+                    .await?
+                },
+                Err(error) => return Err(error.into()),
+            };
+            let files = rows
+                .iter()
+                .map(|row| decode_table_file(row, snapshot_id))
+                .collect::<Result<Vec<_>>>()?;
+            let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
+                return Ok(Vec::new());
+            };
+            // A filtered page's ids are sparse within `(after, last]`, so the
+            // two enrichment queries below are restricted to the ids actually
+            // returned instead of to that whole range — otherwise a selective
+            // filter would read the per-column stats of every file it just
+            // pruned, which is the cost the filter exists to avoid.
+            //
+            // The ids are bound as one array parameter rather than spelled out
+            // in the SQL. Inlining a page's worth of them gives every page a
+            // distinct query string, and sqlx keys its per-connection
+            // prepared-statement cache on that string: each page would pay a
+            // Parse/Describe round trip and evict the other statements the
+            // connection had cached. The listing query's own `$1..$8` are fixed
+            // by `fetch_data_file_page` and untouched by this; the two
+            // enrichment queries number their parameters independently.
+            let page_ids: Option<Vec<i64>> = stats_sql
+                .as_ref()
+                .map(|_| files.iter().map(|file| file.data_file_id).collect());
+            let page_id_filter = |column: &str, parameter: usize| {
+                page_ids.as_ref().map_or_else(String::new, |_| {
+                    format!("\n                   AND {column} = ANY(${parameter}::bigint[])")
+                })
+            };
+            let statistics_sql = format!(
+                "SELECT stats.data_file_id, stats.column_id,
+                        stats.column_size_bytes, stats.value_count, stats.null_count,
+                        stats.min_value, stats.max_value, stats.contains_nan
+                 FROM ducklake_file_column_stats AS stats
+                 INNER JOIN ducklake_data_file AS data
+                   ON data.data_file_id = stats.data_file_id
+                  AND data.table_id = stats.table_id
+                 WHERE stats.table_id = $1
+                   AND $2 >= data.begin_snapshot
+                   AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)
+                   AND stats.data_file_id > $4
+                   AND stats.data_file_id <= $5{}
+                 ORDER BY stats.data_file_id, stats.column_id",
+                page_id_filter("stats.data_file_id", 6)
+            );
+            let mut statistics_query = sqlx::query(AssertSqlSafe(statistics_sql))
+                .bind(table_id)
+                .bind(snapshot_id)
+                .bind(snapshot_id)
+                .bind(after_data_file_id.unwrap_or(i64::MIN))
+                .bind(last_data_file_id);
+            if let Some(ids) = page_ids.as_deref() {
+                statistics_query = statistics_query.bind(ids);
+            }
+            let statistics = match statistics_query.fetch_all(&self.pool).await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeFileColumnStatistics {
+                            data_file_id: row.try_get(0)?,
+                            column_id: row.try_get(1)?,
+                            column_size_bytes: row.try_get(2)?,
+                            value_count: row.try_get(3)?,
+                            null_count: row.try_get(4)?,
+                            min_value: row.try_get(5)?,
+                            max_value: row.try_get(6)?,
+                            contains_nan: row.try_get(7)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
+            for statistic in statistics {
+                statistics_by_file
+                    .entry(statistic.data_file_id)
+                    .or_default()
+                    .push(statistic);
+            }
+
+            // Enrich with per-file partition values (for pruning), scoped to the
+            // page's data_file_id range. Keyed by globally-unique ids; no catalog
+            // scoping. Missing partition table => no enrichment.
+            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
+            let partition_values_sql = format!(
+                "SELECT data_file_id, partition_key_index, partition_value
+                 FROM ducklake_file_partition_value
+                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3{}",
+                page_id_filter("data_file_id", 4)
+            );
+            let mut partition_values_query = sqlx::query(AssertSqlSafe(partition_values_sql))
+                .bind(table_id)
+                .bind(after_data_file_id.unwrap_or(i64::MIN))
+                .bind(last_data_file_id);
+            if let Some(ids) = page_ids.as_deref() {
+                partition_values_query = partition_values_query.bind(ids);
+            }
+            match partition_values_query.fetch_all(&self.pool).await {
+                Ok(rows) => {
+                    for row in rows {
+                        let data_file_id: i64 = row.try_get(0)?;
+                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
+                        let value: Option<String> = row.try_get(2)?;
+                        values_by_file
+                            .entry(data_file_id)
+                            .or_default()
+                            .push((key_index, value));
+                    }
+                },
+                Err(error) if is_missing_statistics_table(&error) => {},
+                Err(error) => return Err(error.into()),
+            }
+
+            Ok(files
+                .into_iter()
+                .map(|mut file| {
+                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
+                        file.partition_values = values;
+                    }
+                    DuckLakeFileMetadata {
+                        column_statistics: statistics_by_file
+                            .remove(&file.data_file_id)
+                            .unwrap_or_default(),
+                        file,
+                    }
+                })
+                .collect())
+        })
     }
 }
 
@@ -724,163 +993,18 @@ impl MetadataProvider for MulticatalogProvider {
         after_data_file_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<DuckLakeFileMetadata>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let limit = i64::try_from(limit).map_err(|_| {
-            crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
-        })?;
-        block_on(async {
-            let caps = self.schema_capabilities().await?;
-            let partial_max_expr = if caps.data_file_partial_max {
-                "data.partial_max::bigint"
-            } else {
-                "NULL::bigint"
-            };
-            let schema_version_expr = if caps.schema_versions {
-                "(SELECT sv.schema_version::bigint
-                  FROM ducklake_schema_versions sv
-                  WHERE sv.table_id = data.table_id
-                    AND sv.begin_snapshot <= data.begin_snapshot
-                  ORDER BY sv.begin_snapshot DESC LIMIT 1)"
-            } else {
-                "NULL::bigint"
-            };
-            let sql = format!(
-                "SELECT data.data_file_id, data.path, data.path_is_relative,
-                        data.file_size_bytes, data.footer_size, data.encryption_key,
-                        data.row_id_start, data.record_count,
-                        del.delete_file_id, del.path, del.path_is_relative,
-                        del.file_size_bytes, del.footer_size, del.encryption_key,
-                        del.delete_count, data.begin_snapshot::bigint,
-                        {partial_max_expr}, {schema_version_expr},
-                        NULL::bigint AS data_partition_id,
-                        data.mapping_id::bigint
-                 FROM ducklake_data_file AS data
-                 LEFT JOIN ducklake_delete_file AS del
-                   ON data.data_file_id = del.data_file_id
-                  AND del.table_id = $1
-                  AND $2 >= del.begin_snapshot
-                  AND ($3 < del.end_snapshot OR del.end_snapshot IS NULL)
-                 WHERE data.table_id = $4
-                   AND $5 >= data.begin_snapshot
-                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND data.data_file_id > $7
-                 ORDER BY data.data_file_id
-                 LIMIT $8"
-            );
-            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(after_data_file_id.unwrap_or(i64::MIN))
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
-            let files = rows
-                .iter()
-                .map(|row| decode_table_file(row, snapshot_id))
-                .collect::<Result<Vec<_>>>()?;
-            let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
-                return Ok(Vec::new());
-            };
-            let statistics = match sqlx::query(
-                "SELECT stats.data_file_id, stats.column_id,
-                        stats.column_size_bytes, stats.value_count, stats.null_count,
-                        stats.min_value, stats.max_value, stats.contains_nan
-                 FROM ducklake_file_column_stats AS stats
-                 INNER JOIN ducklake_data_file AS data
-                   ON data.data_file_id = stats.data_file_id
-                  AND data.table_id = stats.table_id
-                 WHERE stats.table_id = $1
-                   AND $2 >= data.begin_snapshot
-                   AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND stats.data_file_id > $4
-                   AND stats.data_file_id <= $5
-                 ORDER BY stats.data_file_id, stats.column_id",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(last_data_file_id)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|row| {
-                        Ok(DuckLakeFileColumnStatistics {
-                            data_file_id: row.try_get(0)?,
-                            column_id: row.try_get(1)?,
-                            column_size_bytes: row.try_get(2)?,
-                            value_count: row.try_get(3)?,
-                            null_count: row.try_get(4)?,
-                            min_value: row.try_get(5)?,
-                            max_value: row.try_get(6)?,
-                            contains_nan: row.try_get(7)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                Err(error) if is_missing_statistics_table(&error) => Vec::new(),
-                Err(error) => return Err(error.into()),
-            };
-            let mut statistics_by_file: HashMap<i64, Vec<_>> = HashMap::new();
-            for statistic in statistics {
-                statistics_by_file
-                    .entry(statistic.data_file_id)
-                    .or_default()
-                    .push(statistic);
-            }
+        self.file_metadata_page(table_id, snapshot_id, after_data_file_id, limit, None)
+    }
 
-            // Enrich with per-file partition values (for pruning), scoped to the
-            // page's data_file_id range. Keyed by globally-unique ids; no catalog
-            // scoping. Missing partition table => no enrichment.
-            let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-            match sqlx::query(
-                "SELECT data_file_id, partition_key_index, partition_value
-                 FROM ducklake_file_partition_value
-                 WHERE table_id = $1 AND data_file_id > $2 AND data_file_id <= $3",
-            )
-            .bind(table_id)
-            .bind(after_data_file_id.unwrap_or(i64::MIN))
-            .bind(last_data_file_id)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => {
-                    for row in rows {
-                        let data_file_id: i64 = row.try_get(0)?;
-                        let key_index: i32 = i32::try_from(row.try_get::<i64, _>(1)?).unwrap_or(0);
-                        let value: Option<String> = row.try_get(2)?;
-                        values_by_file
-                            .entry(data_file_id)
-                            .or_default()
-                            .push((key_index, value));
-                    }
-                },
-                Err(error) if is_missing_statistics_table(&error) => {},
-                Err(error) => return Err(error.into()),
-            }
-
-            Ok(files
-                .into_iter()
-                .map(|mut file| {
-                    if let Some(values) = values_by_file.remove(&file.data_file_id) {
-                        file.partition_values = values;
-                    }
-                    DuckLakeFileMetadata {
-                        column_statistics: statistics_by_file
-                            .remove(&file.data_file_id)
-                            .unwrap_or_default(),
-                        file,
-                    }
-                })
-                .collect())
-        })
+    fn get_table_file_metadata_page_filtered(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        self.file_metadata_page(table_id, snapshot_id, after_data_file_id, limit, filter)
     }
 
     fn get_table_summary_statistics(

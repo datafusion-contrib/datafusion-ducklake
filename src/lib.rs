@@ -96,8 +96,8 @@ pub mod multicatalog_provider;
 pub mod sql;
 #[cfg(feature = "write")]
 pub mod stats_collect;
-#[cfg(feature = "write")]
 pub mod stats_encode;
+pub mod stats_filter;
 #[cfg(feature = "write")]
 pub mod table_writer;
 #[cfg(feature = "write")]

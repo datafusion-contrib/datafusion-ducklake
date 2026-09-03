@@ -320,6 +320,9 @@ A few highlights worth knowing up front:
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
 - Table partitioning: read + file pruning on all backends; partitioned writes on every
   writable backend.
+- Filter pushdown reaches the catalog: per-column statistics narrow the file-listing query
+  itself, so a selective scan no longer lists every file. A few type/backend combinations
+  decline it and fall back to in-memory pruning — see COMPATIBILITY.md.
 - Data inlined by DuckDB's ducklake extension is **not read** — see COMPATIBILITY.md for
   the `COUNT(*)` undercount caveat and how to avoid it.
 

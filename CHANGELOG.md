@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A pushed-down filter never changes a query's answer, checked by a generated sweep over
+  hostile catalog statistics on every backend (#293).
+- Pushed-down filters narrow the DuckLake file listing in the catalog query itself, using
+  per-column statistics, so planning a selective scan or keyed mutation no longer lists
+  every live file (#293).
 - `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
   set how many finished data files a rolling or partitioned write uploads at once, default 4.
   Written output is identical at any setting (#280).
@@ -27,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / rewrite paths explicitly (#130).
 
 ### Changed
+
+- Files carrying a live delete file are now pruned by their statistics, matching official
+  DuckLake; previously they were kept regardless of the predicate (#293).
 
 - **BREAKING**: `DuckLakeFileData` and `DataFileChange` are now non-exhaustive and
   implement `Default`; `DataFileChange` gains `mapping_id`. Downstream metadata

@@ -4,13 +4,20 @@
 //! These set up a populated catalog via the writer side, then verify the
 //! reader's catalog-scoping with full isolation between catalogs.
 
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysColumn, lit};
 use datafusion_ducklake::metadata_provider::MetadataProvider;
+use datafusion_ducklake::metadata_provider::{DuckLakeFileMetadata, DuckLakeTableColumn};
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
+use datafusion_ducklake::stats_filter::{StatsFilter, lower_predicate};
 use datafusion_ducklake::{
     MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
     initialize_multicatalog_schema,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::sync::Arc;
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -482,4 +489,190 @@ async fn schema_capability_probe_memoized_after_first_select() {
 
     // Clones share the memo (the cell is Arc-shared).
     assert!(pa.clone().schema_capabilities_cached());
+}
+
+// ---------------------------------------------------------------------------
+// Filter pushdown into the file-listing SQL
+// ---------------------------------------------------------------------------
+
+/// One catalog holding one table and five live files, each exercising a
+/// different case of the statistics join. Returns the provider, the table id,
+/// the snapshot to read at, and the file ids in listing order:
+///
+/// | file | statistics row       | must be         |
+/// |------|----------------------|-----------------|
+/// | 0    | none at all          | kept, LEFT JOIN |
+/// | 1    | min `0`, max `10`    | kept (matches)  |
+/// | 2    | min `100`, max `200` | pruned          |
+/// | 3    | min `not-a-number`   | kept, fail-open |
+/// | 4    | min/max NULL         | kept, fail-open |
+///
+/// The pruned file sits between two matching ones, which is what lets the
+/// keyset-pagination assertion fail if the filter is ever applied after the
+/// fetch instead of inside the query.
+async fn seed_filter_catalog(
+    pool: &PgPool,
+) -> anyhow::Result<(MulticatalogProvider, i64, i64, Vec<i64>)> {
+    let cols = vec![ColumnDef::new("id", "int64", true).unwrap()];
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("filter_cat").await?;
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id).await?;
+    writer.set_data_path("/data")?;
+    let setup = writer.begin_write_transaction("public", "t", &cols, WriteMode::Replace)?;
+    writer.register_data_file(
+        setup.table_id,
+        "public",
+        "t",
+        setup.snapshot_id,
+        &DataFileInfo::new("f0.parquet", 1024, 3),
+        WriteMode::Replace,
+        setup.base_snapshot_id,
+        &cols,
+        &setup.column_ids,
+    )?;
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id).await?;
+    let snapshot_id = provider.get_current_snapshot()?;
+    let table_id = setup.table_id;
+    let column_id = provider.get_table_structure(table_id, snapshot_id)?[0].column_id;
+
+    let mut file_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_data_file WHERE table_id = $1 ORDER BY data_file_id",
+    )
+    .bind(table_id)
+    .fetch_all(pool)
+    .await?;
+    // `data_file_id` is an identity column, so the ids are assigned here rather
+    // than chosen; they come back in insertion order.
+    for path in ["f1.parquet", "f2.parquet", "f3.parquet", "f4.parquet"] {
+        file_ids.push(
+            sqlx::query_scalar(
+                "INSERT INTO ducklake_data_file
+                     (table_id, path, path_is_relative, file_size_bytes, footer_size,
+                      record_count, row_id_start, begin_snapshot)
+                 VALUES ($1, $2, true, 1024, 1, 3, 0, $3)
+                 RETURNING data_file_id",
+            )
+            .bind(table_id)
+            .bind(path)
+            .bind(snapshot_id)
+            .fetch_one(pool)
+            .await?,
+        );
+    }
+
+    for (file_index, min_value, max_value) in [
+        (1usize, Some("0"), Some("10")),
+        (2, Some("100"), Some("200")),
+        (3, Some("not-a-number"), Some("also-not-a-number")),
+        (4, None, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes, value_count,
+                  null_count, min_value, max_value, contains_nan)
+             VALUES ($1, $2, $3, 8, 100, 0, $4, $5, NULL)",
+        )
+        .bind(file_ids[file_index])
+        .bind(table_id)
+        .bind(column_id)
+        .bind(min_value)
+        .bind(max_value)
+        .execute(pool)
+        .await?;
+    }
+    Ok((provider, table_id, snapshot_id, file_ids))
+}
+
+/// `id > 5 AND id < 10` over the seeded table's only column.
+fn seeded_filter(column_id: i64) -> StatsFilter {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, true)]);
+    let columns =
+        [DuckLakeTableColumn::new(column_id, "id".to_string(), "int64".to_string(), true)];
+    let id = Arc::new(PhysColumn::new("id", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate = Arc::new(BinaryExpr::new(
+        Arc::new(BinaryExpr::new(Arc::clone(&id), Operator::Gt, lit(5i64))),
+        Operator::And,
+        Arc::new(BinaryExpr::new(id, Operator::Lt, lit(10i64))),
+    )) as Arc<dyn PhysicalExpr>;
+    lower_predicate(&predicate, &schema, &columns).expect("predicate lowers")
+}
+
+/// The multicatalog reader prunes on the same terms as the single-catalog one:
+/// only a file whose recorded range proves it cannot match, never one whose
+/// statistics are absent, incomplete or unreadable. A malformed `min_value`
+/// would abort the query outright under a plain `CAST`, so this covers both
+/// halves of the fail-open contract.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn file_listing_filter_prunes_only_on_provable_statistics() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let filter =
+        seeded_filter(provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id);
+
+    let unfiltered = provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .unwrap();
+    assert_eq!(listed_ids(&unfiltered), ids);
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(table_id, snapshot_id, None, 4096, Some(&filter))
+        .expect("a malformed stat must not fail the listing query");
+    assert_eq!(
+        listed_ids(&filtered),
+        vec![ids[0], ids[1], ids[3], ids[4]],
+        "only the file whose range 100..200 excludes 5 < id < 10 may be pruned"
+    );
+}
+
+/// The filter goes inside the query, ahead of `LIMIT`, so the keyset cursor
+/// still reaches every matching file. Applied after the fetch, the page landing
+/// on the pruned file would come back empty and iteration would stop there.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn file_listing_filter_paginates_past_pruned_files() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let filter =
+        seeded_filter(provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id);
+
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = provider
+            .get_table_file_metadata_page_filtered(table_id, snapshot_id, cursor, 1, Some(&filter))
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        seen.extend(listed_ids(&page));
+        cursor = seen.last().copied();
+    }
+    assert_eq!(seen, vec![ids[0], ids[1], ids[3], ids[4]]);
+}
+
+/// A catalog with no `ducklake_file_column_stats` cannot be joined against it,
+/// so the filter is dropped and every file is listed rather than the scan
+/// failing.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn file_listing_filter_falls_open_on_a_catalog_without_statistics() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let filter =
+        seeded_filter(provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id);
+    sqlx::query("DROP TABLE ducklake_file_column_stats")
+        .execute(&pool)
+        .await
+        .expect("drop the statistics table");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(table_id, snapshot_id, None, 4096, Some(&filter))
+        .expect("a legacy catalog must still list its files");
+    assert_eq!(listed_ids(&filtered), ids);
+}
+
+fn listed_ids(files: &[DuckLakeFileMetadata]) -> Vec<i64> {
+    files.iter().map(|file| file.file.data_file_id).collect()
 }

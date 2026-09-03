@@ -20,7 +20,7 @@
 //! For more information, see: <https://duckdb.org/docs/stable/data/parquet/encryption>
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Error message for DuckDB-encrypted files (non-PME compliant)
 pub const DUCKDB_ENCRYPTION_ERROR: &str = "Encrypted Parquet file detected but decryption failed. \
@@ -77,19 +77,32 @@ use parquet::encryption::encrypt::FileEncryptionProperties;
 ///
 /// This factory maintains a mapping of file paths to their encryption keys,
 /// populated from the DuckLake catalog metadata.
+///
+/// The map sits behind a lock so that a caller listing files in pages can hand
+/// out one factory over a key set it goes on adding to ([`Self::shared`]).
+/// Readers that already cloned the factory resolve keys installed after them,
+/// and there is no second copy of the map to fall out of step with the one
+/// being added to.
 #[derive(Clone)]
 pub struct DuckLakeEncryptionFactory {
     /// Map of file paths to their encryption keys (base64 or hex encoded)
-    file_keys: Arc<HashMap<String, String>>,
+    file_keys: Arc<RwLock<HashMap<String, String>>>,
 }
 
 // Custom Debug implementation to avoid exposing encryption keys in logs
 impl std::fmt::Debug for DuckLakeEncryptionFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DuckLakeEncryptionFactory")
-            .field("file_count", &self.file_keys.len())
-            .field("files", &self.file_keys.keys().collect::<Vec<_>>())
-            .finish()
+        let mut out = f.debug_struct("DuckLakeEncryptionFactory");
+        match self.file_keys.read() {
+            Ok(file_keys) => out
+                .field("file_count", &file_keys.len())
+                .field("files", &file_keys.keys().collect::<Vec<_>>()),
+            // Unreadable only if a writer panicked holding the lock. Formatting
+            // must not panic in turn, or the panic that poisoned it cannot be
+            // reported.
+            Err(_) => out.field("file_count", &"poisoned"),
+        }
+        .finish()
     }
 }
 
@@ -99,21 +112,33 @@ impl DuckLakeEncryptionFactory {
     /// # Arguments
     /// * `file_keys` - Map of file paths to encryption keys
     pub fn new(file_keys: HashMap<String, String>) -> Self {
+        Self::shared(Arc::new(RwLock::new(file_keys)))
+    }
+
+    /// Create a factory over a key map its owner goes on adding to.
+    ///
+    /// The factory looks keys up through that same map, so a path installed
+    /// after this call resolves through a factory handed out before it. That is
+    /// what lets a caller listing files in bounded pages keep one factory for
+    /// the whole listing instead of rebuilding it over the accumulated keys
+    /// every page.
+    ///
+    /// # Arguments
+    /// * `file_keys` - Shared map of file paths to encryption keys
+    pub fn shared(file_keys: Arc<RwLock<HashMap<String, String>>>) -> Self {
         Self {
-            file_keys: Arc::new(file_keys),
+            file_keys,
         }
     }
 
     /// Create an empty encryption factory (for tables with no encrypted files).
     pub fn empty() -> Self {
-        Self {
-            file_keys: Arc::new(HashMap::new()),
-        }
+        Self::new(HashMap::new())
     }
 
     /// Check if any files have encryption keys.
     pub fn has_encrypted_files(&self) -> bool {
-        !self.file_keys.is_empty()
+        !self.file_keys.read().unwrap().is_empty()
     }
 
     /// Decode an encryption key from its stored format.
@@ -212,28 +237,33 @@ impl EncryptionFactory for DuckLakeEncryptionFactory {
         // 2. With leading slash added
         // 3. With leading slash removed
         // 4. Normalized comparison (both without leading slash)
-        let key = self
-            .file_keys
-            .get(&path_str)
-            .or_else(|| self.file_keys.get(&format!("/{}", path_str)))
-            .or_else(|| self.file_keys.get(path_str.trim_start_matches('/')))
-            .or_else(|| {
-                // Try matching by normalized paths - useful when absolute paths differ
-                // e.g., stored as "/Users/x/data/file.parquet" but received as "Users/x/data/file.parquet"
-                self.file_keys.iter().find_map(|(stored_path, key)| {
-                    let stored_normalized = stored_path.trim_start_matches('/');
-                    let path_normalized = path_str.trim_start_matches('/');
-                    if stored_normalized == path_normalized {
-                        Some(key)
-                    } else {
-                        None
-                    }
+        // The key is copied out under the read lock rather than held across the
+        // decode below, so an installing writer is never blocked on a decode.
+        let key = {
+            let file_keys = self.file_keys.read().unwrap();
+            file_keys
+                .get(&path_str)
+                .or_else(|| file_keys.get(&format!("/{}", path_str)))
+                .or_else(|| file_keys.get(path_str.trim_start_matches('/')))
+                .or_else(|| {
+                    // Try matching by normalized paths - useful when absolute paths differ
+                    // e.g., stored as "/Users/x/data/file.parquet" but received as "Users/x/data/file.parquet"
+                    file_keys.iter().find_map(|(stored_path, key)| {
+                        let stored_normalized = stored_path.trim_start_matches('/');
+                        let path_normalized = path_str.trim_start_matches('/');
+                        if stored_normalized == path_normalized {
+                            Some(key)
+                        } else {
+                            None
+                        }
+                    })
                 })
-            });
+                .cloned()
+        };
 
         match key {
             Some(encoded_key) => {
-                let key_bytes = Self::decode_key(encoded_key)?;
+                let key_bytes = Self::decode_key(&encoded_key)?;
 
                 // Create decryption properties with the footer key
                 // DuckLake uses uniform encryption (same key for footer and all columns)
@@ -297,7 +327,7 @@ mod tests {
     fn test_empty_factory() {
         let factory = DuckLakeEncryptionFactory::empty();
         assert!(!factory.has_encrypted_files());
-        assert_eq!(factory.file_keys.len(), 0);
+        assert_eq!(factory.file_keys.read().unwrap().len(), 0);
     }
 
     #[test]
@@ -308,7 +338,7 @@ mod tests {
 
         let factory = DuckLakeEncryptionFactory::new(keys);
         assert!(factory.has_encrypted_files());
-        assert_eq!(factory.file_keys.len(), 2);
+        assert_eq!(factory.file_keys.read().unwrap().len(), 2);
     }
 
     #[test]
@@ -320,7 +350,7 @@ mod tests {
         let factory = builder.build();
 
         assert!(factory.has_encrypted_files());
-        assert_eq!(factory.file_keys.len(), 1);
+        assert_eq!(factory.file_keys.read().unwrap().len(), 1);
     }
 
     #[test]
@@ -331,10 +361,28 @@ mod tests {
         builder.add_file("/path/to/file3.parquet", Some("key3"));
         let factory = builder.build();
 
-        assert_eq!(factory.file_keys.len(), 3);
-        assert!(factory.file_keys.contains_key("/path/to/file1.parquet"));
-        assert!(factory.file_keys.contains_key("/path/to/file2.parquet"));
-        assert!(factory.file_keys.contains_key("/path/to/file3.parquet"));
+        assert_eq!(factory.file_keys.read().unwrap().len(), 3);
+        assert!(
+            factory
+                .file_keys
+                .read()
+                .unwrap()
+                .contains_key("/path/to/file1.parquet")
+        );
+        assert!(
+            factory
+                .file_keys
+                .read()
+                .unwrap()
+                .contains_key("/path/to/file2.parquet")
+        );
+        assert!(
+            factory
+                .file_keys
+                .read()
+                .unwrap()
+                .contains_key("/path/to/file3.parquet")
+        );
     }
 
     #[test]
@@ -344,9 +392,9 @@ mod tests {
         builder.add_file("file.parquet", Some("key2"));
         let factory = builder.build();
 
-        assert_eq!(factory.file_keys.len(), 1);
+        assert_eq!(factory.file_keys.read().unwrap().len(), 1);
         assert_eq!(
-            factory.file_keys.get("file.parquet"),
+            factory.file_keys.read().unwrap().get("file.parquet"),
             Some(&"key2".to_string())
         );
     }

@@ -20,7 +20,14 @@
 
 use crate::common;
 
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::common::ScalarValue;
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysColumn, lit};
 use datafusion::prelude::*;
+use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
+use datafusion_ducklake::stats_filter::{StatsFilter, lower_predicate};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckdbMetadataProvider, SqliteMetadataProvider,
     metadata_provider::MetadataProvider,
@@ -1208,4 +1215,463 @@ async fn test_schema_capability_probe_memoized_positive_only() {
 
     // Clones share the memo (the cell is Arc-shared).
     assert!(provider.clone().schema_capabilities_cached());
+}
+
+// ---------------------------------------------------------------------------
+// Statistics filter pushdown (`get_table_file_metadata_page_filtered`)
+// ---------------------------------------------------------------------------
+
+/// A catalog with three files on table 1, plus the per-file statistics table.
+///
+/// SQLite's own `init_schema` above predates `ducklake_file_column_stats`, so
+/// the filter tests create it themselves — which is also what makes the
+/// fail-open test below meaningful.
+/// Register schema 1 and table 1, which `ducklake_data_file` keys on.
+async fn insert_schema_and_table(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_schema
+             (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 'main', 'main/', 1, 1)",
+    )
+    .execute(&provider.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_table
+             (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 1, 'events', 'events/', 1, 1)",
+    )
+    .execute(&provider.pool)
+    .await?;
+    Ok(())
+}
+
+async fn create_provider_with_file_stats() -> anyhow::Result<SqliteMetadataProvider> {
+    let provider = create_sqlite_provider().await?;
+    insert_schema_and_table(&provider).await?;
+    let pool = &provider.pool;
+    sqlx::query(
+        "CREATE TABLE ducklake_file_column_stats (
+            data_file_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
+            column_id INTEGER NOT NULL,
+            column_size_bytes INTEGER,
+            value_count INTEGER,
+            null_count INTEGER,
+            min_value TEXT,
+            max_value TEXT,
+            contains_nan INTEGER
+        )",
+    )
+    .execute(pool)
+    .await?;
+    for data_file_id in 1..=3i64 {
+        sqlx::query(
+            "INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  record_count, row_id_start, begin_snapshot)
+             VALUES (?, 1, ?, 0, 1000, 10, 0, 1)",
+        )
+        .bind(data_file_id)
+        .bind(format!("file{data_file_id}.parquet"))
+        .execute(pool)
+        .await?;
+    }
+    Ok(provider)
+}
+
+/// Give `data_file_id` a statistics row for column 7.
+async fn insert_column_stats(
+    provider: &SqliteMetadataProvider,
+    data_file_id: i64,
+    min_value: Option<&str>,
+    max_value: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, value_count, null_count, min_value, max_value)
+         VALUES (?, 1, 7, 10, 0, ?, ?)",
+    )
+    .bind(data_file_id)
+    .bind(min_value)
+    .bind(max_value)
+    .execute(&provider.pool)
+    .await?;
+    Ok(())
+}
+
+/// Lower `a <op> value` on an `INT32` column whose `column_id` is 7.
+fn int32_filter(operator: Operator, value: i32) -> StatsFilter {
+    let column = Arc::new(PhysColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, operator, lit(value))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+    let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+    lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a statistics filter")
+}
+
+fn file_ids(files: &[datafusion_ducklake::metadata_provider::DuckLakeFileMetadata]) -> Vec<i64> {
+    files.iter().map(|file| file.file.data_file_id).collect()
+}
+
+/// The catalog query itself drops files whose bounds cannot hold a match, and
+/// keeps the ones that can.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_prunes_by_statistics() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_column_stats(&provider, 1, Some("0"), Some("10"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, Some("100"), Some("200"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, Some("60"), Some("70"))
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![2, 3]);
+
+    // Same call without a filter must still see every file.
+    let unfiltered = provider
+        .get_table_file_metadata_page(1, 1, None, 100)
+        .expect("unfiltered page");
+    assert_eq!(file_ids(&unfiltered), vec![1, 2, 3]);
+}
+
+/// The pruning happens inside the query, before `LIMIT`. A page whose first
+/// candidates are all pruned must still return the matching file further along:
+/// filtering after the fetch would return an empty page here, which the keyset
+/// iterator in `FileMetadataPages` reads as "no files left".
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_applies_the_filter_before_limit() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_column_stats(&provider, 1, Some("0"), Some("10"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, Some("11"), Some("20"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, Some("100"), Some("200"))
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let page = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 1, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&page), vec![3]);
+}
+
+/// A bound that is present but not a number must keep the file. SQLite's
+/// `CAST('not-a-number' AS INTEGER)` is `0`, so an unguarded cast would compare
+/// this file's minimum as zero and prune it for `a < 5` — a file that may well
+/// hold matching rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_keeps_a_malformed_bound() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_column_stats(&provider, 1, Some("not-a-number"), Some("10"))
+        .await
+        .unwrap();
+    // A well-formed bound that genuinely cannot match, to prove the filter is
+    // doing something at all.
+    insert_column_stats(&provider, 2, Some("100"), Some("200"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, Some("1"), Some("2"))
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Lt, 5);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 3]);
+}
+
+/// A file with no statistics row for the column, and one whose bound is NULL,
+/// are both kept: neither proves anything about the column's values.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_keeps_files_without_usable_stats() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    // File 1: no stats row at all. File 2: a row with a NULL minimum.
+    insert_column_stats(&provider, 2, None, Some("10"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, Some("100"), Some("200"))
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Lt, 5);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 2]);
+}
+
+/// A catalog with no `ducklake_file_column_stats` at all must still list its
+/// files: joining a table that does not exist is a hard error, so the query
+/// falls back to the unfiltered listing.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_falls_back_without_a_statistics_table() {
+    let provider = create_sqlite_provider().await.unwrap();
+    insert_schema_and_table(&provider).await.unwrap();
+    for data_file_id in 1..=2i64 {
+        sqlx::query(
+            "INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  record_count, row_id_start, begin_snapshot)
+             VALUES (?, 1, ?, 0, 1000, 10, 0, 1)",
+        )
+        .bind(data_file_id)
+        .bind(format!("file{data_file_id}.parquet"))
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    }
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("a legacy catalog still lists files");
+    assert_eq!(file_ids(&filtered), vec![1, 2]);
+}
+
+/// The float bound check runs in SQLite itself, and covers both notations
+/// `stats_encode` writes: a plain decimal and the exponent form it uses outside
+/// `[1e-4, 1e16)`. File 3's bound of `1.5e+20` is above the constant, so it
+/// prunes like any other.
+///
+/// The shape test is what makes the exponent form safe to use: `CAST` stops at
+/// the first byte it cannot read rather than failing, so `'1e'` would come back
+/// as `1.0` and compare as a value the file does not hold.
+/// `filtered_file_page_keeps_a_malformed_bound` covers that direction.
+///
+/// `contains_nan` is `0` on every file here, because a float bound is only
+/// usable at all once the file is known to be NaN-free.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_checks_float_bounds_in_sqlite() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    for (data_file_id, min_value) in [(1i64, "1.5"), (2, "100.5"), (3, "1.5e+20")] {
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, value_count, null_count,
+                  min_value, max_value, contains_nan)
+             VALUES (?, 1, 7, 10, 0, ?, '1000.0', 0)",
+        )
+        .bind(data_file_id)
+        .bind(min_value)
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    }
+
+    let column = Arc::new(PhysColumn::new("f", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, Operator::Lt, lit(5.0f64))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+    let columns = vec![DuckLakeTableColumn::new(7, "f".to_string(), "double".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1]);
+}
+
+/// A date-range filter prunes on SQLite, which has no date type: the comparison
+/// runs on the encoded text, behind a shape test that keeps it chronological.
+///
+/// File 3's bound is the same date written the way `chrono` renders a year past
+/// 9999 (`+12921-08-18`). It sorts below every ordinary date as text, so the
+/// shape test rejects it and the file is kept rather than mis-compared.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_prunes_a_date_range_in_sqlite() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_column_stats(&provider, 1, Some("2024-01-01"), Some("2024-01-31"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, Some("2024-06-15"), Some("2024-07-01"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, Some("+12921-08-18"), Some("+12921-09-01"))
+        .await
+        .unwrap();
+
+    // 19_875 days after the epoch is 2024-06-01.
+    let column = Arc::new(PhysColumn::new("d", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate = Arc::new(BinaryExpr::new(
+        column,
+        Operator::GtEq,
+        lit(ScalarValue::Date32(Some(19_875))),
+    )) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+    let columns = vec![DuckLakeTableColumn::new(7, "d".to_string(), "date".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![2, 3]);
+}
+
+/// The same for a timestamp, including the fractional seconds `stats_encode`
+/// writes and the `+00` suffix it appends to a zoned value.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_prunes_a_timestamp_range_in_sqlite() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_column_stats(
+        &provider,
+        1,
+        Some("2023-11-14 22:13:20+00"),
+        Some("2023-11-14 22:13:20.5+00"),
+    )
+    .await
+    .unwrap();
+    insert_column_stats(
+        &provider,
+        2,
+        Some("2023-11-15 00:00:00+00"),
+        Some("2023-11-16 00:00:00+00"),
+    )
+    .await
+    .unwrap();
+    // Written at another offset, so its text does not order against `+00`.
+    insert_column_stats(
+        &provider,
+        3,
+        Some("2023-11-14 23:13:20+01"),
+        Some("2023-11-14 23:13:20+01"),
+    )
+    .await
+    .unwrap();
+
+    let column = Arc::new(PhysColumn::new("t", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate = Arc::new(BinaryExpr::new(
+        column,
+        Operator::Gt,
+        lit(ScalarValue::TimestampMicrosecond(
+            Some(1_700_000_000_600_000),
+            Some("UTC".into()),
+        )),
+    )) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new(
+        "t",
+        DataType::Timestamp(
+            datafusion::arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        true,
+    )]);
+    let columns =
+        vec![DuckLakeTableColumn::new(7, "t".to_string(), "timestamptz".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    // File 1's maximum is 2023-11-14 22:13:20.5, below the constant .6, so it
+    // is pruned; file 3 is kept because its offset is not the encoding this
+    // comparison is defined for.
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![2, 3]);
+}
+
+/// A selective filter must not read the statistics of the files it pruned.
+///
+/// The two enrichment queries used to be scoped `data_file_id > after AND <=
+/// last`, which is bounded by the page size only while nothing narrows the
+/// listing. With a filter the surviving ids are sparse: three matches at the far
+/// end of a million-file table put `last` near the table maximum, and the first
+/// page's statistics query then returns every stats row below it — unbounded
+/// resident memory, and the whole cost the pushdown exists to remove.
+///
+/// Row *counts* are not observable from the return value, so each pruned file
+/// carries a stats row that cannot be decoded: `value_count` holding the text
+/// `poison`, which SQLite keeps as TEXT in an INTEGER-affinity column and sqlx
+/// refuses to read as an `i64`. Reading one is an error, so the filtered page
+/// succeeding is proof it read none of them — and the unfiltered page below,
+/// whose range does cover them, fails, which is what makes this discriminate
+/// rather than pass vacuously.
+///
+/// The row is on `column_id` 999, which no filter here mentions, so it never
+/// enters the listing query's CTE and cannot change which files survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_reads_no_statistics_for_pruned_files() {
+    let provider = create_sqlite_provider().await.unwrap();
+    insert_schema_and_table(&provider).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE ducklake_file_column_stats (
+            data_file_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
+            column_id INTEGER NOT NULL,
+            column_size_bytes INTEGER,
+            value_count INTEGER,
+            null_count INTEGER,
+            min_value TEXT,
+            max_value TEXT,
+            contains_nan INTEGER
+        )",
+    )
+    .execute(&provider.pool)
+    .await
+    .unwrap();
+
+    // Files 1..=5 cannot hold a value above 50; file 6 can. The match is last,
+    // so `last_data_file_id` is the table maximum and the old range covered
+    // every pruned file.
+    for data_file_id in 1..=6i64 {
+        sqlx::query(
+            "INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  record_count, row_id_start, begin_snapshot)
+             VALUES (?, 1, ?, 0, 1000, 10, 0, 1)",
+        )
+        .bind(data_file_id)
+        .bind(format!("file{data_file_id}.parquet"))
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+        let (min_value, max_value) = if data_file_id == 6 {
+            ("100", "200")
+        } else {
+            ("0", "10")
+        };
+        insert_column_stats(&provider, data_file_id, Some(min_value), Some(max_value))
+            .await
+            .unwrap();
+        if data_file_id < 6 {
+            sqlx::query(
+                "INSERT INTO ducklake_file_column_stats
+                     (data_file_id, table_id, column_id, value_count, null_count,
+                      min_value, max_value)
+                 VALUES (?, 1, 999, 'poison', 0, '0', '10')",
+            )
+            .bind(data_file_id)
+            .execute(&provider.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("the filtered page reads statistics only for the files it returned");
+    assert_eq!(file_ids(&filtered), vec![6]);
+
+    // The same call with no filter returns every file, so its range does reach
+    // the undecodable rows and it fails. That is the behaviour the filtered call
+    // would have had while it scoped by range.
+    let error = provider
+        .get_table_file_metadata_page(1, 1, None, 100)
+        .expect_err("the unfiltered range reaches the undecodable rows");
+    assert!(
+        error.to_string().contains("mismatched types"),
+        "the unfiltered page failed for some reason other than the planted row: {error}"
+    );
 }

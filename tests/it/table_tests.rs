@@ -537,10 +537,16 @@ async fn test_scan_prunes_files_by_statistics() -> DataFusionResult<()> {
 
 /// Pruning composes correctly with the with-deletes scan path: a table where
 /// one file carries a live delete returns correct, delete-applied results under
-/// a selective filter. (A file with a live delete has inexact statistics and is
-/// intentionally never pruned, and its presence suppresses pruning by that
-/// column for the current pass, so this asserts correctness, not a file-count
-/// reduction. See `prune_table_files_iteratively`.)
+/// a selective filter, and that file is pruned like any other when the catalog
+/// statistics rule it out.
+///
+/// A delete file only ever removes rows, so a bound recorded over a file's
+/// physical rows still bounds the rows that survive them — the argument
+/// `restate_in_physical_row_space` sets out in full, and the one official
+/// DuckLake relies on when it prunes delete-bearing files inside its own
+/// file-listing SQL. The catalog-side statistics filter applies it, which is
+/// why the delete-bearing file below disappears from the plan for a filter its
+/// recorded range cannot satisfy.
 #[tokio::test]
 async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
     let temp_dir =
@@ -582,17 +588,33 @@ async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         .expect("tbl present in main schema");
 
-    // Pruning runs over the with-deletes path without error, and the plan still
-    // includes the file that carries the live delete (it is never pruned).
+    // Pruning runs over the with-deletes path without error. `a < 5000` is
+    // satisfiable within the delete-bearing low-range file, so it survives while
+    // the disjoint high-range file is dropped.
     let state = SessionContext::new().state();
     let plan = table
         .scan(&state, None, &[col("a").lt(lit(5000_i32))], None)
         .await?;
     let mut paths = Vec::new();
     collect_partitioned_file_paths(&plan, &mut paths);
-    assert!(
-        !paths.is_empty(),
-        "the file with a live delete is kept, not pruned"
+    assert_eq!(
+        paths.len(),
+        1,
+        "the delete-bearing file matches and is kept, the disjoint one is dropped"
+    );
+
+    // The mirror filter cannot be satisfied anywhere in [0, 999], and a live
+    // delete file no longer exempts a file from that proof: only the high-range
+    // file reaches the plan.
+    let plan = table
+        .scan(&state, None, &[col("a").gt(lit(5000_i32))], None)
+        .await?;
+    let mut paths = Vec::new();
+    collect_partitioned_file_paths(&plan, &mut paths);
+    assert_eq!(
+        paths.len(),
+        1,
+        "the delete-bearing file is pruned on its recorded bounds"
     );
 
     // Correctness across the full range: the delete is applied exactly once, and

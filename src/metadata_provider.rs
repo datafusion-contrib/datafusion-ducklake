@@ -1484,6 +1484,40 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
             .collect())
     }
 
+    /// Load one page of visible files, letting the catalog discard files whose
+    /// statistics prove they cannot match `filter`.
+    ///
+    /// This is the DuckLake filter-pushdown mechanism: official narrows its
+    /// data-file query with per-column CTEs over `ducklake_file_column_stats`
+    /// rather than listing every file and pruning afterwards, so the cost of
+    /// planning a selective query stops scaling with the table. See
+    /// [`crate::stats_filter`], which owns the whole rewrite.
+    ///
+    /// `filter` is advisory in both directions. An implementation may ignore it
+    /// entirely — the default does, which keeps external providers working
+    /// unchanged — and one that honours it must still only ever discard files
+    /// the statistics *prove* cannot match. Returning extra files is always
+    /// correct; returning too few silently loses rows.
+    ///
+    /// Implementations must apply the filter inside the query, before `LIMIT`,
+    /// keeping the `ORDER BY data_file_id` ordering and `after_data_file_id`
+    /// contract of [`Self::get_table_file_metadata_page`] intact. Filtering a
+    /// page *after* fetching it breaks the keyset cursor: a page whose rows all
+    /// fail the filter comes back empty, which
+    /// `FileMetadataPages` reads as "no files left", and every
+    /// matching file beyond it is never visited.
+    fn get_table_file_metadata_page_filtered(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&crate::stats_filter::StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
+        let _ = filter;
+        self.get_table_file_metadata_page(table_id, snapshot_id, after_data_file_id, limit)
+    }
+
     /// Read rows that DuckDB's *data-inlining* optimization stored directly in
     /// the catalog database (not in Parquet), for `table_id` visible at
     /// `snapshot_id`, materialized as Arrow batches in `columns`' physical

@@ -14,6 +14,8 @@ use crate::metadata_provider::{
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
+use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
+use crate::stats_filter::{StatsFilter, StatsLiteral, StatsSqlDialect};
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array, RecordBatch, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -184,6 +186,280 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     message.contains("no such table") || message.contains("does not exist")
 }
 
+/// SQLite spelling of the statistics comparisons in [`crate::stats_filter`].
+///
+/// SQLite has no `TRY_CAST`, and its `CAST` never fails: `CAST('abc' AS REAL)`
+/// is `0.0` and `CAST('abc' AS INTEGER)` is `0`. An unconditional cast would
+/// therefore read a malformed bound as zero and could prune a file that matches,
+/// so every cast below is guarded by a test that the text really is the number
+/// it is about to be read as, and yields SQL `NULL` when it is not.
+/// [`StatsSqlDialect::keep_when_unknown`] turns that `NULL` back into "keep the
+/// file", so a bound this dialect will not read prunes nothing.
+struct SqliteStatsDialect;
+
+impl StatsSqlDialect for SqliteStatsDialect {
+    /// A type not listed here is declined, which drops the comparison and
+    /// prunes nothing. `DECIMAL` is the notable one: SQLite's only numeric with
+    /// a fractional part is `REAL`, and a `DECIMAL(38, s)` constant can carry
+    /// more significant digits than a double, so two decimals this engine
+    /// orders can round to one value and compare equal.
+    ///
+    /// Temporal types are accepted only when *both* sides are canonically
+    /// encoded, which is why the constant is inspected here. SQLite has no
+    /// temporal type, so the comparison stays in the text domain, where order
+    /// matches chronology only for the fixed-width four-digit-year encoding:
+    /// `chrono` renders a year past 9999 as `+12345` and a negative one as
+    /// `-0044`, and `+` and `-` both sort below every digit, so one of those on
+    /// either side would invert the comparison. The stat is checked in SQL and
+    /// the constant right here.
+    fn try_cast(&self, expr: &str, literal: &StatsLiteral, data_type: &DataType) -> Option<String> {
+        match data_type {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64 => {
+                // Round-tripping back to TEXT proves the cast consumed the
+                // whole string and lost nothing: `'abc'` and `''` return as
+                // `'0'`, `'1.5'` as `'1'`, and a value past `i64::MAX`
+                // saturates, so all of them fail the comparison. Integer to
+                // text is exact in SQLite, so a value that does round-trip is
+                // compared exactly, including the full 64-bit range.
+                Some(format!(
+                    "CASE WHEN {expr} = CAST(CAST({expr} AS INTEGER) AS TEXT) \
+                     THEN CAST({expr} AS INTEGER) END"
+                ))
+            },
+            // That round trip cannot vet a REAL: SQLite renders a double back to
+            // text with 15 significant digits, so an exact cast of
+            // `0.30000000000000004` still returns as `0.3`. The text is checked
+            // directly instead. `CAST(... AS REAL)` parses a well-formed decimal
+            // to the nearest double, which is what `stats_encode` wrote and what
+            // SQLite reads the constant as, so the comparison is exact.
+            DataType::Float32 | DataType::Float64 => Some(format!(
+                "CASE WHEN {} THEN CAST({expr} AS REAL) END",
+                sqlite_is_float_text(expr)
+            )),
+            // A boolean stat is the text `true` / `false` and the constant is
+            // rendered quoted, so comparing them as text is both well-defined
+            // and correctly ordered ('false' < 'true'). Any other spelling is
+            // not this encoding, and reading it as a boolean would be a guess.
+            DataType::Boolean => Some(sqlite_guarded_text(
+                expr,
+                &format!("{} IN ('true', 'false')", self.collate_binary(expr)),
+            )),
+            // `YYYY-MM-DD`: fixed width, so text order is date order.
+            DataType::Date32 if is_canonical_date(literal.text()) => {
+                Some(sqlite_guarded_text(expr, &sqlite_is_canonical_date(expr)))
+            },
+            // `YYYY-MM-DD HH:MM:SS[.fff]`. The time unit does not matter — what
+            // matters is the shape both sides are written in. A shorter string
+            // is a prefix of a longer one and so sorts below it, which is right:
+            // no fraction is a zero fraction, and `stats_encode` trims trailing
+            // zeros so `.5` and `.50` cannot both occur.
+            DataType::Timestamp(_, None) if is_canonical_timestamp(literal.text()) => Some(
+                sqlite_guarded_text(expr, &sqlite_is_canonical_timestamp(expr)),
+            ),
+            // The same, plus the `+00` suffix `stats_encode` appends after
+            // normalizing to UTC. The suffix is constant across everything the
+            // guard admits, so it does not disturb the ordering; a catalog
+            // written at another offset is declined rather than compared, since
+            // `12:00:00+01` sorts above `12:00:00+00` and is earlier.
+            DataType::Timestamp(_, Some(_)) if is_canonical_timestamptz(literal.text()) => Some(
+                sqlite_guarded_text(expr, &sqlite_is_canonical_timestamptz(expr)),
+            ),
+            _ => None,
+        }
+    }
+
+    /// SQLite's default collation is already byte-wise, but a catalog is free to
+    /// declare `min_value` / `max_value` `COLLATE NOCASE`, and a comparison
+    /// takes its collation from the column when the other side is a plain
+    /// literal. Naming it keeps the comparison byte-wise like DataFusion's.
+    fn collate_binary(&self, expr: &str) -> String {
+        format!("{expr} COLLATE BINARY")
+    }
+
+    /// `contains_nan` is stored as SQLite's `0` / `1`, so this compares against
+    /// `0` rather than a boolean keyword. Any other stored spelling compares
+    /// unequal to `0`, which reads as "NaN state unknown" and keeps the file.
+    fn boolean_is_not_false(&self, expr: &str) -> String {
+        format!("{expr} IS NULL OR {expr} <> 0")
+    }
+}
+
+/// SQL that is true only when `expr` holds text that `CAST(... AS REAL)` reads
+/// as exactly the number it spells: an optional leading `-`, then digits around
+/// a single `.`, with at least one digit present.
+///
+/// `CAST` stops at the first character it cannot use, so `'1.2.3'` becomes
+/// `1.2`, `'1e'` becomes `1.0` and `'abc'` becomes `0.0`; only a whole-string
+/// match rules those out. Exponent notation — which `stats_encode` emits outside
+/// `[1e-4, 1e16)` — and `inf` deliberately do not match: those bounds prune
+/// nothing rather than risk a partial parse.
+/// Whether a stat is a float exactly as [`crate::stats_encode`] writes one, in
+/// either notation it uses.
+///
+/// SQLite has no regular expressions in a stock build, so both shapes are
+/// pinned with `GLOB`, `instr` and `substr`.
+fn sqlite_is_float_text(expr: &str) -> String {
+    format!(
+        "(({}) OR ({}))",
+        sqlite_is_fixed_decimal_text(expr),
+        sqlite_is_scientific_text(expr)
+    )
+}
+
+/// The scientific notation `stats_encode` writes for any magnitude outside
+/// `[1e-4, 1e16)`: a mantissa, `e`, a sign, then digits.
+///
+/// The shape has to be checked because `CAST` stops at the first byte it cannot
+/// use rather than failing — `CAST('1e' AS REAL)` is `1.0` and
+/// `CAST('1e+2.5' AS REAL)` is `100.0`, both of which would compare as a value
+/// the file does not contain. Everything this admits casts to exactly the double
+/// `stats_encode` wrote, which is also how SQLite reads the constant, so the
+/// comparison is exact.
+///
+/// `inf` and `-inf` are not admitted here and are not meant to be: SQLite reads
+/// either as `0.0`, so a file carrying one contributes no usable bound and is
+/// kept.
+fn sqlite_is_scientific_text(expr: &str) -> String {
+    let e = format!("instr({expr}, 'e')");
+    let mantissa = format!("substr({expr}, 1, {e} - 1)");
+    let exponent = format!("substr({expr}, {e} + 2)");
+    format!(
+        // A mantissa before the `e`, by the same reasoning as the fixed form
+        // except that the dot is optional — `1e+20` has none — so stripping
+        // digits from both ends must leave either nothing or exactly the dot.
+        "{e} > 1 \
+         AND {mantissa} GLOB '[-0-9]*' AND NOT ({mantissa} GLOB '?*-*') \
+         AND ltrim({mantissa}, '-') GLOB '*[0-9]*' \
+         AND rtrim(ltrim(ltrim({mantissa}, '-'), '0123456789'), '0123456789') IN ('', '.') \
+         AND substr({expr}, {e} + 1, 1) GLOB '[-+]' \
+         AND length({expr}) > {e} + 1 \
+         AND {exponent} GLOB '[0-9]*' AND NOT ({exponent} GLOB '*[^0-9]*')"
+    )
+}
+
+fn sqlite_is_fixed_decimal_text(expr: &str) -> String {
+    // `ltrim(x, '-')` drops the sign, and the `?*-*` test rejects a `-` anywhere
+    // but the front so a second one cannot survive that. Stripping leading and
+    // then trailing digits from what is left must expose exactly the `.`, which
+    // is what pins the shape to one dot with digits around it.
+    format!(
+        "{expr} GLOB '[-0-9]*' AND NOT ({expr} GLOB '?*-*') \
+         AND ltrim({expr}, '-') GLOB '*[0-9]*' \
+         AND rtrim(ltrim(ltrim({expr}, '-'), '0123456789'), '0123456789') = '.'"
+    )
+}
+
+/// `expr` compared as text, but only where `guard` holds — SQL `NULL`
+/// elsewhere, which keeps the file.
+///
+/// The collation is named on the `CASE` rather than inside it so it applies to
+/// the value the comparison actually sees.
+fn sqlite_guarded_text(expr: &str, guard: &str) -> String {
+    format!("CASE WHEN {guard} THEN {expr} END COLLATE BINARY")
+}
+
+/// GLOB pattern for a canonical `YYYY-MM-DD`, four digits of year included.
+const SQLITE_DATE_GLOB: &str = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]";
+
+/// SQL that is true only when `expr` holds a canonical DuckLake date.
+fn sqlite_is_canonical_date(expr: &str) -> String {
+    format!("{expr} GLOB '{SQLITE_DATE_GLOB}'")
+}
+
+/// SQL that is true only when `expr` holds a canonical DuckLake timestamp:
+/// `YYYY-MM-DD HH:MM:SS`, optionally followed by `.` and digits that do not end
+/// in `0`.
+///
+/// The first 19 characters are pinned by the pattern, so every accepted value
+/// has its fields in the same fixed-width positions. The fractional part is
+/// checked separately because GLOB cannot say "one or more digits": position 20
+/// must be a `.` followed by at least one digit, everything after it must be a
+/// digit, and a trailing `0` is refused so that `.5` and `.50` — equal values
+/// with different text order — cannot both be admitted.
+fn sqlite_is_canonical_timestamp(expr: &str) -> String {
+    format!(
+        "{expr} GLOB '{SQLITE_DATE_GLOB} [0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' \
+         AND (substr({expr}, 20) = '' \
+              OR (substr({expr}, 20) GLOB '.[0-9]*' \
+                  AND ltrim(substr({expr}, 21), '0123456789') = '' \
+                  AND NOT ({expr} GLOB '*0')))"
+    )
+}
+
+/// SQL that is true only when `expr` holds a canonical DuckLake UTC timestamp:
+/// a canonical timestamp with `stats_encode`'s `+00` suffix.
+fn sqlite_is_canonical_timestamptz(expr: &str) -> String {
+    // Check the timestamp on the value with the suffix removed. Truncating a
+    // string shorter than the suffix yields '', which fails the shape test, and
+    // the suffix test has already required the three characters anyway.
+    let body = format!("substr({expr}, 1, length({expr}) - 3)");
+    format!(
+        "{expr} GLOB '*+00' AND {}",
+        sqlite_is_canonical_timestamp(&body)
+    )
+}
+
+/// Whether `text` is `YYYY-MM-DD` with a four-digit year.
+/// The SQL a lowered statistics filter contributes to the file-listing query.
+struct StatsFilterSql {
+    /// `WITH col_<id>_stats AS (...), ...`, newline-terminated so it can be
+    /// prefixed straight onto the `SELECT`.
+    cte: String,
+    /// One `LEFT JOIN` per column CTE.
+    joins: String,
+    /// The rendered per-column conditions, each already prefixed with `AND`.
+    conditions: String,
+}
+
+/// Render `filter` for SQLite, or `None` when it contributes nothing.
+///
+/// Adds no bind parameters: [`crate::stats_filter`] inlines every literal, and
+/// the only other values spliced in are `i64`s this process computed. The
+/// caller's parameter list and its order are therefore untouched.
+fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<StatsFilterSql> {
+    let rendered = filter?.render(&SqliteStatsDialect)?;
+    let mut cte = String::from("WITH ");
+    let mut joins = String::new();
+    let mut conditions = String::new();
+    for (index, column) in rendered.iter().enumerate() {
+        if index > 0 {
+            cte.push_str(",\n     ");
+        }
+        let alias = &column.alias;
+        let stats = column.stats.join(", ");
+        let column_id = column.column_id;
+        cte.push_str(&format!(
+            "{alias} AS (SELECT data_file_id, {stats}
+                 FROM ducklake_file_column_stats
+                 WHERE column_id = {column_id} AND table_id = {table_id})"
+        ));
+        joins.push_str(&format!(
+            "
+                 LEFT JOIN {alias} ON {alias}.data_file_id = data.data_file_id"
+        ));
+        // The condition arrives already wrapped in its no-stats, per-stat and
+        // unknown guards, so it is spliced verbatim.
+        conditions.push_str(&format!(
+            "
+                   AND {}",
+            column.condition
+        ));
+    }
+    cte.push('\n');
+    Some(StatsFilterSql {
+        cte,
+        joins,
+        conditions,
+    })
+}
+
 /// Optional catalog-schema capabilities probed before scan / CDC / inlined-data
 /// queries.
 ///
@@ -302,6 +578,32 @@ impl SqliteMetadataProvider {
             let _ = self.schema_capabilities.set(caps);
         }
         Ok(caps)
+    }
+
+    /// Bind and run one page of the file-listing query.
+    ///
+    /// The parameter list is identical for the filtered and unfiltered
+    /// spellings of that query — `stats_filter_sql` inlines everything it needs
+    /// — which is what lets the caller retry with the filter dropped.
+    async fn fetch_file_page(
+        &self,
+        sql: &str,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: i64,
+    ) -> std::result::Result<Vec<SqliteRow>, sqlx::Error> {
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(table_id)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .bind(after_data_file_id.unwrap_or(i64::MIN))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
     }
 }
 
@@ -735,6 +1037,23 @@ impl MetadataProvider for SqliteMetadataProvider {
         after_data_file_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<DuckLakeFileMetadata>> {
+        self.get_table_file_metadata_page_filtered(
+            table_id,
+            snapshot_id,
+            after_data_file_id,
+            limit,
+            None,
+        )
+    }
+
+    fn get_table_file_metadata_page_filtered(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: Option<i64>,
+        limit: usize,
+        filter: Option<&StatsFilter>,
+    ) -> Result<Vec<DuckLakeFileMetadata>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -763,8 +1082,23 @@ impl MetadataProvider for SqliteMetadataProvider {
             } else {
                 "NULL"
             };
-            let sql = format!(
-                "SELECT
+            // The statistics filter narrows the list inside this query, before
+            // LIMIT and with the `ORDER BY data.data_file_id` keyset ordering
+            // intact. Filtering a fetched page instead would break the cursor in
+            // `crate::table::FileMetadataPages`: a page whose candidates all
+            // fail the filter comes back empty, which reads as "no files left",
+            // and every matching file beyond it is never visited.
+            let filter_sql = stats_filter_sql(filter, table_id);
+            let build_sql = |filter_sql: Option<&StatsFilterSql>| {
+                let (cte, joins, conditions) = filter_sql.map_or(("", "", ""), |sql| {
+                    (
+                        sql.cte.as_str(),
+                        sql.joins.as_str(),
+                        sql.conditions.as_str(),
+                    )
+                });
+                format!(
+                    "{cte}SELECT
                     data.data_file_id, data.path, data.path_is_relative,
                     data.file_size_bytes, data.footer_size, data.encryption_key,
                     data.row_id_start, data.record_count,
@@ -778,25 +1112,48 @@ impl MetadataProvider for SqliteMetadataProvider {
                    ON data.data_file_id = del.data_file_id
                   AND del.table_id = ?
                   AND ? >= del.begin_snapshot
-                  AND (? < del.end_snapshot OR del.end_snapshot IS NULL)
+                  AND (? < del.end_snapshot OR del.end_snapshot IS NULL){joins}
                  WHERE data.table_id = ?
                    AND ? >= data.begin_snapshot
                    AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
-                   AND data.data_file_id > ?
+                   AND data.data_file_id > ?{conditions}
                  ORDER BY data.data_file_id
                  LIMIT ?"
-            );
-            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(after_data_file_id.unwrap_or(i64::MIN))
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?;
+                )
+            };
+            let rows = match self
+                .fetch_file_page(
+                    &build_sql(filter_sql.as_ref()),
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                )
+                .await
+            {
+                Ok(rows) => rows,
+                // The filter is advisory, so a catalog the narrowed query cannot
+                // run — most importantly one predating `ducklake_file_column_stats`,
+                // where joining it is a hard error — still lists its files. The
+                // retry uses the same parameters, and a failure that is not the
+                // filter's fault surfaces from it.
+                Err(error) if filter_sql.is_some() => {
+                    tracing::debug!(
+                        %error,
+                        table_id,
+                        "statistics-filtered file listing failed; listing every file"
+                    );
+                    self.fetch_file_page(
+                        &build_sql(None),
+                        table_id,
+                        snapshot_id,
+                        after_data_file_id,
+                        limit,
+                    )
+                    .await?
+                },
+                Err(error) => return Err(error.into()),
+            };
             let files = rows
                 .iter()
                 .map(|row| {
@@ -810,8 +1167,50 @@ impl MetadataProvider for SqliteMetadataProvider {
             let Some(last_data_file_id) = files.last().map(|file| file.data_file_id) else {
                 return Ok(Vec::new());
             };
+            // A filtered page's ids are sparse within `(after, last]`, so the
+            // two enrichment queries below are restricted to the ids actually
+            // returned rather than to that whole range. Unfiltered the range
+            // holds at most one page of files, but a selective filter can put a
+            // handful of survivors at the far end of a million-file table, and
+            // the range would then pull back the statistics of every file the
+            // filter just pruned — the exact cost the pushdown exists to remove,
+            // and unbounded resident memory besides.
+            //
+            // The ids are inlined rather than bound as one parameter, which is
+            // what the PostgreSQL provider does. That is a dialect difference,
+            // not a disagreement: `= ANY($n::bigint[])` needs an array type,
+            // and PostgreSQL is the only one of these engines that has one (and
+            // the only one sqlx 0.9 can bind a `Vec<i64>` to). SQLite's nearest
+            // shape, `json_each` over a bound JSON document, would put the
+            // JSON functions of whatever SQLite the build links between a
+            // caller and its file listing. Ids are `i64`, so inlining them adds
+            // no bind parameter and the parameter lists stay as they are.
+            //
+            // Inlining does give every page a distinct query string, and sqlx
+            // keys its per-connection prepared-statement cache on that string.
+            // Both queries below are therefore non-persistent whenever they
+            // carry ids: sqlx then holds them in the driver's single scratch
+            // slot rather than the cache, which holds 100 statements by default
+            // and would otherwise fill with per-page strings that never repeat
+            // and evict the listing query along with everything else the
+            // connection had prepared. Preparing is local here, so what a fresh
+            // string costs SQLite is a parse — the round trip PostgreSQL would
+            // spend on Parse/Describe per page is the other half of why it
+            // binds instead.
+            let page_ids = filter_sql.as_ref().map(|_| {
+                files
+                    .iter()
+                    .map(|file| file.data_file_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            });
+            let page_id_filter = |column: &str| {
+                page_ids.as_ref().map_or_else(String::new, |ids| {
+                    format!("\n                   AND {column} IN ({ids})")
+                })
+            };
 
-            let statistics = match sqlx::query(
+            let statistics = match sqlx::query(AssertSqlSafe(format!(
                 "SELECT stats.data_file_id, stats.column_id,
                         stats.column_size_bytes, stats.value_count, stats.null_count,
                         stats.min_value, stats.max_value, stats.contains_nan
@@ -823,14 +1222,17 @@ impl MetadataProvider for SqliteMetadataProvider {
                    AND ? >= data.begin_snapshot
                    AND (? < data.end_snapshot OR data.end_snapshot IS NULL)
                    AND stats.data_file_id > ?
-                   AND stats.data_file_id <= ?
+                   AND stats.data_file_id <= ?{}
                  ORDER BY stats.data_file_id, stats.column_id",
-            )
+                page_id_filter("stats.data_file_id")
+            )))
             .bind(table_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(after_data_file_id.unwrap_or(i64::MIN))
             .bind(last_data_file_id)
+            // Cacheable only while the text is stable; see the note above.
+            .persistent(page_ids.is_none())
             .fetch_all(&self.pool)
             .await
             {
@@ -863,12 +1265,17 @@ impl MetadataProvider for SqliteMetadataProvider {
             // Enrich with per-file partition values (for pruning), scoped to the
             // page's data_file_id range. Missing partition table => no enrichment.
             let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-            match sqlx::query(SQL_GET_FILE_PARTITION_VALUES)
-                .bind(table_id)
-                .bind(after_data_file_id.unwrap_or(i64::MIN))
-                .bind(last_data_file_id)
-                .fetch_all(&self.pool)
-                .await
+            match sqlx::query(AssertSqlSafe(format!(
+                "{SQL_GET_FILE_PARTITION_VALUES}{}",
+                page_id_filter("data_file_id")
+            )))
+            .bind(table_id)
+            .bind(after_data_file_id.unwrap_or(i64::MIN))
+            .bind(last_data_file_id)
+            // Cacheable only while the text is stable; see the note above.
+            .persistent(page_ids.is_none())
+            .fetch_all(&self.pool)
+            .await
             {
                 Ok(rows) => {
                     for row in rows {
@@ -1792,5 +2199,199 @@ WHERE data.table_id = ?
                 })
                 .collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats_filter::lower_predicate;
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use datafusion::common::ScalarValue;
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column, lit};
+
+    /// Lower `a < <value>` on a column of `data_type` whose `column_id` is 1.
+    fn lower_one(data_type: DataType, value: ScalarValue) -> crate::stats_filter::StatsFilter {
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Lt, lit(value))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", data_type, true)]);
+        let columns = vec![DuckLakeTableColumn::new(1, "a".to_string(), "x".to_string(), true)];
+        lower_predicate(&predicate, &schema, &columns).expect("lowered")
+    }
+
+    fn int32_column(column_id: i64) -> (Schema, Vec<DuckLakeTableColumn>) {
+        (
+            Schema::new(vec![Field::new("a", DataType::Int32, true)]),
+            vec![DuckLakeTableColumn::new(column_id, "a".to_string(), "int32".to_string(), true)],
+        )
+    }
+
+    /// The shape of `a > 5 AND a < 10` on an `INTEGER` column, as the listing
+    /// query splices it. Both conjuncts read a bound and neither reads
+    /// `null_count`, so the CTE also selects `value_count` for the guard.
+    #[test]
+    fn renders_a_two_conjunct_integer_filter() {
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::clone(&column),
+                Operator::Gt,
+                lit(5i32),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(column, Operator::Lt, lit(10i32))),
+        )) as Arc<dyn PhysicalExpr>;
+        let (schema, columns) = int32_column(7);
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 42).expect("rendered");
+        println!("CTE:\n{}", sql.cte);
+        println!("JOINS:{}", sql.joins);
+        println!("CONDITIONS:{}", sql.conditions);
+
+        assert!(
+            sql.cte
+                .starts_with("WITH col_7_stats AS (SELECT data_file_id, ")
+        );
+        assert!(sql.cte.contains("min_value, max_value, value_count"));
+        assert!(sql.cte.contains("WHERE column_id = 7 AND table_id = 42)"));
+        assert!(
+            sql.joins
+                .contains("LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id")
+        );
+        // Both bounds are read through the round-trip guard, and the whole
+        // condition fails open on a malformed one.
+        assert!(sql.conditions.contains(
+            "CASE WHEN col_7_stats.max_value = CAST(CAST(col_7_stats.max_value AS INTEGER) AS TEXT) \
+             THEN CAST(col_7_stats.max_value AS INTEGER) END > 5"
+        ));
+        assert!(sql.conditions.trim_end().ends_with(") IS NOT FALSE"));
+    }
+
+    /// A float bound is read through the text check, and the whole condition
+    /// sits behind the `contains_nan` gate: catalog bounds exclude NaN, and
+    /// DataFusion orders a negative NaN below every value, so neither bound can
+    /// be trusted while the NaN state is unknown or positive.
+    #[test]
+    fn renders_a_float_filter_behind_the_nan_gate() {
+        let column = Arc::new(Column::new("f", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Lt, lit(5.0f64))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        let columns =
+            vec![DuckLakeTableColumn::new(2, "f".to_string(), "double".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        println!("CONDITIONS:{}", sql.conditions);
+        assert!(sql.cte.contains("min_value, value_count, contains_nan"));
+        assert!(
+            sql.conditions
+                .contains("(col_2_stats.contains_nan IS NULL OR col_2_stats.contains_nan <> 0)")
+        );
+        // The bound is only read as a number when the whole text is one.
+        assert!(sql.conditions.contains(
+            "rtrim(ltrim(ltrim(col_2_stats.min_value, '-'), '0123456789'), '0123456789') = '.'"
+        ));
+        assert!(
+            sql.conditions
+                .contains("THEN CAST(col_2_stats.min_value AS REAL) END < 5.0")
+        );
+    }
+
+    /// A `DECIMAL` comparison is declined outright, so the column contributes
+    /// no CTE, no join and no condition at all.
+    #[test]
+    fn declines_decimal_comparisons() {
+        let filter = lower_one(
+            DataType::Decimal128(10, 2),
+            ScalarValue::Decimal128(Some(1234), 10, 2),
+        );
+        assert!(stats_filter_sql(Some(&filter), 1).is_none());
+    }
+
+    /// A date is compared as text, behind a shape test that pins the stat to the
+    /// same fixed-width encoding the constant is in.
+    #[test]
+    fn renders_a_date_filter_as_a_guarded_text_comparison() {
+        // 19_723 days after the epoch is 2024-01-01.
+        let filter = lower_one(DataType::Date32, ScalarValue::Date32(Some(19_723)));
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        println!("CONDITIONS:{}", sql.conditions);
+        assert!(sql.conditions.contains(
+            "CASE WHEN col_1_stats.min_value GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' \
+             THEN col_1_stats.min_value END COLLATE BINARY < '2024-01-01'"
+        ));
+    }
+
+    /// A constant outside the canonical four-digit-year encoding is declined:
+    /// `chrono` writes those years with a leading `+` or `-`, which sort below
+    /// every digit and would invert the text comparison. `stats_encode` renders
+    /// 4_000_000 days after the epoch as `+12921-08-18` and 800_000 before it as
+    /// `-0221-09-04`.
+    #[test]
+    fn declines_a_date_constant_outside_the_canonical_encoding() {
+        for days in [4_000_000, -800_000] {
+            let filter = lower_one(DataType::Date32, ScalarValue::Date32(Some(days)));
+            assert!(
+                stats_filter_sql(Some(&filter), 1).is_none(),
+                "date at {days} days must not render"
+            );
+        }
+    }
+
+    /// A timestamp is compared as text too, fraction and all, and the UTC suffix
+    /// `stats_encode` appends is part of the shape the stat must match.
+    #[test]
+    fn renders_timestamp_filters_with_and_without_a_zone() {
+        let filter = lower_one(
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            ScalarValue::TimestampMicrosecond(Some(1_700_000_000_500_000), None),
+        );
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        println!("NAIVE:{}", sql.conditions);
+        assert!(sql.conditions.contains("< '2023-11-14 22:13:20.5'"));
+        assert!(
+            sql.conditions
+                .contains("OR (substr(col_1_stats.min_value, 20) GLOB '.[0-9]*'")
+        );
+
+        let filter = lower_one(
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), Some("UTC".into())),
+        );
+        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        println!("ZONED:{}", sql.conditions);
+        assert!(sql.conditions.contains("< '2023-11-14 22:13:20+00'"));
+        assert!(
+            sql.conditions
+                .contains("col_1_stats.min_value GLOB '*+00' AND substr(col_1_stats.min_value, 1, length(col_1_stats.min_value) - 3) GLOB")
+        );
+    }
+
+    /// The canonical-encoding tests above are only meaningful if the checks
+    /// agree with what `stats_encode` actually writes.
+    #[test]
+    fn the_canonical_checks_accept_what_the_encoder_writes() {
+        assert!(is_canonical_date("2024-01-01"));
+        assert!(!is_canonical_date("+12921-08-18"));
+        assert!(!is_canonical_date("-0221-09-04"));
+        assert!(!is_canonical_date("2024-01-01 00:00:00"));
+
+        assert!(is_canonical_timestamp("2023-11-14 22:13:20"));
+        assert!(is_canonical_timestamp("2023-11-14 22:13:20.5"));
+        assert!(is_canonical_timestamp("2023-11-14 22:13:20.123456"));
+        // Equal to `.5` but ordered above it as text, so never admitted.
+        assert!(!is_canonical_timestamp("2023-11-14 22:13:20.50"));
+        assert!(!is_canonical_timestamp("2023-11-14 22:13:20."));
+        assert!(!is_canonical_timestamp("2023-11-14 22:13:20+00"));
+        assert!(!is_canonical_timestamp("2024-01-01"));
+
+        assert!(is_canonical_timestamptz("2023-11-14 22:13:20+00"));
+        assert!(is_canonical_timestamptz("2023-11-14 22:13:20.5+00"));
+        // Another offset orders wrongly against `+00`, so it is not canonical.
+        assert!(!is_canonical_timestamptz("2023-11-14 22:13:20+01"));
+        assert!(!is_canonical_timestamptz("2023-11-14 22:13:20"));
     }
 }

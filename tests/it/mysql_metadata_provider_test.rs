@@ -20,7 +20,13 @@
 
 use crate::common;
 
+use arrow::datatypes::{DataType, Field, Schema};
+use datafusion::logical_expr::Operator;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysColumn, lit};
 use datafusion::prelude::*;
+use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
+use datafusion_ducklake::stats_filter::{StatsFilter, lower_predicate};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckdbMetadataProvider, MySqlMetadataProvider,
     metadata_provider::MetadataProvider,
@@ -1193,4 +1199,509 @@ async fn test_connect_caching_sha2_password_without_tls() {
         snapshots.is_empty(),
         "freshly initialized catalog should have no snapshots"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Statistics filter pushdown (`get_table_file_metadata_page_filtered`)
+// ---------------------------------------------------------------------------
+
+/// A catalog with `file_count` files on table 1 and a per-file statistics
+/// table.
+///
+/// MySQL's `init_schema` above predates both `ducklake_file_column_stats` and
+/// the file columns the paged listing projects, so this adds them — which is
+/// also what makes the fail-open test below meaningful.
+async fn create_provider_with_file_stats(
+    file_count: i64,
+) -> anyhow::Result<(MySqlMetadataProvider, testcontainers::ContainerAsync<Mysql>)> {
+    let (provider, container) = create_mysql_provider().await?;
+    let pool = &provider.pool;
+    sqlx::query(
+        "ALTER TABLE ducklake_data_file
+             ADD COLUMN record_count BIGINT,
+             ADD COLUMN row_id_start BIGINT,
+             ADD COLUMN mapping_id BIGINT",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE ducklake_file_column_stats (
+            data_file_id BIGINT NOT NULL,
+            table_id BIGINT NOT NULL,
+            column_id BIGINT NOT NULL,
+            column_size_bytes BIGINT,
+            value_count BIGINT,
+            null_count BIGINT,
+            min_value VARCHAR(4000),
+            max_value VARCHAR(4000),
+            contains_nan BOOLEAN
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_schema
+             (schema_id, schema_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 'main', 'main/', TRUE, 1)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO ducklake_table
+             (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 1, 'events', 'events/', TRUE, 1)",
+    )
+    .execute(pool)
+    .await?;
+    for data_file_id in 1..=file_count {
+        sqlx::query(
+            "INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  record_count, row_id_start, begin_snapshot)
+             VALUES (?, 1, ?, FALSE, 1000, 10, 0, 1)",
+        )
+        .bind(data_file_id)
+        .bind(format!("file{data_file_id}.parquet"))
+        .execute(pool)
+        .await?;
+    }
+    Ok((provider, container))
+}
+
+/// Give `data_file_id` a statistics row for `column_id`.
+async fn insert_column_stats(
+    provider: &MySqlMetadataProvider,
+    data_file_id: i64,
+    column_id: i64,
+    min_value: Option<&str>,
+    max_value: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, value_count, null_count, min_value, max_value)
+         VALUES (?, 1, ?, 10, 0, ?, ?)",
+    )
+    .bind(data_file_id)
+    .bind(column_id)
+    .bind(min_value)
+    .bind(max_value)
+    .execute(&provider.pool)
+    .await?;
+    Ok(())
+}
+
+/// Lower `a <op> value` on an `INT32` column whose `column_id` is 7.
+fn int32_filter(operator: Operator, value: i32) -> StatsFilter {
+    let column = Arc::new(PhysColumn::new("a", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, operator, lit(value))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+    let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+    lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a statistics filter")
+}
+
+fn file_ids(files: &[datafusion_ducklake::metadata_provider::DuckLakeFileMetadata]) -> Vec<i64> {
+    files.iter().map(|file| file.file.data_file_id).collect()
+}
+
+/// The catalog query drops files whose bounds cannot hold a match; a file with
+/// no statistics row, a NULL bound, or a bound that is not a number is kept.
+///
+/// MySQL's `CAST('not-a-number' AS DECIMAL)` is `0` with a warning, so the
+/// malformed case is the one an unguarded cast would silently prune.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_prunes_by_statistics() {
+    let (provider, _container) = create_provider_with_file_stats(5).await.unwrap();
+    // `a < 5` reads min_value only. 1: matches. 2: cannot match. 3: malformed
+    // minimum. 4: NULL minimum. 5: no statistics row at all.
+    insert_column_stats(&provider, 1, 7, Some("1"), Some("2"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, 7, Some("100"), Some("200"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 3, 7, Some("not-a-number"), Some("10"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 4, 7, None, Some("10"))
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Lt, 5);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 3, 4, 5]);
+
+    // The same call without a filter still sees every file.
+    let unfiltered = provider
+        .get_table_file_metadata_page(1, 1, None, 100)
+        .expect("unfiltered page");
+    assert_eq!(file_ids(&unfiltered), vec![1, 2, 3, 4, 5]);
+
+    // The filter is applied before LIMIT: file 2 is pruned inside the query, so
+    // the one-row page after file 1 returns file 3 rather than nothing.
+    let page = provider
+        .get_table_file_metadata_page_filtered(1, 1, Some(1), 1, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&page), vec![3]);
+}
+
+/// String bounds are compared byte-wise, not under MySQL's default
+/// `utf8mb4_0900_ai_ci`.
+///
+/// File 1's bounds are `Zebra` .. `apple`, a valid range byte-wise ('Z' is
+/// 0x5A, 'a' is 0x61) that contains `apple`. Under the case-insensitive
+/// collation `'apple' >= 'Zebra'` is false, so the file would be pruned even
+/// though it may hold matching rows.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_compares_strings_byte_wise() {
+    let (provider, _container) = create_provider_with_file_stats(2).await.unwrap();
+    insert_column_stats(&provider, 1, 8, Some("Zebra"), Some("apple"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, 8, Some("b"), Some("c"))
+        .await
+        .unwrap();
+
+    let column = Arc::new(PhysColumn::new("s", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, Operator::Eq, lit("apple"))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let columns = vec![DuckLakeTableColumn::new(8, "s".to_string(), "varchar".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1]);
+}
+
+/// A stat with a trailing line terminator is refused, not compared.
+///
+/// MySQL 8's `REGEXP` is ICU, where `$` matches *before* a final line
+/// terminator — so a `$`-anchored shape test also admits a bound carrying a
+/// trailing newline or U+2028. That is not cosmetic: U+2028's UTF-8 lead byte
+/// is `0xE2`, which sorts above `.` (0x2E), so such a bound compares as later
+/// than any fractional timestamp and its file is pruned though it holds
+/// matching rows. The guard matches the value against its own leading match
+/// instead, which has no end anchor to get wrong.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_refuses_a_bound_with_a_trailing_line_terminator() {
+    let (provider, _container) = create_provider_with_file_stats(3).await.unwrap();
+    // File 1 is well formed and genuinely cannot match. Files 2 and 3 carry the
+    // same instant with a trailing terminator, which no writer of ours produces
+    // — so their bounds are unusable and both files must survive.
+    insert_column_stats(
+        &provider,
+        1,
+        9,
+        Some("2024-06-01 00:00:00"),
+        Some("2024-06-02 00:00:00"),
+    )
+    .await
+    .unwrap();
+    insert_column_stats(
+        &provider,
+        2,
+        9,
+        Some("2024-01-01 00:00:00\u{2028}"),
+        Some("2024-01-01 00:00:00\u{2028}"),
+    )
+    .await
+    .unwrap();
+    insert_column_stats(
+        &provider,
+        3,
+        9,
+        Some("2024-01-01 00:00:00\n"),
+        Some("2024-01-01 00:00:00\n"),
+    )
+    .await
+    .unwrap();
+
+    let column = Arc::new(PhysColumn::new("t", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate = Arc::new(BinaryExpr::new(
+        column,
+        Operator::Lt,
+        lit(datafusion::common::ScalarValue::TimestampMicrosecond(
+            Some(1_704_067_200_500_000),
+            None,
+        )),
+    )) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new(
+        "t",
+        DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+        true,
+    )]);
+    let columns = vec![DuckLakeTableColumn::new(9, "t".to_string(), "timestamp".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(
+        file_ids(&filtered),
+        vec![2, 3],
+        "a bound with a trailing terminator is not this encoding, so it must not prune"
+    );
+}
+
+/// Trailing spaces do not make two different strings compare equal.
+///
+/// `utf8mb4_bin` is a PAD SPACE collation: it reads `'a'` and `'a '` as the same
+/// value and orders neither below the other. DataFusion compares `Utf8`
+/// byte-wise, where `'a'` is less than `'a '` — so under the padded collation a
+/// file whose bound is `'a'` is pruned from `WHERE s < 'a '` although it holds a
+/// row that satisfies it. `utf8mb4_0900_bin` is NO PAD.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_does_not_pad_string_bounds() {
+    let (provider, _container) = create_provider_with_file_stats(2).await.unwrap();
+    insert_column_stats(&provider, 1, 8, Some("a"), Some("a"))
+        .await
+        .unwrap();
+    insert_column_stats(&provider, 2, 8, Some("x"), Some("z"))
+        .await
+        .unwrap();
+
+    let column = Arc::new(PhysColumn::new("s", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, Operator::Lt, lit("a "))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let columns = vec![DuckLakeTableColumn::new(8, "s".to_string(), "varchar".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(
+        file_ids(&filtered),
+        vec![1],
+        "'a' is byte-wise less than 'a ', so file 1 matches and must be kept"
+    );
+}
+
+/// A date bound MySQL would read leniently is refused, not converted.
+///
+/// MySQL's `DATE` parser accepts far more than the encoder writes:
+/// `' 2020-01-01 '`, `2020/01/01`, `20200101`, `2020.01.01` and `2020-1-1` all
+/// convert to 2020-01-01. Without a shape test each becomes a definite bound
+/// and prunes on a value no writer of ours produced. The cast alone cannot
+/// catch them — it returns NULL only for what no calendar has, like
+/// `2020-02-31`.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_refuses_a_leniently_parsed_date_bound() {
+    let lenient = [" 2020-01-01 ", "2020/01/01", "20200101", "2020.01.01", "2020-1-1"];
+    for bound in lenient {
+        let (provider, _container) = create_provider_with_file_stats(2).await.unwrap();
+        // File 1's real dates are in 2021; the bound claims 2020 in a spelling
+        // the encoder never writes, so it must not be used to prune.
+        insert_column_stats(&provider, 1, 9, Some(bound), Some(bound))
+            .await
+            .unwrap();
+        insert_column_stats(&provider, 2, 9, Some("2019-01-01"), Some("2019-06-01"))
+            .await
+            .unwrap();
+
+        let column = Arc::new(PhysColumn::new("d", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = Arc::new(BinaryExpr::new(
+            column,
+            Operator::Gt,
+            lit(datafusion::common::ScalarValue::Date32(Some(18_700))),
+        )) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(9, "d".to_string(), "date".to_string(), true)];
+        let filter =
+            lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+        let filtered = provider
+            .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+            .expect("filtered page");
+        assert_eq!(
+            file_ids(&filtered),
+            vec![1],
+            "bound {bound:?} is not an encoding this crate writes, so it must not prune file 1"
+        );
+    }
+}
+
+/// A catalog with no `ducklake_file_column_stats` must still list its files:
+/// joining a table that does not exist is a hard error, so the query falls back
+/// to the unfiltered listing.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_falls_back_without_a_statistics_table() {
+    let (provider, _container) = create_provider_with_file_stats(2).await.unwrap();
+    sqlx::query("DROP TABLE ducklake_file_column_stats")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("a legacy catalog still lists files");
+    assert_eq!(file_ids(&filtered), vec![1, 2]);
+}
+
+/// A selective filter must not read the statistics of the files it pruned.
+///
+/// The two enrichment queries used to be scoped `data_file_id > after AND <=
+/// last`, which is bounded by the page size only while nothing narrows the
+/// listing. With a filter the surviving ids are sparse: a single match at the
+/// far end of a large table puts `last` near the table maximum, and the first
+/// page's statistics query then returns every stats row below it.
+///
+/// Row *counts* are not observable from the return value, so the pruned files
+/// carry a stats row that cannot be decoded: a NULL `column_id`, which
+/// `DuckLakeFileColumnStatistics` reads into an `i64`. Reading one is an error,
+/// so the filtered page succeeding is proof it read none of them — and the
+/// unfiltered page below, whose range does cover them, fails, which is what
+/// makes this discriminate rather than pass vacuously.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_reads_no_statistics_for_pruned_files() {
+    let (provider, _container) = create_provider_with_file_stats(6).await.unwrap();
+    // The shared fixture declares `column_id` NOT NULL; drop that so a row the
+    // reader cannot decode can be planted on a pruned file.
+    sqlx::query("ALTER TABLE ducklake_file_column_stats MODIFY column_id BIGINT NULL")
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+
+    // Files 1..=5 cannot hold a value above 50; file 6 can. The match is last,
+    // so `last_data_file_id` is the table maximum and the old range covered
+    // every pruned file.
+    for data_file_id in 1..=6i64 {
+        let (min_value, max_value) = if data_file_id == 6 {
+            ("100", "200")
+        } else {
+            ("0", "10")
+        };
+        insert_column_stats(&provider, data_file_id, 7, Some(min_value), Some(max_value))
+            .await
+            .unwrap();
+        if data_file_id < 6 {
+            // The undecodable row. Its NULL `column_id` also keeps it out of the
+            // filter's own CTE, which selects `column_id = 7`, so it changes
+            // nothing about which files survive.
+            sqlx::query(
+                "INSERT INTO ducklake_file_column_stats
+                     (data_file_id, table_id, column_id, value_count, null_count,
+                      min_value, max_value)
+                 VALUES (?, 1, NULL, 10, 0, '0', '10')",
+            )
+            .bind(data_file_id)
+            .execute(&provider.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let filter = int32_filter(Operator::Gt, 50);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("the filtered page reads statistics only for the files it returned");
+    assert_eq!(file_ids(&filtered), vec![6]);
+
+    // The same call with no filter returns every file, so its range does reach
+    // the planted rows and it fails. That is the behaviour the filtered call
+    // would have had while it scoped by range.
+    provider
+        .get_table_file_metadata_page(1, 1, None, 100)
+        .expect_err("the unfiltered range reaches the undecodable rows");
+}
+
+/// A string constant holding a backslash pushes down, against the real server.
+///
+/// MySQL reads `\` inside a quoted string as an escape unless `sql_mode` carries
+/// `NO_BACKSLASH_ESCAPES`, so the standard rendering of `a\` is `'a\'`, whose
+/// closing quote is consumed and the statement dies with error 1064. Nothing
+/// would be visible from here: the blanket unfiltered retry would list all four
+/// files and the pruning would just be gone. Asserting that exactly the matching
+/// file comes back is therefore the assertion — a query that failed returns
+/// every file, and one that mis-rendered the constant returns the wrong file.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_pushes_down_awkward_string_constants() {
+    let (provider, _container) = create_provider_with_file_stats(4).await.unwrap();
+    // One file per constant, each pinned to that exact value, plus a control the
+    // filter must prune every time.
+    let values = ["a\\", "a'", "a\\'", "zzz"];
+    for (index, value) in values.iter().enumerate() {
+        let data_file_id = i64::try_from(index).unwrap() + 1;
+        insert_column_stats(&provider, data_file_id, 8, Some(value), Some(value))
+            .await
+            .unwrap();
+    }
+
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let columns = vec![DuckLakeTableColumn::new(8, "s".to_string(), "varchar".to_string(), true)];
+    for (index, value) in values.iter().enumerate().take(3) {
+        let column = Arc::new(PhysColumn::new("s", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit(*value))) as Arc<dyn PhysicalExpr>;
+        let filter =
+            lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+        let filtered = provider
+            .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+            .expect("filtered page");
+        assert_eq!(
+            file_ids(&filtered),
+            vec![i64::try_from(index).unwrap() + 1],
+            "constant {value:?} did not push down to exactly its own file"
+        );
+    }
+}
+
+/// A float bound of a magnitude no `f64` holds keeps its file rather than being
+/// read as a saturated one.
+///
+/// `CAST` does not fail on such text, it saturates: on MySQL 8 `'1e-400'` reads
+/// as `0` and `'1e+400'` as `1.797…e308`, both silently. Read that way, file 1's
+/// maximum of `1e-400` becomes `0`, `0 > 1.0` is false and the file is pruned —
+/// a file whose real bound is unknown. The pattern bounds both digit runs so the
+/// text is declined instead, the comparison is NULL, and the file is kept.
+///
+/// File 2 is the control: a well-formed maximum that genuinely cannot match.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn filtered_file_page_keeps_a_float_bound_mysql_would_saturate() {
+    let (provider, _container) = create_provider_with_file_stats(2).await.unwrap();
+    for (data_file_id, max_value) in [(1i64, "1e-400"), (2, "0.5")] {
+        // `contains_nan` must be recorded false, or the NaN gate keeps every
+        // file on its own and the bound is never consulted.
+        sqlx::query(
+            "INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, value_count, null_count,
+                  min_value, max_value, contains_nan)
+             VALUES (?, 1, 9, 10, 0, '0.0', ?, FALSE)",
+        )
+        .bind(data_file_id)
+        .bind(max_value)
+        .execute(&provider.pool)
+        .await
+        .unwrap();
+    }
+
+    let column = Arc::new(PhysColumn::new("f", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, Operator::Gt, lit(1.0f64))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+    let columns = vec![DuckLakeTableColumn::new(9, "f".to_string(), "double".to_string(), true)];
+    let filter =
+        lower_predicate(&predicate, &schema, &columns).expect("predicate lowers to a filter");
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1]);
 }

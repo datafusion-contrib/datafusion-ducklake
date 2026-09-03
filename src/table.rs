@@ -19,6 +19,7 @@ use crate::row_id::{
     positional_table_schema, positional_table_schema_reserving, rowid_field,
 };
 use crate::snapshot_filter::SnapshotFilterExec;
+use crate::stats_filter::{self, StatsFilter};
 use crate::types::{
     DuckLakeDefaultExprAdapterFactory, INITIAL_DEFAULT_METADATA_KEY,
     build_arrow_schema_from_fields, build_read_schema_with_field_id_mapping,
@@ -45,7 +46,7 @@ use datafusion::physical_expr::expressions::BinaryExpr;
 use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder};
 
 #[cfg(feature = "encryption")]
-use crate::encryption::EncryptionFactoryBuilder;
+use crate::encryption::DuckLakeEncryptionFactory;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -100,6 +101,16 @@ struct FileMetadataPages<'a> {
     table_id: i64,
     snapshot_id: i64,
     after_data_file_id: Option<i64>,
+    /// Predicate the catalog may use to skip files whose statistics prove they
+    /// cannot match, lowered by [`crate::stats_filter`].
+    ///
+    /// It has to be applied inside the provider's query, before its `LIMIT`.
+    /// Filtering a page here instead would break the keyset cursor below: a
+    /// page whose candidates all failed the filter would come back empty, the
+    /// iteration would stop, and every matching file beyond it would never be
+    /// visited. That is why this is threaded to the provider rather than
+    /// applied to what the provider returns.
+    filter: Option<&'a StatsFilter>,
     page_name: &'static str,
     finished: bool,
 }
@@ -111,11 +122,12 @@ impl Iterator for FileMetadataPages<'_> {
         if self.finished {
             return None;
         }
-        let metadata = match self.provider.get_table_file_metadata_page(
+        let metadata = match self.provider.get_table_file_metadata_page_filtered(
             self.table_id,
             self.snapshot_id,
             self.after_data_file_id,
             FILE_METADATA_BATCH_SIZE,
+            self.filter,
         ) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -148,6 +160,9 @@ impl Iterator for FileMetadataPages<'_> {
             )));
         }
         self.after_data_file_id = Some(next_after);
+        // A short page means the provider ran out of rows, not that its filter
+        // rejected some: `filter` narrows the query ahead of its `LIMIT`, so a
+        // full page's worth of matches is always returned when one exists.
         self.finished = metadata.len() < FILE_METADATA_BATCH_SIZE;
         Some(Ok(metadata))
     }
@@ -1052,9 +1067,11 @@ pub struct DuckLakeTable {
     /// scans don't re-fetch. `Arc`-wrapped so a cloned table (see `delete_from`)
     /// shares the same memoized configs.
     file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
-    /// Encryption factory for the metadata page currently being planned.
+    /// Decryption keys for the encrypted files this table has listed, and the
+    /// factory built from them. Shared with every clone of the table, so a key
+    /// one of them installs is available to all of them.
     #[cfg(feature = "encryption")]
-    encryption_factory: Arc<std::sync::Mutex<Option<Arc<dyn EncryptionFactory>>>>,
+    encryption_keys: Arc<InstalledEncryptionKeys>,
     /// Schema name (needed for write operations)
     #[cfg(feature = "write")]
     schema_name: Option<String>,
@@ -1076,6 +1093,66 @@ impl std::fmt::Debug for DuckLakeTable {
             .field("schema", &self.schema)
             .field("columns", &self.columns)
             .finish_non_exhaustive()
+    }
+}
+
+/// The decryption keys installed on a table, and the factory every reader
+/// clones from them ([`DuckLakeTable::create_parquet_source`]).
+///
+/// Keys only ever accumulate here: [`DuckLakeTable::install_encryption_keys`]
+/// merges a listing's keys into the set instead of replacing it. No single
+/// listing sees every file — the catalog leaves files unlisted for
+/// [`DuckLakeTable::files_matching`] (see [`crate::stats_filter`]) and a scan
+/// installs page by page — so replacing would drop the key of a file the caller
+/// is still holding from an earlier listing, with no way to get it back short
+/// of listing again. The cell is shared with every clone of the table, so that
+/// caller need not be the one that listed.
+///
+/// Accumulating cannot install a wrong key: a path maps to one key for the life
+/// of the snapshot, because DuckLake data files are immutable and a rewritten or
+/// compacted file is written under a fresh path. A key kept past its file's last
+/// read is dead weight, never a wrong answer, and the set is bounded by the
+/// encrypted files this table has listed.
+///
+/// The factory reads the very map that keys are installed into, so the two
+/// halves cannot drift apart. Whatever key a path maps to now is the key a
+/// reader gets for it, including after a second install of the same path —
+/// which nothing here produces, every data and delete file being named by a
+/// fresh UUID, but which the factory would otherwise be free to answer from a
+/// stale copy.
+///
+/// Deliberately not `Debug`: the keys are secrets, which is why
+/// [`DuckLakeEncryptionFactory`] prints only its file count.
+#[cfg(feature = "encryption")]
+#[derive(Default)]
+struct InstalledEncryptionKeys {
+    /// Resolved file path -> decryption key, unioned over every listing. Only
+    /// encrypted files get an entry, so an unencrypted table keeps this empty.
+    ///
+    /// Shared with `factory` instead of copied into it, so installing a
+    /// listing's keys costs one insert per path however many the table has
+    /// already collected: a scan of P pages installs O(total keys), not
+    /// O(keys per page x P).
+    keys: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// The factory a reader clones, reading through `keys`. Unset until an
+    /// encrypted file is listed, so an unencrypted table never attaches one;
+    /// set once and never replaced, because a factory over the shared map
+    /// already resolves the keys of every later listing. A reader holds the
+    /// `Arc` it cloned, so nothing here disturbs a read already planned.
+    factory: std::sync::OnceLock<Arc<dyn EncryptionFactory>>,
+}
+
+/// Record `path`'s decryption key, ignoring the absent-or-empty key an
+/// unencrypted file carries.
+///
+/// These are the entries
+/// [`EncryptionFactoryBuilder::add_file`](crate::encryption::EncryptionFactoryBuilder::add_file)
+/// would store; they are collected into a plain map so that successive listings
+/// can be unioned before a factory is built from the result.
+#[cfg(feature = "encryption")]
+fn record_encryption_key(keys: &mut HashMap<String, String>, path: &str, key: Option<&str>) {
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        keys.insert(path.to_string(), key.to_string());
     }
 }
 
@@ -1117,9 +1194,10 @@ impl DuckLakeTable {
             false,
         );
 
-        // Build encryption factory from file encryption keys (when encryption feature is enabled)
+        // File metadata — and with it every encryption key — is deferred to the
+        // first listing, so the table opens with no keys installed.
         #[cfg(feature = "encryption")]
-        let encryption_factory = Arc::new(std::sync::Mutex::new(None));
+        let encryption_keys = Arc::new(InstalledEncryptionKeys::default());
 
         Ok(Self {
             table_id,
@@ -1138,7 +1216,7 @@ impl DuckLakeTable {
             table_statistics,
             partition_spec,
             #[cfg(feature = "encryption")]
-            encryption_factory,
+            encryption_keys,
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "write")]
             schema_name: None,
@@ -1249,13 +1327,15 @@ impl DuckLakeTable {
     /// Files are read from the catalog in bounded pages and pruned page by page,
     /// so peak memory tracks the size of the *result*, not the size of the table.
     ///
-    /// One exception, on an encrypted table: decryption keys are collected for
-    /// every file at the snapshot rather than only the retained ones (see the
-    /// note on the encryption factory below), so peak memory additionally carries
-    /// one path/key pair per encrypted file. That is proportional to the table
-    /// rather than to the result — still far below [`Self::files`], which
-    /// materialises every file's full metadata, but the page-at-a-time bound does
-    /// not apply to it.
+    /// One addition, on an encrypted table: the decryption key of every file
+    /// this *lists* joins the table's installed set, one path/key pair each.
+    /// That is a superset of what it returns — each page's keys are collected
+    /// before the in-memory pruning runs over that page, so a file dropped
+    /// there leaves its key behind, which is what keeps it openable for a
+    /// caller holding it from an earlier listing. The set accumulates across
+    /// listings rather than being replaced, so a file this call never listed
+    /// keeps the key an earlier listing installed for it — see
+    /// `InstalledEncryptionKeys` for why that matters and what bounds it.
     ///
     /// # Resolving positions on the returned files
     ///
@@ -1280,22 +1360,33 @@ impl DuckLakeTable {
                 Vec::new()
             },
         };
+        // The same expression the pruning predicates above were built from,
+        // lowered to catalog-statistics SQL so a provider that understands it
+        // can stop listing files their statistics rule out — the cost of a
+        // selective mutation then tracks the result rather than the table.
+        // Fail open here too: `None` means "no SQL filter", and the in-memory
+        // pruning still runs over every file that does come back.
+        let stats_filter =
+            stats_filter::lower_predicate(predicate, &self.physical_schema, &self.columns);
 
-        // Decryption keys are collected for EVERY file at this snapshot, not just
-        // the retained ones, matching what `files` installs. The factory is a
-        // single shared cell that a reader clones whole (`create_parquet_source`)
-        // and that this replaces wholesale, so narrowing it to the retained files
-        // would strand the key of any file another reader is opening — a scan on
-        // a clone of this table, or a later low-level read of a file this call
-        // happened to prune. This costs memory proportional to the table's
-        // encrypted file count rather than to the result — one path/key pair each
-        // — which is the price of not stranding a key. Still well under `files`,
-        // which materialises every file's full metadata.
+        // Decryption keys for the files these pages carry, which is not every
+        // file at the snapshot: the catalog filter above leaves files unlisted,
+        // and a file that never reaches this loop cannot have its key collected
+        // here. The keys that are collected are therefore MERGED into the
+        // table's installed set (`install_encryption_keys`), never installed in
+        // place of it, so the key of a file an earlier listing did see stays
+        // available to whoever holds that file. Readers clone the factory whole
+        // (`create_parquet_source`) out of a cell shared with every clone of
+        // this table, so replacing it here would strand exactly those keys — a
+        // `resolve_positions` on a file `files` returned, or a scan on a clone.
+        //
+        // Keeping the retained files' keys still costs one path/key pair per
+        // encrypted file returned, on top of whatever the table already holds.
         #[cfg(feature = "encryption")]
-        let mut encryption_keys = EncryptionFactoryBuilder::new();
+        let mut encryption_keys = HashMap::new();
 
         let mut matching = Vec::new();
-        for metadata in self.file_metadata_pages("file matching") {
+        for metadata in self.file_metadata_pages("file matching", stats_filter.as_ref()) {
             let (table_files, mut file_statistics) = self.page_files_with_statistics(metadata?);
             restate_in_physical_row_space(&mut file_statistics, &table_files);
             #[cfg(feature = "encryption")]
@@ -1307,16 +1398,29 @@ impl DuckLakeTable {
             );
         }
         #[cfg(feature = "encryption")]
-        self.install_encryption_factory(encryption_keys);
+        self.install_encryption_keys(encryption_keys);
         Ok(matching)
     }
 
-    fn file_metadata_pages(&self, page_name: &'static str) -> FileMetadataPages<'_> {
+    /// Page the catalog's file metadata, optionally handing the provider a
+    /// lowered predicate so it can leave provably non-matching files unlisted.
+    ///
+    /// `filter` is only ever a pre-filter. Every caller still runs the
+    /// in-memory [`PruningPredicate`]s over what comes back, because a provider
+    /// may ignore the filter entirely (the trait method defaults to doing so)
+    /// and because the in-memory pass prunes on things the catalog cannot see —
+    /// partition-derived bounds among them.
+    fn file_metadata_pages<'a>(
+        &'a self,
+        page_name: &'static str,
+        filter: Option<&'a StatsFilter>,
+    ) -> FileMetadataPages<'a> {
         FileMetadataPages {
             provider: self.provider.as_ref(),
             table_id: self.table_id,
             snapshot_id: self.snapshot_id,
             after_data_file_id: None,
+            filter,
             page_name,
             finished: false,
         }
@@ -1776,18 +1880,24 @@ impl DuckLakeTable {
         }
     }
 
-    fn file_pruning_predicates(
+    /// Convert scan filters into physical conjuncts against `physical_schema`.
+    ///
+    /// The single place `scan`'s logical filters become physical expressions.
+    /// Both plan-time pruning paths read the result — the catalog-side
+    /// statistics filter that narrows the listing query and the in-memory
+    /// [`PruningPredicate`]s that run over what it returns — so building them
+    /// once is what stops the two disagreeing about what the predicate is.
+    fn physical_conjuncts(
         &self,
         state: &dyn Session,
         filters: &[Expr],
-    ) -> DataFusionResult<Vec<PruningPredicate>> {
+    ) -> DataFusionResult<Vec<Arc<dyn PhysicalExpr>>> {
         let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        let conjuncts = filters
+        filters
             .iter()
             .flat_map(datafusion::logical_expr::utils::split_conjunction)
             .map(|expr| state.create_physical_expr(expr.clone(), &df_schema))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        self.pruning_predicates(conjuncts)
+            .collect()
     }
 
     /// Build one [`PruningPredicate`] per conjunct against `physical_schema` (the
@@ -1845,8 +1955,8 @@ impl DuckLakeTable {
     /// column (see [`positional_table_schema`]).
     fn create_parquet_source(&self, schema: impl Into<TableSchema>) -> ParquetSource {
         #[cfg(feature = "encryption")]
-        if let Some(factory) = self.encryption_factory.lock().unwrap().as_ref().cloned() {
-            return ParquetSource::new(schema).with_encryption_factory(factory);
+        if let Some(factory) = self.encryption_keys.factory.get() {
+            return ParquetSource::new(schema).with_encryption_factory(Arc::clone(factory));
         }
         ParquetSource::new(schema)
     }
@@ -1857,13 +1967,13 @@ impl DuckLakeTable {
     }
 
     /// Add each file's decryption key — and that of its live delete file — to
-    /// `builder`, resolving paths the same way the readers do. Separate from
+    /// `keys`, resolving paths the same way the readers do. Separate from
     /// installation so a caller reading the catalog in pages can accumulate keys
     /// across every page and install the whole set once.
     #[cfg(feature = "encryption")]
     fn collect_encryption_keys(
         &self,
-        builder: &mut EncryptionFactoryBuilder,
+        keys: &mut HashMap<String, String>,
         table_files: &[DuckLakeTableFile],
     ) -> Result<()> {
         for table_file in table_files {
@@ -1872,35 +1982,62 @@ impl DuckLakeTable {
                 &table_file.file.path,
                 table_file.file.path_is_relative,
             )?;
-            builder.add_file(&resolved_path, table_file.file.encryption_key.as_deref());
+            record_encryption_key(
+                keys,
+                &resolved_path,
+                table_file.file.encryption_key.as_deref(),
+            );
             if let Some(delete_file) = &table_file.delete_file {
                 let path = resolve_path(
                     &self.table_path,
                     &delete_file.path,
                     delete_file.path_is_relative,
                 )?;
-                builder.add_file(&path, delete_file.encryption_key.as_deref());
+                record_encryption_key(keys, &path, delete_file.encryption_key.as_deref());
             }
         }
         Ok(())
     }
 
-    /// Make `builder`'s keys the table's current encryption factory, replacing
-    /// whatever was installed. Readers clone the cell as a whole, so the set
-    /// installed here must cover every file any of them may open.
+    /// Merge one listing's keys into the table's installed set.
+    ///
+    /// Merging, not replacing: a listing covers only the files it was given —
+    /// one page of a scan, or the files the catalog filter left in a
+    /// [`Self::files_matching`] page — and a reader may still be holding a file
+    /// from an earlier one. See [`InstalledEncryptionKeys`].
+    ///
+    /// Cost is one insert per path. The factory looks keys up in the same map,
+    /// so it is attached once — on the first encrypted file the table lists —
+    /// and never rebuilt. A factory owning a copy would instead have every page
+    /// of a scan clone every key collected so far, which over P pages of k keys
+    /// is k*P*(P+1)/2 entry clones: a 245-page listing of a 1M-file encrypted
+    /// table would copy 1.2x10^8 path/key pairs to install 1x10^6.
+    ///
+    /// A listing that carries no keys does not even take the lock, which is
+    /// every page of the unencrypted tables that make up the common case.
     #[cfg(feature = "encryption")]
-    fn install_encryption_factory(&self, builder: EncryptionFactoryBuilder) {
-        let factory = builder.build();
-        *self.encryption_factory.lock().unwrap() = factory
-            .has_encrypted_files()
-            .then(|| Arc::new(factory) as Arc<dyn EncryptionFactory>);
+    fn install_encryption_keys(&self, keys: HashMap<String, String>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.encryption_keys.keys.write().unwrap().extend(keys);
+        // The first encrypted file this table has listed. Every listing after
+        // it reuses this factory, which resolves paths through the map just
+        // extended — so the keys it serves and the keys installed are one set,
+        // not two that could disagree.
+        self.encryption_keys.factory.get_or_init(|| {
+            Arc::new(DuckLakeEncryptionFactory::shared(Arc::clone(
+                &self.encryption_keys.keys,
+            ))) as Arc<dyn EncryptionFactory>
+        });
     }
 
+    /// Collect and install the decryption keys of the files in one listing.
     #[cfg(feature = "encryption")]
     fn configure_encryption_factory(&self, table_files: &[DuckLakeTableFile]) -> Result<()> {
-        let mut builder = EncryptionFactoryBuilder::new();
-        self.collect_encryption_keys(&mut builder, table_files)?;
-        self.install_encryption_factory(builder);
+        let mut keys = HashMap::new();
+        self.collect_encryption_keys(&mut keys, table_files)?;
+        self.install_encryption_keys(keys);
         Ok(())
     }
 
@@ -3106,7 +3243,7 @@ impl DuckLakeTable {
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "encryption")]
-            encryption_factory: self.encryption_factory.clone(),
+            encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,
             writer: None,
             write_options: crate::table_writer::DuckLakeWriteOptions::default(),
@@ -3730,14 +3867,34 @@ impl TableProvider for DuckLakeTable {
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let inlined_deletes = self.inlined_deletes_by_file()?;
-        let pruning = match self.file_pruning_predicates(state, filters) {
+        // One physical form of the filters feeds both pruning paths; see
+        // `physical_conjuncts`. A failure to convert them means "prune
+        // nothing", never an error — the filters are re-applied above this scan
+        // regardless (`supports_filters_pushdown` declares them Inexact).
+        let conjuncts = match self.physical_conjuncts(state, filters) {
+            Ok(conjuncts) => conjuncts,
+            Err(error) => {
+                tracing::debug!(%error, "skipping plan-time file pruning");
+                Vec::new()
+            },
+        };
+        // Catalog-side pre-filter: the provider may leave files unlisted whose
+        // statistics prove they cannot match, which is what stops planning cost
+        // scaling with the table. Purely additive — `prune_table_files_iteratively`
+        // still runs on every file that comes back, and a predicate that will
+        // not lower simply yields no filter.
+        let stats_filter = datafusion::physical_expr::conjunction_opt(conjuncts.iter().cloned())
+            .and_then(|predicate| {
+                stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
+            });
+        let pruning = match self.pruning_predicates(conjuncts) {
             Ok(pruning) => pruning,
             Err(error) => {
                 tracing::debug!(%error, "skipping plan-time file pruning");
                 Vec::new()
             },
         };
-        for metadata in self.file_metadata_pages("planning") {
+        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
             let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
             #[cfg(feature = "encryption")]
             self.configure_encryption_factory(&table_files)?;
@@ -4695,7 +4852,8 @@ mod tests {
 
         let state = SessionContext::new().state();
         let filters = [col("id").eq(lit(999_999_i64))];
-        let pruning = table.file_pruning_predicates(&state, &filters).unwrap();
+        let conjuncts = table.physical_conjuncts(&state, &filters).unwrap();
+        let pruning = table.pruning_predicates(conjuncts).unwrap();
         let mut after = None;
         let mut retained = Vec::new();
         loop {
@@ -4748,7 +4906,7 @@ mod tests {
         )?;
         let state = SessionContext::new().state();
         let filters = [col("range_value").eq(lit(1_i64)), col("partition_key").eq(lit(1_i64))];
-        let predicates = table.file_pruning_predicates(&state, &filters)?;
+        let predicates = table.pruning_predicates(table.physical_conjuncts(&state, &filters)?)?;
         let file = |data_file_id| DuckLakeTableFile {
             data_file_id,
             file: DuckLakeFileData::new(format!("file-{data_file_id}.parquet"), true, 1),
@@ -4811,6 +4969,17 @@ mod tests {
     struct FixedFileProvider {
         files: Vec<DuckLakeFileMetadata>,
         partition_spec: Option<PartitionSpec>,
+        /// Which files a page carries once a caller pushes a filter down, by
+        /// `data_file_id`. `None` ignores the filter and lists everything, which
+        /// is what the trait's default method does and what every test that does
+        /// not name this field exercises.
+        ///
+        /// A real catalog decides this by evaluating the lowered filter against
+        /// `ducklake_file_column_stats`; naming the surviving files outright says
+        /// the same thing without a second implementation of those semantics.
+        /// What matters here is that the other files are never listed at all, so
+        /// nothing downstream — including key collection — can see them.
+        visible_when_filtered: Option<Vec<i64>>,
     }
 
     impl MetadataProvider for FixedFileProvider {
@@ -4869,6 +5038,41 @@ mod tests {
             Ok(self
                 .files
                 .iter()
+                .filter(|entry| {
+                    after_data_file_id.is_none_or(|after| entry.file.data_file_id > after)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn get_table_file_metadata_page_filtered(
+            &self,
+            table_id: i64,
+            snapshot_id: i64,
+            after_data_file_id: Option<i64>,
+            limit: usize,
+            filter: Option<&crate::stats_filter::StatsFilter>,
+        ) -> Result<Vec<DuckLakeFileMetadata>> {
+            let Some(visible) = self
+                .visible_when_filtered
+                .as_ref()
+                .filter(|_| filter.is_some())
+            else {
+                return self.get_table_file_metadata_page(
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                );
+            };
+            // Narrowed inside the "query", ahead of the "limit", exactly as the
+            // real providers must: the keyset cursor still advances over the
+            // surviving files only.
+            Ok(self
+                .files
+                .iter()
+                .filter(|entry| visible.contains(&entry.file.data_file_id))
                 .filter(|entry| {
                     after_data_file_id.is_none_or(|after| entry.file.data_file_id > after)
                 })
@@ -5021,6 +5225,28 @@ mod tests {
             Arc::new(FixedFileProvider {
                 files,
                 partition_spec,
+                visible_when_filtered: None,
+            }),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )
+    }
+
+    /// A table whose catalog honours a pushed-down filter, listing only
+    /// `visible_when_filtered` for a page that carries one. An unfiltered
+    /// listing — [`DuckLakeTable::files`] among them — still sees every file.
+    fn catalog_filtering_table(
+        files: Vec<DuckLakeFileMetadata>,
+        visible_when_filtered: Vec<i64>,
+    ) -> Result<DuckLakeTable> {
+        DuckLakeTable::new(
+            1,
+            "events",
+            Arc::new(FixedFileProvider {
+                files,
+                partition_spec: None,
+                visible_when_filtered: Some(visible_when_filtered),
             }),
             1,
             Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
@@ -5260,23 +5486,52 @@ mod tests {
         Ok(())
     }
 
-    /// Pruning a file must not take its decryption key with it. The encryption
-    /// factory is one shared cell, replaced whole and cloned whole by every
-    /// reader, so a factory narrowed to the returned files would leave a
-    /// concurrent scan — or a later low-level read — unable to open a file this
-    /// call happened to prune.
+    /// Hex-encoded 16-byte AES key, standing in for a catalog-recorded one.
+    #[cfg(feature = "encryption")]
+    const FIXTURE_ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A file the catalog records an encryption key for.
+    #[cfg(feature = "encryption")]
+    fn encrypted_fixture_file(data_file_id: i64, id_bounds: (i64, i64)) -> DuckLakeFileMetadata {
+        let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
+        entry.file.file.encryption_key = Some(FIXTURE_ENCRYPTION_KEY.to_string());
+        entry
+    }
+
+    /// The key `path` resolves to through the table's installed factory, or
+    /// `None` when the factory holds no key for it. `None` is also what an
+    /// unencrypted file gets, so only ever ask this about an encrypted one.
+    #[cfg(feature = "encryption")]
+    async fn installed_decryption_properties(
+        table: &DuckLakeTable,
+        path: &str,
+    ) -> Option<Arc<parquet::encryption::decrypt::FileDecryptionProperties>> {
+        let factory = table
+            .encryption_keys
+            .factory
+            .get()
+            .cloned()
+            .expect("an encrypted table installs a factory");
+        factory
+            .get_file_decryption_properties(&Default::default(), &ObjectPath::from(path))
+            .await
+            .expect("key lookup succeeds")
+    }
+
+    /// Pruning a file must not take its decryption key with it. This catalog
+    /// lists every file — the filter reaches a provider that ignores it, as the
+    /// trait's default method does — so the in-memory pass prunes files whose
+    /// metadata, keys included, was collected on the way past.
+    /// `files_matching_keeps_keys_the_catalog_filter_left_unlisted` covers the
+    /// other half, where the file never reaches the loop at all.
     #[cfg(feature = "encryption")]
     #[tokio::test]
     async fn files_matching_keeps_decryption_keys_for_pruned_files() {
-        // Hex-encoded 16-byte AES key.
-        const KEY: &str = "0123456789abcdef0123456789abcdef";
-        let encrypted = |data_file_id, id_bounds| {
-            let mut entry = fixture_file(data_file_id, None, Some(id_bounds));
-            entry.file.file.encryption_key = Some(KEY.to_string());
-            entry
-        };
-        let table = fixed_table(vec![encrypted(1, (1, 10)), encrypted(2, (100, 110))], None)
-            .expect("table opens");
+        let table = fixed_table(
+            vec![encrypted_fixture_file(1, (1, 10)), encrypted_fixture_file(2, (100, 110))],
+            None,
+        )
+        .expect("table opens");
 
         let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
         let matching = table.files_matching(&predicate).expect("pruning succeeds");
@@ -5286,20 +5541,155 @@ mod tests {
             "file 1's statistics exclude the key, so it is pruned"
         );
 
-        let factory = {
-            let guard = table.encryption_factory.lock().unwrap();
-            guard
-                .clone()
+        assert!(
+            installed_decryption_properties(&table, "file-1.parquet")
+                .await
+                .is_some(),
+            "the pruned file's key must stay installed for other readers",
+        );
+    }
+
+    /// A file the catalog filter leaves unlisted must keep the key an earlier
+    /// listing installed for it.
+    ///
+    /// Catalog-side filtering is not the same as pruning: the file never reaches
+    /// the page loop, so nothing there can collect its key. Installing the keys
+    /// of the listed files *in place of* the table's set would therefore strand
+    /// the key of every file the mutation did not touch — including the ones the
+    /// caller is holding from its own `files()` listing and is about to read
+    /// through `resolve_positions`, which opens them with whatever factory is
+    /// installed. Merging is what keeps those readable.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn files_matching_keeps_keys_the_catalog_filter_left_unlisted() {
+        let table = catalog_filtering_table(
+            vec![encrypted_fixture_file(1, (1, 10)), encrypted_fixture_file(2, (100, 110))],
+            // Only file 2 survives the filter this predicate lowers to.
+            vec![2],
+        )
+        .expect("table opens");
+
+        // How a keyed mutation gets its files: an unfiltered listing first, which
+        // sees the whole snapshot and installs both keys.
+        assert_eq!(table.files().expect("listing succeeds").len(), 2);
+
+        let predicate = physical_predicate(&table, col("id").eq(lit(105_i64)));
+        let matching = table.files_matching(&predicate).expect("pruning succeeds");
+        assert_eq!(
+            matching
+                .iter()
+                .map(|file| file.data_file_id)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the catalog leaves file 1 out of the listing entirely"
+        );
+
+        assert!(
+            installed_decryption_properties(&table, "file-1.parquet")
+                .await
+                .is_some(),
+            "a file the catalog never listed must keep the key an earlier listing installed",
+        );
+        assert!(
+            installed_decryption_properties(&table, "file-2.parquet")
+                .await
+                .is_some(),
+            "the returned file's own key must be installed",
+        );
+    }
+
+    /// A second install of the same path, carrying a different key, must be the
+    /// key the factory then serves.
+    ///
+    /// Nothing in this crate produces one: every data and delete file is named
+    /// by a fresh `Uuid::new_v4()`, compaction and partitioned and streaming
+    /// writes included. The guarantee is still load-bearing, because the
+    /// alternative is silent and permanent — a factory answering out of its own
+    /// copy of the map would hand every reader the superseded key for the rest
+    /// of the table's life, with the installed set and the served set
+    /// disagreeing and no way to tell from either side.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn installing_a_second_key_for_a_path_supersedes_the_first() {
+        /// A different valid key, so the two are told apart by what the factory
+        /// returns rather than by one of them failing to decode.
+        const SUPERSEDED_KEY: &str = "fedcba9876543210fedcba9876543210";
+
+        let table = fixed_table(Vec::new(), None).expect("table opens");
+        let install = |key: &str| {
+            table.install_encryption_keys(HashMap::from([(
+                "file-1.parquet".to_string(),
+                key.to_string(),
+            )]));
+        };
+
+        install(SUPERSEDED_KEY);
+        // The same path with a new key: `HashMap::extend` overwrites the entry
+        // and leaves the length alone, so "did the length change" is not a test
+        // of whether anything was installed.
+        install(FIXTURE_ENCRYPTION_KEY);
+
+        let properties = installed_decryption_properties(&table, "file-1.parquet")
+            .await
+            .expect("the path has a key installed");
+        assert_eq!(
+            properties
+                .footer_key(None)
+                .expect("a footer key")
+                .as_slice(),
+            DuckLakeEncryptionFactory::decode_key(FIXTURE_ENCRYPTION_KEY)
+                .expect("the fixture key decodes")
+                .as_slice(),
+            "the factory must serve the key installed last, not the superseded one",
+        );
+    }
+
+    /// One factory serves every page of a listing, and serves keys installed
+    /// after it was handed out.
+    ///
+    /// Both halves matter. A reader that cloned the factory while planning
+    /// page 1 must be able to open a file listed on page 50 — that is the
+    /// guarantee accumulation exists for. And because the factory reads the
+    /// installed map rather than a copy of it, no page rebuilds it: rebuilding
+    /// per page would clone every key collected so far and make a P-page
+    /// listing quadratic in P.
+    #[cfg(feature = "encryption")]
+    #[tokio::test]
+    async fn one_factory_serves_the_keys_of_every_page() {
+        let table = fixed_table(Vec::new(), None).expect("table opens");
+        let install = |path: &str| {
+            table.install_encryption_keys(HashMap::from([(
+                path.to_string(),
+                FIXTURE_ENCRYPTION_KEY.to_string(),
+            )]));
+        };
+        let installed_factory = || {
+            table
+                .encryption_keys
+                .factory
+                .get()
+                .cloned()
                 .expect("an encrypted table installs a factory")
         };
-        let pruned = ObjectPath::from("file-1.parquet");
-        let properties = factory
-            .get_file_decryption_properties(&Default::default(), &pruned)
-            .await
-            .expect("key lookup succeeds");
+
+        install("file-1.parquet");
+        let from_first_page = installed_factory();
+        install("file-2.parquet");
+
         assert!(
-            properties.is_some(),
-            "the pruned file's key must stay installed for other readers",
+            Arc::ptr_eq(&from_first_page, &installed_factory()),
+            "a later page must reuse the installed factory, not rebuild it",
+        );
+        assert!(
+            from_first_page
+                .get_file_decryption_properties(
+                    &Default::default(),
+                    &ObjectPath::from("file-2.parquet"),
+                )
+                .await
+                .expect("key lookup succeeds")
+                .is_some(),
+            "the factory handed out on page 1 must resolve a key installed on page 2",
         );
     }
 
