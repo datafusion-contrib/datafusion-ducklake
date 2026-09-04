@@ -201,11 +201,24 @@ impl MulticatalogManager {
         // Catalog-scoped child rows that reference `table_id`. Filtered
         // transitively through the schema map so we only touch rows
         // owned by this catalog.
+        // Same set expire reclaims per dead table, plus the two per-file tables:
+        // all are keyed on `table_id`, so they take the scoping this loop already
+        // applies. Dropping a catalog without them orphans exactly what expire used
+        // to orphan (#248), and on SQLite a reused data_file_id would then inherit
+        // a dead file's stats and partition values.
         for child_table in [
             "ducklake_data_file",
             "ducklake_delete_file",
+            "ducklake_file_column_stats",
+            "ducklake_file_partition_value",
             "ducklake_column",
             "ducklake_schema_versions",
+            "ducklake_table_stats",
+            "ducklake_table_column_stats",
+            "ducklake_partition_info",
+            "ducklake_partition_column",
+            "ducklake_sort_info",
+            "ducklake_sort_expression",
         ] {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {} WHERE table_id IN (
@@ -242,6 +255,15 @@ impl MulticatalogManager {
         // Snapshots are catalog-scoped only via the snapshot map; they
         // carry no catalog_id of their own, so the map is the only path
         // to locate them.
+        sqlx::query(
+            "DELETE FROM ducklake_snapshot_changes WHERE snapshot_id IN (
+                SELECT snapshot_id FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1
+            )",
+        )
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             "DELETE FROM ducklake_snapshot WHERE snapshot_id IN (
                 SELECT snapshot_id FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1
@@ -717,6 +739,13 @@ impl MulticatalogManager {
             .bind(&expire_ids)
             .execute(&mut *tx)
             .await?;
+        // Official deletes ducklake_snapshot_changes in the same loop as
+        // ducklake_snapshot (DeleteSnapshots). We write one row per commit, so
+        // leaving them behind orphans at commit rate rather than at expiry rate.
+        sqlx::query("DELETE FROM ducklake_snapshot_changes WHERE snapshot_id = ANY($1)")
+            .bind(&expire_ids)
+            .execute(&mut *tx)
+            .await?;
 
         // 3. Tables in this catalog no longer covered by any surviving snapshot and with
         //    no surviving live version.
@@ -770,6 +799,31 @@ impl MulticatalogManager {
             .bind(&data_file_ids)
             .execute(&mut *tx)
             .await?;
+        // Per-file metadata dies with its file. Official deletes these in the same
+        // group as ducklake_data_file, keyed on the same ids; the compaction path
+        // here already does the same for the sources it retires. Without this the
+        // rows are unreachable (every read joins through ducklake_data_file) but
+        // never reclaimed, so the stats table grows without bound and is scanned
+        // in full on the planning path of every query.
+        // ducklake_file_variant_stats is the fourth table official deletes in this
+        // group. It is not in this schema, so it is omitted rather than skipped at
+        // runtime. IF THAT TABLE IS EVER ADDED, ADD IT HERE TOO.
+        //
+        // That instruction is the whole point of this block: omitting exactly one
+        // per-file table here is how ducklake_file_column_stats came to hold rows
+        // for files deleted long ago. Nothing reads them — every read joins through
+        // ducklake_data_file — and nothing collects them, because expire only cleans
+        // what it retires in its own transaction. The table grows without bound and
+        // is read while planning every query, so the cost lands on queries that
+        // touch none of it.
+        for table in ["ducklake_file_column_stats", "ducklake_file_partition_value"] {
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {table} WHERE data_file_id = ANY($1)"
+            )))
+            .bind(&data_file_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // 5. Delete files orphaned by the data files above, a dead table, or no surviving
         //    snapshot. (Our writer does not emit delete files yet — no-op for our catalogs.)
@@ -798,9 +852,27 @@ impl MulticatalogManager {
             .execute(&mut *tx)
             .await?;
 
-        // 6. Reclaim per-table metadata for fully-expired tables. (No ducklake_table_stats
-        //    on Postgres — that table is maintained only by the SQLite writer.)
-        for table in ["ducklake_table", "ducklake_column", "ducklake_schema_versions"] {
+        // 6. Reclaim per-table metadata for fully-expired tables. This is official's
+        //    twelve-table list from DeleteSnapshots.
+        //    Official's list is twelve (ducklake_metadata_manager.cpp, DeleteSnapshots).
+        //    ducklake_column_tag, ducklake_inlined_data_tables and
+        //    ducklake_column_mapping are omitted because this schema does not have
+        //    them. IF ANY OF THE THREE IS EVER ADDED, ADD IT HERE TOO — official
+        //    reclaims it, and a table-scoped table this loop misses orphans forever.
+        //    ducklake_table_stats is in it because this writer
+        //    creates and maintains it — the comment that used to say otherwise was
+        //    wrong — and the SQLite expire path already reclaimed it.
+        for table in [
+            "ducklake_table",
+            "ducklake_table_stats",
+            "ducklake_table_column_stats",
+            "ducklake_partition_info",
+            "ducklake_partition_column",
+            "ducklake_column",
+            "ducklake_sort_info",
+            "ducklake_sort_expression",
+            "ducklake_schema_versions",
+        ] {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE table_id = ANY($1)"
             )))

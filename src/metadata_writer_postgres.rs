@@ -415,6 +415,92 @@ pub(crate) async fn migrate_column_default_metadata(pool: &PgPool) -> Result<()>
     Ok(())
 }
 
+/// Batch size for one `DELETE` inside the orphan purge, and the cap on how many
+/// batches a single call will run. Bounded on purpose: this runs during schema
+/// initialization, which callers do on startup and often behind a lock, so no
+/// single statement may run long and no single call may run away. A backlog
+/// larger than the cap drains over the next few initializations.
+const ORPHAN_PURGE_BATCH: i64 = 20_000;
+const ORPHAN_PURGE_MAX_BATCHES: usize = 10;
+
+/// Delete metadata rows whose owning row is already gone.
+///
+/// Expire used to drop `ducklake_data_file` and `ducklake_snapshot` rows without
+/// the per-file and per-commit rows hanging off them, so catalogs written by an
+/// earlier version carry rows that no query can reach — every read joins through
+/// the owner — and that nothing will ever collect: expire only cleans what it is
+/// retiring in that transaction, and these owners were retired long ago.
+///
+/// This repairs that history. It is a maintenance operation, not part of expire:
+/// expire keeps deleting exactly what official deletes, and this runs beside it on
+/// the same sweep. Deliberately not called from schema initialization -- callers
+/// bootstrap on startup, often behind a lock where one long statement is a failed
+/// boot, and a scan for orphans has no business on that path.
+///
+/// With expire and `drop_catalog` both reclaiming their children, no path left in
+/// this crate produces these orphans, so on a drained catalog every pass finds
+/// nothing. It stays in the sweep rather than being deleted after one run because
+/// it is the only thing that can reach rows an older version stranded, and because
+/// it is the check that would catch a future path that forgets its children again.
+///
+/// Safety rests on the anti-join, not on a guess about what looks stale. A row
+/// whose owner is absent is unreachable by construction, and owner and dependants
+/// are always written in one transaction, so no snapshot can observe a dependant
+/// whose owner has not landed yet. Batched by `ctid` so each statement touches a
+/// bounded number of rows.
+pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
+    // (dependant table, owning table, shared key)
+    const TARGETS: &[(&str, &str, &str)] = &[
+        (
+            "ducklake_file_column_stats",
+            "ducklake_data_file",
+            "data_file_id",
+        ),
+        (
+            "ducklake_file_partition_value",
+            "ducklake_data_file",
+            "data_file_id",
+        ),
+        (
+            "ducklake_snapshot_changes",
+            "ducklake_snapshot",
+            "snapshot_id",
+        ),
+    ];
+
+    for (child, owner, key) in TARGETS {
+        let mut removed: u64 = 0;
+        for _ in 0..ORPHAN_PURGE_MAX_BATCHES {
+            let affected = sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {child} WHERE ctid IN (
+                     SELECT c.ctid FROM {child} c
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM {owner} o WHERE o.{key} = c.{key}
+                     )
+                     LIMIT $1
+                 )"
+            )))
+            .bind(ORPHAN_PURGE_BATCH)
+            .execute(pool)
+            .await?
+            .rows_affected();
+
+            removed += affected;
+            if affected < ORPHAN_PURGE_BATCH as u64 {
+                break;
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                table = child,
+                removed,
+                "purged orphaned DuckLake metadata rows whose {owner} row was already gone"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// PostgreSQL-based metadata writer for DuckLake catalogs.
 ///
 /// Bound to a single `catalog_id` at construction. To write to a different

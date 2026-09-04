@@ -1196,3 +1196,113 @@ async fn replace_out_of_order_commit_conflicts() {
         "exactly one column generation may be live at the head"
     );
 }
+
+/// Issue #248's correctness case, and why the SQLite half of the expire fix
+/// matters more than the Postgres half.
+///
+/// `data_file_id INTEGER PRIMARY KEY` is a rowid alias, so SQLite hands out
+/// `max(rowid) + 1` and reuses ids after deletes — unlike Postgres, where the
+/// column is `GENERATED ALWAYS AS IDENTITY` and an id is never seen twice. Leave a
+/// retired file's stats behind on SQLite and a later file can take its id and
+/// inherit statistics describing different data. Stats drive pruning and pruning
+/// decides which files are read, so the result is dropped rows, not slow queries.
+///
+/// This asserts the precondition of that bug is gone: after expire, no stats row
+/// survives for the retired file's id.
+#[tokio::test(flavor = "multi_thread")]
+async fn expire_leaves_no_stats_behind_for_a_retired_file_id() {
+    use datafusion_ducklake::metadata_writer::ColumnStat;
+
+    let h = setup().await;
+    let stats = |ids: &[i64]| -> Vec<ColumnStat> {
+        ids.iter()
+            .map(|&column_id| ColumnStat {
+                column_id,
+                min_value: Some("1".to_string()),
+                max_value: Some("9".to_string()),
+                null_count: Some(0),
+                value_count: Some(5),
+                contains_nan: None,
+                column_size_bytes: Some(64),
+            })
+            .collect()
+    };
+
+    let s1 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s1.table_id,
+            "main",
+            "t",
+            s1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 100, 5).with_column_stats(stats(&s1.column_ids)),
+            WriteMode::Replace,
+            s1.base_snapshot_id,
+            &cols(),
+            &s1.column_ids,
+        )
+        .unwrap();
+
+    let p = pool(&h).await;
+    let doomed_id = scalar_i64(&p, "SELECT MAX(data_file_id) FROM ducklake_data_file").await;
+    let before = scalar_i64(
+        &p,
+        &format!(
+            "SELECT COUNT(*) FROM ducklake_file_column_stats WHERE data_file_id = {doomed_id}"
+        ),
+    )
+    .await;
+    assert!(
+        before > 0,
+        "setup wrote no stats, so this test could not detect the bug"
+    );
+
+    // Replace retires f1; expiring s1 then leaves no snapshot covering it.
+    let s2 = h
+        .writer
+        .begin_write_transaction("main", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    h.writer
+        .register_data_file(
+            s2.table_id,
+            "main",
+            "t",
+            s2.snapshot_id,
+            &DataFileInfo::new("f2.parquet", 100, 5).with_column_stats(stats(&s2.column_ids)),
+            WriteMode::Replace,
+            s2.base_snapshot_id,
+            &cols(),
+            &s2.column_ids,
+        )
+        .unwrap();
+    h.writer
+        .expire_snapshots(ExpireCriteria::Versions(vec![s1.snapshot_id]))
+        .unwrap();
+
+    // Precondition: if the file survived, nothing was orphaned and the assertion
+    // below would pass against unfixed code.
+    assert_eq!(
+        scalar_i64(
+            &p,
+            &format!("SELECT COUNT(*) FROM ducklake_data_file WHERE data_file_id = {doomed_id}")
+        )
+        .await,
+        0,
+        "setup did not retire the data file, so this test proves nothing"
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            &format!(
+                "SELECT COUNT(*) FROM ducklake_file_column_stats WHERE data_file_id = {doomed_id}"
+            )
+        )
+        .await,
+        0,
+        "expire deleted the data file but left its {before} stats rows — a file later \
+         reusing this id would inherit them"
+    );
+}

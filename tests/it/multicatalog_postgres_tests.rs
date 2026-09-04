@@ -5760,3 +5760,465 @@ async fn an_invalid_file_column_stats_index_is_rebuilt_on_initialize() {
          left in place is skipped by CREATE INDEX IF NOT EXISTS forever"
     );
 }
+
+/// Per-column stats for every column, so a test that asserts on
+/// `ducklake_file_column_stats` is asserting on rows that actually exist.
+fn file_stats(column_ids: &[i64]) -> Vec<datafusion_ducklake::metadata_writer::ColumnStat> {
+    column_ids
+        .iter()
+        .map(
+            |&column_id| datafusion_ducklake::metadata_writer::ColumnStat {
+                column_id,
+                min_value: Some("1".to_string()),
+                max_value: Some("9".to_string()),
+                null_count: Some(0),
+                value_count: Some(5),
+                contains_nan: None,
+                column_size_bytes: Some(64),
+            },
+        )
+        .collect()
+}
+
+/// Expire must take a retired file's per-file metadata with it.
+///
+/// The live table is created FIRST on purpose. Created second, its snapshots land
+/// inside the dead file's `[begin, end)` range and keep it reachable, so expire
+/// retires nothing and the whole test passes against unfixed code — which is what
+/// the first draft of this test did.
+///
+/// The precondition assert below is what makes that impossible to reintroduce: if
+/// the dead file's row is still present, the setup orphaned nothing and the test
+/// fails there rather than sailing on to a green anti-join.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_reclaims_per_file_metadata_and_spares_live_files() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // The survivor, first, so its snapshots precede the dead file's range.
+    let live = w
+        .begin_write_transaction("public", "t_live", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        live.table_id,
+        "public",
+        "t_live",
+        live.snapshot_id,
+        &DataFileInfo::new("live.parquet", 100, 5).with_column_stats(file_stats(&live.column_ids)),
+        WriteMode::Replace,
+        live.base_snapshot_id,
+        &cols(),
+        &live.column_ids,
+    )
+    .unwrap();
+
+    let dead = w
+        .begin_write_transaction("public", "t_dead", &cols(), WriteMode::Replace)
+        .unwrap();
+    let dead_snap = w
+        .register_data_file(
+            dead.table_id,
+            "public",
+            "t_dead",
+            dead.snapshot_id,
+            &DataFileInfo::new("dead.parquet", 100, 5)
+                .with_column_stats(file_stats(&dead.column_ids)),
+            WriteMode::Replace,
+            dead.base_snapshot_id,
+            &cols(),
+            &dead.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+
+    let dead_file_id: i64 =
+        sqlx::query("SELECT data_file_id FROM ducklake_data_file WHERE table_id = $1")
+            .bind(dead.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    let dead_stats_before: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE data_file_id = $1")
+            .bind(dead_file_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        dead_stats_before > 0,
+        "setup wrote no stats for the file under test"
+    );
+    let live_before: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE table_id = $1")
+            .bind(live.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(live_before > 0, "setup wrote no stats for the live table");
+
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "public", "t_dead")
+            .await
+            .unwrap()
+    );
+    mgr.expire_snapshots_in_catalog("pg_prod", ExpireCriteria::Versions(vec![dead_snap]))
+        .await
+        .unwrap();
+
+    // Precondition, not a result: if the file survived, nothing was orphaned and
+    // the assertions below would pass on unfixed code.
+    let dead_file_rows: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_data_file WHERE data_file_id = $1")
+            .bind(dead_file_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        dead_file_rows, 0,
+        "setup did not retire the data file, so this test proves nothing"
+    );
+
+    let dead_stats_after: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE data_file_id = $1")
+            .bind(dead_file_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        dead_stats_after, 0,
+        "expire deleted the data file but left its {dead_stats_before} stats rows"
+    );
+
+    let live_after: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE table_id = $1")
+            .bind(live.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        live_after, live_before,
+        "expire removed stats belonging to a live file"
+    );
+
+    // Official's per-dead-table list from DeleteSnapshots, less the three tables
+    // this schema does not have. Counted before and after: `covered` records how
+    // many of them the setup actually populated, so this cannot silently become a
+    // set of assertions against empty tables.
+    const PER_TABLE: &[&str] = &[
+        "ducklake_table",
+        "ducklake_table_stats",
+        "ducklake_table_column_stats",
+        "ducklake_partition_info",
+        "ducklake_partition_column",
+        "ducklake_column",
+        "ducklake_sort_info",
+        "ducklake_sort_expression",
+        "ducklake_schema_versions",
+    ];
+    let mut covered = 0;
+    for t in PER_TABLE {
+        let live_rows: i64 = sqlx::query(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {t} WHERE table_id = $1"
+        )))
+        .bind(live.table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+        if live_rows > 0 {
+            covered += 1;
+        }
+        let dead_rows: i64 = sqlx::query(AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {t} WHERE table_id = $1"
+        )))
+        .bind(dead.table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+        assert_eq!(dead_rows, 0, "{t} not reclaimed for the expired table");
+        assert!(
+            live_rows > 0 || t != &"ducklake_table",
+            "the live table vanished from {t}"
+        );
+    }
+    assert!(
+        covered >= 4,
+        "only {covered} of the per-table list was populated by this setup, so the \
+         reclaim assertions are mostly vacuous"
+    );
+}
+
+/// `ducklake_snapshot_changes` is written once per commit, so leaving it behind
+/// orphans at commit rate. Official deletes it in the same loop as the snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_reclaims_snapshot_changes() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let s = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap = w
+        .register_data_file(
+            s.table_id,
+            "public",
+            "t",
+            s.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 100, 5),
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols(),
+            &s.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+
+    let before: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot_changes WHERE snapshot_id = $1")
+            .bind(snap)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(before, 1, "setup did not record a change row to reclaim");
+
+    assert!(
+        mgr.drop_table_in_catalog("pg_prod", "public", "t")
+            .await
+            .unwrap()
+    );
+    mgr.expire_snapshots_in_catalog("pg_prod", ExpireCriteria::Versions(vec![snap]))
+        .await
+        .unwrap();
+
+    let after: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot_changes WHERE snapshot_id = $1")
+            .bind(snap)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(after, 0, "expired snapshot left its change record behind");
+}
+
+/// The repair. Catalogs written before expire reclaimed per-file rows carry
+/// orphans no query can reach and no future expire will collect, so a sweep
+/// collects them. Seeded by hand because reproducing the historical
+/// bug would require running the old code.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn purge_removes_orphans_and_leaves_live_rows_alone() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_prod").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let s = w
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    w.register_data_file(
+        s.table_id,
+        "public",
+        "t",
+        s.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5).with_column_stats(file_stats(&s.column_ids)),
+        WriteMode::Replace,
+        s.base_snapshot_id,
+        &cols(),
+        &s.column_ids,
+    )
+    .unwrap();
+
+    let live_before: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert!(live_before > 0, "setup produced no live stats rows");
+
+    // Orphans: no ducklake_data_file row has id 987654, and no snapshot has id 987654.
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count)
+         VALUES (987654, $1, 1, 10, 1, 0), (987654, $1, 2, 10, 1, 0)",
+    )
+    .bind(s.table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES (987654, '')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    datafusion_ducklake::maintenance::purge_orphaned_metadata_postgres(&pool)
+        .await
+        .unwrap();
+
+    let orphans: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_file_column_stats s
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_data_file d WHERE d.data_file_id = s.data_file_id
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(orphans, 0, "the purge left orphaned stats rows behind");
+
+    let stranded: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_snapshot_changes WHERE snapshot_id = 987654")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        stranded, 0,
+        "the purge left an orphaned change record behind"
+    );
+
+    let live_after: i64 = sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+    assert_eq!(
+        live_after, live_before,
+        "the purge deleted stats belonging to a live file — only unreachable rows may go"
+    );
+
+    let _ = cat;
+}
+
+/// #248 site 2. Dropping a catalog deletes its data files and snapshots; without
+/// their children that strands exactly what expire used to strand. Asserts both
+/// halves: the dropped catalog leaves nothing behind, and a second catalog sharing
+/// the metadata database is untouched — the delete is scoped transitively through
+/// the schema map, so an over-broad predicate here would reach another tenant.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn drop_catalog_reclaims_children_and_spares_other_catalogs() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+
+    let write_one = |name: &'static str| {
+        let cat = futures::executor::block_on(mgr.create_catalog(name)).unwrap();
+        let w = futures::executor::block_on(PostgresMetadataWriter::with_pool(pool.clone(), cat))
+            .unwrap();
+        w.set_data_path("/data").unwrap();
+        let s = w
+            .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+            .unwrap();
+        w.register_data_file(
+            s.table_id,
+            "public",
+            "t",
+            s.snapshot_id,
+            &DataFileInfo::new("f.parquet", 100, 5).with_column_stats(file_stats(&s.column_ids)),
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols(),
+            &s.column_ids,
+        )
+        .unwrap();
+        s.table_id
+    };
+
+    let doomed_table = write_one("pg_doomed");
+    let keeper_table = write_one("pg_keeper");
+
+    let doomed_before: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE table_id = $1")
+            .bind(doomed_table)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    let keeper_before: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE table_id = $1")
+            .bind(keeper_table)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert!(
+        doomed_before > 0 && keeper_before > 0,
+        "setup wrote no stats, so this test could not detect anything"
+    );
+
+    mgr.drop_catalog("pg_doomed").await.unwrap();
+
+    let orphans: i64 = sqlx::query(
+        "SELECT COUNT(*) FROM ducklake_file_column_stats s
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_data_file d WHERE d.data_file_id = s.data_file_id
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .try_get(0)
+    .unwrap();
+    assert_eq!(orphans, 0, "drop_catalog stranded per-file metadata");
+
+    let keeper_after: i64 =
+        sqlx::query("SELECT COUNT(*) FROM ducklake_file_column_stats WHERE table_id = $1")
+            .bind(keeper_table)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get(0)
+            .unwrap();
+    assert_eq!(
+        keeper_after, keeper_before,
+        "drop_catalog reached into another catalog sharing this metadata database"
+    );
+}

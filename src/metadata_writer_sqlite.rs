@@ -475,13 +475,17 @@ impl SqliteMetadataWriter {
             }
             let expire_ids: Vec<i64> = candidates.iter().map(|s| s.snapshot_id).collect();
 
-            // 2. Delete the snapshot rows themselves.
-            sqlx::query(AssertSqlSafe(format!(
-                "DELETE FROM ducklake_snapshot WHERE snapshot_id IN ({})",
-                id_list(&expire_ids)
-            )))
-            .execute(&mut *tx)
-            .await?;
+            // 2. Delete the snapshot rows themselves, and the per-commit change
+            //    records that hang off them. Official deletes both in one loop
+            //    (DeleteSnapshots); a change record outlives its snapshot otherwise.
+            for table in ["ducklake_snapshot", "ducklake_snapshot_changes"] {
+                sqlx::query(AssertSqlSafe(format!(
+                    "DELETE FROM {table} WHERE snapshot_id IN ({})",
+                    id_list(&expire_ids)
+                )))
+                .execute(&mut *tx)
+                .await?;
+            }
 
             // 3. Tables whose lifetime is no longer covered by any surviving snapshot
             //    AND which have no surviving live version.
@@ -524,12 +528,26 @@ impl SqliteMetadataWriter {
             .await?;
             let data_file_ids = schedule_files(&mut tx, dead_data_files).await?;
             if !data_file_ids.is_empty() {
-                sqlx::query(AssertSqlSafe(format!(
-                    "DELETE FROM ducklake_data_file WHERE data_file_id IN ({})",
-                    id_list(&data_file_ids)
-                )))
-                .execute(&mut *tx)
-                .await?;
+                // Per-file metadata dies with its file, keyed on the same ids and in
+                // the same group official uses (DeleteSnapshots). The compaction path
+                // below already does this for the sources it retires; without it here
+                // the rows are unreachable but never reclaimed.
+                // ducklake_file_variant_stats is the fourth table official deletes
+                // here. Not in this schema, so omitted. IF IT IS EVER ADDED, ADD IT
+                // HERE TOO — a per-file table expire does not reclaim orphans
+                // silently and forever.
+                for table in [
+                    "ducklake_data_file",
+                    "ducklake_file_column_stats",
+                    "ducklake_file_partition_value",
+                ] {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {table} WHERE data_file_id IN ({})",
+                        id_list(&data_file_ids)
+                    )))
+                    .execute(&mut *tx)
+                    .await?;
+                }
             }
 
             // 5. Delete files orphaned by the data files above, by a dead table, or no
@@ -579,7 +597,12 @@ impl SqliteMetadataWriter {
                 for table in [
                     "ducklake_table",
                     "ducklake_table_stats",
+                    "ducklake_table_column_stats",
+                    "ducklake_partition_info",
+                    "ducklake_partition_column",
                     "ducklake_column",
+                    "ducklake_sort_info",
+                    "ducklake_sort_expression",
                     "ducklake_schema_versions",
                 ] {
                     sqlx::query(AssertSqlSafe(format!(

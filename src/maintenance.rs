@@ -184,6 +184,23 @@ pub async fn cleanup_old_files_in_catalog(
     .await
 }
 
+/// Reclaim metadata rows whose owning row is already gone, on a Postgres store.
+///
+/// Step 3 of a sweep, after expire and cleanup. Expire deletes the children of the
+/// owners it retires; this collects children whose owners were retired by an
+/// earlier version that did not, and which no future expire can reach because it
+/// deletes by the ids it is retiring. Bounded per call, so a large backlog drains
+/// over successive sweeps rather than stalling one.
+///
+/// Safe by construction rather than by heuristic: a row whose owner is absent is
+/// unreachable -- every read joins through the owner -- and owner and children are
+/// written in one transaction, so no snapshot sees a child whose owner has not
+/// landed.
+#[cfg(feature = "write-postgres")]
+pub async fn purge_orphaned_metadata_postgres(pool: &sqlx::PgPool) -> Result<()> {
+    crate::metadata_writer_postgres::purge_orphaned_metadata(pool).await
+}
+
 /// List the object store under `data_path`, subtract everything referenced by the
 /// catalog (passed in as `(path, path_is_relative)` pairs), filter by `.parquet`
 /// suffix + `last_modified < older_than` (when set), and delete the leftovers.
