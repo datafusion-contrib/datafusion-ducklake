@@ -135,6 +135,46 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         contains_nan BOOLEAN,
         extra_stats VARCHAR
     )"#,
+    // Postgres needs an index here that the DuckLake spec does not define. Every
+    // planning read of this table filters `table_id` for equality and then walks
+    // `data_file_id` as a range — the statistics page query and the column-size
+    // roll-up in `MulticatalogProvider`, and the per-commit recomputation in this
+    // writer — so without one a catalog pays a sequential scan of the whole table
+    // on the planning path of every query, growing with the number of data files
+    // ever written. The official extension leaves this to the operator on Postgres:
+    // duckdb/ducklake#1147 taught its filter pushdown to use such an index but
+    // deliberately does not create one. That is a reasonable default when a person
+    // owns the catalog and a trap when a library does, so this writer creates it.
+    //
+    // Column order follows the predicates rather than convention: `table_id` is the
+    // only equality, `data_file_id` is the only range (and the join key), and
+    // `column_id` costs 8 bytes and lets the planner satisfy the `ORDER BY` without
+    // a sort. `column_size_bytes` rides in INCLUDE so the roll-up query, which
+    // projects nothing else from this table, can be served index-only.
+    // `min_value` / `max_value` stay out on purpose: each is capped at
+    // `MAX_STRING_STAT_BYTES`, and an INCLUDE payload can be compressed but never
+    // moved out of line, so a wide pair would exceed the btree tuple limit and fail
+    // the INSERT — turning a read optimisation into a write outage.
+    //
+    // The guard runs first because a `CREATE INDEX CONCURRENTLY` that is interrupted
+    // leaves an invalid index behind, and `CREATE INDEX IF NOT EXISTS` then skips it
+    // forever — paying the maintenance cost on every write with none of the read
+    // benefit, and silently. Dropping the invalid one makes an interrupted
+    // concurrent build self-healing on the next initialization.
+    r#"DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1 FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indexrelid
+                WHERE c.relname = 'idx_file_column_stats_table_file_column'
+                  AND NOT i.indisvalid
+            ) THEN
+                DROP INDEX IF EXISTS idx_file_column_stats_table_file_column;
+            END IF;
+        END $$"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_file_column_stats_table_file_column
+        ON ducklake_file_column_stats (table_id, data_file_id, column_id)
+        INCLUDE (column_size_bytes)"#,
     // Table-wide per-column roll-up (DuckLake spec) — feeds the optimizer.
     r#"CREATE TABLE IF NOT EXISTS ducklake_table_column_stats (
         table_id BIGINT NOT NULL,

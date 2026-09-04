@@ -5671,3 +5671,92 @@ async fn postgres_file_and_table_column_stats_round_trip_per_column() {
         );
     }
 }
+
+/// The `ducklake_file_column_stats` index is not in the DuckLake spec, so nothing
+/// upstream pins its shape. Assert the key columns *in order* plus the included
+/// column: an index that merely exists under the right name is worthless if the
+/// columns are reordered, because the leading-equality/trailing-range shape is the
+/// entire reason it serves the planning reads.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn file_column_stats_index_has_the_documented_shape() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+
+    let rows = sqlx::query(
+        "SELECT a.attname AS col, (k.ord <= i.indnkeyatts) AS is_key
+         FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+         WHERE c.relname = 'idx_file_column_stats_table_file_column'
+         ORDER BY k.ord",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    let shape: Vec<(String, bool)> = rows
+        .iter()
+        .map(|r| (r.get::<String, _>("col"), r.get::<bool, _>("is_key")))
+        .collect();
+
+    assert_eq!(
+        shape,
+        vec![
+            ("table_id".to_string(), true),
+            ("data_file_id".to_string(), true),
+            ("column_id".to_string(), true),
+            ("column_size_bytes".to_string(), false),
+        ],
+        "the stats index must key on (table_id, data_file_id, column_id) in that \
+         order and include column_size_bytes; got {shape:?}"
+    );
+}
+
+/// An interrupted `CREATE INDEX CONCURRENTLY` leaves an invalid index, and a plain
+/// `CREATE INDEX IF NOT EXISTS` would then skip it forever — every write paying to
+/// maintain an index no read can use. Initialization must drop the invalid one and
+/// rebuild it. Marking `indisvalid = false` by hand is the only way to reach that
+/// state deterministically; it is what an interrupted concurrent build leaves behind.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_invalid_file_column_stats_index_is_rebuilt_on_initialize() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false
+         WHERE indexrelid = 'idx_file_column_stats_table_file_column'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Pre-assert: if this fails the test proved nothing, so fail here rather than
+    // sail on to a green assertion below.
+    let invalid_now: bool = sqlx::query_scalar(
+        "SELECT NOT indisvalid FROM pg_index
+         WHERE indexrelid = 'idx_file_column_stats_table_file_column'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(invalid_now, "setup failed to mark the index invalid");
+
+    initialize_multicatalog_schema(&pool).await.unwrap();
+
+    let valid: Vec<bool> = sqlx::query_scalar(
+        "SELECT i.indisvalid FROM pg_index i
+         JOIN pg_class c ON c.oid = i.indexrelid
+         WHERE c.relname = 'idx_file_column_stats_table_file_column'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        valid,
+        vec![true],
+        "initialization must leave exactly one valid stats index; an invalid one \
+         left in place is skipped by CREATE INDEX IF NOT EXISTS forever"
+    );
+}
