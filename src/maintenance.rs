@@ -161,6 +161,27 @@ pub async fn cleanup_old_files_sqlite(
 }
 
 /// Physically delete files scheduled by
+/// [`DuckdbMetadataWriter::expire_snapshots`] and remove their bookkeeping rows.
+/// Returns resolved absolute paths deleted (or, for `dry_run`, paths that would
+/// be deleted).
+///
+/// [`DuckdbMetadataWriter::expire_snapshots`]: crate::metadata_writer_duckdb::DuckdbMetadataWriter::expire_snapshots
+#[cfg(feature = "write-duckdb")]
+pub async fn cleanup_old_files_duckdb(
+    writer: &crate::metadata_writer_duckdb::DuckdbMetadataWriter,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
+    let files = writer.list_scheduled_for_deletion(&criteria)?;
+    run_cleanup(&data_path, files, object_store, dry_run, |ids| async move {
+        writer.remove_scheduled(&ids)
+    })
+    .await
+}
+
+/// Physically delete files scheduled by
 /// [`MulticatalogManager::expire_snapshots_in_catalog`] for `catalog_name` and remove their
 /// bookkeeping rows. Returns the resolved absolute paths deleted (or, for `dry_run`, the
 /// paths that would be deleted).
@@ -284,6 +305,20 @@ async fn run_orphan_cleanup(
 #[cfg(feature = "write-sqlite")]
 pub async fn delete_orphaned_files_sqlite(
     writer: &crate::metadata_writer_sqlite::SqliteMetadataWriter,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
+    let referenced = writer.list_referenced_paths()?;
+    run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
+}
+
+/// List the DuckDB catalog's `data_path` and delete every unreferenced Parquet
+/// file.
+#[cfg(feature = "write-duckdb")]
+pub async fn delete_orphaned_files_duckdb(
+    writer: &crate::metadata_writer_duckdb::DuckdbMetadataWriter,
     object_store: Arc<dyn ObjectStore>,
     criteria: CleanupCriteria,
     dry_run: bool,

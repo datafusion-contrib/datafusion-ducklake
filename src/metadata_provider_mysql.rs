@@ -3,8 +3,8 @@
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
-    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
@@ -1490,6 +1490,104 @@ impl MetadataProvider for MySqlMetadataProvider {
                     rows,
                     Some(&present),
                 )?);
+            }
+            Ok(batches)
+        })
+    }
+
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let entries = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in entries {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
+                let present = sqlx::query(
+                    "SELECT column_name FROM information_schema.columns
+                     WHERE table_schema = DATABASE() AND table_name = ?",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::MySql,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT row_id, begin_snapshot, {projected} FROM {}
+                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL)
+                     ORDER BY begin_snapshot, row_id",
+                    quote_ident(&table)
+                );
+                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let row_ids = rows
+                    .iter()
+                    .map(|row| row.try_get("row_id"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let begin_snapshots = rows
+                    .iter()
+                    .map(|row| row.try_get("begin_snapshot"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let values = rows
+                    .iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index + 2))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(DuckLakeInlinedData {
+                    table_name: table,
+                    row_ids,
+                    begin_snapshots,
+                    batch: parse_inlined_rows_with_present(
+                        schema.clone(),
+                        columns,
+                        values,
+                        Some(&present),
+                    )?,
+                });
             }
             Ok(batches)
         })
