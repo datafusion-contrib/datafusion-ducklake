@@ -196,10 +196,9 @@ Writer output is configurable (Parquet compression, row-group sizing by row coun
 byte size). See [`DuckLakeTableWriter`](https://docs.rs/datafusion-ducklake) for the
 writer options.
 
-> Writing to a **standard, single-catalog** DuckLake store (the spec-compliant layout) is
-> supported today for **SQLite** via `SqliteMetadataWriter` (feature `write-sqlite`) and for
-> **PostgreSQL** via `PostgresSingleCatalogMetadataWriter` (feature `write-postgres`), where
-> SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both work. See
+> Writing to a **standard, single-catalog** DuckLake store is supported through
+> `DuckdbMetadataWriter`, `SqliteMetadataWriter`, `MySqlMetadataWriter`, and
+> `PostgresSingleCatalogMetadataWriter` with their matching `write-*` features. See
 > [`tests/it/sql_write_tests.rs`](tests/it/sql_write_tests.rs) and
 > [`tests/it/postgres_single_catalog_write_tests.rs`](tests/it/postgres_single_catalog_write_tests.rs).
 
@@ -314,7 +313,8 @@ current limitations, see **[COMPATIBILITY.md](COMPATIBILITY.md)**.
 
 A few highlights worth knowing up front:
 
-- Reads work on DuckDB, SQLite, PostgreSQL, and MySQL; **writes are SQLite/PostgreSQL only**.
+- Reads and writes work on DuckDB, SQLite, PostgreSQL, and MySQL. PostgreSQL uses the
+  experimental multi-catalog write layout.
 - Object stores: local filesystem and S3-compatible (S3, MinIO).
 - Snapshots can be selected through `DuckLakeCatalog` (by id or timestamp) or per query with
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
