@@ -6508,8 +6508,8 @@ mod tests {
             self.inner.get_ranges(location, ranges).await
         }
 
-        fn delete_stream<'a>(
-            &'a self,
+        fn delete_stream(
+            &self,
             locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
             self.inner.delete_stream(locations)
