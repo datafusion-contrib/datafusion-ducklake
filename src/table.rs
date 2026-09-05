@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
@@ -56,8 +58,9 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
+    FileGroup, FileScanConfigBuilder, FileSource, ParquetFileReaderFactory, ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::table_schema::TableSchema;
@@ -67,16 +70,11 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion_datasource_parquet::metadata::DFParquetMetadata;
 use futures::StreamExt;
+use object_store::ObjectMeta;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
-// Deprecated in parquet 59 in favour of a hand-rolled `AsyncFileReader`. The
-// call sites below read a footer once each, so the replacement (a custom
-// reader with its own I/O coalescing) buys nothing here.
-// See https://github.com/apache/arrow-rs/issues/10308.
-#[allow(deprecated)]
-use parquet::arrow::async_reader::ParquetObjectReader;
 use percent_encoding::percent_decode_str;
 
 #[cfg(feature = "encryption")]
@@ -850,61 +848,130 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) row_group_count: usize,
 }
 
-/// Read `resolved_path`'s parquet footer once. `encryption_key` is the file's
-/// DuckLake encryption key when it has one; it is only usable with the
-/// `encryption` feature, and this function cannot open an encrypted file
-/// without it.
+/// The [`ObjectMeta`] DuckLake's own scan-time `PartitionedFile::new(path,
+/// size)` builds (see [`DuckLakeTable::partitioned_file`]): epoch
+/// `last_modified`, no e_tag or version. A plan-time footer probe that builds
+/// this exact shape can share the `RuntimeEnv` `FileMetadataCache` entry with
+/// the scan's own `CachedParquetFileReaderFactory` read (#1323) —
+/// `CachedFileMetadataEntry::is_valid_for` requires an exact `size` AND
+/// `last_modified` match (the cache itself keys only by location), so any
+/// other `last_modified` would silently miss the entry the scan populates,
+/// and vice versa.
+fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
+    ObjectMeta {
+        location,
+        last_modified: DateTime::<Utc>::from_timestamp_nanos(0),
+        size,
+        e_tag: None,
+        version: None,
+    }
+}
+
+/// Read `resolved_path`'s parquet footer once, through `state`'s shared
+/// `RuntimeEnv` file-metadata cache (#1323) rather than the uncached
+/// one-shot `ParquetObjectReader` this used before: a warm cache serves this
+/// from memory, whether the entry was populated by an earlier call here or by
+/// the scan's own `CachedParquetFileReaderFactory` (same cache key — see
+/// [`epoch_object_meta`]).
+///
+/// `file_size_bytes` is the catalog's recorded size for the file, needed to
+/// build the `ObjectMeta` the cache validates against. It is taken as a
+/// parameter rather than resolved via a `head()` call, which would cost
+/// exactly the round trip this function exists to avoid.
+///
+/// `encryption_key` is the file's DuckLake encryption key when it has one; it
+/// is only usable with the `encryption` feature, and this function cannot
+/// open an encrypted file without it. Note an encrypted footer is never
+/// cached — `DFParquetMetadata::fetch_metadata` treats a fetch made with
+/// decryption properties as uncacheable (see its `cache_metadata` gate) — so
+/// this saves nothing for that path beyond sharing one code path with the
+/// unencrypted one.
 pub(crate) async fn read_parquet_footer_facts(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
+    file_size_bytes: Option<i64>,
     encryption_key: Option<&str>,
 ) -> DataFusionResult<ParquetFooterFacts> {
     let object_store = state.runtime_env().object_store(object_store_url)?;
     let object_path = ObjectPath::from(resolved_path);
-    #[allow(deprecated)]
-    let reader = ParquetObjectReader::new(object_store, object_path);
+    let size = match file_size_bytes {
+        Some(size) => validated_file_size(size, resolved_path)?,
+        // The caller doesn't have the catalog's recorded size in reach (a
+        // `file_layout` lookup, keyed only by path). One `head()` — not a
+        // ranged read, so it never shows up as a footer read — resolves the
+        // true size so the `ObjectMeta` built below still matches what a
+        // scan's own `PartitionedFile` would carry, and the cache entry is
+        // still shared rather than silently keyed apart from it.
+        None => object_store.head(&object_path).await?.size,
+    };
+    let object_meta = epoch_object_meta(object_path, size);
 
     #[cfg(feature = "encryption")]
-    let builder = {
-        use parquet::arrow::arrow_reader::ArrowReaderOptions;
-        let options = match encryption_key {
-            Some(key) if !key.is_empty() => {
-                let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                let decryption_props =
-                    parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create decryption properties: {}",
-                                e
-                            ))
-                        })?;
-                ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
-            },
-            _ => ArrowReaderOptions::new(),
-        };
-        ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    let decryption_properties = match encryption_key {
+        Some(key) if !key.is_empty() => {
+            let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+            let props = parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
+                .build()
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to create decryption properties: {}",
+                        e
+                    ))
+                })?;
+            Some(props)
+        },
+        _ => None,
     };
-
     #[cfg(not(feature = "encryption"))]
-    let builder = {
+    let decryption_properties = {
         // Without the feature there is no decryption to configure.
         let _ = encryption_key;
-        ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        None
     };
 
-    let field_ids = extract_parquet_field_ids(builder.metadata());
+    let metadata = DFParquetMetadata::new(object_store.as_ref(), &object_meta)
+        .with_file_metadata_cache(Some(
+            state.runtime_env().cache_manager.get_file_metadata_cache(),
+        ))
+        .with_decryption_properties(decryption_properties)
+        .fetch_metadata()
+        .await?;
+
+    let field_ids = extract_parquet_field_ids(&metadata);
+    let arrow_schema = Arc::new(
+        parquet::arrow::parquet_to_arrow_schema(
+            metadata.file_metadata().schema_descr(),
+            metadata.file_metadata().key_value_metadata(),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?,
+    );
 
     Ok(ParquetFooterFacts {
         field_ids,
-        arrow_schema: builder.schema().clone(),
-        row_group_count: builder.metadata().row_groups().len(),
+        arrow_schema,
+        row_group_count: metadata.row_groups().len(),
     })
+}
+
+/// Build a [`CachedParquetFileReaderFactory`] reading `object_store_url`'s
+/// store through `state`'s shared file-metadata cache (the `RuntimeEnv`'s
+/// `FileMetadataCache`, sized by `with_metadata_cache_limit`), rather than the
+/// uncached `DefaultParquetFileReaderFactory` a bare `ParquetSource::new`
+/// falls back to (#1323). Every query-time `ParquetSource` this crate builds
+/// should attach one, so a footer fetched once (by this scan, another scan, or
+/// the caller's own footer sampling) is never re-fetched for the life of the
+/// cache.
+pub(crate) fn cached_parquet_reader_factory(
+    state: &dyn Session,
+    object_store_url: &ObjectStoreUrl,
+) -> DataFusionResult<Arc<dyn ParquetFileReaderFactory>> {
+    let object_store = state.runtime_env().object_store(object_store_url)?;
+    let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+    Ok(Arc::new(CachedParquetFileReaderFactory::new(
+        object_store,
+        metadata_cache,
+    )))
 }
 
 /// Resolve one file's columns against `columns` by field id.
@@ -916,12 +983,19 @@ pub(crate) async fn read_parquet_file_layout(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
+    file_size_bytes: Option<i64>,
     encryption_key: Option<&str>,
     columns: &[DuckLakeTableColumn],
     fallback_schema: &SchemaRef,
 ) -> DataFusionResult<Arc<ParquetFileLayout>> {
-    let facts =
-        read_parquet_footer_facts(state, object_store_url, resolved_path, encryption_key).await?;
+    let facts = read_parquet_footer_facts(
+        state,
+        object_store_url,
+        resolved_path,
+        file_size_bytes,
+        encryption_key,
+    )
+    .await?;
 
     let (read_schema, name_mapping) = if facts.field_ids.is_empty() {
         (fallback_schema.clone(), HashMap::new())
@@ -1948,17 +2022,56 @@ impl DuckLakeTable {
 
     /// Create a ParquetSource with encryption support if enabled and needed
     /// Build the parquet source for a scan, with the table's encryption factory
-    /// attached when one is installed.
+    /// attached when one is installed, and a [`CachedParquetFileReaderFactory`]
+    /// attached so the scan reads footers through `state`'s shared
+    /// file-metadata cache instead of re-fetching them per file per query
+    /// (#1323).
     ///
     /// Accepts either a plain file schema or a [`TableSchema`] — the latter is
     /// how a *positional* scan asks the reader for the physical-position virtual
     /// column (see [`positional_table_schema`]).
-    fn create_parquet_source(&self, schema: impl Into<TableSchema>) -> ParquetSource {
+    fn create_parquet_source(
+        &self,
+        state: &dyn Session,
+        schema: impl Into<TableSchema>,
+    ) -> DataFusionResult<ParquetSource> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
+        let source = self.apply_session_parquet_options(ParquetSource::new(schema), state);
         #[cfg(feature = "encryption")]
         if let Some(factory) = self.encryption_keys.factory.get() {
-            return ParquetSource::new(schema).with_encryption_factory(Arc::clone(factory));
+            return Ok(source
+                .with_encryption_factory(Arc::clone(factory))
+                .with_parquet_file_reader_factory(reader_factory));
         }
-        ParquetSource::new(schema)
+        Ok(source.with_parquet_file_reader_factory(reader_factory))
+    }
+
+    /// Copy the reader-behaviour subset of the session's parquet options
+    /// (`pushdown_filters`, `reorder_filters`, `force_filter_selections`,
+    /// `max_predicate_cache_size`, `enable_page_index`, `pruning`,
+    /// `bloom_filter_on_read`, `max_in_list_size`) onto `source`. The
+    /// schema/type subset (`schema_force_view_types`, `binary_as_string`,
+    /// `coerce_int96*`, `skip_metadata`, `skip_arrow_metadata`,
+    /// `metadata_size_hint`) is left on `ParquetSource::new`'s defaults: the
+    /// fork supplies its own schema and per-file size hints, so those never
+    /// come from the session.
+    fn apply_session_parquet_options(
+        &self,
+        source: ParquetSource,
+        state: &dyn Session,
+    ) -> ParquetSource {
+        let session_opts = &state.config_options().execution.parquet;
+        let source = source
+            .with_pushdown_filters(session_opts.pushdown_filters)
+            .with_reorder_filters(session_opts.reorder_filters)
+            .with_enable_page_index(session_opts.enable_page_index)
+            .with_bloom_filter_on_read(session_opts.bloom_filter_on_read);
+        let mut table_opts = source.table_parquet_options().clone();
+        table_opts.global.force_filter_selections = session_opts.force_filter_selections;
+        table_opts.global.max_predicate_cache_size = session_opts.max_predicate_cache_size;
+        table_opts.global.pruning = session_opts.pruning;
+        table_opts.global.max_in_list_size = session_opts.max_in_list_size;
+        source.with_table_parquet_options(table_opts)
     }
 
     fn scan_config_builder(&self, source: Arc<dyn FileSource>) -> FileScanConfigBuilder {
@@ -2050,66 +2163,89 @@ impl DuckLakeTable {
         file: &DuckLakeFileData,
     ) -> DataFusionResult<SchemaMapping> {
         let resolved_path = self.resolve_file_path(file)?;
+
+        // A file with a physical rename mapping resolves entirely from the
+        // mapping row (`mapped_schema`) — never from the file's own footer
+        // field ids. Checked FIRST, before any I/O: a renamed file used to pay
+        // a footer fetch here on every `scan()` whose result this branch then
+        // discarded outright (the dominant plan-time footer cost, worse than
+        // the execute-time read #1323 originally fixed, since it ran even for
+        // files this method never needed to open at all).
+        if let Some(mapping_id) = file.mapping_id {
+            return self.mapped_schema(mapping_id, &resolved_path);
+        }
+
         let object_store = state
             .runtime_env()
             .object_store(self.object_store_url.as_ref())?;
         let object_path = ObjectPath::from(resolved_path.as_str());
+        let object_meta = epoch_object_meta(
+            object_path,
+            validated_file_size(file.file_size_bytes, &resolved_path)?,
+        );
+        let metadata_size_hint = file
+            .footer_size
+            .filter(|&size| size > 0)
+            .and_then(|size| usize::try_from(size).ok());
 
-        #[allow(deprecated)]
-        let reader = ParquetObjectReader::new(object_store, object_path);
-
-        // Build the ParquetRecordBatchStreamBuilder with decryption if needed
+        // Resolve decryption properties (if any) before touching the store, the
+        // same way `read_parquet_footer_facts` does.
         #[cfg(feature = "encryption")]
-        let builder = {
-            use parquet::arrow::arrow_reader::ArrowReaderOptions;
-
-            // Check if file has encryption key
-            let options = if let Some(ref key) = file.encryption_key {
-                if !key.is_empty() {
-                    let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                    let decryption_props =
-                        parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
-                            .build()
-                            .map_err(|e| {
-                                DataFusionError::Execution(format!(
-                                    "Failed to create decryption properties: {}",
-                                    e
-                                ))
-                            })?;
-                    ArrowReaderOptions::new().with_file_decryption_properties(decryption_props)
-                } else {
-                    ArrowReaderOptions::new()
-                }
-            } else {
-                ArrowReaderOptions::new()
-            };
-
-            ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?
+        let decryption_properties = match file.encryption_key.as_deref() {
+            Some(key) if !key.is_empty() => {
+                let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
+                let props =
+                    parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
+                        .build()
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to create decryption properties: {}",
+                                e
+                            ))
+                        })?;
+                Some(props)
+            },
+            _ => None,
         };
-
         #[cfg(not(feature = "encryption"))]
-        let builder = ParquetRecordBatchStreamBuilder::new(reader)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let decryption_properties = None;
 
-        let field_id_map = extract_parquet_field_ids(builder.metadata());
+        // Read the footer through `state`'s shared `RuntimeEnv` file-metadata
+        // cache (#1323) — the same cache key a scan's own
+        // `CachedParquetFileReaderFactory` read uses (see `epoch_object_meta`),
+        // so whichever of the two runs first for a given file populates the
+        // entry the other then hits for free. Note an encrypted footer is
+        // never cached either way (`DFParquetMetadata::fetch_metadata` treats
+        // a fetch made with decryption properties as uncacheable), so this
+        // saves nothing new for that path beyond sharing the code with the
+        // unencrypted one.
+        let metadata = DFParquetMetadata::new(object_store.as_ref(), &object_meta)
+            .with_metadata_size_hint(metadata_size_hint)
+            .with_file_metadata_cache(Some(
+                state.runtime_env().cache_manager.get_file_metadata_cache(),
+            ))
+            .with_decryption_properties(decryption_properties)
+            .fetch_metadata()
+            .await?;
 
-        if let Some(mapping_id) = file.mapping_id {
-            return self.mapped_schema(mapping_id, &resolved_path);
-        }
+        let field_id_map = extract_parquet_field_ids(&metadata);
 
         // No field_ids means external file - use current schema directly
         if field_id_map.is_empty() {
             return Ok((self.schema.clone(), HashMap::new(), HashMap::new()));
         }
 
+        let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
+            metadata.file_metadata().schema_descr(),
+            metadata.file_metadata().key_value_metadata(),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping_from_schema(
             &self.columns,
             self.physical_schema.as_ref(),
             &field_id_map,
-            Some(builder.schema().as_ref()),
+            Some(&arrow_schema),
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -2197,7 +2333,7 @@ impl DuckLakeTable {
         // instead of every row of the file. Positions stay true under pruning
         // because the reader derives them from row-group offsets, and a row the
         // reader drops could not have matched anyway.
-        let mut source = self.create_parquet_source(table_schema);
+        let mut source = self.create_parquet_source(state, table_schema)?;
         if self.predicate_is_prunable(&predicate, &file_cfg) {
             source = source.with_predicate(Arc::clone(&predicate));
         }
@@ -2314,7 +2450,7 @@ impl DuckLakeTable {
         // Create file scan config for the delete file
         let file_scan_config = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(delete_schema)),
+            Arc::new(self.create_parquet_source(state, delete_schema)?),
         )
         .with_file_group(FileGroup::new(vec![pf]))
         .build();
@@ -2484,7 +2620,9 @@ impl DuckLakeTable {
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
         for ((read_schema, name_mapping, constants), partitioned_files) in groups {
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(state, read_schema.clone())?,
+                ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(partitioned_files));
 
@@ -2743,7 +2881,7 @@ impl DuckLakeTable {
                 file_statistics,
             )?;
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj))?;
             let scan = DataSourceExec::from_data_source(builder.build());
@@ -2763,7 +2901,7 @@ impl DuckLakeTable {
             )?;
             let mut builder = self
                 .scan_config_builder(Arc::new(
-                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                    self.create_parquet_source(state, file_cfg.read_schema.clone())?,
                 ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(vec![pf]));
@@ -2828,6 +2966,7 @@ impl DuckLakeTable {
             state,
             self.object_store_url.as_ref(),
             &resolved_path,
+            Some(file.file_size_bytes),
             encryption_key,
             &self.columns,
             &self.physical_schema,
@@ -2976,7 +3115,7 @@ impl DuckLakeTable {
 
             let pf = self.partitioned_data_file(table_file, has_embedded, file_statistics)?;
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj))?;
             let mut plan: Arc<dyn ExecutionPlan> =
@@ -3006,7 +3145,7 @@ impl DuckLakeTable {
             let pf = self.partitioned_data_file(table_file, true, file_statistics)?;
             let mut builder = self
                 .scan_config_builder(Arc::new(
-                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                    self.create_parquet_source(state, file_cfg.read_schema.clone())?,
                 ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(vec![pf]));
@@ -3169,7 +3308,9 @@ impl DuckLakeTable {
                 pf = pf.with_metadata_size_hint(hint);
             }
             let builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(state, read_schema.clone())?,
+                ))
                 .with_file_group(FileGroup::new(vec![pf]))
                 .with_projection_indices(Some(projection))?;
             DataSourceExec::from_data_source(builder.build())
@@ -3182,7 +3323,7 @@ impl DuckLakeTable {
             proj.push(pos_table_idx);
             let pos_index = proj.len() - 1;
             let builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
                 ]))
@@ -3478,7 +3619,7 @@ impl DuckLakeTable {
         let pos_index = proj.len() - 1;
 
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
-            self.scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+            self.scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
                 ]))
@@ -4575,7 +4716,9 @@ mod tests {
     };
     use crate::partition::{PartitionSpecColumn, PartitionTransform};
     use crate::types::build_arrow_schema;
+    use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::prelude::{SessionContext, col, lit};
+    use object_store::ObjectStore;
     use rstest::rstest;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6376,5 +6519,330 @@ mod tests {
             "This feature is not implemented: DuckLake sort order 9 contains an unsupported \
              expression; datafusion-ducklake can write only bare-column sort keys",
         );
+    }
+
+    // --- #1323: the DuckLake scan attaches the footer metadata cache ---
+
+    /// Real parquet bytes for a single row group matching `fixed_table`'s
+    /// `id`/`region` (Int64, Int64) schema, so a scan can actually read a
+    /// footer instead of only exercising catalog-side planning.
+    fn footer_cache_fixture_bytes() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64; 10])) as ArrayRef,
+            ],
+        )
+        .expect("build fixture batch");
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("open writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        buf
+    }
+
+    /// An `ObjectStore` wrapper that counts range reads whose end lands
+    /// exactly on `file_len` — the footer/page-index suffix a cold
+    /// `DFParquetMetadata::fetch_metadata_from_store` fetches
+    /// (`datafusion-datasource-parquet`'s `metadata.rs`), which is the read a
+    /// warm [`CachedParquetFileReaderFactory`] must not repeat. Covers every
+    /// method a footer fetch could arrive through: `get_ranges` directly
+    /// (`DFParquetMetadata`'s own call, and the only one this crate's footer
+    /// reads use now that both the scan and `file_schema_mapping` route
+    /// through it — #1323), `get_opts` (a single bounded range there would
+    /// also qualify), and `get_range`, whose `ObjectStoreExt` default
+    /// implementation calls `get_opts` on `self` and so is covered by the
+    /// same override. Delegates every other `ObjectStore` method to `inner`
+    /// untouched.
+    #[derive(Debug)]
+    struct FooterCountingStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        file_len: u64,
+        footer_reads: AtomicUsize,
+    }
+
+    impl FooterCountingStore {
+        fn new(inner: Arc<dyn object_store::ObjectStore>, file_len: u64) -> Self {
+            Self {
+                inner,
+                file_len,
+                footer_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn footer_reads(&self) -> usize {
+            self.footer_reads.load(Ordering::SeqCst)
+        }
+
+        fn count_footer_ranges(&self, ranges: &[std::ops::Range<u64>]) {
+            for range in ranges {
+                if range.end == self.file_len {
+                    self.footer_reads.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    impl std::fmt::Display for FooterCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FooterCountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FooterCountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            // Not exercised by `DFParquetMetadata` today (it always calls
+            // `get_ranges` below, cold or warm, execution-time or plan-time —
+            // see the struct doc), but counted for completeness: `get_range`
+            // (built on this) and any future reader that fetches the footer
+            // as a single `get_opts` range would otherwise go uncounted.
+            if let Some(range) = &options.range
+                && let Ok(resolved) = range.as_range(self.file_len)
+                && resolved.end == self.file_len
+            {
+                self.footer_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.count_footer_ranges(ranges);
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// `create_parquet_source` must attach a [`CachedParquetFileReaderFactory`]
+    /// — reading through `state`'s shared file-metadata cache — rather than
+    /// leaving DataFusion to fall back to the uncached
+    /// `DefaultParquetFileReaderFactory` (#1323). Builds a real
+    /// `DataSourceExec`/`FileScanConfig` scan plan, exactly as a caller of
+    /// `create_parquet_source` does, and downcasts down to the `ParquetSource`
+    /// to inspect the attached factory.
+    #[tokio::test]
+    async fn ducklake_scan_attaches_the_cached_parquet_reader_factory() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(&store_url, store);
+        let state = ctx.state();
+
+        let source = table.create_parquet_source(&state, Arc::clone(&table.physical_schema))?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            table
+                .scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![]))
+                .build(),
+        );
+
+        let found_source = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+            .expect("plan is a DataSourceExec wrapping a parquet FileScanConfig");
+
+        let factory = found_source
+            .parquet_file_reader_factory()
+            .expect("a query-time ParquetSource must attach a reader factory (#1323)");
+        let debug = format!("{factory:?}");
+        assert!(
+            debug.contains("CachedParquetFileReaderFactory"),
+            "expected the metadata-cache-backed reader factory, got: {debug}",
+        );
+
+        Ok(())
+    }
+
+    /// `create_parquet_source` must copy the reader-behaviour subset of the
+    /// session's parquet options onto the `ParquetSource` it builds
+    /// (`reorder_filters`, `max_in_list_size`, and friends — see
+    /// [`DuckLakeTable::apply_session_parquet_options`]), while leaving the
+    /// schema/type subset (`schema_force_view_types` and friends) on the
+    /// source's own defaults, since the fork supplies its own schema.
+    #[tokio::test]
+    async fn ducklake_scan_propagates_session_reader_options_not_schema_options() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let mut session_config = datafusion::execution::config::SessionConfig::new();
+        {
+            let parquet_opts = &mut session_config.options_mut().execution.parquet;
+            parquet_opts.reorder_filters = true;
+            parquet_opts.max_in_list_size = 7;
+            parquet_opts.schema_force_view_types = false;
+        }
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new_with_config(session_config);
+        ctx.runtime_env().register_object_store(&store_url, store);
+        let state = ctx.state();
+
+        let source = table.create_parquet_source(&state, Arc::clone(&table.physical_schema))?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            table
+                .scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![]))
+                .build(),
+        );
+
+        let found_source = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+            .expect("plan is a DataSourceExec wrapping a parquet FileScanConfig");
+
+        let opts = found_source.table_parquet_options();
+        assert!(
+            opts.global.reorder_filters,
+            "reorder_filters must propagate from the session"
+        );
+        assert_eq!(
+            opts.global.max_in_list_size, 7,
+            "max_in_list_size must propagate from the session"
+        );
+        assert!(
+            opts.global.schema_force_view_types,
+            "schema_force_view_types must stay on the source's default (true), \
+             not follow the session, since the fork supplies its own schema"
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end: scanning the same file twice on one `SessionContext` must
+    /// issue the footer/page-index read only on the cold run. The warm run's
+    /// `ParquetSource` reads through the same `RuntimeEnv` file-metadata cache
+    /// the cold run just populated (#1323), so it performs zero range reads
+    /// whose end lands on the file's length.
+    #[tokio::test]
+    async fn ducklake_parquet_source_reuses_cached_footer_metadata_across_scans() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let bytes = footer_cache_fixture_bytes();
+        let file_len = bytes.len() as u64;
+
+        let inner: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let object_path = ObjectPath::from("footer-cache.parquet");
+        inner
+            .put(&object_path, bytes.into())
+            .await
+            .expect("seed the fixture file");
+        let counting = Arc::new(FooterCountingStore::new(inner, file_len));
+
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&store_url, Arc::clone(&counting) as Arc<dyn ObjectStore>);
+        let state = ctx.state();
+
+        let build_plan = |state: &datafusion::execution::SessionState| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let source = table.create_parquet_source(state, Arc::clone(&table.physical_schema))?;
+            let pf = PartitionedFile::new("footer-cache.parquet", file_len);
+            Ok(DataSourceExec::from_data_source(
+                table
+                    .scan_config_builder(Arc::new(source))
+                    .with_file_group(FileGroup::new(vec![pf]))
+                    .build(),
+            ))
+        };
+
+        let plan1 = build_plan(&state)?;
+        let batches1 = datafusion::physical_plan::collect(plan1, state.task_ctx())
+            .await
+            .expect("first scan executes");
+        assert_eq!(
+            batches1.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10,
+            "sanity: the fixture file's rows come back"
+        );
+        let footer_reads_after_cold_scan = counting.footer_reads();
+        assert!(
+            footer_reads_after_cold_scan >= 1,
+            "the cold scan must read the footer at least once"
+        );
+
+        let plan2 = build_plan(&state)?;
+        let batches2 = datafusion::physical_plan::collect(plan2, state.task_ctx())
+            .await
+            .expect("second scan executes");
+        assert_eq!(batches2.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+
+        assert_eq!(
+            counting.footer_reads(),
+            footer_reads_after_cold_scan,
+            "a warm scan must issue zero additional footer reads once the reader factory \
+             shares the session's metadata cache (#1323)",
+        );
+
+        Ok(())
     }
 }
