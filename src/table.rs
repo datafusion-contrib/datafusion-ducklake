@@ -56,8 +56,9 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfigBuilder, FileSource, ParquetSource,
+    FileGroup, FileScanConfigBuilder, FileSource, ParquetFileReaderFactory, ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::table_schema::TableSchema;
@@ -905,6 +906,26 @@ pub(crate) async fn read_parquet_footer_facts(
         arrow_schema: builder.schema().clone(),
         row_group_count: builder.metadata().row_groups().len(),
     })
+}
+
+/// Build a [`CachedParquetFileReaderFactory`] reading `object_store_url`'s
+/// store through `state`'s shared file-metadata cache (the `RuntimeEnv`'s
+/// `FileMetadataCache`, sized by `with_metadata_cache_limit`), rather than the
+/// uncached `DefaultParquetFileReaderFactory` a bare `ParquetSource::new`
+/// falls back to (#1323). Every query-time `ParquetSource` this crate builds
+/// should attach one, so a footer fetched once (by this scan, another scan, or
+/// the caller's own footer sampling) is never re-fetched for the life of the
+/// cache.
+pub(crate) fn cached_parquet_reader_factory(
+    state: &dyn Session,
+    object_store_url: &ObjectStoreUrl,
+) -> DataFusionResult<Arc<dyn ParquetFileReaderFactory>> {
+    let object_store = state.runtime_env().object_store(object_store_url)?;
+    let metadata_cache = state.runtime_env().cache_manager.get_file_metadata_cache();
+    Ok(Arc::new(CachedParquetFileReaderFactory::new(
+        object_store,
+        metadata_cache,
+    )))
 }
 
 /// Resolve one file's columns against `columns` by field id.
@@ -1948,17 +1969,27 @@ impl DuckLakeTable {
 
     /// Create a ParquetSource with encryption support if enabled and needed
     /// Build the parquet source for a scan, with the table's encryption factory
-    /// attached when one is installed.
+    /// attached when one is installed, and a [`CachedParquetFileReaderFactory`]
+    /// attached so the scan reads footers through `state`'s shared
+    /// file-metadata cache instead of re-fetching them per file per query
+    /// (#1323).
     ///
     /// Accepts either a plain file schema or a [`TableSchema`] — the latter is
     /// how a *positional* scan asks the reader for the physical-position virtual
     /// column (see [`positional_table_schema`]).
-    fn create_parquet_source(&self, schema: impl Into<TableSchema>) -> ParquetSource {
+    fn create_parquet_source(
+        &self,
+        state: &dyn Session,
+        schema: impl Into<TableSchema>,
+    ) -> DataFusionResult<ParquetSource> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         #[cfg(feature = "encryption")]
         if let Some(factory) = self.encryption_keys.factory.get() {
-            return ParquetSource::new(schema).with_encryption_factory(Arc::clone(factory));
+            return Ok(ParquetSource::new(schema)
+                .with_encryption_factory(Arc::clone(factory))
+                .with_parquet_file_reader_factory(reader_factory));
         }
-        ParquetSource::new(schema)
+        Ok(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory))
     }
 
     fn scan_config_builder(&self, source: Arc<dyn FileSource>) -> FileScanConfigBuilder {
@@ -2197,7 +2228,7 @@ impl DuckLakeTable {
         // instead of every row of the file. Positions stay true under pruning
         // because the reader derives them from row-group offsets, and a row the
         // reader drops could not have matched anyway.
-        let mut source = self.create_parquet_source(table_schema);
+        let mut source = self.create_parquet_source(state, table_schema)?;
         if self.predicate_is_prunable(&predicate, &file_cfg) {
             source = source.with_predicate(Arc::clone(&predicate));
         }
@@ -2314,7 +2345,7 @@ impl DuckLakeTable {
         // Create file scan config for the delete file
         let file_scan_config = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(delete_schema)),
+            Arc::new(self.create_parquet_source(state, delete_schema)?),
         )
         .with_file_group(FileGroup::new(vec![pf]))
         .build();
@@ -2484,7 +2515,9 @@ impl DuckLakeTable {
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
         for ((read_schema, name_mapping, constants), partitioned_files) in groups {
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(state, read_schema.clone())?,
+                ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(partitioned_files));
 
@@ -2743,7 +2776,7 @@ impl DuckLakeTable {
                 file_statistics,
             )?;
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj))?;
             let scan = DataSourceExec::from_data_source(builder.build());
@@ -2763,7 +2796,7 @@ impl DuckLakeTable {
             )?;
             let mut builder = self
                 .scan_config_builder(Arc::new(
-                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                    self.create_parquet_source(state, file_cfg.read_schema.clone())?,
                 ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(vec![pf]));
@@ -2976,7 +3009,7 @@ impl DuckLakeTable {
 
             let pf = self.partitioned_data_file(table_file, has_embedded, file_statistics)?;
             let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj))?;
             let mut plan: Arc<dyn ExecutionPlan> =
@@ -3006,7 +3039,7 @@ impl DuckLakeTable {
             let pf = self.partitioned_data_file(table_file, true, file_statistics)?;
             let mut builder = self
                 .scan_config_builder(Arc::new(
-                    self.create_parquet_source(file_cfg.read_schema.clone()),
+                    self.create_parquet_source(state, file_cfg.read_schema.clone())?,
                 ))
                 .with_limit(limit)
                 .with_file_group(FileGroup::new(vec![pf]));
@@ -3169,7 +3202,9 @@ impl DuckLakeTable {
                 pf = pf.with_metadata_size_hint(hint);
             }
             let builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(read_schema.clone())))
+                .scan_config_builder(Arc::new(
+                    self.create_parquet_source(state, read_schema.clone())?,
+                ))
                 .with_file_group(FileGroup::new(vec![pf]))
                 .with_projection_indices(Some(projection))?;
             DataSourceExec::from_data_source(builder.build())
@@ -3182,7 +3217,7 @@ impl DuckLakeTable {
             proj.push(pos_table_idx);
             let pos_index = proj.len() - 1;
             let builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
                 ]))
@@ -3471,7 +3506,7 @@ impl DuckLakeTable {
         let pos_index = proj.len() - 1;
 
         let scan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
-            self.scan_config_builder(Arc::new(self.create_parquet_source(table_schema)))
+            self.scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![
                     self.partitioned_file(&table_file.file)?,
                 ]))
@@ -4554,7 +4589,9 @@ mod tests {
     };
     use crate::partition::{PartitionSpecColumn, PartitionTransform};
     use crate::types::build_arrow_schema;
+    use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::prelude::{SessionContext, col, lit};
+    use object_store::ObjectStore;
     use rstest::rstest;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6355,5 +6392,264 @@ mod tests {
             "This feature is not implemented: DuckLake sort order 9 contains an unsupported \
              expression; datafusion-ducklake can write only bare-column sort keys",
         );
+    }
+
+    // --- #1323: the DuckLake scan attaches the footer metadata cache ---
+
+    /// Real parquet bytes for a single row group matching `fixed_table`'s
+    /// `id`/`region` (Int64, Int64) schema, so a scan can actually read a
+    /// footer instead of only exercising catalog-side planning.
+    fn footer_cache_fixture_bytes() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("region", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>())) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1i64; 10])) as ArrayRef,
+            ],
+        )
+        .expect("build fixture batch");
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut buf, schema, None).expect("open writer");
+            writer.write(&batch).expect("write batch");
+            writer.close().expect("close writer");
+        }
+        buf
+    }
+
+    /// An `ObjectStore` wrapper that counts range reads whose end lands
+    /// exactly on `file_len` — the footer/page-index suffix a cold
+    /// `DFParquetMetadata::fetch_metadata_from_store` fetches
+    /// (`datafusion-datasource-parquet`'s `metadata.rs`), which is the read a
+    /// warm [`CachedParquetFileReaderFactory`] must not repeat. Delegates
+    /// every other `ObjectStore` method to `inner` untouched.
+    #[derive(Debug)]
+    struct FooterCountingStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        file_len: u64,
+        footer_reads: AtomicUsize,
+    }
+
+    impl FooterCountingStore {
+        fn new(inner: Arc<dyn object_store::ObjectStore>, file_len: u64) -> Self {
+            Self {
+                inner,
+                file_len,
+                footer_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn footer_reads(&self) -> usize {
+            self.footer_reads.load(Ordering::SeqCst)
+        }
+
+        fn count_footer_ranges(&self, ranges: &[std::ops::Range<u64>]) {
+            for range in ranges {
+                if range.end == self.file_len {
+                    self.footer_reads.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    impl std::fmt::Display for FooterCountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FooterCountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FooterCountingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            // Not exercised by the parquet reader on this crate's read path (it
+            // calls `get_ranges` below), but counted for completeness in case a
+            // future reader routes a footer-sized range through here instead.
+            if let Some(range) = &options.range
+                && let Ok(resolved) = range.as_range(self.file_len)
+                && resolved.end == self.file_len
+            {
+                self.footer_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &ObjectPath,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            self.count_footer_ranges(ranges);
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream<'a>(
+            &'a self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// `create_parquet_source` must attach a [`CachedParquetFileReaderFactory`]
+    /// — reading through `state`'s shared file-metadata cache — rather than
+    /// leaving DataFusion to fall back to the uncached
+    /// `DefaultParquetFileReaderFactory` (#1323). Builds a real
+    /// `DataSourceExec`/`FileScanConfig` scan plan, exactly as a caller of
+    /// `create_parquet_source` does, and downcasts down to the `ParquetSource`
+    /// to inspect the attached factory.
+    #[tokio::test]
+    async fn ducklake_scan_attaches_the_cached_parquet_reader_factory() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(&store_url, store);
+        let state = ctx.state();
+
+        let source = table.create_parquet_source(&state, Arc::clone(&table.physical_schema))?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            table
+                .scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![]))
+                .build(),
+        );
+
+        let found_source = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+            .expect("plan is a DataSourceExec wrapping a parquet FileScanConfig");
+
+        let factory = found_source
+            .parquet_file_reader_factory()
+            .expect("a query-time ParquetSource must attach a reader factory (#1323)");
+        let debug = format!("{factory:?}");
+        assert!(
+            debug.contains("CachedParquetFileReaderFactory"),
+            "expected the metadata-cache-backed reader factory, got: {debug}",
+        );
+
+        Ok(())
+    }
+
+    /// End-to-end: scanning the same file twice on one `SessionContext` must
+    /// issue the footer/page-index read only on the cold run. The warm run's
+    /// `ParquetSource` reads through the same `RuntimeEnv` file-metadata cache
+    /// the cold run just populated (#1323), so it performs zero range reads
+    /// whose end lands on the file's length.
+    #[tokio::test]
+    async fn ducklake_parquet_source_reuses_cached_footer_metadata_across_scans() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let bytes = footer_cache_fixture_bytes();
+        let file_len = bytes.len() as u64;
+
+        let inner: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let object_path = ObjectPath::from("footer-cache.parquet");
+        inner
+            .put(&object_path, bytes.into())
+            .await
+            .expect("seed the fixture file");
+        let counting = Arc::new(FooterCountingStore::new(inner, file_len));
+
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(&store_url, Arc::clone(&counting) as Arc<dyn ObjectStore>);
+        let state = ctx.state();
+
+        let build_plan = |state: &datafusion::execution::SessionState| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            let source = table.create_parquet_source(state, Arc::clone(&table.physical_schema))?;
+            let pf = PartitionedFile::new("footer-cache.parquet", file_len);
+            Ok(DataSourceExec::from_data_source(
+                table
+                    .scan_config_builder(Arc::new(source))
+                    .with_file_group(FileGroup::new(vec![pf]))
+                    .build(),
+            ))
+        };
+
+        let plan1 = build_plan(&state)?;
+        let batches1 = datafusion::physical_plan::collect(plan1, state.task_ctx())
+            .await
+            .expect("first scan executes");
+        assert_eq!(
+            batches1.iter().map(|b| b.num_rows()).sum::<usize>(),
+            10,
+            "sanity: the fixture file's rows come back"
+        );
+        let footer_reads_after_cold_scan = counting.footer_reads();
+        assert!(
+            footer_reads_after_cold_scan >= 1,
+            "the cold scan must read the footer at least once"
+        );
+
+        let plan2 = build_plan(&state)?;
+        let batches2 = datafusion::physical_plan::collect(plan2, state.task_ctx())
+            .await
+            .expect("second scan executes");
+        assert_eq!(batches2.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+
+        assert_eq!(
+            counting.footer_reads(),
+            footer_reads_after_cold_scan,
+            "a warm scan must issue zero additional footer reads once the reader factory \
+             shares the session's metadata cache (#1323)",
+        );
+
+        Ok(())
     }
 }

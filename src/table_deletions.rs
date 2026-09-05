@@ -54,8 +54,9 @@ use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataPr
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
-    ParquetFileLayout, apply_name_mapping_to_layout, read_parquet_file_layout,
-    read_parquet_footer_facts, validated_file_size, validated_record_count,
+    ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
+    read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
+    validated_record_count,
 };
 use crate::table_changes::{check_column_count, present_catalog_schema};
 
@@ -253,6 +254,7 @@ impl TableDeletionsTable {
         // Create scan for current delete file (if exists - None means full file delete)
         let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
             Some(self.build_delete_file_scan(
+                state,
                 current_path,
                 delete_file.current_delete_path_is_relative.unwrap_or(true),
                 delete_file.current_delete_file_size_bytes.unwrap_or(0),
@@ -267,6 +269,7 @@ impl TableDeletionsTable {
         // cumulative mode, where the per-row window filter replaces it)
         let previous_delete_exec = match &delete_file.previous_delete_path {
             Some(prev_path) if snapshot_name.is_none() => Some(self.build_delete_file_scan(
+                state,
                 prev_path,
                 delete_file.previous_delete_path_is_relative.unwrap_or(true),
                 delete_file.previous_delete_file_size_bytes.unwrap_or(0),
@@ -313,6 +316,7 @@ impl TableDeletionsTable {
 
         // Create scan for data file (with the embedded rowid column when present)
         let data_file_exec = self.build_data_file_scan(
+            state,
             &data_file_path,
             delete_file.data_file_size_bytes,
             delete_file.data_file_footer_size.unwrap_or(0),
@@ -378,12 +382,14 @@ impl TableDeletionsTable {
     /// the file's embedded per-row snapshot column is read as a third column.
     fn build_delete_file_scan(
         &self,
+        state: &dyn Session,
         path: &str,
         is_relative: bool,
         size_bytes: i64,
         footer_size: i64,
         snapshot_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let resolved_path = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -411,7 +417,7 @@ impl TableDeletionsTable {
         };
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(schema)),
+            Arc::new(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory)),
         )
         .with_file_group(FileGroup::new(vec![pf]));
 
@@ -435,12 +441,14 @@ impl TableDeletionsTable {
     /// the position column passes through.
     fn build_data_file_scan(
         &self,
+        state: &dyn Session,
         path: &str,
         size_bytes: i64,
         footer_size: i64,
         layout: &ParquetFileLayout,
         embedded_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
         if footer_size > 0
             && let Ok(hint) = usize::try_from(footer_size)
@@ -467,7 +475,9 @@ impl TableDeletionsTable {
         );
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(table_schema)),
+            Arc::new(
+                ParquetSource::new(table_schema).with_parquet_file_reader_factory(reader_factory),
+            ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());

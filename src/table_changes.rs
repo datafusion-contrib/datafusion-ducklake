@@ -42,8 +42,9 @@ use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProv
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
-    ParquetFileLayout, apply_name_mapping_to_layout, delete_file_schema, read_parquet_file_layout,
-    read_parquet_footer_facts, validated_file_size, validated_record_count,
+    ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
+    delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
+    validated_record_count,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
 
@@ -679,10 +680,13 @@ impl TableChangesTable {
         encryption_factory: &Option<Arc<dyn EncryptionFactory>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let read_schema = self.file_read_schema(layout);
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let parquet_source = if let Some(factory) = encryption_factory {
-            ParquetSource::new(read_schema).with_encryption_factory(Arc::clone(factory))
-        } else {
             ParquetSource::new(read_schema)
+                .with_encryption_factory(Arc::clone(factory))
+                .with_parquet_file_reader_factory(reader_factory)
+        } else {
+            ParquetSource::new(read_schema).with_parquet_file_reader_factory(reader_factory)
         };
         self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
             .await
@@ -697,7 +701,9 @@ impl TableChangesTable {
         layout: Option<&ParquetFileLayout>,
         proj_info: &ProjectionInfo,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let parquet_source = ParquetSource::new(self.file_read_schema(layout));
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
+        let parquet_source = ParquetSource::new(self.file_read_schema(layout))
+            .with_parquet_file_reader_factory(reader_factory);
         self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
             .await
     }
@@ -886,10 +892,12 @@ impl TableChangesTable {
     /// so the position column passes straight through.
     fn build_insert_scan(
         &self,
+        state: &dyn Session,
         data_file: &DataFileChange,
         layout: &ParquetFileLayout,
         need_rowid_resolution: bool,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let resolved = resolve_path(
             &self.table_path,
             &data_file.path,
@@ -917,7 +925,10 @@ impl TableChangesTable {
         let plain_scan = |pf: PartitionedFile, schema: SchemaRef| {
             let builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
-                Arc::new(ParquetSource::new(schema)),
+                Arc::new(
+                    ParquetSource::new(schema)
+                        .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
+                ),
             )
             .with_file_group(FileGroup::new(vec![pf]));
             DataSourceExec::from_data_source(builder.build())
@@ -939,7 +950,10 @@ impl TableChangesTable {
                 );
                 let builder = FileScanConfigBuilder::new(
                     self.object_store_url.as_ref().clone(),
-                    Arc::new(ParquetSource::new(table_schema)),
+                    Arc::new(
+                        ParquetSource::new(table_schema)
+                            .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
+                    ),
                 )
                 .with_file_group(FileGroup::new(vec![pf]));
                 DataSourceExec::from_data_source(builder.build())
@@ -962,12 +976,14 @@ impl TableChangesTable {
     /// regardless of how the scan is pruned, split or reordered.
     fn build_delete_data_scan(
         &self,
+        state: &dyn Session,
         resolved_path: &str,
         size_bytes: i64,
         footer_size: i64,
         layout: &ParquetFileLayout,
         embedded_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let mut pf = PartitionedFile::new(
             resolved_path,
             validated_file_size(size_bytes, resolved_path)?,
@@ -985,7 +1001,9 @@ impl TableChangesTable {
         );
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(table_schema)),
+            Arc::new(
+                ParquetSource::new(table_schema).with_parquet_file_reader_factory(reader_factory),
+            ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
@@ -1001,12 +1019,14 @@ impl TableChangesTable {
     /// the correlation path reads its `pos` column to find newly-deleted rows.
     fn build_delete_file_scan(
         &self,
+        state: &dyn Session,
         path: &str,
         is_relative: bool,
         size_bytes: i64,
         footer_size: i64,
         snapshot_name: &Option<String>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         let mut pf = PartitionedFile::new(&resolved, validated_file_size(size_bytes, &resolved)?);
@@ -1031,7 +1051,7 @@ impl TableChangesTable {
         };
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(schema)),
+            Arc::new(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory)),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         Ok(DataSourceExec::from_data_source(builder.build()))
@@ -1185,7 +1205,7 @@ impl TableChangesTable {
                     i
                 });
             let pos_col_idx = (!has_embedded_rowid && resolve_rowid).then_some(next_idx);
-            let scan = self.build_insert_scan(df, layout, resolve_rowid)?;
+            let scan = self.build_insert_scan(state, df, layout, resolve_rowid)?;
             #[cfg(debug_assertions)]
             if let Some(idx) = pos_col_idx {
                 let schema = scan.schema();
@@ -1234,6 +1254,7 @@ impl TableChangesTable {
                     .await?;
                 let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
                 let data_scan = self.build_delete_data_scan(
+                    state,
                     &resolved,
                     dfc.data_file_size_bytes,
                     dfc.data_file_footer_size.unwrap_or(0),
@@ -1268,6 +1289,7 @@ impl TableChangesTable {
                 let cumulative = snapshot_name.is_some();
                 let current_delete_scan = match &dfc.current_delete_path {
                     Some(p) => Some(self.build_delete_file_scan(
+                        state,
                         p,
                         dfc.current_delete_path_is_relative.unwrap_or(true),
                         dfc.current_delete_file_size_bytes.unwrap_or(0),
@@ -1278,6 +1300,7 @@ impl TableChangesTable {
                 };
                 let previous_delete_scan = match &dfc.previous_delete_path {
                     Some(p) if !cumulative => Some(self.build_delete_file_scan(
+                        state,
                         p,
                         dfc.previous_delete_path_is_relative.unwrap_or(true),
                         dfc.previous_delete_file_size_bytes.unwrap_or(0),
