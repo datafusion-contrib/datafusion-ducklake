@@ -3358,7 +3358,7 @@ impl DuckLakeTable {
             encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,
             writer: None,
-            write_options: crate::table_writer::DuckLakeWriteOptions::default(),
+            write_options: self.write_options.clone(),
         }
     }
 
@@ -3375,6 +3375,13 @@ impl DuckLakeTable {
     #[cfg(feature = "write")]
     pub(crate) fn writer(&self) -> Option<&Arc<dyn MetadataWriter>> {
         self.writer.as_ref()
+    }
+
+    /// Resolved catalog settings with explicit Rust overrides applied. Used by
+    /// maintenance writes so their Parquet layout matches ordinary inserts.
+    #[cfg(feature = "write")]
+    pub(crate) fn write_options(&self) -> &crate::table_writer::DuckLakeWriteOptions {
+        &self.write_options
     }
 
     /// The schema name, when this table was opened writable. Used by the
@@ -4160,6 +4167,9 @@ impl TableProvider for DuckLakeTable {
         let schema_name = self.schema_name.as_ref().ok_or_else(|| {
             DataFusionError::Internal("Schema name not set for writable table".to_string())
         })?;
+        self.write_options
+            .validate()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let write_mode = match insert_op {
             InsertOp::Append => WriteMode::Append,
@@ -4209,11 +4219,15 @@ impl TableProvider for DuckLakeTable {
         // per-partition file remains a sorted subsequence. An unsupported expression
         // or missing sort column is rejected before execution rather than silently
         // producing files that violate the active sort contract.
-        let live_sort = self
-            .provider
-            .get_sort_spec(self.table_id, head_snapshot)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let ordering = sort_ordering_for(&input.schema(), live_sort.as_ref())?;
+        let ordering = if self.write_options.sort_on_insert.unwrap_or(true) {
+            let live_sort = self
+                .provider
+                .get_sort_spec(self.table_id, head_snapshot)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            sort_ordering_for(&input.schema(), live_sort.as_ref())?
+        } else {
+            None
+        };
         // Wrap the input in a SortExec now AND declare the same requirement on
         // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
         // (a plain SortExec with no downstream ordering requirement would be
@@ -4263,6 +4277,9 @@ impl TableProvider for DuckLakeTable {
         let schema_name = self.schema_name.as_ref().ok_or_else(|| {
             DataFusionError::Internal("Schema name not set for writable table".to_string())
         })?;
+        self.write_options
+            .validate()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // DuckDB / MySQL metadata writers do not implement the atomic
         // append-with-deletes commit UPDATE needs. Reject up front rather than
@@ -4365,6 +4382,10 @@ impl TableProvider for DuckLakeTable {
         let schema_name = self.schema_name.as_ref().ok_or_else(|| {
             DataFusionError::Internal("Schema name not set for writable table".to_string())
         })?;
+
+        self.write_options
+            .validate()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Build the physical predicate. Empty `filters` (no WHERE) => delete ALL,
         // signalled by `None` and handled as a metadata-only truncate. We resolve

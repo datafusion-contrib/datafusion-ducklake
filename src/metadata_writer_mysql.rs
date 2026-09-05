@@ -62,7 +62,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         `key` VARCHAR(1024) NOT NULL,
         `value` TEXT NOT NULL,
-        scope VARCHAR(1024)
+        scope VARCHAR(1024),
+        scope_id BIGINT
     ) ENGINE = InnoDB"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_snapshot (
         snapshot_id BIGINT NOT NULL PRIMARY KEY,
@@ -1876,6 +1877,32 @@ impl MetadataWriter for MySqlMetadataWriter {
                 if !default_columns.iter().any(|column| column == name) {
                     sqlx::query(ddl).execute(&self.pool).await?;
                 }
+            }
+            let has_scope_id: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'ducklake_metadata' \
+                   AND column_name = 'scope_id'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            let has_scope: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'ducklake_metadata' \
+                   AND column_name = 'scope'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if has_scope == 0 {
+                sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR(255)")
+                    .execute(&self.pool)
+                    .await?;
+            }
+            if has_scope_id == 0 {
+                sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope_id BIGINT")
+                    .execute(&self.pool)
+                    .await?;
             }
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
             // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first

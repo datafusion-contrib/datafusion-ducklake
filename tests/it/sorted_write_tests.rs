@@ -74,10 +74,8 @@ async fn setup() -> Env {
 async fn write_ctx(conn_str: &str, target_file_size: usize, batch_size: usize) -> SessionContext {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
-    let options = DuckLakeWriteOptions {
-        target_file_size: Some(target_file_size),
-        ..Default::default()
-    };
+    let mut options = DuckLakeWriteOptions::default();
+    options.target_file_size = Some(target_file_size);
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
         .unwrap()
         .with_write_options(options);

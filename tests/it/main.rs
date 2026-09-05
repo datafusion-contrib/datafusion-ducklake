@@ -66,6 +66,7 @@ mod renamed_columns_tests;
 mod row_count_tests;
 mod row_id_tests;
 mod rowid_physical_position_tests;
+mod scoped_settings_tests;
 mod sorted_write_duckdb_tests;
 mod sorted_write_tests;
 mod sql_delete_postgres_tests;

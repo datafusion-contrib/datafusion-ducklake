@@ -36,7 +36,8 @@ const SQL_CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS ducklake_metadata (
     key VARCHAR NOT NULL,
     value VARCHAR NOT NULL,
-    scope VARCHAR
+    scope VARCHAR,
+    scope_id INTEGER
 );
 
 -- `schema_version` is the per-catalog monotonic schema counter from the DuckLake
@@ -948,6 +949,29 @@ async fn migrate_add_schema_version(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn migrate_add_metadata_scope_columns(pool: &SqlitePool) -> Result<()> {
+    let columns = sqlx::query("SELECT name FROM pragma_table_info('ducklake_metadata')")
+        .fetch_all(pool)
+        .await?;
+    let has_scope = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "scope");
+    let has_scope_id = columns
+        .iter()
+        .any(|row| row.get::<String, _>("name") == "scope_id");
+    if !has_scope {
+        sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR")
+            .execute(pool)
+            .await?;
+    }
+    if !has_scope_id {
+        sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope_id INTEGER")
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Add `ducklake_data_file.partial_max` to a pre-existing catalog (DuckLake
 /// v1.0). `CREATE TABLE IF NOT EXISTS` only shapes brand-new catalogs, so an
 /// older one needs this `ALTER`.
@@ -1759,6 +1783,25 @@ impl MetadataWriter for SqliteMetadataWriter {
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             tx.commit().await?;
             Ok(snapshot_id)
+        })
+    }
+
+    fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
+        block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
+                .bind(key)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, NULL, NULL)",
+            )
+            .bind(key)
+            .bind(value)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
         })
     }
 
@@ -4128,6 +4171,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
             // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
             migrate_ducklake_column_drop_pk(&self.pool).await?;
+            migrate_add_metadata_scope_columns(&self.pool).await?;
             // Upgrade a pre-existing catalog to track schema_version (add the
             // ducklake_snapshot.schema_version column; idempotent, lossless).
             migrate_add_schema_version(&self.pool).await?;

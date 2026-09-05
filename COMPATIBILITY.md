@@ -163,6 +163,14 @@ provider, run writer initialization with a schema-migration role before reading.
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
 
+### Parquet writer defaults
+
+Scoped `parquet_version` settings apply to data files and positional-delete
+files written by `INSERT`, `UPDATE`, `DELETE`, and maintenance. When the setting
+is absent, this crate retains its existing Parquet V2 default; DuckDB `COPY`
+defaults to Parquet V1. Set `parquet_version = V1` explicitly when identical
+absent-setting behavior is required.
+
 ### Views
 
 Every metadata backend reads snapshot-visible rows from `ducklake_view`. Catalogs without that

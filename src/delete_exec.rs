@@ -294,6 +294,7 @@ async fn run_delete(
         .runtime_env()
         .object_store(object_store_url.as_ref())?;
     let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store)
+        .map(|writer| writer.with_options(table.write_options()))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();

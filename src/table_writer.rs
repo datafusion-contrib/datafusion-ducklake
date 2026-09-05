@@ -14,8 +14,8 @@ use object_store::ObjectStore;
 use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
+use parquet::file::properties::{WriterProperties, WriterVersion};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
@@ -69,15 +69,19 @@ pub const MINIMUM_TARGET_FILE_SIZE: usize = 4096;
 /// later compaction to reorganize (DuckLake compaction merges, never splits).
 pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 
-/// Write-layout options carried from the catalog down to the insert path, so a
-/// SQL `INSERT` builds its [`DuckLakeTableWriter`] with the same compression,
-/// row-group caps, and file-rollover target the embedding engine configured.
-/// A `None` field leaves the writer's default for that setting (uncompressed,
-/// parquet-default row groups, [`DEFAULT_TARGET_FILE_SIZE`] rollover).
+/// Write and maintenance options carried from the catalog down to each table.
+/// A SQL `INSERT`, update rewrite, or compaction output uses the same compression,
+/// row-group caps, file-rollover target, sorting, and partition-path policy.
+/// A `None` field leaves the receiving writer's configured value unchanged.
+/// Catalog-derived options populate DuckDB's defaults: Snappy, 122,880 rows per
+/// row group, and [`DEFAULT_TARGET_FILE_SIZE`] rollover.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DuckLakeWriteOptions {
-    /// Parquet compression codec; `None` = uncompressed.
+    /// Parquet compression codec; `None` leaves the writer's codec unchanged.
     pub compression: Option<Compression>,
+    /// Parquet format version; `None` leaves the writer's version unchanged.
+    pub parquet_version: Option<WriterVersion>,
     /// Max rows per row group; `None` = parquet default.
     pub max_row_group_rows: Option<usize>,
     /// Max uncompressed bytes per row group; `None` = parquet default.
@@ -91,6 +95,267 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
+    /// Whether inserts honor the table's active sort order.
+    pub sort_on_insert: Option<bool>,
+    /// Whether partition values appear as Hive-style directories in file paths.
+    pub hive_file_pattern: Option<bool>,
+    /// Whether merge and rewrite maintenance include this table.
+    pub auto_compact: Option<bool>,
+    /// Minimum deleted-row fraction for automatic rewrite selection.
+    pub rewrite_delete_threshold: Option<f64>,
+    deferred_error: Option<String>,
+}
+
+impl DuckLakeWriteOptions {
+    pub(crate) fn from_metadata_settings(settings: &HashMap<String, String>) -> Result<Self> {
+        let compression_name = settings
+            .get("parquet_compression")
+            .map(String::as_str)
+            .unwrap_or("snappy");
+        let compression_level = compression_name
+            .eq_ignore_ascii_case("zstd")
+            .then(|| {
+                setting_i32(settings, "parquet_compression_level").map(|level| level.or(Some(3)))
+            })
+            .transpose()?
+            .flatten();
+
+        Ok(Self {
+            compression: Some(setting_compression(compression_name, compression_level)?),
+            parquet_version: setting_parquet_version(settings)?,
+            max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
+            max_row_group_bytes: setting_size(settings, "parquet_row_group_size_bytes", None)?,
+            target_file_size: setting_size(
+                settings,
+                "target_file_size",
+                Some(DEFAULT_TARGET_FILE_SIZE),
+            )?,
+            max_open_partitions: None,
+            upload_concurrency: None,
+            sort_on_insert: setting_bool(settings, "sort_on_insert", true)?,
+            hive_file_pattern: setting_bool(settings, "hive_file_pattern", true)?,
+            auto_compact: setting_bool(settings, "auto_compact", true)?,
+            rewrite_delete_threshold: setting_f64(
+                settings,
+                "rewrite_delete_threshold",
+                Some(0.95),
+            )?,
+            deferred_error: None,
+        })
+    }
+
+    pub(crate) fn from_metadata_settings_deferred(settings: &HashMap<String, String>) -> Self {
+        Self::from_metadata_settings(settings).unwrap_or_else(|e| Self {
+            deferred_error: Some(e.to_string()),
+            ..Self::default()
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        match &self.deferred_error {
+            Some(error) => Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Invalid DuckLake write settings: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn with_overrides(mut self, overrides: &Self) -> Self {
+        if overrides.compression.is_some() {
+            self.compression = overrides.compression;
+        }
+        if overrides.parquet_version.is_some() {
+            self.parquet_version = overrides.parquet_version;
+        }
+        if overrides.max_row_group_rows.is_some() {
+            self.max_row_group_rows = overrides.max_row_group_rows;
+        }
+        if overrides.max_row_group_bytes.is_some() {
+            self.max_row_group_bytes = overrides.max_row_group_bytes;
+        }
+        if overrides.target_file_size.is_some() {
+            self.target_file_size = overrides.target_file_size;
+        }
+        if overrides.max_open_partitions.is_some() {
+            self.max_open_partitions = overrides.max_open_partitions;
+        }
+        if overrides.upload_concurrency.is_some() {
+            self.upload_concurrency = overrides.upload_concurrency;
+        }
+        if overrides.sort_on_insert.is_some() {
+            self.sort_on_insert = overrides.sort_on_insert;
+        }
+        if overrides.hive_file_pattern.is_some() {
+            self.hive_file_pattern = overrides.hive_file_pattern;
+        }
+        if overrides.auto_compact.is_some() {
+            self.auto_compact = overrides.auto_compact;
+        }
+        if overrides.rewrite_delete_threshold.is_some() {
+            self.rewrite_delete_threshold = overrides.rewrite_delete_threshold;
+        }
+        self
+    }
+}
+
+fn setting_usize(
+    settings: &HashMap<String, String>,
+    key: &str,
+    default: Option<usize>,
+) -> Result<Option<usize>> {
+    settings
+        .get(key)
+        .map(|value| {
+            value.parse::<usize>().map_err(|e| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Invalid ducklake_metadata {key} value '{value}': {e}"
+                ))
+            })
+        })
+        .transpose()
+        .map(|value| value.or(default))
+}
+
+fn setting_i32(settings: &HashMap<String, String>, key: &str) -> Result<Option<i32>> {
+    settings
+        .get(key)
+        .map(|value| {
+            value.parse::<i32>().map_err(|e| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Invalid ducklake_metadata {key} value '{value}': {e}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn setting_f64(
+    settings: &HashMap<String, String>,
+    key: &str,
+    default: Option<f64>,
+) -> Result<Option<f64>> {
+    let value = settings
+        .get(key)
+        .map(|value| {
+            value.parse::<f64>().map_err(|e| {
+                crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Invalid ducklake_metadata {key} value '{value}': {e}"
+                ))
+            })
+        })
+        .transpose()?
+        .or(default);
+    if value.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+            "ducklake_metadata {key} must be in [0.0, 1.0]"
+        )));
+    }
+    Ok(value)
+}
+
+fn setting_parquet_version(settings: &HashMap<String, String>) -> Result<Option<WriterVersion>> {
+    settings
+        .get("parquet_version")
+        .map(|value| match value.to_ascii_lowercase().as_str() {
+            "1" | "v1" => Ok(WriterVersion::PARQUET_1_0),
+            "2" | "v2" => Ok(WriterVersion::PARQUET_2_0),
+            _ => Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Invalid ducklake_metadata parquet_version '{value}'; expected 1, 2, V1, or V2"
+            ))),
+        })
+        .transpose()
+}
+
+fn setting_size(
+    settings: &HashMap<String, String>,
+    key: &str,
+    default: Option<usize>,
+) -> Result<Option<usize>> {
+    settings
+        .get(key)
+        .map(|value| parse_size(key, value))
+        .transpose()
+        .map(|value| value.or(default))
+}
+
+fn parse_size(key: &str, value: &str) -> Result<usize> {
+    let value = value.trim();
+    let digits = value.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = value.split_at(digits);
+    if number.is_empty() {
+        return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+            "Invalid ducklake_metadata {key} size '{value}'"
+        )));
+    }
+    let number = number.parse::<usize>().map_err(|e| {
+        crate::error::DuckLakeError::InvalidConfig(format!(
+            "Invalid ducklake_metadata {key} size '{value}': {e}"
+        ))
+    })?;
+    let multiplier = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        "tib" => 1usize << 40,
+        _ => {
+            return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                "Invalid ducklake_metadata {key} size unit in '{value}'"
+            )));
+        },
+    };
+    number.checked_mul(multiplier).ok_or_else(|| {
+        crate::error::DuckLakeError::InvalidConfig(format!(
+            "ducklake_metadata {key} size '{value}' exceeds usize"
+        ))
+    })
+}
+
+fn setting_bool(
+    settings: &HashMap<String, String>,
+    key: &str,
+    default: bool,
+) -> Result<Option<bool>> {
+    let value = match settings.get(key) {
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
+                    "Invalid ducklake_metadata {key} value '{value}'; expected true or false"
+                )));
+            },
+        },
+        None => default,
+    };
+    Ok(Some(value))
+}
+
+fn setting_compression(name: &str, level: Option<i32>) -> Result<Compression> {
+    let invalid = |e: parquet::errors::ParquetError| {
+        crate::error::DuckLakeError::InvalidConfig(format!(
+            "Invalid ducklake_metadata parquet_compression_level {}: {e}",
+            level.unwrap_or_default()
+        ))
+    };
+    match name.to_ascii_lowercase().as_str() {
+        "uncompressed" => Ok(Compression::UNCOMPRESSED),
+        "snappy" => Ok(Compression::SNAPPY),
+        "gzip" => Ok(Compression::GZIP(GzipLevel::default())),
+        "brotli" => Ok(Compression::BROTLI(BrotliLevel::default())),
+        "zstd" => Ok(Compression::ZSTD(match level {
+            None | Some(0) => ZstdLevel::default(),
+            Some(level) => ZstdLevel::try_new(level).map_err(invalid)?,
+        })),
+        "lz4" | "lz4_raw" => Ok(Compression::LZ4_RAW),
+        _ => Err(crate::error::DuckLakeError::InvalidConfig(format!(
+            "Unsupported ducklake_metadata parquet_compression '{name}'"
+        ))),
+    }
 }
 
 /// Options shared by streaming and partitioned table writes.
@@ -142,6 +407,7 @@ pub struct DuckLakeTableWriter {
     /// override via [`DuckLakeTableWriter::with_compression`] to trade write
     /// CPU for ~2x smaller files (e.g. `LZ4`, `SNAPPY`, `ZSTD`).
     compression: Compression,
+    writer_version: WriterVersion,
     /// Optional max rows per parquet row group. `None` leaves the parquet
     /// default. Set via [`DuckLakeTableWriter::with_max_row_group_rows`].
     max_row_group_rows: Option<usize>,
@@ -166,6 +432,8 @@ pub struct DuckLakeTableWriter {
     /// Defaults to [`DEFAULT_MAX_OPEN_PARTITIONS`]; override via
     /// [`DuckLakeTableWriter::with_max_open_partitions`].
     max_open_partitions: usize,
+    sort_on_insert: bool,
+    hive_file_pattern: bool,
 }
 
 impl DuckLakeTableWriter {
@@ -181,11 +449,14 @@ impl DuckLakeTableWriter {
             object_store,
             base_key_path: key_path,
             compression: Compression::UNCOMPRESSED,
+            writer_version: WriterVersion::PARQUET_2_0,
             max_row_group_rows: None,
             max_row_group_bytes: None,
             upload_concurrency: DEFAULT_UPLOAD_CONCURRENCY,
             target_file_size: DEFAULT_TARGET_FILE_SIZE,
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
+            sort_on_insert: true,
+            hive_file_pattern: true,
         })
     }
 
@@ -253,6 +524,9 @@ impl DuckLakeTableWriter {
         if let Some(compression) = options.compression {
             self.compression = compression;
         }
+        if let Some(writer_version) = options.parquet_version {
+            self.writer_version = writer_version;
+        }
         if let Some(rows) = options.max_row_group_rows {
             self.max_row_group_rows = Some(rows);
         }
@@ -268,6 +542,12 @@ impl DuckLakeTableWriter {
         if let Some(files) = options.upload_concurrency {
             self.upload_concurrency = files.max(1);
         }
+        if let Some(sort_on_insert) = options.sort_on_insert {
+            self.sort_on_insert = sort_on_insert;
+        }
+        if let Some(hive_file_pattern) = options.hive_file_pattern {
+            self.hive_file_pattern = hive_file_pattern;
+        }
         self
     }
 
@@ -275,7 +555,7 @@ impl DuckLakeTableWriter {
     /// writer's configured compression and row-group caps.
     fn build_writer_props(&self) -> WriterProperties {
         let mut builder = WriterProperties::builder()
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_writer_version(self.writer_version)
             .set_compression(self.compression);
         if let Some(rows) = self.max_row_group_rows {
             builder = builder.set_max_row_group_row_count(Some(rows));
@@ -517,7 +797,7 @@ impl DuckLakeTableWriter {
         // at once, so an uncapped large vector column builds multi-GiB row
         // groups that OOM readers. Both default to the parquet default (unset).
         let mut props_builder = WriterProperties::builder()
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_writer_version(self.writer_version)
             .set_compression(self.compression);
         if let Some(rows) = self.max_row_group_rows {
             props_builder = props_builder.set_max_row_group_row_count(Some(rows));
@@ -568,6 +848,7 @@ impl DuckLakeTableWriter {
                             target_file_size: self.target_file_size,
                             max_open: self.max_open_partitions,
                             upload_concurrency: self.upload_concurrency,
+                            hive_file_pattern: self.hive_file_pattern,
                             open: Vec::new(),
                             staged: Vec::new(),
                         })
@@ -733,7 +1014,7 @@ impl DuckLakeTableWriter {
         // Stream to a local staging file, then multipart-upload it — the same
         // bounded-memory path `finish()` uses for data files.
         let props = WriterProperties::builder()
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_writer_version(self.writer_version)
             .set_compression(self.compression)
             .build();
         let temp = NamedTempFile::new()?;
@@ -873,7 +1154,7 @@ impl DuckLakeTableWriter {
         };
 
         let mut props_builder = WriterProperties::builder()
-            .set_writer_version(parquet::file::properties::WriterVersion::PARQUET_2_0)
+            .set_writer_version(self.writer_version)
             .set_compression(self.compression);
         if let Some(rows) = self.max_row_group_rows {
             props_builder = props_builder.set_max_row_group_row_count(Some(rows));
@@ -1198,7 +1479,7 @@ impl DuckLakeTableWriter {
         //
         // Skipped when the caller already arranged the rows (`!resolve_layout` — the
         // SQL INSERT path, whose plan carries a SortExec for this same spec).
-        let sorted_owned: Vec<RecordBatch> = if resolve_layout {
+        let sorted_owned: Vec<RecordBatch> = if resolve_layout && self.sort_on_insert {
             let lengths: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
             let sorted = crate::sort::sort_batches_by_spec(
                 batches.to_vec(),
@@ -1215,7 +1496,7 @@ impl DuckLakeTableWriter {
         } else {
             Vec::new()
         };
-        let batches: &[RecordBatch] = if resolve_layout {
+        let batches: &[RecordBatch] = if resolve_layout && self.sort_on_insert {
             &sorted_owned
         } else {
             batches
@@ -1316,7 +1597,11 @@ impl DuckLakeTableWriter {
         for (values, batches) in groups {
             // Readable Hive-style relative subpath; files land under the table dir
             // and are registered relative to it.
-            let rel = crate::partition::hive_subpath(key_names, values);
+            let rel = if self.hive_file_pattern {
+                crate::partition::hive_subpath(key_names, values)
+            } else {
+                String::new()
+            };
             let rel_prefix = if rel.is_empty() {
                 None
             } else {
@@ -1676,6 +1961,7 @@ struct PartitionSink {
     props: WriterProperties,
     target_file_size: usize,
     max_open: usize,
+    hive_file_pattern: bool,
     /// One roller per partition with a file in progress, oldest first (eviction takes
     /// from the front). Paired with the partition values its files carry.
     open: Vec<(Vec<Option<String>>, RollingFileWriter)>,
@@ -1720,7 +2006,11 @@ impl PartitionSink {
                         self.staged.push((evicted_values, staged));
                     }
                 }
-                let rel = crate::partition::hive_subpath(&self.key_names, values);
+                let rel = if self.hive_file_pattern {
+                    crate::partition::hive_subpath(&self.key_names, values)
+                } else {
+                    String::new()
+                };
                 self.open.push((
                     values.to_vec(),
                     RollingFileWriter::new(
@@ -2595,6 +2885,140 @@ mod tests {
     use super::*;
     use arrow::array::{Decimal128Array, Int32Array, StringArray, StringViewArray, StructArray};
     use arrow::datatypes::DataType;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("gzip", "22", Compression::GZIP(GzipLevel::default()))]
+    #[case("brotli", "12", Compression::BROTLI(BrotliLevel::default()))]
+    #[case("snappy", "-1", Compression::SNAPPY)]
+    fn compression_level_only_applies_to_zstd(
+        #[case] codec: &str,
+        #[case] level: &str,
+        #[case] expected: Compression,
+    ) {
+        let settings = HashMap::from([
+            ("parquet_compression".to_string(), codec.to_string()),
+            ("parquet_compression_level".to_string(), level.to_string()),
+        ]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+
+        assert_eq!(options.compression, Some(expected));
+    }
+
+    #[rstest]
+    fn zstd_zero_uses_the_parquet_default_level() {
+        let settings = HashMap::from([
+            ("parquet_compression".to_string(), "zstd".to_string()),
+            ("parquet_compression_level".to_string(), "0".to_string()),
+        ]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+
+        assert_eq!(
+            options.compression,
+            Some(Compression::ZSTD(ZstdLevel::default()))
+        );
+    }
+
+    #[rstest]
+    fn zstd_without_a_level_uses_the_ducklake_default() {
+        let settings = HashMap::from([("parquet_compression".to_string(), "zstd".to_string())]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+
+        assert_eq!(
+            options.compression,
+            Some(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        );
+    }
+
+    #[rstest]
+    fn invalid_write_setting_is_deferred_until_validation() {
+        let settings = HashMap::from([
+            ("parquet_compression".to_string(), "zstd".to_string()),
+            ("parquet_compression_level".to_string(), "23".to_string()),
+        ]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings_deferred(&settings);
+
+        assert!(options.validate().is_err());
+    }
+
+    #[rstest]
+    fn metadata_options_include_parquet_version_and_rewrite_threshold() {
+        let settings = HashMap::from([
+            ("parquet_version".to_string(), "V1".to_string()),
+            ("rewrite_delete_threshold".to_string(), "0.75".to_string()),
+        ]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+
+        assert_eq!(options.parquet_version, Some(WriterVersion::PARQUET_1_0));
+        assert_eq!(options.rewrite_delete_threshold, Some(0.75));
+    }
+
+    #[test]
+    fn metadata_write_options_apply_ducklake_defaults_and_units() {
+        let settings = HashMap::from([
+            ("parquet_compression".to_string(), "zstd".to_string()),
+            ("parquet_compression_level".to_string(), "5".to_string()),
+            (
+                "parquet_row_group_size_bytes".to_string(),
+                "2 MiB".to_string(),
+            ),
+            ("target_file_size".to_string(), "5MB".to_string()),
+            ("sort_on_insert".to_string(), "false".to_string()),
+            ("hive_file_pattern".to_string(), "false".to_string()),
+            ("auto_compact".to_string(), "false".to_string()),
+        ]);
+
+        let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+
+        assert_eq!(
+            options.compression,
+            Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
+        );
+        assert_eq!(options.max_row_group_rows, Some(122_880));
+        assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
+        assert_eq!(options.target_file_size, Some(5_000_000));
+        assert_eq!(options.max_open_partitions, None);
+        assert_eq!(options.sort_on_insert, Some(false));
+        assert_eq!(options.hive_file_pattern, Some(false));
+        assert_eq!(options.auto_compact, Some(false));
+    }
+
+    #[test]
+    fn explicit_write_options_override_catalog_settings_per_field() {
+        let stored = DuckLakeWriteOptions::from_metadata_settings(&HashMap::from([
+            ("parquet_compression".to_string(), "zstd".to_string()),
+            ("target_file_size".to_string(), "5MB".to_string()),
+        ]))
+        .unwrap();
+        let explicit = DuckLakeWriteOptions {
+            compression: Some(Compression::LZ4_RAW),
+            sort_on_insert: Some(false),
+            ..Default::default()
+        };
+
+        let options = stored.with_overrides(&explicit);
+
+        assert_eq!(options.compression, Some(Compression::LZ4_RAW));
+        assert_eq!(options.target_file_size, Some(5_000_000));
+        assert_eq!(options.sort_on_insert, Some(false));
+        assert_eq!(options.hive_file_pattern, Some(true));
+    }
+
+    #[test]
+    fn metadata_lz4_uses_the_standard_parquet_codec() {
+        let options = DuckLakeWriteOptions::from_metadata_settings(&HashMap::from([(
+            "parquet_compression".to_string(),
+            "lz4".to_string(),
+        )]))
+        .unwrap();
+
+        assert_eq!(options.compression, Some(Compression::LZ4_RAW));
+    }
 
     #[test]
     fn test_arrow_schema_to_column_defs() {

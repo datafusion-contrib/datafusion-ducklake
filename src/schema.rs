@@ -191,9 +191,18 @@ impl SchemaProvider for DuckLakeSchema {
                 // Configure writer if this schema is writable
                 #[cfg(feature = "write")]
                 let table = if let Some(writer) = self.writer.as_ref() {
+                    let settings = self
+                        .provider
+                        .get_metadata_settings(Some(self.schema_id), Some(meta.table_id))
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let options =
+                        crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(
+                            &settings,
+                        )
+                        .with_overrides(&self.write_options);
                     table
                         .with_writer(self.schema_name.clone(), Arc::clone(writer))
-                        .with_write_options(self.write_options.clone())
+                        .with_write_options(options)
                 } else {
                     table
                 };
@@ -333,6 +342,13 @@ impl SchemaProvider for DuckLakeSchema {
         // Build the table provider from the COMMITTED ids/snapshot (the begin-time
         // `setup.snapshot_id` is vestigial on the commit-time path; the real
         // snapshot is assigned at commit).
+        let settings = self
+            .provider
+            .get_metadata_settings(Some(self.schema_id), Some(committed.table_id))
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let options =
+            crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings)
+                .with_overrides(&self.write_options);
         let writable_table = DuckLakeTable::new(
             committed.table_id,
             name,
@@ -343,7 +359,7 @@ impl SchemaProvider for DuckLakeSchema {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .with_writer(self.schema_name.clone(), Arc::clone(writer))
-        .with_write_options(self.write_options.clone());
+        .with_write_options(options);
 
         Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))
     }

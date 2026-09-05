@@ -19,6 +19,7 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rstest::rstest;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Row};
 use tempfile::TempDir;
@@ -2426,18 +2427,12 @@ async fn merge_inherits_the_tables_write_options() {
     seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
     append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
 
-    let result = run_merge_with_write_options(
-        &temp,
-        DuckLakeWriteOptions {
-            compression: Some(Compression::LZ4),
-            // Two rows per group over six: enough that a single group is
-            // unmistakably the writer default rather than a coincidence.
-            max_row_group_rows: Some(2),
-            ..Default::default()
-        },
-        MergeOptions::default(),
-    )
-    .await;
+    let mut write_options = DuckLakeWriteOptions::default();
+    write_options.compression = Some(Compression::LZ4);
+    // Two rows per group over six: enough that a single group is
+    // unmistakably the writer default rather than a coincidence.
+    write_options.max_row_group_rows = Some(2);
+    let result = run_merge_with_write_options(&temp, write_options, MergeOptions::default()).await;
     assert_eq!(result.files_processed, 2);
     assert_eq!(result.files_created, 1);
 
@@ -2456,6 +2451,71 @@ async fn merge_inherits_the_tables_write_options() {
         codecs.iter().all(|c| *c == Compression::LZ4),
         "merged file written {codecs:?}, not the table's configured codec"
     );
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_compact_false_skips_explicit_merge() {
+    use datafusion_ducklake::DuckLakeWriteOptions;
+
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    append(&temp, vec![4, 5, 6], vec![40, 50, 60]).await;
+    let mut write_options = DuckLakeWriteOptions::default();
+    write_options.auto_compact = Some(false);
+
+    let result = run_merge_with_write_options(&temp, write_options, MergeOptions::default()).await;
+
+    assert_eq!(
+        result,
+        CompactionResult {
+            files_processed: 0,
+            files_created: 0,
+            rows_written: 0,
+        }
+    );
+    let p = pool(&temp).await;
+    let live_files: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot IS NULL")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    assert_eq!(live_files, 2);
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_rewrite_threshold_replaces_the_default_selector() {
+    use datafusion_ducklake::DuckLakeWriteOptions;
+
+    let temp = TempDir::new().unwrap();
+    seed(
+        &temp,
+        (1..=10).collect(),
+        (1..=10).map(|value| value * 10).collect(),
+    )
+    .await;
+    let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("ducklake", Arc::new(catalog));
+    context
+        .sql("DELETE FROM ducklake.main.t WHERE id <= 8")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut write_options = DuckLakeWriteOptions::default();
+    write_options.rewrite_delete_threshold = Some(0.75);
+
+    let result =
+        run_rewrite_with_write_options(&temp, write_options, RewriteOptions::default()).await;
+
+    assert_eq!(result.files_processed, 1);
+    assert_eq!(result.files_created, 1);
+    assert_eq!(result.rows_written, 2);
 }
 
 /// The same for `rewrite_data_files`, which is a second writer construction and
@@ -2478,13 +2538,12 @@ async fn rewrite_inherits_the_tables_write_options() {
 
     // Naming the file rewrites it regardless of its delete fraction, which is
     // what makes this a rewrite rather than a merge.
+    let mut write_options = DuckLakeWriteOptions::default();
+    write_options.compression = Some(Compression::LZ4);
+    write_options.max_row_group_rows = Some(2);
     let result = run_rewrite_with_write_options(
         &temp,
-        DuckLakeWriteOptions {
-            compression: Some(Compression::LZ4),
-            max_row_group_rows: Some(2),
-            ..Default::default()
-        },
+        write_options,
         RewriteOptions {
             data_file_ids: Some(vec![file_id]),
             ..Default::default()
