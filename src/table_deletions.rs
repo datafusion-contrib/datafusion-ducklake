@@ -181,6 +181,9 @@ impl TableDeletionsTable {
             state,
             self.object_store_url.as_ref(),
             &resolved,
+            // `file_layout` is keyed only by path — no catalog size in reach
+            // here, so `read_parquet_file_layout` resolves it via `head()`.
+            None,
             None,
             columns,
             &self.table_schema,
@@ -232,6 +235,7 @@ impl TableDeletionsTable {
                     state,
                     p,
                     delete_file.current_delete_path_is_relative.unwrap_or(true),
+                    delete_file.current_delete_file_size_bytes,
                 )
                 .await?
             },
@@ -369,12 +373,18 @@ impl TableDeletionsTable {
         state: &dyn Session,
         path: &str,
         is_relative: bool,
+        size_bytes: Option<i64>,
     ) -> DataFusionResult<Option<String>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let facts =
-            read_parquet_footer_facts(state, self.object_store_url.as_ref(), &resolved, None)
-                .await?;
+        let facts = read_parquet_footer_facts(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved,
+            size_bytes,
+            None,
+        )
+        .await?;
         Ok(facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned())
     }
 

@@ -1930,6 +1930,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "datafusion-datasource",
+ "datafusion-datasource-parquet",
  "duckdb",
  "futures",
  "hex",

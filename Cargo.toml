@@ -24,6 +24,12 @@ autotests = false
 [dependencies]
 datafusion = { version = "55", default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 datafusion-datasource = { version = "55", default-features = false }
+# `DFParquetMetadata` — the umbrella `datafusion` crate re-exports
+# `ParquetSource` but not this module, so a direct pin is needed to read a
+# file's footer through the same `RuntimeEnv` `FileMetadataCache` a scan's
+# `CachedParquetFileReaderFactory` uses (#1323's plan-time half). Version must
+# stay in lockstep with `datafusion` above.
+datafusion-datasource-parquet = { version = "55", default-features = false }
 arrow = "59.2"
 parquet = { version = "59.2", features = ["async"] }
 object_store = { version = "0.13", default-features = false }
