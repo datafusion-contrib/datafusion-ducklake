@@ -2036,13 +2036,42 @@ impl DuckLakeTable {
         schema: impl Into<TableSchema>,
     ) -> DataFusionResult<ParquetSource> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
+        let source = self.apply_session_parquet_options(ParquetSource::new(schema), state);
         #[cfg(feature = "encryption")]
         if let Some(factory) = self.encryption_keys.factory.get() {
-            return Ok(ParquetSource::new(schema)
+            return Ok(source
                 .with_encryption_factory(Arc::clone(factory))
                 .with_parquet_file_reader_factory(reader_factory));
         }
-        Ok(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory))
+        Ok(source.with_parquet_file_reader_factory(reader_factory))
+    }
+
+    /// Copy the reader-behaviour subset of the session's parquet options
+    /// (`pushdown_filters`, `reorder_filters`, `force_filter_selections`,
+    /// `max_predicate_cache_size`, `enable_page_index`, `pruning`,
+    /// `bloom_filter_on_read`, `max_in_list_size`) onto `source`. The
+    /// schema/type subset (`schema_force_view_types`, `binary_as_string`,
+    /// `coerce_int96*`, `skip_metadata`, `skip_arrow_metadata`,
+    /// `metadata_size_hint`) is left on `ParquetSource::new`'s defaults: the
+    /// fork supplies its own schema and per-file size hints, so those never
+    /// come from the session.
+    fn apply_session_parquet_options(
+        &self,
+        source: ParquetSource,
+        state: &dyn Session,
+    ) -> ParquetSource {
+        let session_opts = &state.config_options().execution.parquet;
+        let source = source
+            .with_pushdown_filters(session_opts.pushdown_filters)
+            .with_reorder_filters(session_opts.reorder_filters)
+            .with_enable_page_index(session_opts.enable_page_index)
+            .with_bloom_filter_on_read(session_opts.bloom_filter_on_read);
+        let mut table_opts = source.table_parquet_options().clone();
+        table_opts.global.force_filter_selections = session_opts.force_filter_selections;
+        table_opts.global.max_predicate_cache_size = session_opts.max_predicate_cache_size;
+        table_opts.global.pruning = session_opts.pruning;
+        table_opts.global.max_in_list_size = session_opts.max_in_list_size;
+        source.with_table_parquet_options(table_opts)
     }
 
     fn scan_config_builder(&self, source: Arc<dyn FileSource>) -> FileScanConfigBuilder {
@@ -6665,6 +6694,63 @@ mod tests {
         assert!(
             debug.contains("CachedParquetFileReaderFactory"),
             "expected the metadata-cache-backed reader factory, got: {debug}",
+        );
+
+        Ok(())
+    }
+
+    /// `create_parquet_source` must copy the reader-behaviour subset of the
+    /// session's parquet options onto the `ParquetSource` it builds
+    /// (`reorder_filters`, `max_in_list_size`, and friends — see
+    /// [`DuckLakeTable::apply_session_parquet_options`]), while leaving the
+    /// schema/type subset (`schema_force_view_types` and friends) on the
+    /// source's own defaults, since the fork supplies its own schema.
+    #[tokio::test]
+    async fn ducklake_scan_propagates_session_reader_options_not_schema_options() -> Result<()> {
+        let table = fixed_table(vec![], None)?;
+
+        let mut session_config = datafusion::execution::config::SessionConfig::new();
+        {
+            let parquet_opts = &mut session_config.options_mut().execution.parquet;
+            parquet_opts.reorder_filters = true;
+            parquet_opts.max_in_list_size = 7;
+            parquet_opts.schema_force_view_types = false;
+        }
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let store_url = url::Url::parse(table.object_store_url().as_str()).expect("valid url");
+        let ctx = SessionContext::new_with_config(session_config);
+        ctx.runtime_env().register_object_store(&store_url, store);
+        let state = ctx.state();
+
+        let source = table.create_parquet_source(&state, Arc::clone(&table.physical_schema))?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            table
+                .scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![]))
+                .build(),
+        );
+
+        let found_source = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+            .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+            .expect("plan is a DataSourceExec wrapping a parquet FileScanConfig");
+
+        let opts = found_source.table_parquet_options();
+        assert!(
+            opts.global.reorder_filters,
+            "reorder_filters must propagate from the session"
+        );
+        assert_eq!(
+            opts.global.max_in_list_size, 7,
+            "max_in_list_size must propagate from the session"
+        );
+        assert!(
+            opts.global.schema_force_view_types,
+            "schema_force_view_types must stay on the source's default (true), \
+             not follow the session, since the fork supplies its own schema"
         );
 
         Ok(())
