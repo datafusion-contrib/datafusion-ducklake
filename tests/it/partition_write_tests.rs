@@ -16,8 +16,8 @@ use tempfile::TempDir;
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
-    WriteMode, execute_ducklake_sql,
+    ColumnDef, DuckLakeCatalog, DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider,
+    SqliteMetadataWriter, WriteMode, execute_ducklake_sql,
 };
 
 struct Env {
@@ -84,7 +84,9 @@ async fn setup() -> Env {
 async fn write_ctx(conn_str: &str) -> SessionContext {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+        .unwrap()
+        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx
@@ -1017,8 +1019,11 @@ async fn create_events_table_no_spec() -> (String, i64, TempDir) {
 async fn writable_catalog(conn_str: &str) -> (SessionContext, Arc<DuckLakeCatalog>) {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
-    let catalog =
-        Arc::new(DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap());
+    let catalog = Arc::new(
+        DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+            .unwrap()
+            .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(0)),
+    );
     let ctx = SessionContext::new();
     ctx.register_catalog(
         "ducklake",

@@ -33,8 +33,7 @@ fn create_catalog_with_renamed_column(catalog_path: &Path) -> Result<()> {
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     // Create table with original column name
     conn.execute(
@@ -70,8 +69,7 @@ fn create_catalog_with_multiple_renames(catalog_path: &Path) -> Result<()> {
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     // Create table with original column names
     conn.execute(
@@ -358,8 +356,7 @@ fn create_catalog_renamed_with_post_rename_file(catalog_path: &Path) -> Result<(
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
     conn.execute(
         "CREATE TABLE test_catalog.test_table (id INT, name VARCHAR);",
         [],
@@ -464,8 +461,7 @@ fn create_catalog_rename_then_delete(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
     conn.execute(
         "CREATE TABLE test_catalog.test_table (id INT, name VARCHAR);",
         [],
@@ -532,8 +528,7 @@ fn create_catalog_drop_readd(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
     conn.execute(
         "CREATE TABLE test_catalog.test_table (id INT, tag VARCHAR);",
         [],
@@ -567,8 +562,7 @@ async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
         let conn = duckdb::Connection::open_in_memory()?;
         crate::common::ensure_ducklake_installed();
         conn.execute("LOAD ducklake;", [])?;
-        let ducklake_path = format!("ducklake:{}", catalog_path.display());
-        conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+        crate::common::attach_catalog_without_inlining(&conn, &catalog_path, "test_catalog")?;
         let mut stmt = conn.prepare("SELECT id, tag FROM test_catalog.test_table ORDER BY id")?;
         let mut rows = stmt.query([])?;
         let mut duck: Vec<(i32, Option<String>)> = Vec::new();
@@ -620,8 +614,7 @@ fn create_catalog_evolved_struct_child(catalog_path: &Path, rename: bool) -> Res
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
     if rename {
         conn.execute(
             "CREATE TABLE test_catalog.t (id INT, s STRUCT(a INT, b INT));",

@@ -5,7 +5,9 @@
 
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, FixedSizeBinaryArray};
+use arrow::datatypes::{DataType, Schema as ArrowSchema};
+use arrow::record_batch::RecordBatch;
 use std::collections::{HashMap, HashSet};
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
@@ -144,6 +146,30 @@ impl SnapshotCommitMetadata {
         }
         Ok(())
     }
+}
+
+pub(crate) fn inlined_text_value(array: &dyn Array, row: usize) -> Result<String> {
+    if matches!(
+        array.data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    ) {
+        return crate::nested_inline::render_text(array, row);
+    }
+    if array.data_type() == &DataType::FixedSizeBinary(16) {
+        let bytes = array
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("Arrow data type and array implementation agree")
+            .value(row);
+        return uuid::Uuid::from_slice(bytes)
+            .map(|value| value.to_string())
+            .map_err(|error| DuckLakeError::InvalidConfig(format!("invalid UUID bytes: {error}")));
+    }
+    Ok(arrow::util::display::array_value_to_string(array, row)?)
 }
 
 /// Column definition for creating or updating a table's schema.
@@ -987,6 +1013,113 @@ pub struct CommitIds {
     pub table_id: i64,
 }
 
+/// Stable identity of one visible inlined row selected for deletion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct InlinedRowRef {
+    /// Physical `ducklake_inlined_data_*` table registered for the table.
+    pub table_name: String,
+    /// Stable DuckLake row id within that table.
+    pub row_id: i64,
+}
+
+/// Row storage staged for one table in a multi-table write.
+#[derive(Debug, Clone)]
+pub enum StagedTableData {
+    /// Parquet data files already uploaded to object storage.
+    Files(Vec<DataFileInfo>),
+    /// Record batches to store in DuckLake's metadata catalog.
+    Inlined(Vec<RecordBatch>),
+    /// No inserted rows; the stage contains only deletes.
+    None,
+}
+
+/// One table's staged changes in a multi-table write.
+#[derive(Debug, Clone)]
+pub struct StagedTableWrite {
+    pub(crate) table_id: i64,
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+    pub(crate) base_snapshot_id: i64,
+    pub(crate) mode: WriteMode,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) column_ids: Vec<i64>,
+    pub(crate) data: StagedTableData,
+    pub(crate) snapshot_id_columns: Vec<String>,
+    pub(crate) positional_deletes: Vec<DeleteFileEntry>,
+    pub(crate) inlined_deletes: Vec<InlinedRowRef>,
+}
+
+impl StagedTableWrite {
+    /// Returns the target table id reserved during write setup.
+    #[must_use]
+    pub const fn table_id(&self) -> i64 {
+        self.table_id
+    }
+
+    /// Returns the target schema name.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// Returns the target table name.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the table snapshot observed during write setup.
+    #[must_use]
+    pub const fn base_snapshot_id(&self) -> i64 {
+        self.base_snapshot_id
+    }
+
+    /// Returns the staged write mode.
+    #[must_use]
+    pub const fn mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    /// Returns the staged catalog columns.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
+    /// Returns the catalog column ids paired with the staged columns.
+    #[must_use]
+    pub fn column_ids(&self) -> &[i64] {
+        &self.column_ids
+    }
+
+    /// Returns the staged row storage.
+    #[must_use]
+    pub const fn data(&self) -> &StagedTableData {
+        &self.data
+    }
+
+    /// Returns the staged positional deletes.
+    #[must_use]
+    pub fn positional_deletes(&self) -> &[DeleteFileEntry] {
+        &self.positional_deletes
+    }
+
+    /// Returns the staged inlined-row deletes.
+    #[must_use]
+    pub fn inlined_deletes(&self) -> &[InlinedRowRef] {
+        &self.inlined_deletes
+    }
+}
+
+/// Result of one atomic multi-table write.
+#[derive(Debug, Clone)]
+pub struct MultiTableCommit {
+    /// Snapshot shared by every committed table change.
+    pub snapshot_id: i64,
+    /// Authoritative schema and table ids for each staged table.
+    pub tables: Vec<CommitIds>,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
@@ -1012,6 +1145,70 @@ pub struct WriteSetupResult {
     pub field_ids: Vec<i64>,
 }
 
+pub(crate) const INLINED_INDEX_COLUMNS_SETTING: &str = "inlined_index_columns";
+
+pub(crate) fn encode_inlined_index_columns(columns: &[String]) -> Result<String> {
+    let mut seen = std::collections::HashSet::with_capacity(columns.len());
+    let mut normalized = Vec::with_capacity(columns.len());
+    for column in columns {
+        let column = column.trim();
+        validate_name(column, "Inlined index column")?;
+        if column.contains(',') {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "inlined index column '{column}' contains a comma"
+            )));
+        }
+        if !seen.insert(column.to_string()) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "duplicate inlined index column '{column}'"
+            )));
+        }
+        normalized.push(column.to_string());
+    }
+    Ok(normalized.join(","))
+}
+
+pub(crate) fn parse_inlined_index_columns(value: &str) -> Result<Vec<String>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    encode_inlined_index_columns(&columns)?;
+    Ok(columns)
+}
+
+/// Write paths tolerate a declaration whose columns were removed or renamed by
+/// a later schema migration: unknown columns are skipped so an inlined commit
+/// never fails on a stale declaration. `set_inlined_index_columns` still
+/// validates strictly at declaration time.
+pub(crate) fn live_inlined_index_columns(
+    declared: Vec<String>,
+    available: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    declared
+        .into_iter()
+        .filter(|column| available.contains(column))
+        .collect()
+}
+
+pub(crate) fn validate_inlined_index_columns(
+    declared: &[String],
+    available: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for column in declared {
+        if !available.contains(column) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "inlined index column '{column}' is not a live top-level table column"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Trait for writing metadata to DuckLake catalogs.
 ///
 /// Implementations must be thread-safe (`Send + Sync`).
@@ -1023,6 +1220,53 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn set_global_setting(&self, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "global-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Replace a table-scoped catalog setting.
+    fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "table-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Declare table columns that every physical inlined-data table should
+    /// index. An empty declaration retains only the mandatory `row_id` index.
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        self.set_table_setting(table_id, INLINED_INDEX_COLUMNS_SETTING, &value)
+    }
+
+    /// Backfill the declared indexes on every existing physical inlined-data
+    /// table. Implementations also apply any backend-specific legacy migration.
+    fn ensure_inlined_indexes(&self, _table_id: i64) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "inlined index maintenance is not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Run an operation while holding a backend-appropriate commit lock.
+    ///
+    /// A coordination utility for callers that want to serialize a multi-step
+    /// commit workflow (e.g. read staged state, dedup, commit) under one
+    /// `identity` across processes. Correctness does not depend on it: the
+    /// optimistic `expected_base_snapshot_id` fence remains the conflict
+    /// mechanism, and this lock only avoids duplicate concurrent work.
+    ///
+    /// Contract: the lock is held for the duration of `operation` and released
+    /// on both success and error before this returns; an `operation` error
+    /// propagates and takes precedence over a release error. A crashed holder
+    /// must not leave the lock held (backends use self-releasing mechanisms:
+    /// an advisory transaction lock, a file lock released on close). Keep
+    /// critical sections short — implementations may pin a connection while
+    /// the lock is held.
+    fn with_commit_lock(
+        &self,
+        _identity: &str,
+        _operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "commit locking is not supported by this metadata backend".to_string(),
         ))
     }
 
@@ -1369,6 +1613,64 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         )
     }
 
+    /// Whether this writer can store a small insert with `schema`'s column
+    /// types inlined in the catalog ([`Self::register_inlined_data`]) such that
+    /// its own inline read path decodes them back exactly. The write path
+    /// consults this before routing a row-bearing write at or below the scoped
+    /// `data_inlining_row_limit`: a writer that returns `false` keeps the
+    /// Parquet path instead of failing the write (or corrupting a round trip),
+    /// since when to inline is writer policy under the DuckLake specification.
+    fn supports_data_inlining(&self, _schema: &ArrowSchema) -> bool {
+        false
+    }
+
+    /// Store a small insert in the catalog instead of writing a Parquet file.
+    ///
+    /// Implementations create or reuse the per-`(table_id, schema_version)`
+    /// physical table, register it in `ducklake_inlined_data_tables`, insert the
+    /// rows with their stable row ids and snapshot bounds, update table stats,
+    /// record `commit_metadata` and the snapshot change ledger (appending to any
+    /// DDL entries already recorded for the snapshot), and — when
+    /// `expected_base_snapshot_id` is set and `mode` is not Replace — abort with
+    /// [`crate::DuckLakeError::Conflict`] if the table's data-file generation
+    /// changed since that snapshot, all in the same transaction as the snapshot
+    /// commit.
+    #[allow(clippy::too_many_arguments)]
+    fn register_inlined_data(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _snapshot_id: i64,
+        _batches: &[RecordBatch],
+        _mode: WriteMode,
+        _base_snapshot: i64,
+        _columns: &[ColumnDef],
+        _column_ids: &[i64],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "data inlining is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Commit staged changes for multiple tables in one metadata transaction.
+    ///
+    /// Implementations allocate one snapshot, evaluate the optional table-state
+    /// fence once for the complete write, and make every table change visible
+    /// together. A returned error must leave no staged metadata visible.
+    fn commit_multi_table(
+        &self,
+        _writes: &[StagedTableWrite],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        Err(DuckLakeError::InvalidConfig(
+            "multi-table writes are not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Register a positional delete file for a single data file, superseding any
     /// prior live delete file for it (at most one is live per data file).
     ///
@@ -1598,6 +1900,59 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Err(DuckLakeError::InvalidConfig(
             "positional DELETE is not supported on this metadata backend".to_string(),
         ))
+    }
+
+    /// End visible inlined rows in one new snapshot. Implementations must fence
+    /// every row against `base_snapshot`, set `end_snapshot` only while it is
+    /// still live, and decrement the current table row count atomically.
+    fn commit_inlined_deletes(
+        &self,
+        _table_id: i64,
+        _schema_name: &str,
+        _table_name: &str,
+        _base_snapshot: i64,
+        _rows: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        Err(DuckLakeError::InvalidConfig(
+            "inlined-row DELETE is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Apply positional and inlined-row deletes in one snapshot. The default
+    /// dispatches when only one storage form is present; backends supporting a
+    /// table that mixes both forms override this for an atomic combined commit.
+    fn commit_deletes(
+        &self,
+        table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+        positional: &[DeleteFileEntry],
+        inlined: &[InlinedRowRef],
+    ) -> Result<CommitIds> {
+        match (positional.is_empty(), inlined.is_empty()) {
+            (false, true) => self.commit_positional_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                positional,
+            ),
+            (true, false) => self.commit_inlined_deletes(
+                table_id,
+                schema_name,
+                table_name,
+                base_snapshot,
+                inlined,
+            ),
+            (false, false) => Err(DuckLakeError::InvalidConfig(
+                "combined positional and inlined-row DELETE is not supported on this metadata backend"
+                    .to_string(),
+            )),
+            (true, true) => Err(DuckLakeError::InvalidConfig(
+                "commit_deletes requires at least one delete".to_string(),
+            )),
+        }
     }
 
     /// Commit a compaction (`merge_adjacent_files` / `rewrite_data_files`) in
@@ -1878,6 +2233,43 @@ mod tests {
     use arrow::datatypes::Field;
     use std::sync::Arc;
 
+    #[test]
+    fn inlined_index_columns_normalize_and_reject_ambiguous_values() {
+        assert_eq!(
+            encode_inlined_index_columns(&[" identifier ".to_string(), "timestamp".to_string()])
+                .unwrap(),
+            "identifier,timestamp"
+        );
+        assert_eq!(
+            parse_inlined_index_columns("identifier, timestamp").unwrap(),
+            vec!["identifier".to_string(), "timestamp".to_string()]
+        );
+        assert!(
+            encode_inlined_index_columns(&["identifier".to_string(), "identifier".to_string()])
+                .is_err()
+        );
+        assert!(encode_inlined_index_columns(&["bad,name".to_string()]).is_err());
+    }
+
+    #[test]
+    fn inlined_index_columns_must_name_live_top_level_columns() {
+        let available = std::collections::HashSet::from(["identifier".to_string()]);
+        validate_inlined_index_columns(&["identifier".to_string()], &available).unwrap();
+        assert!(validate_inlined_index_columns(&["nested.value".to_string()], &available).is_err());
+    }
+
+    #[test]
+    fn stale_inlined_index_columns_are_skipped_not_fatal() {
+        let available = std::collections::HashSet::from(["identifier".to_string()]);
+        assert_eq!(
+            live_inlined_index_columns(
+                vec!["identifier".to_string(), "removed_column".to_string()],
+                &available,
+            ),
+            vec!["identifier".to_string()]
+        );
+    }
+
     fn promoted(values: Vec<(i32, Option<String>)>) -> DataFileInfo {
         DataFileInfo::new("f.parquet", 1024, 10).with_partition(7, values)
     }
@@ -1886,6 +2278,33 @@ mod tests {
     /// case, so these tests exercise arity/index/transform rules in isolation.
     fn utf8_types(n: usize) -> Vec<Option<DataType>> {
         vec![Some(DataType::Utf8); n]
+    }
+
+    #[test]
+    fn scalar_inlining_support_matches_round_trip_contract() {
+        for data_type in [
+            DataType::Int8,
+            DataType::Float64,
+            DataType::Decimal128(38, 16),
+            DataType::Date32,
+            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
+            DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano),
+            DataType::LargeUtf8,
+            DataType::LargeBinary,
+            DataType::FixedSizeBinary(16),
+        ] {
+            assert!(
+                crate::nested_inline::scalar_type_supports_inlining(&data_type),
+                "{data_type}"
+            );
+        }
+        assert!(!crate::nested_inline::scalar_type_supports_inlining(
+            &DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond,),
+        ));
+        assert!(!crate::nested_inline::scalar_type_supports_inlining(
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        ));
     }
 
     #[test]

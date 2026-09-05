@@ -30,8 +30,9 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::sort::{NullOrder, SortDirection, SortField};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataProvider, MetadataWriter, PartitionTransform,
-    SqliteMetadataProvider, SqliteMetadataWriter, WriteMode, register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider, MetadataWriter,
+    PartitionTransform, SqliteMetadataProvider, SqliteMetadataWriter, WriteMode,
+    register_ducklake_functions,
 };
 
 /// The `(id, val)` schema used throughout.
@@ -98,7 +99,9 @@ async fn writable_ctx(temp_dir: &TempDir) -> SessionContext {
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
     let writer = SqliteMetadataWriter::new(&conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(&conn_str).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+        .unwrap()
+        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx

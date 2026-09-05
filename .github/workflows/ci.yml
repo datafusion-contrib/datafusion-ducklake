@@ -25,6 +25,7 @@ concurrency:
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  DUCKDB_CLI_VERSION: "1.5.5"
   RUSTC_WRAPPER: "sccache"
   # Incremental artifacts are useless on a fresh CI runner and inflate the target
   # directory that the cache below has to carry, so keep them out of it. (This is
@@ -217,6 +218,18 @@ jobs:
       # `write-sqlite` pulls in the writer and sqlite-provider tests,
       # which are `#![cfg]`-gated; without it cargo compiles them to
       # zero-test binaries.
+      - name: Install DuckDB CLI (macOS)
+        if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
+        shell: bash
+        run: |
+          duckdb_archive="$RUNNER_TEMP/duckdb.gz"
+          curl --fail --location --retry 3 --output "$duckdb_archive" \
+            "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_CLI_VERSION}/duckdb_cli-osx-universal.gz"
+          gzip --decompress --stdout "$duckdb_archive" > "$RUNNER_TEMP/duckdb"
+          chmod +x "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/duckdb" --version
+
       - name: Run tests (macOS; Linux is covered by test-full)
         if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
         run: cargo test --features "skip-tests-with-docker write-sqlite"
@@ -445,6 +458,18 @@ jobs:
       # `skip-tests-with-docker` is NOT set, so the container-backed suites run.
       # Multicatalog (the runtimedb-specific layer, gated on `write-postgres`) is
       # intentionally excluded here — its test files stay in-tree but don't run.
+      - name: Install DuckDB CLI
+        if: steps.changes.outputs.code == 'true'
+        shell: bash
+        run: |
+          duckdb_archive="$RUNNER_TEMP/duckdb.gz"
+          curl --fail --location --retry 3 --output "$duckdb_archive" \
+            "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_CLI_VERSION}/duckdb_cli-linux-amd64.gz"
+          gzip --decompress --stdout "$duckdb_archive" > "$RUNNER_TEMP/duckdb"
+          chmod +x "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/duckdb" --version
+
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
         run: cargo test --features "duckdb-bundled encryption metadata-mysql metadata-postgres metadata-sqlite write-sqlite"

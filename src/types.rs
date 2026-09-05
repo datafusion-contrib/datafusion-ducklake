@@ -86,6 +86,17 @@ impl PhysicalExprAdapter for DuckLakeDefaultExprAdapter {
 
 pub(crate) fn parse_ducklake_scalar(value: &str, data_type: &DataType) -> Option<ScalarValue> {
     match data_type {
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Map(_, _) => crate::nested_inline::parse_text(value, data_type),
+        _ => parse_ducklake_scalar_leaf(value, data_type),
+    }
+}
+
+pub(crate) fn parse_ducklake_scalar_leaf(value: &str, data_type: &DataType) -> Option<ScalarValue> {
+    match data_type {
         DataType::Boolean => match value.to_ascii_lowercase().as_str() {
             "0" | "false" => Some(ScalarValue::Boolean(Some(false))),
             "1" | "true" => Some(ScalarValue::Boolean(Some(true))),
@@ -102,6 +113,11 @@ pub(crate) fn parse_ducklake_scalar(value: &str, data_type: &DataType) -> Option
         DataType::FixedSizeBinary(size) => decode_hex(value)
             .filter(|value| value.len() == *size as usize)
             .map(|value| ScalarValue::FixedSizeBinary(*size, Some(value))),
+        DataType::Timestamp(TimeUnit::Nanosecond, timezone) => value
+            .parse::<i64>()
+            .ok()
+            .map(|value| ScalarValue::TimestampNanosecond(Some(value), timezone.clone()))
+            .or_else(|| ScalarValue::try_from_string(value.to_string(), data_type).ok()),
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
@@ -779,6 +795,20 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
         .collect();
 
     Ok(Schema::new(fields?))
+}
+
+pub(crate) fn build_strict_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
+    let fields = columns
+        .iter()
+        .map(|column| {
+            Ok(Field::new(
+                &column.column_name,
+                column.data_type()?,
+                column.is_nullable,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new(fields))
 }
 
 /// Prefix of the synthetic name a read schema gives a column the file does not
