@@ -47,7 +47,7 @@ use std::collections::HashSet;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::common::tree_node::TreeNodeRecursion;
@@ -60,7 +60,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
 
-use crate::metadata_writer::{DeleteFileEntry, MetadataWriter};
+use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter};
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
 
@@ -273,12 +273,15 @@ async fn run_delete(
     let table_files = table
         .files()
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
+    let inlined_data = table
+        .inlined_data_with_row_ids()
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
     // Delete-all (no WHERE): metadata-only truncate — end every live data file in
     // one snapshot. Skip the empty table entirely (no-op, no snapshot).
     let predicate = match predicate {
         None => {
-            if table_files.is_empty() {
+            if table_files.is_empty() && inlined_data.is_empty() {
                 return Ok(0);
             }
             return writer
@@ -298,8 +301,31 @@ async fn run_delete(
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
+    let mut inlined_rows: Vec<InlinedRowRef> = Vec::new();
     let mut total_deleted: u64 = 0;
     let inlined_deletes = table.inlined_deletes_by_file()?;
+
+    for inlined in &inlined_data {
+        let values = predicate.evaluate(&inlined.batch)?;
+        let matches = values.into_array(inlined.batch.num_rows())?;
+        let matches = matches
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "DELETE predicate did not evaluate to a boolean array".to_string(),
+                )
+            })?;
+        for (row, row_id) in inlined.row_ids.iter().enumerate() {
+            if matches.is_valid(row) && matches.value(row) {
+                inlined_rows.push(InlinedRowRef {
+                    table_name: inlined.table_name.clone(),
+                    row_id: *row_id,
+                });
+            }
+        }
+    }
+    total_deleted += inlined_rows.len() as u64;
 
     for tf in &table_files {
         // A file rewritten by an UPDATE or by compaction is handled here like any
@@ -355,7 +381,7 @@ async fn run_delete(
         total_deleted += newly_deleted.len() as u64;
     }
 
-    if entries.is_empty() {
+    if entries.is_empty() && inlined_rows.is_empty() {
         // Predicate matched nothing new anywhere: no commit, no snapshot.
         return Ok(0);
     }
@@ -365,7 +391,14 @@ async fn run_delete(
     // dedicated delete-only commit rather than `register_data_file_with_deletes`
     // (which requires an appended file).
     writer
-        .commit_positional_deletes(table_id, schema_name, table_name, base_snapshot, &entries)
+        .commit_deletes(
+            table_id,
+            schema_name,
+            table_name,
+            base_snapshot,
+            &entries,
+            &inlined_rows,
+        )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
     Ok(total_deleted)

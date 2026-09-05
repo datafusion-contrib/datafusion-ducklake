@@ -1,16 +1,19 @@
 //! PostgreSQL metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::inlined_filter::{
+    InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
+};
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
-    DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting, SchemaMetadata,
-    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
-    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
-    parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
-    resolve_metadata_settings,
+    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
+    ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
+    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
+    reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -938,6 +941,62 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT snapshot.snapshot_id,
+                        snapshot.snapshot_time::text AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM ducklake_snapshot AS snapshot
+                 JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT changes.snapshot_id
+                 FROM ducklake_snapshot_changes AS changes
+                 WHERE (changes.commit_extra_info = $1
+                        OR strpos(changes.commit_extra_info, $2) > 0)
+                   AND EXISTS (
+                       SELECT 1 FROM ducklake_data_file AS files
+                       WHERE files.begin_snapshot = changes.snapshot_id
+                         AND files.end_snapshot IS NULL
+                   )
+                 ORDER BY changes.snapshot_id
+                 LIMIT 1",
+            )
+            .bind(needle)
+            .bind(needle)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
+        })
+    }
+
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
         block_on(async {
             let rows = sqlx::query(
@@ -1565,9 +1624,21 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
         block_on(async {
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
+                return Ok(InlinedDataScan::default());
             }
             let registry = sqlx::query(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
@@ -1583,7 +1654,120 @@ impl MetadataProvider for PostgresMetadataProvider {
                 if !is_inlined_data_table(&table) {
                     continue;
                 }
+                let physical_columns = sqlx::query(
+                    "SELECT column_name, data_type FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1",
+                )
+                .bind(&table)
+                .fetch_all(&self.pool)
+                .await?;
+                let present = physical_columns
+                    .iter()
+                    .map(|row| row.try_get::<String, _>(0))
+                    .collect::<std::result::Result<HashSet<_>, _>>()?;
+                let physical_types = physical_columns
+                    .iter()
+                    .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+                    .collect::<std::result::Result<HashMap<_, _>, sqlx::Error>>()?;
+                let projected = columns
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        if !present.contains(&column.column_name) {
+                            "NULL::text".to_string()
+                        } else {
+                            let ident = quote_ident(&column.column_name);
+                            inlined_text_projection(
+                                InlinedDataBackend::Postgres,
+                                column,
+                                field.data_type(),
+                                &ident,
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let rendered = filter.and_then(|filter| {
+                    render_inlined_filter(
+                        filter,
+                        InlinedSqlDialect::Postgres,
+                        schema.as_ref(),
+                        &physical_types,
+                        2,
+                    )
+                });
+                let pushed = rendered
+                    .as_ref()
+                    .map(|rendered| format!(" AND ({})", rendered.sql))
+                    .unwrap_or_default();
+                let sql = format!(
+                    "SELECT {projected} FROM {} \
+                 WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL){pushed} \
+                     ORDER BY row_id",
+                    quote_ident(&table)
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+                    .bind(snapshot_id)
+                    .bind(snapshot_id);
+                if let Some(rendered) = rendered {
+                    for bind in rendered.binds {
+                        query = match bind {
+                            InlinedSqlBind::Bool(value) => query.bind(value),
+                            InlinedSqlBind::I64(value) => query.bind(value),
+                            InlinedSqlBind::U64(value) => query.bind(value.to_string()),
+                            InlinedSqlBind::F64(value) => query.bind(value),
+                            InlinedSqlBind::Text(value) => query.bind(value),
+                            InlinedSqlBind::Bytes(value) => query.bind(value),
+                        };
+                    }
+                }
+                let rows = query.fetch_all(&self.pool).await?;
+                if rows.is_empty() {
+                    continue;
+                }
+                let rows = rows
+                    .into_iter()
+                    .map(|row| {
+                        (0..columns.len())
+                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                batches.push(parse_inlined_rows_with_present(
+                    schema.clone(),
+                    columns,
+                    rows,
+                    Some(&present),
+                )?);
+            }
+            Ok(InlinedDataScan::from_batches(batches))
+        })
+    }
 
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            let entries = sqlx::query(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
+            let mut batches = Vec::new();
+
+            for entry in entries {
+                let table: String = entry.try_get("table_name")?;
+                if !is_inlined_data_table(&table) {
+                    continue;
+                }
                 let present = sqlx::query(
                     "SELECT column_name FROM information_schema.columns
                      WHERE table_schema = current_schema() AND table_name = $1",
@@ -1613,9 +1797,9 @@ impl MetadataProvider for PostgresMetadataProvider {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT {projected} FROM {} \
-                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL) \
-                     ORDER BY row_id",
+                    "SELECT row_id, begin_snapshot, {projected} FROM {}
+                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL)
+                     ORDER BY begin_snapshot, row_id",
                     quote_ident(&table)
                 );
                 let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
@@ -1626,20 +1810,33 @@ impl MetadataProvider for PostgresMetadataProvider {
                 if rows.is_empty() {
                     continue;
                 }
-                let rows = rows
+                let row_ids = rows
+                    .iter()
+                    .map(|row| row.try_get("row_id"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let begin_snapshots = rows
+                    .iter()
+                    .map(|row| row.try_get("begin_snapshot"))
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                let decoded_rows = rows
                     .into_iter()
                     .map(|row| {
                         (0..columns.len())
-                            .map(|index| row.try_get::<Option<String>, _>(index))
+                            .map(|index| row.try_get::<Option<String>, _>(index + 2))
                             .collect::<std::result::Result<Vec<_>, _>>()
                     })
                     .collect::<std::result::Result<Vec<_>, _>>()?;
-                batches.push(parse_inlined_rows_with_present(
-                    schema.clone(),
-                    columns,
-                    rows,
-                    Some(&present),
-                )?);
+                batches.push(DuckLakeInlinedData {
+                    table_name: table,
+                    row_ids,
+                    begin_snapshots,
+                    batch: parse_inlined_rows_with_present(
+                        schema.clone(),
+                        columns,
+                        decoded_rows,
+                        Some(&present),
+                    )?,
+                });
             }
             Ok(batches)
         })

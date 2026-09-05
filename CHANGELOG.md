@@ -16,6 +16,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live file (#293).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
+- MySQL inlines supported list, struct, and map batches, including strict
+  maintenance reads and atomic multi-table writes (#277).
+- Inlined writers store numeric and temporal values in native backend types, and
+  declared per-table indexes plus a mandatory `row_id` index accelerate inlined
+  filters and deletes on all four backends.
+- MySQL skips declared indexes on `LONGTEXT` and `LONGBLOB`, while retaining
+  numeric declarations and mandatory `row_id` indexes.
+
+- Catalog-inlined scans push safe equality, range, null, boolean, and prefix
+  filters into parameterized metadata queries on all four backends while keeping
+  DataFusion residual filters `Inexact` (#277).
+
+- Embedding APIs expose snapshot changes, opaque commit lookup, table-scoped
+  setting upserts, and backend commit coordination locks on SQLite and
+  PostgreSQL, with unsupported defaults elsewhere (#274).
+
+- `DuckLakeWriteTransaction` stages Parquet files, inlined rows, and deletes
+  across tables, then publishes them in one snapshot on DuckDB, SQLite,
+  PostgreSQL, or MySQL (#274).
+
+- SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
+  snapshot on all four write backends; DuckDB and MySQL now implement combined
+  deletes and exact inline-aware truncate counts (#273).
+
+- Scoped settings now govern writer compression, row groups, rollover, sorting,
+  partition paths, and the inclusive `data_inlining_row_limit`; supported small
+  writes stay in metadata with stable row IDs and snapshot visibility (#272).
+
 - `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
   set how many finished data files a rolling or partitioned write uploads at once, default 4.
   Written output is identical at any setting (#280).
@@ -54,6 +82,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers no public constructor for one, so these two execs are effectively crate-internal now.
   `ROW_POS_COLUMN_NAME` is also only a *base* name: a scan whose file already has a column of
   that name uses a suffixed variant, so locating the column by name is no longer reliable (#130).
+- Failed multi-table commits remove staged objects only on definite pre-commit
+  rejection; ambiguous network commit failures leave them for guarded vacuum
+  rather than risking deletion of committed files (#274).
+
+- Small writes inline only when `supports_data_inlining` accepts the schema;
+  unsupported schemas fall back to Parquet. `UPDATE` and row-lineage scans reject
+  visible inlined rows with a clear flush-or-disable remedy (#272).
+
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory
@@ -87,6 +123,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete file, with no `NanPruningBarrierExec` above it, silently dropping NaN rows (#130).
 - The internal physical-position column could bind to a catalog column of the same name in the
   CDC feeds, making them report the wrong rows (#130).
+- MySQL multi-table commits allocate the serializing snapshot before fence and
+  liveness reads, preventing stale read views and overlapping row IDs (#274).
+- Fresh multi-table creation records each `created_schema:` ledger entry exactly
+  once (#274).
+
+- MySQL allocates data and delete file IDs consistently from catalog counters,
+  avoiding collisions across append, update, delete, and compaction paths (#273).
+- DuckDB and MySQL mutation flows now record `changes_made` entries for every
+  data-modifying snapshot (#273).
+- A first write after an abandoned staged table now commits and seeds table stats
+  instead of failing with a permanent `Conflict` (#273).
+
+- SQLite and MySQL inline encodings now round-trip floats and binary values
+  exactly (#272).
+- Inline commits honor expected-base, commit-metadata, and partition-spec fences
+  and preserve existing snapshot-change tokens (#272).
+- MySQL creates inline-table DDL before opening the write transaction, avoiding
+  implicit partial commits (#272).
+
 - `NULL` sentinels, BLOB decoding, expression-default reads, and legacy schema migration (#259).
 - Name-mapped Hive columns retain values through `DELETE`, `UPDATE`, and compaction;
   mapped CDC reads no longer return NULL after column renames. Map keys and nested

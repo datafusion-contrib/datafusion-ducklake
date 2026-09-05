@@ -7,18 +7,21 @@
 //! extra scoping because the caller already obtained the id through a
 //! catalog-scoped lookup.
 //!
-//! This implementation is standalone; it does not wrap
-//! [`crate::PostgresMetadataProvider`] — the existing single-catalog provider
-//! is untouched.
+//! Catalog-scoped queries are implemented here. Reads keyed by globally unique table IDs reuse the
+//! single-catalog provider's storage-level implementation.
 
+use arrow::record_batch::RecordBatch;
+
+use crate::PostgresMetadataProvider;
 use crate::Result;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
-    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping, DuckLakeNameMappingEntry,
-    DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
-    DuckLakeTableFile, DuckLakeTableStatistics, FileWithTable, MetadataProvider, MetadataSetting,
-    SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
-    block_on, reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
+    DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
+    FileWithTable, MetadataProvider, MetadataSetting, SchemaMetadata, SnapshotChangeMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema, block_on,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::metadata_provider_postgres::{
     PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, stats_filter_sql,
@@ -141,6 +144,7 @@ impl SchemaCapabilities {
 #[derive(Debug, Clone)]
 pub struct MulticatalogProvider {
     pool: PgPool,
+    inlined_provider: PostgresMetadataProvider,
     catalog_id: i64,
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
@@ -170,6 +174,7 @@ impl MulticatalogProvider {
             .ok_or_else(|| crate::DuckLakeError::CatalogNotFound(catalog_name.to_string()))?
             .try_get(0)?;
         Ok(Self {
+            inlined_provider: PostgresMetadataProvider::from_pool(pool.clone()),
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
@@ -180,6 +185,7 @@ impl MulticatalogProvider {
     /// name lookup. Caller is responsible for ensuring the id exists.
     pub async fn with_pool_and_id(pool: PgPool, catalog_id: i64) -> Result<Self> {
         Ok(Self {
+            inlined_provider: PostgresMetadataProvider::from_pool(pool.clone()),
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
@@ -619,6 +625,74 @@ impl MetadataProvider for MulticatalogProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT snapshot.snapshot_id,
+                        snapshot.snapshot_time::text AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM ducklake_snapshot AS snapshot
+                 JOIN ducklake_catalog_snapshot_map AS catalog
+                   ON catalog.snapshot_id = snapshot.snapshot_id
+                 JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 WHERE catalog.catalog_id = $1
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .bind(self.catalog_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT changes.snapshot_id
+                 FROM ducklake_snapshot_changes AS changes
+                 JOIN ducklake_catalog_snapshot_map AS snapshots
+                   ON snapshots.snapshot_id = changes.snapshot_id
+                 WHERE snapshots.catalog_id = $1
+                   AND (changes.commit_extra_info = $2
+                        OR strpos(changes.commit_extra_info, $3) > 0)
+                   AND EXISTS (
+                       SELECT 1 FROM ducklake_data_file AS files
+                       JOIN ducklake_table AS tables ON tables.table_id = files.table_id
+                       JOIN ducklake_catalog_schema_map AS schemas
+                         ON schemas.schema_id = tables.schema_id
+                       WHERE schemas.catalog_id = $1
+                         AND files.begin_snapshot = changes.snapshot_id
+                         AND files.end_snapshot IS NULL
+                   )
+                 ORDER BY changes.snapshot_id
+                 LIMIT 1",
+            )
+            .bind(self.catalog_id)
+            .bind(needle)
+            .bind(needle)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
         })
     }
 
@@ -1276,6 +1350,46 @@ impl MetadataProvider for MulticatalogProvider {
                 files,
             })
         })
+    }
+
+    fn get_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<RecordBatch>> {
+        self.inlined_provider
+            .get_inlined_data(table_id, snapshot_id, columns)
+    }
+
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+    ) -> Result<crate::inlined_filter::InlinedDataScan> {
+        self.inlined_provider
+            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+    }
+
+    fn get_inlined_data_with_row_ids(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<Vec<DuckLakeInlinedData>> {
+        self.inlined_provider
+            .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)
+    }
+
+    fn get_inlined_deletes(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedDelete>> {
+        self.inlined_provider
+            .get_inlined_deletes(table_id, snapshot_id)
     }
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
