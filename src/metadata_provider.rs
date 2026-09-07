@@ -45,6 +45,14 @@ pub const SQL_GET_TABLE_COLUMNS: &str =
        AND (? < end_snapshot OR end_snapshot IS NULL)
      ORDER BY column_order";
 
+#[cfg(any(feature = "metadata-duckdb", feature = "metadata-sqlite"))]
+pub(crate) const SQL_FILE_SCHEMA_VERSION: &str = "(SELECT sv.schema_version
+                  FROM ducklake_schema_versions sv
+                  WHERE sv.table_id = data.table_id
+                    AND sv.begin_snapshot <= data.begin_snapshot
+                  ORDER BY sv.begin_snapshot DESC
+                  LIMIT 1)";
+
 pub const SQL_GET_DATA_FILES: &str = "
     SELECT
         data.data_file_id,

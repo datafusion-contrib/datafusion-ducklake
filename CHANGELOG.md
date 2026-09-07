@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live file (#293).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
+- SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
+  snapshot on all four write backends; DuckDB and MySQL now implement combined
+  deletes and exact inline-aware truncate counts (#273).
+
 - `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
   set how many finished data files a rolling or partitioned write uploads at once, default 4.
   Written output is identical at any setting (#280).
@@ -34,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / rewrite paths explicitly (#130).
 
 ### Changed
+- Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining (#273).
 
 - Files carrying a live delete file are now pruned by their statistics, matching official
   DuckLake; previously they were kept regardless of the predicate (#293).
@@ -70,7 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
 
 ### Fixed
+- Read legacy global schema-version ledgers without assuming per-table provenance (#273).
 
+- Fix DuckDB compaction skipping eligible data files and retain historical row visibility (#273).
 - Invalid write-only catalog settings no longer block table reads; they fail when a write or
   maintenance operation is planned (#271).
 - Legacy two-column `ducklake_metadata` tables migrate both scope columns losslessly (#271).
@@ -87,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delete file, with no `NanPruningBarrierExec` above it, silently dropping NaN rows (#130).
 - The internal physical-position column could bind to a catalog column of the same name in the
   CDC feeds, making them report the wrong rows (#130).
+- MySQL allocates data and delete file IDs consistently from catalog counters,
+  avoiding collisions across append, update, delete, and compaction paths (#273).
+- DuckDB and MySQL mutation flows now record `changes_made` entries for every
+  data-modifying snapshot (#273).
+- A first write after an abandoned staged table now commits and seeds table stats
+  instead of failing with a permanent `Conflict` (#273).
+
 - `NULL` sentinels, BLOB decoding, expression-default reads, and legacy schema migration (#259).
 - Name-mapped Hive columns retain values through `DELETE`, `UPDATE`, and compaction;
   mapped CDC reads no longer return NULL after column renames. Map keys and nested
