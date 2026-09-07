@@ -746,8 +746,8 @@ impl DuckdbMetadataProvider {
                 WHERE name = 'default_value_type') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
                 WHERE name = 'default_value_dialect') > 0,
-               (SELECT COUNT(*) FROM information_schema.tables
-                WHERE table_name = 'ducklake_schema_versions') > 0",
+               (SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = 'ducklake_schema_versions' AND column_name = 'table_id') > 0",
             [],
             |row| {
                 Ok((
@@ -2497,11 +2497,6 @@ mod tests {
             column_size_bytes BIGINT, value_count BIGINT, null_count BIGINT,
             min_value VARCHAR, max_value VARCHAR, contains_nan BOOLEAN);";
 
-    /// A file-backed catalog built by `setup`, then opened by the provider.
-    ///
-    /// The provider opens read-only, so the writing connection is closed before
-    /// it is constructed. The `TempDir` comes back with it because dropping it
-    /// deletes the catalog.
     #[test]
     fn file_provenance_tracks_each_files_origin_schema() {
         let (_dir, provider) = provider_over(
@@ -2605,24 +2600,38 @@ mod tests {
 
     #[test]
     fn legacy_file_provenance_keeps_unknown_schema_version() {
-        let (_dir, provider) = provider_over(
-            "            INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, path, path_is_relative, file_size_bytes, record_count)            VALUES (10, 3, 2, 'ten.parquet', true, 100, 2);",
-        );
-        let files = provider.get_table_files_for_select(3, 3).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(
-            (files[0].begin_snapshot, files[0].schema_version),
-            (Some(2), None)
-        );
-        let page = provider
-            .get_table_file_metadata_page(3, 3, None, 1)
-            .unwrap();
-        assert_eq!(
-            (page[0].file.begin_snapshot, page[0].file.schema_version),
-            (Some(2), None)
-        );
+        for ledger in [
+            "",
+            "CREATE TABLE ducklake_schema_versions (begin_snapshot BIGINT, schema_version BIGINT);
+             INSERT INTO ducklake_schema_versions VALUES (0, 0), (1, 1);",
+        ] {
+            let (_dir, provider) = provider_over(&format!(
+                "{ledger}
+                 INSERT INTO ducklake_data_file
+                     (data_file_id, table_id, begin_snapshot, path, path_is_relative, file_size_bytes, record_count)
+                 VALUES (10, 3, 2, 'ten.parquet', true, 100, 2);"
+            ));
+            let files = provider.get_table_files_for_select(3, 3).unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(
+                (files[0].begin_snapshot, files[0].schema_version),
+                (Some(2), None)
+            );
+            let page = provider
+                .get_table_file_metadata_page(3, 3, None, 1)
+                .unwrap();
+            assert_eq!(
+                (page[0].file.begin_snapshot, page[0].file.schema_version),
+                (Some(2), None)
+            );
+        }
     }
 
+    /// A file-backed catalog built by `setup`, then opened by the provider.
+    ///
+    /// The provider opens read-only, so the writing connection is closed before
+    /// it is constructed. The `TempDir` comes back with it because dropping it
+    /// deletes the catalog.
     fn provider_over(setup: &str) -> (TempDir, DuckdbMetadataProvider) {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("catalog.duckdb");

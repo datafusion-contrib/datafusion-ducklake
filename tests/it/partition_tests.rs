@@ -22,8 +22,7 @@ fn create_partitioned_catalog(catalog_path: &std::path::Path) -> anyhow::Result<
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.events (id INTEGER, region VARCHAR, ts TIMESTAMP);",

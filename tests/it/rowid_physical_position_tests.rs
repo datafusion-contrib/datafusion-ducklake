@@ -33,10 +33,7 @@ fn open(catalog_path: &Path) -> anyhow::Result<duckdb::Connection> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
-    conn.execute(
-        &format!("ATTACH 'ducklake:{}' AS c;", catalog_path.display()),
-        [],
-    )?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "c")?;
     Ok(conn)
 }
 

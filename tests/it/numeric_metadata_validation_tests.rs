@@ -18,8 +18,7 @@ fn create_catalog_with_negative_file_size(catalog_path: &std::path::Path) -> any
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.items (id INT, name VARCHAR);",
@@ -46,8 +45,7 @@ fn create_catalog_with_negative_footer_size(catalog_path: &std::path::Path) -> a
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    crate::common::attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.items (id INT, name VARCHAR);",

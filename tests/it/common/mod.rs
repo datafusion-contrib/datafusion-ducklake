@@ -49,6 +49,21 @@ pub fn ensure_ducklake_installed() {
     ensure_extension_installed("parquet");
 }
 
+pub fn attach_catalog_without_inlining(
+    connection: &duckdb::Connection,
+    path: &Path,
+    catalog: &str,
+) -> duckdb::Result<()> {
+    connection.execute(
+        &format!(
+            "ATTACH 'ducklake:{}' AS {catalog} (DATA_INLINING_ROW_LIMIT 0);",
+            path.display()
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
 /// Creates a catalog with a simple table (no deletes)
 ///
 /// Table schema:
@@ -70,8 +85,7 @@ pub fn create_catalog_no_deletes(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.users (
@@ -110,8 +124,7 @@ pub fn create_catalog_with_deletes(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.products (
@@ -156,8 +169,7 @@ pub fn create_catalog_with_updates(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.inventory (
@@ -211,8 +223,7 @@ pub fn create_catalog_filter_pushdown(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.items (
@@ -249,8 +260,7 @@ pub fn create_catalog_empty_table(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     conn.execute(
         "CREATE TABLE test_catalog.tbl (
@@ -279,8 +289,7 @@ pub fn create_catalog_basic_test(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     // Create first table: test(i INTEGER, j INTEGER)
     conn.execute(
@@ -331,8 +340,7 @@ pub fn create_catalog_complex_deletions(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     // Create table
     conn.execute(
@@ -377,8 +385,7 @@ pub fn create_catalog_multiple_snapshots(catalog_path: &Path) -> Result<()> {
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    let ducklake_path = format!("ducklake:{}", catalog_path.display());
-    conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
+    attach_catalog_without_inlining(&conn, catalog_path, "test_catalog")?;
 
     // Snapshot 1: Create table and insert first batch
     conn.execute(
