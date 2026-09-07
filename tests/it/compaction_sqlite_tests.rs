@@ -308,6 +308,7 @@ fn create_official_mapped_compaction_fixture(temp: &TempDir) -> anyhow::Result<(
     conn.execute("INSTALL sqlite", [])?;
     conn.execute("LOAD sqlite", [])?;
     conn.execute("LOAD ducklake", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     conn.execute(
         &format!(
             "ATTACH 'ducklake:sqlite:{}' AS lake \
@@ -374,28 +375,9 @@ async fn read_mapped_rows(temp: &TempDir) -> anyhow::Result<Vec<(i32, i32)>> {
 }
 
 #[cfg(feature = "metadata-duckdb")]
-async fn migrate_pinned_duckdb_fixture(temp: &TempDir) -> anyhow::Result<()> {
+async fn normalize_official_data_file_ids(temp: &TempDir) -> anyhow::Result<()> {
     let pool = pool(temp).await;
     SqliteMetadataWriter::new_with_init(&db_url(temp)).await?;
-    let schema_version_columns = sqlx::query("PRAGMA table_info(ducklake_schema_versions)")
-        .fetch_all(&pool)
-        .await?;
-    if !schema_version_columns
-        .iter()
-        .any(|row| row.get::<String, _>(1) == "table_id")
-    {
-        // The pinned DuckDB 1.4.1 test extension predates the per-table column
-        // that released DuckDB 1.5.5 writes; keep the fixture shape equivalent
-        sqlx::query("ALTER TABLE ducklake_schema_versions ADD COLUMN table_id INTEGER")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "UPDATE ducklake_schema_versions
-             SET table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 't')",
-        )
-        .execute(&pool)
-        .await?;
-    }
     let data_file_columns = sqlx::query("PRAGMA table_info(ducklake_data_file)")
         .fetch_all(&pool)
         .await?;
@@ -406,7 +388,9 @@ async fn migrate_pinned_duckdb_fixture(temp: &TempDir) -> anyhow::Result<()> {
         .unwrap();
     if data_file_id_type != "INTEGER" {
         // SQLite auto-allocates only an exact INTEGER PRIMARY KEY; normalize the
-        // official BIGINT declaration to the crate writer's documented precondition
+        // official BIGINT declaration to the crate writer's documented
+        // precondition. Required until the writer allocates the id explicitly
+        // instead of relying on the rowid alias (see issue #291).
         sqlx::query("ALTER TABLE ducklake_data_file RENAME TO ducklake_data_file__official")
             .execute(&pool)
             .await?;
@@ -455,7 +439,7 @@ async fn migrate_pinned_duckdb_fixture(temp: &TempDir) -> anyhow::Result<()> {
 async fn mapped_hive_values_survive_merge_adjacent_files() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     create_official_mapped_compaction_fixture(&temp)?;
-    migrate_pinned_duckdb_fixture(&temp).await?;
+    normalize_official_data_file_ids(&temp).await?;
     assert_eq!(read_mapped_rows(&temp).await?, vec![(1, 7), (2, 8)]);
 
     let result = run_merge(&temp, MergeOptions::default()).await;

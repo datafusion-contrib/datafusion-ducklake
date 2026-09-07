@@ -69,6 +69,7 @@ pub fn create_catalog_no_deletes(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -109,6 +110,7 @@ pub fn create_catalog_with_deletes(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -155,6 +157,7 @@ pub fn create_catalog_with_updates(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -210,6 +213,7 @@ pub fn create_catalog_filter_pushdown(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -248,6 +252,7 @@ pub fn create_catalog_empty_table(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -278,6 +283,7 @@ pub fn create_catalog_basic_test(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -330,6 +336,7 @@ pub fn create_catalog_complex_deletions(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -376,6 +383,7 @@ pub fn create_catalog_multiple_snapshots(catalog_path: &Path) -> Result<()> {
 
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;

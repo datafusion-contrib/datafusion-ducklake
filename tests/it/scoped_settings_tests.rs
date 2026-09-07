@@ -322,6 +322,9 @@ fn official_duckdb_settings_resolve_with_table_precedence() {
     connection.execute("INSTALL ducklake", []).unwrap();
     connection.execute("LOAD ducklake", []).unwrap();
     connection
+        .execute("SET ducklake_default_data_inlining_row_limit = 0;", [])
+        .unwrap();
+    connection
         .execute(
             &format!(
                 "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}')",

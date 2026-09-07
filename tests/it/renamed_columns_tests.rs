@@ -32,6 +32,7 @@ fn create_catalog_with_renamed_column(catalog_path: &Path) -> Result<()> {
 
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -69,6 +70,7 @@ fn create_catalog_with_multiple_renames(catalog_path: &Path) -> Result<()> {
 
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -358,6 +360,7 @@ fn create_catalog_renamed_with_post_rename_file(catalog_path: &Path) -> Result<(
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     conn.execute(
@@ -464,6 +467,7 @@ fn create_catalog_rename_then_delete(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     conn.execute(
@@ -532,6 +536,7 @@ fn create_catalog_drop_readd(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     conn.execute(
@@ -567,6 +572,7 @@ async fn test_drop_readd_column_reads_null_for_pre_drop_rows() -> Result<()> {
         let conn = duckdb::Connection::open_in_memory()?;
         crate::common::ensure_ducklake_installed();
         conn.execute("LOAD ducklake;", [])?;
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
         let ducklake_path = format!("ducklake:{}", catalog_path.display());
         conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
         let mut stmt = conn.prepare("SELECT id, tag FROM test_catalog.test_table ORDER BY id")?;
@@ -620,6 +626,7 @@ fn create_catalog_evolved_struct_child(catalog_path: &Path, rename: bool) -> Res
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
     if rename {

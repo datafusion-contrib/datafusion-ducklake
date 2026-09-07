@@ -25,6 +25,7 @@ fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;
@@ -44,6 +45,7 @@ fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;
@@ -76,6 +78,7 @@ fn create_catalog_rowid_with_update(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS c;", ducklake_path), [])?;

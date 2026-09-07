@@ -23,6 +23,7 @@ fn create_empty_table_catalog(catalog_path: &std::path::Path) -> anyhow::Result<
 
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     // Create data directory (DuckLake only creates it on first INSERT)
     let data_dir = catalog_path.with_extension("ducklake.files");
@@ -171,6 +172,7 @@ fn create_populated_table_catalog(catalog_path: &std::path::Path) -> anyhow::Res
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let data_dir = catalog_path.with_extension("ducklake.files");
     std::fs::create_dir_all(&data_dir)?;
@@ -432,6 +434,7 @@ fn create_two_file_catalog(catalog_path: &std::path::Path) -> anyhow::Result<()>
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let data_dir = catalog_path.with_extension("ducklake.files");
     std::fs::create_dir_all(&data_dir)?;
@@ -565,6 +568,7 @@ async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
         };
         crate::common::ensure_ducklake_installed();
         exec("LOAD ducklake;")?;
+        exec("SET ducklake_default_data_inlining_row_limit = 0;")?;
         std::fs::create_dir_all(catalog_path.with_extension("ducklake.files"))
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         exec(&format!(

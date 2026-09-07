@@ -21,6 +21,7 @@ fn create_partitioned_catalog(catalog_path: &std::path::Path) -> anyhow::Result<
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -178,6 +179,7 @@ fn create_partition_moving_update_catalog(catalog_path: &std::path::Path) -> any
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     conn.execute(
         &format!(
             "ATTACH 'ducklake:{}' AS test_catalog (DATA_INLINING_ROW_LIMIT 0);",

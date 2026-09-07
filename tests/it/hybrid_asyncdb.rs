@@ -72,6 +72,7 @@ impl HybridDuckLakeDB {
         let conn = Connection::open_in_memory()?;
         crate::common::ensure_ducklake_installed();
         conn.execute("LOAD ducklake;", [])?;
+        conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
         let ducklake_path = format!("ducklake:{}", catalog_path.display());
         let attach_sql = format!(

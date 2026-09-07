@@ -17,6 +17,7 @@ fn create_catalog_with_negative_file_size(catalog_path: &std::path::Path) -> any
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;
@@ -45,6 +46,7 @@ fn create_catalog_with_negative_footer_size(catalog_path: &std::path::Path) -> a
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     let ducklake_path = format!("ducklake:{}", catalog_path.display());
     conn.execute(&format!("ATTACH '{}' AS test_catalog;", ducklake_path), [])?;

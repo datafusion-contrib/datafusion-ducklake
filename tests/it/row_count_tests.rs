@@ -47,6 +47,8 @@ fn duckdb_count_star(catalog_path: &Path, table: &str) -> DataFusionResult<i64> 
     let conn = duckdb::Connection::open_in_memory().map_err(to_df)?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", []).map_err(to_df)?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])
+        .map_err(to_df)?;
     conn.execute(
         &format!("ATTACH 'ducklake:{}' AS c;", catalog_path.display()),
         [],

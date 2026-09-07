@@ -103,13 +103,16 @@ fn stored_view_sql(catalog_path: &Path, view_name: &str) -> anyhow::Result<Strin
     )?)
 }
 
-fn normalize_current_view_sql(catalog_path: &Path) -> anyhow::Result<()> {
+/// Rewrite one view's stored SQL from the `{DUCKLAKE_CATALOG}` placeholder to a
+/// literal attach alias, which is the shape catalogs written before the
+/// placeholder existed hold.
+fn legacy_qualify_view_sql(catalog_path: &Path, view_name: &str) -> anyhow::Result<()> {
     let connection = duckdb::Connection::open(catalog_path)?;
     connection.execute(
         "UPDATE ducklake_view
-         SET sql = replace(sql, 'lake.', '{DUCKLAKE_CATALOG}.')
-         WHERE view_name <> 'legacy_qualified'",
-        [],
+         SET sql = replace(sql, '{DUCKLAKE_CATALOG}.', 'lake.')
+         WHERE view_name = ?",
+        [view_name],
     )?;
     Ok(())
 }
@@ -121,6 +124,7 @@ fn duckdb_rows(
 ) -> anyhow::Result<Vec<Vec<String>>> {
     let connection = duckdb::Connection::open_in_memory()?;
     connection.execute("LOAD ducklake", [])?;
+    connection.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     connection.execute(
         &format!(
             "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}')",
@@ -187,9 +191,13 @@ async fn duckdb_views_are_listed_and_queryable() -> anyhow::Result<()> {
         &data_path,
         "SELECT CAST(rowid AS VARCHAR) AS rowid_text FROM lake.rowids ORDER BY rowid",
     )?;
-    assert!(stored_view_sql(&catalog_path, "filtered")?.contains("lake.users"));
-    normalize_current_view_sql(&catalog_path)?;
+    // DuckLake stores a view's SQL with the catalog name replaced by the
+    // `{DUCKLAKE_CATALOG}` placeholder, so the SQL survives the catalog being
+    // attached under a different alias.
     assert!(stored_view_sql(&catalog_path, "filtered")?.contains("{DUCKLAKE_CATALOG}.users"));
+    // A catalog written before the placeholder existed holds the attach alias
+    // instead. Rewrite one view to that shape so the read path is covered for both.
+    legacy_qualify_view_sql(&catalog_path, "legacy_qualified")?;
     assert!(stored_view_sql(&catalog_path, "legacy_qualified")?.contains("lake.users"));
     assert!(stored_view_sql(&catalog_path, "schema_qualified")?.contains("s1.cross_values"));
     assert!(stored_view_sql(&catalog_path, "mixed_schema")?.contains("MySchema.mixed_values"));

@@ -23,6 +23,7 @@ async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
     // Install and load ducklake extension
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     // Create a test table with some data (local filesystem)
     conn.execute(
@@ -66,6 +67,7 @@ async fn create_s3_test_catalog(
     // Install and load ducklake extension
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
 
     eprintln!("Configuring S3 secret for endpoint: {}", s3_endpoint);
 

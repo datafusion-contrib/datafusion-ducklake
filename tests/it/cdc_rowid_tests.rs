@@ -27,6 +27,8 @@ fn write_catalog(path: &std::path::Path, statements: &[&str]) -> DataFusionResul
     let conn = duckdb::Connection::open_in_memory().map_err(box_err)?;
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", []).map_err(box_err)?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])
+        .map_err(box_err)?;
     conn.execute(&format!("ATTACH 'ducklake:{}' AS c;", path.display()), [])
         .map_err(box_err)?;
     for s in statements {

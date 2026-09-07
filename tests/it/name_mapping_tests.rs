@@ -38,6 +38,7 @@ fn create_name_mapping_catalog(
     let conn = duckdb::Connection::open_in_memory()?;
     conn.execute("INSTALL ducklake", [])?;
     conn.execute("LOAD ducklake", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     conn.execute("INSTALL parquet", [])?;
     conn.execute(
         &format!(
@@ -261,6 +262,7 @@ async fn add_data_files_accepts_duckdb_numeric_hive_literals() -> anyhow::Result
     let conn = duckdb::Connection::open_in_memory()?;
     conn.execute("INSTALL ducklake", [])?;
     conn.execute("LOAD ducklake", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     conn.execute(
         &format!(
             "ATTACH 'ducklake:{}' AS lake \

@@ -24,6 +24,7 @@ fn create_official_default_catalog(path: &Path) -> Result<Vec<(i32, i32)>> {
     let conn = duckdb::Connection::open_in_memory()?;
     ensure_ducklake_installed();
     conn.execute("LOAD ducklake", [])?;
+    conn.execute("SET ducklake_default_data_inlining_row_limit = 0;", [])?;
     conn.execute(
         &format!("ATTACH 'ducklake:{}' AS official", path.display()),
         [],
