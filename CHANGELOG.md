@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / rewrite paths explicitly (#130).
 
 ### Changed
-- Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining.
+- Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining (#273).
 
 - Files carrying a live delete file are now pruned by their statistics, matching official
   DuckLake; previously they were kept regardless of the predicate (#293).
@@ -75,7 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
 
 ### Fixed
-- Read legacy global schema-version ledgers without assuming per-table provenance.
+- Read legacy global schema-version ledgers without assuming per-table provenance (#273).
 
 - Fix DuckDB compaction skipping eligible data files and retain historical row visibility (#273).
 - Invalid write-only catalog settings no longer block table reads; they fail when a write or

@@ -26,7 +26,10 @@ async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
 
     // Create a test table with some data (local filesystem)
     conn.execute(
-        &format!("ATTACH 'ducklake:{}' AS test_catalog;", catalog_path),
+        &format!(
+            "ATTACH 'ducklake:{}' AS test_catalog (DATA_INLINING_ROW_LIMIT 0);",
+            catalog_path
+        ),
         [],
     )?;
 
@@ -145,7 +148,7 @@ async fn create_s3_test_catalog(
     eprintln!("Attaching catalog with DATA_PATH: {}", s3_data_path);
 
     let attach_sql = format!(
-        "ATTACH 'ducklake:{}' AS test_catalog (DATA_PATH '{}');",
+        "ATTACH 'ducklake:{}' AS test_catalog (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0);",
         catalog_path, s3_data_path
     );
 
@@ -260,6 +263,10 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
         "ducklake-data/",
     )
     .await?;
+    assert_parquet_data_files(
+        &catalog_path_str,
+        &[("inventory", 1, 4), ("products", 1, 5)],
+    )?;
     eprintln!("Test data written to MinIO");
 
     // Configure S3 client for DataFusion
@@ -396,6 +403,7 @@ async fn test_local_filesystem_with_s3_style_paths() -> anyhow::Result<()> {
     // Generate test data locally
     eprintln!("Generating local test data...");
     create_local_test_catalog(&catalog_path_str).await?;
+    assert_parquet_data_files(&catalog_path_str, &[("products", 1, 5)])?;
 
     // Create session context
     let ctx = SessionContext::new();
@@ -421,5 +429,33 @@ async fn test_local_filesystem_with_s3_style_paths() -> anyhow::Result<()> {
 
     eprintln!("Local filesystem test passed");
 
+    Ok(())
+}
+
+fn assert_parquet_data_files(
+    catalog_path: &str,
+    expected: &[(&str, i64, i64)],
+) -> anyhow::Result<()> {
+    let connection = duckdb::Connection::open(catalog_path)?;
+    let mut statement = connection.prepare(
+        "SELECT t.table_name, COUNT(*), SUM(f.record_count)::BIGINT
+         FROM ducklake_data_file f JOIN ducklake_table t ON t.table_id = f.table_id
+         WHERE f.end_snapshot IS NULL AND t.end_snapshot IS NULL
+         GROUP BY t.table_name ORDER BY t.table_name",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected = expected
+        .iter()
+        .map(|(name, files, rows)| (name.to_string(), *files, *rows))
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
     Ok(())
 }
