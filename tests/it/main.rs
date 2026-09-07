@@ -23,6 +23,7 @@ mod cdc_rowid_tests;
 mod column_defaults_tests;
 mod column_stats_tests;
 mod common;
+mod compaction_duckdb_tests;
 mod compaction_postgres_tests;
 mod compaction_sqlite_tests;
 mod concurrent_staged_upload_tests;

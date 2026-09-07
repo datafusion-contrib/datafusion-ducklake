@@ -83,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fix DuckDB compaction skipping eligible data files and retain historical row visibility (#273).
 - Invalid write-only catalog settings no longer block table reads; they fail when a write or
   maintenance operation is planned (#271).
 - Legacy two-column `ducklake_metadata` tables migrate both scope columns losslessly (#271).

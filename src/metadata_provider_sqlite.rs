@@ -1,6 +1,7 @@
 //! SQLite metadata provider for DuckLake catalogs.
 
 use crate::Result;
+use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
@@ -897,12 +898,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 "NULL"
             };
             let schema_version_expr = if caps.schema_versions {
-                "(SELECT sv.schema_version
-                  FROM ducklake_schema_versions sv
-                  WHERE sv.table_id = data.table_id
-                    AND sv.begin_snapshot <= data.begin_snapshot
-                  ORDER BY sv.begin_snapshot DESC
-                  LIMIT 1)"
+                SQL_FILE_SCHEMA_VERSION
             } else {
                 "NULL"
             };
@@ -1111,12 +1107,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 "NULL"
             };
             let schema_version_expr = if caps.schema_versions {
-                "(SELECT sv.schema_version
-                  FROM ducklake_schema_versions sv
-                  WHERE sv.table_id = data.table_id
-                    AND sv.begin_snapshot <= data.begin_snapshot
-                  ORDER BY sv.begin_snapshot DESC
-                  LIMIT 1)"
+                SQL_FILE_SCHEMA_VERSION
             } else {
                 "NULL"
             };

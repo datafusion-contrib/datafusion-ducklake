@@ -1,4 +1,5 @@
 use crate::DuckLakeError;
+use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedDelete, DuckLakeNameMapping,
@@ -335,9 +336,11 @@ fn query_data_file_page(
     after_data_file_id: i64,
     limit: i64,
     filters: &[RenderedColumnFilter],
+    capabilities: SchemaCapabilities,
 ) -> Result<Vec<DuckLakeTableFile>, duckdb::Error> {
     let base = data_files_sql_filtered(table_id, filters)
         .unwrap_or_else(|| SQL_GET_DATA_FILES.to_string());
+    let base = file_provenance_sql(&base, capabilities);
     // The statistics conditions sit inside the query, ahead of the LIMIT, and
     // the keyset ordering is untouched. Filtering the page after fetching it
     // would break the cursor `FileMetadataPages` drives: a page whose
@@ -393,9 +396,9 @@ fn query_data_file_page(
                     delete_file,
                     row_id_start: row.get(6)?,
                     snapshot_id: Some(snapshot_id),
-                    begin_snapshot: None,
-                    schema_version: None,
-                    partial_max: None,
+                    begin_snapshot: row.get(16)?,
+                    schema_version: row.get(17)?,
+                    partial_max: row.get(18)?,
                     max_row_count: row.get(7)?,
                     delete_count,
                     partition_id: None,
@@ -562,6 +565,8 @@ struct SchemaCapabilities {
     column_default_value_type: bool,
     /// `ducklake_column.default_value_dialect` exists.
     column_default_value_dialect: bool,
+    /// The per-table schema-version ledger exists.
+    schema_versions: bool,
 }
 
 impl SchemaCapabilities {
@@ -574,6 +579,7 @@ impl SchemaCapabilities {
             && self.column_default_value
             && self.column_default_value_type
             && self.column_default_value_dialect
+            && self.schema_versions
     }
 }
 
@@ -721,7 +727,8 @@ impl DuckdbMetadataProvider {
             column_default_value,
             column_default_value_type,
             column_default_value_dialect,
-        ): (bool, bool, bool, bool, bool, bool, bool, bool) = conn.query_row(
+            schema_versions,
+        ): (bool, bool, bool, bool, bool, bool, bool, bool, bool) = conn.query_row(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
@@ -738,7 +745,9 @@ impl DuckdbMetadataProvider {
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
                 WHERE name = 'default_value_type') > 0,
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_column')
-                WHERE name = 'default_value_dialect') > 0",
+                WHERE name = 'default_value_dialect') > 0,
+               (SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_name = 'ducklake_schema_versions') > 0",
             [],
             |row| {
                 Ok((
@@ -750,6 +759,7 @@ impl DuckdbMetadataProvider {
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )?;
@@ -762,6 +772,7 @@ impl DuckdbMetadataProvider {
             column_default_value,
             column_default_value_type,
             column_default_value_dialect,
+            schema_versions,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -1024,7 +1035,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
         snapshot_id: i64,
     ) -> crate::Result<Vec<DuckLakeTableFile>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_GET_DATA_FILES)?;
+        let sql = file_provenance_sql(SQL_GET_DATA_FILES, self.schema_capabilities(&conn)?);
+        let mut stmt = conn.prepare(&sql)?;
 
         let files = stmt
             .query_map(
@@ -1069,9 +1081,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
                         delete_file,
                         row_id_start,
                         snapshot_id: Some(snapshot_id),
-                        begin_snapshot: None,
-                        schema_version: None,
-                        partial_max: None,
+                        begin_snapshot: row.get(16)?,
+                        schema_version: row.get(17)?,
+                        partial_max: row.get(18)?,
                         max_row_count: record_count,
                         delete_count,
                         partition_id: None,
@@ -1277,6 +1289,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let rendered = filter
             .and_then(|filter| filter.render(&DuckdbStatsDialect))
             .unwrap_or_default();
+        let capabilities = self.schema_capabilities(&conn)?;
         let files = match query_data_file_page(
             &conn,
             table_id,
@@ -1284,6 +1297,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             after_data_file_id,
             limit,
             &rendered,
+            capabilities,
         ) {
             Ok(files) => files,
             // The filter is advisory, so a catalog the narrowed query cannot run
@@ -1302,7 +1316,15 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     table_id,
                     "statistics-filtered file listing failed; listing every file"
                 );
-                query_data_file_page(&conn, table_id, snapshot_id, after_data_file_id, limit, &[])?
+                query_data_file_page(
+                    &conn,
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                    &[],
+                    capabilities,
+                )?
             },
             Err(error) => return Err(error.into()),
         };
@@ -1788,7 +1810,8 @@ impl MetadataProvider for DuckdbMetadataProvider {
 
     fn list_all_files(&self, snapshot_id: i64) -> crate::Result<Vec<FileWithTable>> {
         let conn = self.connection();
-        let mut stmt = conn.prepare(SQL_LIST_ALL_FILES)?;
+        let sql = file_provenance_sql(SQL_LIST_ALL_FILES, self.schema_capabilities(&conn)?);
+        let mut stmt = conn.prepare(&sql)?;
 
         let files = stmt
             .query_map(
@@ -1847,9 +1870,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
                             delete_file,
                             row_id_start: None,
                             snapshot_id: None,
-                            begin_snapshot: None,
-                            schema_version: None,
-                            partial_max: None,
+                            begin_snapshot: row.get(15)?,
+                            schema_version: row.get(16)?,
+                            partial_max: row.get(17)?,
                             max_row_count,
                             delete_count: None,
                             partition_id: None,
@@ -2006,6 +2029,24 @@ fn parse_partial_file_info_max(info: &str) -> Option<i64> {
         .and_then(|snap| snap.trim().parse::<i64>().ok())
 }
 
+fn file_provenance_sql(sql: &str, capabilities: SchemaCapabilities) -> String {
+    let schema_version = if capabilities.schema_versions {
+        SQL_FILE_SCHEMA_VERSION
+    } else {
+        "NULL"
+    };
+    let partial_max = if capabilities.data_file_partial_max {
+        "data.partial_max"
+    } else {
+        "NULL"
+    };
+    sql.replacen(
+        "\n    FROM ",
+        &format!(",\n        data.begin_snapshot,\n        {schema_version},\n        {partial_max}\n    FROM "),
+        1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2031,6 +2072,18 @@ mod tests {
     use duckdb::{Connection, params};
     use std::collections::BTreeSet;
     use tempfile::TempDir;
+
+    const LEGACY_CAPABILITIES: SchemaCapabilities = SchemaCapabilities {
+        data_file_partial_max: false,
+        delete_file_partial_max: false,
+        inlined_data_tables: false,
+        views: false,
+        column_initial_default: false,
+        column_default_value: false,
+        column_default_value_type: false,
+        column_default_value_dialect: false,
+        schema_versions: false,
+    };
 
     /// Render `filters` for the DuckDB dialect and splice them into the
     /// data-file listing, for a single Int32 column with the given `column_id`.
@@ -2287,7 +2340,7 @@ mod tests {
             .render(&DuckdbStatsDialect)
             .expect("filter renders for DuckDB");
 
-        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered)
+        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered, LEGACY_CAPABILITIES)
             .expect_err("the CTE cannot read a table that is not there");
         assert!(
             is_missing_statistics_table(&error),
@@ -2304,7 +2357,7 @@ mod tests {
              statistics table: {error}"
         );
 
-        let files = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &[])
+        let files = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &[], LEGACY_CAPABILITIES)
             .expect("the unfiltered retry still lists every file");
         assert_eq!(files.len(), 1);
     }
@@ -2362,6 +2415,7 @@ mod tests {
             column_default_value: false,
             column_default_value_type: false,
             column_default_value_dialect: false,
+            schema_versions: false,
         };
 
         let table_defaults = conn.query_row(
@@ -2424,6 +2478,7 @@ mod tests {
 
     /// The DDL a paged listing reads, minus every table it does not touch.
     const PAGE_LISTING_SCHEMA: &str = "
+        CREATE TABLE ducklake_column (column_id BIGINT);
         CREATE TABLE ducklake_data_file (
             data_file_id BIGINT, table_id BIGINT, begin_snapshot BIGINT,
             end_snapshot BIGINT, path VARCHAR, path_is_relative BOOLEAN,
@@ -2447,6 +2502,127 @@ mod tests {
     /// The provider opens read-only, so the writing connection is closed before
     /// it is constructed. The `TempDir` comes back with it because dropping it
     /// deletes the catalog.
+    #[test]
+    fn file_provenance_tracks_each_files_origin_schema() {
+        let (_dir, provider) = provider_over(
+            "CREATE TABLE ducklake_schema_versions (table_id BIGINT, begin_snapshot BIGINT, schema_version BIGINT);
+             CREATE TABLE ducklake_schema (schema_id BIGINT, schema_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT);
+             CREATE TABLE ducklake_table (table_id BIGINT, schema_id BIGINT, table_name VARCHAR, begin_snapshot BIGINT, end_snapshot BIGINT);
+             INSERT INTO ducklake_schema VALUES (1, 'main', 1, NULL);
+             INSERT INTO ducklake_table VALUES (3, 1, 'events', 1, NULL);
+             INSERT INTO ducklake_schema_versions VALUES (3, 1, 7), (3, 4, 9), (3, 8, 11), (99, 1, 31);
+             ALTER TABLE ducklake_data_file ADD COLUMN partial_max BIGINT;
+             INSERT INTO ducklake_data_file
+                 (data_file_id, table_id, begin_snapshot, path, path_is_relative,
+                  file_size_bytes, row_id_start, record_count, mapping_id, partial_max)
+             VALUES (10, 3, 2, 'ten.parquet', true, 100, 0, 2, 55, 3),
+                    (20, 3, 5, 'twenty.parquet', true, 120, 2, 3, 66, 6);
+             INSERT INTO ducklake_file_column_stats
+                 (data_file_id, table_id, column_id, column_size_bytes, value_count,
+                  null_count, min_value, max_value, contains_nan)
+             VALUES (10, 3, 7, 8, 2, 0, '1', '2', false),
+                    (20, 3, 7, 12, 3, 0, '3', '5', false);",
+        );
+        let files = provider.get_table_files_for_select(3, 9).unwrap();
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| (
+                    file.data_file_id,
+                    file.file.mapping_id,
+                    file.row_id_start,
+                    file.max_row_count,
+                    file.begin_snapshot,
+                    file.schema_version,
+                    file.partial_max
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (10, Some(55), Some(0), Some(2), Some(2), Some(7), Some(3)),
+                (20, Some(66), Some(2), Some(3), Some(5), Some(9), Some(6))
+            ]
+        );
+        let first = provider
+            .get_table_file_metadata_page(3, 9, None, 1)
+            .unwrap();
+        let second = provider
+            .get_table_file_metadata_page(3, 9, Some(10), 1)
+            .unwrap();
+        assert_eq!(
+            (
+                first[0].file.begin_snapshot,
+                first[0].file.schema_version,
+                first[0].file.partial_max
+            ),
+            (Some(2), Some(7), Some(3))
+        );
+        assert_eq!(
+            (
+                second[0].file.begin_snapshot,
+                second[0].file.schema_version,
+                second[0].file.partial_max
+            ),
+            (Some(5), Some(9), Some(6))
+        );
+        let filtered = provider
+            .get_table_file_metadata_page_filtered(
+                3,
+                9,
+                None,
+                10,
+                Some(&int32_filter(Operator::Gt, 2)),
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            (
+                filtered[0].file.data_file_id,
+                filtered[0].file.begin_snapshot,
+                filtered[0].file.schema_version,
+                filtered[0].file.partial_max
+            ),
+            (20, Some(5), Some(9), Some(6))
+        );
+        let all = provider.list_all_files(9).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|entry| (
+                    entry.file.data_file_id,
+                    entry.file.begin_snapshot,
+                    entry.file.schema_version,
+                    entry.file.partial_max
+                ))
+                .collect::<Vec<_>>(),
+            vec![(10, Some(2), Some(7), Some(3)), (20, Some(5), Some(9), Some(6))]
+        );
+        let historical = provider.get_table_files_for_select(3, 3).unwrap();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(
+            (historical[0].begin_snapshot, historical[0].schema_version),
+            (Some(2), Some(7))
+        );
+    }
+
+    #[test]
+    fn legacy_file_provenance_keeps_unknown_schema_version() {
+        let (_dir, provider) = provider_over(
+            "            INSERT INTO ducklake_data_file (data_file_id, table_id, begin_snapshot, path, path_is_relative, file_size_bytes, record_count)            VALUES (10, 3, 2, 'ten.parquet', true, 100, 2);",
+        );
+        let files = provider.get_table_files_for_select(3, 3).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            (files[0].begin_snapshot, files[0].schema_version),
+            (Some(2), None)
+        );
+        let page = provider
+            .get_table_file_metadata_page(3, 3, None, 1)
+            .unwrap();
+        assert_eq!(
+            (page[0].file.begin_snapshot, page[0].file.schema_version),
+            (Some(2), None)
+        );
+    }
+
     fn provider_over(setup: &str) -> (TempDir, DuckdbMetadataProvider) {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("catalog.duckdb");
@@ -2595,7 +2771,7 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory DuckDB");
         conn.execute_batch(PAGE_LISTING_SCHEMA)
             .expect("catalog schema");
-        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered)
+        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered, LEGACY_CAPABILITIES)
             .expect_err("DuckDB cannot parse the alias");
         // The point of the widening: the old guard would have re-raised this.
         assert!(
