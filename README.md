@@ -313,8 +313,8 @@ current limitations, see **[COMPATIBILITY.md](COMPATIBILITY.md)**.
 
 A few highlights worth knowing up front:
 
-- Reads and writes work on DuckDB, SQLite, PostgreSQL, and MySQL. PostgreSQL uses the
-  experimental multi-catalog write layout.
+- Reads and writes work on DuckDB, SQLite, PostgreSQL, and MySQL. PostgreSQL supports the standard
+  single-catalog layout, recommended by default, and an experimental multi-catalog layout.
 - Object stores: local filesystem and S3-compatible (S3, MinIO).
 - Snapshots can be selected through `DuckLakeCatalog` (by id or timestamp) or per query with
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
