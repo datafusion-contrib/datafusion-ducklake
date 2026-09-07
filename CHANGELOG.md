@@ -37,8 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING**: The `duckdb` dependency requires 1.10505.0 (DuckDB 1.5.5); downstreams pinned to
   1.4.x must move up. Existing catalogs need no migration (#270).
-- A DuckDB-metadata catalog created through `write-duckdb` now uses DuckDB 1.5 storage, which
-  earlier DuckDB releases cannot open (#270).
 - Files carrying a live delete file are now pruned by their statistics, matching official
   DuckLake; previously they were kept regardless of the predicate (#293).
 - **BREAKING**: `DuckLakeWriteOptions` is non-exhaustive and gains `parquet_version`,
