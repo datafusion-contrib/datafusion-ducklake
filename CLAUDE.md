@@ -259,7 +259,7 @@ the postgres/mysql provider and multicatalog tests require Docker (`testcontaine
 The integration tests are a **single binary**, `tests/it/main.rs`, with one module per
 file rather than one `tests/*.rs` target each (`autotests = false` plus an explicit
 `[[test]] name = "it"`). Cargo links one binary per test target, and with
-`duckdb-bundled` on by default each statically linked its own copy of DuckDB, so ~50
+`duckdb-bundled` enabled each statically linked its own copy of DuckDB, so ~50
 targets meant several GB of linker output per build. Practical consequences: a test's
 name now carries its module as a prefix (`write_tests::test_append_semantics`), so
 substring filters still work; and targeting one former file is
@@ -278,7 +278,8 @@ Representative groups:
 
 Run tests with:
 ```bash
-cargo test                    # Default features; postgres/mysql/multicatalog tests need Docker
+cargo test --features duckdb-bundled   # Most fixtures are built by DuckDB, so they need this
+                                       # postgres/mysql/multicatalog tests also need Docker
 cargo test delete_filter      # Delete file tests only
 cargo test concurrent         # Concurrency tests only
 cargo test --ignored          # Performance benchmarks

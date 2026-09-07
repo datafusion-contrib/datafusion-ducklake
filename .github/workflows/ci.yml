@@ -233,9 +233,14 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/duckdb" --version
 
+      # `duckdb-bundled` is named explicitly and is load-bearing: almost every
+      # fixture is built by driving the DuckLake extension through the bundled
+      # engine, and `tests/it/common` is `#![cfg(feature = "metadata-duckdb")]`.
+      # Drop it and those modules cfg out, so the suite silently shrinks instead
+      # of failing. It stopped being a default feature, so it has to be listed.
       - name: Run tests (macOS; Linux is covered by test-full)
         if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
-        run: cargo test --features "skip-tests-with-docker write-sqlite"
+        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite"
 
       - name: Check documentation
         if: steps.changes.outputs.code == 'true'
@@ -373,6 +378,14 @@ jobs:
             cargo check --no-default-features --features "$features"
             echo "::endgroup::"
           done
+
+      # The loop above checks the library only, and every other job names its
+      # features, so nothing else compiles the test targets on bare defaults.
+      # That is how two unit tests calling a `write`-gated method sat broken:
+      # `cargo check --tests` failed on default features and no job ran it.
+      - name: Check test targets on default features
+        if: steps.changes.outputs.code == 'true'
+        run: cargo check --tests
 
 
   test-full:

@@ -71,7 +71,7 @@ aws-credential-types = "1.2"
 sqllogictest = "0.23"
 
 [features]
-default = ["metadata-duckdb", "duckdb-bundled"]
+default = ["metadata-sqlite"]
 
 # Allow skipping tests that use docker (in CI, macos doesn't support docker).
 skip-tests-with-docker = []

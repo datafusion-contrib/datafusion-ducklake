@@ -21,7 +21,9 @@ path = "src/bin/generate_tpcds.rs"
 # DataFusion-DuckLake: Uncomment ONE of the following options
 
 # Option 1: Local development (default)
-datafusion-ducklake = { path = "..", features = ["metadata-duckdb"] }
+# `duckdb-bundled` is not a default feature and this benchmark links DuckDB
+# statically, so ask for it here rather than relying on feature unification.
+datafusion-ducklake = { path = "..", features = ["duckdb-bundled"] }
 
 # Option 2: Specific git commit
 # datafusion-ducklake = { git = "https://github.com/hotdata-dev/datafusion-ducklake", rev = "COMMIT_HASH", features = ["metadata-duckdb"] }

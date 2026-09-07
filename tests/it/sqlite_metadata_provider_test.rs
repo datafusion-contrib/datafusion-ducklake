@@ -18,6 +18,8 @@
 //! - Concurrent access and thread safety
 //! - Error handling and edge cases
 
+// Only the DuckDB-sourced fixtures below need these.
+#[cfg(feature = "metadata-duckdb")]
 use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -26,14 +28,16 @@ use datafusion::logical_expr::Operator;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, Column as PhysColumn, lit};
 use datafusion::prelude::*;
+#[cfg(feature = "metadata-duckdb")]
+use datafusion_ducklake::DuckdbMetadataProvider;
 use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
 use datafusion_ducklake::stats_filter::{StatsFilter, lower_predicate};
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckdbMetadataProvider, SqliteMetadataProvider,
-    metadata_provider::MetadataProvider,
+    DuckLakeCatalog, SqliteMetadataProvider, metadata_provider::MetadataProvider,
 };
 use sqlx::SqlitePool;
 use std::sync::Arc;
+#[cfg(feature = "metadata-duckdb")]
 use tempfile::TempDir;
 
 /// Initialize DuckLake catalog schema in SQLite (for tests only)
@@ -395,6 +399,7 @@ async fn populate_test_data(provider: &SqliteMetadataProvider) -> anyhow::Result
 }
 
 /// Helper to populate SQLite with metadata from a DuckDB-created catalog
+#[cfg(feature = "metadata-duckdb")]
 async fn populate_from_duckdb_catalog(
     provider: &SqliteMetadataProvider,
 ) -> anyhow::Result<(String, TempDir)> {
@@ -1034,6 +1039,7 @@ async fn test_datafusion_integration() {
     assert!(!results.is_empty(), "Should have schema results");
 }
 
+#[cfg(feature = "metadata-duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_query_real_parquet_files() {
     let provider = create_sqlite_provider().await.unwrap();
@@ -1099,6 +1105,7 @@ async fn test_query_real_parquet_files() {
     assert_eq!(email_col.value(1), "bob@example.com");
 }
 
+#[cfg(feature = "metadata-duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_query_with_filter() {
     let provider = create_sqlite_provider().await.unwrap();
