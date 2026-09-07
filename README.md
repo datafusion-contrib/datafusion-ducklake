@@ -33,9 +33,19 @@ Add the crate:
 cargo add datafusion-ducklake
 ```
 
-The default build includes the statically bundled DuckDB catalog backend. Applications configure
-their object store implementation directly. Other catalog backends and write support are opt‑in
-via feature flags. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
+The default build includes the SQLite catalog backend. Every other catalog backend, and write
+support for all of them, is opt-in via feature flags; applications configure their object store
+implementation directly. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full matrix.
+
+The DuckDB backend statically compiles DuckDB, which is by far the slowest dependency in this
+crate to build, so it is not a default:
+
+```toml
+# Cargo.toml — read (and write) DuckDB-backed catalogs
+[dependencies.datafusion-ducklake]
+version = "0.7"
+features = ["duckdb-bundled"]   # add "write-duckdb" to write them
+```
 
 ```toml
 # Cargo.toml — read PostgreSQL catalogs
@@ -327,6 +337,21 @@ A few highlights worth knowing up front:
   the `COUNT(*)` undercount caveat and how to avoid it.
 
 ---
+
+## Running the tests
+
+The test fixtures are built by driving the real DuckLake extension through a bundled DuckDB, and
+those modules are gated on `metadata-duckdb`. Since that is not a default feature, a bare
+`cargo test` compiles only a small fraction of the suite:
+
+```bash
+cargo test --features duckdb-bundled            # the suite as CI runs it, minus Docker
+cargo test --features "duckdb-bundled write-sqlite metadata-postgres metadata-mysql"
+```
+
+The PostgreSQL, MySQL, and multi-catalog suites need Docker (via `testcontainers`). Note that
+`--all-features` enables `skip-tests-with-docker`, which *ignores* those suites rather than
+running them, so a green `--all-features` run is not evidence that they passed.
 
 ## Project status
 

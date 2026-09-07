@@ -4687,8 +4687,10 @@ mod tests {
     };
     use crate::partition::{PartitionSpecColumn, PartitionTransform};
     use crate::types::build_arrow_schema;
+    #[cfg(feature = "write")]
     use datafusion::datasource::physical_plan::FileScanConfig;
     use datafusion::prelude::{SessionContext, col, lit};
+    #[cfg(feature = "write")]
     use object_store::ObjectStore;
     use rstest::rstest;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6654,6 +6656,8 @@ mod tests {
     /// `DataSourceExec`/`FileScanConfig` scan plan, exactly as a caller of
     /// `create_parquet_source` does, and downcasts down to the `ParquetSource`
     /// to inspect the attached factory.
+    // Reads the table's object-store URL, which is only compiled with `write`.
+    #[cfg(feature = "write")]
     #[tokio::test]
     async fn ducklake_scan_attaches_the_cached_parquet_reader_factory() -> Result<()> {
         let table = fixed_table(vec![], None)?;
@@ -6696,6 +6700,8 @@ mod tests {
     /// `ParquetSource` reads through the same `RuntimeEnv` file-metadata cache
     /// the cold run just populated (#1323), so it performs zero range reads
     /// whose end lands on the file's length.
+    // Reads the table's object-store URL, which is only compiled with `write`.
+    #[cfg(feature = "write")]
     #[tokio::test]
     async fn ducklake_parquet_source_reuses_cached_footer_metadata_across_scans() -> Result<()> {
         let table = fixed_table(vec![], None)?;

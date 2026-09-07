@@ -17,13 +17,14 @@
 //! ```no_run
 //! # async fn example() -> datafusion_ducklake::Result<()> {
 //! use datafusion::prelude::*;
-//! use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
+//! use datafusion_ducklake::{DuckLakeCatalog, SqliteMetadataProvider};
 //!
 //! // Create a DataFusion session context
 //! let ctx = SessionContext::new();
 //!
-//! // Create a DuckDB metadata provider
-//! let provider = DuckdbMetadataProvider::new("path/to/catalog.ducklake")?;
+//! // Create a metadata provider for the catalog database. Each backend has its
+//! // own provider behind its own feature; `metadata-sqlite` is on by default.
+//! let provider = SqliteMetadataProvider::new("sqlite:path/to/catalog.sqlite").await?;
 //!
 //! // Register a DuckLake catalog with the provider
 //! let catalog = DuckLakeCatalog::new(provider)?;

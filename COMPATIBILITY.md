@@ -17,8 +17,8 @@ PostgreSQL path uses the experimental multi-catalog layout described below.
 
 | Backend    | Read | Write | Multi-catalog | Feature flags                                          |
 |------------|:----:|:-----:|:-------------:|--------------------------------------------------------|
-| DuckDB     |  ✅  |  ✅   |      ❌       | `metadata-duckdb` (default), `write-duckdb`            |
-| SQLite     |  ✅  |  ✅   |      ❌       | `metadata-sqlite`, `write-sqlite`                      |
+| DuckDB     |  ✅  |  ✅   |      ❌       | `metadata-duckdb` (+ `duckdb-bundled`), `write-duckdb` |
+| SQLite     |  ✅  |  ✅   |      ❌       | `metadata-sqlite` (default), `write-sqlite`            |
 | PostgreSQL |  ✅  |  ✅   |      ✅       | `metadata-postgres`, `write-postgres`, `multicatalog-postgres` |
 | MySQL      |  ✅  |  ✅   |      ❌       | `metadata-mysql`, `write-mysql`                        |
 
@@ -78,9 +78,9 @@ AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before cre
 
 | Feature                  | Description                                                              | Default |
 |--------------------------|--------------------------------------------------------------------------|:-------:|
-| `metadata-duckdb`        | DuckDB catalog read backend                                              |   ✅    |
-| `duckdb-bundled`         | Statically compile & bundle DuckDB (disable for dynamic linking)         |   ✅    |
-| `metadata-sqlite`        | SQLite catalog read backend                                              |         |
+| `metadata-duckdb`        | DuckDB catalog read backend                                              |         |
+| `duckdb-bundled`         | Statically compile & bundle DuckDB (disable for dynamic linking)         |         |
+| `metadata-sqlite`        | SQLite catalog read backend                                              |   ✅    |
 | `metadata-postgres`      | PostgreSQL catalog read backend                                          |         |
 | `metadata-mysql`         | MySQL catalog read backend                                               |         |
 | `write`                  | Base write support (INSERT, CTAS, maintenance API); needs a write backend|         |

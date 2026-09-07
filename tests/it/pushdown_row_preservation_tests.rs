@@ -587,31 +587,6 @@ impl CatalogStore {
         }
     }
 
-    /// Bring a catalog written by the DuckLake extension that ships with
-    /// `duckdb` 1.4.1 — the version this fixture is written by — up to the shape
-    /// a released DuckDB 1.5.x writes.
-    ///
-    /// Only `DuckdbMetadataProvider` probes for the newer catalog columns. The
-    /// three SQL providers select `ducklake_column.default_value_type` /
-    /// `default_value_dialect` and `ducklake_schema_versions.table_id`
-    /// unconditionally, so on the older shape they fail the query outright.
-    /// `official_pushdown_parity_tests` and `compaction_sqlite_tests` top up the
-    /// same two tables for the same reason. Nothing here touches
-    /// `ducklake_data_file` or `ducklake_file_column_stats`: every statistic the
-    /// sweep reads is exactly as official wrote it.
-    async fn migrate(&self) {
-        for statement in [
-            "ALTER TABLE ducklake_column ADD COLUMN default_value_type VARCHAR(255)",
-            "ALTER TABLE ducklake_column ADD COLUMN default_value_dialect VARCHAR(255)",
-            "ALTER TABLE ducklake_schema_versions ADD COLUMN table_id BIGINT",
-            "UPDATE ducklake_schema_versions SET table_id =
-             (SELECT table_id FROM ducklake_table WHERE table_name = 't')",
-        ] {
-            // A column a newer extension already wrote is not an error here.
-            let _ = self.try_exec(statement).await;
-        }
-    }
-
     /// `contains_nan` is a real boolean on DuckDB and PostgreSQL and an integer
     /// on SQLite and MySQL.
     fn bool_literal(&self, value: bool) -> &'static str {
@@ -1655,9 +1630,7 @@ async fn sqlite_fixture(temp: &TempDir) -> CatalogStore {
         &data_path,
     )
     .expect("sqlite fixture builds");
-    let store = CatalogStore::Sqlite(format!("sqlite:{}", catalog_path.display()));
-    store.migrate().await;
-    store
+    CatalogStore::Sqlite(format!("sqlite:{}", catalog_path.display()))
 }
 
 /// SQLite carries the bulk: no Docker, and the dialect with the least type
@@ -1696,7 +1669,6 @@ async fn pushdown_row_preservation_duckdb() {
     )
     .expect("duckdb fixture builds");
     let store = CatalogStore::DuckDb(catalog_path);
-    store.migrate().await;
     sweep(&store, false).await;
 }
 
@@ -1726,7 +1698,6 @@ async fn pushdown_row_preservation_postgres() {
     .expect("postgres fixture builds");
 
     let store = CatalogStore::Postgres(url);
-    store.migrate().await;
     sweep(&store, false).await;
 }
 
@@ -1797,6 +1768,5 @@ async fn pushdown_row_preservation_mysql() {
     transport_catalog_to_mysql(&catalog_path, &dsn).expect("catalog transports to mysql");
 
     let store = CatalogStore::MySql(url);
-    store.migrate().await;
     sweep(&store, false).await;
 }

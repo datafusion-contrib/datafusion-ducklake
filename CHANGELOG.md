@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining (#273).
+- **BREAKING**: Default features are now `metadata-sqlite` alone, so a default build no longer
+  compiles DuckDB; add `features = ["duckdb-bundled"]` for the DuckDB provider and writer (#304).
 
 - Files carrying a live delete file are now pruned by their statistics, matching official
   DuckLake; previously they were kept regardless of the predicate (#293).
