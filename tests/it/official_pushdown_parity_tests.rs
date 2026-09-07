@@ -156,31 +156,6 @@ fn insert_fourth_file(
     with_official_ducklake(attach_target, extensions, data_path, &INSERTS[3..])
 }
 
-/// Bring a catalog written by the DuckLake extension that ships with `duckdb`
-/// 1.4.1 — the version this fixture is written by — up to the shape a released
-/// DuckDB 1.5.x writes.
-///
-/// Only `DuckdbMetadataProvider` probes for the newer catalog columns.
-/// `SqliteMetadataProvider`, `PostgresMetadataProvider` and
-/// `MySqlMetadataProvider` select `ducklake_column.default_value_type` /
-/// `default_value_dialect` and `ducklake_schema_versions.table_id`
-/// unconditionally, so on the older shape they fail the query outright rather
-/// than degrading. `compaction_sqlite_tests::migrate_pinned_duckdb_fixture`
-/// tops up the same two tables for the same reason.
-///
-/// Nothing here touches `ducklake_data_file` or `ducklake_file_column_stats`:
-/// every file and every statistic this test reads is exactly as official wrote
-/// it. `VARCHAR(255)` and `BIGINT` are accepted by all three dialects, and a
-/// statement that fails because the column is already there is discarded at the
-/// call site.
-const MIGRATE_PINNED_DUCKDB_CATALOG: [&str; 4] = [
-    "ALTER TABLE ducklake_column ADD COLUMN default_value_type VARCHAR(255)",
-    "ALTER TABLE ducklake_column ADD COLUMN default_value_dialect VARCHAR(255)",
-    "ALTER TABLE ducklake_schema_versions ADD COLUMN table_id BIGINT",
-    "UPDATE ducklake_schema_versions
-     SET table_id = (SELECT table_id FROM ducklake_table WHERE table_name = 'filter_pushdown')",
-];
-
 /// The row the official test prints for a `SELECT *` assertion.
 struct OfficialRow {
     v: i32,
@@ -668,12 +643,6 @@ async fn sqlite_catalog_matches_official_pushdown() {
     let url = format!("sqlite:{}", catalog_path.display());
 
     build_fixture(&target, &["sqlite"], &data_path).unwrap();
-    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
-    for statement in MIGRATE_PINNED_DUCKDB_CATALOG {
-        // A column a newer extension already wrote is not an error here.
-        sqlx::query(statement).execute(&pool).await.ok();
-    }
-    pool.close().await;
 
     let provider = Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
     assert_official_parity(
@@ -720,12 +689,6 @@ async fn postgres_catalog_matches_official_pushdown() {
     let data_path = temp.path().join("data");
 
     build_fixture(&target, &["postgres"], &data_path).unwrap();
-    let pool = sqlx::PgPool::connect(&url).await.unwrap();
-    for statement in MIGRATE_PINNED_DUCKDB_CATALOG {
-        // A column a newer extension already wrote is not an error here.
-        sqlx::query(statement).execute(&pool).await.ok();
-    }
-    pool.close().await;
 
     // No divergences, on any server version. A temporal comparison is made on
     // the encoded text rather than by casting, so it needs neither
@@ -750,8 +713,7 @@ async fn postgres_catalog_matches_official_pushdown() {
 /// "Unsupported operator type HASH_JOIN in UPDATE statement — only simple
 /// deletes are supported in the MySQL connector". The first `INSERT` into a
 /// MySQL-hosted DuckLake catalog succeeds; the second aborts at commit. That is
-/// upstream and on the write path, and reproduces on DuckDB 1.5.5 as well as on
-/// the bundled 1.4.1.
+/// upstream and on the write path, and reproduces on the bundled DuckDB 1.5.5.
 ///
 /// So official DuckLake writes the catalog where it can, into its own DuckDB
 /// format, and DuckDB copies the rows across unchanged. Every statistic the
@@ -791,17 +753,9 @@ fn transport_catalog_to_mysql(catalog_path: &Path, dsn: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// Top up a freshly transported catalog and open a provider on it. The
-/// transport replaces every table, so the migration has to be reapplied each
-/// time.
+/// Open a provider on a freshly transported catalog.
 #[cfg(feature = "metadata-mysql")]
 async fn open_mysql(url: &str) -> Arc<datafusion_ducklake::MySqlMetadataProvider> {
-    let pool = sqlx::MySqlPool::connect(url).await.unwrap();
-    for statement in MIGRATE_PINNED_DUCKDB_CATALOG {
-        // A column a newer extension already wrote is not an error here.
-        sqlx::query(statement).execute(&pool).await.ok();
-    }
-    pool.close().await;
     Arc::new(
         datafusion_ducklake::MySqlMetadataProvider::new(url)
             .await

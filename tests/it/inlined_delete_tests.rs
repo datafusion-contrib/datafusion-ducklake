@@ -126,9 +126,9 @@ mod duckdb_oracle {
                 .unwrap()
         };
 
-        // DuckDB 1.5 creates this table directly. The 1.4.1 library pinned by
-        // this crate emits a regular positional delete, so normalize only that
-        // metadata row into the current specification's equivalent encoding.
+        // The bundled DuckLake creates the inlined-delete table itself. Guard
+        // against an engine that emits a regular positional delete instead, by
+        // normalizing that one metadata row into the equivalent inlined encoding.
         let metadata = duckdb::Connection::open(&catalog_path).unwrap();
         let table_id: i64 = metadata
             .query_row(
