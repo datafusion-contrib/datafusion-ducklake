@@ -41,8 +41,8 @@ use crate::metadata_writer::{
     MultiTableCommit, SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite,
     WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    quote_snapshot_table, staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -967,6 +967,7 @@ async fn record_table_write_changes(
     table_name: &str,
     mode: WriteMode,
     has_deletes: bool,
+    inlined: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
     let row = sqlx::query(
@@ -991,7 +992,7 @@ async fn record_table_write_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    let mut replaced_existing_data: bool = sqlx::query_scalar(
+    let replaced_existing_data: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
             WHERE table_id = ? AND end_snapshot = ?
@@ -1001,7 +1002,8 @@ async fn record_table_write_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    if !replaced_existing_data {
+    let mut replaced_inlined = false;
+    if mode == WriteMode::Replace {
         // A Replace over inline-only prior data ends inline rows, not files.
         let inlined_tables: Vec<String> = sqlx::query_scalar(
             "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
@@ -1019,7 +1021,7 @@ async fn record_table_write_changes(
                 .fetch_one(&mut **tx)
                 .await?
             {
-                replaced_existing_data = true;
+                replaced_inlined = true;
                 break;
             }
         }
@@ -1040,11 +1042,11 @@ async fn record_table_write_changes(
     } else if altered {
         changes.push(format!("altered_table:{table_id}"));
     }
-    changes.push(table_write_changes(
+    changes.push(table_storage_changes(
         table_id,
-        mode,
-        has_deletes,
-        replaced_existing_data,
+        Some(inlined),
+        has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
+        replaced_inlined,
     ));
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }
@@ -1660,7 +1662,10 @@ async fn validate_staged_table(
     Ok(schema_id)
 }
 
-async fn has_live_data(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, table_id: i64) -> Result<bool> {
+async fn has_live_data(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+) -> Result<(bool, bool)> {
     let has_files: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM ducklake_data_file
@@ -1670,9 +1675,6 @@ async fn has_live_data(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, table_id: i6
     .bind(table_id)
     .fetch_one(&mut **tx)
     .await?;
-    if has_files {
-        return Ok(true);
-    }
     let inline_tables =
         sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
             .bind(table_id)
@@ -1687,10 +1689,10 @@ async fn has_live_data(tx: &mut sqlx::Transaction<'_, sqlx::MySql>, table_id: i6
         .fetch_one(&mut **tx)
         .await?;
         if has_rows {
-            return Ok(true);
+            return Ok((has_files, true));
         }
     }
-    Ok(false)
+    Ok((has_files, false))
 }
 
 async fn commit_staged_files(
@@ -2380,6 +2382,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
+                false,
                 commit_metadata,
             )
             .await?;
@@ -2540,6 +2543,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                false,
                 false,
                 commit_metadata,
             )
@@ -2705,6 +2709,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 !deletes.is_empty(),
+                false,
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
@@ -3387,6 +3392,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 table_name,
                 mode,
                 false,
+                true,
                 commit_metadata,
             )
             .await?;
@@ -3483,7 +3489,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     table_id: write.table_id,
                 });
             }
-            for (write, replaced_existing_data) in writes.iter().zip(had_live_data) {
+            for (write, (had_files, had_inlined_rows)) in writes.iter().zip(had_live_data) {
                 match &write.data {
                     StagedTableData::Files(files) => {
                         commit_staged_files(&mut tx, snapshot_id, write, files).await?;
@@ -3504,18 +3510,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?;
                 }
                 apply_staged_inlined_deletes(&mut tx, snapshot_id, write).await?;
-                let has_deletes =
-                    !write.positional_deletes.is_empty() || !write.inlined_deletes.is_empty();
-                let changes_made = if matches!(&write.data, StagedTableData::None) {
-                    format!("deleted_from_table:{}", write.table_id)
-                } else {
-                    table_write_changes(
-                        write.table_id,
-                        write.mode,
-                        has_deletes,
-                        replaced_existing_data,
-                    )
-                };
+                let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
                 record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata)
                     .await?;
             }
@@ -3951,6 +3946,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 schema_name,
                 table_name,
                 mode,
+                false,
                 false,
                 &SnapshotCommitMetadata::default(),
             )

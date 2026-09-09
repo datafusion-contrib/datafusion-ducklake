@@ -20,8 +20,8 @@ use crate::metadata_writer::{
     ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
     StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
     catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    catalog_columns_differ, staged_table_write_changes, table_storage_changes, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -367,12 +367,6 @@ CREATE TABLE IF NOT EXISTS ducklake_table_stats (
     file_size_bytes INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
-    table_id INTEGER NOT NULL,
-    table_name VARCHAR NOT NULL,
-    schema_version INTEGER NOT NULL
-);
-
 -- Per-file, per-column statistics (DuckLake spec zone maps). Powers file-level
 -- pruning: min/max are the DuckDB-canonical VARCHAR encoding of the bounds,
 -- value_count is the non-null count, null_count the null count. Column set
@@ -497,6 +491,13 @@ CREATE TABLE IF NOT EXISTS ducklake_sort_expression (
 );
 "#;
 
+const SQL_CREATE_INLINED_DATA_TABLES: &str =
+    "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+    table_id INTEGER,
+    table_name VARCHAR,
+    schema_version INTEGER
+);";
+
 /// SQLite-based metadata writer for DuckLake catalogs.
 #[derive(Debug, Clone)]
 pub struct SqliteMetadataWriter {
@@ -518,7 +519,11 @@ impl SqliteMetadataWriter {
         let filename = options.get_filename();
         let lock_path = (!filename.as_os_str().is_empty()
             && filename != std::path::Path::new(":memory:"))
-        .then(|| filename.with_extension("commit.lock"));
+        .then(|| {
+            let mut path = filename.as_os_str().to_os_string();
+            path.push(".commit.lock");
+            PathBuf::from(path)
+        });
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect(connection_string)
@@ -526,6 +531,9 @@ impl SqliteMetadataWriter {
 
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;
+        sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+            .execute(&pool)
+            .await?;
         Ok(Self {
             pool,
             lock_path,
@@ -1457,13 +1465,12 @@ async fn retire_prior_generation(
     Ok(())
 }
 
-/// Whether `snapshot_id` ended prior rows of the table — Parquet files or
-/// inlined rows — i.e. a Replace actually replaced existing data.
-async fn replace_ended_prior_rows(
+// The flags report retired Parquet files and inlined rows, respectively
+async fn replaced_storage(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
     snapshot_id: i64,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let replaced: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
@@ -1474,9 +1481,6 @@ async fn replace_ended_prior_rows(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    if replaced {
-        return Ok(true);
-    }
     for table_name in inlined_table_names(tx, table_id).await? {
         let sql = format!(
             "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot = ?)",
@@ -1487,10 +1491,10 @@ async fn replace_ended_prior_rows(
             .fetch_one(&mut **tx)
             .await?
         {
-            return Ok(true);
+            return Ok((replaced, true));
         }
     }
-    Ok(false)
+    Ok((replaced, false))
 }
 
 async fn inlined_table_names(
@@ -2349,7 +2353,7 @@ async fn commit_inlined_at_snapshot(
     );
     let mut ddl = format!(
         "CREATE TABLE IF NOT EXISTS {} (\
-         row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+         row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
         quote_ident(&physical_name)
     );
     for (field, column) in batches[0].schema().fields().iter().zip(&write.columns) {
@@ -3315,8 +3319,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
 
@@ -3480,8 +3483,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             let schema_id: i64 =
@@ -3565,7 +3567,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             let mut ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {} (\
-                 row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+                 row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
                 quote_ident(&physical_name)
             );
             for (field, column) in batches[0].schema().fields().iter().zip(columns) {
@@ -3651,9 +3653,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             // carry created_schema:/created_table: entries) instead of replacing
             // it, and record a Replace over prior data — Parquet or inlined — as
             // delete + insert, the same semantics the Parquet path records.
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
-            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            let (replaced_files, replaced_inlined) =
+                replaced_storage(&mut tx, table_id, snapshot_id).await?;
+            let changes_made = table_storage_changes(
+                table_id,
+                Some(true),
+                mode == WriteMode::Replace && replaced_files,
+                mode == WriteMode::Replace && replaced_inlined,
+            );
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
 
             let schema_id: i64 =
@@ -3709,8 +3716,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(write.table_id)
                 .fetch_one(&mut *tx)
                 .await?;
-                had_live_data
-                    .push(files || live_inlined_row_count(&mut tx, write.table_id).await? > 0);
+                had_live_data.push((
+                    files,
+                    live_inlined_row_count(&mut tx, write.table_id).await? > 0,
+                ));
             }
             let (snapshot_id, mut schema_version) = insert_snapshot(&mut tx).await?;
             let mut schema_changed = false;
@@ -3732,7 +3741,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             let mut tables = Vec::with_capacity(writes.len());
-            for (write, replaced_existing_data) in writes.iter().zip(had_live_data) {
+            for (write, (had_files, had_inlined_rows)) in writes.iter().zip(had_live_data) {
                 match &write.data {
                     StagedTableData::Files(files) => {
                         commit_files_at_snapshot(&mut tx, snapshot_id, write, files).await?;
@@ -3774,18 +3783,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                 }
-                let has_deletes =
-                    !write.positional_deletes.is_empty() || !write.inlined_deletes.is_empty();
-                let changes_made = if matches!(&write.data, StagedTableData::None) {
-                    format!("deleted_from_table:{}", write.table_id)
-                } else {
-                    table_write_changes(
-                        write.table_id,
-                        write.mode,
-                        has_deletes,
-                        replaced_existing_data,
-                    )
-                };
+                let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
                 record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata)
                     .await?;
                 let schema_id: i64 =
@@ -4149,8 +4147,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -4407,8 +4404,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -5254,8 +5250,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 base_snapshot,
             )
             .await?;
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(
                 &mut tx,
@@ -5349,6 +5344,9 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn initialize_schema(&self) -> Result<()> {
         block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
+            sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+                .execute(&self.pool)
+                .await?;
             // Upgrade a pre-existing catalog's `ducklake_column` from the legacy
             // single-row-PK shape to upstream's bare shape (idempotent, crash-safe).
             // `CREATE TABLE IF NOT EXISTS` above only shapes new catalogs.
@@ -5616,6 +5614,8 @@ impl MetadataWriter for SqliteMetadataWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_provider::MetadataProvider;
+    use arrow::array::Int64Array;
     use tempfile::TempDir;
 
     #[test]
@@ -5642,6 +5642,149 @@ mod tests {
             .await
             .unwrap();
         (writer, temp_dir)
+    }
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn staged_inline_changes_follow_storage_and_share_snapshot() {
+        let (writer, temp) = create_test_writer().await;
+        let columns = vec![ColumnDef::new("value", "BIGINT", false).unwrap()];
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![31, 47])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let mut writes = Vec::new();
+        for (name, data) in [
+            (
+                "files",
+                StagedTableData::Files(vec![DataFileInfo::new("rows.parquet", 123, 3)]),
+            ),
+            ("inline", StagedTableData::Inlined(vec![batch.clone()])),
+        ] {
+            let setup = writer
+                .begin_write_transaction("main", name, &columns, WriteMode::Append)
+                .unwrap();
+            writes.push(StagedTableWrite {
+                table_id: setup.table_id,
+                schema_name: "main".to_string(),
+                table_name: name.to_string(),
+                base_snapshot_id: setup.base_snapshot_id,
+                mode: WriteMode::Append,
+                columns: columns.clone(),
+                column_ids: setup.column_ids,
+                data,
+                snapshot_id_columns: Vec::new(),
+                positional_deletes: Vec::new(),
+                inlined_deletes: Vec::new(),
+                inlined_flush: false,
+            });
+        }
+        let commit = writer
+            .commit_multi_table(&writes, &SnapshotCommitMetadata::default(), None)
+            .unwrap();
+        let provider = crate::SqliteMetadataProvider::new(&format!(
+            "sqlite:{}",
+            temp.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let changes = provider.list_snapshot_changes().unwrap();
+        let changes = changes
+            .iter()
+            .find(|change| change.snapshot_id == commit.snapshot_id)
+            .unwrap()
+            .changes_made
+            .as_deref()
+            .unwrap();
+        assert_eq!(
+            changes,
+            format!(
+                "created_schema:\"main\",created_table:\"main\".\"files\",created_table:\"main\".\"inline\",inserted_into_table:{},inlined_insert:{}",
+                writes[0].table_id, writes[1].table_id
+            )
+        );
+        let table_columns = provider
+            .get_table_structure(writes[1].table_id, commit.snapshot_id)
+            .unwrap();
+        let inline = provider
+            .get_inlined_data_with_row_ids(writes[1].table_id, commit.snapshot_id, &table_columns)
+            .unwrap();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].row_ids, vec![0, 1]);
+        assert_eq!(inline[0].begin_snapshots, vec![commit.snapshot_id; 2]);
+        assert_eq!(inline[0].batch, batch);
+        let file_snapshot: i64 =
+            sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_data_file WHERE table_id = ?")
+                .bind(writes[0].table_id)
+                .fetch_one(&writer.pool)
+                .await
+                .unwrap();
+        assert_eq!(file_snapshot, commit.snapshot_id);
+
+        let mut replacement = writes[1].clone();
+        replacement.base_snapshot_id = commit.snapshot_id;
+        replacement.mode = WriteMode::Replace;
+        let replaced = writer
+            .commit_multi_table(
+                &[replacement.clone()],
+                &SnapshotCommitMetadata::default(),
+                Some(commit.snapshot_id),
+            )
+            .unwrap();
+        let changes = provider.list_snapshot_changes().unwrap();
+        assert_eq!(
+            changes.last().unwrap().changes_made,
+            Some(format!(
+                "inlined_delete:{},inlined_insert:{}",
+                replacement.table_id, replacement.table_id
+            ))
+        );
+        let current = provider
+            .get_inlined_data_with_row_ids(
+                replacement.table_id,
+                replaced.snapshot_id,
+                &table_columns,
+            )
+            .unwrap();
+        assert_eq!(current[0].row_ids, vec![2, 3]);
+        replacement.mode = WriteMode::Append;
+        replacement.base_snapshot_id = replaced.snapshot_id;
+        replacement.data = StagedTableData::None;
+        replacement.inlined_deletes = vec![InlinedRowRef {
+            table_name: current[0].table_name.clone(),
+            row_id: 2,
+        }];
+        let deleted = writer
+            .commit_multi_table(
+                &[replacement],
+                &SnapshotCommitMetadata::default(),
+                Some(replaced.snapshot_id),
+            )
+            .unwrap();
+        let remaining = provider
+            .get_inlined_data_with_row_ids(writes[1].table_id, deleted.snapshot_id, &table_columns)
+            .unwrap();
+        assert_eq!(remaining[0].row_ids, vec![3]);
+        assert_eq!(
+            remaining[0]
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+            &[47]
+        );
+        assert_eq!(
+            provider
+                .list_snapshot_changes()
+                .unwrap()
+                .last()
+                .unwrap()
+                .changes_made,
+            Some(format!("inlined_delete:{}", writes[1].table_id))
+        );
     }
 
     /// An existing user's catalog (legacy `column_id INTEGER PRIMARY KEY`) must be

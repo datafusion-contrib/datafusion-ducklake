@@ -80,8 +80,8 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeWriteOptions {
-    /// Maximum rows written into catalog-backed inlined storage. `Some(0)`
-    /// disables inlining; `None` leaves direct writer calls on the Parquet path.
+    /// Reserved limit for automatic catalog-backed inlining. High-level writes
+    /// currently use Parquet regardless of this value.
     pub data_inlining_row_limit: Option<usize>,
     /// Parquet compression codec; `None` leaves the writer's codec unchanged.
     pub compression: Option<Compression>,
@@ -157,7 +157,7 @@ impl DuckLakeWriteOptions {
         })
     }
 
-    /// Sets the maximum number of rows stored in catalog-backed inlined storage.
+    /// Sets the reserved automatic inlining limit; high-level writes currently use Parquet.
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
@@ -424,7 +424,10 @@ struct PreparedTableWrite {
 ///
 /// The DuckDB, SQLite, MySQL, and multicatalog PostgreSQL metadata writers support this
 /// transaction. Other metadata writers return an unsupported-operation error when
-/// [`Self::commit`] is called.
+/// [`Self::commit`] is called. Create and commit target tables before staging;
+/// DuckDB and MySQL require their column metadata to exist at commit time.
+/// Empty transactions, zero-row stages, and empty delete sets return an error.
+/// Inlined deletes must identify one live row visible at the stage's base snapshot.
 #[derive(Debug)]
 pub struct DuckLakeWriteTransaction<'a> {
     writer: &'a DuckLakeTableWriter,
@@ -1063,6 +1066,12 @@ impl DuckLakeTableWriter {
                 &rows,
             )
             .await?;
+        transaction
+            .writes
+            .last_mut()
+            .expect("flush stages one table")
+            .write
+            .inlined_flush = true;
         let mut results = transaction.commit().await?;
         if results.len() != 1 {
             return Err(crate::DuckLakeError::Internal(format!(
@@ -1779,6 +1788,7 @@ impl DuckLakeTableWriter {
                     snapshot_id_columns: Vec::new(),
                     positional_deletes: Vec::new(),
                     inlined_deletes: Vec::new(),
+                    inlined_flush: false,
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
@@ -1865,6 +1875,7 @@ impl DuckLakeTableWriter {
                 snapshot_id_columns: Vec::new(),
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
+                inlined_flush: false,
             },
             object_paths,
             files_written,
@@ -2266,6 +2277,7 @@ impl DuckLakeWriteTransaction<'_> {
                 snapshot_id_columns: Vec::new(),
                 positional_deletes: positional_deletes.to_vec(),
                 inlined_deletes: inlined_deletes.to_vec(),
+                inlined_flush: false,
             },
             object_paths,
             files_written: 0,

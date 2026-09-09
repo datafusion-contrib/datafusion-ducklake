@@ -19,8 +19,8 @@ use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
     ColumnDef, DeleteFileEntry, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MetadataProvider, MetadataWriter, MulticatalogManager,
-    MulticatalogProvider, PostgresMetadataWriter, WriteMode,
+    MetadataProvider, MetadataWriter, MulticatalogManager, MulticatalogProvider,
+    PostgresMetadataWriter, WriteMode,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -43,9 +43,12 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
     Ok((pool, container))
 }
 
+#[rstest::rstest]
+#[case::existing_tables(true)]
+#[case::reserved_tables(false)]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn multi_table_write_commits_parquet_and_inline_rows_postgres() {
+async fn multi_table_write_commits_two_tables_postgres(#[case] existing: bool) {
     let (pool, _container) = spin_up_postgres().await.unwrap();
     let manager = MulticatalogManager::new(pool.clone());
     let catalog_id = manager.create_catalog("pg_multi_table").await.unwrap();
@@ -57,30 +60,30 @@ async fn multi_table_write_commits_parquet_and_inline_rows_postgres() {
         ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
         ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
     ];
-    for table_name in ["data", "coverage"] {
-        let setup = writer
-            .begin_write_transaction("public", table_name, &columns, WriteMode::Append)
-            .unwrap();
-        writer
-            .publish_snapshot(
-                setup.table_id,
-                "public",
-                table_name,
-                setup.snapshot_id,
-                WriteMode::Append,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.column_ids,
-            )
-            .unwrap();
+    if existing {
+        for table_name in ["data", "coverage"] {
+            let setup = writer
+                .begin_write_transaction("public", table_name, &columns, WriteMode::Append)
+                .unwrap();
+            writer
+                .publish_snapshot(
+                    setup.table_id,
+                    "public",
+                    table_name,
+                    setup.snapshot_id,
+                    WriteMode::Append,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.column_ids,
+                )
+                .unwrap();
+        }
     }
-    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(2);
     let table_writer = DuckLakeTableWriter::new(
         writer,
         Arc::new(LocalFileSystem::new()) as Arc<dyn object_store::ObjectStore>,
     )
-    .unwrap()
-    .with_options(&options);
+    .unwrap();
     let mut transaction = table_writer.transaction();
     transaction
         .stage_write(
@@ -119,7 +122,7 @@ async fn multi_table_write_commits_parquet_and_inline_rows_postgres() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
     assert_eq!(results[0].files_written, 1);
-    assert_eq!(results[1].files_written, 0);
+    assert_eq!(results[1].files_written, 1);
     let data_snapshots: Vec<i64> = sqlx::query_scalar(
         "SELECT DISTINCT begin_snapshot FROM ducklake_data_file WHERE table_id = $1",
     )
@@ -127,22 +130,15 @@ async fn multi_table_write_commits_parquet_and_inline_rows_postgres() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    let inline_table: String = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+    let second_snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file WHERE table_id = $1",
     )
     .bind(results[1].table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let inline_snapshots: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT DISTINCT begin_snapshot FROM \"{}\"",
-        inline_table.replace('"', "\"\"")
-    )))
     .fetch_all(&pool)
     .await
     .unwrap();
     assert_eq!(data_snapshots, vec![results[0].snapshot_id]);
-    assert_eq!(inline_snapshots, vec![results[0].snapshot_id]);
+    assert_eq!(second_snapshots, vec![results[0].snapshot_id]);
     let changes: String = sqlx::query_scalar(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
     )
@@ -150,13 +146,18 @@ async fn multi_table_write_commits_parquet_and_inline_rows_postgres() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        changes,
-        format!(
-            "inserted_into_table:{},inserted_into_table:{}",
-            results[0].table_id, results[1].table_id
-        )
+    let inserts = format!(
+        "inserted_into_table:{},inserted_into_table:{}",
+        results[0].table_id, results[1].table_id
     );
+    let expected = if existing {
+        inserts
+    } else {
+        format!(
+            "created_schema:\"public\",created_table:\"public\".\"data\",created_table:\"public\".\"coverage\",{inserts}"
+        )
+    };
+    assert_eq!(changes, expected);
 }
 
 /// The `(id, val)` table schema used throughout.

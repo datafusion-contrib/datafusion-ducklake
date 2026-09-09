@@ -213,6 +213,29 @@ the writer removes all staged Parquet data and delete objects. An ambiguous fail
 lost COMMIT acknowledgement on a network backend — leaves the staged objects to the guarded
 vacuum, which reclaims only files no committed snapshot references.
 
+Staged commits are supported by DuckDB, SQLite, MySQL, and the experimental
+multicatalog PostgreSQL writer. The standard single-catalog PostgreSQL writer
+returns `Unsupported`. High-level row staging currently writes Parquet; explicit
+metadata-level inline writes and inline-row deletes use `inlined_insert` and
+`inlined_delete`, while flushes use `inline_flush`. Automatic small-write
+routing is separate from the staged transaction API.
+
+Unlike DuckDB's no-op commits, empty transactions, zero-row stages, and empty
+delete sets return errors. Inline deletes require one live row visible at the
+stage's base snapshot; stale or missing row identities abort the transaction.
+Create and commit tables before staging on DuckDB and MySQL. SQLite and
+multicatalog PostgreSQL can also finalize reserved tables.
+
+Opening a SQLite or multicatalog PostgreSQL writer creates the inline-table
+registry when it is absent, even without `initialize_schema()`. SQLite also
+migrates legacy non-null change ledgers. Snapshot-change readers preserve null
+changes and snapshots without ledger rows. The commit metadata lookup
+deliberately searches only snapshots with live Parquet files; it is not a
+general idempotency check for inline-only, delete-only, or retired commits.
+MySQL returns `Unsupported` for both snapshot-change APIs. Coordination locks
+cover the whole catalog file on SQLite and DuckDB, and the requested identity on
+multicatalog PostgreSQL; MySQL does not implement that API.
+
 `WriteMode::Replace` (SQL `INSERT OVERWRITE`, and the first write of a table) is
 **abort-on-conflict** under concurrency, matching DuckLake's snapshot isolation:
 

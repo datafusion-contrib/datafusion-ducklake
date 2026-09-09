@@ -17,8 +17,8 @@ use crate::metadata_writer::{
     ExistingCatalogColumn, InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata,
     StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
     catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_name,
+    catalog_columns_differ, staged_table_write_changes, table_storage_changes, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_name,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -31,6 +31,13 @@ use sqlx::AssertSqlSafe;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, Postgres};
+
+const SQL_CREATE_INLINED_DATA_TABLES: &str =
+    "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
+    table_id BIGINT,
+    table_name VARCHAR,
+    schema_version BIGINT
+)";
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -235,11 +242,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         next_row_id BIGINT NOT NULL DEFAULT 0,
         file_size_bytes BIGINT NOT NULL DEFAULT 0
     )"#,
-    r#"CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
-        table_id BIGINT NOT NULL,
-        table_name VARCHAR NOT NULL,
-        schema_version BIGINT NOT NULL
-    )"#,
+    SQL_CREATE_INLINED_DATA_TABLES,
     // Per-file, per-column zone maps (DuckLake spec) — powers file pruning.
     // Column set mirrors the official extension and the SQLite writer.
     r#"CREATE TABLE IF NOT EXISTS ducklake_file_column_stats (
@@ -637,6 +640,9 @@ impl PostgresMetadataWriter {
     /// Use [`crate::multicatalog::MulticatalogManager::create_catalog`] to obtain
     /// or create a catalog id by name.
     pub async fn with_pool(pool: PgPool, catalog_id: i64) -> Result<Self> {
+        sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+            .execute(&pool)
+            .await?;
         Ok(Self {
             pool,
             catalog_id,
@@ -657,11 +663,7 @@ impl PostgresMetadataWriter {
             .max_connections(max_connections)
             .connect(connection_string)
             .await?;
-        Ok(Self {
-            pool,
-            catalog_id,
-            lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
-        })
+        Self::with_pool(pool, catalog_id).await
     }
 
     /// Sets the Postgres `lock_timeout` (ms) applied before `FOR UPDATE`.
@@ -1701,10 +1703,25 @@ async fn finalize_table_snapshot(
 
     let mut ddl_changes = Vec::new();
     if schema_was_created {
-        ddl_changes.push(format!(
+        let schema_entry = format!(
             "created_schema:{}",
-            crate::metadata_writer::quote_snapshot_name(schema_name),
-        ));
+            crate::metadata_writer::quote_snapshot_name(schema_name)
+        );
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+        if !recorded
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .any(|token| token == schema_entry)
+        {
+            ddl_changes.push(schema_entry);
+        }
     }
     if table_was_created {
         ddl_changes.push(format!(
@@ -1727,13 +1744,12 @@ async fn finalize_table_snapshot(
     Ok((schema_id, table_id))
 }
 
-/// Whether `snapshot_id` ended prior rows of the table — Parquet files or
-/// inlined rows — i.e. a Replace actually replaced existing data.
-async fn replace_ended_prior_rows(
+// The flags report retired Parquet files and inlined rows, respectively
+async fn replaced_storage(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
     snapshot_id: i64,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let replaced: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
@@ -1744,9 +1760,6 @@ async fn replace_ended_prior_rows(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    if replaced {
-        return Ok(true);
-    }
     let inlined_tables: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
     )
@@ -1763,10 +1776,10 @@ async fn replace_ended_prior_rows(
             .fetch_one(&mut **tx)
             .await?
         {
-            return Ok(true);
+            return Ok((replaced, true));
         }
     }
-    Ok(false)
+    Ok((replaced, false))
 }
 
 async fn record_snapshot_changes(
@@ -1904,7 +1917,7 @@ async fn commit_inlined_at_snapshot(
         .collect::<Vec<_>>();
     let mut ddl = format!(
         "CREATE TABLE IF NOT EXISTS {} (\
-         row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+         row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
         quote_ident(&physical_name)
     );
     for ((column, _field), sql_type) in write
@@ -2711,8 +2724,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
 
@@ -2873,8 +2885,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             // advance_catalog_head MUST be the last write before commit.
@@ -2962,7 +2973,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .collect::<Vec<_>>();
             let mut ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {} (\
-                 row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+                 row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
                 quote_ident(&physical_name)
             );
             for ((column, _field), sql_type) in columns
@@ -3057,9 +3068,14 @@ impl MetadataWriter for PostgresMetadataWriter {
             // (created_schema:/created_table:) instead of replacing them, and
             // record a Replace over prior data — Parquet or inlined — as delete
             // + insert, the same semantics the Parquet path records.
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
-            let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
+            let (replaced_files, replaced_inlined) =
+                replaced_storage(&mut tx, table_id, snapshot_id).await?;
+            let changes_made = table_storage_changes(
+                table_id,
+                Some(true),
+                mode == WriteMode::Replace && replaced_files,
+                mode == WriteMode::Replace && replaced_inlined,
+            );
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
             tx.commit().await?;
@@ -3131,7 +3147,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                         .fetch_one(&mut *tx)
                         .await?;
                 }
-                had_live_data.push(files || inline_rows > 0);
+                had_live_data.push((files, inline_rows > 0));
             }
             let snapshot_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
@@ -3169,7 +3185,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 });
             }
 
-            for (write, replaced_existing_data) in committed_writes.iter().zip(had_live_data) {
+            for (write, (had_files, had_inlined_rows)) in committed_writes.iter().zip(had_live_data)
+            {
                 match &write.data {
                     StagedTableData::Files(files) => {
                         commit_files_at_snapshot(&mut tx, snapshot_id, write, files).await?;
@@ -3211,18 +3228,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                 }
-                let has_deletes =
-                    !write.positional_deletes.is_empty() || !write.inlined_deletes.is_empty();
-                let changes_made = if matches!(&write.data, StagedTableData::None) {
-                    format!("deleted_from_table:{}", write.table_id)
-                } else {
-                    table_write_changes(
-                        write.table_id,
-                        write.mode,
-                        has_deletes,
-                        replaced_existing_data,
-                    )
-                };
+                let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
                 record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata)
                     .await?;
             }
@@ -4216,8 +4222,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -4472,8 +4477,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made =
                 table_write_changes(table_id, mode, !deletes.is_empty(), replaced_existing_data);
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
@@ -5534,8 +5538,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .await?;
 
-            let replaced_existing_data =
-                replace_ended_prior_rows(&mut tx, table_id, snapshot_id).await?;
+            let replaced_existing_data = replaced_storage(&mut tx, table_id, snapshot_id).await?;
             let changes_made = table_write_changes(table_id, mode, false, replaced_existing_data);
             record_snapshot_changes(
                 &mut tx,

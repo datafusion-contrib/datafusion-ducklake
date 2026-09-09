@@ -640,7 +640,7 @@ impl MetadataProvider for MulticatalogProvider {
                  FROM ducklake_snapshot AS snapshot
                  JOIN ducklake_catalog_snapshot_map AS catalog
                    ON catalog.snapshot_id = snapshot.snapshot_id
-                 JOIN ducklake_snapshot_changes AS changes
+                 LEFT JOIN ducklake_snapshot_changes AS changes
                    ON changes.snapshot_id = snapshot.snapshot_id
                  WHERE catalog.catalog_id = $1
                  ORDER BY snapshot.snapshot_id",

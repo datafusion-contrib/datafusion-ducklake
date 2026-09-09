@@ -537,7 +537,7 @@ async fn record_table_write_changes(
         table_id,
         mode,
         false,
-        replaced_existing_data,
+        (replaced_existing_data, false),
     ));
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }

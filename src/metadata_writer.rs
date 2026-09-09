@@ -53,16 +53,56 @@ pub(crate) fn table_write_changes(
     table_id: i64,
     mode: WriteMode,
     has_deletes: bool,
-    replaced_existing_data: bool,
+    replaced_storage: (bool, bool),
 ) -> String {
-    match (mode, has_deletes, replaced_existing_data) {
-        (WriteMode::Append, false, _) | (WriteMode::Replace, false, false) => {
-            format!("inserted_into_table:{table_id}")
-        },
-        (WriteMode::Append | WriteMode::Replace, true, _) | (WriteMode::Replace, false, true) => {
-            format!("deleted_from_table:{table_id},inserted_into_table:{table_id}")
-        },
+    table_storage_changes(
+        table_id,
+        Some(false),
+        has_deletes || (mode == WriteMode::Replace && replaced_storage.0),
+        mode == WriteMode::Replace && replaced_storage.1,
+    )
+}
+
+pub(crate) fn staged_table_write_changes(
+    write: &StagedTableWrite,
+    had_files: bool,
+    had_inlined_rows: bool,
+) -> String {
+    if write.inlined_flush {
+        return format!("inline_flush:{}", write.table_id);
     }
+    let insert = match &write.data {
+        StagedTableData::Files(_) => Some(false),
+        StagedTableData::Inlined(_) => Some(true),
+        StagedTableData::None => None,
+    };
+    table_storage_changes(
+        write.table_id,
+        insert,
+        !write.positional_deletes.is_empty() || (write.mode == WriteMode::Replace && had_files),
+        !write.inlined_deletes.is_empty() || (write.mode == WriteMode::Replace && had_inlined_rows),
+    )
+}
+
+pub(crate) fn table_storage_changes(
+    table_id: i64,
+    inlined_insert: Option<bool>,
+    deleted_files: bool,
+    deleted_inlined: bool,
+) -> String {
+    let mut changes = Vec::new();
+    if deleted_files {
+        changes.push(format!("deleted_from_table:{table_id}"));
+    }
+    if deleted_inlined {
+        changes.push(format!("inlined_delete:{table_id}"));
+    }
+    match inlined_insert {
+        Some(false) => changes.push(format!("inserted_into_table:{table_id}")),
+        Some(true) => changes.push(format!("inlined_insert:{table_id}")),
+        None => {},
+    }
+    changes.join(",")
 }
 
 pub(crate) fn quote_snapshot_name(name: &str) -> String {
@@ -1044,6 +1084,7 @@ pub struct InlinedRowRef {
 
 /// Row storage staged for one table in a multi-table write.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StagedTableData {
     /// Parquet data files already uploaded to object storage.
     Files(Vec<DataFileInfo>),
@@ -1067,6 +1108,7 @@ pub struct StagedTableWrite {
     pub(crate) snapshot_id_columns: Vec<String>,
     pub(crate) positional_deletes: Vec<DeleteFileEntry>,
     pub(crate) inlined_deletes: Vec<InlinedRowRef>,
+    pub(crate) inlined_flush: bool,
 }
 
 impl StagedTableWrite {
@@ -1129,6 +1171,12 @@ impl StagedTableWrite {
     pub fn inlined_deletes(&self) -> &[InlinedRowRef] {
         &self.inlined_deletes
     }
+
+    /// Returns whether this stage moves inlined rows into Parquet without changing logical rows.
+    #[must_use]
+    pub const fn inlined_flush(&self) -> bool {
+        self.inlined_flush
+    }
 }
 
 /// Result of one atomic multi-table write.
@@ -1190,7 +1238,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// A coordination utility for callers that want to serialize a multi-step
     /// commit workflow (e.g. read staged state, dedup, commit) under one
-    /// `identity` across processes. Correctness does not depend on it: the
+    /// `identity` across processes. Multicatalog PostgreSQL scopes the lock by identity;
+    /// SQLite and DuckDB serialize all identities in the same catalog file.
+    /// MySQL does not support this coordination API. Correctness does not depend on it: the
     /// optimistic `expected_base_snapshot_id` fence remains the conflict
     /// mechanism, and this lock only avoids duplicate concurrent work.
     ///

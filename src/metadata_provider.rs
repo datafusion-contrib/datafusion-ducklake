@@ -1,5 +1,5 @@
-use crate::Result;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
+use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -413,7 +413,7 @@ pub struct SnapshotChangeMetadata {
     /// Timestamp when the snapshot was created.
     pub timestamp: Option<String>,
     /// Comma-separated DuckLake change tokens.
-    pub changes_made: String,
+    pub changes_made: Option<String>,
     /// Optional commit author.
     pub author: Option<String>,
     /// Optional commit message.
@@ -1447,7 +1447,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List snapshot change-ledger entries in snapshot order.
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
-        Ok(Vec::new())
+        Err(DuckLakeError::Unsupported(
+            "snapshot change metadata is not supported by this backend".to_string(),
+        ))
     }
 
     /// Find the first snapshot with live data files whose `commit_extra_info`
@@ -1457,7 +1459,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// and supplies the exact needle to match (including any delimiters its
     /// own convention uses to make substring matches unambiguous).
     fn find_snapshot_by_commit_extra_info(&self, _needle: &str) -> Result<Option<i64>> {
-        Ok(None)
+        Err(DuckLakeError::Unsupported(
+            "commit metadata lookup is not supported by this backend".to_string(),
+        ))
     }
 
     /// List schemas for a specific snapshot

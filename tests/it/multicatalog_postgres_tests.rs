@@ -48,8 +48,7 @@ async fn multicatalog_provider_reads_inlined_rows() {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_ducklake::metadata_provider::MetadataProvider;
-    use datafusion_ducklake::{DuckLakeWriteOptions, MulticatalogProvider};
-    use object_store::memory::InMemory;
+    use datafusion_ducklake::{MulticatalogProvider, SnapshotCommitMetadata};
     use tempfile::TempDir;
 
     let (pool, _container) = spin_up_postgres().await.unwrap();
@@ -70,12 +69,24 @@ async fn multicatalog_provider_reads_inlined_rows() {
         vec![Arc::new(Int64Array::from(vec![7]))],
     )
     .unwrap();
-    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
-    let result = DuckLakeTableWriter::new(Arc::new(writer), Arc::new(InMemory::new()))
-        .unwrap()
-        .with_options(&options)
-        .write_table("main", "values", &[batch])
-        .await
+    let columns = vec![ColumnDef::new("value", "BIGINT", false).unwrap()];
+    let setup = writer
+        .begin_write_transaction("main", "values", &columns, WriteMode::Append)
+        .unwrap();
+    let result = writer
+        .register_inlined_data(
+            setup.table_id,
+            "main",
+            "values",
+            setup.snapshot_id,
+            &[batch],
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
         .unwrap();
     let provider = MulticatalogProvider::with_pool_and_id(pool, catalog_id)
         .await
@@ -92,7 +103,6 @@ async fn multicatalog_provider_reads_inlined_rows() {
         .downcast_ref::<Int64Array>()
         .unwrap();
 
-    assert_eq!(result.files_written, 0);
     assert_eq!(batches.len(), 1);
     assert_eq!(values.values(), &[7]);
 }

@@ -948,7 +948,7 @@ impl MetadataProvider for PostgresMetadataProvider {
                         changes.commit_message,
                         changes.commit_extra_info
                  FROM ducklake_snapshot AS snapshot
-                 JOIN ducklake_snapshot_changes AS changes
+                 LEFT JOIN ducklake_snapshot_changes AS changes
                    ON changes.snapshot_id = snapshot.snapshot_id
                  ORDER BY snapshot.snapshot_id",
             )

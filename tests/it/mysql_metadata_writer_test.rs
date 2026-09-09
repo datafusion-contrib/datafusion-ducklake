@@ -16,9 +16,9 @@ use datafusion_ducklake::maintenance::ExpireCriteria;
 use datafusion_ducklake::metadata_writer::InlinedRowRef;
 use datafusion_ducklake::{
     ColumnDef, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider,
-    MetadataWriter, MySqlMetadataProvider, MySqlMetadataWriter, SnapshotCommitMetadata,
-    SourceRetirement, WriteMode, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
+    MySqlMetadataProvider, MySqlMetadataWriter, SnapshotCommitMetadata, SourceRetirement,
+    WriteMode, WriteSetupResult,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::{AssertSqlSafe, Row};
@@ -974,7 +974,7 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn mysql_multi_table_write_commits_parquet_and_inline_rows() {
+async fn mysql_multi_table_write_commits_two_tables() {
     let container = Mysql::default().start().await.unwrap();
     let port = container.get_host_port_ipv4(3306).await.unwrap();
     let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
@@ -1006,7 +1006,7 @@ async fn mysql_multi_table_write_commits_parquet_and_inline_rows() {
     let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
     let mut transaction = table_writer.transaction();
     transaction
-        .stage_write_with_options(
+        .stage_write(
             "main",
             "data",
             schema.as_ref(),
@@ -1016,19 +1016,17 @@ async fn mysql_multi_table_write_commits_parquet_and_inline_rows() {
                 vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
             )
             .unwrap()],
-            &DuckLakeWriteOptions::default().with_data_inlining_row_limit(0),
         )
         .await
         .unwrap();
     transaction
-        .stage_write_with_options(
+        .stage_write(
             "main",
             "coverage",
             schema.as_ref(),
             WriteMode::Append,
             &[RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
                 .unwrap()],
-            &DuckLakeWriteOptions::default().with_data_inlining_row_limit(1),
         )
         .await
         .unwrap();
@@ -1038,27 +1036,19 @@ async fn mysql_multi_table_write_commits_parquet_and_inline_rows() {
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].snapshot_id, committed[1].snapshot_id);
     assert_eq!(committed[0].files_written, 1);
-    assert_eq!(committed[1].files_written, 0);
+    assert_eq!(committed[1].files_written, 1);
     let file_snapshot: i64 =
         sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_data_file WHERE table_id = ?")
             .bind(committed[0].table_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    let inline_table: String = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
-    )
-    .bind(committed[1].table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let inline_snapshot: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT begin_snapshot FROM `{}`",
-        inline_table.replace('`', "``")
-    )))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let second_snapshot: i64 =
+        sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_data_file WHERE table_id = ?")
+            .bind(committed[1].table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let changes: String = sqlx::query_scalar(
         "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
     )
@@ -1067,7 +1057,7 @@ async fn mysql_multi_table_write_commits_parquet_and_inline_rows() {
     .await
     .unwrap();
     assert_eq!(file_snapshot, committed[0].snapshot_id);
-    assert_eq!(inline_snapshot, committed[0].snapshot_id);
+    assert_eq!(second_snapshot, committed[0].snapshot_id);
     assert_eq!(
         changes,
         format!(
