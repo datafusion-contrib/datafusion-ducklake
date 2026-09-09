@@ -8,7 +8,7 @@ use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -47,6 +47,26 @@ pub enum WriteMode {
     Replace,
     /// Keep existing data and append new records
     Append,
+}
+
+pub(crate) fn validate_table_setting(key: &str) -> Result<String> {
+    let key = key.to_ascii_lowercase();
+    match key.as_str() {
+        "parquet_compression"
+        | "parquet_compression_level"
+        | "parquet_version"
+        | "parquet_row_group_size"
+        | "parquet_row_group_size_bytes"
+        | "target_file_size"
+        | "data_inlining_row_limit"
+        | "sort_on_insert"
+        | "hive_file_pattern"
+        | "auto_compact"
+        | "rewrite_delete_threshold" => Ok(key),
+        _ => Err(DuckLakeError::Unsupported(format!(
+            "unsupported table setting '{key}'"
+        ))),
+    }
 }
 
 pub(crate) fn table_write_changes(
@@ -103,6 +123,50 @@ pub(crate) fn table_storage_changes(
         None => {},
     }
     changes.join(",")
+}
+
+pub(crate) fn snapshot_has_change(changes: &str, expected: &str) -> bool {
+    snapshot_change_tokens(changes).any(|change| change == expected)
+}
+
+pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
+    snapshot_change_tokens(changes).any(|change| {
+        let Some((kind, id)) = change.split_once(':') else {
+            return false;
+        };
+        id.parse::<i64>().ok() == Some(table_id)
+            && [
+                "dropped_table",
+                "altered_table",
+                "inlined_delete",
+                "inline_flush",
+                "inserted_into_table",
+                "inlined_insert",
+            ]
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    changes.split(move |character| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        character == ',' && !quoted
+    })
+}
+
+pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
+    let mut groups = BTreeMap::new();
+    for row in rows {
+        groups
+            .entry(row.table_name.as_str())
+            .or_insert_with(BTreeSet::new)
+            .insert(row.row_id);
+    }
+    groups
 }
 
 pub(crate) fn quote_snapshot_name(name: &str) -> String {
@@ -1227,7 +1291,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// Replace a table-scoped catalog setting.
+    /// Replace a supported write option on a live table.
     fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "table-scoped settings are not supported by this metadata backend".to_string(),
@@ -1238,9 +1302,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// A coordination utility for callers that want to serialize a multi-step
     /// commit workflow (e.g. read staged state, dedup, commit) under one
-    /// `identity` across processes. Multicatalog PostgreSQL scopes the lock by identity;
+    /// `identity` across processes. PostgreSQL and MySQL scope the lock by identity;
     /// SQLite and DuckDB serialize all identities in the same catalog file.
-    /// MySQL does not support this coordination API. Correctness does not depend on it: the
+    /// Correctness does not depend on it: the
     /// optimistic `expected_base_snapshot_id` fence remains the conflict
     /// mechanism, and this lock only avoids duplicate concurrent work.
     ///

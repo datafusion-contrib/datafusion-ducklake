@@ -8,10 +8,10 @@ use crate::metadata_provider::{
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting,
     SQL_GET_FILE_PARTITION_VALUES, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
-    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
-    reconstruct_columns_with_table, resolve_metadata_settings,
+    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata,
+    TableWithSchema, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
+    inlined_text_projection, is_inlined_data_table, parse_inlined_rows_with_present,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -642,6 +642,62 @@ impl MetadataProvider for MySqlMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT snapshot.snapshot_id,
+                        CAST(snapshot.snapshot_time AS CHAR) AS snapshot_time,
+                        changes.changes_made,
+                        changes.author,
+                        changes.commit_message,
+                        changes.commit_extra_info
+                 FROM ducklake_snapshot AS snapshot
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChangeMetadata {
+                        snapshot_id: row.try_get("snapshot_id")?,
+                        timestamp: row.try_get("snapshot_time")?,
+                        changes_made: row.try_get("changes_made")?,
+                        author: row.try_get("author")?,
+                        commit_message: row.try_get("commit_message")?,
+                        commit_extra_info: row.try_get("commit_extra_info")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
+        block_on(async {
+            let row = sqlx::query(
+                "SELECT changes.snapshot_id
+                 FROM ducklake_snapshot_changes AS changes
+                 WHERE (BINARY changes.commit_extra_info = BINARY ?
+                        OR instr(BINARY changes.commit_extra_info, BINARY ?) > 0)
+                   AND EXISTS (
+                       SELECT 1 FROM ducklake_data_file AS files
+                       WHERE files.begin_snapshot = changes.snapshot_id
+                         AND files.end_snapshot IS NULL
+                   )
+                 ORDER BY changes.snapshot_id
+                 LIMIT 1",
+            )
+            .bind(needle)
+            .bind(needle)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
         })
     }
 

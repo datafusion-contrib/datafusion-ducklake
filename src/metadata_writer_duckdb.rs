@@ -45,9 +45,10 @@ use crate::metadata_writer::{
     DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, InlinedRowRef, MetadataWriter,
     MultiTableCommit, SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite,
     WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, staged_table_write_changes, table_storage_changes, top_level_column_ids,
-    validate_delete_entries, validate_name,
+    catalog_column_type_requires_migration, catalog_columns_differ, inlined_delete_conflicts,
+    inlined_delete_groups, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
+    staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -908,22 +909,6 @@ fn record_table_write_changes(
     inlined: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
-    let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = tx.query_row(
-        "SELECT s.begin_snapshot, t.begin_snapshot
-         FROM ducklake_table t
-         JOIN ducklake_schema s ON s.schema_id = t.schema_id
-         WHERE t.table_id = ?",
-        params![table_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let altered: bool = tx.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM ducklake_schema_versions
-            WHERE table_id = ? AND begin_snapshot = ?
-         )",
-        params![table_id, snapshot_id],
-        |row| row.get(0),
-    )?;
     let replaced_existing_data: bool = tx.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
@@ -955,12 +940,62 @@ fn record_table_write_changes(
         }
     }
 
+    let write_changes = table_storage_changes(
+        table_id,
+        Some(inlined),
+        has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
+        replaced_inlined,
+    );
+    record_table_changes(
+        tx,
+        snapshot_id,
+        table_id,
+        schema_name,
+        table_name,
+        &write_changes,
+        commit_metadata,
+    )
+}
+
+fn record_table_changes(
+    tx: &Transaction<'_>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    write_changes: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = tx.query_row(
+        "SELECT s.begin_snapshot, t.begin_snapshot
+         FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ?",
+        params![table_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let altered: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_schema_versions
+            WHERE table_id = ? AND begin_snapshot = ?
+         )",
+        params![table_id, snapshot_id],
+        |row| row.get(0),
+    )?;
     let mut changes = Vec::new();
     if schema_begin_snapshot == snapshot_id {
-        changes.push(format!(
-            "created_schema:{}",
-            quote_snapshot_name(schema_name)
-        ));
+        let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
+        let recorded: Option<String> = tx
+            .query_row(
+                "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+                params![snapshot_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if !snapshot_has_change(recorded.as_deref().unwrap_or_default(), &entry) {
+            changes.push(entry);
+        }
     }
     if table_begin_snapshot == snapshot_id {
         changes.push(format!(
@@ -970,12 +1005,7 @@ fn record_table_write_changes(
     } else if altered {
         changes.push(format!("altered_table:{table_id}"));
     }
-    changes.push(table_storage_changes(
-        table_id,
-        Some(inlined),
-        has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
-        replaced_inlined,
-    ));
+    changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata)
 }
 
@@ -1426,36 +1456,85 @@ fn apply_inlined_deletes(
     base_snapshot: i64,
     rows: &[InlinedRowRef],
 ) -> Result<()> {
-    let registered = inlined_table_names(tx, table_id)?
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    for row in rows {
-        if !registered.contains(&row.table_name) {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} belongs to an unregistered table '{}'",
-                row.row_id, row.table_name
-            )));
-        }
-        let affected = tx.execute(
-            &format!(
-                "UPDATE {} SET end_snapshot = ? \
-                 WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
-                quote_ident(&row.table_name)
-            ),
-            params![snapshot_id, row.row_id, base_snapshot],
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let registered = inlined_table_names(tx, table_id)?;
+    let changes: Vec<Option<String>> = {
+        let mut statement = tx.prepare("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id > ? AND snapshot_id < ?")?;
+        statement
+            .query_map(params![base_snapshot, snapshot_id], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    if changes
+        .iter()
+        .flatten()
+        .any(|changes| inlined_delete_conflicts(changes, table_id))
+    {
+        return Err(crate::DuckLakeError::Conflict(
+            "table changed since the inlined delete snapshot".to_string(),
+        ));
+    }
+    for name in &registered {
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE (begin_snapshot > ? AND begin_snapshot < ?) OR (end_snapshot > ? AND end_snapshot < ?))",
+            quote_ident(name)
+        );
+        let changed: bool = tx.query_row(
+            &sql,
+            params![base_snapshot, snapshot_id, base_snapshot, snapshot_id],
+            |row| row.get(0),
         )?;
-        if affected != 1 {
+        if changed {
+            return Err(crate::DuckLakeError::Conflict(
+                "inlined rows changed since the delete snapshot".to_string(),
+            ));
+        }
+    }
+    for (name, row_ids) in inlined_delete_groups(rows) {
+        if !registered.iter().any(|table| table == name) {
             return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
-                row.row_id, row.table_name
+                "inlined deletes reference unregistered table '{name}'"
             )));
         }
+        let ids = row_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = ? WHERE row_id IN ({ids}) AND end_snapshot IS NULL AND begin_snapshot <> ?",
+            quote_ident(name)
+        );
+        tx.execute(&sql, params![snapshot_id, snapshot_id])?;
     }
     Ok(())
 }
 
 fn finalize_snapshot(
     tx: &Transaction<'_>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    mode: WriteMode,
+    base_snapshot: i64,
+) -> Result<i64> {
+    let (snapshot_id, _) = insert_snapshot(tx)?;
+    finalize_table_snapshot(
+        tx,
+        snapshot_id,
+        table_id,
+        columns,
+        column_ids,
+        mode,
+        base_snapshot,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_table_snapshot(
+    tx: &Transaction<'_>,
+    snapshot_id: i64,
     table_id: i64,
     columns: &[ColumnDef],
     column_ids: &[i64],
@@ -1474,7 +1553,11 @@ fn finalize_snapshot(
 
     // Allocate the snapshot FIRST (carrying schema_version forward); corrected to
     // a DDL bump below once the commit is classified.
-    let (snapshot_id, mut schema_version) = insert_snapshot(tx)?;
+    let mut schema_version: i64 = tx.query_row(
+        "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+        params![snapshot_id],
+        |row| row.get(0),
+    )?;
 
     // The table's live columns ordered by column_order. Collected into an owned
     // Vec so the prepared statement is dropped before we mutate the same
@@ -1522,6 +1605,13 @@ fn finalize_snapshot(
         ));
     }
 
+    if current.is_empty() {
+        tx.execute("UPDATE ducklake_schema SET begin_snapshot = ? WHERE schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?) AND begin_snapshot = (SELECT begin_snapshot FROM ducklake_table WHERE table_id = ?)", params![snapshot_id, table_id, table_id])?;
+        tx.execute(
+            "UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ?",
+            params![snapshot_id, table_id],
+        )?;
+    }
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -1665,6 +1755,9 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
+    if current.is_empty() && proposed.len() == write.column_ids.len() {
+        return Ok(schema_id);
+    }
     if current.len() != proposed.len() || proposed.len() != write.column_ids.len() {
         return Err(crate::DuckLakeError::Conflict(format!(
             "multi-table write target {}.{} changed schema after staging",
@@ -1807,7 +1900,7 @@ fn commit_staged_inline(
     );
     let mut ddl = format!(
         "CREATE TABLE IF NOT EXISTS {} (\
-         row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT",
+         row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
         quote_ident(&physical_name)
     );
     let schema = batches[0].schema();
@@ -1906,48 +1999,13 @@ fn apply_staged_inlined_deletes(
     snapshot_id: i64,
     write: &StagedTableWrite,
 ) -> Result<()> {
-    if write.inlined_deletes.is_empty() {
-        return Ok(());
-    }
-    let mut statement =
-        tx.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
-    let registered = statement
-        .query_map(params![write.table_id], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
-    drop(statement);
-    for row in &write.inlined_deletes {
-        if !registered.contains(&row.table_name) {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} belongs to an unregistered table '{}'",
-                row.row_id, row.table_name
-            )));
-        }
-        let affected = tx.execute(
-            &format!(
-                "UPDATE {} SET end_snapshot = ? \
-                 WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
-                quote_ident(&row.table_name)
-            ),
-            params![snapshot_id, row.row_id, write.base_snapshot_id],
-        )?;
-        if affected != 1 {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} in '{}' is no longer live at snapshot {}",
-                row.row_id, row.table_name, write.base_snapshot_id
-            )));
-        }
-    }
-    let deleted = i64::try_from(write.inlined_deletes.len()).map_err(|_| {
-        crate::DuckLakeError::InvalidConfig(
-            "multi-table inline delete count exceeds i64".to_string(),
-        )
-    })?;
-    tx.execute(
-        "UPDATE ducklake_table_stats
-         SET record_count = GREATEST(record_count - ?, 0) WHERE table_id = ?",
-        params![deleted, write.table_id],
-    )?;
-    Ok(())
+    apply_inlined_deletes(
+        tx,
+        write.table_id,
+        snapshot_id,
+        write.base_snapshot_id,
+        &write.inlined_deletes,
+    )
 }
 
 impl DuckdbMetadataWriter {
@@ -2056,10 +2114,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
     }
 
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        let key = validate_table_setting(key)?;
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = ?)",
+            "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL)",
             params![table_id],
             |row| row.get(0),
         )?;
@@ -2802,10 +2861,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut tables = Vec::with_capacity(writes.len());
         for write in writes {
             let schema_id = validate_staged_table(&tx, write)?;
-            if write.mode == WriteMode::Replace {
-                detect_replace_conflict(&tx, write.table_id, write.base_snapshot_id)?;
-                retire_prior_generation(&tx, write.table_id, snapshot_id)?;
-            }
+            finalize_table_snapshot(
+                &tx,
+                snapshot_id,
+                write.table_id,
+                &write.columns,
+                &write.column_ids,
+                write.mode,
+                write.base_snapshot_id,
+            )?;
             tables.push(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -2833,7 +2897,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
             }
             apply_staged_inlined_deletes(&tx, snapshot_id, write)?;
             let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
-            record_snapshot_changes(&tx, snapshot_id, &changes_made, commit_metadata)?;
+            record_table_changes(
+                &tx,
+                snapshot_id,
+                write.table_id,
+                &write.schema_name,
+                &write.table_name,
+                &changes_made,
+                commit_metadata,
+            )?;
         }
         tx.commit()?;
         Ok(MultiTableCommit {

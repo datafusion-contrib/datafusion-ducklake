@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::record_batch::RecordBatch;
-#[cfg(feature = "write-duckdb")]
+#[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use datafusion::prelude::SessionContext;
-#[cfg(feature = "write-duckdb")]
+#[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use datafusion_ducklake::DuckLakeCatalog;
 #[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use datafusion_ducklake::DuckLakeTableWriter;
@@ -31,13 +31,22 @@ use datafusion_ducklake::{DuckdbMetadataProvider, DuckdbMetadataWriter};
 use object_store::ObjectStore;
 #[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use object_store::local::LocalFileSystem;
-#[cfg(feature = "write-duckdb")]
+#[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 use std::slice::from_ref;
 use tempfile::TempDir;
-#[cfg(feature = "write-postgres")]
+#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
 use testcontainers::runners::AsyncRunner;
 #[cfg(feature = "write-postgres")]
 use testcontainers_modules::postgres::Postgres;
+
+#[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
+use datafusion_ducklake::WriteResult;
+#[cfg(feature = "write-mysql")]
+use datafusion_ducklake::{MySqlMetadataProvider, MySqlMetadataWriter};
+#[cfg(feature = "write-postgres")]
+use datafusion_ducklake::{PostgresMetadataProvider, PostgresSingleCatalogMetadataWriter};
+#[cfg(feature = "write-mysql")]
+use testcontainers_modules::mysql::Mysql;
 
 fn columns() -> Vec<ColumnDef> {
     vec![ColumnDef::new("value", "BIGINT", false).unwrap()]
@@ -83,7 +92,21 @@ fn assert_metadata_contract(
     identity: &str,
     table_id: i64,
     snapshot_id: i64,
+    test_global_settings: bool,
 ) {
+    let error = writer
+        .set_table_setting(table_id, "misspelled_option", "42")
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Unsupported feature: unsupported table setting 'misspelled_option'"
+    );
+    assert_eq!(
+        provider
+            .find_snapshot_by_commit_extra_info(&identity.to_ascii_uppercase())
+            .unwrap(),
+        None
+    );
     let changes = provider.list_snapshot_changes().unwrap();
     let change = changes
         .iter()
@@ -99,19 +122,21 @@ fn assert_metadata_contract(
         Some(snapshot_id),
     );
 
+    if test_global_settings {
+        writer
+            .set_global_setting("data_inlining_row_limit", "17")
+            .unwrap();
+        assert_eq!(
+            provider
+                .get_metadata_settings(None, None)
+                .unwrap()
+                .get("data_inlining_row_limit")
+                .map(String::as_str),
+            Some("17"),
+        );
+    }
     writer
-        .set_global_setting("data_inlining_row_limit", "17")
-        .unwrap();
-    assert_eq!(
-        provider
-            .get_metadata_settings(None, None)
-            .unwrap()
-            .get("data_inlining_row_limit")
-            .map(String::as_str),
-        Some("17"),
-    );
-    writer
-        .set_table_setting(table_id, "data_inlining_row_limit", "42")
+        .set_table_setting(table_id, "DATA_INLINING_ROW_LIMIT", "42")
         .unwrap();
     assert_eq!(
         provider
@@ -127,6 +152,7 @@ fn assert_metadata_contract(
         .with_commit_lock(
             identity,
             Box::new(|| {
+                assert_eq!(provider.get_current_snapshot()?, snapshot_id);
                 called.store(true, Ordering::SeqCst);
                 Ok(())
             }),
@@ -399,7 +425,24 @@ async fn sqlite_metadata_contract() {
     let provider = SqliteMetadataProvider::new(&url).await.unwrap();
     let (table_id, snapshot_id) = write_contract_data(&writer, "sqlite-contract");
 
-    assert_metadata_contract(&provider, &writer, "sqlite-contract", table_id, snapshot_id);
+    assert_metadata_contract(
+        &provider,
+        &writer,
+        "sqlite-contract",
+        table_id,
+        snapshot_id,
+        true,
+    );
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE ducklake_table SET end_snapshot = ? WHERE table_id = ?")
+        .bind(snapshot_id)
+        .bind(table_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        matches!(writer.set_table_setting(table_id, "auto_compact", "true"), Err(DuckLakeError::TableNotFound(id)) if id == table_id.to_string())
+    );
 }
 
 #[cfg(feature = "write-postgres")]
@@ -427,6 +470,7 @@ async fn postgres_metadata_contract() {
         "postgres-contract",
         table_id,
         snapshot_id,
+        true,
     );
     let second_id = manager
         .create_catalog("metadata_contract_two")
@@ -630,36 +674,16 @@ async fn sqlite_reopens_legacy_catalog_without_schema_initialization() {
 }
 
 #[cfg(feature = "write-duckdb")]
+#[rstest::rstest]
+#[case::existing_tables(true)]
+#[case::new_tables(false)]
 #[tokio::test(flavor = "multi_thread")]
-async fn duckdb_multi_table_commit_reads_both_tables() {
+async fn duckdb_multi_table_commit_reads_both_tables(#[case] existing: bool) {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("catalog.ducklake");
     let writer = Arc::new(DuckdbMetadataWriter::new_with_init(path.to_str().unwrap()).unwrap());
     writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
-    let table_writer =
-        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new())).unwrap();
-    let first = batch(vec![11, 23]);
-    let second = batch(vec![37]);
-    for (name, rows) in [("first", &first), ("second", &second)] {
-        table_writer
-            .append_table("main", name, from_ref(rows))
-            .await
-            .unwrap();
-    }
-    let mut transaction = table_writer.transaction();
-    for (name, rows) in [("first", &first), ("second", &second)] {
-        transaction
-            .stage_write(
-                "main",
-                name,
-                rows.schema().as_ref(),
-                WriteMode::Append,
-                from_ref(rows),
-            )
-            .await
-            .unwrap();
-    }
-    let results = transaction.commit().await.unwrap();
+    let results = commit_tables(writer.clone(), existing).await;
     let provider = writer.metadata_provider();
     let changes = provider.list_snapshot_changes().unwrap();
     let ctx = SessionContext::new();
@@ -687,12 +711,160 @@ async fn duckdb_multi_table_commit_reads_both_tables() {
         (results[1].files_written, results[1].records_written),
         (1, 1)
     );
-    assert_eq!(values, vec![11, 11, 23, 23, 37, 37]);
     assert_eq!(
-        changes.last().unwrap().changes_made,
-        Some(format!(
+        values,
+        if existing {
+            vec![11, 11, 23, 23, 37, 37]
+        } else {
+            vec![11, 23, 37]
+        }
+    );
+    let expected = if existing {
+        format!(
             "inserted_into_table:{},inserted_into_table:{}",
             results[0].table_id, results[1].table_id
-        ))
+        )
+    } else {
+        format!(
+            "created_schema:\"main\",created_table:\"main\".\"first\",inserted_into_table:{},created_table:\"main\".\"second\",inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    };
+    assert_eq!(
+        changes.last().unwrap().changes_made.as_deref(),
+        Some(expected.as_str())
     );
+}
+
+#[cfg(feature = "write-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_single_metadata_contract() {
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let writer = PostgresSingleCatalogMetadataWriter::new_with_init(&url)
+        .await
+        .unwrap();
+    let provider = PostgresMetadataProvider::new(&url).await.unwrap();
+    let (table_id, snapshot) = write_contract_data(&writer, "single-contract");
+    assert_metadata_contract(
+        &provider,
+        &writer,
+        "single-contract",
+        table_id,
+        snapshot,
+        true,
+    );
+}
+
+#[cfg(feature = "write-mysql")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_metadata_contract() {
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    let writer = MySqlMetadataWriter::new_with_init(&url).await.unwrap();
+    let provider = MySqlMetadataProvider::new(&url).await.unwrap();
+    let (table_id, snapshot) = write_contract_data(&writer, "mysql-contract");
+    assert_metadata_contract(
+        &provider,
+        &writer,
+        "mysql-contract",
+        table_id,
+        snapshot,
+        false,
+    );
+}
+
+#[cfg(feature = "write-postgres")]
+#[rstest::rstest]
+#[case::existing_tables(true)]
+#[case::new_tables(false)]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_single_multi_table_commit_reads_both_tables(#[case] existing: bool) {
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let writer = Arc::new(
+        PostgresSingleCatalogMetadataWriter::new_with_init(&url)
+            .await
+            .unwrap(),
+    );
+    let temp = TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let results = commit_tables(writer, existing).await;
+    let provider = PostgresMetadataProvider::new(&url).await.unwrap();
+    let changes = provider.list_snapshot_changes().unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("test", Arc::new(DuckLakeCatalog::new(provider).unwrap()));
+    let actual = ctx.sql("SELECT value FROM test.main.first UNION ALL SELECT value FROM test.main.second ORDER BY value").await.unwrap().collect().await.unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    let expected = if existing {
+        format!(
+            "inserted_into_table:{},inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    } else {
+        format!(
+            "created_schema:\"main\",created_table:\"main\".\"first\",inserted_into_table:{},created_table:\"main\".\"second\",inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    };
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    assert_eq!(
+        values,
+        if existing {
+            vec![11, 11, 23, 23, 37, 37]
+        } else {
+            vec![11, 23, 37]
+        }
+    );
+    assert_eq!(
+        changes.last().unwrap().changes_made.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
+async fn commit_tables(writer: Arc<dyn MetadataWriter>, existing: bool) -> Vec<WriteResult> {
+    let table_writer =
+        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new())).unwrap();
+    let first = batch(vec![11, 23]);
+    let second = batch(vec![37]);
+    if existing {
+        for (name, rows) in [("first", &first), ("second", &second)] {
+            table_writer
+                .append_table("main", name, from_ref(rows))
+                .await
+                .unwrap();
+        }
+    }
+    let mut transaction = table_writer.transaction();
+    for (name, rows) in [("first", &first), ("second", &second)] {
+        transaction
+            .stage_write(
+                "main",
+                name,
+                rows.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(rows),
+            )
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap()
 }

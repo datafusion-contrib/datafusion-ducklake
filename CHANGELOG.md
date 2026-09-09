@@ -17,13 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
 - Read nullable snapshot changes and find commits with live files on DuckDB,
-  SQLite, and PostgreSQL; MySQL reports unsupported APIs (#274).
-- Set table-scoped settings and coordinate commits on DuckDB, SQLite, and
-  multicatalog PostgreSQL; standard PostgreSQL and MySQL are unsupported (#274).
-- Commit staged writes across existing tables in one snapshot on DuckDB,
-  SQLite, MySQL, and multicatalog PostgreSQL (#274).
+  SQLite, PostgreSQL, and MySQL (#274).
+- Set supported table-scoped options and coordinate commits on DuckDB, SQLite,
+  MySQL, and both PostgreSQL layouts (#274).
+- Commit staged writes across new or existing tables in one snapshot on all
+  metadata backends; empty staging calls do not publish snapshots (#274).
 - `DuckLakeWriteOptions::data_inlining_row_limit` reserves the automatic limit;
-  high-level writes still use Parquet (#274).
+  high-level writes use Parquet and leave the stored limit unparsed (#274).
+- Validate snapshot-column staging before uploading files, and reject settings
+  for unknown options or dropped tables (#274).
 
 - SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
   snapshot on all four write backends; DuckDB and MySQL now implement combined

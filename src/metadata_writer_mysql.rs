@@ -40,9 +40,10 @@ use crate::metadata_writer::{
     DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, InlinedRowRef, MetadataWriter,
     MultiTableCommit, SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite,
     WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
-    quote_snapshot_table, staged_table_write_changes, table_storage_changes, top_level_column_ids,
-    validate_delete_entries, validate_name,
+    catalog_column_type_requires_migration, catalog_columns_differ, inlined_delete_conflicts,
+    inlined_delete_groups, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
+    staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -53,8 +54,8 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use sqlx::Row;
-use sqlx::mysql::{MySql, MySqlPool, MySqlPoolOptions};
-use sqlx::{AssertSqlSafe, QueryBuilder};
+use sqlx::mysql::{MySql, MySqlConnection, MySqlPool, MySqlPoolOptions};
+use sqlx::{AssertSqlSafe, Connection, QueryBuilder};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -970,28 +971,6 @@ async fn record_table_write_changes(
     inlined: bool,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT s.begin_snapshot AS schema_begin_snapshot,
-                t.begin_snapshot AS table_begin_snapshot
-         FROM ducklake_table t
-         JOIN ducklake_schema s ON s.schema_id = t.schema_id
-         WHERE t.table_id = ?",
-    )
-    .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let schema_begin_snapshot: i64 = row.try_get("schema_begin_snapshot")?;
-    let table_begin_snapshot: i64 = row.try_get("table_begin_snapshot")?;
-    let altered: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM ducklake_schema_versions
-            WHERE table_id = ? AND begin_snapshot = ?
-         )",
-    )
-    .bind(table_id)
-    .bind(snapshot_id)
-    .fetch_one(&mut **tx)
-    .await?;
     let replaced_existing_data: bool = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM ducklake_data_file
@@ -1027,12 +1006,68 @@ async fn record_table_write_changes(
         }
     }
 
+    let write_changes = table_storage_changes(
+        table_id,
+        Some(inlined),
+        has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
+        replaced_inlined,
+    );
+    record_table_changes(
+        tx,
+        snapshot_id,
+        table_id,
+        schema_name,
+        table_name,
+        &write_changes,
+        commit_metadata,
+    )
+    .await
+}
+
+async fn record_table_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    write_changes: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT s.begin_snapshot AS schema_begin_snapshot,
+                t.begin_snapshot AS table_begin_snapshot
+         FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id
+         WHERE t.table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let schema_begin_snapshot: i64 = row.try_get("schema_begin_snapshot")?;
+    let table_begin_snapshot: i64 = row.try_get("table_begin_snapshot")?;
+    let altered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_schema_versions
+            WHERE table_id = ? AND begin_snapshot = ?
+         )",
+    )
+    .bind(table_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
     let mut changes = Vec::new();
     if schema_begin_snapshot == snapshot_id {
-        changes.push(format!(
-            "created_schema:{}",
-            quote_snapshot_name(schema_name)
-        ));
+        let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+        if !snapshot_has_change(recorded.as_deref().unwrap_or_default(), &entry) {
+            changes.push(entry);
+        }
     }
     if table_begin_snapshot == snapshot_id {
         changes.push(format!(
@@ -1042,12 +1077,7 @@ async fn record_table_write_changes(
     } else if altered {
         changes.push(format!("altered_table:{table_id}"));
     }
-    changes.push(table_storage_changes(
-        table_id,
-        Some(inlined),
-        has_deletes || (mode == WriteMode::Replace && replaced_existing_data),
-        replaced_inlined,
-    ));
+    changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }
 
@@ -1308,35 +1338,63 @@ async fn apply_inlined_deletes(
     base_snapshot: i64,
     rows: &[InlinedRowRef],
 ) -> Result<()> {
-    let registered = inlined_table_names(tx, table_id)
-        .await?
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    for row in rows {
-        if !registered.contains(&row.table_name) {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} belongs to an unregistered table '{}'",
-                row.row_id, row.table_name
-            )));
-        }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let registered: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let changes: Vec<Option<String>> = sqlx::query_scalar("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id > ? AND snapshot_id < ?").bind(base_snapshot).bind(snapshot_id).fetch_all(&mut **tx).await?;
+    if changes
+        .iter()
+        .flatten()
+        .any(|changes| inlined_delete_conflicts(changes, table_id))
+    {
+        return Err(crate::DuckLakeError::Conflict(
+            "table changed since the inlined delete snapshot".to_string(),
+        ));
+    }
+    for name in &registered {
         let sql = format!(
-            "UPDATE {} SET end_snapshot = ? \
-             WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
-            quote_ident(&row.table_name)
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE (begin_snapshot > ? AND begin_snapshot < ?) OR (end_snapshot > ? AND end_snapshot < ?))",
+            quote_ident(name)
         );
-        let affected = sqlx::query(AssertSqlSafe(sql))
-            .bind(snapshot_id)
-            .bind(row.row_id)
+        let changed: bool = sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(base_snapshot)
-            .execute(&mut **tx)
-            .await?
-            .rows_affected();
-        if affected != 1 {
+            .bind(snapshot_id)
+            .bind(base_snapshot)
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        if changed {
+            return Err(crate::DuckLakeError::Conflict(
+                "inlined rows changed since the delete snapshot".to_string(),
+            ));
+        }
+    }
+    for (name, row_ids) in inlined_delete_groups(rows) {
+        if !registered.iter().any(|table| table == name) {
             return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} in '{}' is no longer live at snapshot {base_snapshot}",
-                row.row_id, row.table_name
+                "inlined deletes reference unregistered table '{name}'"
             )));
         }
+        let ids = row_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE {} SET end_snapshot = ? WHERE row_id IN ({ids}) AND end_snapshot IS NULL AND begin_snapshot <> ?",
+            quote_ident(name)
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }
@@ -1419,10 +1477,37 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
 ) -> Result<i64> {
+    let (snapshot_id, _) = insert_snapshot(tx).await?;
+    finalize_table_snapshot(
+        tx,
+        snapshot_id,
+        table_id,
+        columns,
+        column_ids,
+        mode,
+        base_snapshot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_table_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    snapshot_id: i64,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    mode: WriteMode,
+    base_snapshot: i64,
+) -> Result<i64> {
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
     // corrected to a DDL bump below once we've classified the commit.
-    let (snapshot_id, mut schema_version) = insert_snapshot(tx).await?;
+    let mut schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?;
 
     // Classify this commit as DDL vs pure data write. `current` is the table's
     // live columns ordered by `column_order`; an empty set means a brand-new table
@@ -1472,6 +1557,14 @@ async fn finalize_snapshot(
             "table columns were created concurrently with different field ids; retry the write"
                 .to_string(),
         ));
+    }
+    if current.is_empty() {
+        sqlx::query("UPDATE ducklake_schema AS s JOIN ducklake_table AS t ON t.schema_id = s.schema_id SET s.begin_snapshot = ? WHERE t.table_id = ? AND s.begin_snapshot = t.begin_snapshot").bind(snapshot_id).bind(table_id).execute(&mut **tx).await?;
+        sqlx::query("UPDATE ducklake_table SET begin_snapshot = ? WHERE table_id = ?")
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut **tx)
+            .await?;
     }
     let is_ddl = current.is_empty()
         || catalog_columns_differ(
@@ -1636,6 +1729,9 @@ async fn validate_staged_table(
     .bind(write.table_id)
     .fetch_all(&mut **tx)
     .await?;
+    if current.is_empty() && proposed.len() == write.column_ids.len() {
+        return Ok(schema_id);
+    }
     if current.len() != proposed.len() || proposed.len() != write.column_ids.len() {
         return Err(crate::DuckLakeError::Conflict(format!(
             "multi-table write target {}.{} changed schema after staging",
@@ -1818,23 +1914,6 @@ async fn commit_staged_inline(
         "ducklake_inlined_data_{}_{}",
         write.table_id, schema_version
     );
-    // The physical table was created before this transaction opened (MySQL DDL
-    // would implicitly commit it). A missing table means the schema version
-    // moved between pre-creation and this commit; abort so the caller retries.
-    let physical_exists: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM information_schema.tables
-         WHERE table_schema = DATABASE() AND table_name = ?",
-    )
-    .bind(&physical_name)
-    .fetch_one(&mut **tx)
-    .await?;
-    if !physical_exists {
-        return Err(crate::DuckLakeError::Conflict(format!(
-            "multi-table inline stage for table {} resolved schema version {schema_version}, \
-             whose inline table does not exist yet; retry the commit",
-            write.table_id
-        )));
-    }
     sqlx::query(
         "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
          SELECT ?, ?, ? FROM DUAL WHERE NOT EXISTS (
@@ -1917,62 +1996,72 @@ async fn apply_staged_inlined_deletes(
     snapshot_id: i64,
     write: &StagedTableWrite,
 ) -> Result<()> {
-    if write.inlined_deletes.is_empty() {
-        return Ok(());
-    }
-    let registered =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-            .bind(write.table_id)
-            .fetch_all(&mut **tx)
-            .await?
-            .into_iter()
-            .map(|row| row.try_get(0))
-            .collect::<std::result::Result<std::collections::HashSet<String>, _>>()?;
-    for row in &write.inlined_deletes {
-        if !registered.contains(&row.table_name) {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} belongs to an unregistered table '{}'",
-                row.row_id, row.table_name
-            )));
-        }
-        let affected = sqlx::query(AssertSqlSafe(format!(
-            "UPDATE {} SET end_snapshot = ? \
-             WHERE row_id = ? AND begin_snapshot <= ? AND end_snapshot IS NULL",
-            quote_ident(&row.table_name)
-        )))
-        .bind(snapshot_id)
-        .bind(row.row_id)
-        .bind(write.base_snapshot_id)
-        .execute(&mut **tx)
-        .await?
-        .rows_affected();
-        if affected != 1 {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "inlined row {} in '{}' is no longer live at snapshot {}",
-                row.row_id, row.table_name, write.base_snapshot_id
-            )));
-        }
-    }
-    let deleted = i64::try_from(write.inlined_deletes.len()).map_err(|_| {
-        crate::DuckLakeError::InvalidConfig(
-            "multi-table inline delete count exceeds i64".to_string(),
-        )
-    })?;
-    sqlx::query(
-        "UPDATE ducklake_table_stats
-         SET record_count = GREATEST(record_count - ?, 0) WHERE table_id = ?",
+    apply_inlined_deletes(
+        tx,
+        write.table_id,
+        snapshot_id,
+        write.base_snapshot_id,
+        &write.inlined_deletes,
     )
-    .bind(deleted)
-    .bind(write.table_id)
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
+    .await
 }
 
 impl MetadataWriter for MySqlMetadataWriter {
     fn supports_update(&self) -> bool {
         true
     }
+    fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        let key = validate_table_setting(key)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let live: Option<i64> = sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL FOR UPDATE").bind(table_id).fetch_optional(&mut *tx).await?;
+            if live.is_none() {
+                return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+            sqlx::query("DELETE FROM ducklake_metadata WHERE `key` = ? AND scope = 'table' AND scope_id = ?").bind(&key).bind(table_id).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO ducklake_metadata (`key`, value, scope, scope_id) VALUES (?, ?, 'table', ?)").bind(&key).bind(value).bind(table_id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn with_commit_lock(
+        &self,
+        identity: &str,
+        operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        block_on(async {
+            let mut connection = self.pool.acquire().await?;
+            // Named locks outlive transactions; close also releases the lock after a panic or failed unlock.
+            connection.close_on_drop();
+            let acquired: Option<i64> =
+                sqlx::query_scalar("SELECT GET_LOCK(SHA2(CONCAT(DATABASE(), ':', ?), 256), 30)")
+                    .bind(identity)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if acquired != Some(1) {
+                return Err(crate::DuckLakeError::Conflict(
+                    "commit coordination lock was not acquired".to_string(),
+                ));
+            }
+            let result = operation();
+            let unlock = sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT RELEASE_LOCK(SHA2(CONCAT(DATABASE(), ':', ?), 256))",
+            )
+            .bind(identity)
+            .fetch_one(&mut *connection)
+            .await;
+            match (result, unlock) {
+                (Err(e), _) => Err(e),
+                (Ok(()), Ok(Some(1))) => Ok(()),
+                (Ok(()), Ok(_)) => Err(crate::DuckLakeError::Internal(
+                    "commit coordination lock was not released".to_string(),
+                )),
+                (Ok(()), Err(e)) => Err(e.into()),
+            }
+        })
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -3432,33 +3521,15 @@ impl MetadataWriter for MySqlMetadataWriter {
         }
 
         block_on(async {
-            // MySQL DDL implicitly commits, so physical inline tables must exist
-            // before the write transaction opens. Predict the schema version the
-            // commit will resolve; commit_staged_inline aborts with Conflict if
-            // it moved, and the caller's retry recreates for the new version.
-            let predicted_version: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(schema_version), 0) FROM ducklake_snapshot",
-            )
-            .fetch_one(&self.pool)
-            .await?;
             for write in writes {
-                if let StagedTableData::Inlined(batches) = &write.data {
-                    if batches.is_empty() {
-                        continue;
-                    }
-                    let physical_name = format!(
-                        "ducklake_inlined_data_{}_{predicted_version}",
-                        write.table_id
-                    );
-                    let ddl = inlined_mysql_table_ddl(
-                        &physical_name,
-                        batches[0].schema().fields(),
-                        &write.columns,
-                    );
-                    sqlx::query(AssertSqlSafe(ddl)).execute(&self.pool).await?;
+                if let StagedTableData::Inlined(batches) = &write.data
+                    && batches.iter().all(|batch| batch.num_rows() == 0)
+                {
+                    return Err(crate::DuckLakeError::InvalidConfig(
+                        "multi-table inline stage requires at least one row".to_string(),
+                    ));
                 }
             }
-
             let mut tx = self.pool.begin().await?;
             // Allocate the snapshot FIRST: its counter update takes the
             // serializing row lock before any plain SELECT establishes this
@@ -3478,16 +3549,49 @@ impl MetadataWriter for MySqlMetadataWriter {
             let mut tables = Vec::with_capacity(writes.len());
             for write in writes {
                 let schema_id = validate_staged_table(&mut tx, write).await?;
-                if write.mode == WriteMode::Replace {
-                    detect_replace_conflict(&mut tx, write.table_id, write.base_snapshot_id)
-                        .await?;
-                    retire_prior_generation(&mut tx, write.table_id, snapshot_id).await?;
-                }
+                finalize_table_snapshot(
+                    &mut tx,
+                    snapshot_id,
+                    write.table_id,
+                    &write.columns,
+                    &write.column_ids,
+                    write.mode,
+                    write.base_snapshot_id,
+                )
+                .await?;
                 tables.push(CommitIds {
                     snapshot_id,
                     schema_id,
                     table_id: write.table_id,
                 });
+            }
+            if writes
+                .iter()
+                .any(|write| matches!(write.data, StagedTableData::Inlined(_)))
+            {
+                let schema_version: i64 = sqlx::query_scalar(
+                    "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+                )
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                // The counter lock keeps the version stable. A separate connection prevents DDL from committing metadata.
+                let mut ddl_connection =
+                    MySqlConnection::connect_with(&self.pool.connect_options()).await?;
+                for write in writes {
+                    if let StagedTableData::Inlined(batches) = &write.data {
+                        let physical_name =
+                            format!("ducklake_inlined_data_{}_{schema_version}", write.table_id);
+                        let ddl = inlined_mysql_table_ddl(
+                            &physical_name,
+                            batches[0].schema().fields(),
+                            &write.columns,
+                        );
+                        sqlx::query(AssertSqlSafe(ddl))
+                            .execute(&mut ddl_connection)
+                            .await?;
+                    }
+                }
             }
             for (write, (had_files, had_inlined_rows)) in writes.iter().zip(had_live_data) {
                 match &write.data {
@@ -3511,8 +3615,16 @@ impl MetadataWriter for MySqlMetadataWriter {
                 }
                 apply_staged_inlined_deletes(&mut tx, snapshot_id, write).await?;
                 let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
-                record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata)
-                    .await?;
+                record_table_changes(
+                    &mut tx,
+                    snapshot_id,
+                    write.table_id,
+                    &write.schema_name,
+                    &write.table_name,
+                    &changes_made,
+                    commit_metadata,
+                )
+                .await?;
             }
             tx.commit().await?;
             Ok(MultiTableCommit {
@@ -4384,6 +4496,92 @@ impl MetadataWriter for MySqlMetadataWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
+    use std::sync::Arc;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::mysql::Mysql;
+
+    #[rstest::rstest]
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    async fn mysql_staged_inline_uses_the_locked_schema_version() {
+        let container = Mysql::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(3306).await.unwrap();
+        let url = format!("mysql://root@127.0.0.1:{port}/test");
+        let writer = MySqlMetadataWriter::with_max_connections(&url, 1)
+            .await
+            .unwrap();
+        writer.initialize_schema().unwrap();
+        let columns = vec![ColumnDef::new("value", "BIGINT", false).unwrap()];
+        let batch = RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![7, 11])) as Arc<dyn Array>,
+        )])
+        .unwrap();
+        let setup = writer
+            .begin_write_transaction("main", "events", &columns, WriteMode::Append)
+            .unwrap();
+        let write = StagedTableWrite {
+            table_id: setup.table_id,
+            schema_name: "main".to_string(),
+            table_name: "events".to_string(),
+            base_snapshot_id: setup.base_snapshot_id,
+            mode: WriteMode::Append,
+            columns,
+            column_ids: setup.column_ids,
+            data: StagedTableData::Inlined(vec![batch]),
+            snapshot_id_columns: Vec::new(),
+            positional_deletes: Vec::new(),
+            inlined_deletes: Vec::new(),
+            inlined_flush: false,
+        };
+        let committed = writer
+            .commit_multi_table(
+                std::slice::from_ref(&write),
+                &SnapshotCommitMetadata::default(),
+                None,
+            )
+            .unwrap();
+        let schema_version: i64 = sqlx::query_scalar(
+            "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
+        )
+        .bind(committed.snapshot_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        let physical: String = sqlx::query_scalar(
+            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+        )
+        .bind(write.table_id)
+        .fetch_one(&writer.pool)
+        .await
+        .unwrap();
+        let sql = format!(
+            "SELECT row_id, begin_snapshot, value FROM {} ORDER BY row_id",
+            quote_ident(&physical)
+        );
+        let rows: Vec<(i64, i64, i64)> = sqlx::query_as(AssertSqlSafe(sql))
+            .fetch_all(&writer.pool)
+            .await
+            .unwrap();
+        assert_eq!(schema_version, 1);
+        assert_eq!(
+            physical,
+            format!("ducklake_inlined_data_{}_1", write.table_id)
+        );
+        assert_eq!(
+            rows,
+            vec![(0, committed.snapshot_id, 7), (1, committed.snapshot_id, 11)]
+        );
+        let mut empty = write;
+        empty.data = StagedTableData::Inlined(Vec::new());
+        let error = writer
+            .commit_multi_table(&[empty], &SnapshotCommitMetadata::default(), None)
+            .unwrap_err();
+        let state: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM ducklake_snapshot), (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name LIKE 'ducklake_inlined_data_%')").fetch_one(&writer.pool).await.unwrap();
+        assert!(matches!(error, crate::DuckLakeError::InvalidConfig(_)));
+        assert_eq!(state, (1, 2));
+    }
 
     #[test]
     fn mysql_inlined_types_follow_sqlite_style_encodings() {

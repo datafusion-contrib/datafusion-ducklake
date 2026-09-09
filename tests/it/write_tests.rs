@@ -25,8 +25,8 @@ use sqlx::Row;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, MetadataProvider, MetadataWriter,
-    SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, WriteMode,
+    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider,
+    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, WriteMode,
     register_ducklake_functions,
 };
 
@@ -2601,4 +2601,313 @@ async fn failed_multi_table_database_commit_preserves_staged_files() {
             .unwrap(),
         base.snapshot_id
     );
+}
+
+#[rstest::rstest]
+#[case::snapshot_columns(false)]
+#[case::snapshot_columns_with_deletes(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_snapshot_column_stage_leaves_no_objects(#[case] with_deletes: bool) {
+    let (metadata, temp) = create_test_env().await;
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), store.clone()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![19])) as ArrayRef,
+    )])
+    .unwrap();
+    let options = DuckLakeWriteOptions::default();
+    let mut transaction = writer.transaction();
+    let result = if with_deletes {
+        transaction
+            .stage_write_with_deletes_and_snapshot_columns(
+                "main",
+                "events",
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+                &options,
+                &["value"],
+            )
+            .await
+    } else {
+        transaction
+            .stage_write_with_snapshot_columns(
+                "main",
+                "events",
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+                &["value"],
+            )
+            .await
+    };
+    transaction.abort().await.unwrap();
+    assert!(matches!(result, Err(DuckLakeError::InvalidConfig(_))));
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+}
+
+#[rstest::rstest]
+#[case::empty_transaction(0)]
+#[case::empty_rows(1)]
+#[case::empty_rows_with_options(2)]
+#[case::empty_snapshot_rows(3)]
+#[case::empty_deletes(4)]
+#[case::empty_rows_with_deletes(5)]
+#[case::empty_snapshot_rows_with_deletes(6)]
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_transaction_stages_do_not_publish(#[case] stage: u8) {
+    let (metadata, temp) = create_test_env().await;
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), store.clone()).unwrap();
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+    let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+    let options = DuckLakeWriteOptions::default();
+    let mut transaction = writer.transaction();
+    match stage {
+        0 => {},
+        1 => transaction
+            .stage_write(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+            )
+            .await
+            .unwrap(),
+        2 => transaction
+            .stage_write_with_options(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+            )
+            .await
+            .unwrap(),
+        3 => transaction
+            .stage_write_with_snapshot_columns(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+                &["value"],
+            )
+            .await
+            .unwrap(),
+        4 => transaction
+            .stage_deletes("main", "events", &schema, &[], &[])
+            .unwrap(),
+        5 => transaction
+            .stage_write_with_deletes(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        6 => transaction
+            .stage_write_with_deletes_and_snapshot_columns(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+                &options,
+                &["value"],
+            )
+            .await
+            .unwrap(),
+        _ => unreachable!(),
+    }
+    let results = transaction.commit().await.unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let state: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM ducklake_snapshot), (SELECT COUNT(*) FROM ducklake_table), (SELECT COUNT(*) FROM ducklake_column)").fetch_one(&pool).await.unwrap();
+    assert_eq!(results.len(), 0);
+    assert_eq!(state, (0, 0, 0));
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_append_stages_commute_without_a_fence() {
+    let (metadata, temp) = create_test_env().await;
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), create_object_store()).unwrap();
+    let rows = [11, 23, 37].map(|value| {
+        RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        )])
+        .unwrap()
+    });
+    writer
+        .append_table("main", "events", from_ref(&rows[0]))
+        .await
+        .unwrap();
+    let mut first = writer.transaction();
+    let mut second = writer.transaction();
+    first
+        .stage_write(
+            "main",
+            "events",
+            rows[1].schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&rows[1]),
+        )
+        .await
+        .unwrap();
+    second
+        .stage_write(
+            "main",
+            "events",
+            rows[2].schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&rows[2]),
+        )
+        .await
+        .unwrap();
+    let first = first.commit().await.unwrap();
+    let second = second.commit().await.unwrap();
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx
+        .sql("SELECT value FROM test.main.events ORDER BY value")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(second[0].snapshot_id, first[0].snapshot_id + 1);
+    assert_eq!(values, vec![11, 23, 37]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_schema_change_rejects_without_reverting_columns() {
+    let (metadata, temp) = create_test_env().await;
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), create_object_store()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![11])) as ArrayRef,
+    )])
+    .unwrap();
+    writer
+        .append_table("main", "events", from_ref(&batch))
+        .await
+        .unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "events",
+            batch.schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&batch),
+        )
+        .await
+        .unwrap();
+    let changed = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![23])), Arc::new(StringArray::from(vec!["added"]))],
+    )
+    .unwrap();
+    let committed = writer
+        .append_table("main", "events", &[changed])
+        .await
+        .unwrap();
+    let error = transaction.commit().await.unwrap_err();
+    let provider =
+        SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let columns = provider
+        .get_table_structure(committed.table_id, committed.snapshot_id)
+        .unwrap();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        committed.snapshot_id
+    );
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.column_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["value", "extra"]
+    );
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx
+        .sql("SELECT value FROM test.main.events ORDER BY value")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(values, vec![11, 23]);
 }

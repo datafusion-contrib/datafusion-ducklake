@@ -126,7 +126,7 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(10))?,
+            data_inlining_row_limit: None,
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
@@ -422,12 +422,12 @@ struct PreparedTableWrite {
 
 /// A set of table changes committed in one DuckLake snapshot.
 ///
-/// The DuckDB, SQLite, MySQL, and multicatalog PostgreSQL metadata writers support this
-/// transaction. Other metadata writers return an unsupported-operation error when
-/// [`Self::commit`] is called. Create and commit target tables before staging;
-/// DuckDB and MySQL require their column metadata to exist at commit time.
-/// Empty transactions, zero-row stages, and empty delete sets return an error.
-/// Inlined deletes must identify one live row visible at the stage's base snapshot.
+/// DuckDB, SQLite, MySQL, and both PostgreSQL writers finalize new or existing
+/// tables in this transaction. Empty staging calls add no result entry, and an
+/// empty transaction returns without publishing a snapshot. Inlined deletes
+/// ignore missing row identities and rows inserted by the same transaction;
+/// concurrent changes still conflict. An explicit expected-base snapshot adds
+/// a table-state precondition, including for append stages.
 #[derive(Debug)]
 pub struct DuckLakeWriteTransaction<'a> {
     writer: &'a DuckLakeTableWriter,
@@ -2041,6 +2041,10 @@ impl DuckLakeWriteTransaction<'_> {
         mode: WriteMode,
         batches: &[RecordBatch],
     ) -> Result<()> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return Ok(());
+        }
+
         let prepared = self
             .writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
@@ -2059,6 +2063,10 @@ impl DuckLakeWriteTransaction<'_> {
         batches: &[RecordBatch],
         options: &DuckLakeWriteOptions,
     ) -> Result<()> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return Ok(());
+        }
+
         let writer = self.writer.clone().with_options(options);
         let prepared = writer
             .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
@@ -2079,27 +2087,33 @@ impl DuckLakeWriteTransaction<'_> {
         options: &DuckLakeWriteOptions,
         snapshot_id_columns: &[&str],
     ) -> Result<()> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return Ok(());
+        }
+
         let writer = self.writer.clone().with_options(options);
-        let mut prepared = writer
-            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
-            .await?;
-        if !matches!(&prepared.write.data, StagedTableData::Inlined(_)) {
+        if !writer.should_inline(
+            batches.iter().map(RecordBatch::num_rows).sum(),
+            arrow_schema,
+        ) {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "commit snapshot columns require an inlined table stage".to_string(),
             ));
         }
         for name in snapshot_id_columns {
-            if !prepared
-                .write
-                .columns
+            if !arrow_schema
+                .fields()
                 .iter()
-                .any(|column| column.name() == *name)
+                .any(|field| field.name() == name)
             {
                 return Err(crate::DuckLakeError::InvalidConfig(format!(
                     "commit snapshot column '{name}' is not present in the staged schema"
                 )));
             }
         }
+        let mut prepared = writer
+            .prepare_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
+            .await?;
         prepared.write.snapshot_id_columns = snapshot_id_columns
             .iter()
             .map(|name| (*name).to_string())
@@ -2122,18 +2136,18 @@ impl DuckLakeWriteTransaction<'_> {
         options: &DuckLakeWriteOptions,
         snapshot_id_columns: &[&str],
     ) -> Result<()> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return self.stage_deletes(
+                schema_name,
+                table_name,
+                arrow_schema,
+                positional_deletes,
+                inlined_deletes,
+            );
+        }
+
         if !positional_deletes.is_empty() {
             validate_delete_entries(mode, positional_deletes)?;
-        }
-        if inlined_deletes
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != inlined_deletes.len()
-        {
-            return Err(crate::DuckLakeError::InvalidConfig(
-                "multi-table write contains duplicate inlined deletes".to_string(),
-            ));
         }
         let delete_paths = positional_deletes
             .iter()
@@ -2181,18 +2195,18 @@ impl DuckLakeWriteTransaction<'_> {
         positional_deletes: &[DeleteFileEntry],
         inlined_deletes: &[InlinedRowRef],
     ) -> Result<()> {
+        if batches.iter().all(|batch| batch.num_rows() == 0) {
+            return self.stage_deletes(
+                schema_name,
+                table_name,
+                arrow_schema,
+                positional_deletes,
+                inlined_deletes,
+            );
+        }
+
         if !positional_deletes.is_empty() {
             validate_delete_entries(mode, positional_deletes)?;
-        }
-        if inlined_deletes
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != inlined_deletes.len()
-        {
-            return Err(crate::error::DuckLakeError::InvalidConfig(
-                "multi-table write contains duplicate inlined deletes".to_string(),
-            ));
         }
 
         let delete_paths = positional_deletes
@@ -2231,20 +2245,8 @@ impl DuckLakeWriteTransaction<'_> {
         inlined_deletes: &[InlinedRowRef],
     ) -> Result<()> {
         validate_delete_entries(WriteMode::Append, positional_deletes)?;
-        if inlined_deletes
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != inlined_deletes.len()
-        {
-            return Err(crate::error::DuckLakeError::InvalidConfig(
-                "multi-table write contains duplicate inlined deletes".to_string(),
-            ));
-        }
         if positional_deletes.is_empty() && inlined_deletes.is_empty() {
-            return Err(crate::error::DuckLakeError::InvalidConfig(
-                "delete-only table stage requires at least one delete".to_string(),
-            ));
+            return Ok(());
         }
         let columns = arrow_schema_to_column_defs(arrow_schema)?;
         let setup = self.writer.metadata.begin_write_transaction(
@@ -2289,9 +2291,7 @@ impl DuckLakeWriteTransaction<'_> {
     /// Commits every staged table change in one metadata transaction.
     pub async fn commit(mut self) -> Result<Vec<WriteResult>> {
         if self.writes.is_empty() {
-            return Err(crate::error::DuckLakeError::InvalidConfig(
-                "multi-table write requires at least one table stage".to_string(),
-            ));
+            return Ok(Vec::new());
         }
         let writes = self
             .writes
@@ -3682,7 +3682,7 @@ mod tests {
             options.compression,
             Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         );
-        assert_eq!(options.data_inlining_row_limit, Some(10));
+        assert_eq!(options.data_inlining_row_limit, None);
         assert_eq!(options.max_row_group_rows, Some(122_880));
         assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
         assert_eq!(options.target_file_size, Some(5_000_000));
@@ -3708,7 +3708,7 @@ mod tests {
         let options = stored.with_overrides(&explicit);
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
-        assert_eq!(options.data_inlining_row_limit, Some(10));
+        assert_eq!(options.data_inlining_row_limit, None);
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));

@@ -972,9 +972,12 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
     );
 }
 
+#[rstest::rstest]
+#[case::existing_tables(true)]
+#[case::new_tables(false)]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn mysql_multi_table_write_commits_two_tables() {
+async fn mysql_multi_table_write_commits_two_tables(#[case] existing: bool) {
     let container = Mysql::default().start().await.unwrap();
     let port = container.get_host_port_ipv4(3306).await.unwrap();
     let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
@@ -986,22 +989,24 @@ async fn mysql_multi_table_write_commits_two_tables() {
     let pool = sqlx::MySqlPool::connect(&conn_str).await.unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
     let columns = vec![ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap()];
-    for table_name in ["data", "coverage"] {
-        let setup = writer
-            .begin_write_transaction("main", table_name, &columns, WriteMode::Append)
-            .unwrap();
-        writer
-            .publish_snapshot(
-                setup.table_id,
-                "main",
-                table_name,
-                setup.snapshot_id,
-                WriteMode::Append,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.column_ids,
-            )
-            .unwrap();
+    if existing {
+        for table_name in ["data", "coverage"] {
+            let setup = writer
+                .begin_write_transaction("main", table_name, &columns, WriteMode::Append)
+                .unwrap();
+            writer
+                .publish_snapshot(
+                    setup.table_id,
+                    "main",
+                    table_name,
+                    setup.snapshot_id,
+                    WriteMode::Append,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.column_ids,
+                )
+                .unwrap();
+        }
     }
     let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
     let mut transaction = table_writer.transaction();
@@ -1058,11 +1063,16 @@ async fn mysql_multi_table_write_commits_two_tables() {
     .unwrap();
     assert_eq!(file_snapshot, committed[0].snapshot_id);
     assert_eq!(second_snapshot, committed[0].snapshot_id);
-    assert_eq!(
-        changes,
+    let expected = if existing {
         format!(
             "inserted_into_table:{},inserted_into_table:{}",
             committed[0].table_id, committed[1].table_id
         )
-    );
+    } else {
+        format!(
+            "created_schema:\"main\",created_table:\"main\".\"data\",inserted_into_table:{},created_table:\"main\".\"coverage\",inserted_into_table:{}",
+            committed[0].table_id, committed[1].table_id
+        )
+    };
+    assert_eq!(changes, expected);
 }
