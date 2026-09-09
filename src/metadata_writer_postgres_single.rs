@@ -24,14 +24,21 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
-    SnapshotCommitMetadata, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    quote_snapshot_name, quote_snapshot_table, table_write_changes, top_level_column_ids,
-    validate_name,
+    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
+    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
+    quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
+    top_level_column_ids, validate_name,
+};
+use crate::metadata_writer_postgres::{
+    SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
+    apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_inlined_at_snapshot,
+    detect_replace_conflict as detect_staged_conflict, quote_ident, set_postgres_table_setting,
+    validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
-use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::{AssertSqlSafe, Row};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -39,6 +46,7 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 /// the SQLite and MySQL writers (and so upstream); only the SQL types differ. Split
 /// one per entry because sqlx runs each `query()` as a single prepared statement.
 const SQL_CREATE_TABLES: &[&str] = &[
+    SQL_CREATE_INLINED_DATA_TABLES,
     r#"CREATE TABLE IF NOT EXISTS ducklake_metadata (
         key VARCHAR NOT NULL,
         value VARCHAR NOT NULL,
@@ -485,6 +493,39 @@ async fn record_table_write_changes(
     mode: WriteMode,
     commit_metadata: &SnapshotCommitMetadata,
 ) -> Result<()> {
+    let replaced_existing_data: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+            SELECT 1 FROM ducklake_data_file
+            WHERE table_id = $1 AND end_snapshot = $2
+         )",
+    )
+    .bind(table_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let write_changes = table_write_changes(table_id, mode, false, (replaced_existing_data, false));
+    record_table_changes(
+        tx,
+        snapshot_id,
+        table_id,
+        schema_name,
+        table_name,
+        &write_changes,
+        commit_metadata,
+    )
+    .await
+}
+
+async fn record_table_changes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    table_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    write_changes: &str,
+    commit_metadata: &SnapshotCommitMetadata,
+) -> Result<()> {
     let row = sqlx::query(
         "SELECT s.begin_snapshot AS schema_begin_snapshot,
                 t.begin_snapshot AS table_begin_snapshot
@@ -507,23 +548,19 @@ async fn record_table_write_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    let replaced_existing_data: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM ducklake_data_file
-            WHERE table_id = $1 AND end_snapshot = $2
-         )",
-    )
-    .bind(table_id)
-    .bind(snapshot_id)
-    .fetch_one(&mut **tx)
-    .await?;
-
     let mut changes = Vec::new();
     if schema_begin_snapshot == snapshot_id {
-        changes.push(format!(
-            "created_schema:{}",
-            quote_snapshot_name(schema_name)
-        ));
+        let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+        if !snapshot_has_change(recorded.as_deref().unwrap_or_default(), &entry) {
+            changes.push(entry);
+        }
     }
     if table_begin_snapshot == snapshot_id {
         changes.push(format!(
@@ -533,12 +570,7 @@ async fn record_table_write_changes(
     } else if altered {
         changes.push(format!("altered_table:{table_id}"));
     }
-    changes.push(table_write_changes(
-        table_id,
-        mode,
-        false,
-        replaced_existing_data,
-    ));
+    changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
 }
 
@@ -753,10 +785,41 @@ async fn finalize_snapshot(
     mode: WriteMode,
     base_snapshot: i64,
 ) -> Result<CommitIds> {
+    let (snapshot_id, _) = insert_snapshot(tx).await?;
+    finalize_table_snapshot(
+        tx,
+        snapshot_id,
+        schema_name,
+        table_name,
+        table_id_hint,
+        columns,
+        column_ids,
+        mode,
+        base_snapshot,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_table_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    table_id_hint: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    mode: WriteMode,
+    base_snapshot: i64,
+) -> Result<CommitIds> {
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
     // corrected to a DDL bump below once we've classified the commit.
-    let (snapshot_id, mut schema_version) = insert_snapshot(tx).await?;
+    let mut schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?;
 
     let schema_id: i64 =
         match sqlx::query_scalar(
@@ -994,6 +1057,134 @@ async fn finalize_snapshot(
 }
 
 impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
+    fn commit_multi_table(
+        &self,
+        writes: &[StagedTableWrite],
+        commit_metadata: &SnapshotCommitMetadata,
+        expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        if writes.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_multi_table requires at least one table stage".to_string(),
+            ));
+        }
+        let ids = writes
+            .iter()
+            .map(|write| write.table_id)
+            .collect::<std::collections::HashSet<_>>();
+        if ids.len() != writes.len() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "commit_multi_table requires one stage per table".to_string(),
+            ));
+        }
+        block_on(async {
+            sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
+                .execute(&self.pool)
+                .await?;
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            let mut had_data = Vec::with_capacity(writes.len());
+            for write in writes {
+                validate_staged_table(&mut tx, write).await?;
+                if let Some(expected) = expected_base_snapshot_id {
+                    detect_staged_conflict(write.table_id, expected, &mut tx).await?;
+                }
+                let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut *tx).await?;
+                let names: Vec<String> = sqlx::query_scalar(
+                    "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+                )
+                .bind(write.table_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut inline = false;
+                for name in names {
+                    let sql = format!(
+                        "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot IS NULL)",
+                        quote_ident(&name)
+                    );
+                    inline |= sqlx::query_scalar::<_, bool>(AssertSqlSafe(sql))
+                        .fetch_one(&mut *tx)
+                        .await?;
+                }
+                had_data.push((files, inline));
+            }
+            let mut tables = Vec::with_capacity(writes.len());
+            for write in writes {
+                tables.push(
+                    finalize_table_snapshot(
+                        &mut tx,
+                        snapshot_id,
+                        &write.schema_name,
+                        &write.table_name,
+                        write.table_id,
+                        &write.columns,
+                        &write.column_ids,
+                        write.mode,
+                        write.base_snapshot_id,
+                    )
+                    .await?,
+                );
+            }
+            for ((write, ids), (files, inline)) in writes.iter().zip(&tables).zip(had_data) {
+                let mut write = write.clone();
+                write.table_id = ids.table_id;
+                match &write.data {
+                    StagedTableData::Files(files) => {
+                        commit_files_at_snapshot(&mut tx, snapshot_id, &write, files).await?;
+                    },
+                    StagedTableData::Inlined(batches) => {
+                        commit_inlined_at_snapshot(&mut tx, snapshot_id, &write, batches).await?;
+                    },
+                    StagedTableData::None => {},
+                }
+                apply_positional_deletes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.positional_deletes,
+                )
+                .await?;
+                apply_inlined_deletes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.inlined_deletes,
+                )
+                .await?;
+                let changes = staged_table_write_changes(&write, files, inline);
+                record_table_changes(
+                    &mut tx,
+                    snapshot_id,
+                    write.table_id,
+                    &write.schema_name,
+                    &write.table_name,
+                    &changes,
+                    commit_metadata,
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            Ok(MultiTableCommit {
+                snapshot_id,
+                tables,
+            })
+        })
+    }
+
+    fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
+        set_postgres_table_setting(&self.pool, None, table_id, key, value)
+    }
+
+    fn with_commit_lock(
+        &self,
+        identity: &str,
+        operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        with_postgres_commit_lock(&self.pool, &format!("single:{identity}"), operation)
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;

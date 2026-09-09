@@ -39,6 +39,74 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
     Ok((pool, container))
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multicatalog_provider_reads_inlined_rows() {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion_ducklake::metadata_provider::MetadataProvider;
+    use datafusion_ducklake::{MulticatalogProvider, SnapshotCommitMetadata};
+    use tempfile::TempDir;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("inline_read").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![7]))],
+    )
+    .unwrap();
+    let columns = vec![ColumnDef::new("value", "BIGINT", false).unwrap()];
+    let setup = writer
+        .begin_write_transaction("main", "values", &columns, WriteMode::Append)
+        .unwrap();
+    let result = writer
+        .register_inlined_data(
+            setup.table_id,
+            "main",
+            "values",
+            setup.snapshot_id,
+            &[batch],
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+        .unwrap();
+    let provider = MulticatalogProvider::with_pool_and_id(pool, catalog_id)
+        .await
+        .unwrap();
+    let columns = provider
+        .get_table_structure(result.table_id, result.snapshot_id)
+        .unwrap();
+    let batches = provider
+        .get_inlined_data(result.table_id, result.snapshot_id, &columns)
+        .unwrap();
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    assert_eq!(batches.len(), 1);
+    assert_eq!(values.values(), &[7]);
+}
+
 fn cols() -> Vec<ColumnDef> {
     vec![
         ColumnDef::new("id", "int64", false).unwrap(),

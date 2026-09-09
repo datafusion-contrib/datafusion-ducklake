@@ -196,13 +196,50 @@ settings, including `execution.time_zone`, are not inherited.
 
 ## Write concurrency
 
-All write backends use the same **commit-time** model: a write's snapshot id, all its
-metadata rows, and its publication are written in **one transaction**, with the snapshot id
-assigned at commit (so per-catalog id order == commit order) and nothing visible until that
-transaction commits. There are no "dormant" (committed-but-unpublished) rows, so reads never
-observe another writer's uncommitted schema, a transient empty table, or a torn generation.
-On Postgres multi-catalog the begin step only *reserves* ids (via the IDENTITY sequence) and
-reads existing state; it writes nothing.
+Write commits allocate a snapshot and publish their data and final metadata in
+one database transaction. Write setup retains each backend's existing schema
+and table reservation behavior; PostgreSQL layouts reserve identifiers without
+publishing schema or table rows.
+
+`DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
+MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field
+IDs. A conflict rejects the whole commit. Definite rejections remove staged
+objects; ambiguous database or transport failures retain them for guarded vacuum.
+Snapshot-column staging validates its inputs before uploading any objects.
+
+Ordinary append stages commute. Callers can explicitly require an unchanged
+base snapshot with `expected_base_snapshot_id`, including for append stages.
+That optional precondition is stronger than ordinary append isolation.
+
+Empty transactions, zero-row staging calls, and empty delete sets are no-ops.
+They add no result entry or snapshot. Staged inline deletes group row IDs by
+physical table, ignore missing identities, and exclude rows inserted in the
+same snapshot. Separate checks reject concurrent changes, including inline
+deletes and flushes. New inline-delete paths leave the gross metadata record
+count unchanged; query counts come from the visible rows.
+
+MySQL resolves the inline schema version while holding the commit's counter
+lock. It creates physical inline tables through a separate connection so DDL
+cannot implicitly commit the metadata transaction. Zero-row inline stages are
+rejected before physical DDL. The new DuckDB staged inline DDL is nullable,
+matching SQLite and PostgreSQL; older native DDL remains unchanged.
+
+High-level row staging uses Parquet. Automatic small-write routing remains
+separate, and the stored `data_inlining_row_limit` is not parsed by this writer.
+Explicit inline inserts, deletes, and flushes use their storage-specific
+`inlined_insert`, `inlined_delete`, and `inline_flush` ledger tokens.
+
+Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
+registry; standard PostgreSQL staged commits create it on demand. SQLite also
+migrates legacy non-null change ledgers. Snapshot-change readers on all backends
+preserve NULL changes and snapshots without ledger rows. Commit metadata lookup
+searches snapshots with live Parquet files; it is not general idempotency for
+inline-only, delete-only, or retired commits.
+
+Table settings require a supported option and a live table. Coordination locks
+cover the catalog file on SQLite and DuckDB, and the requested identity on
+PostgreSQL and MySQL. MySQL's pre-existing global-setting setter remains
+unsupported.
 
 `WriteMode::Replace` (SQL `INSERT OVERWRITE`, and the first write of a table) is
 **abort-on-conflict** under concurrency, matching DuckLake's snapshot isolation:

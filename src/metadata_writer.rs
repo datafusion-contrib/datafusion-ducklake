@@ -8,7 +8,7 @@ use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -49,20 +49,124 @@ pub enum WriteMode {
     Append,
 }
 
+pub(crate) fn validate_table_setting(key: &str) -> Result<String> {
+    let key = key.to_ascii_lowercase();
+    match key.as_str() {
+        "parquet_compression"
+        | "parquet_compression_level"
+        | "parquet_version"
+        | "parquet_row_group_size"
+        | "parquet_row_group_size_bytes"
+        | "target_file_size"
+        | "data_inlining_row_limit"
+        | "sort_on_insert"
+        | "hive_file_pattern"
+        | "auto_compact"
+        | "rewrite_delete_threshold" => Ok(key),
+        _ => Err(DuckLakeError::Unsupported(format!(
+            "unsupported table setting '{key}'"
+        ))),
+    }
+}
+
 pub(crate) fn table_write_changes(
     table_id: i64,
     mode: WriteMode,
     has_deletes: bool,
-    replaced_existing_data: bool,
+    replaced_storage: (bool, bool),
 ) -> String {
-    match (mode, has_deletes, replaced_existing_data) {
-        (WriteMode::Append, false, _) | (WriteMode::Replace, false, false) => {
-            format!("inserted_into_table:{table_id}")
-        },
-        (WriteMode::Append | WriteMode::Replace, true, _) | (WriteMode::Replace, false, true) => {
-            format!("deleted_from_table:{table_id},inserted_into_table:{table_id}")
-        },
+    table_storage_changes(
+        table_id,
+        Some(false),
+        has_deletes || (mode == WriteMode::Replace && replaced_storage.0),
+        mode == WriteMode::Replace && replaced_storage.1,
+    )
+}
+
+pub(crate) fn staged_table_write_changes(
+    write: &StagedTableWrite,
+    had_files: bool,
+    had_inlined_rows: bool,
+) -> String {
+    if write.inlined_flush {
+        return format!("inline_flush:{}", write.table_id);
     }
+    let insert = match &write.data {
+        StagedTableData::Files(_) => Some(false),
+        StagedTableData::Inlined(_) => Some(true),
+        StagedTableData::None => None,
+    };
+    table_storage_changes(
+        write.table_id,
+        insert,
+        !write.positional_deletes.is_empty() || (write.mode == WriteMode::Replace && had_files),
+        !write.inlined_deletes.is_empty() || (write.mode == WriteMode::Replace && had_inlined_rows),
+    )
+}
+
+pub(crate) fn table_storage_changes(
+    table_id: i64,
+    inlined_insert: Option<bool>,
+    deleted_files: bool,
+    deleted_inlined: bool,
+) -> String {
+    let mut changes = Vec::new();
+    if deleted_files {
+        changes.push(format!("deleted_from_table:{table_id}"));
+    }
+    if deleted_inlined {
+        changes.push(format!("inlined_delete:{table_id}"));
+    }
+    match inlined_insert {
+        Some(false) => changes.push(format!("inserted_into_table:{table_id}")),
+        Some(true) => changes.push(format!("inlined_insert:{table_id}")),
+        None => {},
+    }
+    changes.join(",")
+}
+
+pub(crate) fn snapshot_has_change(changes: &str, expected: &str) -> bool {
+    snapshot_change_tokens(changes).any(|change| change == expected)
+}
+
+pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
+    snapshot_change_tokens(changes).any(|change| {
+        let Some((kind, id)) = change.split_once(':') else {
+            return false;
+        };
+        id.parse::<i64>().ok() == Some(table_id)
+            && [
+                "dropped_table",
+                "altered_table",
+                "inlined_delete",
+                "inline_flush",
+                "inserted_into_table",
+                "inlined_insert",
+            ]
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    changes.split(move |character| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        character == ',' && !quoted
+    })
+}
+
+pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
+    let mut groups = BTreeMap::new();
+    for row in rows {
+        groups
+            .entry(row.table_name.as_str())
+            .or_insert_with(BTreeSet::new)
+            .insert(row.row_id);
+    }
+    groups
 }
 
 pub(crate) fn quote_snapshot_name(name: &str) -> String {
@@ -1042,6 +1146,112 @@ pub struct InlinedRowRef {
     pub row_id: i64,
 }
 
+/// Row storage staged for one table in a multi-table write.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum StagedTableData {
+    /// Parquet data files already uploaded to object storage.
+    Files(Vec<DataFileInfo>),
+    /// Record batches to store in DuckLake's metadata catalog.
+    Inlined(Vec<RecordBatch>),
+    /// No inserted rows; the stage contains only deletes.
+    None,
+}
+
+/// One table's staged changes in a multi-table write.
+#[derive(Debug, Clone)]
+pub struct StagedTableWrite {
+    pub(crate) table_id: i64,
+    pub(crate) schema_name: String,
+    pub(crate) table_name: String,
+    pub(crate) base_snapshot_id: i64,
+    pub(crate) mode: WriteMode,
+    pub(crate) columns: Vec<ColumnDef>,
+    pub(crate) column_ids: Vec<i64>,
+    pub(crate) data: StagedTableData,
+    pub(crate) snapshot_id_columns: Vec<String>,
+    pub(crate) positional_deletes: Vec<DeleteFileEntry>,
+    pub(crate) inlined_deletes: Vec<InlinedRowRef>,
+    pub(crate) inlined_flush: bool,
+}
+
+impl StagedTableWrite {
+    /// Returns the target table id reserved during write setup.
+    #[must_use]
+    pub const fn table_id(&self) -> i64 {
+        self.table_id
+    }
+
+    /// Returns the target schema name.
+    #[must_use]
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// Returns the target table name.
+    #[must_use]
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// Returns the table snapshot observed during write setup.
+    #[must_use]
+    pub const fn base_snapshot_id(&self) -> i64 {
+        self.base_snapshot_id
+    }
+
+    /// Returns the staged write mode.
+    #[must_use]
+    pub const fn mode(&self) -> WriteMode {
+        self.mode
+    }
+
+    /// Returns the staged catalog columns.
+    #[must_use]
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
+    /// Returns the catalog column ids paired with the staged columns.
+    #[must_use]
+    pub fn column_ids(&self) -> &[i64] {
+        &self.column_ids
+    }
+
+    /// Returns the staged row storage.
+    #[must_use]
+    pub const fn data(&self) -> &StagedTableData {
+        &self.data
+    }
+
+    /// Returns the staged positional deletes.
+    #[must_use]
+    pub fn positional_deletes(&self) -> &[DeleteFileEntry] {
+        &self.positional_deletes
+    }
+
+    /// Returns the staged inlined-row deletes.
+    #[must_use]
+    pub fn inlined_deletes(&self) -> &[InlinedRowRef] {
+        &self.inlined_deletes
+    }
+
+    /// Returns whether this stage moves inlined rows into Parquet without changing logical rows.
+    #[must_use]
+    pub const fn inlined_flush(&self) -> bool {
+        self.inlined_flush
+    }
+}
+
+/// Result of one atomic multi-table write.
+#[derive(Debug, Clone)]
+pub struct MultiTableCommit {
+    /// Snapshot shared by every committed table change.
+    pub snapshot_id: i64,
+    /// Authoritative schema and table ids for each staged table.
+    pub tables: Vec<CommitIds>,
+}
+
 /// Result of a transactional write setup operation.
 #[derive(Debug)]
 pub struct WriteSetupResult {
@@ -1078,6 +1288,40 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn set_global_setting(&self, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "global-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Replace a supported write option on a live table.
+    fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "table-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Run an operation while holding a backend-appropriate commit lock.
+    ///
+    /// A coordination utility for callers that want to serialize a multi-step
+    /// commit workflow (e.g. read staged state, dedup, commit) under one
+    /// `identity` across processes. PostgreSQL and MySQL scope the lock by identity;
+    /// SQLite and DuckDB serialize all identities in the same catalog file.
+    /// Correctness does not depend on it: the
+    /// optimistic `expected_base_snapshot_id` fence remains the conflict
+    /// mechanism, and this lock only avoids duplicate concurrent work.
+    ///
+    /// Contract: the lock is held for the duration of `operation` and released
+    /// on both success and error before this returns; an `operation` error
+    /// propagates and takes precedence over a release error. A crashed holder
+    /// must not leave the lock held (backends use self-releasing mechanisms:
+    /// an advisory transaction lock, a file lock released on close). Keep
+    /// critical sections short — implementations may pin a connection while
+    /// the lock is held.
+    fn with_commit_lock(
+        &self,
+        _identity: &str,
+        _operation: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "commit locking is not supported by this metadata backend".to_string(),
         ))
     }
 
@@ -1463,6 +1707,22 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(
             "data inlining is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Commit staged changes for multiple tables in one metadata transaction.
+    ///
+    /// Implementations allocate one snapshot, evaluate the optional table-state
+    /// fence once for the complete write, and make every table change visible
+    /// together. A returned error must leave no staged metadata visible.
+    fn commit_multi_table(
+        &self,
+        _writes: &[StagedTableWrite],
+        _commit_metadata: &SnapshotCommitMetadata,
+        _expected_base_snapshot_id: Option<i64>,
+    ) -> Result<MultiTableCommit> {
+        Err(DuckLakeError::InvalidConfig(
+            "multi-table writes are not supported by this metadata writer".to_string(),
         ))
     }
 

@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every live file (#293).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
   every metadata backend; SQL writes and compaction honour the resolved values (#271).
+- Read nullable snapshot changes and find commits with live files on DuckDB,
+  SQLite, PostgreSQL, and MySQL (#274).
+- Set supported table-scoped options and coordinate commits on DuckDB, SQLite,
+  MySQL, and both PostgreSQL layouts (#274).
+- Commit staged writes across new or existing tables in one snapshot on all
+  metadata backends; empty staging calls do not publish snapshots (#274).
+- `DuckLakeWriteOptions::data_inlining_row_limit` reserves the automatic limit;
+  high-level writes use Parquet and leave the stored limit unparsed (#274).
+- Validate snapshot-column staging before uploading files, and reject settings
+  for unknown options or dropped tables (#274).
+
 - SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
   snapshot on all four write backends; DuckDB and MySQL now implement combined
   deletes and exact inline-aware truncate counts (#273).
@@ -61,6 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers no public constructor for one, so these two execs are effectively crate-internal now.
   `ROW_POS_COLUMN_NAME` is also only a *base* name: a scan whose file already has a column of
   that name uses a suffixed variant, so locating the column by name is no longer reliable (#130).
+- Opening SQLite and multicatalog PostgreSQL writers adds the inline registry
+  required by staged writes, replacements, and truncation (#274).
+
 - **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
   `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
 - Rolling and partitioned writes upload up to 4 files at once, raising peak write memory

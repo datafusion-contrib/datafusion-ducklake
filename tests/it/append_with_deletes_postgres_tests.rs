@@ -18,8 +18,9 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{BinaryExpr, col, lit};
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DeleteFileEntry, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, MetadataProvider,
-    MetadataWriter, MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter, WriteMode,
+    ColumnDef, DeleteFileEntry, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter,
+    MetadataProvider, MetadataWriter, MulticatalogManager, MulticatalogProvider,
+    PostgresMetadataWriter, WriteMode,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -40,6 +41,123 @@ async fn spin_up_postgres() -> anyhow::Result<(PgPool, ContainerAsync<Postgres>)
         .await?;
     datafusion_ducklake::initialize_multicatalog_schema(&pool).await?;
     Ok((pool, container))
+}
+
+#[rstest::rstest]
+#[case::existing_tables(true)]
+#[case::reserved_tables(false)]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn multi_table_write_commits_two_tables_postgres(#[case] existing: bool) {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("pg_multi_table").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = writer_for(&pool, catalog_id, &data_path).await;
+    let columns = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    if existing {
+        for table_name in ["data", "coverage"] {
+            let setup = writer
+                .begin_write_transaction("public", table_name, &columns, WriteMode::Append)
+                .unwrap();
+            writer
+                .publish_snapshot(
+                    setup.table_id,
+                    "public",
+                    table_name,
+                    setup.snapshot_id,
+                    WriteMode::Append,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.column_ids,
+                )
+                .unwrap();
+        }
+    }
+    let table_writer = DuckLakeTableWriter::new(
+        writer,
+        Arc::new(LocalFileSystem::new()) as Arc<dyn object_store::ObjectStore>,
+    )
+    .unwrap();
+    let mut transaction = table_writer.transaction();
+    transaction
+        .stage_write(
+            "public",
+            "data",
+            schema().as_ref(),
+            WriteMode::Append,
+            &[RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
+                ],
+            )
+            .unwrap()],
+        )
+        .await
+        .unwrap();
+    transaction
+        .stage_write(
+            "public",
+            "coverage",
+            schema().as_ref(),
+            WriteMode::Append,
+            &[RecordBatch::try_new(
+                schema(),
+                vec![Arc::new(Int32Array::from(vec![1])), Arc::new(Int32Array::from(vec![10]))],
+            )
+            .unwrap()],
+        )
+        .await
+        .unwrap();
+
+    let results = transaction.commit().await.unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    assert_eq!(results[0].files_written, 1);
+    assert_eq!(results[1].files_written, 1);
+    let data_snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file WHERE table_id = $1",
+    )
+    .bind(results[0].table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let second_snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file WHERE table_id = $1",
+    )
+    .bind(results[1].table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(data_snapshots, vec![results[0].snapshot_id]);
+    assert_eq!(second_snapshots, vec![results[0].snapshot_id]);
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+    )
+    .bind(results[0].snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let inserts = format!(
+        "inserted_into_table:{},inserted_into_table:{}",
+        results[0].table_id, results[1].table_id
+    );
+    let expected = if existing {
+        inserts
+    } else {
+        format!(
+            "created_schema:\"public\",created_table:\"public\".\"data\",created_table:\"public\".\"coverage\",{inserts}"
+        )
+    };
+    assert_eq!(changes, expected);
 }
 
 /// The `(id, val)` table schema used throughout.

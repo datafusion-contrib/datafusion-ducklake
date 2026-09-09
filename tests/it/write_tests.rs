@@ -5,25 +5,29 @@
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
+use std::slice::from_ref;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, ListBuilder, MapArray, StringArray, StringBuilder,
-    StringViewArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, ListBuilder, MapArray, StringArray,
+    StringBuilder, StringViewArray, StructArray, TimestampMicrosecondArray,
+    TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Float32Type, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
+use futures::TryStreamExt;
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
 use sqlx::Row;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTableWriter, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode, register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataProvider,
+    MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter, TableWriteOptions, WriteMode,
+    register_ducklake_functions,
 };
 
 /// Create a local filesystem object store.
@@ -88,6 +92,7 @@ fn parquet_schema_fields(path: &std::path::Path) -> Vec<(String, Option<i32>)> {
     result
 }
 
+#[cfg(feature = "metadata-duckdb")]
 fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
     let conformance_path = catalog_path.with_file_name("duckdb-conformance.db");
     std::fs::copy(catalog_path, &conformance_path).unwrap();
@@ -515,6 +520,7 @@ async fn test_write_and_read_list_struct_column_roundtrip() {
         .await
         .unwrap();
 
+    #[cfg(feature = "metadata-duckdb")]
     assert_duckdb_extension_reads_depths(&temp_dir.path().join("test.db"));
 
     let ctx = create_read_context(&temp_dir).await;
@@ -2299,4 +2305,609 @@ async fn test_write_and_read_nanosecond_timestamptz() {
         ns_values.as_slice(),
         "sub-microsecond fraction must survive the round-trip"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_table_commit_records_created_schema_once() {
+    let (metadata, temp) = create_test_env().await;
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), create_object_store()).unwrap();
+    let first = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![11, 23])) as ArrayRef,
+    )])
+    .unwrap();
+    let second = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![37])) as ArrayRef,
+    )])
+    .unwrap();
+    let mut transaction = writer.transaction();
+    for (name, batch) in [("first", &first), ("second", &second)] {
+        transaction
+            .stage_write(
+                "new_schema",
+                name,
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(batch),
+            )
+            .await
+            .unwrap();
+    }
+    let results = transaction.commit().await.unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(results[0].snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let snapshots: Vec<i64> =
+        sqlx::query_scalar("SELECT begin_snapshot FROM ducklake_data_file ORDER BY table_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx.sql("SELECT value FROM test.new_schema.first UNION ALL SELECT value FROM test.new_schema.second ORDER BY value")
+        .await.unwrap().collect().await.unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].snapshot_id, results[1].snapshot_id);
+    assert_eq!(
+        (results[0].files_written, results[0].records_written),
+        (1, 2)
+    );
+    assert_eq!(
+        (results[1].files_written, results[1].records_written),
+        (1, 1)
+    );
+    assert_eq!(snapshots, vec![results[0].snapshot_id; 2]);
+    assert_eq!(values, vec![11, 23, 37]);
+    assert_eq!(
+        changes,
+        format!(
+            "created_schema:\"new_schema\",created_table:\"new_schema\".\"first\",created_table:\"new_schema\".\"second\",inserted_into_table:{},inserted_into_table:{}",
+            results[0].table_id, results[1].table_id
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicted_multi_table_commit_leaves_no_partial_state_and_no_staged_files() {
+    let (metadata, temp) = create_test_env().await;
+    let metadata = Arc::new(metadata);
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(metadata.clone(), store.clone()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![11])) as ArrayRef,
+    )])
+    .unwrap();
+    writer
+        .append_table("main", "first", from_ref(&batch))
+        .await
+        .unwrap();
+    let base = writer
+        .append_table("main", "second", from_ref(&batch))
+        .await
+        .unwrap();
+    let mut transaction = writer
+        .transaction()
+        .with_options(&TableWriteOptions::new().with_expected_base_snapshot_id(base.snapshot_id));
+    for name in ["first", "second"] {
+        transaction
+            .stage_write(
+                "main",
+                name,
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(&batch),
+            )
+            .await
+            .unwrap();
+    }
+    let concurrent = writer
+        .append_table("main", "second", &[batch])
+        .await
+        .unwrap();
+    let provider =
+        SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let snapshots = provider.list_snapshots().unwrap().len();
+    let error = transaction.commit().await.unwrap_err();
+    let files = store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx.sql("SELECT (SELECT COUNT(*) FROM test.main.first) AS first, (SELECT COUNT(*) FROM test.main.second) AS second")
+        .await.unwrap().collect().await.unwrap();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        concurrent.snapshot_id
+    );
+    assert_eq!(provider.list_snapshots().unwrap().len(), snapshots);
+    assert_eq!(files.len(), 3);
+    assert_eq!(
+        actual[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[1]
+    );
+    assert_eq!(
+        actual[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values(),
+        &[2]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn abort_multi_table_write_removes_staged_files() {
+    let (metadata, temp) = create_test_env().await;
+    let metadata = Arc::new(metadata);
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(metadata.clone(), store.clone()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![17])) as ArrayRef,
+    )])
+    .unwrap();
+    let base = writer
+        .append_table("main", "events", from_ref(&batch))
+        .await
+        .unwrap();
+    let before = store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "events",
+            batch.schema().as_ref(),
+            WriteMode::Append,
+            &[batch],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    transaction.abort().await.unwrap();
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap()
+            .get_current_snapshot()
+            .unwrap(),
+        base.snapshot_id
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_multi_table_database_commit_preserves_staged_files() {
+    let (metadata, temp) = create_test_env().await;
+    let metadata = Arc::new(metadata);
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(metadata.clone(), store.clone()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![19])) as ArrayRef,
+    )])
+    .unwrap();
+    let base = writer
+        .append_table("main", "events", from_ref(&batch))
+        .await
+        .unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "events",
+            batch.schema().as_ref(),
+            WriteMode::Append,
+            &[batch],
+        )
+        .await
+        .unwrap();
+    let before = store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    sqlx::query("DROP TABLE ducklake_snapshot_changes")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = transaction.commit().await.unwrap_err();
+    assert!(matches!(error, DuckLakeError::Sqlx(_)), "{error}");
+    assert_eq!(before.len(), 2);
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap()
+            .get_current_snapshot()
+            .unwrap(),
+        base.snapshot_id
+    );
+}
+
+#[rstest::rstest]
+#[case::snapshot_columns(false)]
+#[case::snapshot_columns_with_deletes(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn rejected_snapshot_column_stage_leaves_no_objects(#[case] with_deletes: bool) {
+    let (metadata, temp) = create_test_env().await;
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), store.clone()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![19])) as ArrayRef,
+    )])
+    .unwrap();
+    let options = DuckLakeWriteOptions::default();
+    let mut transaction = writer.transaction();
+    let result = if with_deletes {
+        transaction
+            .stage_write_with_deletes_and_snapshot_columns(
+                "main",
+                "events",
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+                &options,
+                &["value"],
+            )
+            .await
+    } else {
+        transaction
+            .stage_write_with_snapshot_columns(
+                "main",
+                "events",
+                batch.schema().as_ref(),
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+                &["value"],
+            )
+            .await
+    };
+    transaction.abort().await.unwrap();
+    assert!(matches!(result, Err(DuckLakeError::InvalidConfig(_))));
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+}
+
+#[rstest::rstest]
+#[case::empty_transaction(0)]
+#[case::empty_rows(1)]
+#[case::empty_rows_with_options(2)]
+#[case::empty_snapshot_rows(3)]
+#[case::empty_deletes(4)]
+#[case::empty_rows_with_deletes(5)]
+#[case::empty_snapshot_rows_with_deletes(6)]
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_transaction_stages_do_not_publish(#[case] stage: u8) {
+    let (metadata, temp) = create_test_env().await;
+    let store = create_object_store();
+    let prefix = ObjectPath::from(
+        temp.path()
+            .join("data")
+            .to_string_lossy()
+            .trim_start_matches('/'),
+    );
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), store.clone()).unwrap();
+    let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+    let batch = RecordBatch::new_empty(Arc::new(schema.clone()));
+    let options = DuckLakeWriteOptions::default();
+    let mut transaction = writer.transaction();
+    match stage {
+        0 => {},
+        1 => transaction
+            .stage_write(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+            )
+            .await
+            .unwrap(),
+        2 => transaction
+            .stage_write_with_options(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+            )
+            .await
+            .unwrap(),
+        3 => transaction
+            .stage_write_with_snapshot_columns(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &options,
+                &["value"],
+            )
+            .await
+            .unwrap(),
+        4 => transaction
+            .stage_deletes("main", "events", &schema, &[], &[])
+            .unwrap(),
+        5 => transaction
+            .stage_write_with_deletes(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+            )
+            .await
+            .unwrap(),
+        6 => transaction
+            .stage_write_with_deletes_and_snapshot_columns(
+                "main",
+                "events",
+                &schema,
+                WriteMode::Append,
+                from_ref(&batch),
+                &[],
+                &[],
+                &options,
+                &["value"],
+            )
+            .await
+            .unwrap(),
+        _ => unreachable!(),
+    }
+    let results = transaction.commit().await.unwrap();
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let state: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM ducklake_snapshot), (SELECT COUNT(*) FROM ducklake_table), (SELECT COUNT(*) FROM ducklake_column)").fetch_one(&pool).await.unwrap();
+    assert_eq!(results.len(), 0);
+    assert_eq!(state, (0, 0, 0));
+    assert_eq!(
+        store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_append_stages_commute_without_a_fence() {
+    let (metadata, temp) = create_test_env().await;
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), create_object_store()).unwrap();
+    let rows = [11, 23, 37].map(|value| {
+        RecordBatch::try_from_iter(vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![value])) as ArrayRef,
+        )])
+        .unwrap()
+    });
+    writer
+        .append_table("main", "events", from_ref(&rows[0]))
+        .await
+        .unwrap();
+    let mut first = writer.transaction();
+    let mut second = writer.transaction();
+    first
+        .stage_write(
+            "main",
+            "events",
+            rows[1].schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&rows[1]),
+        )
+        .await
+        .unwrap();
+    second
+        .stage_write(
+            "main",
+            "events",
+            rows[2].schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&rows[2]),
+        )
+        .await
+        .unwrap();
+    let first = first.commit().await.unwrap();
+    let second = second.commit().await.unwrap();
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx
+        .sql("SELECT value FROM test.main.events ORDER BY value")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(second[0].snapshot_id, first[0].snapshot_id + 1);
+    assert_eq!(values, vec![11, 23, 37]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_schema_change_rejects_without_reverting_columns() {
+    let (metadata, temp) = create_test_env().await;
+    let writer = DuckLakeTableWriter::new(Arc::new(metadata), create_object_store()).unwrap();
+    let batch = RecordBatch::try_from_iter(vec![(
+        "value",
+        Arc::new(Int64Array::from(vec![11])) as ArrayRef,
+    )])
+    .unwrap();
+    writer
+        .append_table("main", "events", from_ref(&batch))
+        .await
+        .unwrap();
+    let mut transaction = writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "events",
+            batch.schema().as_ref(),
+            WriteMode::Append,
+            from_ref(&batch),
+        )
+        .await
+        .unwrap();
+    let changed = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ])),
+        vec![Arc::new(Int64Array::from(vec![23])), Arc::new(StringArray::from(vec!["added"]))],
+    )
+    .unwrap();
+    let committed = writer
+        .append_table("main", "events", &[changed])
+        .await
+        .unwrap();
+    let error = transaction.commit().await.unwrap_err();
+    let provider =
+        SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))
+            .await
+            .unwrap();
+    let columns = provider
+        .get_table_structure(committed.table_id, committed.snapshot_id)
+        .unwrap();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        committed.snapshot_id
+    );
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| column.column_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["value", "extra"]
+    );
+    let ctx = create_read_context(&temp).await;
+    let actual = ctx
+        .sql("SELECT value FROM test.main.events ORDER BY value")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values: Vec<i64> = actual
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(values, vec![11, 23]);
 }

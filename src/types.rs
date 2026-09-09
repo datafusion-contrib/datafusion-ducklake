@@ -781,6 +781,20 @@ pub fn build_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
     Ok(Schema::new(fields?))
 }
 
+pub(crate) fn build_strict_arrow_schema(columns: &[DuckLakeTableColumn]) -> Result<Schema> {
+    let fields = columns
+        .iter()
+        .map(|column| {
+            Ok(Field::new(
+                &column.column_name,
+                column.data_type()?,
+                column.is_nullable,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new(fields))
+}
+
 /// Prefix of the synthetic name a read schema gives a column the file does not
 /// carry, so the scan null-fills it instead of matching a same-named column that
 /// happens to be present.
