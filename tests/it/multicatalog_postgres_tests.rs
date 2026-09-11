@@ -6290,3 +6290,499 @@ async fn drop_catalog_reclaims_children_and_spares_other_catalogs() {
         "drop_catalog reached into another catalog sharing this metadata database"
     );
 }
+
+// ---------------------------------------------------------------------------
+// File ownership: relative rows own, absolute rows reference.
+//
+// A database fork registers its source's files under its own catalog with the
+// source's fully resolved paths marked absolute. These tests pin the rule that
+// keeps that safe: a catalog never schedules an object it only references, and
+// an owner's cleanup waits while any catalog still references the object.
+// ---------------------------------------------------------------------------
+
+/// Expiring a snapshot that retires an absolute-path (reference) row deletes
+/// the row but schedules nothing: the referencing catalog does not own the
+/// object, so it must not reclaim it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_in_catalog_drops_absolute_reference_rows_without_scheduling() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    wa.set_data_path("/data").unwrap();
+    wb.set_data_path("/data").unwrap();
+
+    // A owns f1.
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a1.table_id,
+        "public",
+        "t",
+        a1.snapshot_id,
+        &DataFileInfo::new("f1.parquet", 100, 5),
+        WriteMode::Replace,
+        a1.base_snapshot_id,
+        &cols(),
+        &a1.column_ids,
+    )
+    .unwrap();
+
+    // B references f1, then replaces that reference with another (retiring it).
+    let f1_abs = format!("/data/cat_{cat_a}/public/t/f1.parquet");
+    let f2_abs = format!("/data/cat_{cat_a}/public/t/f2.parquet");
+    let r1 = wb
+        .register_existing_data_file(
+            "public",
+            "t",
+            &cols(),
+            &a1.column_ids,
+            &DataFileInfo::new(f1_abs.clone(), 100, 5).with_absolute_path(),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    let r2 = wb
+        .register_existing_data_file(
+            "public",
+            "t",
+            &cols(),
+            &a1.column_ids,
+            &DataFileInfo::new(f2_abs.clone(), 100, 5).with_absolute_path(),
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let expired = mgr
+        .expire_snapshots_in_catalog("cat_b", ExpireCriteria::Versions(vec![r1.snapshot_id]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1, "B's first snapshot expired");
+
+    // The dead reference row is gone: only the live reference remains in B.
+    let b_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM ducklake_data_file WHERE table_id = $1 ORDER BY data_file_id",
+    )
+    .bind(r2.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        b_paths,
+        vec![f2_abs],
+        "the retired reference row was deleted"
+    );
+
+    // But nothing was scheduled: B does not own A's object.
+    let b_scheduled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        b_scheduled, 0,
+        "a reference is never scheduled for deletion"
+    );
+
+    // A's own row is untouched.
+    let a_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1")
+            .bind(a1.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(a_rows, 1);
+}
+
+/// An owner's cleanup skips a scheduled object while an absolute data-file row
+/// in another catalog still names it, and reclaims it once that row is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_in_catalog_keeps_a_file_an_absolute_reference_still_names() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    // A: f1 then f2 (f1 superseded). Both objects exist under A's layout.
+    let table_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::write(table_dir.join("f1.parquet"), b"f1").unwrap();
+    std::fs::write(table_dir.join("f2.parquet"), b"f2").unwrap();
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap1 = wa
+        .register_data_file(
+            a1.table_id,
+            "public",
+            "t",
+            a1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 2, 5),
+            WriteMode::Replace,
+            a1.base_snapshot_id,
+            &cols(),
+            &a1.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        "public",
+        "t",
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 2, 5),
+        WriteMode::Replace,
+        a2.base_snapshot_id,
+        &cols(),
+        &a2.column_ids,
+    )
+    .unwrap();
+
+    // B references f1 by the string A's reader resolves it to.
+    let (_, base) = parse_object_store_url(&data_str).unwrap();
+    let f1_abs = join_paths(&base, &format!("cat_{cat_a}/public/t/f1.parquet")).unwrap();
+    wb.register_existing_data_file(
+        "public",
+        "t",
+        &cols(),
+        &a1.column_ids,
+        &DataFileInfo::new(f1_abs.clone(), 2, 5).with_absolute_path(),
+        WriteMode::Replace,
+    )
+    .unwrap();
+
+    // A expires its first snapshot: f1 is dead in A and scheduled (A owns it).
+    let expired = mgr
+        .expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![snap1]))
+        .await
+        .unwrap();
+    assert_eq!(expired.len(), 1);
+    let scheduled = |cat: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+            )
+            .bind(cat)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let schedule_start = |cat: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+                "SELECT schedule_start FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+            )
+            .bind(cat)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(scheduled(cat_a).await, 1, "A scheduled f1");
+    let before = schedule_start(cat_a).await;
+
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    // Dry run and real run alike leave f1 alone while B's reference stands.
+    let would = cleanup_old_files_in_catalog(&mgr, "cat_a", os.clone(), CleanupCriteria::All, true)
+        .await
+        .unwrap();
+    assert!(
+        would.is_empty(),
+        "dry run must not list a referenced file: {would:?}"
+    );
+    let deleted =
+        cleanup_old_files_in_catalog(&mgr, "cat_a", os.clone(), CleanupCriteria::All, false)
+            .await
+            .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "referenced file not deleted: {deleted:?}"
+    );
+    assert!(
+        table_dir.join("f1.parquet").exists(),
+        "f1 survives while B references it"
+    );
+    assert_eq!(scheduled(cat_a).await, 1, "f1 stays scheduled for later");
+    assert!(
+        schedule_start(cat_a).await >= before,
+        "a deferred row's schedule_start moves forward, not back"
+    );
+
+    // B lets go: the next cleanup reclaims f1 and only f1.
+    mgr.drop_catalog("cat_b").await.unwrap();
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, vec![f1_abs]);
+    assert!(!table_dir.join("f1.parquet").exists(), "f1 reclaimed");
+    assert!(table_dir.join("f2.parquet").exists(), "live f2 untouched");
+    assert_eq!(scheduled(cat_a).await, 0);
+}
+
+/// The same guard honours an absolute-path *delete-file* row: a referenced
+/// positional delete file is kept while any catalog still points at it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_in_catalog_honours_absolute_delete_file_references() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo};
+    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    // A: f1 then f2. f1 will be retired and scheduled; B will name it as the
+    // delete file of its own reference to f2 (the shape of the guard, not of a
+    // real fork — the guard only compares paths).
+    let table_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::write(table_dir.join("f1.parquet"), b"f1").unwrap();
+    std::fs::write(table_dir.join("f2.parquet"), b"f2").unwrap();
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap1 = wa
+        .register_data_file(
+            a1.table_id,
+            "public",
+            "t",
+            a1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 2, 5),
+            WriteMode::Replace,
+            a1.base_snapshot_id,
+            &cols(),
+            &a1.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        "public",
+        "t",
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 2, 5),
+        WriteMode::Replace,
+        a2.base_snapshot_id,
+        &cols(),
+        &a2.column_ids,
+    )
+    .unwrap();
+
+    let (_, base) = parse_object_store_url(&data_str).unwrap();
+    let f1_abs = join_paths(&base, &format!("cat_{cat_a}/public/t/f1.parquet")).unwrap();
+    let f2_abs = join_paths(&base, &format!("cat_{cat_a}/public/t/f2.parquet")).unwrap();
+    wb.register_existing_data_file_with_delete(
+        "public",
+        "t",
+        &cols(),
+        &a1.column_ids,
+        &DataFileInfo::new(f2_abs, 2, 5).with_absolute_path(),
+        Some(&DeleteFileInfo::new(f1_abs.clone(), 2, 1).with_absolute_path()),
+        WriteMode::Replace,
+    )
+    .unwrap();
+
+    mgr.expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![snap1]))
+        .await
+        .unwrap();
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted =
+        cleanup_old_files_in_catalog(&mgr, "cat_a", os.clone(), CleanupCriteria::All, false)
+            .await
+            .unwrap();
+    assert!(
+        deleted.is_empty(),
+        "a delete-file reference protects the object too: {deleted:?}"
+    );
+    assert!(table_dir.join("f1.parquet").exists());
+
+    mgr.drop_catalog("cat_b").await.unwrap();
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, vec![f1_abs]);
+    assert!(!table_dir.join("f1.parquet").exists());
+}
+
+/// `register_existing_data_file_with_delete` inserts the delete row in the same
+/// commit, hanging off the freshly assigned data file, with the caller's path
+/// stored as given (absolute here) and its count.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_with_delete_attaches_an_absolute_reference_delete_row() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_ref_delete").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    let out = w
+        .register_existing_data_file_with_delete(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("/data/cat_9/public/orders/f1.parquet", 1024, 3)
+                .with_absolute_path()
+                .with_footer_size(77),
+            Some(
+                &DeleteFileInfo::new("/data/cat_9/public/orders/d1.parquet", 64, 1)
+                    .with_absolute_path()
+                    .with_footer_size(33),
+            ),
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let (data_file_id, data_path, data_rel, footer): (i64, String, bool, Option<i64>) =
+        sqlx::query_as(
+            "SELECT data_file_id, path, path_is_relative, footer_size
+             FROM ducklake_data_file WHERE table_id = $1",
+        )
+        .bind(out.table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(data_path, "/data/cat_9/public/orders/f1.parquet");
+    assert!(!data_rel, "data file stored as a reference");
+    assert_eq!(footer, Some(77));
+
+    let (del_data_file_id, del_path, del_rel, del_footer, del_count, del_begin): (
+        i64,
+        String,
+        bool,
+        Option<i64>,
+        i64,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT data_file_id, path, path_is_relative, footer_size, delete_count, begin_snapshot
+         FROM ducklake_delete_file WHERE table_id = $1",
+    )
+    .bind(out.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        del_data_file_id, data_file_id,
+        "hangs off the new data file"
+    );
+    assert_eq!(del_path, "/data/cat_9/public/orders/d1.parquet");
+    assert!(!del_rel, "delete file stored as a reference");
+    assert_eq!(del_footer, Some(33));
+    assert_eq!(del_count, 1);
+    assert_eq!(del_begin, out.snapshot_id, "same commit, same snapshot");
+
+    // The no-delete shorthand still works and attaches nothing.
+    let out2 = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("/data/cat_9/public/orders/f2.parquet", 512, 2).with_absolute_path(),
+            WriteMode::Append,
+        )
+        .unwrap();
+    assert_eq!(out2.table_id, out.table_id);
+    let delete_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_delete_file WHERE table_id = $1")
+            .bind(out.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(delete_rows, 1);
+}
+
+/// The partial indexes behind `referenced_absolute_paths` are part of the
+/// schema bootstrap, so an existing deployment gains them on its next boot.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn initialize_multicatalog_schema_creates_absolute_path_indexes() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let names = ["idx_data_file_absolute_path", "idx_delete_file_absolute_path"];
+    let defs: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname::text, indexdef::text FROM pg_indexes
+         WHERE indexname = ANY($1) ORDER BY indexname",
+    )
+    .bind(&names[..])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        defs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+        names.to_vec()
+    );
+    for (name, def) in &defs {
+        assert!(
+            def.contains("WHERE (NOT path_is_relative)"),
+            "{name} must be partial over absolute rows: {def}"
+        );
+    }
+    // Idempotent: a second bootstrap is a no-op, not a duplicate-index error.
+    initialize_multicatalog_schema(&pool).await.unwrap();
+}

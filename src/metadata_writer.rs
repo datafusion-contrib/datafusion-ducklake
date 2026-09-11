@@ -2258,14 +2258,58 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// Default: unsupported; only multicatalog Postgres, whose column ids are
     /// reusable across catalogs, implements it.
+    ///
+    /// Shorthand for [`register_existing_data_file_with_delete`] with no delete file.
+    ///
+    /// [`register_existing_data_file_with_delete`]: MetadataWriter::register_existing_data_file_with_delete
     #[allow(clippy::too_many_arguments)]
     fn register_existing_data_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        file: &DataFileInfo,
+        mode: WriteMode,
+    ) -> Result<CommitIds> {
+        self.register_existing_data_file_with_delete(
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            file,
+            None,
+            mode,
+        )
+    }
+
+    /// [`register_existing_data_file`] that also attaches `delete`, an existing
+    /// positional delete file for `file`, in the same commit.
+    ///
+    /// Positional deletes address rows by their position inside the data file, so a
+    /// delete file stays valid for any byte-identical copy — or reference — of that
+    /// file. A database fork uses this to carry the source table's row-level deletes
+    /// across without rewriting either file: both `file` and `delete` are registered
+    /// with the source's paths marked absolute (`with_absolute_path`), and the
+    /// destination reads exactly what the source read at that snapshot.
+    ///
+    /// The delete row is inserted with the freshly assigned `data_file_id`, the
+    /// commit's snapshot, and `delete`'s own path, relativity, sizes and count, none
+    /// of which are checked against the file's contents (the caller copied them from
+    /// the source catalog).
+    ///
+    /// Default: unsupported, like [`register_existing_data_file`].
+    ///
+    /// [`register_existing_data_file`]: MetadataWriter::register_existing_data_file
+    #[allow(clippy::too_many_arguments)]
+    fn register_existing_data_file_with_delete(
         &self,
         _schema_name: &str,
         _table_name: &str,
         _columns: &[ColumnDef],
         _column_ids: &[i64],
         _file: &DataFileInfo,
+        _delete: Option<&DeleteFileInfo>,
         _mode: WriteMode,
     ) -> Result<CommitIds> {
         Err(DuckLakeError::InvalidConfig(

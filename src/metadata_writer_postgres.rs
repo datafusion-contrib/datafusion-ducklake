@@ -539,6 +539,15 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
         ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
+    // An absolute-path file row is a reference to a file another catalog owns
+    // (a database fork registers the source's files this way). Cleanup asks
+    // "does any catalog still reference this path" before deleting an object;
+    // these partial indexes answer that in one lookup. Only reference rows are
+    // absolute, so the indexed set is tiny on every deployment.
+    r#"CREATE INDEX IF NOT EXISTS idx_data_file_absolute_path
+        ON ducklake_data_file(path) WHERE NOT path_is_relative"#,
+    r#"CREATE INDEX IF NOT EXISTS idx_delete_file_absolute_path
+        ON ducklake_delete_file(path) WHERE NOT path_is_relative"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_dropped_data_path (
         data_path VARCHAR PRIMARY KEY,
         dropped_at TIMESTAMPTZ DEFAULT NOW()
@@ -1139,10 +1148,13 @@ END";
 const COMPACTION_REL_FLAG: &str =
     "(df.path_is_relative AND t.path_is_relative AND s.path_is_relative)";
 
-/// Insert `(id, resolved_path, rel)` rows (as produced by
-/// [`COMPACTION_RESOLVED_PATH`] / [`COMPACTION_REL_FLAG`]) into
-/// `ducklake_files_scheduled_for_deletion`, scoped to `catalog_id`. Mirrors the
-/// multicatalog expire path's `schedule_pg_files`.
+/// Insert `(id, resolved_path, rel, file_rel)` rows (as produced by
+/// [`COMPACTION_RESOLVED_PATH`] / [`COMPACTION_REL_FLAG`] plus the file row's own
+/// `path_is_relative`) into `ducklake_files_scheduled_for_deletion`, scoped to
+/// `catalog_id`. Mirrors the multicatalog expire path's `schedule_pg_files`,
+/// including its ownership rule: a file row whose own path is absolute is a
+/// reference to another catalog's file, so the row is retired by the caller but
+/// the object is never scheduled here.
 async fn schedule_compaction_files(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     catalog_id: i64,
@@ -1152,6 +1164,10 @@ async fn schedule_compaction_files(
         let id: i64 = row.try_get(0)?;
         let path: String = row.try_get(1)?;
         let rel: bool = row.try_get(2)?;
+        let file_rel: bool = row.try_get(3)?;
+        if !file_rel {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
                  (catalog_id, data_file_id, path, path_is_relative, schedule_start)
@@ -3882,13 +3898,14 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
-    fn register_existing_data_file(
+    fn register_existing_data_file_with_delete(
         &self,
         schema_name: &str,
         table_name: &str,
         columns: &[ColumnDef],
         column_ids: &[i64],
         file: &DataFileInfo,
+        delete: Option<&DeleteFileInfo>,
         mode: WriteMode,
     ) -> Result<CommitIds> {
         // This method bypasses begin_write_transaction, so it must do begin's
@@ -4047,6 +4064,29 @@ impl MetadataWriter for PostgresMetadataWriter {
             // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
             // with the table's spec.
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+
+            // An existing positional delete file travels with its data file: same
+            // commit, same snapshot, hanging off the id just assigned. The path is
+            // stored as given (a fork marks it absolute, pointing at the source's
+            // object), like the data file's.
+            if let Some(delete) = delete {
+                sqlx::query(
+                    "INSERT INTO ducklake_delete_file
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, delete_count, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(data_file_id)
+                .bind(table_id)
+                .bind(&delete.path)
+                .bind(delete.path_is_relative)
+                .bind(delete.file_size_bytes)
+                .bind(delete.footer_size)
+                .bind(delete.delete_count)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -5179,7 +5219,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     // multicatalog expire path does) and REMOVE their catalog rows.
                     let dead_data = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.data_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
-                                {COMPACTION_REL_FLAG} AS rel
+                                {COMPACTION_REL_FLAG} AS rel, df.path_is_relative AS file_rel
                          FROM ducklake_data_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -5192,7 +5232,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
                     let dead_del = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.delete_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
-                                {COMPACTION_REL_FLAG} AS rel
+                                {COMPACTION_REL_FLAG} AS rel, df.path_is_relative AS file_rel
                          FROM ducklake_delete_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id

@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use std::collections::HashSet;
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
 /// root (file → table → schema → data_path). An absolute path anywhere in the chain
@@ -798,7 +799,8 @@ impl MulticatalogManager {
         // 4. Data files orphaned (in this catalog): schedule paths, then drop the rows.
         //    `= ANY($2)` with an empty array is simply false — no special-casing needed.
         let dead_data_files = sqlx::query(AssertSqlSafe(format!(
-            "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel
+            "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
+                    df.path_is_relative AS file_rel
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -846,9 +848,10 @@ impl MulticatalogManager {
         }
 
         // 5. Delete files orphaned by the data files above, a dead table, or no surviving
-        //    snapshot. (Our writer does not emit delete files yet — no-op for our catalogs.)
+        //    snapshot.
         let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
-            "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel
+            "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
+                    df.path_is_relative AS file_rel
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -1004,6 +1007,63 @@ impl MulticatalogManager {
         Ok(())
     }
 
+    /// Of `paths` (fully resolved, as the reader resolves them), those that an
+    /// absolute-path `ducklake_data_file` or `ducklake_delete_file` row in ANY
+    /// catalog still points at.
+    ///
+    /// Deliberately unscoped: an absolute row is a reference to a file another
+    /// catalog owns (see `schedule_pg_files`), so the question "does anyone still
+    /// read this object" has to look across catalogs. Served by the partial indexes
+    /// `idx_data_file_absolute_path` / `idx_delete_file_absolute_path`; only
+    /// reference rows are absolute, so the indexed set stays small.
+    pub async fn referenced_absolute_paths(&self, paths: &[String]) -> Result<HashSet<String>> {
+        if paths.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let rows = sqlx::query(
+            "SELECT path FROM ducklake_data_file
+             WHERE NOT path_is_relative AND path = ANY($1)
+             UNION
+             SELECT path FROM ducklake_delete_file
+             WHERE NOT path_is_relative AND path = ANY($1)",
+        )
+        .bind(paths)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| Ok(r.try_get::<String, _>(0)?))
+            .collect()
+    }
+
+    /// Push the scheduled rows for `paths` in `catalog_name` back to "scheduled
+    /// now", so a `CleanupCriteria::OlderThan` sweep does not re-examine them
+    /// until a full grace period has passed again. Used for files that are
+    /// still referenced by another catalog. Matches on `path`: the
+    /// `data_file_id` column holds delete-file ids too, so ids alone collide.
+    /// Unknown catalog ⇒ no-op.
+    pub(crate) async fn defer_scheduled_in_catalog(
+        &self,
+        catalog_name: &str,
+        paths: &[String],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let catalog_id = match self.find_catalog_id(catalog_name).await? {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        sqlx::query(
+            "UPDATE ducklake_files_scheduled_for_deletion SET schedule_start = NOW()
+             WHERE catalog_id = $1 AND path = ANY($2)",
+        )
+        .bind(catalog_id)
+        .bind(paths)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every physical file referenced by a catalog whose effective `data_path`
     /// matches one of `data_paths`. Canonical-root cleanup must preserve aliases.
     pub(crate) async fn list_referenced_paths_in_data_paths(
@@ -1043,8 +1103,18 @@ impl MulticatalogManager {
     }
 }
 
-/// Insert `(catalog_id, data_file_id, resolved_path, rel)` rows into
-/// `ducklake_files_scheduled_for_deletion` and return the scheduled ids.
+/// Schedule the physical files behind dead `(id, resolved_path, rel, file_rel)` rows
+/// and return EVERY dead id, scheduled or not, so the caller deletes all the rows.
+///
+/// A catalog owns only the files it registered with `ducklake_data_file.path_is_relative`
+/// (or the delete-file equivalent) set to true: they live under its own layout. A row
+/// whose own path is absolute is a *reference* to a file another catalog owns — a
+/// database fork registers the source's files this way instead of copying them. Such a
+/// row is dropped like any other dead row, but its object is never scheduled: the owner
+/// reclaims it through its own expire, and `cleanup_old_files_in_catalog` holds that
+/// reclaim back for as long as any reference row still points at the path. The test is
+/// the file row's own flag, not the resolved chain flag (`rel`), which also goes false
+/// when a schema or table path is absolute — that file is still the catalog's own.
 async fn schedule_pg_files(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     catalog_id: i64,
@@ -1055,6 +1125,11 @@ async fn schedule_pg_files(
         let id: i64 = row.try_get(0)?;
         let path: String = row.try_get(1)?;
         let rel: bool = row.try_get(2)?;
+        let file_rel: bool = row.try_get(3)?;
+        ids.push(id);
+        if !file_rel {
+            continue;
+        }
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
                  (catalog_id, data_file_id, path, path_is_relative, schedule_start)
@@ -1066,7 +1141,6 @@ async fn schedule_pg_files(
         .bind(rel)
         .execute(&mut **tx)
         .await?;
-        ids.push(id);
     }
     Ok(ids)
 }
