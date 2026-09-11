@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use datafusion_ducklake::{
-    DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    DuckLakeCatalog, MetadataProvider, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
 };
 
 /// Create a local filesystem object store
@@ -89,8 +89,8 @@ async fn create_read_context(temp_dir: &TempDir) -> SessionContext {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_create_table_as_select() {
-    let (ctx, temp_dir) = create_writable_catalog().await;
+async fn test_create_table_as_select_rejects_rows_without_publishing_metadata() {
+    let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
 
     // Create a source table in memory
     let schema = Arc::new(Schema::new(vec![
@@ -109,36 +109,37 @@ async fn test_create_table_as_select() {
 
     ctx.register_batch("source", batch).unwrap();
 
-    // Create table using CTAS
-    let result = ctx
+    let connection = format!(
+        "sqlite:{}?mode=rwc",
+        temp_dir.path().join("test.db").display()
+    );
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap();
+    let error = ctx
         .sql("CREATE TABLE ducklake.main.users AS SELECT * FROM source")
-        .await;
+        .await
+        .expect_err("CTAS must not silently discard source rows");
 
-    // Check if CTAS is supported - it may not be fully implemented yet
-    match result {
-        Ok(df) => {
-            df.collect().await.unwrap();
-
-            // Verify table was created by reading it back with fresh context
-            let read_ctx = create_read_context(&temp_dir).await;
-            let df = read_ctx
-                .sql("SELECT * FROM ducklake.main.users ORDER BY id")
-                .await
-                .unwrap();
-            let result_batches = df.collect().await.unwrap();
-
-            assert!(!result_batches.is_empty());
-            let total_rows: usize = result_batches.iter().map(|b| b.num_rows()).sum();
-            assert_eq!(total_rows, 3);
-        },
-        Err(e) => {
-            println!("CREATE TABLE AS SELECT not yet fully supported: {e}");
-        },
-    }
+    assert!(
+        error
+            .to_string()
+            .contains("CREATE TABLE AS SELECT with rows is not supported"),
+        "{error}"
+    );
+    assert_eq!(provider.get_current_snapshot().unwrap(), snapshot);
+    assert!(
+        !provider
+            .table_exists(schema.schema_id, "users", snapshot)
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_legacy_catalog_without_view_metadata_keeps_ctas_working() {
+async fn test_legacy_catalog_without_view_metadata_keeps_empty_ctas_working() {
     let (ctx, temp_dir) = create_writable_catalog_with_main_schema().await;
     let connection = format!(
         "sqlite:{}?mode=rwc",
@@ -183,7 +184,7 @@ async fn test_legacy_catalog_without_view_metadata_keeps_ctas_working() {
         "{error}"
     );
 
-    ctx.sql("CREATE TABLE ducklake.main.created AS SELECT 1 AS id")
+    ctx.sql("CREATE TABLE ducklake.main.created AS SELECT 1 AS id WHERE false")
         .await
         .unwrap()
         .collect()

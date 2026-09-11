@@ -489,7 +489,7 @@ jobs:
 
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
-        run: cargo test --features "duckdb-bundled encryption metadata-mysql metadata-postgres metadata-sqlite write-sqlite"
+        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite"
 
       - name: Save target directory (main only)
         if: |

@@ -1717,7 +1717,7 @@ impl MetadataProvider for PostgresMetadataProvider {
             .bind(table_id)
             .fetch_all(&self.pool)
             .await?;
-            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
             let mut batches = Vec::new();
 
             for entry in entries {

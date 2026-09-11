@@ -28,10 +28,10 @@ one. For TLS, also enable one of `tls-native-tls`, `tls-rustls-aws-lc-rs`, or
 
 PostgreSQL has **two** writers, both behind `write-postgres`:
 
-| Writer | Layout | Spec-compliant | SQL `CREATE TABLE`/CTAS | Read back with |
-|--------|--------|:--------------:|:-----------------------:|----------------|
-| `PostgresSingleCatalogMetadataWriter` | Standard single-catalog | ✅ | ✅ | `PostgresMetadataProvider` (and any other DuckLake reader, incl. DuckDB) |
-| `PostgresMetadataWriter` | Library-specific multi-catalog | ❌ | ❌ | `MulticatalogProvider` only |
+| Writer                                | Layout                         | Spec-compliant   | SQL `CREATE TABLE`        | Read back with                                                           |
+| ------------------------------------- | ------------------------------ | :--------------: | :-----------------------: | ------------------------------------------------------------------------ |
+| `PostgresSingleCatalogMetadataWriter` | Standard single-catalog        | ✅                | ✅                         | `PostgresMetadataProvider` (and any other DuckLake reader, incl. DuckDB) |
+| `PostgresMetadataWriter`              | Library-specific multi-catalog | ❌                | ❌                         | `MulticatalogProvider` only                                              |
 
 Use `PostgresSingleCatalogMetadataWriter` unless you specifically need many
 catalogs in one database. It produces the same catalog shape as the SQLite and
@@ -47,12 +47,12 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 > DuckLake specification and is not (yet) supported or accepted upstream. Catalogs
 > written this way are only readable through `MulticatalogProvider`, not as standard
 > single-catalog DuckLake stores, so **multi-catalog should be treated as
-> experimental** and subject to change. Note also that SQL `CREATE TABLE`/CTAS is not
+> experimental** and subject to change. Note also that SQL `CREATE TABLE` is not
 > available on this path (the first write of a table goes through
 > `DuckLakeTableWriter`); `INSERT INTO` works once a table exists.
 >
 > PostgreSQL writes no longer *require* this path: `PostgresSingleCatalogMetadataWriter`
-> writes the standard spec-compliant layout and supports CTAS.
+> writes the standard spec-compliant layout and supports SQL `CREATE TABLE` and `INSERT INTO`.
 
 ---
 
@@ -76,24 +76,24 @@ AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before cre
 
 ## Feature flags
 
-| Feature                  | Description                                                              | Default |
-|--------------------------|--------------------------------------------------------------------------|:-------:|
-| `metadata-duckdb`        | DuckDB catalog read backend                                              |         |
-| `duckdb-bundled`         | Statically compile & bundle DuckDB (disable for dynamic linking)         |         |
-| `metadata-sqlite`        | SQLite catalog read backend                                              |   ✅    |
-| `metadata-postgres`      | PostgreSQL catalog read backend                                          |         |
-| `metadata-mysql`         | MySQL catalog read backend                                               |         |
-| `write`                  | Base write support (INSERT, CTAS, maintenance API); needs a write backend|         |
-| `write-duckdb`           | Write to standard single-catalog DuckDB catalogs                        |         |
-| `write-sqlite`           | Write to SQLite catalogs (`write` + `metadata-sqlite`)                   |         |
-| `write-postgres`         | Write to PostgreSQL catalogs (`write` + `metadata-postgres` + multi-catalog) |     |
-| `write-mysql`            | Write to standard single-catalog MySQL catalogs                         |         |
-| `multicatalog-postgres`  | Read multiple catalogs from one PostgreSQL store                         |         |
-| `tls-native-tls`         | Use native TLS for SQLx PostgreSQL connections                           |         |
-| `tls-rustls-aws-lc-rs`   | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                   |         |
-| `tls-rustls-ring`        | Use Rustls with Ring for SQLx PostgreSQL connections                     |         |
-| `encryption`             | Parquet Modular Encryption (PME) reads                                   |         |
-| `skip-tests-with-docker` | CI-only: skip tests that require Docker                                  |         |
+| Feature                    | Description                                                                       | Default   |
+| -------------------------- | --------------------------------------------------------------------------------- | :-------: |
+| `metadata-duckdb`          | DuckDB catalog read backend                                                       |           |
+| `duckdb-bundled`           | Statically compile & bundle DuckDB (disable for dynamic linking)                  |           |
+| `metadata-sqlite`          | SQLite catalog read backend                                                       | ✅         |
+| `metadata-postgres`        | PostgreSQL catalog read backend                                                   |           |
+| `metadata-mysql`           | MySQL catalog read backend                                                        |           |
+| `write`                    | Base write support (INSERT, CREATE TABLE, maintenance API); needs a write backend |           |
+| `write-duckdb`             | Write to standard single-catalog DuckDB catalogs                                  |           |
+| `write-sqlite`             | Write to SQLite catalogs (`write` + `metadata-sqlite`)                            |           |
+| `write-postgres`           | Write to PostgreSQL catalogs (`write` + `metadata-postgres` + multi-catalog)      |           |
+| `write-mysql`              | Write to standard single-catalog MySQL catalogs                                   |           |
+| `multicatalog-postgres`    | Read multiple catalogs from one PostgreSQL store                                  |           |
+| `tls-native-tls`           | Use native TLS for SQLx PostgreSQL connections                                    |           |
+| `tls-rustls-aws-lc-rs`     | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                            |           |
+| `tls-rustls-ring`          | Use Rustls with Ring for SQLx PostgreSQL connections                              |           |
+| `encryption`               | Parquet Modular Encryption (PME) reads                                            |           |
+| `skip-tests-with-docker`   | CI-only: skip tests that require Docker                                           |           |
 
 For dynamic linking against a system `libduckdb`, disable defaults and re-enable just
 the read backend: `--no-default-features --features metadata-duckdb` (requires
@@ -109,7 +109,7 @@ the read backend: `--no-default-features --features metadata-duckdb` (requires
 | Strings / dates / timestamps          |    ✅     |                                                              |
 | Decimal (precision & scale)           |    ✅     |                                                              |
 | Geometry                              |    ✅     | Mapped to `Binary` (WKB)                                     |
-| Complex / nested (list, struct, map)  | Supported | Recursive types and nullable‑field evolution; no pruning     |
+| Complex / nested (list, struct, map)  | Supported | Recursive types, nullable evolution, inlining; no pruning       |
 
 ### Column defaults
 
@@ -130,34 +130,64 @@ MySQL, and PostgreSQL. DuckDB read providers project missing fields as `NULL`.
 For a legacy SQLite, MySQL, or PostgreSQL catalog opened through a read-only
 provider, run writer initialization with a schema-migration role before reading.
 
+### Inlined physical storage
+
+Inlined columns preserve DuckLake's physical encodings:
+
+- **DuckDB:** Native unsigned integers, temporal values, and nested columns.
+- **PostgreSQL multicatalog writer:** Decimal text for `UInt64`, text for dates
+  and timestamps, native `TIME`, and `BYTEA` for strings and binary values. The
+  standard single-catalog writer keeps small writes in Parquet.
+- **SQLite:** Decimal text for `UInt64`, text for dates and timestamps, and
+  DuckDB-compatible nested literals. Binary leaves use escaped bytes.
+- **MySQL:** `BIGINT UNSIGNED` for UInt64, `FLOAT`/`DOUBLE` for floats,
+  `DECIMAL(p,s)` for Decimal128, `DATE`, `TIME(6)`, and `DATETIME(6)` for
+  second-to-microsecond timestamps. `DATETIME(6)` supports years in [1000, 9999]
+  without session-time-zone conversion. Nanosecond timestamps use `BIGINT`;
+  nested values use text.
+
+PostgreSQL maps a 16-byte fixed binary column to `UUID` only when its DuckLake
+logical type is `uuid`. Other fixed binary values use `BYTEA`. High-level DuckDB
+and PostgreSQL writes
+with sub-microsecond intervals take the Parquet path; Arrow 59 cannot write that
+interval type to Parquet, so those writes still return an unsupported-type error.
+
+Call `MetadataWriter::set_inlined_index_columns(table_id, columns)` to declare
+indexes, then `ensure_inlined_indexes(table_id)` to backfill existing physical
+tables. New physical tables apply those declarations. Repeated calls are safe
+and preserve column types. No index is created without a declaration. Indexes
+are a library extension and are optional; no scan-speed guarantee is implied.
+Declarations validate strictly when set. Write and ensure paths skip declared
+columns that a later schema change removes or renames.
+
 ---
 
 ## Capabilities
 
-| Capability                                              | Status |
-|---------------------------------------------------------|:------:|
-| `SELECT` against DuckLake tables                        |   ✅   |
-| `INSERT INTO` (table must already exist on the PostgreSQL path) | ✅ |
-| `CREATE TABLE AS SELECT` (SQL DDL; SQLite single-catalog only — not on the PostgreSQL multi-catalog path) | 🟧 |
-| `DROP TABLE` (via `MetadataWriter`)                     |   ✅   |
-| Row-level deletes (Merge-On-Read delete files, read)    |   ✅   |
-| SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends) | ✅ |
-| SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations) | ✅ |
-| Snapshot-based consistency (bound at catalog creation)  |   ✅   |
-| Filter pushdown to Parquet (row-group / page pruning)   |   ✅   |
-| Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file | ✅ |
-| Parquet footer size hints (1 read/file instead of 2)    |   ✅   |
-| Row lineage (`rowid` virtual column, opt-in)            |   ✅   |
-| SQL-queryable `information_schema`                      |   ✅   |
-| Read-only DuckLake views on every metadata backend      |   🟧   |
-| Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`) | ✅ |
-| Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation | ✅ |
-| Parquet Modular Encryption (PME) reads (feature `encryption`) | ✅ |
-| Configurable writer output (compression, row-group sizing) | ✅  |
-| Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned) | ✅ |
-| Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅ |
-| Partitioned `UPDATE` / upsert — the append+delete commit registers every appended file (one per output partition) together with the positional deletes, in one snapshot. A row whose partition-key value changed moves to its NEW partition and keeps its `rowid` lineage | ✅ |
-| Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec) | ✅ |
+| Capability                                                                                                                                                                                                                                                                                                                       | Status   |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
+| `SELECT` against DuckLake tables                                                                                                                                                                                                                                                                                                 | ✅        |
+| `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
+| Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
+| `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
+| Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
+| SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends)                                                                                                                                                                              | ✅        |
+| SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations)                                                                                                                                    | ✅        |
+| Snapshot-based consistency (bound at catalog creation)                                                                                                                                                                                                                                                                           | ✅        |
+| Filter pushdown to Parquet (row-group / page pruning)                                                                                                                                                                                                                                                                            | ✅        |
+| Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file                                                                                                                                                    | ✅        |
+| Parquet footer size hints (1 read/file instead of 2)                                                                                                                                                                                                                                                                             | ✅        |
+| Row lineage (`rowid` virtual column, opt-in)                                                                                                                                                                                                                                                                                     | ✅        |
+| SQL-queryable `information_schema`                                                                                                                                                                                                                                                                                               | ✅        |
+| Read-only DuckLake views on every metadata backend                                                                                                                                                                                                                                                                               | 🟧       |
+| Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`)                                                                                                                                              | ✅        |
+| Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation                                                                                                                                                                                                                                                 | ✅        |
+| Parquet Modular Encryption (PME) reads (feature `encryption`)                                                                                                                                                                                                                                                                    | ✅        |
+| Configurable writer output (compression, row-group sizing)                                                                                                                                                                                                                                                                       | ✅        |
+| Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned)                                                                                                                                                                                 | ✅        |
+| Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅        |
+| Partitioned `UPDATE` / upsert — the append+delete commit registers every appended file (one per output partition) together with the positional deletes, in one snapshot. A row whose partition-key value changed moves to its NEW partition and keeps its `rowid` lineage                                                        | ✅        |
+| Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec)                                                                                                                                                                                                                                        | ✅        |
 
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
@@ -169,6 +199,8 @@ files written by `INSERT`, `UPDATE`, `DELETE`, and maintenance. When the setting
 is absent, this crate retains its existing Parquet V2 default; DuckDB `COPY`
 defaults to Parquet V1. Set `parquet_version = V1` explicitly when identical
 absent-setting behavior is required.
+Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
+multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 
 ### Views
 
@@ -193,6 +225,11 @@ commands, and propagates the catalog's row-lineage option. Caller-registered UDF
 settings, including `execution.time_zone`, are not inherited.
 
 ---
+
+Non-empty `CREATE TABLE AS SELECT` is rejected before any table metadata is
+published. Create an empty table, reopen the catalog to see its committed
+snapshot, and use `INSERT INTO ... SELECT` to write rows. CTAS support requires
+session and object-store handling that the registration path does not provide.
 
 ## Write concurrency
 
@@ -224,9 +261,22 @@ cannot implicitly commit the metadata transaction. Zero-row inline stages are
 rejected before physical DDL. The new DuckDB staged inline DDL is nullable,
 matching SQLite and PostgreSQL; older native DDL remains unchanged.
 
-High-level row staging uses Parquet. Automatic small-write routing remains
-separate, and the stored `data_inlining_row_limit` is not parsed by this writer.
-Explicit inline inserts, deletes, and flushes use their storage-specific
+To move existing inline rows into Parquet, call
+`MetadataProvider::get_inlined_data_with_row_ids`, then pass those batches and
+their snapshot to `DuckLakeTableWriter::flush_inlined_data` from Rust
+before using operations that require Parquet storage. There is no SQL flush hook.
+Setting the row limit to zero affects future writes and does not flush existing
+rows. Arrow 59 cannot flush `Interval(MonthDayNano)` values. Automatic compaction
+and removal of physical inline tables during maintenance remain unsupported.
+
+High-level row staging honors the scoped `data_inlining_row_limit`, defaulting
+to `0` so writes stay in Parquet. Set a positive limit to opt in; the threshold
+is inclusive. This stages the feature until inline UPDATE, rowid, CDC, SQL flush,
+and automatic inline-table maintenance are supported. Current DuckLake defaults
+to `10`; matching that default is deferred until these paths are ready (see
+[#270](https://github.com/datafusion-contrib/datafusion-ducklake/issues/270)).
+Explicit settings and direct-writer options still apply. Unsupported schemas
+or writer capabilities fall back to Parquet. Inline inserts, deletes, and flushes retain the merged
 `inlined_insert`, `inlined_delete`, and `inline_flush` ledger tokens.
 
 Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
@@ -398,15 +448,22 @@ Known edges:
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Data inlining: scalar rows are read on every metadata backend.** DuckLake
-  inlines `INSERT`s of up to 10 rows into the catalog by default. SQLite,
+- **Data inlining: supported rows are read on every metadata backend.** The DuckDB
+  DuckLake extension inlines `INSERT`s of up to 10 rows by default. SQLite,
   DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
   `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
   (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
   `DELETE`, and compaction on all four backends; the `rowid` path remains
-  unsupported for inlined rows. Non‑scalar inlined columns fail with an
-  error that directs users to flush the rows to Parquet or disable inlining at
-  write time.
+  unsupported for inlined rows. Lists, structs, and maps inline on SQLite,
+  DuckDB, MySQL, and the multicatalog PostgreSQL writer when every field passes
+  the shared type gate. Unsupported schemas fall back to Parquet. Inlined rows containing
+  `Interval(MonthDayNano)` remain readable, but Arrow 59 cannot flush that
+  interval type to Parquet.
+- **Change feeds reject windows containing inlined inserts or inline-row deletes.**
+  These row versions are not yet decoded by CDC. `ducklake_table_insertions`
+  rejects inline inserts; `ducklake_table_changes` and `ducklake_table_deletions`
+  reject inline-row deletes.
+  Use `data_inlining_row_limit = 0` for tables consumed through change feeds.
 - **The change feed does not surface inlined deletes.** `ducklake_table_changes`
   and `ducklake_table_deletions` read delete *files* added in the window; a
   snapshot whose only change is an inlined Parquet‑row delete emits no `delete`

@@ -40,28 +40,31 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
+use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite,
-    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
-    catalog_column_type_requires_migration, catalog_columns_differ, inlined_delete_conflicts,
-    inlined_delete_groups, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, top_level_column_ids,
-    validate_delete_entries, validate_name, validate_table_setting,
+    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING,
+    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, SourceRetirement,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
+    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
+    quote_snapshot_name, quote_snapshot_table, snapshot_has_change, staged_table_write_changes,
+    table_storage_changes, top_level_column_ids, validate_delete_entries,
+    validate_inlined_index_columns, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    IntervalMonthDayNanoArray, LargeBinaryArray, LargeStringArray, StringArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
+    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, IntervalMonthDayNanoArray, LargeBinaryArray, LargeListArray,
+    LargeStringArray, ListArray, MapArray, StringArray, StructArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
 use arrow::record_batch::RecordBatch;
-use duckdb::types::{TimeUnit as DuckdbTimeUnit, Value};
+use duckdb::types::{Decimal, TimeUnit as DuckdbTimeUnit, Value};
 use duckdb::{Connection, OptionalExt, Transaction, params, params_from_iter};
 use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -97,6 +100,26 @@ fn inlined_duckdb_value(array: &dyn Array, row: usize) -> Result<Value> {
         DataType::UInt64 => value!(UInt64Array, UBigInt),
         DataType::Float32 => value!(Float32Array, Float),
         DataType::Float64 => value!(Float64Array, Double),
+        DataType::Decimal128(precision, scale) => Value::Decimal(
+            Decimal::new(
+                *precision,
+                u8::try_from(*scale).map_err(|e| {
+                    crate::DuckLakeError::Unsupported(format!(
+                        "DuckDB cannot inline decimal scale {scale}: {e}",
+                    ))
+                })?,
+                array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("Arrow data type and array implementation agree")
+                    .value(row),
+            )
+            .map_err(|e| {
+                crate::DuckLakeError::Unsupported(format!(
+                    "DuckDB cannot inline decimal({precision}, {scale}): {e}",
+                ))
+            })?,
+        ),
         DataType::Date32 => value!(Date32Array, Date32),
         DataType::Time64(ArrowTimeUnit::Microsecond) => Value::Time64(
             DuckdbTimeUnit::Microsecond,
@@ -149,6 +172,12 @@ fn inlined_duckdb_value(array: &dyn Array, row: usize) -> Result<Value> {
                 .downcast_ref::<IntervalMonthDayNanoArray>()
                 .expect("Arrow data type and array implementation agree")
                 .value(row);
+            if value.nanoseconds % 1_000 != 0 {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "DuckDB INTERVAL cannot inline sub-microsecond nanoseconds: {}",
+                    value.nanoseconds
+                )));
+            }
             Value::Interval {
                 months: value.months,
                 days: value.days,
@@ -207,15 +236,24 @@ fn inlined_duckdb_value(array: &dyn Array, row: usize) -> Result<Value> {
     })
 }
 
-/// Scalar types the DuckDB inline path preserves through catalog normalization.
-/// Backend-native DDL spellings are used when DuckLake type names are aliases.
-/// Nested values remain on the Parquet path until their SQL representation has
-/// a matching parser.
+// Scalar leaves use backend-native DDL aliases; nested values use recursive native DDL and bind
+// only their scalar leaves.
 fn duckdb_type_inlines(data_type: &DataType) -> bool {
-    crate::metadata_writer::scalar_type_supports_inlining(data_type)
+    crate::nested_inline::type_supports_inlining(data_type)
 }
 
 fn inlined_duckdb_type(data_type: &DataType, ducklake_type: &str) -> String {
+    if matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    ) {
+        return crate::nested_inline::duckdb_type_name(data_type)
+            .expect("supported nested inline type has DuckDB DDL");
+    }
     match data_type {
         DataType::Int8 => "TINYINT".to_string(),
         DataType::Float32 => "FLOAT".to_string(),
@@ -235,11 +273,240 @@ fn inlined_duckdb_value_sql(data_type: &DataType, ducklake_type: &str) -> String
     if matches!(data_type, DataType::Timestamp(ArrowTimeUnit::Nanosecond, _)) {
         "make_timestamp_ns(?)".to_string()
     } else {
-        format!(
-            "CAST(? AS {})",
-            inlined_duckdb_type(data_type, ducklake_type),
-        )
+        let data_type = if ducklake_type.is_empty() {
+            crate::nested_inline::duckdb_type_name(data_type)
+                .expect("supported inline scalar has DuckDB DDL")
+        } else {
+            inlined_duckdb_type(data_type, ducklake_type)
+        };
+        format!("CAST(? AS {data_type})")
     }
+}
+
+struct EncodedDuckdbValue {
+    sql: String,
+    binds: Vec<Value>,
+}
+
+fn encode_duckdb_value(
+    array: &dyn Array,
+    row: usize,
+    ducklake_type: &str,
+    depth: usize,
+) -> Result<EncodedDuckdbValue> {
+    if depth > crate::types::MAX_NESTED_TYPE_DEPTH {
+        return Err(crate::DuckLakeError::UnsupportedType(format!(
+            "Nested inline value exceeds maximum depth {}",
+            crate::types::MAX_NESTED_TYPE_DEPTH
+        )));
+    }
+
+    let data_type = array.data_type();
+    if let Some(nested_type) = crate::nested_inline::duckdb_type_name(data_type)
+        && array.is_null(row)
+        && !crate::nested_inline::scalar_type_supports_inlining(data_type)
+    {
+        return Ok(EncodedDuckdbValue {
+            sql: format!("CAST(NULL AS {nested_type})"),
+            binds: Vec::new(),
+        });
+    }
+
+    match data_type {
+        DataType::List(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("Arrow data type and array implementation agree");
+            let offsets = array.value_offsets();
+            encode_duckdb_list(
+                array.values().as_ref(),
+                offsets[row] as usize,
+                offsets[row + 1] as usize,
+                data_type,
+                depth,
+            )
+        },
+        DataType::LargeList(_) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .expect("Arrow data type and array implementation agree");
+            let offsets = array.value_offsets();
+            encode_duckdb_list(
+                array.values().as_ref(),
+                offsets[row] as usize,
+                offsets[row + 1] as usize,
+                data_type,
+                depth,
+            )
+        },
+        DataType::FixedSizeList(_, size) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .expect("Arrow data type and array implementation agree");
+            let size = usize::try_from(*size).map_err(|e| {
+                crate::DuckLakeError::UnsupportedType(format!(
+                    "Invalid fixed-size list length {size}: {e}"
+                ))
+            })?;
+            let start = row * size;
+            encode_duckdb_list(
+                array.values().as_ref(),
+                start,
+                start + size,
+                data_type,
+                depth,
+            )
+        },
+        DataType::Struct(fields) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("Arrow data type and array implementation agree");
+            let values = fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let value =
+                        encode_duckdb_value(array.column(index).as_ref(), row, "", depth + 1)?;
+                    Ok((
+                        format!("{} := {}", quote_ident(field.name()), value.sql),
+                        value.binds,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut binds = Vec::new();
+            let sql = values
+                .into_iter()
+                .map(|(sql, values)| {
+                    binds.extend(values);
+                    sql
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(EncodedDuckdbValue {
+                sql: format!(
+                    "CAST(struct_pack({sql}) AS {})",
+                    crate::nested_inline::duckdb_type_name(data_type)
+                        .expect("supported struct has DuckDB DDL")
+                ),
+                binds,
+            })
+        },
+        DataType::Map(_, _) => {
+            let array = array
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .expect("Arrow data type and array implementation agree");
+            let offsets = array.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let mut key_sql = Vec::with_capacity(end - start);
+            let mut value_sql = Vec::with_capacity(end - start);
+            let mut key_binds = Vec::new();
+            let mut value_binds = Vec::new();
+            for index in start..end {
+                let key = encode_duckdb_value(array.keys().as_ref(), index, "", depth + 1)?;
+                key_sql.push(key.sql);
+                key_binds.extend(key.binds);
+                let value = encode_duckdb_value(array.values().as_ref(), index, "", depth + 1)?;
+                value_sql.push(value.sql);
+                value_binds.extend(value.binds);
+            }
+            key_binds.extend(value_binds);
+            Ok(EncodedDuckdbValue {
+                sql: format!(
+                    "CAST(map([{}], [{}]) AS {})",
+                    key_sql.join(", "),
+                    value_sql.join(", "),
+                    crate::nested_inline::duckdb_type_name(data_type)
+                        .expect("supported map has DuckDB DDL")
+                ),
+                binds: key_binds,
+            })
+        },
+        _ => Ok(EncodedDuckdbValue {
+            sql: inlined_duckdb_value_sql(data_type, ducklake_type),
+            binds: vec![inlined_duckdb_value(array, row)?],
+        }),
+    }
+}
+
+fn encode_duckdb_list(
+    values: &dyn Array,
+    start: usize,
+    end: usize,
+    data_type: &DataType,
+    depth: usize,
+) -> Result<EncodedDuckdbValue> {
+    let mut sql = Vec::with_capacity(end - start);
+    let mut binds = Vec::new();
+    for index in start..end {
+        let value = encode_duckdb_value(values, index, "", depth + 1)?;
+        sql.push(value.sql);
+        binds.extend(value.binds);
+    }
+    Ok(EncodedDuckdbValue {
+        sql: format!(
+            "CAST([{}] AS {})",
+            sql.join(", "),
+            crate::nested_inline::duckdb_type_name(data_type)
+                .expect("supported list has DuckDB DDL")
+        ),
+        binds,
+    })
+}
+
+fn duckdb_inlined_index_columns(tx: &Transaction<'_>, table_id: i64) -> Result<Vec<String>> {
+    let value: Option<String> = tx
+        .query_row(
+            "SELECT value FROM ducklake_metadata
+             WHERE key = ? AND scope = 'table' AND scope_id = ?",
+            params![INLINED_INDEX_COLUMNS_SETTING, table_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let declared = parse_inlined_index_columns(value.as_deref().unwrap_or_default())?;
+    let mut statement = tx.prepare(
+        "SELECT column_name FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+    )?;
+    let available = statement
+        .query_map(params![table_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+    drop(statement);
+    Ok(live_inlined_index_columns(declared, &available))
+}
+
+fn ensure_duckdb_physical_indexes(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    physical_name: &str,
+) -> Result<()> {
+    let declared = duckdb_inlined_index_columns(tx, table_id)?;
+    let mut statement = tx.prepare("SELECT name FROM pragma_table_info(?)")?;
+    let present = statement
+        .query_map(params![physical_name], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+    drop(statement);
+    for column in declared.iter().map(String::as_str) {
+        if !present.contains(column) {
+            continue;
+        }
+        let index_name = format!("{physical_name}_{column}_idx");
+        tx.execute(
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {}({})",
+                quote_ident(&index_name),
+                quote_ident(physical_name),
+                quote_ident(column),
+            ),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn id_list(ids: &[i64]) -> String {
@@ -1109,10 +1376,6 @@ fn detect_replace_conflict(tx: &Transaction<'_>, table_id: i64, base_snapshot: i
     Ok(())
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id` and
-/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
-/// files registered for *this* snapshot. `next_row_id` is left untouched (rowids
-/// stay monotonic across the table's lifetime). Mirrors the SQLite writer.
 fn detect_new_inlined_deletes(
     tx: &Transaction<'_>,
     table_id: i64,
@@ -1162,6 +1425,10 @@ fn detect_new_inlined_deletes(
     Ok(())
 }
 
+/// Retire the prior generation's still-visible data files at `snapshot_id` and
+/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
+/// files registered for *this* snapshot. `next_row_id` is left untouched (rowids
+/// stay monotonic across the table's lifetime). Mirrors the SQLite writer.
 fn retire_prior_generation(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64) -> Result<()> {
     tx.execute(
         "UPDATE ducklake_data_file SET end_snapshot = ?
@@ -1760,8 +2027,13 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
     }
     if current.len() != proposed.len() || proposed.len() != write.column_ids.len() {
         return Err(crate::DuckLakeError::Conflict(format!(
-            "multi-table write target {}.{} changed schema after staging",
-            write.schema_name, write.table_name
+            "multi-table write target {}.{} changed schema after staging: catalog has {} nodes, \
+             staged schema has {} nodes and {} field IDs",
+            write.schema_name,
+            write.table_name,
+            current.len(),
+            proposed.len(),
+            write.column_ids.len(),
         )));
     }
     for (index, ((column_id, column_type, nullable, parent_id), proposed)) in
@@ -1774,8 +2046,14 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
             || *parent_id != proposed_parent
         {
             return Err(crate::DuckLakeError::Conflict(format!(
-                "multi-table write target {}.{} changed schema after staging",
-                write.schema_name, write.table_name
+                "multi-table write target {}.{} changed schema after staging at node {index}: \
+                 catalog ({column_id}, {column_type}, nullable={nullable}, parent={parent_id:?}), \
+                 staged ({}, {}, nullable={}, parent={proposed_parent:?})",
+                write.schema_name,
+                write.table_name,
+                write.column_ids[index],
+                proposed.ducklake_type,
+                proposed.is_nullable,
             )));
         }
     }
@@ -1883,6 +2161,7 @@ fn commit_staged_inline(
     write: &StagedTableWrite,
     batches: &[RecordBatch],
 ) -> Result<()> {
+    enforce_inline_partition_fence(tx, write.table_id, write.base_snapshot_id)?;
     let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if record_count == 0 {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -1915,6 +2194,7 @@ fn commit_staged_inline(
     }
     ddl.push(')');
     tx.execute(&ddl, [])?;
+    ensure_duckdb_physical_indexes(tx, write.table_id, &physical_name)?;
     tx.execute(
         "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
          SELECT ?, ?, ? WHERE NOT EXISTS (
@@ -1941,42 +2221,50 @@ fn commit_staged_inline(
         .map(|column| quote_ident(column.name()))
         .collect::<Vec<_>>()
         .join(", ");
-    let value_list = write
-        .columns
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            format!(
-                "CAST(? AS {})",
-                inlined_duckdb_type(field.data_type(), column.ducklake_type()),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let insert_sql = format!(
-        "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) \
-         VALUES (?, ?, ?, {})",
-        quote_ident(&physical_name),
-        column_list,
-        value_list
-    );
     for batch in batches {
         for batch_row in 0..batch.num_rows() {
-            let mut values = Vec::with_capacity(write.columns.len() + 3);
+            let encoded = batch
+                .columns()
+                .iter()
+                .zip(&write.columns)
+                .zip(schema.fields())
+                .map(|((array, column), field)| {
+                    if write
+                        .snapshot_id_columns
+                        .iter()
+                        .any(|name| name == column.name())
+                        && array.is_null(batch_row)
+                    {
+                        Ok(EncodedDuckdbValue {
+                            sql: inlined_duckdb_value_sql(
+                                field.data_type(),
+                                column.ducklake_type(),
+                            ),
+                            binds: vec![Value::BigInt(snapshot_id)],
+                        })
+                    } else {
+                        encode_duckdb_value(array.as_ref(), batch_row, column.ducklake_type(), 0)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let value_list = encoded
+                .iter()
+                .map(|value| value.sql.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_sql = format!(
+                "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) \
+                 VALUES (?, ?, ?, {})",
+                quote_ident(&physical_name),
+                column_list,
+                value_list
+            );
+            let mut values = Vec::new();
             values.push(Value::BigInt(row_id));
             values.push(Value::BigInt(snapshot_id));
             values.push(Value::Null);
-            for (array, column) in batch.columns().iter().zip(&write.columns) {
-                if write
-                    .snapshot_id_columns
-                    .iter()
-                    .any(|name| name == column.name())
-                    && array.is_null(batch_row)
-                {
-                    values.push(Value::BigInt(snapshot_id));
-                } else {
-                    values.push(inlined_duckdb_value(array.as_ref(), batch_row)?);
-                }
+            for value in encoded {
+                values.extend(value.binds);
             }
             tx.execute(&insert_sql, params_from_iter(values))?;
             row_id += 1;
@@ -2133,6 +2421,65 @@ impl MetadataWriter for DuckdbMetadataWriter {
             "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, 'table', ?)",
             params![key, value, table_id],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let mut statement = tx.prepare(
+            "SELECT column_name FROM ducklake_column
+             WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+        )?;
+        let available = statement
+            .query_map(params![table_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        drop(statement);
+        if available.is_empty() {
+            return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+        }
+        validate_inlined_index_columns(columns, &available)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT value FROM ducklake_metadata
+                 WHERE key = ? AND scope = 'table' AND scope_id = ?",
+                params![INLINED_INDEX_COLUMNS_SETTING, table_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.as_deref() == Some(value.as_str()) {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute(
+            "DELETE FROM ducklake_metadata
+             WHERE key = ? AND scope = 'table' AND scope_id = ?",
+            params![INLINED_INDEX_COLUMNS_SETTING, table_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+             VALUES (?, ?, 'table', ?)",
+            params![INLINED_INDEX_COLUMNS_SETTING, value, table_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let mut statement =
+            tx.prepare("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")?;
+        let physical_tables = statement
+            .query_map(params![table_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        duckdb_inlined_index_columns(&tx, table_id)?;
+        for physical_table in physical_tables {
+            ensure_duckdb_physical_indexes(&tx, table_id, &physical_table)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2671,10 +3018,24 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        if schema
+            .fields()
+            .iter()
+            .any(|field| is_inlined_system_column(field.name()))
+        {
+            return false;
+        }
         schema
             .fields()
             .iter()
             .all(|field| duckdb_type_inlines(field.data_type()))
+    }
+
+    fn supports_data_inlining_values(&self, batches: &[RecordBatch]) -> bool {
+        batches
+            .iter()
+            .flat_map(RecordBatch::columns)
+            .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2709,6 +3070,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
         let mut conn = self.connection();
         let tx = conn.transaction()?;
+        enforce_inline_partition_fence(&tx, table_id, base_snapshot)?;
         let snapshot_id =
             finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
         if mode != WriteMode::Replace
@@ -2740,6 +3102,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         ddl.push(')');
         tx.execute(&ddl, [])?;
+        ensure_duckdb_physical_indexes(&tx, table_id, &physical_name)?;
         tx.execute(
             "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
              SELECT ?, ?, ? WHERE NOT EXISTS (
@@ -2759,29 +3122,34 @@ impl MetadataWriter for DuckdbMetadataWriter {
             .map(|column| quote_ident(column.name()))
             .collect::<Vec<_>>()
             .join(", ");
-        let value_list = columns
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                inlined_duckdb_value_sql(field.data_type(), column.ducklake_type())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let insert_sql = format!(
-            "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) \
-             VALUES (?, ?, ?, {})",
-            quote_ident(&physical_name),
-            column_list,
-            value_list
-        );
         for batch in batches {
             for batch_row in 0..batch.num_rows() {
-                let mut values = Vec::with_capacity(columns.len() + 3);
+                let encoded = batch
+                    .columns()
+                    .iter()
+                    .zip(columns)
+                    .map(|(array, column)| {
+                        encode_duckdb_value(array.as_ref(), batch_row, column.ducklake_type(), 0)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let value_list = encoded
+                    .iter()
+                    .map(|value| value.sql.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let insert_sql = format!(
+                    "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) \
+                     VALUES (?, ?, ?, {})",
+                    quote_ident(&physical_name),
+                    column_list,
+                    value_list
+                );
+                let mut values = Vec::new();
                 values.push(Value::BigInt(row_id));
                 values.push(Value::BigInt(snapshot_id));
                 values.push(Value::Null);
-                for array in batch.columns() {
-                    values.push(inlined_duckdb_value(array.as_ref(), batch_row)?);
+                for value in encoded {
+                    values.extend(value.binds);
                 }
                 tx.execute(&insert_sql, params_from_iter(values))?;
                 row_id += 1;
@@ -3525,7 +3893,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let gross: Option<i64> = tx
             .query_row(
-                "SELECT record_count FROM ducklake_table_stats WHERE table_id = ?",
+                "SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
                 params![table_id],
                 |row| row.get(0),
             )
@@ -3536,7 +3904,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![table_id],
             |row| row.get::<_, i64>(0),
         )?;
-        let live_rows = u64::try_from((gross.unwrap_or(0) - deleted).max(0)).unwrap_or(0);
+        let live_rows =
+            u64::try_from((gross.unwrap_or(0) + live_inlined - deleted).max(0)).unwrap_or(0);
         tx.execute(
             "UPDATE ducklake_data_file SET end_snapshot = ?
              WHERE table_id = ? AND end_snapshot IS NULL",
@@ -4165,6 +4534,20 @@ impl MetadataWriter for DuckdbMetadataWriter {
             field_ids,
         })
     }
+}
+
+fn enforce_inline_partition_fence(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let changed: i64 = tx.query_row("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)", params![table_id, base_snapshot, base_snapshot], |row| row.get(0))?;
+    if changed != 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "partition spec for table {table_id} changed during inline write; retry the write"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

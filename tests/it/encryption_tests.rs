@@ -85,6 +85,14 @@ fn create_catalog_with_encrypted_file(
             snapshot_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE ducklake_snapshot_changes (
+            snapshot_id BIGINT PRIMARY KEY,
+            changes_made VARCHAR,
+            author VARCHAR,
+            commit_message VARCHAR,
+            commit_extra_info VARCHAR
+        );
+
         -- Schema table
         CREATE TABLE ducklake_schema (
             schema_id BIGINT PRIMARY KEY,
@@ -173,6 +181,10 @@ fn create_catalog_with_encrypted_file(
 
     // Insert snapshot
     conn.execute("INSERT INTO ducklake_snapshot (snapshot_id) VALUES (1)", [])?;
+    conn.execute(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES (1, 'inserted_into_table:1')",
+        [],
+    )?;
 
     // Insert schema (main schema)
     conn.execute(
@@ -396,6 +408,10 @@ async fn test_read_encrypted_parquet_with_wrong_key_fails() -> anyhow::Result<()
 fn rename_column_in_second_snapshot(catalog_path: &Path) -> anyhow::Result<()> {
     let conn = duckdb::Connection::open(catalog_path)?;
     conn.execute("INSERT INTO ducklake_snapshot (snapshot_id) VALUES (2)", [])?;
+    conn.execute(
+        "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made) VALUES (2, 'altered_table:1')",
+        [],
+    )?;
     conn.execute(
         "UPDATE ducklake_column SET end_snapshot = 2 WHERE column_id = 2",
         [],

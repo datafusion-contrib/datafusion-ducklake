@@ -349,7 +349,7 @@ async fn detect_replace_conflict(
     table_id: i64,
     base_snapshot: i64,
 ) -> Result<()> {
-    let conflict: Option<i64> = sqlx::query(
+    let conflict: Option<i32> = sqlx::query(
         "SELECT 1 FROM ducklake_data_file
          WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2)
          LIMIT 1",

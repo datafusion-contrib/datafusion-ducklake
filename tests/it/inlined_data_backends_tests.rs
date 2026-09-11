@@ -408,7 +408,7 @@ async fn mysql_sqlite_style_inlined_rows_are_visible() {
         .unwrap();
     }
     sqlx::query(
-        "CREATE TABLE ducklake_inlined_data_tables(
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables(
              table_id BIGINT, table_name VARCHAR(255), schema_version BIGINT)",
     )
     .execute(&pool)

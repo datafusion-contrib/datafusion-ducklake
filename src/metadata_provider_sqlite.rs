@@ -23,6 +23,7 @@ use arrow::array::{
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef};
+use datafusion::scalar::ScalarValue;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
@@ -103,6 +104,7 @@ fn build_inlined_batch(
     schema: &SchemaRef,
     columns: &[DuckLakeTableColumn],
     present: &HashSet<String>,
+    _physical_types: &HashMap<String, String>,
     rows: &[sqlx::sqlite::SqliteRow],
 ) -> Result<RecordBatch> {
     let n = rows.len();
@@ -150,6 +152,9 @@ fn build_inlined_batch(
                 }
                 Arc::new(UInt64Array::from(values)) as ArrayRef
             },
+            DataType::Date32
+            | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+            | DataType::Timestamp(_, _) => build_inlined_temporal_array(rows, name, dt)?,
             DataType::Float32 => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
@@ -257,6 +262,60 @@ fn build_inlined_batch(
         arrays.push(array);
     }
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
+}
+
+fn build_inlined_temporal_array(
+    rows: &[SqliteRow],
+    column_name: &str,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    let values = rows
+        .iter()
+        .map(|row| {
+            let value = match row.try_get::<Option<String>, _>(column_name) {
+                Ok(None) => return Ok(ScalarValue::try_from(data_type)?),
+                Ok(Some(text)) => {
+                    if let Some(value) = crate::types::parse_ducklake_scalar(&text, data_type) {
+                        return Ok(value);
+                    }
+                    text.parse::<i64>().map_err(|_| {
+                        crate::DuckLakeError::Unsupported(format!(
+                            "inlined column '{column_name}' cannot decode {data_type}"
+                        ))
+                    })?
+                },
+                Err(_) => match row.try_get::<Option<i64>, _>(column_name)? {
+                    Some(value) => value,
+                    None => return Ok(ScalarValue::try_from(data_type)?),
+                },
+            };
+            match data_type {
+                DataType::Date32 => Ok(ScalarValue::Date32(Some(
+                    i32::try_from(value)
+                        .map_err(|e| crate::DuckLakeError::InvalidConfig(e.to_string()))?,
+                ))),
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+                    Ok(ScalarValue::Time64Microsecond(Some(value)))
+                },
+                DataType::Timestamp(unit, timezone) => Ok(match unit {
+                    arrow::datatypes::TimeUnit::Second => {
+                        ScalarValue::TimestampSecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Millisecond => {
+                        ScalarValue::TimestampMillisecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Microsecond => {
+                        ScalarValue::TimestampMicrosecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Nanosecond => {
+                        ScalarValue::TimestampNanosecond(Some(value), timezone.clone())
+                    },
+                }),
+                _ => unreachable!("only temporal columns use this decoder"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ScalarValue::iter_to_array(values)?)
 }
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
@@ -1721,7 +1780,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 // Which of the table's columns this inline table physically has
                 // (its layout matches the schema version it was created for).
                 let info = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT name FROM pragma_table_info({})",
+                    "SELECT name, type FROM pragma_table_info({})",
                     // pragma wants a string literal; single-quote-escape the name.
                     format_args!("'{}'", phys.replace('\'', "''"))
                 )))
@@ -1731,6 +1790,15 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .iter()
                     .filter_map(|r| r.try_get::<String, _>("name").ok())
                     .collect();
+                let physical_types = info
+                    .iter()
+                    .filter_map(|row| {
+                        Some((
+                            row.try_get::<String, _>("name").ok()?,
+                            row.try_get::<String, _>("type").ok()?,
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
 
                 // Project the table columns this inline table actually has; rows
                 // visible at the snapshot (this predicate also hides inlined-row
@@ -1759,7 +1827,13 @@ impl MetadataProvider for SqliteMetadataProvider {
                 if rows.is_empty() {
                     continue;
                 }
-                batches.push(build_inlined_batch(&schema, columns, &present, &rows)?);
+                batches.push(build_inlined_batch(
+                    &schema,
+                    columns,
+                    &present,
+                    &physical_types,
+                    &rows,
+                )?);
             }
             Ok(batches)
         })
@@ -1812,7 +1886,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             .bind(table_id)
             .fetch_all(&self.pool)
             .await?;
-            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
             let mut batches = Vec::new();
             for reg in regs {
                 let physical_name: String = reg.try_get("table_name")?;
@@ -1824,7 +1898,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     continue;
                 }
                 let info = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT name FROM pragma_table_info({})",
+                    "SELECT name, type FROM pragma_table_info({})",
                     format_args!("'{}'", physical_name.replace('\'', "''"))
                 )))
                 .fetch_all(&self.pool)
@@ -1833,6 +1907,15 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .iter()
                     .filter_map(|row| row.try_get::<String, _>("name").ok())
                     .collect();
+                let physical_types = info
+                    .iter()
+                    .filter_map(|row| {
+                        Some((
+                            row.try_get::<String, _>("name").ok()?,
+                            row.try_get::<String, _>("type").ok()?,
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>();
                 let projected = columns
                     .iter()
                     .filter(|column| present.contains(column.column_name.as_str()))
@@ -1869,7 +1952,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                     table_name: physical_name,
                     row_ids,
                     begin_snapshots,
-                    batch: build_inlined_batch(&schema, columns, &present, &rows)?,
+                    batch: build_inlined_batch(&schema, columns, &present, &physical_types, &rows)?,
                 });
             }
             Ok(batches)
