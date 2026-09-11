@@ -10,7 +10,7 @@ DataFusion-DuckLake is a DataFusion extension that provides read and write acces
 
 The extension integrates DuckLake with Apache DataFusion by implementing DataFusion's catalog and table provider interfaces.
 
-Reads are supported on all four catalog backends. Writes are feature-gated and currently implemented for SQLite (`write-sqlite`) and PostgreSQL (`write-postgres`). Both have a **standard single-catalog** writer (`SqliteMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE AS SELECT` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
+Reads are supported on all four catalog backends. Writes are feature-gated and currently implemented for SQLite (`write-sqlite`) and PostgreSQL (`write-postgres`). Both have a **standard single-catalog** writer (`SqliteMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
 
 ## Commands
 
@@ -54,7 +54,7 @@ The codebase follows a layered architecture with clear separation of concerns:
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
    - `MetadataWriter` trait (`metadata_writer.rs`) defines catalog mutations; implemented by `SqliteMetadataWriter` (`metadata_writer_sqlite.rs`), `PostgresSingleCatalogMetadataWriter` (`metadata_writer_postgres_single.rs`, standard spec layout), and `PostgresMetadataWriter` (`metadata_writer_postgres.rs`, multi-catalog layout)
    - `DuckLakeTableWriter` / `TableWriteSession` (`table_writer.rs`): write Arrow batches to Parquet with configurable compression and row-group sizing
-   - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO` / `CREATE TABLE AS SELECT`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/it/insert_partitioning_tests.rs`)
+   - `DuckLakeInsertExec` (`insert_exec.rs`): DataFusion execution plan backing `INSERT INTO`. Declares `required_input_distribution() == SinglePartition` so multi-partition inputs are coalesced before writing (guards against silently dropping rows; see `tests/it/insert_partitioning_tests.rs`)
    - A catalog becomes writable via `DuckLakeCatalog::with_writer(provider, writer)`
    - `maintenance.rs`: expire snapshots, clean up superseded files, reclaim orphaned files (Rust API, not SQL DDL)
    - Multi-catalog (PostgreSQL, **experimental & library-specific** — not part of the DuckLake spec, not accepted upstream): `MulticatalogManager` (`multicatalog.rs`) creates/manages many catalogs in one store; `MulticatalogProvider` (`multicatalog_provider.rs`, feature `multicatalog-postgres`) reads them. SQL CTAS is unsupported here (first write of a table goes through `DuckLakeTableWriter`); `INSERT INTO` works once the table exists. PostgreSQL writes no longer require this path — use `PostgresSingleCatalogMetadataWriter` for the spec-compliant layout.
@@ -233,6 +233,9 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 ```
 
 ### Current Limitations
+
+- Non-empty `CREATE TABLE AS SELECT` is rejected before publishing metadata.
+  Create an empty table, reopen the catalog, then use `INSERT INTO ... SELECT`.
 - Writes are supported on SQLite and PostgreSQL only; DuckDB and MySQL are read-only
 - No `UPDATE` / `DELETE` operations yet (delete files are read but not written)
 - No SQL `AS OF` syntax; use `DuckLakeCatalog::with_snapshot`,

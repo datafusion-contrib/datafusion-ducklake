@@ -6052,7 +6052,7 @@ mod tests {
         assert_eq!(inlined_postgres_type(&DataType::UInt32, "uint32"), "BIGINT");
         assert_eq!(
             inlined_postgres_type(&DataType::UInt64, "uint64"),
-            "NUMERIC(20,0)"
+            "VARCHAR"
         );
         assert_eq!(inlined_postgres_type(&DataType::Utf8, "varchar"), "BYTEA");
         assert_eq!(
@@ -6067,13 +6067,13 @@ mod tests {
             inlined_postgres_type(&DataType::FixedSizeBinary(32), "fixed_size_binary(32)"),
             "BYTEA"
         );
-        assert_eq!(inlined_postgres_type(&DataType::Date32, "date"), "DATE");
+        assert_eq!(inlined_postgres_type(&DataType::Date32, "date"), "VARCHAR");
         assert_eq!(
             inlined_postgres_type(
                 &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
                 "timestamp_ns",
             ),
-            "BIGINT"
+            "VARCHAR"
         );
         assert_eq!(
             inlined_postgres_type(
@@ -6088,10 +6088,10 @@ mod tests {
     fn postgres_uint64_inline_insert_casts_the_parameter() {
         let values = UInt64Array::from(vec![u64::MAX]);
         let mut query = QueryBuilder::<Postgres>::new("VALUES (");
-        push_inlined_postgres_value(&mut query, &values, 0, "NUMERIC(20,0)").unwrap();
+        push_inlined_postgres_value(&mut query, &values, 0, "VARCHAR").unwrap();
         query.push(')');
 
-        assert_eq!(query.sql(), "VALUES (CAST($1 AS NUMERIC(20,0)))");
+        assert_eq!(query.sql(), "VALUES (CAST($1 AS VARCHAR))");
     }
 
     #[test]

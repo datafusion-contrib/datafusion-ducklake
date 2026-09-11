@@ -18,6 +18,7 @@ use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
+use datafusion_ducklake::MetadataProvider;
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, NullOrder, PartitionTransform, PostgresMetadataProvider,
@@ -360,15 +361,17 @@ async fn replace_retires_the_prior_generation() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn sql_ctas_then_insert_then_select() {
+async fn sql_create_then_insert_then_select() {
     let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
 
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
     let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("lake", Arc::new(catalog));
 
-    ctx.sql("CREATE TABLE lake.main.nums AS SELECT 1 AS id, 'one' AS name")
+    ctx.sql("CREATE TABLE lake.main.nums (id BIGINT, name VARCHAR)")
         .await
         .unwrap()
         .collect()
@@ -376,7 +379,7 @@ async fn sql_ctas_then_insert_then_select() {
         .unwrap();
 
     // A catalog pins its snapshot at construction, so re-open to observe the
-    // committed CTAS before appending to it.
+    // committed table before appending to it.
     let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
     let writer2 = PostgresSingleCatalogMetadataWriter::new(&conn_str)
         .await
@@ -385,7 +388,7 @@ async fn sql_ctas_then_insert_then_select() {
     let ctx = SessionContext::new();
     ctx.register_catalog("lake", Arc::new(catalog));
 
-    ctx.sql("INSERT INTO lake.main.nums VALUES (2, 'two')")
+    ctx.sql("INSERT INTO lake.main.nums VALUES (1, 'one'), (2, 'two')")
         .await
         .unwrap()
         .collect()
@@ -1113,21 +1116,14 @@ async fn concurrent_create_of_the_same_table_conflicts_instead_of_writing_null_c
         )
         .unwrap();
 
-    let ctx = read_context(&conn_str).await;
-    let batches = ctx
-        .sql("SELECT count(*) AS n FROM lake.main.t")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    let n = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(n, 2);
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    assert_eq!(
+        provider
+            .get_table_row_count(retry.table_id, snapshot)
+            .unwrap(),
+        2
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

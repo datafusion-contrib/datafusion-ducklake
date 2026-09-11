@@ -138,7 +138,7 @@ PostgreSQL has two writers, both behind the `write-postgres` feature:
 - **`PostgresSingleCatalogMetadataWriter`** — the **standard, spec-compliant**
   single-catalog layout. Same catalog shape as the SQLite and MySQL writers, so the
   catalog is readable (and writable) by other DuckLake implementations including
-  DuckDB's `ducklake` extension. SQL `CREATE TABLE AS SELECT` and `INSERT INTO` both
+  DuckDB's `ducklake` extension. SQL `CREATE TABLE` and `INSERT INTO` both
   work. **Prefer this one.**
 - **`PostgresMetadataWriter`** — the **experimental multi-catalog layout** described in
   [its own section](#multi-catalog-postgresql-experimental), for hosting many catalogs
@@ -158,13 +158,19 @@ let writer = PostgresSingleCatalogMetadataWriter::new_with_init(
 ).await?;
 writer.set_data_path("/abs/path/to/data")?;
 
-// CTAS and INSERT both work on this path
+// SQL planning requires the target schema to exist
+let snapshot = writer.create_snapshot()?;
+writer.get_or_create_schema("main", None, snapshot)?;
 let provider = PostgresMetadataProvider::new("postgresql://user:pass@localhost:5432/db").await?;
 let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
 let ctx = SessionContext::new();
 ctx.register_catalog("ducklake", Arc::new(catalog));
-ctx.sql("CREATE TABLE ducklake.main.events AS SELECT 1 AS id").await?.collect().await?;
+ctx.sql("CREATE TABLE ducklake.main.events (id BIGINT)").await?.collect().await?;
 ```
+
+Non-empty `CREATE TABLE AS SELECT` is rejected before publishing metadata.
+After creating an empty table, reopen the catalog before using
+`INSERT INTO ... SELECT` to populate it.
 
 The multi-catalog path instead looks like this — tables are created through the writer
 API (no CTAS), then appended to with SQL:

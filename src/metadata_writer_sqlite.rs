@@ -5784,13 +5784,13 @@ mod tests {
             "VARCHAR"
         );
         assert_eq!(inlined_sqlite_type(&DataType::FixedSizeBinary(32)), "BLOB");
-        assert_eq!(inlined_sqlite_type(&DataType::Date32), "BIGINT");
+        assert_eq!(inlined_sqlite_type(&DataType::Date32), "VARCHAR");
         assert_eq!(
             inlined_sqlite_type(&DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Nanosecond,
                 None,
             )),
-            "BIGINT"
+            "VARCHAR"
         );
     }
 

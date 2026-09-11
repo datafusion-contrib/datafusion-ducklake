@@ -103,6 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Return a typed conflict for stale PostgreSQL single-catalog writes (#272).
+- Reject non-empty `CREATE TABLE AS SELECT` without publishing metadata;
+  use `CREATE TABLE` followed by `INSERT INTO ... SELECT` (#272).
+
 - Preserve DuckLake temporal and binary encodings in inlined writes (#272).
 - Fence partition changes during inline commits and count live rows in
   DELETE-all (#272).
