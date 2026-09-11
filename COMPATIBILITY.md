@@ -160,6 +160,19 @@ are a library extension and are optional; no scan-speed guarantee is implied.
 Declarations validate strictly when set. Write and ensure paths skip declared
 columns that a later schema change removes or renames.
 
+### Inlined scan filters
+
+Catalog queries apply supported equality, range, null, boolean, and prefix
+predicates before materializing inline rows. Supported AND terms can push
+independently; OR pushes only when every branch is supported. NOT remains a
+residual predicate, and DataFusion reapplies all filters for exact results.
+
+Comparisons require a compatible physical encoding. SQLite UInt64 comparisons
+normalize both TEXT and VARCHAR decimal values, including mixed padded and
+unpadded rows. Unsupported encodings and missing schema-version columns fall
+back to residual filtering. Metadata queries read all data columns; output
+projection occurs in DataFusion. Index declarations remain optional.
+
 ---
 
 ## Capabilities
