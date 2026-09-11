@@ -522,7 +522,7 @@ fn u64_sql_bind(value: &InlinedValue, dialect: InlinedSqlDialect) -> Option<Inli
 fn u64_uses_legacy_text(dialect: InlinedSqlDialect, physical_type: &str) -> bool {
     let physical = physical_type.trim().to_ascii_uppercase();
     match dialect {
-        InlinedSqlDialect::Sqlite => physical != "TEXT",
+        InlinedSqlDialect::Sqlite => true,
         InlinedSqlDialect::Postgres => {
             !physical.starts_with("NUMERIC") && !physical.starts_with("DECIMAL")
         },
@@ -540,10 +540,6 @@ fn native_u64_operands(
     let ident = quote_ident(column, dialect);
     let physical = physical_type.trim().to_ascii_uppercase();
     match dialect {
-        InlinedSqlDialect::Sqlite if physical == "TEXT" => (
-            format!("{ident} COLLATE BINARY"),
-            format!("substr('00000000000000000000' || {placeholder}, -20, 20)"),
-        ),
         InlinedSqlDialect::Postgres
             if physical.starts_with("NUMERIC") || physical.starts_with("DECIMAL") =>
         {
@@ -979,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn native_uint64_comparisons_leave_columns_bare() {
+    fn uint64_comparisons_respect_physical_encodings() {
         let filter = InlinedFilter::Comparison {
             column: "u64".to_string(),
             op: InlinedComparison::Gt,
@@ -989,7 +985,7 @@ mod tests {
             (
                 InlinedSqlDialect::Sqlite,
                 "TEXT",
-                "\"u64\" COLLATE BINARY > substr('00000000000000000000' || ?, -20, 20)",
+                "substr('00000000000000000000' || \"u64\", -20, 20) COLLATE BINARY > substr('00000000000000000000' || ?, -20, 20)",
             ),
             (
                 InlinedSqlDialect::Postgres,
@@ -1019,9 +1015,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sqlite_legacy_uint64_equality_normalizes_padding() {
-        // Legacy VARCHAR tables can hold both unpadded rows and padded rows
+    #[rstest::rstest]
+    #[case("TEXT")]
+    #[case("VARCHAR")]
+    fn sqlite_uint64_equality_normalizes_padding(#[case] physical_type: &str) {
+        // SQLite text columns can hold both unpadded rows and padded rows
         // written after the storage change; a bare equality would miss the
         // padded ones, so every operator normalizes through zero padding.
         let filter = InlinedFilter::Comparison {
@@ -1033,7 +1031,7 @@ mod tests {
             &filter,
             InlinedSqlDialect::Sqlite,
             &render_schema(),
-            &HashMap::from([("u64".to_string(), "VARCHAR".to_string())]),
+            &HashMap::from([("u64".to_string(), physical_type.to_string())]),
             0,
         )
         .unwrap();

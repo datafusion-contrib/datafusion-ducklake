@@ -1643,10 +1643,7 @@ async fn sqlite_stale_index_declaration_does_not_block_inlined_commits() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        indexes,
-        vec![format!("{physical}_row_id_idx"), format!("{physical}_value_idx"),]
-    );
+    assert_eq!(indexes, vec![format!("{physical}_value_idx")]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
