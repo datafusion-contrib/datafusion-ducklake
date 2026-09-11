@@ -749,3 +749,130 @@ async fn rewrite_preserves_partition_assignment_postgres() {
         vec![(9, 1), (10, 1)]
     );
 }
+
+/// A merge over absolute-path (reference) rows writes its output under the
+/// merging catalog's own layout and removes the reference rows, but schedules
+/// nothing: the referenced objects belong to the source catalog, which keeps
+/// reading them. This is how a database fork's compaction materialises its own
+/// copy without touching its source.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn merge_of_absolute_reference_files_does_not_schedule_them() {
+    use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, WriteMode};
+    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let os: ObjStore = Arc::new(LocalFileSystem::new());
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+
+    // A writes three files.
+    let created = DuckLakeTableWriter::new(writer_for(&pool, cat_a, &data).await, os.clone())
+        .unwrap()
+        .write_table("public", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    for (ids, vals) in [(vec![3, 4], vec![30, 40]), (vec![5, 6], vec![50, 60])] {
+        DuckLakeTableWriter::new(writer_for(&pool, cat_a, &data).await, os.clone())
+            .unwrap()
+            .append_table("public", "t", &[batch(ids, vals)])
+            .await
+            .unwrap();
+    }
+    let a_files = live_files(&pool, "cat_a").await;
+    assert_eq!(a_files.len(), 3, "three source files");
+    let rows = vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
+
+    // B references all three by their resolved paths, adopting A's column ids
+    // so the files' embedded field ids resolve in B.
+    let column_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY column_order",
+    )
+    .bind(created.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let (_, base) = parse_object_store_url(data.to_str().unwrap()).unwrap();
+    let cols = vec![
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("val", "int32", false).unwrap(),
+    ];
+    let wb = writer_for(&pool, cat_b, &data).await;
+    for (i, f) in a_files.iter().enumerate() {
+        let abs = join_paths(&base, &format!("cat_{cat_a}/public/t/{}", f.file.path)).unwrap();
+        let mode = if i == 0 {
+            WriteMode::Replace
+        } else {
+            WriteMode::Append
+        };
+        wb.register_existing_data_file(
+            "public",
+            "t",
+            &cols,
+            &column_ids,
+            &DataFileInfo::new(abs, f.file.file_size_bytes, f.max_row_count.unwrap())
+                .with_absolute_path(),
+            mode,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        read_rows(&pool, "cat_b", None).await,
+        rows,
+        "B reads A's bytes"
+    );
+
+    // Merge on B: its three reference rows become one owned file.
+    let result = with_writable_table(&pool, cat_b, "cat_b", &data, |t, s| async move {
+        t.merge_adjacent_files(&s, MergeOptions::default()).await
+    })
+    .await;
+    assert_eq!(result.files_processed, 3, "all three references merged");
+    assert_eq!(result.files_created, 1);
+
+    let b_files = live_files(&pool, "cat_b").await;
+    assert_eq!(b_files.len(), 1, "one merged file remains in B");
+    assert!(
+        b_files[0].file.path_is_relative,
+        "merge output is B's own (relative) file"
+    );
+    assert!(
+        data.join(format!("cat_{cat_b}"))
+            .join("public")
+            .join("t")
+            .join(&b_files[0].file.path)
+            .exists(),
+        "merge output lives under B's layout"
+    );
+    assert_eq!(
+        scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+            cat_b,
+        )
+        .await,
+        0,
+        "reference rows were removed without scheduling A's objects"
+    );
+
+    // A is untouched: objects present, rows live, reads identical.
+    for f in &a_files {
+        assert!(
+            data.join(format!("cat_{cat_a}"))
+                .join("public")
+                .join("t")
+                .join(&f.file.path)
+                .exists(),
+            "A's {} survives B's merge",
+            f.file.path
+        );
+    }
+    assert_eq!(live_files(&pool, "cat_a").await.len(), 3);
+    assert_eq!(read_rows(&pool, "cat_a", None).await, rows);
+    assert_eq!(read_rows(&pool, "cat_b", None).await, rows);
+}

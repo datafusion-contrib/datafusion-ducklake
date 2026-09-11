@@ -186,6 +186,16 @@ pub async fn cleanup_old_files_duckdb(
 /// bookkeeping rows. Returns the resolved absolute paths deleted (or, for `dry_run`, the
 /// paths that would be deleted).
 ///
+/// A scheduled file that an absolute-path data or delete file row in ANY catalog still
+/// points at is not deleted: another catalog registered that object by reference (a
+/// database fork does this instead of copying), so the owner's reclaim waits. The row
+/// stays scheduled and its `schedule_start` is reset, so an `OlderThan` sweep leaves it
+/// alone for another grace period; once the last reference row is gone the next sweep
+/// deletes it. Referencing catalogs never schedule such rows themselves (see
+/// `schedule_pg_files`), so the owner's scheduled row is the only reclaim intent — and
+/// when the owner catalog is dropped first, the object is reclaimed by the orphan sweep
+/// once no row anywhere resolves to it.
+///
 /// [`MulticatalogManager::expire_snapshots_in_catalog`]: crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog
 #[cfg(feature = "write-postgres")]
 pub async fn cleanup_old_files_in_catalog(
@@ -199,10 +209,51 @@ pub async fn cleanup_old_files_in_catalog(
     let files = mgr
         .list_scheduled_for_deletion_in_catalog(catalog_name, &criteria)
         .await?;
+    let files = retain_unreferenced(mgr, catalog_name, &data_path, files, dry_run).await?;
     run_cleanup(&data_path, files, object_store, dry_run, |ids| async move {
         mgr.remove_scheduled_in_catalog(catalog_name, &ids).await
     })
     .await
+}
+
+/// Drop from `files` every scheduled row whose resolved path an absolute-path row in
+/// some catalog still references, deferring those rows (unless `dry_run`). Resolution
+/// is the same `resolve_path(base_key, …)` `run_cleanup` performs, so the strings
+/// compare byte-for-byte with what a referencing row stores.
+#[cfg(feature = "write-postgres")]
+async fn retain_unreferenced(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    catalog_name: &str,
+    data_path: &str,
+    files: Vec<ScheduledFile>,
+    dry_run: bool,
+) -> Result<Vec<ScheduledFile>> {
+    if files.is_empty() {
+        return Ok(files);
+    }
+    let (_, base_key) = parse_object_store_url(data_path)?;
+    let mut resolved = Vec::with_capacity(files.len());
+    for file in &files {
+        resolved.push(resolve_path(&base_key, &file.path, file.path_is_relative)?);
+    }
+    let referenced = mgr.referenced_absolute_paths(&resolved).await?;
+    if referenced.is_empty() {
+        return Ok(files);
+    }
+    let mut kept = Vec::with_capacity(files.len());
+    let mut deferred = Vec::new();
+    for (file, abs) in files.into_iter().zip(resolved) {
+        if referenced.contains(&abs) {
+            deferred.push(file.path);
+        } else {
+            kept.push(file);
+        }
+    }
+    if !dry_run {
+        mgr.defer_scheduled_in_catalog(catalog_name, &deferred)
+            .await?;
+    }
+    Ok(kept)
 }
 
 /// Reclaim metadata rows whose owning row is already gone, on a Postgres store.
