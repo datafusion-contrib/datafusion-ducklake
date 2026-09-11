@@ -50,6 +50,7 @@ use datafusion::physical_plan::{
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
+use crate::metadata_provider::reject_inlined_changes;
 use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
@@ -519,6 +520,13 @@ impl TableProvider for TableDeletionsTable {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Get delete files added between snapshots
+        reject_inlined_changes(
+            self.provider.as_ref(),
+            self.table_id,
+            self.start_snapshot,
+            self.end_snapshot,
+            &["inlined_delete"],
+        )?;
         let delete_files = self
             .provider
             .get_delete_files_added_between_snapshots(

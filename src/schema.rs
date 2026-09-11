@@ -16,6 +16,8 @@ use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 #[cfg(feature = "write")]
 use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode, validate_name};
 #[cfg(feature = "write")]
+use datafusion::datasource::MemTable;
+#[cfg(feature = "write")]
 use datafusion::error::DataFusionError;
 
 /// Validate table name to prevent path traversal attacks and reject
@@ -302,6 +304,24 @@ impl SchemaProvider for DuckLakeSchema {
                     .to_string(),
             )
         })?;
+
+        // DataFusion supplies materialized CTAS rows in a MemTable. Publishing only
+        // its schema would discard those rows.
+        if let Some(memory) = table.downcast_ref::<MemTable>() {
+            for partition in &memory.batches {
+                let batches = partition.try_read().map_err(|_| {
+                    DataFusionError::Execution(
+                        "Cannot register an in-memory table while its rows are being modified"
+                            .to_string(),
+                    )
+                })?;
+                if batches.iter().any(|batch| batch.num_rows() > 0) {
+                    return Err(DataFusionError::NotImplemented(
+                        "CREATE TABLE AS SELECT with rows is not supported; use CREATE TABLE followed by INSERT INTO ... SELECT".to_string(),
+                    ));
+                }
+            }
+        }
 
         // Convert Arrow schema to ColumnDefs
         let arrow_schema = table.schema();

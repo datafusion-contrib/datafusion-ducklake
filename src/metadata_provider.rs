@@ -1,3 +1,4 @@
+use crate::inlined_filter::{InlinedDataScan, InlinedFilter};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::datatypes::{DataType, Field, SchemaRef};
@@ -723,6 +724,47 @@ pub(crate) fn build_inlined_batch(
         .map(|index| ScalarValue::iter_to_array(rows.iter().map(|row| row[index].clone())))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(RecordBatch::try_new(schema, arrays)?)
+}
+
+pub(crate) fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    changes.split(move |character| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        character == ',' && !quoted
+    })
+}
+
+pub(crate) fn reject_inlined_changes(
+    provider: &dyn MetadataProvider,
+    table_id: i64,
+    start_snapshot: i64,
+    end_snapshot: i64,
+    kinds: &[&str],
+) -> Result<()> {
+    let changes = match provider.list_snapshot_changes() {
+        Ok(changes) => changes,
+        Err(DuckLakeError::Unsupported(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let tokens = kinds
+        .iter()
+        .map(|kind| format!("{kind}:{table_id}"))
+        .collect::<Vec<_>>();
+    if changes.iter().any(|change| {
+        change.snapshot_id >= start_snapshot
+            && change.snapshot_id <= end_snapshot
+            && change.changes_made.as_deref().is_some_and(|changes| {
+                snapshot_change_tokens(changes)
+                    .any(|token| tokens.iter().any(|expected| token == expected))
+            })
+    }) {
+        return Err(DuckLakeError::Unsupported(
+            "change feeds over inlined rows are not supported; use Parquet writes for change-feed tables".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1671,6 +1713,27 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// Read visible inlined rows for a table scan with an optional conservative
+    /// metadata-catalog filter.
+    ///
+    /// The default preserves source compatibility for external providers by
+    /// delegating to [`Self::get_inlined_data`] and reporting the rows it
+    /// materialized. Implementations may omit unsupported filter nodes but must
+    /// never exclude a row which could satisfy the original DataFusion filter.
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        _filter: Option<&InlinedFilter>,
+    ) -> Result<InlinedDataScan> {
+        Ok(InlinedDataScan::from_batches(self.get_inlined_data(
+            table_id,
+            snapshot_id,
+            columns,
+        )?))
+    }
+
     /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
     /// that are visible at `snapshot_id`.
     ///
@@ -1727,7 +1790,13 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
             .map(|f| f.max_row_count.unwrap_or(0) - f.delete_count.unwrap_or(0))
             .sum::<i64>()
             - inlined_count;
-        Ok(net.max(0) as u64)
+        let columns = self.get_table_structure(table_id, snapshot_id)?;
+        let inlined_rows = self
+            .get_inlined_data(table_id, snapshot_id, &columns)?
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .sum::<u64>();
+        Ok(net.max(0) as u64 + inlined_rows)
     }
 
     // Dynamic lookup methods for on-demand metadata retrieval
@@ -1923,25 +1992,20 @@ mod tests {
     }
 
     #[test]
-    fn inlined_rows_reject_unsupported_nested_encoding() {
+    fn inlined_rows_parse_nested_encoding() {
         let columns = vec![column("items", "list<int32>")];
         let schema = Arc::new(Schema::new(vec![Field::new_list(
             "items",
             Field::new("item", DataType::Int32, true),
             true,
         )]));
-        let error = parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]])
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("inlined data for column 'items' cannot decode value '[1, 2]' as List"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            error.to_string().contains(INLINED_DATA_REMEDIATION),
-            "unexpected error: {error}"
+        let batch =
+            parse_inlined_rows(schema, &columns, vec![vec![Some("[1, 2]".to_string())]]).unwrap();
+        assert_eq!(
+            ScalarValue::try_from_array(batch.column(0), 0)
+                .unwrap()
+                .to_string(),
+            "[1, 2]"
         );
     }
 

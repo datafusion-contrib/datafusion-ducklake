@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::{
@@ -148,8 +149,10 @@ async fn table_scoped_parquet_options_control_insert_update_and_delete_files() {
     sqlx::query(
         "INSERT INTO ducklake_metadata (key, value, scope, scope_id) \
          VALUES ('parquet_compression', 'zstd', 'table', ?), \
-                ('parquet_version', 'V1', 'table', ?)",
+                ('parquet_version', 'V1', 'table', ?), \
+                ('data_inlining_row_limit', '0', 'table', ?)",
     )
+    .bind(setup.table_id)
     .bind(setup.table_id)
     .bind(setup.table_id)
     .execute(&pool)
@@ -311,6 +314,143 @@ async fn invalid_write_setting_does_not_block_reads() {
         Err(e) => e.to_string(),
     };
     assert!(error.contains("Invalid DuckLake write settings"), "{error}");
+}
+
+#[rstest]
+#[case(None, 1, 0)]
+#[case(Some("0"), 1, 0)]
+#[case(Some("2"), 0, 2)]
+#[tokio::test(flavor = "multi_thread")]
+async fn table_scoped_row_limit_controls_sql_inlining(
+    #[case] limit: Option<&str>,
+    #[case] expected_files: i64,
+    #[case] expected_rows: usize,
+) {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("catalog.db");
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let connection = format!("sqlite:{}?mode=rwc", database.display());
+    let writer = SqliteMetadataWriter::new_with_init(&connection)
+        .await
+        .unwrap();
+    writer.set_data_path(data.to_str().unwrap()).unwrap();
+    let columns = vec![ColumnDef::new("id", "int64", false).unwrap()];
+    let setup = writer
+        .begin_write_transaction("main", "events", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    if let Some(limit) = limit {
+        sqlx::query("INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES ('data_inlining_row_limit', ?, 'table', ?)")
+            .bind(limit).bind(setup.table_id).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let context = SessionContext::new();
+    context.register_catalog("lake", Arc::new(catalog));
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    context
+        .register_batch(
+            "source",
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap(),
+        )
+        .unwrap();
+    context
+        .sql("INSERT INTO lake.main.events SELECT * FROM source")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let pool = SqlitePool::connect(&connection).await.unwrap();
+    let files: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ?")
+            .bind(setup.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let columns = provider
+        .get_table_structure(setup.table_id, snapshot)
+        .unwrap();
+    let rows = provider
+        .get_inlined_data(setup.table_id, snapshot, &columns)
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum::<usize>();
+    let context = writable_context(&connection).await;
+    let read = context
+        .sql("SELECT id FROM lake.main.events ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids = read
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(files, expected_files);
+    assert_eq!(rows, expected_rows);
+    assert_eq!(ids, vec![1, 2]);
+    if expected_rows == 0 {
+        let updated = context
+            .sql("UPDATE lake.main.events SET id = id + 10")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let count = ScalarValue::try_from_array(updated[0].column(0), 0).unwrap();
+        let read = writable_context(&connection)
+            .await
+            .sql("SELECT id FROM lake.main.events ORDER BY id")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let ids = read
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(count, ScalarValue::UInt64(Some(2)));
+        assert_eq!(ids, vec![11, 12]);
+    }
 }
 
 #[test]

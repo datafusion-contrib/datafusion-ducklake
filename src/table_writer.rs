@@ -80,8 +80,8 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeWriteOptions {
-    /// Reserved limit for automatic catalog-backed inlining. High-level writes
-    /// currently use Parquet regardless of this value.
+    /// Maximum rows stored in catalog-backed inlined storage. Zero disables
+    /// inlining; `None` leaves the receiving writer's limit unchanged.
     pub data_inlining_row_limit: Option<usize>,
     /// Parquet compression codec; `None` leaves the writer's codec unchanged.
     pub compression: Option<Compression>,
@@ -126,7 +126,9 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            data_inlining_row_limit: None,
+            // Keep inlining opt-in until inline UPDATE, rowid, CDC, SQL flush, and
+            // automatic maintenance are supported. Explicit settings still apply (#270).
+            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(0))?,
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
@@ -157,7 +159,7 @@ impl DuckLakeWriteOptions {
         })
     }
 
-    /// Sets the reserved automatic inlining limit; high-level writes currently use Parquet.
+    /// Sets the maximum row count for catalog-backed inlining.
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
@@ -1467,13 +1469,17 @@ impl DuckLakeTableWriter {
             for (values, _) in &groups {
                 spec.validate_values(arrow_schema, values)?;
             }
+        } else {
+            return Err(crate::DuckLakeError::Conflict(
+                "partition spec changed before write; retry the write".to_string(),
+            ));
         }
 
-        if self.should_inline(records_written, arrow_schema) {
-            let batches: Vec<RecordBatch> = groups
-                .iter()
-                .flat_map(|(_, batches)| batches.iter().cloned())
-                .collect();
+        let batches: Vec<RecordBatch> = groups
+            .iter()
+            .flat_map(|(_, batches)| batches.iter().cloned())
+            .collect();
+        if self.should_inline(records_written, arrow_schema, &batches) {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1483,7 +1489,7 @@ impl DuckLakeTableWriter {
                 mode,
                 setup.base_snapshot_id,
                 &columns,
-                &setup.column_ids,
+                &setup.field_ids,
                 &options.commit_metadata,
                 options.expected_base_snapshot_id,
             )?;
@@ -1630,7 +1636,12 @@ impl DuckLakeTableWriter {
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        if self.should_inline(records_written, arrow_schema) {
+        if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
+            return Err(crate::DuckLakeError::Conflict(
+                "table gained a partition spec before write; retry the write".to_string(),
+            ));
+        }
+        if self.should_inline(records_written, arrow_schema, batches) {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1640,7 +1651,7 @@ impl DuckLakeTableWriter {
                 mode,
                 setup.base_snapshot_id,
                 &columns,
-                &setup.column_ids,
+                &setup.field_ids,
                 &SnapshotCommitMetadata::new(),
                 None,
             )?;
@@ -1774,7 +1785,12 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        if self.should_inline(records_written, arrow_schema) {
+        if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
+            return Err(crate::DuckLakeError::Conflict(
+                "table gained a partition spec before write; retry the write".to_string(),
+            ));
+        }
+        if self.should_inline(records_written, arrow_schema, batches) {
             return Ok(PreparedTableWrite {
                 write: StagedTableWrite {
                     table_id: setup.table_id,
@@ -1783,7 +1799,7 @@ impl DuckLakeTableWriter {
                     base_snapshot_id: setup.base_snapshot_id,
                     mode,
                     columns,
-                    column_ids: setup.column_ids,
+                    column_ids: setup.field_ids,
                     data: StagedTableData::Inlined(batches.to_vec()),
                     snapshot_id_columns: Vec::new(),
                     positional_deletes: Vec::new(),
@@ -1903,8 +1919,13 @@ impl DuckLakeTableWriter {
         Ok(ObjectPath::from(path.trim_start_matches('/')))
     }
 
-    fn should_inline(&self, _rows: usize, _arrow_schema: &Schema) -> bool {
-        false
+    fn should_inline(&self, rows: usize, arrow_schema: &Schema, batches: &[RecordBatch]) -> bool {
+        rows > 0
+            && self
+                .data_inlining_row_limit
+                .is_some_and(|limit| rows <= limit)
+            && self.metadata.supports_data_inlining(arrow_schema)
+            && self.metadata.supports_data_inlining_values(batches)
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -2095,6 +2116,7 @@ impl DuckLakeWriteTransaction<'_> {
         if !writer.should_inline(
             batches.iter().map(RecordBatch::num_rows).sum(),
             arrow_schema,
+            batches,
         ) {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "commit snapshot columns require an inlined table stage".to_string(),
@@ -3682,7 +3704,7 @@ mod tests {
             options.compression,
             Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         );
-        assert_eq!(options.data_inlining_row_limit, None);
+        assert_eq!(options.data_inlining_row_limit, Some(0));
         assert_eq!(options.max_row_group_rows, Some(122_880));
         assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
         assert_eq!(options.target_file_size, Some(5_000_000));
@@ -3708,7 +3730,7 @@ mod tests {
         let options = stored.with_overrides(&explicit);
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
-        assert_eq!(options.data_inlining_row_limit, None);
+        assert_eq!(options.data_inlining_row_limit, Some(0));
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));

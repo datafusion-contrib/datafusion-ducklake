@@ -1362,6 +1362,17 @@ impl MetadataProvider for MulticatalogProvider {
             .get_inlined_data(table_id, snapshot_id, columns)
     }
 
+    fn scan_inlined_data(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+    ) -> Result<crate::inlined_filter::InlinedDataScan> {
+        self.inlined_provider
+            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+    }
+
     fn get_inlined_data_with_row_ids(
         &self,
         table_id: i64,

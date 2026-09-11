@@ -3,6 +3,7 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
+use crate::metadata_provider::snapshot_change_tokens;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -38,6 +39,18 @@ pub fn validate_name(name: &str, kind: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+pub(crate) fn is_inlined_system_column(name: &str) -> bool {
+    [
+        "row_id",
+        "begin_snapshot",
+        "end_snapshot",
+        "_ducklake_internal_row_id",
+        "_ducklake_internal_snapshot_id",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 /// Write mode for table operations.
@@ -148,16 +161,6 @@ pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
     })
 }
 
-fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
-    let mut quoted = false;
-    changes.split(move |character| {
-        if character == '"' {
-            quoted = !quoted;
-        }
-        character == ',' && !quoted
-    })
-}
-
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
     let mut groups = BTreeMap::new();
     for row in rows {
@@ -253,6 +256,16 @@ impl SnapshotCommitMetadata {
 }
 
 pub(crate) fn inlined_text_value(array: &dyn Array, row: usize) -> Result<String> {
+    if matches!(
+        array.data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+    ) {
+        return crate::nested_inline::render_text(array, row);
+    }
     if array.data_type() == &DataType::FixedSizeBinary(16) {
         let bytes = array
             .as_any()
@@ -264,36 +277,6 @@ pub(crate) fn inlined_text_value(array: &dyn Array, row: usize) -> Result<String
             .map_err(|error| DuckLakeError::InvalidConfig(format!("invalid UUID bytes: {error}")));
     }
     Ok(arrow::util::display::array_value_to_string(array, row)?)
-}
-
-pub(crate) fn scalar_type_supports_inlining(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Null
-            | DataType::Boolean
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Decimal128(_, _)
-            | DataType::Date32
-            | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-            | DataType::Timestamp(_, _)
-            | DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::FixedSizeBinary(_)
-    )
 }
 
 /// Column definition for creating or updating a table's schema.
@@ -1277,6 +1260,70 @@ pub struct WriteSetupResult {
     pub field_ids: Vec<i64>,
 }
 
+pub(crate) const INLINED_INDEX_COLUMNS_SETTING: &str = "inlined_index_columns";
+
+pub(crate) fn encode_inlined_index_columns(columns: &[String]) -> Result<String> {
+    let mut seen = std::collections::HashSet::with_capacity(columns.len());
+    let mut normalized = Vec::with_capacity(columns.len());
+    for column in columns {
+        let column = column.trim();
+        validate_name(column, "Inlined index column")?;
+        if column.contains(',') {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "inlined index column '{column}' contains a comma"
+            )));
+        }
+        if !seen.insert(column.to_string()) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "duplicate inlined index column '{column}'"
+            )));
+        }
+        normalized.push(column.to_string());
+    }
+    Ok(normalized.join(","))
+}
+
+pub(crate) fn parse_inlined_index_columns(value: &str) -> Result<Vec<String>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let columns = value
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    encode_inlined_index_columns(&columns)?;
+    Ok(columns)
+}
+
+/// Write paths tolerate a declaration whose columns were removed or renamed by
+/// a later schema migration: unknown columns are skipped so an inlined commit
+/// never fails on a stale declaration. `set_inlined_index_columns` still
+/// validates strictly at declaration time.
+pub(crate) fn live_inlined_index_columns(
+    declared: Vec<String>,
+    available: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    declared
+        .into_iter()
+        .filter(|column| available.contains(column))
+        .collect()
+}
+
+pub(crate) fn validate_inlined_index_columns(
+    declared: &[String],
+    available: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for column in declared {
+        if !available.contains(column) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "inlined index column '{column}' is not a live top-level table column"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Trait for writing metadata to DuckLake catalogs.
 ///
 /// Implementations must be thread-safe (`Send + Sync`).
@@ -1295,6 +1342,21 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "table-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Declare table columns that every physical inlined-data table should
+    /// index. An empty declaration retains only the mandatory `row_id` index.
+    fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
+        let value = encode_inlined_index_columns(columns)?;
+        self.set_table_setting(table_id, INLINED_INDEX_COLUMNS_SETTING, &value)
+    }
+
+    /// Backfill the declared indexes on every existing physical inlined-data
+    /// table. Implementations also apply any backend-specific legacy migration.
+    fn ensure_inlined_indexes(&self, _table_id: i64) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "inlined index maintenance is not supported by this metadata backend".to_string(),
         ))
     }
 
@@ -1677,6 +1739,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// since when to inline is writer policy under the DuckLake specification.
     fn supports_data_inlining(&self, _schema: &ArrowSchema) -> bool {
         false
+    }
+
+    /// Whether values in an otherwise supported schema can be inlined losslessly.
+    fn supports_data_inlining_values(&self, _batches: &[RecordBatch]) -> bool {
+        true
     }
 
     /// Store a small insert in the catalog instead of writing a Parquet file.
@@ -2288,6 +2355,43 @@ mod tests {
     use arrow::datatypes::Field;
     use std::sync::Arc;
 
+    #[test]
+    fn inlined_index_columns_normalize_and_reject_ambiguous_values() {
+        assert_eq!(
+            encode_inlined_index_columns(&[" identifier ".to_string(), "timestamp".to_string()])
+                .unwrap(),
+            "identifier,timestamp"
+        );
+        assert_eq!(
+            parse_inlined_index_columns("identifier, timestamp").unwrap(),
+            vec!["identifier".to_string(), "timestamp".to_string()]
+        );
+        assert!(
+            encode_inlined_index_columns(&["identifier".to_string(), "identifier".to_string()])
+                .is_err()
+        );
+        assert!(encode_inlined_index_columns(&["bad,name".to_string()]).is_err());
+    }
+
+    #[test]
+    fn inlined_index_columns_must_name_live_top_level_columns() {
+        let available = std::collections::HashSet::from(["identifier".to_string()]);
+        validate_inlined_index_columns(&["identifier".to_string()], &available).unwrap();
+        assert!(validate_inlined_index_columns(&["nested.value".to_string()], &available).is_err());
+    }
+
+    #[test]
+    fn stale_inlined_index_columns_are_skipped_not_fatal() {
+        let available = std::collections::HashSet::from(["identifier".to_string()]);
+        assert_eq!(
+            live_inlined_index_columns(
+                vec!["identifier".to_string(), "removed_column".to_string()],
+                &available,
+            ),
+            vec!["identifier".to_string()]
+        );
+    }
+
     fn promoted(values: Vec<(i32, Option<String>)>) -> DataFileInfo {
         DataFileInfo::new("f.parquet", 1024, 10).with_partition(7, values)
     }
@@ -2312,14 +2416,17 @@ mod tests {
             DataType::LargeBinary,
             DataType::FixedSizeBinary(16),
         ] {
-            assert!(scalar_type_supports_inlining(&data_type), "{data_type}");
+            assert!(
+                crate::nested_inline::scalar_type_supports_inlining(&data_type),
+                "{data_type}"
+            );
         }
-        assert!(!scalar_type_supports_inlining(&DataType::Time64(
-            arrow::datatypes::TimeUnit::Nanosecond,
-        )));
-        assert!(!scalar_type_supports_inlining(&DataType::List(Arc::new(
-            Field::new("item", DataType::Int64, true),
-        ))));
+        assert!(!crate::nested_inline::scalar_type_supports_inlining(
+            &DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond,),
+        ));
+        assert!(!crate::nested_inline::scalar_type_supports_inlining(
+            &DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        ));
     }
 
     #[test]
