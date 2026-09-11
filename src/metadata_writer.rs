@@ -3,6 +3,7 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
+use crate::metadata_provider::snapshot_change_tokens;
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -145,16 +146,6 @@ pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
             ]
             .iter()
             .any(|candidate| kind.eq_ignore_ascii_case(candidate))
-    })
-}
-
-fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
-    let mut quoted = false;
-    changes.split(move |character| {
-        if character == '"' {
-            quoted = !quoted;
-        }
-        character == ',' && !quoted
     })
 }
 
@@ -1736,6 +1727,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// since when to inline is writer policy under the DuckLake specification.
     fn supports_data_inlining(&self, _schema: &ArrowSchema) -> bool {
         false
+    }
+
+    /// Whether values in an otherwise supported schema can be inlined losslessly.
+    fn supports_data_inlining_values(&self, _batches: &[RecordBatch]) -> bool {
+        true
     }
 
     /// Store a small insert in the catalog instead of writing a Parquet file.

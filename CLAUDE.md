@@ -208,14 +208,10 @@ The `DuckLakeTable` provider handles URL resolution by:
 - Geometry types are mapped to Binary (WKB format)
 - Complex types (nested lists, structs, maps) return descriptive errors
   instead of silently failing
-- Inlined writers preserve backend-native numeric and temporal types where
-  lossless. SQLite stores `UInt64` as zero-padded 20-digit text and temporal
-  values as integers; PostgreSQL and MySQL store nanosecond timestamps as
-  `BIGINT`.
-- `MetadataWriter::set_inlined_index_columns()` persists per-table top-level
-  index declarations. `ensure_inlined_indexes()` backfills them idempotently,
-  and every physical inlined table always has a `row_id` index.
-
+- Inlined writers preserve DuckLake encodings. SQLite uses text for temporal values;
+  PostgreSQL uses text for dates, timestamps, and `UInt64`. See `COMPATIBILITY.md`.
+- `MetadataWriter::set_inlined_index_columns()` declares optional physical indexes.
+  Creating indexes never changes existing column types.
 
 ## Development Notes
 
@@ -259,7 +255,8 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
   `begin_write_with_embedded_rowid` and `begin_write_to_path`, which write to one
   caller-determined file.
 - DuckDB-encrypted (non-PME) Parquet files are not supported
-- Data inlining is not read (see `COMPATIBILITY.md` for the `COUNT(*)` undercount caveat)
+- Inlined rows participate in scans and `COUNT(*)`; see `COMPATIBILITY.md` for
+  mutation and CDC limits.
 - No optional metadata caching layer (all lookups are dynamic)
 
 ### Testing

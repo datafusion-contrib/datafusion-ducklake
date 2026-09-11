@@ -2004,7 +2004,7 @@ async fn create_mysql_physical_indexes(
     .await?
     .into_iter()
     .collect::<std::collections::HashMap<_, _>>();
-    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+    for column in declared.iter().map(String::as_str) {
         let Some(physical_type) = physical_types.get(column) else {
             continue;
         };
@@ -2054,6 +2054,7 @@ async fn commit_staged_inline(
     write: &StagedTableWrite,
     batches: &[RecordBatch],
 ) -> Result<()> {
+    enforce_inline_partition_fence(tx, write.table_id, write.base_snapshot_id).await?;
     let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if record_count == 0 {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -2881,6 +2882,14 @@ impl MetadataWriter for MySqlMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        if schema.fields().iter().any(|field| {
+            matches!(
+                field.name().to_ascii_lowercase().as_str(),
+                "row_id" | "begin_snapshot" | "end_snapshot"
+            )
+        }) {
+            return false;
+        }
         schema
             .fields()
             .iter()
@@ -3484,7 +3493,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 return Ok(0);
             }
             let gross: Option<i64> = sqlx::query_scalar(
-                "SELECT record_count FROM ducklake_table_stats WHERE table_id = ?",
+                "SELECT CAST(COALESCE(SUM(record_count), 0) AS SIGNED) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
             )
             .bind(table_id)
             .fetch_optional(&mut *tx)
@@ -3497,7 +3506,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
-            let live_rows = (gross.unwrap_or(0) - deleted).max(0) as u64;
+            let live_rows = (gross.unwrap_or(0) + live_inlined - deleted).max(0) as u64;
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = ?
                  WHERE table_id = ? AND end_snapshot IS NULL",
@@ -3601,6 +3610,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 ensure_mysql_physical_indexes(&self.pool, table_id, &physical_name).await?;
 
                 let mut tx = self.pool.begin().await?;
+                enforce_inline_partition_fence(&mut tx, table_id, base_snapshot).await?;
                 let snapshot_id =
                     finalize_snapshot(&mut tx, table_id, columns, column_ids, mode, base_snapshot)
                         .await?;
@@ -4740,6 +4750,20 @@ impl MetadataWriter for MySqlMetadataWriter {
             })
         })
     }
+}
+
+async fn enforce_inline_partition_fence(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let changed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)").bind(table_id).bind(base_snapshot).bind(base_snapshot).fetch_one(&mut **tx).await?;
+    if changed != 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "partition spec for table {table_id} changed during inline write; retry the write"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

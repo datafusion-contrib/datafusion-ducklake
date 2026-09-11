@@ -132,34 +132,33 @@ provider, run writer initialization with a schema-migration role before reading.
 
 ### Inlined physical storage
 
-New inlined physical tables use lossless, ordered backend types for values used
-in filters:
+Inlined columns preserve DuckLake's physical encodings:
 
-- **DuckDB:** Native unsigned integers and DuckDB temporal types, including
-  nanosecond timestamps.
-- **PostgreSQL:** `NUMERIC(20,0)` for `UInt64`; native `DATE`, `TIME`,
-  and second-to-microsecond `TIMESTAMP`; `BIGINT` for nanosecond timestamps.
-- **MySQL:** `BIGINT UNSIGNED` for `UInt64`; native `DATE`, `TIME(6)`,
-  and second-to-microsecond `DATETIME(6)` (year range 1000-9999, no
-  session-time-zone conversion); `BIGINT` for nanosecond timestamps.
-- **SQLite:** Zero-padded, 20-digit `TEXT` for `UInt64`; integer epoch values
-  in the declared Arrow unit for temporal columns.
+- **DuckDB:** Native unsigned integers, temporal values, and nested columns.
+- **PostgreSQL multicatalog writer:** Decimal text for `UInt64`, text for dates
+  and timestamps, native `TIME`, and `BYTEA` for strings and binary values. The
+  standard single-catalog writer keeps small writes in Parquet.
+- **SQLite:** Decimal text for `UInt64`, text for dates and timestamps, and
+  DuckDB-compatible nested literals. Binary leaves use escaped bytes.
+- **MySQL:** `BIGINT UNSIGNED` for UInt64, `FLOAT`/`DOUBLE` for floats,
+  `DECIMAL(p,s)` for Decimal128, `DATE`, `TIME(6)`, and `DATETIME(6)` for
+  second-to-microsecond timestamps. `DATETIME(6)` supports years in [1000, 9999]
+  without session-time-zone conversion. Nanosecond timestamps use `BIGINT`;
+  nested values use text.
 
-MySQL also stores floats and `Decimal128(p,s)` as native `FLOAT`/`DOUBLE`
-and `DECIMAL(p,s)`. PostgreSQL maps a 16-byte fixed binary column to `UUID`
-only when its DuckLake logical type is `uuid`; other fixed binary values use
-`BYTEA`. PostgreSQL and DuckDB reject inlined `Interval(MonthDayNano)` values
-with sub-microsecond precision instead of truncating them.
+PostgreSQL maps a 16-byte fixed binary column to `UUID` only when its DuckLake
+logical type is `uuid`. Other fixed binary values use `BYTEA`. High-level DuckDB
+and PostgreSQL writes
+with sub-microsecond intervals take the Parquet path; Arrow 59 cannot write that
+interval type to Parquet, so those writes still return an unsupported-type error.
 
-Call `MetadataWriter::set_inlined_index_columns(table_id, columns)` to persist
-the top-level columns that should be indexed, then call
-`ensure_inlined_indexes(table_id)` to backfill existing physical tables. Every
-physical inlined table receives a `row_id` index, including tables created after
-the declaration. Repeated ensure calls are safe. PostgreSQL ensure calls also
-migrate legacy text-encoded `UInt64` columns to `NUMERIC(20,0)`; SQLite retains
-legacy column types. Declarations validate strictly when set; write and ensure
-paths skip declared columns a later schema migration removed or renamed, so a
-stale declaration never fails an inlined commit.
+Call `MetadataWriter::set_inlined_index_columns(table_id, columns)` to declare
+indexes, then `ensure_inlined_indexes(table_id)` to backfill existing physical
+tables. New physical tables apply those declarations. Repeated calls are safe
+and preserve column types. No index is created without a declaration. Indexes
+are a library extension and are optional; no scan-speed guarantee is implied.
+Declarations validate strictly when set. Write and ensure paths skip declared
+columns that a later schema change removes or renames.
 
 ---
 
@@ -256,6 +255,14 @@ lock. It creates physical inline tables through a separate connection so DDL
 cannot implicitly commit the metadata transaction. Zero-row inline stages are
 rejected before physical DDL. The new DuckDB staged inline DDL is nullable,
 matching SQLite and PostgreSQL; older native DDL remains unchanged.
+
+To move existing inline rows into Parquet, call
+`MetadataProvider::get_inlined_data_with_row_ids`, then pass those batches and
+their snapshot to `DuckLakeTableWriter::flush_inlined_data` from Rust
+before using operations that require Parquet storage. There is no SQL flush hook.
+Setting the row limit to zero affects future writes and does not flush existing
+rows. Arrow 59 cannot flush `Interval(MonthDayNano)` values. Automatic compaction
+and removal of physical inline tables during maintenance remain unsupported.
 
 High-level row staging honors the scoped `data_inlining_row_limit`, defaulting
 catalog-backed writes to 10 rows. Zero disables inlining. Direct writers retain
@@ -438,19 +445,16 @@ Known edges:
   `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
   (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
   `DELETE`, and compaction on all four backends; the `rowid` path remains
-  unsupported for inlined rows. Lists, structs, and maps inline on every
-  writable backend when every field passes the shared nested-type gate.
-  Unsupported schemas fall back to Parquet. Inlined rows containing
+  unsupported for inlined rows. Lists, structs, and maps inline on SQLite,
+  DuckDB, MySQL, and the multicatalog PostgreSQL writer when every field passes
+  the shared type gate. Unsupported schemas fall back to Parquet. Inlined rows containing
   `Interval(MonthDayNano)` remain readable, but Arrow 59 cannot flush that
   interval type to Parquet.
-  Inlined scans conservatively push equality, range, null, conjunction,
-  disjunction, and case-sensitive prefix predicates into parameterized catalog
-  SQL. Supported `AND` children push independently; `OR` pushes only when every
-  branch is supported. DataFusion reapplies every filter. A physical schema or
-  backend encoding that cannot preserve DataFusion comparison semantics falls
-  back to materializing those rows. Projection pushdown is automatic. Declared
-  physical indexes are described under
-  [Inlined physical storage](#inlined-physical-storage).
+- **Change feeds reject windows containing inlined inserts or inline-row deletes.**
+  These row versions are not yet decoded by CDC. `ducklake_table_insertions`
+  rejects inline inserts; `ducklake_table_changes` and `ducklake_table_deletions`
+  reject inline-row deletes.
+  Use `data_inlining_row_limit = 0` for tables consumed through change feeds.
 - **The change feed does not surface inlined deletes.** `ducklake_table_changes`
   and `ducklake_table_deletions` read delete *files* added in the window; a
   snapshot whose only change is an inlined Parquet‑row delete emits no `delete`

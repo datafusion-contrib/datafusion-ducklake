@@ -725,6 +725,47 @@ pub(crate) fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
+pub(crate) fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    changes.split(move |character| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        character == ',' && !quoted
+    })
+}
+
+pub(crate) fn reject_inlined_changes(
+    provider: &dyn MetadataProvider,
+    table_id: i64,
+    start_snapshot: i64,
+    end_snapshot: i64,
+    kinds: &[&str],
+) -> Result<()> {
+    let changes = match provider.list_snapshot_changes() {
+        Ok(changes) => changes,
+        Err(DuckLakeError::Unsupported(_)) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let tokens = kinds
+        .iter()
+        .map(|kind| format!("{kind}:{table_id}"))
+        .collect::<Vec<_>>();
+    if changes.iter().any(|change| {
+        change.snapshot_id >= start_snapshot
+            && change.snapshot_id <= end_snapshot
+            && change.changes_made.as_deref().is_some_and(|changes| {
+                snapshot_change_tokens(changes)
+                    .any(|token| tokens.iter().any(|expected| token == expected))
+            })
+    }) {
+        return Err(DuckLakeError::Unsupported(
+            "change feeds over inlined rows are not supported; use Parquet writes for change-feed tables".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn parse_inlined_rows(
     schema: SchemaRef,
@@ -1727,7 +1768,13 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
             .map(|f| f.max_row_count.unwrap_or(0) - f.delete_count.unwrap_or(0))
             .sum::<i64>()
             - inlined_count;
-        Ok(net.max(0) as u64)
+        let columns = self.get_table_structure(table_id, snapshot_id)?;
+        let inlined_rows = self
+            .get_inlined_data(table_id, snapshot_id, &columns)?
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .sum::<u64>();
+        Ok(net.max(0) as u64 + inlined_rows)
     }
 
     // Dynamic lookup methods for on-demand metadata retrieval

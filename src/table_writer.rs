@@ -1467,13 +1467,17 @@ impl DuckLakeTableWriter {
             for (values, _) in &groups {
                 spec.validate_values(arrow_schema, values)?;
             }
+        } else {
+            return Err(crate::DuckLakeError::Conflict(
+                "partition spec changed before write; retry the write".to_string(),
+            ));
         }
 
-        if self.should_inline(records_written, arrow_schema) {
-            let batches: Vec<RecordBatch> = groups
-                .iter()
-                .flat_map(|(_, batches)| batches.iter().cloned())
-                .collect();
+        let batches: Vec<RecordBatch> = groups
+            .iter()
+            .flat_map(|(_, batches)| batches.iter().cloned())
+            .collect();
+        if self.should_inline(records_written, arrow_schema, &batches) {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1630,7 +1634,12 @@ impl DuckLakeTableWriter {
                 .begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        if self.should_inline(records_written, arrow_schema) {
+        if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
+            return Err(crate::DuckLakeError::Conflict(
+                "table gained a partition spec before write; retry the write".to_string(),
+            ));
+        }
+        if self.should_inline(records_written, arrow_schema, batches) {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1774,7 +1783,12 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        if self.should_inline(records_written, arrow_schema) {
+        if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
+            return Err(crate::DuckLakeError::Conflict(
+                "table gained a partition spec before write; retry the write".to_string(),
+            ));
+        }
+        if self.should_inline(records_written, arrow_schema, batches) {
             return Ok(PreparedTableWrite {
                 write: StagedTableWrite {
                     table_id: setup.table_id,
@@ -1903,12 +1917,13 @@ impl DuckLakeTableWriter {
         Ok(ObjectPath::from(path.trim_start_matches('/')))
     }
 
-    fn should_inline(&self, rows: usize, arrow_schema: &Schema) -> bool {
+    fn should_inline(&self, rows: usize, arrow_schema: &Schema, batches: &[RecordBatch]) -> bool {
         rows > 0
             && self
                 .data_inlining_row_limit
                 .is_some_and(|limit| rows <= limit)
             && self.metadata.supports_data_inlining(arrow_schema)
+            && self.metadata.supports_data_inlining_values(batches)
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -2099,6 +2114,7 @@ impl DuckLakeWriteTransaction<'_> {
         if !writer.should_inline(
             batches.iter().map(RecordBatch::num_rows).sum(),
             arrow_schema,
+            batches,
         ) {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "commit snapshot columns require an inlined table stage".to_string(),

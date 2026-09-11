@@ -1077,7 +1077,7 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
     .unwrap();
     assert_eq!(
         stored,
-        vec!["00000000000000000000", "09223372036854775808", "18446744073709551615",]
+        vec!["0", "9223372036854775808", "18446744073709551615"]
     );
 
     let index_writer = SqliteMetadataWriter::new(&format!(
@@ -1103,11 +1103,7 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
     .unwrap();
     assert_eq!(
         indexes,
-        vec![
-            format!("{physical}_identifier_idx"),
-            format!("{physical}_row_id_idx"),
-            format!("{physical}_value_idx"),
-        ]
+        vec![format!("{physical}_identifier_idx"), format!("{physical}_value_idx"),]
     );
     sqlx::query(AssertSqlSafe(format!(
         "WITH RECURSIVE seq(value) AS (
@@ -1143,23 +1139,6 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
                 || detail.contains(&format!("{physical}_value_idx"))
         }),
         "{coverage_plan:?}"
-    );
-    let row_id_plan = sqlx::query(AssertSqlSafe(format!(
-        "EXPLAIN QUERY PLAN UPDATE {physical} SET end_snapshot = ? WHERE row_id = ?"
-    )))
-    .bind(snapshot)
-    .bind(1_i64)
-    .fetch_all(&pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| row.try_get::<String, _>(3).unwrap())
-    .collect::<Vec<_>>();
-    assert!(
-        row_id_plan
-            .iter()
-            .any(|detail| detail.contains(&format!("{physical}_row_id_idx"))),
-        "{row_id_plan:?}"
     );
     sqlx::query(AssertSqlSafe(format!(
         "DELETE FROM {physical} WHERE row_id >= 101"
@@ -1316,16 +1295,39 @@ async fn sqlite_temporal_values_round_trip_across_native_and_legacy_tables() {
         .unwrap();
 
     let pool = SqlitePool::connect(&rw_url(&temp)).await.unwrap();
+    let physical: String = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(result.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let types: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, type FROM pragma_table_info(?) WHERE name LIKE 'event_%' ORDER BY cid",
+    )
+    .bind(&physical)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        types,
+        vec![
+            ("event_date".to_string(), "VARCHAR".to_string()),
+            ("event_time".to_string(), "VARCHAR".to_string()),
+            ("event_us".to_string(), "VARCHAR".to_string()),
+            ("event_ns".to_string(), "VARCHAR".to_string()),
+        ]
+    );
     let legacy = format!("ducklake_inlined_data_{}_legacy", result.table_id);
     sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE {legacy}(\
              row_id BIGINT NOT NULL,\
              begin_snapshot BIGINT NOT NULL,\
              end_snapshot BIGINT,\
-             event_date VARCHAR,\
-             event_time VARCHAR,\
-             event_us VARCHAR,\
-             event_ns VARCHAR\
+             event_date DATE,\
+             event_time TIME,\
+             event_us TIMESTAMP,\
+             event_ns BIGINT\
          )"
     )))
     .execute(&pool)
@@ -1336,6 +1338,13 @@ async fn sqlite_temporal_values_round_trip_across_native_and_legacy_tables() {
              100, ?, NULL, '1970-01-03', '00:00:02.000003',\
              '1970-01-01T00:00:02.000003', '1970-01-01T00:00:02.000003004'\
          )"
+    )))
+    .bind(result.snapshot_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {legacy} VALUES (101, ?, NULL, 3, 3000004, 3000004, 3000004005)"
     )))
     .bind(result.snapshot_id)
     .execute(&pool)
@@ -1372,7 +1381,7 @@ async fn sqlite_temporal_values_round_trip_across_native_and_legacy_tables() {
         })
         .collect::<Vec<_>>();
     dates.sort_unstable();
-    assert_eq!(dates, vec![1, 2]);
+    assert_eq!(dates, vec![1, 2, 3]);
     let mut timestamps = batches
         .iter()
         .flat_map(|batch| {
@@ -1387,7 +1396,10 @@ async fn sqlite_temporal_values_round_trip_across_native_and_legacy_tables() {
         })
         .collect::<Vec<_>>();
     timestamps.sort_unstable();
-    assert_eq!(timestamps, vec![1_000_002_003, 2_000_003_004]);
+    assert_eq!(
+        timestamps,
+        vec![1_000_002_003, 2_000_003_004, 3_000_004_005]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1445,7 +1457,7 @@ async fn sqlite_declared_indexes_apply_when_inline_table_is_created_later() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(indexes, 2);
+    assert_eq!(indexes, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1673,6 +1685,23 @@ async fn delete_commits_parquet_and_inlined_rows_atomically() {
             .unwrap();
     assert_eq!(delete_snapshots.0, delete_snapshots.1);
     assert_eq!(inlined_end, delete_snapshots.0);
+    let deleted = ctx
+        .sql("DELETE FROM ducklake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+    assert_eq!(read_rows(&t, None).await, Vec::<(i32, i32)>::new());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1973,7 +2002,7 @@ async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
 async fn update_refuses_tables_with_inlined_rows() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
-    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .with_options(&options)
@@ -1987,6 +2016,12 @@ async fn update_refuses_tables_with_inlined_rows() {
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx.sql("INSERT INTO ducklake.main.t VALUES (3, 30)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let error = match ctx
         .sql("UPDATE ducklake.main.t SET val = 99 WHERE id = 1")
         .await
@@ -2001,7 +2036,7 @@ async fn update_refuses_tables_with_inlined_rows() {
         "{message}"
     );
     // Nothing changed.
-    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20)]);
+    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2220,4 +2255,212 @@ async fn crate_and_duckdb_round_trip_inlined_rows() {
         })
         .collect::<Vec<_>>();
     assert_eq!(values, vec![vec![1, 2], vec![3, 4]]);
+}
+
+#[rstest::rstest]
+#[case("row_id")]
+#[case("BEGIN_SNAPSHOT")]
+#[case("end_snapshot")]
+#[tokio::test(flavor = "multi_thread")]
+async fn reserved_inline_columns_fall_back_to_parquet(#[case] name: &str) {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
+    let input = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![37]))]).unwrap();
+    let result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
+        .write_table("main", "reserved", &[input])
+        .await
+        .unwrap();
+    assert_eq!(result.files_written, 1);
+    assert_eq!(result.records_written, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_schema_versions_fill_new_columns_with_null() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
+    let first = table_writer
+        .write_table("main", "t", &[batch(vec![1], vec![10])])
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, false),
+        Field::new("extra", DataType::Int32, true),
+    ]));
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(Int32Array::from(vec![20])),
+            Arc::new(Int32Array::from(vec![Some(42)])),
+        ],
+    )
+    .unwrap();
+    let second = table_writer
+        .append_table("main", "t", &[input])
+        .await
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let columns = provider
+        .get_table_structure(second.table_id, second.snapshot_id)
+        .unwrap();
+    let batches = provider
+        .get_inlined_data(second.table_id, second.snapshot_id, &columns)
+        .unwrap();
+    let mut rows = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let extra = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            ids.iter()
+                .zip(vals.iter())
+                .zip(extra.iter())
+                .map(|((id, val), extra)| (id, val, extra))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    assert_eq!(
+        provider
+            .get_table_row_count(second.table_id, second.snapshot_id)
+            .unwrap(),
+        2
+    );
+    assert_eq!((first.files_written, second.files_written), (0, 0));
+    assert_eq!(batches.len(), 2);
+    assert_eq!(
+        rows,
+        vec![(Some(1), Some(10), None), (Some(2), Some(20), Some(42))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_feed_refuses_inlined_inserts_in_its_window() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let result = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
+        .write_table("main", "t", &[batch(vec![1], vec![10])])
+        .await
+        .unwrap();
+    let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap());
+    let ctx = SessionContext::new();
+    datafusion_ducklake::register_ducklake_functions(&ctx, provider.clone());
+    for function in ["ducklake_table_changes", "ducklake_table_insertions"] {
+        let query = format!(
+            "SELECT * FROM {function}('main.t', {}, {})",
+            result.snapshot_id, result.snapshot_id
+        );
+        let error = match ctx.sql(&query).await {
+            Ok(df) => df.collect().await.expect_err("inline CDC must refuse"),
+            Err(e) => e,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("change feeds over inlined rows are not supported"),
+            "{error}"
+        );
+    }
+    let writer = Arc::new(SqliteMetadataWriter::new(&rw_url(&temp)).await.unwrap());
+    let catalog = DuckLakeCatalog::with_writer(provider.clone(), writer).unwrap();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx.sql("DELETE FROM ducklake.main.t WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let query = format!("SELECT * FROM ducklake_table_deletions('main.t', {snapshot}, {snapshot})");
+    let error = match ctx.sql(&query).await {
+        Ok(df) => df
+            .collect()
+            .await
+            .expect_err("inline deletion feed must refuse"),
+        Err(e) => e,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("change feeds over inlined rows are not supported"),
+        "{error}"
+    );
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_inline_write_fences_partition_changes(#[case] reset: bool) {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
+    let initial = table_writer
+        .write_table("main", "t", &[batch(vec![1], vec![10])])
+        .await
+        .unwrap();
+    if reset {
+        writer
+            .set_partition_spec(
+                initial.table_id,
+                &[(
+                    "id".to_string(),
+                    datafusion_ducklake::partition::PartitionTransform::Identity,
+                )],
+            )
+            .unwrap();
+    }
+    let mut transaction = table_writer.transaction();
+    transaction
+        .stage_write(
+            "main",
+            "t",
+            &table_schema(),
+            WriteMode::Append,
+            &[batch(vec![2], vec![20])],
+        )
+        .await
+        .unwrap();
+    if reset {
+        writer.reset_partition_spec(initial.table_id).unwrap();
+    } else {
+        writer
+            .set_partition_spec(
+                initial.table_id,
+                &[(
+                    "id".to_string(),
+                    datafusion_ducklake::partition::PartitionTransform::Identity,
+                )],
+            )
+            .unwrap();
+    }
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("staged inline write must fence partition DDL");
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(read_rows(&temp, None).await, vec![(1, 10)]);
 }

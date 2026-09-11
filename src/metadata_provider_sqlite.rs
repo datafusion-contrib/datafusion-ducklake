@@ -18,11 +18,9 @@ use crate::sort::SortSpec;
 use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
 use crate::stats_filter::{StatsFilter, StatsLiteral, StatsSqlDialect};
 use arrow::array::{
-    ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringViewArray,
-    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, RecordBatch, StringViewArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion::scalar::ScalarValue;
@@ -106,7 +104,7 @@ fn build_inlined_batch(
     schema: &SchemaRef,
     columns: &[DuckLakeTableColumn],
     present: &HashSet<String>,
-    physical_types: &HashMap<String, String>,
+    _physical_types: &HashMap<String, String>,
     rows: &[sqlx::sqlite::SqliteRow],
 ) -> Result<RecordBatch> {
     let n = rows.len();
@@ -118,12 +116,6 @@ fn build_inlined_batch(
             arrays.push(inlined_missing_scalar(col, dt)?.to_array_of_size(n)?);
             continue;
         }
-        let text_encoded = physical_types.get(name).is_some_and(|physical_type| {
-            let physical_type = physical_type.trim().to_ascii_uppercase();
-            physical_type.contains("CHAR")
-                || physical_type.contains("TEXT")
-                || physical_type.contains("CLOB")
-        });
         // SQLite stores INTEGER as i64 and REAL as f64; read at that width and
         // narrow/convert to the catalog's declared Arrow type.
         macro_rules! ints {
@@ -160,49 +152,9 @@ fn build_inlined_batch(
                 }
                 Arc::new(UInt64Array::from(values)) as ArrayRef
             },
-            DataType::Date32 if text_encoded => build_inlined_text_array(rows, name, dt)?,
-            DataType::Date32 => ints!(Date32Array, i32),
-            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) if text_encoded => {
-                build_inlined_text_array(rows, name, dt)?
-            },
-            DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
-                ints!(Time64MicrosecondArray, i64)
-            },
-            DataType::Timestamp(_, _) if text_encoded => build_inlined_text_array(rows, name, dt)?,
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, timezone) => {
-                let values = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i64>, _>(name))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.clone()))
-                    as ArrayRef
-            },
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, timezone) => {
-                let values = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i64>, _>(name))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Arc::new(
-                    TimestampMillisecondArray::from(values).with_timezone_opt(timezone.clone()),
-                ) as ArrayRef
-            },
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, timezone) => {
-                let values = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i64>, _>(name))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Arc::new(
-                    TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.clone()),
-                ) as ArrayRef
-            },
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, timezone) => {
-                let values = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i64>, _>(name))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(timezone.clone()))
-                    as ArrayRef
-            },
+            DataType::Date32
+            | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
+            | DataType::Timestamp(_, _) => build_inlined_temporal_array(rows, name, dt)?,
             DataType::Float32 => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
@@ -312,28 +264,58 @@ fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
 }
 
-fn build_inlined_text_array(
+fn build_inlined_temporal_array(
     rows: &[SqliteRow],
     column_name: &str,
     data_type: &DataType,
 ) -> Result<ArrayRef> {
-    let values =
-        rows.iter()
-            .map(|row| {
-                let value = row.try_get::<Option<String>, _>(column_name)?;
-                match value {
-                    Some(value) => crate::types::parse_ducklake_scalar(&value, data_type)
-                        .ok_or_else(|| {
-                            crate::DuckLakeError::Unsupported(format!(
-                                "inlined data column '{column_name}' cannot decode value '{value}' \
-                             as {data_type}"
-                            ))
-                        }),
-                    None => Ok(ScalarValue::try_from(data_type)?),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-    Ok(ScalarValue::iter_to_array(values.into_iter())?)
+    let values = rows
+        .iter()
+        .map(|row| {
+            let value = match row.try_get::<Option<String>, _>(column_name) {
+                Ok(None) => return Ok(ScalarValue::try_from(data_type)?),
+                Ok(Some(text)) => {
+                    if let Some(value) = crate::types::parse_ducklake_scalar(&text, data_type) {
+                        return Ok(value);
+                    }
+                    text.parse::<i64>().map_err(|_| {
+                        crate::DuckLakeError::Unsupported(format!(
+                            "inlined column '{column_name}' cannot decode {data_type}"
+                        ))
+                    })?
+                },
+                Err(_) => match row.try_get::<Option<i64>, _>(column_name)? {
+                    Some(value) => value,
+                    None => return Ok(ScalarValue::try_from(data_type)?),
+                },
+            };
+            match data_type {
+                DataType::Date32 => Ok(ScalarValue::Date32(Some(
+                    i32::try_from(value)
+                        .map_err(|e| crate::DuckLakeError::InvalidConfig(e.to_string()))?,
+                ))),
+                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+                    Ok(ScalarValue::Time64Microsecond(Some(value)))
+                },
+                DataType::Timestamp(unit, timezone) => Ok(match unit {
+                    arrow::datatypes::TimeUnit::Second => {
+                        ScalarValue::TimestampSecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Millisecond => {
+                        ScalarValue::TimestampMillisecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Microsecond => {
+                        ScalarValue::TimestampMicrosecond(Some(value), timezone.clone())
+                    },
+                    arrow::datatypes::TimeUnit::Nanosecond => {
+                        ScalarValue::TimestampNanosecond(Some(value), timezone.clone())
+                    },
+                }),
+                _ => unreachable!("only temporal columns use this decoder"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ScalarValue::iter_to_array(values)?)
 }
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {

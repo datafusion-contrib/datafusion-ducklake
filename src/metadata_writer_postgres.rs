@@ -26,7 +26,7 @@ use crate::metadata_writer::{
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, FixedSizeBinaryArray, IntervalMonthDayNanoArray,
-    LargeBinaryArray, LargeStringArray, StringArray, TimestampNanosecondArray,
+    LargeBinaryArray, LargeStringArray, StringArray,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -58,17 +58,16 @@ fn inlined_postgres_type(data_type: &DataType, ducklake_type: &str) -> String {
         DataType::Int64 => "BIGINT".to_string(),
         DataType::UInt8 | DataType::UInt16 => "INTEGER".to_string(),
         DataType::UInt32 => "BIGINT".to_string(),
-        DataType::UInt64 => "NUMERIC(20,0)".to_string(),
+        DataType::UInt64 => "VARCHAR".to_string(),
         DataType::Float32 => "REAL".to_string(),
         DataType::Float64 => "DOUBLE PRECISION".to_string(),
         DataType::Decimal32(precision, scale)
         | DataType::Decimal64(precision, scale)
         | DataType::Decimal128(precision, scale)
         | DataType::Decimal256(precision, scale) => format!("DECIMAL({precision},{scale})"),
-        DataType::Date32 => "DATE".to_string(),
+        DataType::Date32 => "VARCHAR".to_string(),
         DataType::Time32(_) | DataType::Time64(_) => "TIME".to_string(),
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => "BIGINT".to_string(),
-        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        DataType::Timestamp(_, _) => "VARCHAR".to_string(),
         DataType::Interval(_) => "INTERVAL".to_string(),
         DataType::FixedSizeBinary(16) if ducklake_type.trim().eq_ignore_ascii_case("uuid") => {
             "UUID".to_string()
@@ -96,25 +95,6 @@ fn push_inlined_postgres_value(
     row: usize,
     sql_type: &str,
 ) -> Result<()> {
-    if array.data_type() == &DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None)
-        || matches!(
-            array.data_type(),
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some(_))
-        )
-    {
-        if array.is_null(row) {
-            query.push_bind(Option::<i64>::None);
-        } else {
-            query.push_bind(
-                array
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .expect("Arrow data type and array implementation agree")
-                    .value(row),
-            );
-        }
-        return Ok(());
-    }
     if array.data_type() == &DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
         && !array.is_null(row)
     {
@@ -221,24 +201,6 @@ async fn ensure_postgres_physical_indexes(
     physical_name: &str,
 ) -> Result<()> {
     let declared = postgres_inlined_index_columns(tx, table_id).await?;
-    let uint64_columns = sqlx::query(
-        "SELECT column_name, column_type FROM ducklake_column
-         WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .filter_map(|row| {
-        let name = row.try_get::<String, _>(0).ok()?;
-        let column_type = row.try_get::<String, _>(1).ok()?;
-        matches!(
-            column_type.trim().to_ascii_lowercase().as_str(),
-            "uint64" | "ubigint"
-        )
-        .then_some(name)
-    })
-    .collect::<std::collections::HashSet<_>>();
     let physical_rows = sqlx::query(
         "SELECT column_name, data_type FROM information_schema.columns
          WHERE table_schema = current_schema() AND table_name = $1",
@@ -250,23 +212,7 @@ async fn ensure_postgres_physical_indexes(
         .iter()
         .filter_map(|row| row.try_get::<String, _>(0).ok())
         .collect::<std::collections::HashSet<_>>();
-    for row in physical_rows {
-        let column_name: String = row.try_get(0)?;
-        let data_type: String = row.try_get(1)?;
-        if uint64_columns.contains(&column_name)
-            && matches!(data_type.as_str(), "character varying" | "text")
-        {
-            sqlx::query(AssertSqlSafe(format!(
-                "ALTER TABLE {} ALTER COLUMN {} TYPE NUMERIC(20,0) USING {}::numeric",
-                quote_ident(physical_name),
-                quote_ident(&column_name),
-                quote_ident(&column_name),
-            )))
-            .execute(&mut **tx)
-            .await?;
-        }
-    }
-    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+    for column in declared.iter().map(String::as_str) {
         if !present.contains(column) {
             continue;
         }
@@ -2064,6 +2010,7 @@ pub(crate) async fn commit_inlined_at_snapshot(
     write: &StagedTableWrite,
     batches: &[RecordBatch],
 ) -> Result<()> {
+    enforce_inline_partition_fence(tx, write.table_id, write.base_snapshot_id).await?;
     let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if record_count == 0 {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -3182,10 +3129,25 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        if schema.fields().iter().any(|field| {
+            matches!(
+                field.name().to_ascii_lowercase().as_str(),
+                "row_id" | "begin_snapshot" | "end_snapshot"
+            ) || field.name().len() > 63
+        }) {
+            return false;
+        }
         schema
             .fields()
             .iter()
             .all(|field| postgres_type_inlines(field.data_type()))
+    }
+
+    fn supports_data_inlining_values(&self, batches: &[RecordBatch]) -> bool {
+        batches
+            .iter()
+            .flat_map(RecordBatch::columns)
+            .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3222,6 +3184,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
+            enforce_inline_partition_fence(&mut tx, table_id, base_snapshot).await?;
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
                 schema_name,
@@ -5450,7 +5413,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // computed BEFORE ending anything (so it matches what we retire).
             // SUM(bigint) is NUMERIC in Postgres; cast back to BIGINT for i64.
             let gross: Option<i64> = sqlx::query_scalar(
-                "SELECT COALESCE(record_count, 0) FROM ducklake_table_stats WHERE table_id = $1",
+                "SELECT COALESCE(SUM(record_count), 0)::BIGINT FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
             )
             .bind(table_id)
             .fetch_optional(&mut *tx)
@@ -5489,7 +5452,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             } else {
                 0
             };
-            let live_rows = (gross.unwrap_or(0) - deleted - inlined_deleted).max(0) as u64;
+            let live_rows =
+                (gross.unwrap_or(0) + live_inlined - deleted - inlined_deleted).max(0) as u64;
 
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = $1
@@ -6053,6 +6017,23 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn supports_update(&self) -> bool {
         true
     }
+}
+
+async fn enforce_inline_partition_fence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let changed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2)")
+        .bind(table_id)
+        .bind(base_snapshot)
+        .fetch_one(&mut **tx).await?;
+    if changed != 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "partition spec for table {table_id} changed during inline write; retry the write"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

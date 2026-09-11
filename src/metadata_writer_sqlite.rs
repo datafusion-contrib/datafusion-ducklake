@@ -28,11 +28,9 @@ use crate::metadata_writer::{
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
-    Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -58,9 +56,6 @@ fn inlined_sqlite_type(data_type: &DataType) -> &'static str {
         | DataType::UInt16
         | DataType::UInt32 => "BIGINT",
         DataType::UInt64 => "TEXT",
-        DataType::Date32
-        | DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)
-        | DataType::Timestamp(_, _) => "BIGINT",
         // DOUBLE has numeric affinity, so a bound f64 stays REAL; a VARCHAR
         // column's TEXT affinity would coerce it to text, which the inline
         // reader (which expects REAL) cannot decode.
@@ -132,29 +127,13 @@ fn push_inlined_sqlite_value(
         DataType::UInt32 => unsigned!(UInt32Array),
         DataType::UInt64 => {
             query.push_bind(format!(
-                "{:020}",
+                "{}",
                 array
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .expect("Arrow data type and array implementation agree")
                     .value(row),
             ));
-        },
-        DataType::Date32 => signed!(Date32Array),
-        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
-            signed!(Time64MicrosecondArray)
-        },
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, _) => {
-            signed!(TimestampSecondArray)
-        },
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, _) => {
-            signed!(TimestampMillisecondArray)
-        },
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
-            signed!(TimestampMicrosecondArray)
-        },
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
-            signed!(TimestampNanosecondArray)
         },
         DataType::Float32 => {
             query.push_bind(f64::from(
@@ -278,7 +257,7 @@ async fn ensure_sqlite_physical_indexes(
         .await?
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+    for column in declared.iter().map(String::as_str) {
         if !present.contains(column) {
             continue;
         }
@@ -2493,6 +2472,7 @@ async fn commit_inlined_at_snapshot(
     write: &StagedTableWrite,
     batches: &[RecordBatch],
 ) -> Result<()> {
+    enforce_inline_partition_fence(tx, write.table_id, write.base_snapshot_id).await?;
     let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if record_count == 0 {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -3731,6 +3711,14 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        if schema.fields().iter().any(|field| {
+            matches!(
+                field.name().to_ascii_lowercase().as_str(),
+                "row_id" | "begin_snapshot" | "end_snapshot"
+            )
+        }) {
+            return false;
+        }
         schema
             .fields()
             .iter()
@@ -3769,6 +3757,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             let mut tx = self.pool.begin().await?;
+            enforce_inline_partition_fence(&mut tx, table_id, base_snapshot).await?;
             let snapshot_id = finalize_snapshot(
                 &mut tx,
                 table_id,
@@ -5277,7 +5266,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Rows removed = gross record_count minus still-live delete counts,
             // computed BEFORE ending anything so it matches what we retire.
             let gross: Option<i64> = sqlx::query_scalar(
-                "SELECT COALESCE(record_count, 0) FROM ducklake_table_stats WHERE table_id = ?",
+                "SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
             )
             .bind(table_id)
             .fetch_optional(&mut *tx)
@@ -5312,7 +5301,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             } else {
                 0
             };
-            let live_rows = (gross.unwrap_or(0) - deleted - inlined_deleted).max(0) as u64;
+            let live_rows =
+                (gross.unwrap_or(0) + live_inlined - deleted - inlined_deleted).max(0) as u64;
 
             sqlx::query(
                 "UPDATE ducklake_data_file SET end_snapshot = ?
@@ -5752,6 +5742,24 @@ impl MetadataWriter for SqliteMetadataWriter {
             })
         })
     }
+}
+
+async fn enforce_inline_partition_fence(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let changed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)")
+        .bind(table_id)
+        .bind(base_snapshot)
+        .bind(base_snapshot)
+        .fetch_one(&mut **tx).await?;
+    if changed != 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "partition spec for table {table_id} changed during inline write; retry the write"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

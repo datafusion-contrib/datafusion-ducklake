@@ -7,6 +7,7 @@
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
+use crate::metadata_provider::reject_inlined_changes;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
@@ -1405,6 +1406,18 @@ impl TableProvider for TableChangesTable {
         // per-file read schemas are built from — official DuckLake resolves a
         // change feed against exactly that generation of the schema.
         let columns = self.resolve_columns()?;
+
+        reject_inlined_changes(
+            self.provider.as_ref(),
+            self.table_id,
+            self.start_snapshot,
+            self.end_snapshot,
+            if self.insertions_only {
+                &["inlined_insert"]
+            } else {
+                &["inlined_insert", "inlined_delete"]
+            },
+        )?;
 
         // Get data files added between snapshots (INSERT changes)
         let data_files = self

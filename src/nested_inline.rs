@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
+#[cfg(feature = "write")]
+use arrow::array::FixedSizeBinaryArray;
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, LargeListArray, ListArray, MapArray,
-    StructArray, new_empty_array,
+    Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, StructArray,
+    new_empty_array,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, TimeUnit};
 use datafusion::common::ScalarValue;
 
+#[cfg(feature = "write")]
 use crate::{DuckLakeError, Result};
 
 pub(crate) fn scalar_type_supports_inlining(data_type: &DataType) -> bool {
@@ -143,6 +146,24 @@ fn quote_ident(name: &str) -> String {
 }
 
 #[cfg(feature = "write")]
+pub(crate) fn values_support_inlining(array: &dyn Array) -> bool {
+    if let Some(intervals) = array
+        .as_any()
+        .downcast_ref::<arrow::array::IntervalMonthDayNanoArray>()
+    {
+        return intervals
+            .iter()
+            .flatten()
+            .all(|value| value.nanoseconds % 1000 == 0);
+    }
+    array
+        .to_data()
+        .child_data()
+        .iter()
+        .all(|child| values_support_inlining(arrow::array::make_array(child.clone()).as_ref()))
+}
+
+#[cfg(feature = "write")]
 pub(crate) fn render_text(array: &dyn Array, row: usize) -> Result<String> {
     render_text_at_depth(array, row, 0, false)
 }
@@ -242,9 +263,7 @@ fn render_text_at_depth(
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
-        | DataType::FixedSizeBinary(_) => {
-            Ok(format!("0x{}", encode_hex(binary_value(array, row)?)))
-        },
+        | DataType::FixedSizeBinary(_) => Ok(quote_text(&encode_blob(binary_value(array, row)?))),
         _ => Ok(arrow::util::display::array_value_to_string(array, row)?),
     }
 }
@@ -281,12 +300,11 @@ fn binary_value(array: &dyn Array, row: usize) -> Result<&[u8]> {
 }
 
 #[cfg(feature = "write")]
-fn encode_hex(value: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(value.len() * 2);
+fn encode_blob(value: &[u8]) -> String {
+    let mut encoded = String::new();
     for byte in value {
-        encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        // Escape every byte to protect nested delimiters and the NULL token
+        encoded.push_str(&format!("\\x{byte:02X}"));
     }
     encoded
 }
@@ -361,6 +379,19 @@ impl<'a> Parser<'a> {
                     DataType::Utf8View => Some(ScalarValue::Utf8View(Some(value))),
                     _ => unreachable!(),
                 }
+            },
+            DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_) => {
+                let value = if self.peek() == Some(b'\'') {
+                    self.parse_quoted()?
+                } else {
+                    self.take_until(terminators).trim().to_string()
+                };
+                let scalar =
+                    crate::types::parse_ducklake_default_scalar(&value, &DataType::Binary)?;
+                scalar.cast_to(data_type).ok()
             },
             _ => {
                 let token = self.take_until(terminators).trim();
@@ -620,6 +651,8 @@ pub(crate) fn build_map_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "write", feature = "metadata-duckdb"))]
+    use arrow::array::BinaryArray;
     #[cfg(feature = "write")]
     use arrow::array::{Int32Array, StringArray};
 
@@ -710,5 +743,45 @@ mod tests {
                 ScalarValue::try_from_array(&array, row).unwrap()
             );
         }
+    }
+    #[cfg(all(feature = "write", feature = "metadata-duckdb"))]
+    #[test]
+    fn binary_literals_round_trip_through_duckdb() {
+        let values = BinaryArray::from(vec![Some(&b"A\0,]\\'NULL"[..]), None]);
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Binary, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+            Arc::new(values),
+            None,
+        );
+        let encoded = render_text(&list, 0).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let bytes: Vec<u8> = conn
+            .query_row("SELECT CAST(? AS BLOB[])[1]", [&encoded], |row| row.get(0))
+            .unwrap();
+        assert_eq!(bytes, b"A\0,]\\'NULL");
+        assert_eq!(
+            parse_text(&encoded, list.data_type()).unwrap(),
+            ScalarValue::try_from_array(&list, 0).unwrap()
+        );
+        for scalar in [
+            ScalarValue::LargeBinary(Some(bytes.clone())),
+            ScalarValue::BinaryView(Some(bytes.clone())),
+            ScalarValue::FixedSizeBinary(10, Some(bytes.clone())),
+        ] {
+            let item_type = scalar.data_type();
+            let null = ScalarValue::try_from(&item_type).unwrap();
+            let data_type = DataType::List(Arc::new(Field::new("item", item_type, true)));
+            let expected = build_list_scalar(&data_type, vec![scalar, null]).unwrap();
+            assert_eq!(parse_text(&encoded, &data_type).unwrap(), expected);
+        }
+        let reference: String = conn
+            .query_row("SELECT [CAST(? AS BLOB)]::VARCHAR", [&bytes], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let expected =
+            build_list_scalar(list.data_type(), vec![ScalarValue::Binary(Some(bytes))]).unwrap();
+        assert_eq!(parse_text(&reference, list.data_type()).unwrap(), expected);
     }
 }

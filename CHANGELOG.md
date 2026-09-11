@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for unknown options or dropped tables (#274).
 - MySQL inlines supported list, struct, and map batches under the row limit and
   skips declared indexes on `LONGTEXT`/`LONGBLOB` columns (#272).
-- Inlined values use native backend storage types, with declared per-table
-  indexes and a mandatory `row_id` index (#272).
+- Add optional declared indexes on inlined tables without changing their column
+  types (#272).
 
 - SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
   snapshot on all four write backends; DuckDB and MySQL now implement combined
@@ -44,7 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
 
+- Row lineage and positional deletes take the physical row position from the Parquet reader's
+  `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
+  into row-group / page / bloom pruning, which the previous design had to refuse — measured
+  2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
+  resolution prunes too (`DELETE`; an `UPDATE`'s source scan pushes no predicate). Byte-range
+  splitting replaces the hand-rolled row-group partitioning
+  this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
+  / rewrite paths explicitly (#130).
+
 ### Changed
+
+- **BREAKING**: Catalog writes inline up to 10 rows by default; set
+  `data_inlining_row_limit = 0` to keep future writes in Parquet (#272).
 
 - Small writes inline only when `supports_data_inlining` accepts the schema; unsupported schemas fall back to Parquet.
   `UPDATE` and row-lineage scans reject visible inlined rows with a clear flush-or-disable remedy (#272).
@@ -90,6 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
 
 ### Fixed
+
+- Preserve DuckLake temporal and binary encodings in inlined writes (#272).
+- Fence partition changes during inline commits and count live rows in
+  DELETE-all (#272).
+- Reject incomplete inline change feeds and check the current snapshot before
+  UPDATE (#272).
 
 - SQLite and MySQL inline encodings now round-trip floats and binary values exactly (#272).
 - Inline commits honor expected-base, commit-metadata, and partition-spec fences and preserve existing snapshot-change

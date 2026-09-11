@@ -228,7 +228,11 @@ async fn duckdb_writer_rejects_submicrosecond_interval_inlining() {
         .write_table("main", "submicrosecond_interval", &[batch])
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("sub-microsecond"));
+    let message = error.to_string();
+    assert!(
+        message.contains("MonthDayNano") && message.contains("parquet"),
+        "{message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -300,7 +304,7 @@ async fn duckdb_writer_round_trips_uint64_boundaries_and_indexes() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(index_count, 2);
+    assert_eq!(index_count, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

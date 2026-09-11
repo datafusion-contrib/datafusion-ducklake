@@ -490,7 +490,7 @@ fn ensure_duckdb_physical_indexes(
         .query_map(params![physical_name], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
     drop(statement);
-    for column in std::iter::once("row_id").chain(declared.iter().map(String::as_str)) {
+    for column in declared.iter().map(String::as_str) {
         if !present.contains(column) {
             continue;
         }
@@ -2160,6 +2160,7 @@ fn commit_staged_inline(
     write: &StagedTableWrite,
     batches: &[RecordBatch],
 ) -> Result<()> {
+    enforce_inline_partition_fence(tx, write.table_id, write.base_snapshot_id)?;
     let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if record_count == 0 {
         return Err(crate::DuckLakeError::InvalidConfig(
@@ -3016,10 +3017,25 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        if schema.fields().iter().any(|field| {
+            matches!(
+                field.name().to_ascii_lowercase().as_str(),
+                "row_id" | "begin_snapshot" | "end_snapshot"
+            )
+        }) {
+            return false;
+        }
         schema
             .fields()
             .iter()
             .all(|field| duckdb_type_inlines(field.data_type()))
+    }
+
+    fn supports_data_inlining_values(&self, batches: &[RecordBatch]) -> bool {
+        batches
+            .iter()
+            .flat_map(RecordBatch::columns)
+            .all(|array| crate::nested_inline::values_support_inlining(array.as_ref()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3054,6 +3070,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
         let mut conn = self.connection();
         let tx = conn.transaction()?;
+        enforce_inline_partition_fence(&tx, table_id, base_snapshot)?;
         let snapshot_id =
             finalize_snapshot(&tx, table_id, columns, column_ids, mode, base_snapshot)?;
         if mode != WriteMode::Replace
@@ -3876,7 +3893,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
         let gross: Option<i64> = tx
             .query_row(
-                "SELECT record_count FROM ducklake_table_stats WHERE table_id = ?",
+                "SELECT COALESCE(SUM(record_count), 0) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
                 params![table_id],
                 |row| row.get(0),
             )
@@ -3887,7 +3904,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![table_id],
             |row| row.get::<_, i64>(0),
         )?;
-        let live_rows = u64::try_from((gross.unwrap_or(0) - deleted).max(0)).unwrap_or(0);
+        let live_rows =
+            u64::try_from((gross.unwrap_or(0) + live_inlined - deleted).max(0)).unwrap_or(0);
         tx.execute(
             "UPDATE ducklake_data_file SET end_snapshot = ?
              WHERE table_id = ? AND end_snapshot IS NULL",
@@ -4516,6 +4534,20 @@ impl MetadataWriter for DuckdbMetadataWriter {
             field_ids,
         })
     }
+}
+
+fn enforce_inline_partition_fence(
+    tx: &Transaction<'_>,
+    table_id: i64,
+    base_snapshot: i64,
+) -> Result<()> {
+    let changed: i64 = tx.query_row("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)", params![table_id, base_snapshot, base_snapshot], |row| row.get(0))?;
+    if changed != 0 {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "partition spec for table {table_id} changed during inline write; retry the write"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

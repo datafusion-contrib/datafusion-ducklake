@@ -1017,12 +1017,21 @@ async fn create_events_table_no_spec() -> (String, i64, TempDir) {
 }
 
 async fn writable_catalog(conn_str: &str) -> (SessionContext, Arc<DuckLakeCatalog>) {
+    writable_catalog_with_limit(conn_str, 0).await
+}
+
+async fn writable_catalog_with_limit(
+    conn_str: &str,
+    limit: usize,
+) -> (SessionContext, Arc<DuckLakeCatalog>) {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
     let catalog = Arc::new(
         DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
             .unwrap()
-            .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(0)),
+            .with_write_options(
+                DuckLakeWriteOptions::default().with_data_inlining_row_limit(limit),
+            ),
     );
     let ctx = SessionContext::new();
     ctx.register_catalog(
@@ -1241,8 +1250,11 @@ async fn reset_partitioned_then_insert_same_session_is_unpartitioned() {
     assert!(page[0].file.partition_values.is_empty());
 }
 
+#[rstest::rstest]
+#[case(0)]
+#[case(10)]
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_reset_during_insert_conflicts() {
+async fn concurrent_reset_during_insert_conflicts(#[case] limit: usize) {
     // P1 (concurrency): a partition spec retired by a concurrent RESET/SET *after*
     // the insert plan captured it but *before* the insert commits must abort at the
     // commit-time fence — never stamp a retired partition_id into a committed file.
@@ -1257,7 +1269,7 @@ async fn concurrent_reset_during_insert_conflicts() {
         )
         .unwrap();
     }
-    let (ctx, _catalog) = writable_catalog(&conn_str).await;
+    let (ctx, _catalog) = writable_catalog_with_limit(&conn_str, limit).await;
     // Build the physical plan now: insert_into captures the LIVE spec (region).
     let plan = ctx
         .sql(INSERT_SQL)
@@ -1293,15 +1305,18 @@ async fn concurrent_reset_during_insert_conflicts() {
     );
 }
 
+#[rstest::rstest]
+#[case(0)]
+#[case(10)]
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_set_during_unpartitioned_insert_conflicts() {
+async fn concurrent_set_during_unpartitioned_insert_conflicts(#[case] limit: usize) {
     // Inverse P1: an unpartitioned INSERT plan captured while the table had NO spec,
     // then a concurrent SET PARTITIONED BY makes it partitioned before the plan
     // commits. The commit must abort — never leave a partition_id-less file in a
     // now-partitioned table, and never silently re-lay-out the rows under a spec the
     // plan never saw. The caller re-plans against the new spec and retries.
     let (conn_str, table_id, _temp) = create_events_table_no_spec().await;
-    let (ctx, _catalog) = writable_catalog(&conn_str).await;
+    let (ctx, _catalog) = writable_catalog_with_limit(&conn_str, limit).await;
     // Build the plan now: table is unpartitioned -> partition = None.
     let plan = ctx
         .sql(INSERT_SQL)

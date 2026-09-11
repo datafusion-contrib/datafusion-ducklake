@@ -278,10 +278,7 @@ async fn mysql_nested_inlined_rows_round_trip_flush_and_skip_text_indexes() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(
-        index_names,
-        vec![format!("{physical}_id_idx"), format!("{physical}_row_id_idx"),]
-    );
+    assert_eq!(index_names, vec![format!("{physical}_id_idx")]);
 
     let provider = MySqlMetadataProvider::from_pool(pool.clone());
     let columns = provider

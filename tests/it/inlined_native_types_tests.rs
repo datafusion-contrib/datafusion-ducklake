@@ -34,7 +34,7 @@ use tempfile::TempDir;
 #[cfg(feature = "write-postgres")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
+async fn postgres_inlined_types_preserve_reference_storage() {
     use datafusion_ducklake::{
         MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
         initialize_multicatalog_schema,
@@ -97,7 +97,7 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(native_type, "numeric");
+    assert_eq!(native_type, "character varying");
 
     let legacy_table = format!("ducklake_inlined_data_{}_legacy", u64_result.table_id);
     sqlx::query(AssertSqlSafe(format!(
@@ -142,7 +142,7 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(legacy_type, "numeric");
+    assert_eq!(legacy_type, "character varying");
     let index_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_indexes \
          WHERE tablename IN ($1, $2) AND indexname IN ($3, $4, $5, $6)",
@@ -156,7 +156,7 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(index_count, 4);
+    assert_eq!(index_count, 2);
 
     let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
         .await
@@ -189,7 +189,7 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
         .unwrap();
     let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "EXPLAIN SELECT row_id FROM \"{native_table}\" \
-         WHERE value >= CAST($1 AS NUMERIC(20,0))"
+         WHERE value = $1"
     )))
     .bind((i64::MAX as u64 + 1).to_string())
     .fetch_all(&mut *connection)
@@ -301,16 +301,13 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
     assert_eq!(
         physical_types,
         vec![
-            ("event_date".to_string(), "date".to_string()),
-            ("event_ns".to_string(), "bigint".to_string()),
+            ("event_date".to_string(), "character varying".to_string()),
+            ("event_ns".to_string(), "character varying".to_string()),
             (
                 "event_time".to_string(),
                 "time without time zone".to_string(),
             ),
-            (
-                "event_us".to_string(),
-                "timestamp without time zone".to_string(),
-            ),
+            ("event_us".to_string(), "character varying".to_string(),),
         ]
     );
     let columns = provider
@@ -346,7 +343,11 @@ async fn postgres_native_inlined_types_indexes_and_legacy_migration() {
         .write_table("main", "submicrosecond_interval", &[interval_batch])
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("sub-microsecond"));
+    let message = error.to_string();
+    assert!(
+        message.contains("MonthDayNano") && message.contains("parquet"),
+        "{message}"
+    );
 }
 
 #[cfg(feature = "write-mysql")]
@@ -472,7 +473,7 @@ async fn mysql_native_inlined_types_and_indexes_round_trip() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(index_count, 3);
+    assert_eq!(index_count, 2);
 
     let provider = MySqlMetadataProvider::from_pool(pool);
     let columns = provider
