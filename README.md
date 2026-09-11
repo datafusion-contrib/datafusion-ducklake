@@ -133,6 +133,10 @@ df.show().await?;
 
 ## Writing a catalog
 
+Data inlining is opt-in. The default `data_inlining_row_limit = 0` keeps writes
+in Parquet. A positive limit enables eligible small writes; see the
+[inlined storage limits](COMPATIBILITY.md#inlined-physical-storage) before enabling it.
+
 PostgreSQL has two writers, both behind the `write-postgres` feature:
 
 - **`PostgresSingleCatalogMetadataWriter`** — the **standard, spec-compliant**

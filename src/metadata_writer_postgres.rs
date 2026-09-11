@@ -12,6 +12,7 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::block_on;
+use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
@@ -3129,12 +3130,11 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
-        if schema.fields().iter().any(|field| {
-            matches!(
-                field.name().to_ascii_lowercase().as_str(),
-                "row_id" | "begin_snapshot" | "end_snapshot"
-            ) || field.name().len() > 63
-        }) {
+        if schema
+            .fields()
+            .iter()
+            .any(|field| is_inlined_system_column(field.name()) || field.name().len() > 63)
+        {
             return false;
         }
         schema

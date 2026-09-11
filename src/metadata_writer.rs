@@ -41,6 +41,18 @@ pub fn validate_name(name: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn is_inlined_system_column(name: &str) -> bool {
+    [
+        "row_id",
+        "begin_snapshot",
+        "end_snapshot",
+        "_ducklake_internal_row_id",
+        "_ducklake_internal_snapshot_id",
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
+}
+
 /// Write mode for table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {

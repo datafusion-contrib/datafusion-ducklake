@@ -55,8 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING**: Catalog writes inline up to 10 rows by default; set
-  `data_inlining_row_limit = 0` to keep future writes in Parquet (#272).
+- Keep data inlining disabled by default; set `data_inlining_row_limit` to a
+  positive threshold to opt in (#272).
 
 - Small writes inline only when `supports_data_inlining` accepts the schema; unsupported schemas fall back to Parquet.
   `UPDATE` and row-lineage scans reject visible inlined rows with a clear flush-or-disable remedy (#272).

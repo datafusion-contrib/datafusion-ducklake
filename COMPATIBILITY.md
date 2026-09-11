@@ -270,9 +270,13 @@ rows. Arrow 59 cannot flush `Interval(MonthDayNano)` values. Automatic compactio
 and removal of physical inline tables during maintenance remain unsupported.
 
 High-level row staging honors the scoped `data_inlining_row_limit`, defaulting
-catalog-backed writes to 10 rows. Zero disables inlining. Direct writers retain
-Parquet unless configured, and unsupported schemas or writer capabilities fall
-back to Parquet. Inline inserts, deletes, and flushes retain the merged
+to `0` so writes stay in Parquet. Set a positive limit to opt in; the threshold
+is inclusive. This stages the feature until inline UPDATE, rowid, CDC, SQL flush,
+and automatic inline-table maintenance are supported. Current DuckLake defaults
+to `10`; matching that default is deferred until these paths are ready (see
+[#270](https://github.com/datafusion-contrib/datafusion-ducklake/issues/270)).
+Explicit settings and direct-writer options still apply. Unsupported schemas
+or writer capabilities fall back to Parquet. Inline inserts, deletes, and flushes retain the merged
 `inlined_insert`, `inlined_delete`, and `inline_flush` ledger tokens.
 
 Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
@@ -444,8 +448,8 @@ Known edges:
   mis-dropped); only whole-value (`identity`) and calendar-year ranges prune files.
 - **Complex / nested types** have minimal support.
 - **DuckDB-encrypted (non-PME) Parquet files** are not supported (only PME).
-- **Data inlining: supported rows are read on every metadata backend.** DuckLake
-  inlines `INSERT`s of up to 10 rows into the catalog by default. SQLite,
+- **Data inlining: supported rows are read on every metadata backend.** The DuckDB
+  DuckLake extension inlines `INSERT`s of up to 10 rows by default. SQLite,
   DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
   `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
   (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,

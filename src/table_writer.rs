@@ -126,7 +126,9 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(10))?,
+            // Keep inlining opt-in until inline UPDATE, rowid, CDC, SQL flush, and
+            // automatic maintenance are supported. Explicit settings still apply (#270).
+            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(0))?,
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
@@ -3702,7 +3704,7 @@ mod tests {
             options.compression,
             Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         );
-        assert_eq!(options.data_inlining_row_limit, Some(10));
+        assert_eq!(options.data_inlining_row_limit, Some(0));
         assert_eq!(options.max_row_group_rows, Some(122_880));
         assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
         assert_eq!(options.target_file_size, Some(5_000_000));
@@ -3728,7 +3730,7 @@ mod tests {
         let options = stored.with_overrides(&explicit);
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
-        assert_eq!(options.data_inlining_row_limit, Some(10));
+        assert_eq!(options.data_inlining_row_limit, Some(0));
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));

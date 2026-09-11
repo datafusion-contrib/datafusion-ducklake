@@ -2010,10 +2010,12 @@ async fn update_refuses_tables_with_inlined_rows() {
         .await
         .unwrap();
 
-    // Default write options: inlining stays enabled on the writable catalog.
+    // Explicitly enable inlining to exercise the current-snapshot UPDATE guard
     let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
     let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+        .unwrap()
+        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
     ctx.sql("INSERT INTO ducklake.main.t VALUES (3, 30)")
@@ -2261,6 +2263,8 @@ async fn crate_and_duckdb_round_trip_inlined_rows() {
 #[case("row_id")]
 #[case("BEGIN_SNAPSHOT")]
 #[case("end_snapshot")]
+#[case("_ducklake_internal_row_id")]
+#[case("_DUCKLAKE_INTERNAL_SNAPSHOT_ID")]
 #[tokio::test(flavor = "multi_thread")]
 async fn reserved_inline_columns_fall_back_to_parquet(#[case] name: &str) {
     let temp = TempDir::new().unwrap();
@@ -2273,6 +2277,32 @@ async fn reserved_inline_columns_fall_back_to_parquet(#[case] name: &str) {
         .write_table("main", "reserved", &[input])
         .await
         .unwrap();
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog(
+        "ducklake",
+        Arc::new(DuckLakeCatalog::new(provider).unwrap()),
+    );
+    let read = ctx
+        .sql(&format!("SELECT \"{name}\" FROM ducklake.main.reserved"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let values = read
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![37]);
     assert_eq!(result.files_written, 1);
     assert_eq!(result.records_written, 1);
 }
