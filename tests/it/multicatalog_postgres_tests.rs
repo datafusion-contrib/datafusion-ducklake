@@ -6786,3 +6786,179 @@ async fn initialize_multicatalog_schema_creates_absolute_path_indexes() {
     // Idempotent: a second bootstrap is a no-op, not a duplicate-index error.
     initialize_multicatalog_schema(&pool).await.unwrap();
 }
+
+/// The fail-closed ownership guard: a scheduled ABSOLUTE row naming an object outside
+/// the cleaning catalog's own `cat_{id}/` layout is never deleted, however unreferenced
+/// it looks.
+///
+/// This is the mixed-version case. A build without the ownership rule scheduled every
+/// dead row including references, so a fork's catalog can hold a scheduled row naming
+/// the source's live object. The reference row that would have protected it is already
+/// gone (the same expire deleted it), and the source's own row is relative, so the
+/// reference check alone finds nothing and would delete another catalog's live file.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_refuses_a_scheduled_path_outside_the_catalogs_own_layout() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, cleanup_old_files_in_catalog};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    for (cat, name) in [(cat_a, "cat_a"), (cat_b, "cat_b")] {
+        let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+            .await
+            .unwrap();
+        w.set_data_path(&data_str).unwrap();
+        let _ = name;
+    }
+
+    // A owns a live object. Nothing references it; A's own row is relative.
+    let a_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("live.parquet"), b"live").unwrap();
+
+    // B holds a poison scheduled row: absolute, naming A's object. Inserted directly,
+    // because the current code never writes one — only an older build did.
+    let poison = format!("{}/cat_{}/public/t/live.parquet", data.display(), cat_a);
+    sqlx::query(
+        "INSERT INTO ducklake_files_scheduled_for_deletion
+             (catalog_id, data_file_id, path, path_is_relative, schedule_start)
+         VALUES ($1, 1, $2, FALSE, NOW())",
+    )
+    .bind(cat_b)
+    .bind(&poison)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_b", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert!(
+        deleted.is_empty(),
+        "B must not reclaim an object outside its own layout: {deleted:?}"
+    );
+    assert!(
+        a_dir.join("live.parquet").exists(),
+        "A's live object survives B's cleanup"
+    );
+    let still_scheduled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_b)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_scheduled, 1,
+        "the refused row is left in place rather than silently dropped"
+    );
+}
+
+/// Reclaiming one file must not erase a deferred row that merely shares its id.
+///
+/// `data_file_id` and `delete_file_id` are independent identity sequences whose values
+/// both land in the scheduled table's `data_file_id` column, so a collision is routine.
+/// Deferral splits one sweep's rows into kept and deferred, so removing bookkeeping by
+/// id would let the reclaimed row take the deferred one with it — losing the owner's
+/// only record that the shared object is still meant to be reclaimed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn reclaiming_a_file_keeps_a_deferred_row_that_shares_its_id() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, cleanup_old_files_in_catalog};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    let a_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("shared.parquet"), b"shared").unwrap();
+    std::fs::write(a_dir.join("solo.parquet"), b"solo").unwrap();
+
+    let shared_abs = format!("{}/cat_{}/public/t/shared.parquet", data.display(), cat_a);
+    let solo_rel = "cat_".to_string() + &cat_a.to_string() + "/public/t/solo.parquet";
+
+    // B references the shared object, so A's scheduled row for it must be deferred.
+    let ids = vec![1_i64, 2_i64];
+    wb.register_existing_data_file(
+        "public",
+        "t",
+        &cols(),
+        &ids,
+        &DataFileInfo::new(shared_abs.clone(), 6, 1).with_absolute_path(),
+        WriteMode::Replace,
+    )
+    .unwrap();
+
+    // Two scheduled rows in A colliding on id 7: the shared one (deferred) and a solo
+    // one (reclaimed). Inserted directly so the collision is exact and deliberate.
+    for (path, rel) in [(shared_abs.as_str(), false), (solo_rel.as_str(), true)] {
+        sqlx::query(
+            "INSERT INTO ducklake_files_scheduled_for_deletion
+                 (catalog_id, data_file_id, path, path_is_relative, schedule_start)
+             VALUES ($1, 7, $2, $3, NOW())",
+        )
+        .bind(cat_a)
+        .bind(path)
+        .bind(rel)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        deleted.len(),
+        1,
+        "only the unreferenced file is reclaimed: {deleted:?}"
+    );
+    assert!(deleted[0].ends_with("solo.parquet"), "{deleted:?}");
+    assert!(!a_dir.join("solo.parquet").exists(), "solo reclaimed");
+    assert!(
+        a_dir.join("shared.parquet").exists(),
+        "the referenced object survives"
+    );
+
+    let remaining: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
+    )
+    .bind(cat_a)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining,
+        vec![shared_abs],
+        "the deferred row survives its id-twin's reclamation"
+    );
+}

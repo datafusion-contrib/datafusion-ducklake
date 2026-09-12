@@ -984,12 +984,20 @@ impl MulticatalogManager {
 
     /// Remove scheduled-deletion bookkeeping rows for `catalog_name` after their objects
     /// are gone. Unknown catalog ⇒ no-op.
-    pub(crate) async fn remove_scheduled_in_catalog(
+    ///
+    /// Keyed by `path`, not by `data_file_id`: data files and delete files are two
+    /// independent identity sequences that share this table's `data_file_id` column, so
+    /// a data file and a delete file routinely collide on one id. That was harmless
+    /// while every listed row was deleted in the same pass, but a deferred row (one an
+    /// absolute reference still names) now stays behind while its id-twin is reclaimed —
+    /// and removing by id would take the deferred row with it, losing the owner's only
+    /// record that the object is still meant to be reclaimed.
+    pub(crate) async fn remove_scheduled_paths_in_catalog(
         &self,
         catalog_name: &str,
-        ids: &[i64],
+        paths: &[String],
     ) -> Result<()> {
-        if ids.is_empty() {
+        if paths.is_empty() {
             return Ok(());
         }
         let catalog_id = match self.find_catalog_id(catalog_name).await? {
@@ -998,10 +1006,10 @@ impl MulticatalogManager {
         };
         sqlx::query(
             "DELETE FROM ducklake_files_scheduled_for_deletion
-             WHERE catalog_id = $1 AND data_file_id = ANY($2)",
+             WHERE catalog_id = $1 AND path = ANY($2)",
         )
         .bind(catalog_id)
-        .bind(ids)
+        .bind(paths)
         .execute(&self.pool)
         .await?;
         Ok(())
