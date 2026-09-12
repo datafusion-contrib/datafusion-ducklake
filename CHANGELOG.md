@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
   `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
+- `MetadataWriter::register_existing_data_file_with_delete` registers an existing data file
+  together with an existing positional delete file in one commit, so a byte-identical copy
+  or reference of a file carries its row-level deletes across catalogs. Multicatalog
+  Postgres only; `register_existing_data_file` is now the no-delete shorthand.
 - A pushed-down filter never changes a query's answer, checked by a generated sweep over
   hostile catalog statistics on every backend (#293).
 - Pushed-down filters narrow the DuckLake file listing in the catalog query itself, using
@@ -54,6 +58,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / rewrite paths explicitly (#130).
 
 ### Changed
+
+- **BREAKING** (multicatalog Postgres only): `path_is_relative = false` on a
+  `ducklake_data_file` / `ducklake_delete_file` row now means *reference*, not merely an
+  absolute spelling. A catalog owns only the files it registered with a relative path (they
+  live under its own `cat_{id}/` layout); a row with an absolute path names a file another
+  catalog owns, which is how a database fork shares its source's files without copying them.
+  Expire and compaction delete such a row without scheduling its object,
+  `cleanup_old_files_in_catalog` leaves a scheduled file alone while an absolute row in any
+  catalog still names it, and refuses outright to delete a scheduled object outside the
+  cleaning catalog's own layout. Two partial indexes
+  (`idx_data_file_absolute_path`, `idx_delete_file_absolute_path`) serve that check. The
+  orphan sweep already counted every catalog's rows and is unchanged. Consequences for an
+  existing store on this layout: a catalog's own absolute-path files (as written by
+  `begin_write_to_path`) are no longer reclaimed by its expire, and on the first boot after
+  upgrading, the two new indexes build with a plain (non-`CONCURRENTLY`) `CREATE INDEX` like
+  every other index this schema bootstrap creates, briefly locking the table against writes.
 
 - Keep data inlining disabled by default; set `data_inlining_row_limit` to a
   positive threshold to opt in (#272).

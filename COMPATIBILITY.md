@@ -54,6 +54,15 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 > PostgreSQL writes no longer *require* this path: `PostgresSingleCatalogMetadataWriter`
 > writes the standard spec-compliant layout and supports SQL `CREATE TABLE` and `INSERT INTO`.
 
+Multi-catalog file ownership: a catalog owns only the data and delete files it
+registered with a relative path (they live under its own `cat_{id}/` layout). A row
+whose path is absolute is a *reference* to a file another catalog owns — that is how
+`register_existing_data_file` lets one catalog share another's files without copying
+them. Expire and compaction delete such a row without scheduling its object, and
+`cleanup_old_files_in_catalog` does not delete a scheduled object while an absolute row
+in any catalog still names it. Official DuckLake has no such rule; its maintenance
+commands schedule and delete every path the expiring catalog holds.
+
 ---
 
 ## Object stores

@@ -21,7 +21,7 @@
 //! same one a [`crate::table_writer::DuckLakeTableWriter`] was built with).
 
 use crate::Result;
-use crate::path_resolver::{parse_object_store_url, resolve_path};
+use crate::path_resolver::{join_paths, parse_object_store_url, resolve_path};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "write-postgres")]
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -99,7 +99,7 @@ async fn run_cleanup<RemoveFut>(
     files: Vec<ScheduledFile>,
     object_store: Arc<dyn ObjectStore>,
     dry_run: bool,
-    remove_rows: impl FnOnce(Vec<i64>) -> RemoveFut,
+    remove_rows: impl FnOnce(Vec<ScheduledFile>) -> RemoveFut,
 ) -> Result<Vec<String>>
 where
     RemoveFut: std::future::Future<Output = Result<()>>,
@@ -110,11 +110,9 @@ where
     let (_, base_key) = parse_object_store_url(data_path)?;
 
     let mut resolved = Vec::with_capacity(files.len());
-    let mut ids = Vec::with_capacity(files.len());
     for file in &files {
         let abs = resolve_path(&base_key, &file.path, file.path_is_relative)?;
         resolved.push(abs);
-        ids.push(file.data_file_id);
     }
 
     if dry_run {
@@ -136,8 +134,23 @@ where
         }
     }
 
-    remove_rows(ids).await?;
+    remove_rows(files).await?;
     Ok(resolved)
+}
+
+/// The object-store key a resolved path actually names — the same transform
+/// [`run_cleanup`] applies before deleting and [`run_orphan_cleanup`] applies before
+/// comparing.
+///
+/// Reclaim safety turns on "does any catalog still reference this object", and the two
+/// sides of that question are built by different code: a referencing row's path comes
+/// from the registering engine's own nested resolve, a scheduled row's from the SQL
+/// resolvers, which always insert a separator where [`crate::path_resolver::join_paths`]
+/// omits one after a base that already ends in it. Comparing canonical keys rather than
+/// raw strings keeps a one-character spelling difference from reading as "unreferenced"
+/// and deleting a live file.
+fn canonical_key(resolved: &str) -> String {
+    ObjectPath::from(resolved.trim_start_matches('/')).to_string()
 }
 
 /// Physically delete files scheduled by [`SqliteMetadataWriter::expire_snapshots`] and
@@ -154,10 +167,24 @@ pub async fn cleanup_old_files_sqlite(
 ) -> Result<Vec<String>> {
     let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
     let files = writer.list_scheduled_for_deletion(&criteria)?;
-    run_cleanup(&data_path, files, object_store, dry_run, |ids| async move {
-        writer.remove_scheduled(&ids)
-    })
+    run_cleanup(
+        &data_path,
+        files,
+        object_store,
+        dry_run,
+        |files| async move { writer.remove_scheduled(&scheduled_ids(&files)) },
+    )
     .await
+}
+
+/// The `data_file_id` column of every scheduled row, for backends that key their
+/// bookkeeping removal by id.
+///
+/// The multicatalog Postgres backend deliberately does not: see
+/// [`crate::multicatalog::MulticatalogManager::remove_scheduled_paths_in_catalog`].
+#[cfg(any(feature = "write-sqlite", feature = "write-duckdb", feature = "write-mysql"))]
+fn scheduled_ids(files: &[ScheduledFile]) -> Vec<i64> {
+    files.iter().map(|f| f.data_file_id).collect()
 }
 
 /// Physically delete files scheduled by
@@ -175,9 +202,13 @@ pub async fn cleanup_old_files_duckdb(
 ) -> Result<Vec<String>> {
     let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
     let files = writer.list_scheduled_for_deletion(&criteria)?;
-    run_cleanup(&data_path, files, object_store, dry_run, |ids| async move {
-        writer.remove_scheduled(&ids)
-    })
+    run_cleanup(
+        &data_path,
+        files,
+        object_store,
+        dry_run,
+        |files| async move { writer.remove_scheduled(&scheduled_ids(&files)) },
+    )
     .await
 }
 
@@ -185,6 +216,16 @@ pub async fn cleanup_old_files_duckdb(
 /// [`MulticatalogManager::expire_snapshots_in_catalog`] for `catalog_name` and remove their
 /// bookkeeping rows. Returns the resolved absolute paths deleted (or, for `dry_run`, the
 /// paths that would be deleted).
+///
+/// A scheduled file that an absolute-path data or delete file row in ANY catalog still
+/// points at is not deleted: another catalog registered that object by reference (a
+/// database fork does this instead of copying), so the owner's reclaim waits. The row
+/// stays scheduled and its `schedule_start` is reset, so an `OlderThan` sweep leaves it
+/// alone for another grace period; once the last reference row is gone the next sweep
+/// deletes it. Referencing catalogs never schedule such rows themselves (see
+/// `schedule_pg_files`), so the owner's scheduled row is the only reclaim intent — and
+/// when the owner catalog is dropped first, the object is reclaimed by the orphan sweep
+/// once no row anywhere resolves to it.
 ///
 /// [`MulticatalogManager::expire_snapshots_in_catalog`]: crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog
 #[cfg(feature = "write-postgres")]
@@ -199,10 +240,106 @@ pub async fn cleanup_old_files_in_catalog(
     let files = mgr
         .list_scheduled_for_deletion_in_catalog(catalog_name, &criteria)
         .await?;
-    run_cleanup(&data_path, files, object_store, dry_run, |ids| async move {
-        mgr.remove_scheduled_in_catalog(catalog_name, &ids).await
-    })
+    let files = retain_unreferenced(mgr, catalog_name, &data_path, files, dry_run).await?;
+    run_cleanup(
+        &data_path,
+        files,
+        object_store,
+        dry_run,
+        |files| async move {
+            let paths: Vec<String> = files.into_iter().map(|f| f.path).collect();
+            mgr.remove_scheduled_paths_in_catalog(catalog_name, &paths)
+                .await
+        },
+    )
     .await
+}
+
+/// Drop from `files` every scheduled row this catalog must not delete: one whose
+/// object an absolute-path row in some catalog still references (deferred, so the
+/// owner reclaims it once the last reference goes), and one whose object this catalog
+/// does not own at all (skipped and warned about, never deleted).
+///
+/// Both comparisons are on canonical object-store keys, not raw strings — see
+/// [`canonical_key`] for why a raw comparison is unsafe here.
+///
+/// The ownership guard is what makes this fail closed. A catalog owns the files under
+/// its own `cat_{id}/` layout; an *absolute* scheduled row naming an object outside it
+/// is not this catalog's to reclaim. Such a row is not written by this code — a
+/// referencing catalog never schedules what it only references — but an older build
+/// without that rule did schedule them, so a metadata database written by a mixed pair
+/// of versions can still hold one, naming a live file another catalog reads. Deleting
+/// it would destroy that catalog's data. `path_is_relative` rows are exempt: they
+/// resolve through this catalog's own schema and table rows by construction, which is
+/// what a legacy pre-`cat_{id}` layout registers.
+#[cfg(feature = "write-postgres")]
+async fn retain_unreferenced(
+    mgr: &crate::multicatalog::MulticatalogManager,
+    catalog_name: &str,
+    data_path: &str,
+    files: Vec<ScheduledFile>,
+    dry_run: bool,
+) -> Result<Vec<ScheduledFile>> {
+    if files.is_empty() {
+        return Ok(files);
+    }
+    let (_, base_key) = parse_object_store_url(data_path)?;
+    let own_prefix = match mgr.find_catalog_id(catalog_name).await? {
+        Some(id) => Some(canonical_key(&join_paths(&base_key, &format!("cat_{id}"))?)),
+        None => None,
+    };
+
+    let mut resolved = Vec::with_capacity(files.len());
+    for file in &files {
+        resolved.push(resolve_path(&base_key, &file.path, file.path_is_relative)?);
+    }
+    // Probe every spelling of each key the stored side might hold, so the index-served
+    // equality still matches a row written with a different separator or leading slash;
+    // whatever comes back is canonicalised before it is compared.
+    let mut probe: Vec<String> = Vec::with_capacity(resolved.len() * 3);
+    for abs in &resolved {
+        let key = canonical_key(abs);
+        probe.push(abs.clone());
+        probe.push(format!("/{key}"));
+        probe.push(key);
+    }
+    probe.sort();
+    probe.dedup();
+    let referenced: HashSet<String> = mgr
+        .referenced_absolute_paths(&probe)
+        .await?
+        .iter()
+        .map(|p| canonical_key(p))
+        .collect();
+
+    let mut kept = Vec::with_capacity(files.len());
+    let mut deferred = Vec::new();
+    for (file, abs) in files.into_iter().zip(resolved) {
+        let key = canonical_key(&abs);
+        if !file.path_is_relative
+            && let Some(prefix) = &own_prefix
+            && !(key == *prefix || key.starts_with(&format!("{prefix}/")))
+        {
+            tracing::warn!(
+                catalog = catalog_name,
+                path = %abs,
+                own_prefix = %prefix,
+                "refusing to reclaim a scheduled file outside this catalog's own layout; \
+                 it names an object another catalog owns and is left scheduled"
+            );
+            continue;
+        }
+        if referenced.contains(&key) {
+            deferred.push(file.path);
+        } else {
+            kept.push(file);
+        }
+    }
+    if !dry_run {
+        mgr.defer_scheduled_in_catalog(catalog_name, &deferred)
+            .await?;
+    }
+    Ok(kept)
 }
 
 /// Reclaim metadata rows whose owning row is already gone, on a Postgres store.

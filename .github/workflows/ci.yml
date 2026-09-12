@@ -469,11 +469,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-target-full-
 
-      # Runs the single-catalog suites across every metadata backend
-      # (Postgres/MySQL via testcontainers, SQLite, DuckDB) + encryption.
-      # `skip-tests-with-docker` is NOT set, so the container-backed suites run.
-      # Multicatalog (the runtimedb-specific layer, gated on `write-postgres`) is
-      # intentionally excluded here — its test files stay in-tree but don't run.
+      # Runs the suites across every metadata backend (Postgres/MySQL via
+      # testcontainers, SQLite, DuckDB) + encryption. `skip-tests-with-docker` is
+      # NOT set, so the container-backed suites run.
+      #
+      # The multicatalog suites run here too. Their files are gated on
+      # `write-postgres`, and that feature enables `multicatalog-postgres`
+      # (Cargo.toml), so the feature list below pulls them in. An earlier version
+      # of this comment claimed they were excluded; that was read during review as
+      # "the file-ownership tests never run in CI", which was wrong. Keep
+      # `write-postgres` in the list or `tests/it/multicatalog_postgres_tests.rs`
+      # and `tests/it/compaction_postgres_tests.rs` silently compile out.
       - name: Install DuckDB CLI
         if: steps.changes.outputs.code == 'true'
         shell: bash
