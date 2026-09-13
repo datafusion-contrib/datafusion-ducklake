@@ -12,8 +12,11 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use tempfile::TempDir;
+use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::minio::MinIO;
+
+const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
 
 /// Helper to create test data using DuckDB with local filesystem
 async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
@@ -214,8 +217,8 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("MinIO integration tests not available"));
     }
 
-    // Start MinIO container using the testcontainers MinIO module
-    let minio = MinIO::default().start().await?;
+    // Docker Hub no longer serves `minio/minio`; Quay still publishes the same pinned tag
+    let minio = MinIO::default().with_name(MINIO_IMAGE_NAME).start().await?;
     let minio_port = minio.get_host_port_ipv4(9000).await?;
     let minio_endpoint = format!("http://127.0.0.1:{}", minio_port);
 
