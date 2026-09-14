@@ -21,7 +21,9 @@
 //! same one a [`crate::table_writer::DuckLakeTableWriter`] was built with).
 
 use crate::Result;
-use crate::path_resolver::{join_paths, parse_object_store_url, resolve_path};
+#[cfg(feature = "write-postgres")]
+use crate::path_resolver::join_paths;
+use crate::path_resolver::{parse_object_store_url, resolve_path};
 use chrono::{DateTime, Utc};
 #[cfg(feature = "write-postgres")]
 use datafusion::datasource::object_store::ObjectStoreUrl;
@@ -149,6 +151,7 @@ where
 /// omits one after a base that already ends in it. Comparing canonical keys rather than
 /// raw strings keeps a one-character spelling difference from reading as "unreferenced"
 /// and deleting a live file.
+#[cfg(feature = "write-postgres")]
 fn canonical_key(resolved: &str) -> String {
     ObjectPath::from(resolved.trim_start_matches('/')).to_string()
 }
@@ -293,20 +296,14 @@ async fn retain_unreferenced(
     for file in &files {
         resolved.push(resolve_path(&base_key, &file.path, file.path_is_relative)?);
     }
-    // Probe every spelling of each key the stored side might hold, so the index-served
-    // equality still matches a row written with a different separator or leading slash;
-    // whatever comes back is canonicalised before it is compared.
-    let mut probe: Vec<String> = Vec::with_capacity(resolved.len() * 3);
-    for abs in &resolved {
-        let key = canonical_key(abs);
-        probe.push(abs.clone());
-        probe.push(format!("/{key}"));
-        probe.push(key);
-    }
-    probe.sort();
-    probe.dedup();
+    // Canonicalise the whole stored side, rather than probing it with the spellings
+    // this side happens to produce. A reference row names its object in whatever form
+    // its registrar wrote; `ObjectPath` folds those forms together, SQL equality does
+    // not. Selecting by equality would return only the rows whose spelling was guessed,
+    // and a reference that does not come back is indistinguishable from one that does
+    // not exist — which deletes a file another catalog is reading.
     let referenced: HashSet<String> = mgr
-        .referenced_absolute_paths(&probe)
+        .all_absolute_reference_paths()
         .await?
         .iter()
         .map(|p| canonical_key(p))

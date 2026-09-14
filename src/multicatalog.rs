@@ -12,7 +12,6 @@ use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use std::collections::HashSet;
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
 /// root (file → table → schema → data_path). An absolute path anywhere in the chain
@@ -1015,27 +1014,34 @@ impl MulticatalogManager {
         Ok(())
     }
 
-    /// Of `paths` (fully resolved, as the reader resolves them), those that an
-    /// absolute-path `ducklake_data_file` or `ducklake_delete_file` row in ANY
-    /// catalog still points at.
+    /// Every path an absolute-path `ducklake_data_file` or `ducklake_delete_file` row
+    /// in ANY catalog still points at, exactly as stored.
     ///
-    /// Deliberately unscoped: an absolute row is a reference to a file another
-    /// catalog owns (see `schedule_pg_files`), so the question "does anyone still
-    /// read this object" has to look across catalogs. Served by the partial indexes
-    /// `idx_data_file_absolute_path` / `idx_delete_file_absolute_path`; only
-    /// reference rows are absolute, so the indexed set stays small.
-    pub async fn referenced_absolute_paths(&self, paths: &[String]) -> Result<HashSet<String>> {
-        if paths.is_empty() {
-            return Ok(HashSet::new());
-        }
+    /// Deliberately unscoped: an absolute row is a reference to a file another catalog
+    /// owns (see `schedule_pg_files`), so the question "does anyone still read this
+    /// object" has to look across catalogs.
+    ///
+    /// Returns the rows rather than answering a membership question about a caller's
+    /// list, because the caller must compare *canonical object-store keys* and SQL
+    /// equality cannot. Two spellings of one path — a doubled separator, a leading
+    /// slash — name the same object and read identically, so a stored row matched by
+    /// string equality against a probe list is matched only if the caller happened to
+    /// guess its spelling. A probe that misses reads as "nobody references this" and
+    /// deletes a live file, which is the failure this whole rule exists to prevent.
+    /// Selection is therefore left broad and the comparison done by the caller in
+    /// Rust, the way [`crate::maintenance::delete_orphaned_files_multicatalog`] has
+    /// always compared against real object locations.
+    ///
+    /// The partial indexes `idx_data_file_absolute_path` /
+    /// `idx_delete_file_absolute_path` serve this as an index-only scan, and only
+    /// reference rows are absolute, so the scanned set is bounded by how many
+    /// cross-catalog references exist rather than by the size of the file tables.
+    pub async fn all_absolute_reference_paths(&self) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT path FROM ducklake_data_file
-             WHERE NOT path_is_relative AND path = ANY($1)
+            "SELECT path FROM ducklake_data_file WHERE NOT path_is_relative
              UNION
-             SELECT path FROM ducklake_delete_file
-             WHERE NOT path_is_relative AND path = ANY($1)",
+             SELECT path FROM ducklake_delete_file WHERE NOT path_is_relative",
         )
-        .bind(paths)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -1074,6 +1080,17 @@ impl MulticatalogManager {
 
     /// Every physical file referenced by a catalog whose effective `data_path`
     /// matches one of `data_paths`. Canonical-root cleanup must preserve aliases.
+    ///
+    /// Absolute-path rows are collected from EVERY catalog, not only those in the swept
+    /// group. Such a row is a reference to a file another catalog owns, and nothing
+    /// constrains the referrer to share the owner's root: a catalog on a sibling
+    /// `data_path` referencing a file under the swept one is in neither the group nor
+    /// its nested-prefix merge, so scoping this arm would make its references invisible
+    /// and the sweep would delete a file that catalog is reading. The rows are cheap to
+    /// include — the partial indexes on absolute paths serve them, and only references
+    /// are absolute — and a path outside the swept root simply never matches a listed
+    /// object, so widening the arm cannot preserve anything that should have been
+    /// reclaimed.
     pub(crate) async fn list_referenced_paths_in_data_paths(
         &self,
         data_paths: &[String],
@@ -1099,7 +1116,13 @@ impl MulticatalogManager {
              UNION ALL
              SELECT path AS p, path_is_relative AS rel
              FROM ducklake_files_scheduled_for_deletion
-             WHERE catalog_id IN (SELECT catalog_id FROM root_catalog)"
+             WHERE catalog_id IN (SELECT catalog_id FROM root_catalog)
+             UNION ALL
+             SELECT path AS p, FALSE AS rel
+             FROM ducklake_data_file WHERE NOT path_is_relative
+             UNION ALL
+             SELECT path AS p, FALSE AS rel
+             FROM ducklake_delete_file WHERE NOT path_is_relative"
         );
         let rows = sqlx::query(AssertSqlSafe(q.as_str()))
             .bind(data_paths)

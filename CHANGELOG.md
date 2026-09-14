@@ -72,7 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   catalog still names it, and refuses outright to delete a scheduled object outside the
   cleaning catalog's own layout. Two partial indexes
   (`idx_data_file_absolute_path`, `idx_delete_file_absolute_path`) serve that check. The
-  orphan sweep already counted every catalog's rows and is unchanged. Consequences for an
+  orphan sweep now counts absolute rows from every catalog, not only those on the swept
+  data path, since nothing constrains a referrer to share its owner's root. Consequences for an
   existing store on this layout: a catalog's own absolute-path files (as written by
   `begin_write_to_path`) are no longer reclaimed by its expire, and on the first boot after
   upgrading, the two new indexes build with a plain (non-`CONCURRENTLY`) `CREATE INDEX` like

@@ -6962,3 +6962,192 @@ async fn reclaiming_a_file_keeps_a_deferred_row_that_shares_its_id() {
         "the deferred row survives its id-twin's reclamation"
     );
 }
+
+/// A reference spelled differently from the scheduled row still protects its object.
+///
+/// The two sides of "does any catalog reference this" are written by different code and
+/// need not agree on spelling: a doubled separator names the same object key and reads
+/// identically. Selecting reference rows by string equality against a probe built from
+/// the scheduled side would return only the spellings that side guessed, and a reference
+/// that does not come back is indistinguishable from one that does not exist.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn cleanup_honours_a_reference_spelled_differently_from_the_scheduled_row() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    let a_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("f1.parquet"), b"f1").unwrap();
+    std::fs::write(a_dir.join("f2.parquet"), b"f2").unwrap();
+
+    // A owns f1 then supersedes it with f2, so f1 is retired and scheduled.
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap1 = wa
+        .register_data_file(
+            a1.table_id,
+            "public",
+            "t",
+            a1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 2, 5),
+            WriteMode::Replace,
+            a1.base_snapshot_id,
+            &cols(),
+            &a1.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        "public",
+        "t",
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 2, 5),
+        WriteMode::Replace,
+        a2.base_snapshot_id,
+        &cols(),
+        &a2.column_ids,
+    )
+    .unwrap();
+
+    // B references f1 with a DOUBLED separator. Same object, different spelling.
+    let odd = format!("{}/cat_{}/public//t/f1.parquet", data.display(), cat_a);
+    let plain = format!("{}/cat_{}/public/t/f1.parquet", data.display(), cat_a);
+    assert_eq!(
+        object_store::path::Path::from(odd.trim_start_matches('/')),
+        object_store::path::Path::from(plain.trim_start_matches('/')),
+        "the two spellings must name one object, or this test proves nothing"
+    );
+    wb.register_existing_data_file(
+        "public",
+        "t",
+        &cols(),
+        &a1.column_ids,
+        &DataFileInfo::new(odd, 2, 5).with_absolute_path(),
+        WriteMode::Replace,
+    )
+    .unwrap();
+
+    mgr.expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![snap1]))
+        .await
+        .unwrap();
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+
+    assert!(
+        deleted.is_empty(),
+        "a differently spelled reference still protects f1: {deleted:?}"
+    );
+    assert!(
+        a_dir.join("f1.parquet").exists(),
+        "f1 is referenced by cat_b and must survive cat_a's cleanup"
+    );
+    assert!(
+        a_dir.join("f2.parquet").exists(),
+        "the live file is untouched"
+    );
+}
+
+/// The orphan sweep protects a reference held by a catalog on a different `data_path`.
+///
+/// A referrer is not constrained to share its owner's root. Scoping the sweep's
+/// reference set to the swept group alone would make such a row invisible and reclaim a
+/// file that catalog is reading.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn orphan_sweep_honours_a_reference_from_a_catalog_on_a_sibling_data_path() {
+    use datafusion_ducklake::maintenance::{CleanupCriteria, delete_orphaned_files_in_data_path};
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+
+    // Two SIBLING roots, neither nested in the other.
+    let temp = TempDir::new().unwrap();
+    let root_a = temp.path().join("root_a");
+    let root_b = temp.path().join("root_b");
+    std::fs::create_dir_all(&root_a).unwrap();
+    std::fs::create_dir_all(&root_b).unwrap();
+    wa.set_data_path(root_a.to_str().unwrap()).unwrap();
+    wb.set_data_path(root_b.to_str().unwrap()).unwrap();
+
+    // An object under A's root, referenced by B, whose catalog rows no longer exist in
+    // A (as after a drop) — exactly what the orphan sweep is there to reclaim, except
+    // that B still reads it.
+    let a_dir = root_a.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&a_dir).unwrap();
+    std::fs::write(a_dir.join("shared.parquet"), b"shared").unwrap();
+    std::fs::write(a_dir.join("stray.parquet"), b"stray").unwrap();
+
+    let shared = format!("{}/cat_{}/public/t/shared.parquet", root_a.display(), cat_a);
+    wb.register_existing_data_file(
+        "public",
+        "t",
+        &cols(),
+        &[1_i64, 2_i64],
+        &DataFileInfo::new(shared, 6, 1).with_absolute_path(),
+        WriteMode::Replace,
+    )
+    .unwrap();
+
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted = delete_orphaned_files_in_data_path(
+        &mgr,
+        root_a.to_str().unwrap(),
+        os,
+        CleanupCriteria::All,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        deleted.len(),
+        1,
+        "only the genuine orphan is reclaimed: {deleted:?}"
+    );
+    assert!(deleted[0].ends_with("stray.parquet"), "{deleted:?}");
+    assert!(
+        a_dir.join("shared.parquet").exists(),
+        "a reference from a sibling root still protects the object"
+    );
+    assert!(!a_dir.join("stray.parquet").exists(), "the orphan is gone");
+}
