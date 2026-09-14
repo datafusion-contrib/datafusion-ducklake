@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
   `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
+- `DataFileInfo::with_owner_catalog` / `DeleteFileInfo::with_owner_catalog` mark a registered
+  file as a reference to another catalog's object rather than one of this catalog's own (#310).
 - `MetadataWriter::register_existing_data_file_with_delete` registers an existing data file
   together with an existing positional delete file in one commit, so a byte-identical copy
   or reference of a file carries its row-level deletes across catalogs. Multicatalog
@@ -62,22 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING** (multicatalog Postgres only): `path_is_relative = false` on a
-  `ducklake_data_file` / `ducklake_delete_file` row now means *reference*, not merely an
-  absolute spelling. A catalog owns only the files it registered with a relative path (they
-  live under its own `cat_{id}/` layout); a row with an absolute path names a file another
-  catalog owns, which is how a database fork shares its source's files without copying them.
-  Expire and compaction delete such a row without scheduling its object,
-  `cleanup_old_files_in_catalog` leaves a scheduled file alone while an absolute row in any
-  catalog still names it, and refuses outright to delete a scheduled object outside the
-  cleaning catalog's own layout. Two partial indexes
-  (`idx_data_file_absolute_path`, `idx_delete_file_absolute_path`) serve that check. The
-  orphan sweep now counts absolute rows from every catalog, not only those on the swept
-  data path, since nothing constrains a referrer to share its owner's root. Consequences for an
-  existing store on this layout: a catalog's own absolute-path files (as written by
-  `begin_write_to_path`) are no longer reclaimed by its expire, and on the first boot after
-  upgrading, the two new indexes build with a plain (non-`CONCURRENTLY`) `CREATE INDEX` like
-  every other index this schema bootstrap creates, briefly locking the table against writes.
+- **BREAKING** (multicatalog Postgres only): a `ducklake_data_file` / `ducklake_delete_file`
+  row whose new `owner_catalog_id` is set references a file that catalog owns, so expire,
+  compaction and the orphan sweep never reclaim it and the owner defers its own reclaim while
+  it stands (#309, #310). Migration is additive and automatic on the next boot: existing rows
+  become NULL (owned) and two partial indexes build with a plain `CREATE INDEX`.
 
 - Keep data inlining disabled by default; set `data_inlining_row_limit` to a
   positive threshold to opt in (#272).
@@ -127,6 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Multicatalog Postgres: a catalog's own absolute-path file, as `begin_write_to_path` writes,
+  is scheduled and reclaimed again instead of leaking when it lives outside `data_path` (#310).
 - Return a typed conflict for stale PostgreSQL single-catalog writes (#272).
 - Reject non-empty `CREATE TABLE AS SELECT` without publishing metadata;
   use `CREATE TABLE` followed by `INSERT INTO ... SELECT` (#272).

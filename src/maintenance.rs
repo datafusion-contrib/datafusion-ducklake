@@ -91,6 +91,13 @@ pub struct ScheduledFile {
     pub path: String,
     /// Whether `path` is relative to the catalog `data_path` root.
     pub path_is_relative: bool,
+    /// The catalog that owned this object when the row was scheduled, on the
+    /// multicatalog Postgres layout. Always the scheduling catalog itself — a
+    /// catalog only schedules what it owns — so its job is to mark the row as one
+    /// the ownership rule produced. `None` on every other backend, and on a
+    /// multicatalog row written before the rule existed, which
+    /// [`cleanup_old_files_in_catalog`] therefore treats as unverified.
+    pub owner_catalog_id: Option<i64>,
 }
 
 /// Resolve scheduled rows against `data_path`, delete the objects (unless `dry_run`),
@@ -266,15 +273,21 @@ pub async fn cleanup_old_files_in_catalog(
 /// Both comparisons are on canonical object-store keys, not raw strings — see
 /// [`canonical_key`] for why a raw comparison is unsafe here.
 ///
-/// The ownership guard is what makes this fail closed. A catalog owns the files under
-/// its own `cat_{id}/` layout; an *absolute* scheduled row naming an object outside it
-/// is not this catalog's to reclaim. Such a row is not written by this code — a
-/// referencing catalog never schedules what it only references — but an older build
-/// without that rule did schedule them, so a metadata database written by a mixed pair
-/// of versions can still hold one, naming a live file another catalog reads. Deleting
-/// it would destroy that catalog's data. `path_is_relative` rows are exempt: they
-/// resolve through this catalog's own schema and table rows by construction, which is
-/// what a legacy pre-`cat_{id}` layout registers.
+/// The ownership guard is what makes this fail closed, and it applies only to rows
+/// whose provenance is unknown. A row this code scheduled carries
+/// `owner_catalog_id` — a catalog only ever schedules what it owns — so it is
+/// reclaimed on that record alone, which is what lets a catalog reclaim its own file
+/// written outside its layout (a [`crate::DuckLakeTableWriter::begin_write_to_path`]
+/// target). A row WITHOUT that marker predates the ownership rule and cannot be
+/// trusted: a build without the rule did schedule files it merely referenced, so a
+/// metadata database written by a mixed pair of versions can hold one naming a live
+/// file another catalog reads, with the reference row that would have protected it
+/// already gone. Deleting it would destroy that catalog's data. Such a row is
+/// therefore reclaimed only where a catalog's own files live — under its own
+/// `cat_{id}/` layout — and refused, with a warning, anywhere else.
+/// `path_is_relative` rows are exempt either way: they resolve through this catalog's
+/// own schema and table rows by construction, which is what a legacy pre-`cat_{id}`
+/// layout registers.
 #[cfg(feature = "write-postgres")]
 async fn retain_unreferenced(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -303,7 +316,7 @@ async fn retain_unreferenced(
     // and a reference that does not come back is indistinguishable from one that does
     // not exist — which deletes a file another catalog is reading.
     let referenced: HashSet<String> = mgr
-        .all_absolute_reference_paths()
+        .all_reference_paths()
         .await?
         .iter()
         .map(|p| canonical_key(p))
@@ -313,7 +326,8 @@ async fn retain_unreferenced(
     let mut deferred = Vec::new();
     for (file, abs) in files.into_iter().zip(resolved) {
         let key = canonical_key(&abs);
-        if !file.path_is_relative
+        if file.owner_catalog_id.is_none()
+            && !file.path_is_relative
             && let Some(prefix) = &own_prefix
             && !(key == *prefix || key.starts_with(&format!("{prefix}/")))
         {
@@ -321,8 +335,9 @@ async fn retain_unreferenced(
                 catalog = catalog_name,
                 path = %abs,
                 own_prefix = %prefix,
-                "refusing to reclaim a scheduled file outside this catalog's own layout; \
-                 it names an object another catalog owns and is left scheduled"
+                "refusing to reclaim a scheduled file outside this catalog's own layout \
+                 that was scheduled before file ownership was recorded; it may name an \
+                 object another catalog owns and is left scheduled"
             );
             continue;
         }

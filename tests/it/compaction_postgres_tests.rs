@@ -816,7 +816,8 @@ async fn merge_of_absolute_reference_files_does_not_schedule_them() {
             &cols,
             &column_ids,
             &DataFileInfo::new(abs, f.file.file_size_bytes, f.max_row_count.unwrap())
-                .with_absolute_path(),
+                .with_absolute_path()
+                .with_owner_catalog(cat_a),
             mode,
         )
         .unwrap();

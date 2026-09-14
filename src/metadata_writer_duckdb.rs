@@ -2321,6 +2321,8 @@ impl DuckdbMetadataWriter {
                 data_file_id: row.get(0)?,
                 path: row.get(1)?,
                 path_is_relative: row.get(2)?,
+                // Single-catalog layout — see the SQLite writer.
+                owner_catalog_id: None,
             })
         };
         let files = if let Some(cutoff) = cutoff {

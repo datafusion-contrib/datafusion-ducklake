@@ -45,6 +45,11 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     // bootstrap path — runtimedb and the multicatalog tests call it — so the
     // migration MUST run here, not only in PostgresMetadataWriter::initialize_schema.
     crate::metadata_writer_postgres::migrate_ducklake_column_to_composite_pk(pool).await?;
+    // Give every file row an explicit owner (NULL = this catalog's own) rather than
+    // reading ownership off `path_is_relative`, and build the indexes that serve the
+    // reference lookup. Additive and idempotent; MUST run here for the same reason as
+    // the migration above — this is the bootstrap path callers actually use.
+    crate::metadata_writer_postgres::migrate_file_ownership_column(pool).await?;
     Ok(())
 }
 
@@ -799,7 +804,7 @@ impl MulticatalogManager {
         //    `= ANY($2)` with an empty array is simply false — no special-casing needed.
         let dead_data_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
-                    df.path_is_relative AS file_rel
+                    df.owner_catalog_id IS NULL AS owned
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -850,7 +855,7 @@ impl MulticatalogManager {
         //    snapshot.
         let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
-                    df.path_is_relative AS file_rel
+                    df.owner_catalog_id IS NULL AS owned
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -951,7 +956,7 @@ impl MulticatalogManager {
         let rows = match criteria {
             CleanupCriteria::All => {
                 sqlx::query(
-                    "SELECT data_file_id, path, path_is_relative
+                    "SELECT data_file_id, path, path_is_relative, owner_catalog_id
                  FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
                 )
                 .bind(catalog_id)
@@ -960,7 +965,7 @@ impl MulticatalogManager {
             },
             CleanupCriteria::OlderThan(ts) => {
                 sqlx::query(
-                    "SELECT data_file_id, path, path_is_relative
+                    "SELECT data_file_id, path, path_is_relative, owner_catalog_id
                  FROM ducklake_files_scheduled_for_deletion
                  WHERE catalog_id = $1 AND schedule_start < $2::timestamptz",
                 )
@@ -976,6 +981,7 @@ impl MulticatalogManager {
                     data_file_id: r.try_get(0)?,
                     path: r.try_get(1)?,
                     path_is_relative: r.try_get(2)?,
+                    owner_catalog_id: r.try_get(3)?,
                 })
             })
             .collect()
@@ -1014,12 +1020,12 @@ impl MulticatalogManager {
         Ok(())
     }
 
-    /// Every path an absolute-path `ducklake_data_file` or `ducklake_delete_file` row
-    /// in ANY catalog still points at, exactly as stored.
+    /// Every path a `ducklake_data_file` or `ducklake_delete_file` row in ANY catalog
+    /// references — one naming another catalog as its owner — exactly as stored.
     ///
-    /// Deliberately unscoped: an absolute row is a reference to a file another catalog
-    /// owns (see `schedule_pg_files`), so the question "does anyone still read this
-    /// object" has to look across catalogs.
+    /// Deliberately unscoped: such a row references a file another catalog owns (see
+    /// `schedule_pg_files`), so the question "does anyone still read this object" has
+    /// to look across catalogs.
     ///
     /// Returns the rows rather than answering a membership question about a caller's
     /// list, because the caller must compare *canonical object-store keys* and SQL
@@ -1032,15 +1038,19 @@ impl MulticatalogManager {
     /// Rust, the way [`crate::maintenance::delete_orphaned_files_multicatalog`] has
     /// always compared against real object locations.
     ///
-    /// The partial indexes `idx_data_file_absolute_path` /
-    /// `idx_delete_file_absolute_path` serve this as an index-only scan, and only
-    /// reference rows are absolute, so the scanned set is bounded by how many
-    /// cross-catalog references exist rather than by the size of the file tables.
-    pub async fn all_absolute_reference_paths(&self) -> Result<Vec<String>> {
+    /// The partial indexes `idx_data_file_owner_catalog` /
+    /// `idx_delete_file_owner_catalog` serve this as an index-only scan, so the
+    /// scanned set is bounded by how many cross-catalog references exist rather than
+    /// by the size of the file tables.
+    ///
+    /// A catalog's OWN absolute-path file is deliberately absent: it is not a
+    /// reference, and including it would make the catalog defer its own reclaim
+    /// against itself forever.
+    pub async fn all_reference_paths(&self) -> Result<Vec<String>> {
         let rows = sqlx::query(
-            "SELECT path FROM ducklake_data_file WHERE NOT path_is_relative
+            "SELECT path FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL
              UNION
-             SELECT path FROM ducklake_delete_file WHERE NOT path_is_relative",
+             SELECT path FROM ducklake_delete_file WHERE owner_catalog_id IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1081,16 +1091,23 @@ impl MulticatalogManager {
     /// Every physical file referenced by a catalog whose effective `data_path`
     /// matches one of `data_paths`. Canonical-root cleanup must preserve aliases.
     ///
-    /// Absolute-path rows are collected from EVERY catalog, not only those in the swept
-    /// group. Such a row is a reference to a file another catalog owns, and nothing
-    /// constrains the referrer to share the owner's root: a catalog on a sibling
-    /// `data_path` referencing a file under the swept one is in neither the group nor
-    /// its nested-prefix merge, so scoping this arm would make its references invisible
-    /// and the sweep would delete a file that catalog is reading. The rows are cheap to
-    /// include — the partial indexes on absolute paths serve them, and only references
-    /// are absolute — and a path outside the swept root simply never matches a listed
-    /// object, so widening the arm cannot preserve anything that should have been
-    /// reclaimed.
+    /// Reference rows are collected from EVERY catalog, not only those in the swept
+    /// group. Such a row names a file another catalog owns, and nothing constrains the
+    /// referrer to share the owner's root: a catalog on a sibling `data_path`
+    /// referencing a file under the swept one is in neither the group nor its
+    /// nested-prefix merge, so scoping this arm would make its references invisible
+    /// and the sweep would delete a file that catalog is reading. The rows are cheap
+    /// to include — the partial indexes on `owner_catalog_id` serve them — and a path
+    /// outside the swept root simply never matches a listed object, so widening the
+    /// arm cannot preserve anything that should have been reclaimed.
+    ///
+    /// This arm covers references only, not every absolutely-spelled row. A catalog's
+    /// OWN absolute-path file is already covered by the scoped arms whenever its
+    /// catalog is in the swept group, because [`PG_RESOLVED_PATH`] short-circuits to
+    /// the stored path. What is left uncovered is a catalog writing its own file into
+    /// a DIFFERENT catalog's `data_path` — interleaving two catalogs' objects in one
+    /// tree with nothing recording whose is whose — which this layout does not
+    /// support.
     pub(crate) async fn list_referenced_paths_in_data_paths(
         &self,
         data_paths: &[String],
@@ -1119,10 +1136,10 @@ impl MulticatalogManager {
              WHERE catalog_id IN (SELECT catalog_id FROM root_catalog)
              UNION ALL
              SELECT path AS p, FALSE AS rel
-             FROM ducklake_data_file WHERE NOT path_is_relative
+             FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL
              UNION ALL
              SELECT path AS p, FALSE AS rel
-             FROM ducklake_delete_file WHERE NOT path_is_relative"
+             FROM ducklake_delete_file WHERE owner_catalog_id IS NOT NULL"
         );
         let rows = sqlx::query(AssertSqlSafe(q.as_str()))
             .bind(data_paths)
@@ -1134,18 +1151,23 @@ impl MulticatalogManager {
     }
 }
 
-/// Schedule the physical files behind dead `(id, resolved_path, rel, file_rel)` rows
+/// Schedule the physical files behind dead `(id, resolved_path, rel, owned)` rows
 /// and return EVERY dead id, scheduled or not, so the caller deletes all the rows.
 ///
-/// A catalog owns only the files it registered with `ducklake_data_file.path_is_relative`
-/// (or the delete-file equivalent) set to true: they live under its own layout. A row
-/// whose own path is absolute is a *reference* to a file another catalog owns — a
-/// database fork registers the source's files this way instead of copying them. Such a
-/// row is dropped like any other dead row, but its object is never scheduled: the owner
-/// reclaims it through its own expire, and `cleanup_old_files_in_catalog` holds that
-/// reclaim back for as long as any reference row still points at the path. The test is
-/// the file row's own flag, not the resolved chain flag (`rel`), which also goes false
-/// when a schema or table path is absolute — that file is still the catalog's own.
+/// A catalog owns a file unless the row names another catalog as its owner
+/// (`ducklake_data_file.owner_catalog_id`, or the delete-file equivalent). A row that
+/// does is a *reference* to a file another catalog owns — a database fork registers
+/// the source's files this way instead of copying them. Such a row is dropped like
+/// any other dead row, but its object is never scheduled: the owner reclaims it
+/// through its own expire, and `cleanup_old_files_in_catalog` holds that reclaim back
+/// for as long as any reference row still points at the path.
+///
+/// The test is ownership, NOT how the path is spelled. Both the resolved chain flag
+/// (`rel`) and the file row's own `path_is_relative` go false for a catalog's own
+/// file — under an absolute schema or table path, or when
+/// [`crate::DuckLakeTableWriter::begin_write_to_path`] put the file outside
+/// `data_path` — and reading either as "someone else's" strands the object with
+/// nothing left in the catalog naming it.
 async fn schedule_pg_files(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     catalog_id: i64,
@@ -1156,15 +1178,19 @@ async fn schedule_pg_files(
         let id: i64 = row.try_get(0)?;
         let path: String = row.try_get(1)?;
         let rel: bool = row.try_get(2)?;
-        let file_rel: bool = row.try_get(3)?;
+        let owned: bool = row.try_get(3)?;
         ids.push(id);
-        if !file_rel {
+        if !owned {
             continue;
         }
+        // `owner_catalog_id` is stamped with the scheduling catalog: this row is
+        // one the ownership rule produced, so cleanup need not fall back to the
+        // layout check it applies to rows written before the rule existed.
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
-                 (catalog_id, data_file_id, path, path_is_relative, schedule_start)
-             VALUES ($1, $2, $3, $4, NOW())",
+                 (catalog_id, data_file_id, path, path_is_relative, schedule_start,
+                  owner_catalog_id)
+             VALUES ($1, $2, $3, $4, NOW(), $1)",
         )
         .bind(catalog_id)
         .bind(id)

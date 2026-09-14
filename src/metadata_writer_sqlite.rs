@@ -949,6 +949,10 @@ impl SqliteMetadataWriter {
                         data_file_id: r.try_get(0)?,
                         path: r.try_get(1)?,
                         path_is_relative: r.try_get::<i64, _>(2)? != 0,
+                        // Single-catalog layout: there is no other catalog for a
+                        // file to belong to, so every scheduled row is this
+                        // catalog's own.
+                        owner_catalog_id: None,
                     })
                 })
                 .collect()

@@ -747,6 +747,24 @@ pub struct DataFileInfo {
     /// DuckDB-canonical VARCHAR (`None` == SQL NULL). Persisted to
     /// `ducklake_file_partition_value`. Empty for an unpartitioned file.
     pub partition_values: Vec<(i32, Option<String>)>,
+    /// Which catalog owns the physical object, on the multicatalog Postgres layout.
+    ///
+    /// `None` — the catalog this file is registered in owns it, and reclaims it
+    /// through its own expire, compaction and cleanup. That covers every file this
+    /// crate writes, whether the path is stored relative to the table (the usual
+    /// shape) or absolute — a [`DuckLakeTableWriter::begin_write_to_path`] target
+    /// is absolute and may sit outside `data_path` entirely, and is still owned.
+    ///
+    /// `Some(id)` — the row is a *reference* to a file catalog `id` owns, which a
+    /// database fork registers instead of copying the object. The registering
+    /// catalog then never schedules or deletes it, and the owner's cleanup holds
+    /// its own reclaim back for as long as the reference stands.
+    ///
+    /// Read only by [`MetadataWriter::register_existing_data_file_with_delete`] on
+    /// multicatalog Postgres; every other backend and write path ignores it.
+    ///
+    /// [`DuckLakeTableWriter::begin_write_to_path`]: crate::DuckLakeTableWriter::begin_write_to_path
+    pub owner_catalog_id: Option<i64>,
 }
 
 impl DataFileInfo {
@@ -772,6 +790,7 @@ impl DataFileInfo {
             column_stats: Vec::new(),
             partition_id: None,
             partition_values: Vec::new(),
+            owner_catalog_id: None,
         }
     }
 
@@ -801,8 +820,29 @@ impl DataFileInfo {
     }
 
     /// Mark this file as having an absolute path.
+    ///
+    /// This says only how the path is spelled, NOT who owns the object: a catalog's
+    /// own file written through [`DuckLakeTableWriter::begin_write_to_path`] is
+    /// absolute and still owned. Use
+    /// [`with_owner_catalog`](Self::with_owner_catalog) to register a reference to
+    /// another catalog's file.
+    ///
+    /// [`DuckLakeTableWriter::begin_write_to_path`]: crate::DuckLakeTableWriter::begin_write_to_path
     pub fn with_absolute_path(mut self) -> Self {
         self.path_is_relative = false;
+        self
+    }
+
+    /// Mark this row as a reference to a file catalog `owner_catalog_id` owns,
+    /// rather than a file of the catalog it is registered in. See
+    /// [`owner_catalog_id`](Self::owner_catalog_id).
+    ///
+    /// A reference should also carry
+    /// [`with_absolute_path`](Self::with_absolute_path): a relative path resolves
+    /// through the REFERRING catalog's schema and table rows, which is not where
+    /// the owner's object lives.
+    pub fn with_owner_catalog(mut self, owner_catalog_id: i64) -> Self {
+        self.owner_catalog_id = Some(owner_catalog_id);
         self
     }
 }
@@ -941,6 +981,11 @@ pub struct DeleteFileInfo {
     pub footer_size: Option<i64>,
     /// Number of deleted positions in this file.
     pub delete_count: i64,
+    /// Which catalog owns the physical object. Mirrors
+    /// [`DataFileInfo::owner_catalog_id`] exactly: `None` means the registering
+    /// catalog owns and reclaims it, `Some(id)` that the row references a file
+    /// catalog `id` owns.
+    pub owner_catalog_id: Option<i64>,
 }
 
 impl DeleteFileInfo {
@@ -959,6 +1004,7 @@ impl DeleteFileInfo {
             file_size_bytes,
             footer_size: None,
             delete_count,
+            owner_catalog_id: None,
         }
     }
 
@@ -968,9 +1014,17 @@ impl DeleteFileInfo {
         self
     }
 
-    /// Mark this delete file as having an absolute path.
+    /// Mark this delete file as having an absolute path. Says how the path is
+    /// spelled, not who owns the object — see [`DataFileInfo::with_absolute_path`].
     pub fn with_absolute_path(mut self) -> Self {
         self.path_is_relative = false;
+        self
+    }
+
+    /// Mark this row as a reference to a delete file catalog `owner_catalog_id`
+    /// owns. See [`DataFileInfo::with_owner_catalog`].
+    pub fn with_owner_catalog(mut self, owner_catalog_id: i64) -> Self {
+        self.owner_catalog_id = Some(owner_catalog_id);
         self
     }
 }
@@ -2290,8 +2344,19 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// delete file stays valid for any byte-identical copy — or reference — of that
     /// file. A database fork uses this to carry the source table's row-level deletes
     /// across without rewriting either file: both `file` and `delete` are registered
-    /// with the source's paths marked absolute (`with_absolute_path`), and the
+    /// with the source's paths marked absolute (`with_absolute_path`) and with the
+    /// source's catalog named as their owner (`with_owner_catalog`), and the
     /// destination reads exactly what the source read at that snapshot.
+    ///
+    /// # Ownership
+    ///
+    /// `with_owner_catalog` is what makes a row a reference, not the absolute path.
+    /// Omit it and the row says "my own file, spelled absolutely" — which is the
+    /// right answer for promoting a file this catalog wrote outside its own layout,
+    /// and the wrong one for a fork, whose reclaim paths would then delete the
+    /// source's object. Naming the registering catalog as the owner is rejected:
+    /// a row cannot reference itself, and such a row would never be reclaimed by
+    /// anyone.
     ///
     /// The delete row is inserted with the freshly assigned `data_file_id`, the
     /// commit's snapshot, and `delete`'s own path, relativity, sizes and count, none
