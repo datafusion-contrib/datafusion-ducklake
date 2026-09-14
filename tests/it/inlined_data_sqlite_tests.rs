@@ -1354,7 +1354,7 @@ async fn sqlite_uint64_filter_handles_mixed_legacy_and_padded_tables() {
     actual.sort_unstable();
     assert_eq!(actual, vec![i64::MAX as u64 + 1, u64::MAX]);
 
-    for (needle, expected) in [(42_u64, 42_u64), (7, 7)] {
+    for (needle, expected) in [(0_u64, 0_u64), (42, 42), (7, 7)] {
         let filtered = provider
             .scan_inlined_data(
                 result.table_id,
@@ -2266,6 +2266,67 @@ async fn row_lineage_scan_refuses_tables_with_inlined_rows() {
         .unwrap();
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_lineage_scan_refuses_only_when_pushed_filters_keep_inlined_rows() {
+    let t = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&t).await);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&options);
+    table_writer
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    // Twelve rows exceed the inlining limit and land in Parquet.
+    let ids = (100..112).collect::<Vec<_>>();
+    let vals = ids.iter().map(|id| id * 10).collect::<Vec<_>>();
+    table_writer
+        .append_table("main", "t", &[batch(ids, vals)])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&t)).await.unwrap();
+    let catalog = DuckLakeCatalog::new(provider)
+        .unwrap()
+        .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    // The pushed filter excludes every inlined row, so the Parquet-only
+    // rowid plan loses nothing and the scan succeeds.
+    let batches = ctx
+        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 100")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows = batches
+        .iter()
+        .flat_map(|b| {
+            let rowids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ids = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..b.num_rows()).map(move |i| (rowids.value(i), ids.value(i)))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows, vec![(2, 100)]);
+
+    // An inlined row still matches, so the scan keeps refusing.
+    let error = match ctx
+        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 2")
+        .await
+    {
+        Ok(df) => df.collect().await.expect_err("rowid scan must refuse"),
+        Err(e) => e,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("row-lineage (rowid) scan on a table with inlined rows is not supported"),
+        "{message}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

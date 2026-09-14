@@ -356,8 +356,10 @@ fn render_node(
                 })
                 .collect::<Option<Vec<_>>>();
             match rendered {
-                Some(rendered) => Some(format!("({})", rendered.join(" OR "))),
-                None => {
+                Some(rendered) if !rendered.is_empty() => {
+                    Some(format!("({})", rendered.join(" OR ")))
+                },
+                _ => {
                     binds.truncate(checkpoint);
                     None
                 },
@@ -386,11 +388,7 @@ fn render_node(
             if !physical_type_matches(dialect, data_type, physical_type) {
                 return None;
             }
-            let bind = if *data_type == DataType::UInt64 {
-                u64_sql_bind(value, dialect)?
-            } else {
-                sql_bind(value, data_type, dialect, op.is_range())?
-            };
+            let bind = sql_bind(value, data_type, dialect, op.is_range())?;
             let placeholder = placeholder(dialect, first_placeholder + binds.len());
             binds.push(bind);
             if *data_type == DataType::UInt64 {
@@ -476,14 +474,7 @@ fn sql_bind(
         (DataType::UInt8 | DataType::UInt16 | DataType::UInt32, InlinedValue::U64(value)) => {
             i64::try_from(*value).ok().map(InlinedSqlBind::I64)
         },
-        (DataType::UInt64, InlinedValue::U64(value)) => match dialect {
-            InlinedSqlDialect::Sqlite if range => Some(InlinedSqlBind::Text(value.to_string())),
-            InlinedSqlDialect::Sqlite => i64::try_from(*value).ok().map(InlinedSqlBind::I64),
-            InlinedSqlDialect::DuckDb => Some(InlinedSqlBind::U64(*value)),
-            InlinedSqlDialect::Postgres | InlinedSqlDialect::MySql => {
-                Some(InlinedSqlBind::Text(value.to_string()))
-            },
-        },
+        (DataType::UInt64, InlinedValue::U64(_)) => u64_sql_bind(value, dialect),
         (DataType::Float32 | DataType::Float64, InlinedValue::F64(value))
             if value.is_finite() && !(dialect == InlinedSqlDialect::MySql && range) =>
         {
@@ -865,6 +856,24 @@ mod tests {
         .unwrap();
         assert_eq!(rendered.sql, "\"id\" = ?");
         assert_eq!(rendered.binds, vec![InlinedSqlBind::I64(7)]);
+    }
+
+    #[test]
+    fn empty_conjunction_and_disjunction_render_nothing() {
+        let present = HashMap::from([("id".to_string(), "BIGINT".to_string())]);
+        for filter in [InlinedFilter::And(vec![]), InlinedFilter::Or(vec![])] {
+            assert!(
+                render_inlined_filter(
+                    &filter,
+                    InlinedSqlDialect::Sqlite,
+                    &render_schema(),
+                    &present,
+                    1,
+                )
+                .is_none(),
+                "{filter:?}"
+            );
+        }
     }
 
     #[test]
