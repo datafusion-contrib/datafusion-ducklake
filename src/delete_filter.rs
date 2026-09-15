@@ -84,18 +84,30 @@ impl DeleteFilterExec {
 }
 
 impl DeleteFilterExec {
-    /// How many of `deleted_positions` name a row this scan will actually emit.
+    /// How many of `deleted_positions` name a row of THIS file.
     ///
     /// NOT `deleted_positions.len()`. Execution drops a row only when that row's
-    /// own position is in the set, and it emits no row at or past `rows` (the
-    /// clamp in `filter_batch`). A position outside `0..rows` therefore removes
-    /// nothing, and subtracting it would publish a count BELOW what the scan
-    /// returns — `count(*)` is answered from that number, so the query would be
-    /// wrong rather than slow.
+    /// own position is in the set, so a position outside `0..rows` names no row
+    /// here and removes nothing. Subtracting it would publish a count below what
+    /// the scan returns, and `count(*)` is answered from that number, so the
+    /// query would be wrong rather than slow.
     ///
-    /// Such a position arises without any corruption: a delete file's
+    /// Such a position arises with no corruption at all: a delete file's
     /// `file_path` column is documentation this reader ignores, so one delete
     /// file referenced by several data files contributes the others' positions.
+    /// With a truthful `record_count` the file holds exactly `rows` rows, every
+    /// such position belongs to a different file, and `rows - in_range` is
+    /// exactly what the scan emits.
+    ///
+    /// With a CORRUPT `record_count`, `rows` is itself wrong and the published
+    /// count disagrees with the scan in whichever direction the corruption runs.
+    /// That is a deliberate trade, and upstream's: the alternative — clamping the
+    /// scan to the recorded count — makes the numbers agree by dropping rows,
+    /// and this filter also feeds the UPDATE source scan, where a dropped row is
+    /// rewritten out of existence rather than hidden.
+    ///
+    /// The subtraction at the call site needs no `checked_sub`: this counts only
+    /// positions strictly below `rows`, from a set, so it can never exceed them.
     fn deleted_in_range(&self, rows: usize) -> usize {
         self.deleted_positions
             .iter()

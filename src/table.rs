@@ -2677,12 +2677,23 @@ impl DuckLakeTable {
         if let Some(delete_file) = &table_file.delete_file {
             positions.extend(self.read_delete_file_positions(state, delete_file).await?);
         }
-        // Positions are NOT filtered here. A position past the file's recorded
-        // end is handled where official handles it — by clamping the data scan
-        // (`DeleteFilterExec`) — because dropping it instead would un-delete its
-        // row whenever `record_count` under-states the file, and would also
-        // empty the set and route the file to the plain-scan branch, skipping
-        // the clamp altogether.
+        // Positions are NOT filtered against the file's recorded `record_count`,
+        // for two reasons that point the same way.
+        //
+        // Dropping one would un-delete its row whenever `record_count`
+        // under-states the file — the position disappears, nothing matches the
+        // row, and a deleted row comes back. And dropping the only position
+        // empties the set, which routes the file to the plain-scan branch below,
+        // where no delete filtering happens at all.
+        //
+        // Official does not filter them either: its `SetMaxRowCount` clamp is
+        // unreachable, since `DuckLakeFileListEntry::max_row_count` is never
+        // assigned anywhere in its tree. It reads every physical row, applies
+        // deletes, and lets `count(*)` disagree with its own scan on a corrupt
+        // count.
+        //
+        // The statistics side handles the mismatch instead, without touching
+        // execution — see `DeleteFilterExec::deleted_in_range`.
         Ok(positions)
     }
 
