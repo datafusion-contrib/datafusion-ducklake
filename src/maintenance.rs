@@ -91,13 +91,18 @@ pub struct ScheduledFile {
     pub path: String,
     /// Whether `path` is relative to the catalog `data_path` root.
     pub path_is_relative: bool,
-    /// The catalog that owned this object when the row was scheduled, on the
-    /// multicatalog Postgres layout. Always the scheduling catalog itself — a
-    /// catalog only schedules what it owns — so its job is to mark the row as one
-    /// the ownership rule produced. `None` on every other backend, and on a
-    /// multicatalog row written before the rule existed, which
+    /// Whether the catalog that scheduled this row owned the object, on the
+    /// multicatalog Postgres layout. `Some(true)` on every row the ownership rule
+    /// produced — a catalog only ever schedules what it owns — so its job is to mark
+    /// the row's provenance, not to name a second party. `None` on every other
+    /// backend, and on a multicatalog row written before the rule existed, which
     /// [`cleanup_old_files_in_catalog`] therefore treats as unverified.
-    pub owner_catalog_id: Option<i64>,
+    ///
+    /// Deliberately NOT called `owner_catalog_id` like the column on
+    /// `ducklake_data_file`: there, a set value names ANOTHER catalog, and one name
+    /// carrying opposite meanings in two tables is what a later query copies across
+    /// and gets backwards.
+    pub scheduled_by_owner: Option<bool>,
 }
 
 /// Resolve scheduled rows against `data_path`, delete the objects (unless `dry_run`),
@@ -266,28 +271,39 @@ pub async fn cleanup_old_files_in_catalog(
 }
 
 /// Drop from `files` every scheduled row this catalog must not delete: one whose
-/// object an absolute-path row in some catalog still references (deferred, so the
-/// owner reclaims it once the last reference goes), and one whose object this catalog
-/// does not own at all (skipped and warned about, never deleted).
+/// object a reference row in some catalog still names (deferred, so the owner
+/// reclaims it once the last reference goes), and one whose object this catalog does
+/// not own at all (skipped and warned about, never deleted).
 ///
 /// Both comparisons are on canonical object-store keys, not raw strings — see
 /// [`canonical_key`] for why a raw comparison is unsafe here.
 ///
-/// The ownership guard is what makes this fail closed, and it applies only to rows
-/// whose provenance is unknown. A row this code scheduled carries
-/// `owner_catalog_id` — a catalog only ever schedules what it owns — so it is
-/// reclaimed on that record alone, which is what lets a catalog reclaim its own file
-/// written outside its layout (a [`crate::DuckLakeTableWriter::begin_write_to_path`]
-/// target). A row WITHOUT that marker predates the ownership rule and cannot be
-/// trusted: a build without the rule did schedule files it merely referenced, so a
-/// metadata database written by a mixed pair of versions can hold one naming a live
-/// file another catalog reads, with the reference row that would have protected it
-/// already gone. Deleting it would destroy that catalog's data. Such a row is
-/// therefore reclaimed only where a catalog's own files live — under its own
-/// `cat_{id}/` layout — and refused, with a warning, anywhere else.
-/// `path_is_relative` rows are exempt either way: they resolve through this catalog's
-/// own schema and table rows by construction, which is what a legacy pre-`cat_{id}`
-/// layout registers.
+/// Two guards make this fail closed, and the first holds unconditionally.
+///
+/// **An object inside another catalog's `cat_{id}/` layout is never reclaimed here**,
+/// however the row was scheduled and whenever. That catalog owns everything under its
+/// own prefix by construction, so a scheduled row of ours naming one is wrong whatever
+/// produced it. The check cannot be waived by the row's own claim of ownership,
+/// because the case that most needs catching is a row whose claim is the thing that is
+/// wrong: a reference registered while `path_is_relative = false` still meant
+/// "reference" reads as owned after the ownership column is added (every pre-existing
+/// row migrates to NULL), so this catalog's expire schedules the owner's live object
+/// and stamps it as its own to reclaim. Trusting that stamp deletes another catalog's
+/// data. A legacy pre-`cat_{id}` layout is unaffected: its files sit under no
+/// `cat_{id}/` prefix at all, so nothing matches.
+///
+/// **A row of unknown provenance is reclaimed only under this catalog's own layout.**
+/// A row this code scheduled carries `scheduled_by_owner` — a catalog only ever
+/// schedules what it owns — which is what lets a catalog reclaim its own file written
+/// outside its layout (a [`crate::DuckLakeTableWriter::begin_write_to_path`] target,
+/// which may sit outside `data_path` entirely). A row without that marker predates the
+/// ownership rule: a build without the rule did schedule files it merely referenced,
+/// so a metadata database written by a mixed pair of versions can hold one naming a
+/// live file another catalog reads, with the reference row that would have protected
+/// it already gone. Absolute rows like that are refused, with a warning, anywhere but
+/// this catalog's own prefix. Relative rows are exempt from this second guard only:
+/// they resolve through this catalog's own schema and table rows by construction,
+/// which is what a legacy pre-`cat_{id}` layout registers.
 #[cfg(feature = "write-postgres")]
 async fn retain_unreferenced(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -300,10 +316,26 @@ async fn retain_unreferenced(
         return Ok(files);
     }
     let (_, base_key) = parse_object_store_url(data_path)?;
-    let own_prefix = match mgr.find_catalog_id(catalog_name).await? {
+    let own_catalog_id = mgr.find_catalog_id(catalog_name).await?;
+    let own_prefix = match own_catalog_id {
         Some(id) => Some(canonical_key(&join_paths(&base_key, &format!("cat_{id}"))?)),
         None => None,
     };
+    // Every OTHER catalog's own-layout prefix, each resolved against ITS data_path
+    // rather than ours — nothing makes a referrer share its owner's root. A parse
+    // failure propagates rather than dropping that catalog from the set: losing a
+    // prefix here silently re-opens the delete this guard exists to refuse.
+    let mut foreign_prefixes: Vec<String> = Vec::new();
+    for (id, path) in mgr.list_catalog_data_paths().await? {
+        if Some(id) == own_catalog_id {
+            continue;
+        }
+        let (_, foreign_base) = parse_object_store_url(&path)?;
+        foreign_prefixes.push(canonical_key(&join_paths(
+            &foreign_base,
+            &format!("cat_{id}"),
+        )?));
+    }
 
     let mut resolved = Vec::with_capacity(files.len());
     for file in &files {
@@ -324,12 +356,23 @@ async fn retain_unreferenced(
 
     let mut kept = Vec::with_capacity(files.len());
     let mut deferred = Vec::new();
+    let under = |key: &str, prefix: &str| key == prefix || key.starts_with(&format!("{prefix}/"));
     for (file, abs) in files.into_iter().zip(resolved) {
         let key = canonical_key(&abs);
-        if file.owner_catalog_id.is_none()
+        if let Some(foreign) = foreign_prefixes.iter().find(|p| under(&key, p)) {
+            tracing::warn!(
+                catalog = catalog_name,
+                path = %abs,
+                owner_prefix = %foreign,
+                "refusing to reclaim a scheduled file inside another catalog's own \
+                 layout; that catalog owns it and is left to reclaim it"
+            );
+            continue;
+        }
+        if file.scheduled_by_owner != Some(true)
             && !file.path_is_relative
             && let Some(prefix) = &own_prefix
-            && !(key == *prefix || key.starts_with(&format!("{prefix}/")))
+            && !under(&key, prefix)
         {
             tracing::warn!(
                 catalog = catalog_name,

@@ -956,7 +956,7 @@ impl MulticatalogManager {
         let rows = match criteria {
             CleanupCriteria::All => {
                 sqlx::query(
-                    "SELECT data_file_id, path, path_is_relative, owner_catalog_id
+                    "SELECT data_file_id, path, path_is_relative, scheduled_by_owner
                  FROM ducklake_files_scheduled_for_deletion WHERE catalog_id = $1",
                 )
                 .bind(catalog_id)
@@ -965,7 +965,7 @@ impl MulticatalogManager {
             },
             CleanupCriteria::OlderThan(ts) => {
                 sqlx::query(
-                    "SELECT data_file_id, path, path_is_relative, owner_catalog_id
+                    "SELECT data_file_id, path, path_is_relative, scheduled_by_owner
                  FROM ducklake_files_scheduled_for_deletion
                  WHERE catalog_id = $1 AND schedule_start < $2::timestamptz",
                 )
@@ -981,7 +981,7 @@ impl MulticatalogManager {
                     data_file_id: r.try_get(0)?,
                     path: r.try_get(1)?,
                     path_is_relative: r.try_get(2)?,
-                    owner_catalog_id: r.try_get(3)?,
+                    scheduled_by_owner: r.try_get(3)?,
                 })
             })
             .collect()
@@ -1018,6 +1018,21 @@ impl MulticatalogManager {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Every catalog's `(catalog_id, data_path)`, for a caller that must reason about
+    /// where OTHER catalogs' own files live. Catalogs with no `data_path` configured
+    /// are omitted: nothing can be said about where their files sit.
+    pub(crate) async fn list_catalog_data_paths(&self) -> Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT catalog_id, data_path::TEXT FROM ducklake_catalog
+             WHERE data_path IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| Ok((r.try_get::<i64, _>(0)?, r.try_get::<String, _>(1)?)))
+            .collect()
     }
 
     /// Every path a `ducklake_data_file` or `ducklake_delete_file` row in ANY catalog
@@ -1183,14 +1198,15 @@ async fn schedule_pg_files(
         if !owned {
             continue;
         }
-        // `owner_catalog_id` is stamped with the scheduling catalog: this row is
-        // one the ownership rule produced, so cleanup need not fall back to the
-        // layout check it applies to rows written before the rule existed.
+        // `scheduled_by_owner` marks this row as one the ownership rule produced, so
+        // cleanup need not fall back to the layout check it applies to rows written
+        // before the rule existed. It never exempts a row from the check that refuses
+        // an object inside ANOTHER catalog's layout, which holds unconditionally.
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
                  (catalog_id, data_file_id, path, path_is_relative, schedule_start,
-                  owner_catalog_id)
-             VALUES ($1, $2, $3, $4, NOW(), $1)",
+                  scheduled_by_owner)
+             VALUES ($1, $2, $3, $4, NOW(), TRUE)",
         )
         .bind(catalog_id)
         .bind(id)

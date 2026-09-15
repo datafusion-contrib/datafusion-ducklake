@@ -952,7 +952,7 @@ impl SqliteMetadataWriter {
                         // Single-catalog layout: there is no other catalog for a
                         // file to belong to, so every scheduled row is this
                         // catalog's own.
-                        owner_catalog_id: None,
+                        scheduled_by_owner: None,
                     })
                 })
                 .collect()

@@ -64,11 +64,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BREAKING** (multicatalog Postgres only): a `ducklake_data_file` / `ducklake_delete_file`
-  row whose new `owner_catalog_id` is set references a file that catalog owns, so expire,
-  compaction and the orphan sweep never reclaim it and the owner defers its own reclaim while
-  it stands (#309, #310). Migration is additive and automatic on the next boot: existing rows
-  become NULL (owned) and two partial indexes build with a plain `CREATE INDEX`.
+- **BREAKING** (multicatalog Postgres only): a data/delete file row with `owner_catalog_id` set
+  references a file that catalog owns, so no reclaim path touches it (#309, #310). The next boot
+  migrates additively: existing rows become NULL, i.e. owned.
+- **BREAKING**: `ScheduledFile`, `DataFileInfo` and `DeleteFileInfo` each gain a public field, so
+  a struct literal over them no longer compiles; use the `new()` constructors and builders (#310).
+- The multicatalog orphan sweep's cross-catalog arm now collects reference rows rather than every
+  absolutely-spelled row; a catalog writing its own file into another catalog's `data_path` is
+  unprotected, as it was before #309 (#310).
 
 - Keep data inlining disabled by default; set `data_inlining_row_limit` to a
   positive threshold to opt in (#272).

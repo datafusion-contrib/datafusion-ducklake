@@ -538,19 +538,21 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     // catalogs apart — the data-file rows it would otherwise join against are
     // already deleted by the time the file is scheduled.
     //
-    // `owner_catalog_id` records that the scheduling catalog owned the object, so
-    // cleanup can tell a row written under the ownership rule from one written
-    // before it. It equals `catalog_id` on every row inserted here — a catalog only
-    // ever schedules what it owns — and is NULL exactly on rows predating the rule,
-    // which may name another catalog's live file and are therefore held to the
-    // stricter layout check in `retain_unreferenced`.
+    // `scheduled_by_owner` records that the scheduling catalog owned the object, so
+    // cleanup can tell a row written under the ownership rule from one written before
+    // it. TRUE on every row inserted here — a catalog only ever schedules what it owns
+    // — and NULL exactly on rows predating the rule, which may name another catalog's
+    // live file and are therefore held to the stricter layout check in
+    // `retain_unreferenced`. It is a boolean, not an `owner_catalog_id` like the file
+    // tables carry: there a set value names ANOTHER catalog, and reusing the name for
+    // the opposite polarity invites a query that gets it backwards.
     r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
         catalog_id BIGINT NOT NULL,
         data_file_id BIGINT NOT NULL,
         path VARCHAR NOT NULL,
         path_is_relative BOOLEAN NOT NULL DEFAULT TRUE,
         schedule_start TIMESTAMPTZ DEFAULT NOW(),
-        owner_catalog_id BIGINT
+        scheduled_by_owner BOOLEAN
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
         ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
@@ -662,7 +664,7 @@ pub(crate) async fn migrate_file_ownership_column(pool: &PgPool) -> Result<()> {
         "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS owner_catalog_id BIGINT",
         "ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS owner_catalog_id BIGINT",
         "ALTER TABLE ducklake_files_scheduled_for_deletion
-         ADD COLUMN IF NOT EXISTS owner_catalog_id BIGINT",
+         ADD COLUMN IF NOT EXISTS scheduled_by_owner BOOLEAN",
         // Cleanup asks "does any catalog still reference this object", answered by a
         // scan of the reference rows. These partial indexes keep that set — bounded
         // by how many cross-catalog references exist, not by the size of the file
@@ -1225,8 +1227,8 @@ async fn schedule_compaction_files(
         sqlx::query(
             "INSERT INTO ducklake_files_scheduled_for_deletion
                  (catalog_id, data_file_id, path, path_is_relative, schedule_start,
-                  owner_catalog_id)
-             VALUES ($1, $2, $3, $4, NOW(), $1)",
+                  scheduled_by_owner)
+             VALUES ($1, $2, $3, $4, NOW(), TRUE)",
         )
         .bind(catalog_id)
         .bind(id)
@@ -3980,19 +3982,45 @@ impl MetadataWriter for PostgresMetadataWriter {
                 catalog_column_count
             )));
         }
-        // A reference names the catalog that OWNS the object. Naming this one is a
-        // contradiction — and a silent leak: the row would be a reference nobody
-        // schedules, while the owner cleanup that would have reclaimed it is this
-        // very catalog, holding itself back for as long as its own row stands.
-        for owner in [file.owner_catalog_id, delete.and_then(|d| d.owner_catalog_id)]
-            .into_iter()
-            .flatten()
-        {
+        // Both ways of getting ownership wrong are refused here, where the caller can
+        // still fix them.
+        //
+        // Naming THIS catalog as owner is a contradiction, and a silent leak: the row
+        // would be a reference nobody schedules, while the owner cleanup that would
+        // have reclaimed it is this very catalog, holding itself back for as long as
+        // its own row stands.
+        //
+        // A reference with a RELATIVE path is worse — it deletes rather than leaks.
+        // `all_reference_paths` hands cleanup the stored path verbatim, which the
+        // owner then compares against its own fully-resolved key; a relative spelling
+        // can never match, so the owner's cleanup is not deferred and reclaims the
+        // object while this row still names it. (The row does not even read back
+        // correctly here: a relative path resolves through THIS catalog's schema and
+        // table rows, not the owner's.)
+        for (kind, owner, is_relative) in [
+            ("file", file.owner_catalog_id, file.path_is_relative),
+            (
+                "delete file",
+                delete.and_then(|d| d.owner_catalog_id),
+                delete.is_some_and(|d| d.path_is_relative),
+            ),
+        ] {
+            let Some(owner) = owner else {
+                continue;
+            };
             if owner == self.catalog_id {
                 return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "register_existing_data_file: owner_catalog_id {owner} is this catalog; a \
-                     row that references its own catalog's file is never reclaimed by anyone. \
-                     Leave it unset for a file this catalog owns."
+                    "register_existing_data_file: {kind} owner_catalog_id {owner} is this \
+                     catalog; a row that references its own catalog's file is never reclaimed \
+                     by anyone. Leave it unset for a file this catalog owns."
+                )));
+            }
+            if is_relative {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "register_existing_data_file: {kind} references catalog {owner} but its \
+                     path is relative, so it resolves through this catalog's layout and never \
+                     matches the object the owner's cleanup defers against. Mark it absolute \
+                     with `with_absolute_path()`."
                 )));
             }
         }
