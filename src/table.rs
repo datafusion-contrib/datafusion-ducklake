@@ -418,6 +418,75 @@ fn file_row_count(
     }
 }
 
+/// This file's live row count taken from `record_count` alone, for the scan
+/// SUMMARY rather than for pruning.
+///
+/// Deliberately does NOT fall back to a column's `value_count` the way
+/// [`file_row_count`] does. `value_count` is the count of NON-NULL values
+/// (official: "value_count should be the count of non-null values"), so on a
+/// nullable column it is smaller than the row count. As a pruning estimate that
+/// is harmless; published as a scan's `num_rows` it becomes the answer to
+/// `count(*)`, and a table whose files omit `record_count` would report fewer
+/// rows than it holds. Absent beats wrong: the aggregate then reads the data.
+///
+/// DELETE-FREE FILES ONLY. A file carrying deletes reports `Absent`, because
+/// `record_count` alone over-reports it.
+///
+/// Do not "improve" this into a general count by subtracting `delete_count`:
+/// rows removed by an INLINED delete leave `delete_file` and `delete_count`
+/// both NULL, so such a file would report its gross count and `count(*)` would
+/// over-report by exactly the rows that were deleted. Any future with-deletes
+/// summary (see the `count(*)`-after-DELETE convergence issue) must take the
+/// inlined-delete map, not just this row.
+///
+/// Only the delete-free scan path consumes this today, so the restriction costs
+/// nothing: files with deletes are planned by a different exec.
+fn file_summary_row_count(file: &DuckLakeTableFile) -> Precision<usize> {
+    if file.delete_file.is_some() || file.delete_count.is_some_and(|count| count > 0) {
+        return Precision::Absent;
+    }
+    file.max_row_count
+        .and_then(|value| statistic_usize(value, "record_count"))
+        .map(Precision::Exact)
+        .unwrap_or(Precision::Absent)
+}
+
+/// Whether a catalog bound on this type may be a widened approximation rather
+/// than the value actually present in the file.
+///
+/// The DuckLake spec requires `min_value`/`max_value` only to bound the column,
+/// not to equal its extremes, and writers exercise that latitude: a parquet
+/// writer truncates a long BYTE_ARRAY bound to a prefix and rounds it outward,
+/// and `ducklake_add_data_files` ingests those footers verbatim. Answering
+/// `max(v)` from such a bound returns a string the table does not contain.
+///
+/// Official refuses string MIN/MAX from statistics for exactly this reason (its
+/// `min_max_optimization_basic` test says so in as many words), so the bounds
+/// are usable for PRUNING — where a widened bound is safe — and never for the
+/// answer. Numeric and temporal bounds are stored whole and stay usable, including
+/// the fixed-length ones: parquet explicitly refuses to truncate `Decimal` and
+/// `Float16` statistics because their sort order is not the byte-array sort order.
+///
+/// This is a TYPE ALLOWLIST standing in for a property the catalog does not
+/// record. Parquet carries `is_min_value_exact` / `is_max_value_exact` flags for
+/// exactly this question; DuckLake has no column for them, and `add_data_files`
+/// ingests footer bounds without them. So the list has to be re-checked whenever
+/// the type map in `types.rs` grows a new mapping onto a variable-length physical
+/// type — a new type that lands on `Utf8View`/`BinaryView` is covered, one that
+/// invents its own is not.
+fn bound_may_be_widened(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
 /// Whether the catalog *proves* this file holds no rows.
 ///
 /// A file with no rows cannot hold a row matching any predicate, so it is safe to
@@ -747,6 +816,16 @@ pub fn delete_file_schema() -> SchemaRef {
             .with_metadata(parquet_field_id_metadata(DELETE_POS_FIELD_ID)),
     ]))
 }
+
+/// One catalog metadata page, resolved: its files, the per-file statistics that
+/// drive PRUNING (partition-derived bounds folded in), and the narrower per-file
+/// statistics that may be published as a scan SUMMARY. See
+/// [`DuckLakeTable::page_files_with_both_statistics`] for why the last two differ.
+type PagedFileStatistics = (
+    Vec<DuckLakeTableFile>,
+    HashMap<i64, Arc<Statistics>>,
+    HashMap<i64, Arc<Statistics>>,
+);
 
 /// Cached schema mapping for renamed and path-derived columns.
 type SchemaMapping = (
@@ -1786,6 +1865,55 @@ impl DuckLakeTable {
         &self,
         metadata: Vec<DuckLakeFileMetadata>,
     ) -> (Vec<DuckLakeTableFile>, HashMap<i64, Arc<Statistics>>) {
+        // Summary statistics are deliberately NOT built here. This is the
+        // keyed-mutation path (`files_matching`), which pages over the whole
+        // table; `summary_statistics_from` deep-clones every file's
+        // `ColumnStatistics` including each `ScalarValue` bound, so building a
+        // map this caller drops immediately would cost one wasted clone per file
+        // per mutation.
+        let (table_files, pruning, _) = self.page_files_resolved(metadata, false);
+        (table_files, pruning)
+    }
+
+    /// As [`Self::page_files_with_statistics`], and additionally the per-file
+    /// statistics that may be published as the SCAN SUMMARY.
+    ///
+    /// Two maps rather than one because `Precision` carries two meanings here
+    /// that do not coincide. For pruning, `Exact` means "act on this bound"; a
+    /// widened bound is still sound because pruning only ever drops a file that
+    /// provably cannot match. For the summary, `Exact` means "this IS the
+    /// answer", and `AggregateStatistics` returns it verbatim. Bounds that are
+    /// safe to prune on are therefore not all safe to answer from, and the
+    /// summary map drops the ones that are not:
+    ///
+    /// - **partition-derived bounds** are omitted, because the summary is built
+    ///   before [`Self::apply_partition_bounds`] runs. Official never derives a
+    ///   column bound from a partition value, and a bound synthesised from
+    ///   whatever a writer stamped into `ducklake_file_partition_value` has no
+    ///   business answering `max(col)`.
+    /// - **bounds on types a writer may widen** are dropped — see
+    ///   [`bound_may_be_widened`].
+    /// - **every bound on a file carrying deletes** is dropped, because the
+    ///   catalog's bounds are never tightened when rows are removed, so the
+    ///   extreme may name a row that is gone. This mirrors official's
+    ///   `min_max_exact` gate.
+    /// - **`num_rows`** comes from [`file_summary_row_count`], which subtracts
+    ///   deletes and refuses the `value_count` fallback, so it stays exact
+    ///   through a DELETE exactly as official's `count(*)` does.
+    fn page_files_with_both_statistics(
+        &self,
+        metadata: Vec<DuckLakeFileMetadata>,
+    ) -> PagedFileStatistics {
+        self.page_files_resolved(metadata, true)
+    }
+
+    /// Shared body of the two page resolvers; `want_summary` decides whether the
+    /// (cloning) summary map is built at all.
+    fn page_files_resolved(
+        &self,
+        metadata: Vec<DuckLakeFileMetadata>,
+        want_summary: bool,
+    ) -> PagedFileStatistics {
         let mut catalog_file_statistics = Vec::new();
         let mut table_files = Vec::with_capacity(metadata.len());
         for DuckLakeFileMetadata {
@@ -1807,10 +1935,49 @@ impl DuckLakeTable {
             false,
             true,
         );
+        // Derived from the PRISTINE per-file statistics, before partition bounds
+        // are folded in below.
+        let summary_statistics = if want_summary {
+            self.summary_statistics_from(&table_files, &file_statistics)
+        } else {
+            HashMap::new()
+        };
         // Synthesize per-file bounds from partition values so partition columns
         // prune even when a file carries no parquet-derived column statistics.
         self.apply_partition_bounds(&table_files, &mut file_statistics);
-        (table_files, file_statistics)
+        (table_files, file_statistics, summary_statistics)
+    }
+
+    /// Narrow the pruning statistics of each file to what may be published as a
+    /// scan summary. See [`Self::page_files_with_both_statistics`] for why the
+    /// two differ.
+    fn summary_statistics_from(
+        &self,
+        table_files: &[DuckLakeTableFile],
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> HashMap<i64, Arc<Statistics>> {
+        let mut summary = HashMap::with_capacity(table_files.len());
+        for file in table_files {
+            let Some(pruning) = file_statistics.get(&file.data_file_id) else {
+                continue;
+            };
+            let mut statistics = pruning.as_ref().clone();
+            statistics.num_rows = file_summary_row_count(file);
+            let has_deletes = file.delete_file.is_some();
+            for (index, column) in statistics.column_statistics.iter_mut().enumerate() {
+                let widened = self
+                    .physical_schema
+                    .fields()
+                    .get(index)
+                    .is_none_or(|field| bound_may_be_widened(field.data_type()));
+                if has_deletes || widened {
+                    column.min_value = Precision::Absent;
+                    column.max_value = Precision::Absent;
+                }
+            }
+            summary.insert(file.data_file_id, Arc::new(statistics));
+        }
+        summary
     }
 
     /// Inject partition-derived min/max bounds into per-file statistics so the
@@ -2537,6 +2704,117 @@ impl DuckLakeTable {
         Ok(cfg.embedded_rowid_parquet_name.is_some())
     }
 
+    /// Roll one scan group's per-file catalog statistics up into the group- and
+    /// scan-level [`Statistics`] DataFusion's cost-based rules read.
+    ///
+    /// Without this a scan reports [`Statistics::new_unknown`], because
+    /// `FileScanConfigBuilder` defaults to it and nothing here overrode it. The
+    /// per-file statistics were already attached (`partitioned_data_file`), so
+    /// pruning and row-group filtering always worked; what was missing is the
+    /// summary, and `AggregateStatistics` reads only the summary. The visible
+    /// cost was that an unfiltered `count(*)` / `min(col)` / `max(col)` read the
+    /// data to recompute numbers the catalog already records — on a 1.4-billion-row
+    /// table, two minutes to return one row.
+    ///
+    /// Official DuckLake answers the same aggregates from its catalog
+    /// (`DuckLakeGetPartitionStats` publishes an exact row count, and exact column
+    /// bounds when no row has ever been deleted), so this converges on it rather
+    /// than adding behaviour of our own.
+    ///
+    /// The inputs are the SUMMARY statistics from
+    /// [`Self::page_files_with_both_statistics`], never the pruning ones. That
+    /// distinction is the whole safety argument: the summary map has already
+    /// dropped partition-derived bounds, bounds on types a writer may widen, and
+    /// every bound on a file carrying deletes, so whatever remains `Exact` here
+    /// is a value the table actually holds.
+    ///
+    /// A *filtered* scan needs no special handling. `supports_filters_pushdown`
+    /// declares our filters `Inexact`, so DataFusion keeps a `FilterExec` above
+    /// the scan and the aggregate never sees the scan node directly. That coupling
+    /// is load-bearing and not obvious: `AggregateStatistics` runs BEFORE
+    /// `FilterPushdown` in DataFusion's pipeline, so `FileScanConfig`'s own
+    /// filter-downgrade has not happened yet when the fold is decided, and the
+    /// published count is post-prune but pre-filter. Declaring any filter class
+    /// `Exact` would remove that `FilterExec` and let a filtered `count(*)` fold
+    /// to the unfiltered count.
+    ///
+    /// One place we are deliberately AHEAD of official: official gates MIN/MAX on
+    /// a table-wide accumulated `record_count == net_count`, so a TRUNCATE,
+    /// overwrite or compaction disables its fold permanently. We compute from the
+    /// live file set instead, so we keep folding after those — and correctly,
+    /// because our bounds come from the visible files rather than from a global
+    /// high-water mark that is never tightened.
+    ///
+    /// Returns `None` — leaving the scan reporting unknown statistics, exactly as
+    /// it did before this existed — when the rollup cannot be trusted:
+    ///
+    /// - statistics collection is switched off;
+    /// - any file's `num_rows` is not `Exact`. Merging a group where one file's
+    ///   count is unknown would publish a total lower than the scan returns, and
+    ///   `count(*)` would be answered with it. `Precision::Absent` does propagate
+    ///   through the merge, so this is belt-and-braces rather than the only
+    ///   defence — but it is checked explicitly because a wrong count is the worst
+    ///   failure this code can produce.
+    ///
+    /// When this group's read schema is not IDENTICAL to the table's physical
+    /// schema, the row count is still published and every column bound is
+    /// suppressed — see the comment at the publish site. Bounds are positional
+    /// against the physical schema; the count is not.
+    fn roll_up_scan_statistics(
+        &self,
+        state: &dyn Session,
+        file_group: FileGroup,
+        read_schema: &SchemaRef,
+        summary_statistics: &[Arc<Statistics>],
+    ) -> (FileGroup, Option<Statistics>) {
+        if !state.config_options().execution.collect_statistics {
+            return (file_group, None);
+        }
+        if summary_statistics.is_empty() || summary_statistics.len() != file_group.len() {
+            return (file_group, None);
+        }
+        if summary_statistics
+            .iter()
+            .any(|statistics| !matches!(statistics.num_rows, Precision::Exact(_)))
+        {
+            return (file_group, None);
+        }
+        let merged = Statistics::try_merge_iter(
+            summary_statistics.iter().map(Arc::as_ref),
+            self.physical_schema.as_ref(),
+        );
+        match merged {
+            Ok(summary) => {
+                // `num_rows` comes from `record_count` and has no relationship to
+                // column positions, so it survives a schema this scan reads under a
+                // different shape (a nested child field rebuilt by the read-schema
+                // mapping is enough to make the two unequal). The BOUNDS do not:
+                // they are positional against the table's physical schema. So when
+                // the schemas are not identical, publish the count and suppress
+                // every bound rather than publishing nothing — otherwise a table
+                // with one struct or list column loses the `count(*)` fold it had
+                // every right to.
+                let summary = if read_schema.as_ref() == self.physical_schema.as_ref() {
+                    summary
+                } else {
+                    let mut unknown = Statistics::new_unknown(read_schema);
+                    unknown.num_rows = summary.num_rows;
+                    unknown.total_byte_size = summary.total_byte_size;
+                    unknown
+                };
+                let file_group = file_group.with_statistics(Arc::new(summary.clone()));
+                (file_group, Some(summary))
+            },
+            // A merge failure is never a reason to fail the scan: unknown statistics
+            // are what this path produced before, and they cost optimisation only,
+            // never correctness.
+            Err(error) => {
+                tracing::debug!(%error, "skipping scan statistics rollup");
+                (file_group, None)
+            },
+        }
+    }
+
     /// Build a single execution plan for all files without delete files
     ///
     /// Groups multiple files into a single efficient execution plan since they don't
@@ -2546,6 +2824,7 @@ impl DuckLakeTable {
         state: &dyn Session,
         files: &[&DuckLakeTableFile],
         file_statistics: &HashMap<i64, Arc<Statistics>>,
+        summary_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -2554,7 +2833,8 @@ impl DuckLakeTable {
         // schema must be resolved PER FILE. Group files that share the same
         // physical schema into one ParquetSource and union the groups; the common
         // case (no schema evolution) stays a single group / single scan.
-        let mut groups: Vec<(SchemaMapping, Vec<PartitionedFile>)> = Vec::new();
+        let mut groups: Vec<(SchemaMapping, Vec<PartitionedFile>, Vec<Arc<Statistics>>)> =
+            Vec::new();
         let mut group_index: HashMap<String, usize> = HashMap::new();
 
         for table_file in files {
@@ -2587,11 +2867,20 @@ impl DuckLakeTable {
                 key.push('\u{6}');
             }
 
+            // Kept positionally alongside the group's files so the rollup can
+            // refuse a group where any file lacks a summary, rather than
+            // silently merging a subset.
+            let summary = summary_statistics.get(&table_file.data_file_id).cloned();
             match group_index.get(&key) {
-                Some(&gi) => groups[gi].1.push(pf),
+                Some(&gi) => {
+                    groups[gi].1.push(pf);
+                    if let Some(summary) = summary {
+                        groups[gi].2.push(summary);
+                    }
+                },
                 None => {
                     group_index.insert(key, groups.len());
-                    groups.push((mapping, vec![pf]));
+                    groups.push((mapping, vec![pf], summary.into_iter().collect()));
                 },
             }
         }
@@ -2609,13 +2898,22 @@ impl DuckLakeTable {
         // Build one scan per physical-schema group; ColumnRenameExec coerces each
         // group to the catalog schema (renamed columns or a differing Arrow type).
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
-        for ((read_schema, name_mapping, constants), partitioned_files) in groups {
+        for ((read_schema, name_mapping, constants), partitioned_files, group_summary) in groups {
+            let (file_group, summary) = self.roll_up_scan_statistics(
+                state,
+                FileGroup::new(partitioned_files),
+                &read_schema,
+                &group_summary,
+            );
             let mut builder = self
                 .scan_config_builder(Arc::new(
                     self.create_parquet_source(state, read_schema.clone())?,
                 ))
                 .with_limit(limit)
-                .with_file_group(FileGroup::new(partitioned_files));
+                .with_file_group(file_group);
+            if let Some(summary) = summary {
+                builder = builder.with_statistics(summary);
+            }
 
             if let Some(proj) = projection {
                 builder = builder.with_projection_indices(Some(proj.clone()))?;
@@ -3969,6 +4267,12 @@ impl TableProvider for DuckLakeTable {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        // Inexact here is ALSO what keeps a filtered `count(*)` correct: it is the
+        // retained `FilterExec` that stops `AggregateStatistics` folding the scan's
+        // published (post-prune, pre-filter) row count into the answer. That rule
+        // runs before `FilterPushdown`, so nothing downstream would catch it.
+        // Before declaring any filter class Exact, read `roll_up_scan_statistics`.
+        //
         // Mark all filters as Inexact because we apply delete filters after the scan.
         // DataFusion will reapply these filters after DeleteFilterExec to ensure
         // correctness, but Parquet can still use them for:
@@ -4058,7 +4362,8 @@ impl TableProvider for DuckLakeTable {
             },
         };
         for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
-            let (table_files, file_statistics) = self.page_files_with_statistics(metadata?);
+            let (table_files, file_statistics, summary_statistics) =
+                self.page_files_with_both_statistics(metadata?);
             #[cfg(feature = "encryption")]
             self.configure_encryption_factory(&table_files)?;
 
@@ -4113,6 +4418,7 @@ impl TableProvider for DuckLakeTable {
                         state,
                         &files_without_deletes,
                         &file_statistics,
+                        &summary_statistics,
                         projection,
                         limit,
                     )
