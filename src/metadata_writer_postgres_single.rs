@@ -1488,12 +1488,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // finalize_snapshot); ON CONFLICT DO NOTHING is a no-op if it exists.
             seed_table_stats(&mut tx, table_id).await?;
 
-            let row_id_start: i64 =
+            let next_row_id: i64 =
                 sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
             let data_file_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_data_file
@@ -1507,7 +1508,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?
@@ -1523,10 +1524,11 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + $1,
-                     record_count    = record_count + $1,
-                     file_size_bytes = file_size_bytes + $2
-                 WHERE table_id = $3",
+                     record_count    = record_count + $2,
+                     file_size_bytes = file_size_bytes + $3
+                 WHERE table_id = $4",
             )
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)
@@ -1634,9 +1636,11 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
             for file in files {
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let data_file_id: i64 = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
@@ -1649,7 +1653,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
-                .bind(next_row_id)
+                .bind(row_ids.stored)
                 .bind(snapshot_id)
                 .fetch_one(&mut *tx)
                 .await?
@@ -1657,7 +1661,8 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                next_row_id += file.record_count;
+                next_row_id += row_ids.advance;
+                total_advance += row_ids.advance;
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
@@ -1665,10 +1670,11 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + $1,
-                     record_count    = record_count + $1,
-                     file_size_bytes = file_size_bytes + $2
-                 WHERE table_id = $3",
+                     record_count    = record_count + $2,
+                     file_size_bytes = file_size_bytes + $3
+                 WHERE table_id = $4",
             )
+            .bind(total_advance)
             .bind(total_records)
             .bind(total_bytes)
             .bind(table_id)

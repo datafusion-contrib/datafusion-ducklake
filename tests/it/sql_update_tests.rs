@@ -222,6 +222,66 @@ async fn live_data_file_count(temp_dir: &TempDir) -> i64 {
         .unwrap()
 }
 
+/// `row_id_start` of every live data file, in `data_file_id` order.
+async fn live_row_id_starts(temp_dir: &TempDir) -> Vec<Option<i64>> {
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}", db_path.display());
+    let pool = SqlitePool::connect(&conn_str).await.unwrap();
+    sqlx::query_scalar(
+        "SELECT row_id_start FROM ducklake_data_file
+         WHERE end_snapshot IS NULL ORDER BY data_file_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+}
+
+/// `ducklake_table_stats.next_row_id`.
+async fn next_row_id(temp_dir: &TempDir) -> i64 {
+    let db_path = temp_dir.path().join("test.db");
+    let conn_str = format!("sqlite:{}", db_path.display());
+    let pool = SqlitePool::connect(&conn_str).await.unwrap();
+    sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+}
+
+/// An `UPDATE` output gets a fresh `row_id_start` and advances `next_row_id`,
+/// matching official DuckLake: `GetNewDataFile` assigns the counter to every new
+/// data file, and `DuckLakeTableStats::MergeFileStats` advances it.
+///
+/// The recorded range is not what serves reads. The output also carries each
+/// row's original rowid inline, and the reader takes those, so the rows below
+/// keep ids 0..2 while the catalog claims the file starts at 3. Recording NULL
+/// instead would describe the file more honestly but would diverge from official
+/// with nothing forcing it, so this pins the upstream answer. See #315.
+#[tokio::test(flavor = "multi_thread")]
+async fn update_output_records_a_fresh_range_like_official() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_table(&temp_dir, vec![1, 2, 3], vec![10, 20, 30]).await;
+    assert_eq!(live_row_id_starts(&temp_dir).await, vec![Some(0)]);
+    assert_eq!(next_row_id(&temp_dir).await, 3);
+
+    let ctx = writable_ctx(&temp_dir).await;
+    let updated = run_dml_count(
+        &ctx,
+        "UPDATE ducklake.main.t SET val = val + 1 WHERE id <= 2",
+    )
+    .await;
+    assert_eq!(updated, 2);
+
+    // The source file stays live, masked by a positional delete; the rewrite
+    // output is the second row.
+    assert_eq!(live_row_id_starts(&temp_dir).await, vec![Some(0), Some(3)]);
+    assert_eq!(next_row_id(&temp_dir).await, 5);
+
+    // Lineage still comes from the embedded column, not from that range.
+    let mut rows = read_rowid_rows(&temp_dir).await;
+    rows.sort_by_key(|(_, id, _)| *id);
+    assert_eq!(rows, vec![(0, 1, 11), (1, 2, 21), (2, 3, 30)]);
+}
+
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]

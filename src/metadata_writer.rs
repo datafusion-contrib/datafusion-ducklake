@@ -718,6 +718,27 @@ pub struct ColumnStat {
     pub column_size_bytes: Option<i64>,
 }
 
+/// How a committed file's `ducklake_data_file.row_id_start` is decided.
+///
+/// A file's rowids come either from a catalog range (`row_id_start + position`,
+/// what an INSERT records) or from an embedded parquet column tagged with
+/// [`ROW_ID_PARQUET_FIELD_ID`](crate::row_id::ROW_ID_PARQUET_FIELD_ID), which
+/// records `row_id_start = NULL`. The read path picks from the parquet footer
+/// alone, so a range on an embedded-rowid file is never read back, and misleads
+/// anything that resolves a rowid through catalog ranges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowIdStart {
+    /// Fresh range off `next_row_id`, advancing it by `record_count`.
+    #[default]
+    Assign,
+    /// SQL `NULL`: the file carries its own rowids, so nothing is minted.
+    Embedded,
+    /// Store this value as-is, adopted from the catalog the file came from.
+    /// Carries the SOURCE's id space — see the precondition on
+    /// [`DataFileInfo::with_source_row_id_start`].
+    Preserved(i64),
+}
+
 /// Information about a data file to register in the catalog.
 ///
 /// This struct contains the metadata needed to register a Parquet file in the DuckLake catalog.
@@ -765,6 +786,13 @@ pub struct DataFileInfo {
     ///
     /// [`DuckLakeTableWriter::begin_write_to_path`]: crate::DuckLakeTableWriter::begin_write_to_path
     pub owner_catalog_id: Option<i64>,
+    /// How this file's `row_id_start` is decided at commit.
+    pub row_id_start: RowIdStart,
+    /// Raise the destination's `next_row_id` to at least this before the range is
+    /// drawn, as a max so the allocator stays monotonic. Needed with
+    /// [`RowIdStart::Embedded`]/[`RowIdStart::Preserved`], whose real ids the row
+    /// count does not reveal: pass the source table's `next_row_id`.
+    pub row_id_floor: Option<i64>,
 }
 
 impl DataFileInfo {
@@ -791,6 +819,8 @@ impl DataFileInfo {
             partition_id: None,
             partition_values: Vec::new(),
             owner_catalog_id: None,
+            row_id_start: RowIdStart::Assign,
+            row_id_floor: None,
         }
     }
 
@@ -844,6 +874,85 @@ impl DataFileInfo {
     pub fn with_owner_catalog(mut self, owner_catalog_id: i64) -> Self {
         self.owner_catalog_id = Some(owner_catalog_id);
         self
+    }
+
+    /// Record `row_id_start = NULL`: the file carries its own rowids.
+    pub fn with_embedded_row_ids(mut self) -> Self {
+        self.row_id_start = RowIdStart::Embedded;
+        self
+    }
+
+    /// Carry the source catalog's `row_id_start` over verbatim: `None` (the
+    /// source stored SQL `NULL`) maps to [`RowIdStart::Embedded`], `Some(start)`
+    /// to [`RowIdStart::Preserved`].
+    ///
+    /// # Precondition
+    ///
+    /// A carried range belongs to the source's id space, and nothing here can
+    /// check it against the destination's: carrying `Some(1)` for a 5-row file
+    /// into a table whose allocator is at 3 claims `[1, 6)` over an already
+    /// issued `[0, 3)`. Use it only when every file of the destination table
+    /// comes from the one source (a fork), and pass the source's `next_row_id`
+    /// to [`with_row_id_floor`](Self::with_row_id_floor). Not enforced: the only
+    /// available check, `start >= next_row_id`, would reject a fork registering
+    /// the source's files in any order but ascending.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a negative `start`.
+    pub fn with_source_row_id_start(mut self, start: Option<i64>) -> Self {
+        self.row_id_start = match start {
+            None => RowIdStart::Embedded,
+            Some(start) => {
+                assert!(start >= 0, "row_id_start must be non-negative, got {start}");
+                RowIdStart::Preserved(start)
+            },
+        };
+        self
+    }
+
+    /// See [`row_id_floor`](Self::row_id_floor).
+    ///
+    /// # Panics
+    ///
+    /// Panics on a negative `floor`.
+    pub fn with_row_id_floor(mut self, floor: i64) -> Self {
+        assert!(floor >= 0, "row_id_floor must be non-negative, got {floor}");
+        self.row_id_floor = Some(floor);
+        self
+    }
+}
+
+/// Resolved by [`allocate_row_id_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowIdAllocation {
+    /// Value to bind for `ducklake_data_file.row_id_start` (`None` == SQL NULL).
+    pub(crate) stored: Option<i64>,
+    /// How far `ducklake_table_stats.next_row_id` moves. Never negative.
+    pub(crate) advance: i64,
+}
+
+/// Resolve `file`'s `row_id_start` and allocator advance against `next_row_id`.
+/// Every commit path that inserts a `ducklake_data_file` row goes through this,
+/// so the policy means the same thing on every backend.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn allocate_row_id_start(next_row_id: i64, file: &DataFileInfo) -> RowIdAllocation {
+    let base = next_row_id.max(file.row_id_floor.unwrap_or(i64::MIN));
+    let advance_to = |target: i64| target.saturating_sub(next_row_id).max(0);
+    match file.row_id_start {
+        RowIdStart::Assign => RowIdAllocation {
+            stored: Some(base),
+            advance: advance_to(base.saturating_add(file.record_count)),
+        },
+        RowIdStart::Embedded => RowIdAllocation {
+            stored: None,
+            advance: advance_to(base),
+        },
+        // Push the allocator past the adopted range's end, not just the floor.
+        RowIdStart::Preserved(start) => RowIdAllocation {
+            stored: Some(start),
+            advance: advance_to(base.max(start.saturating_add(file.record_count))),
+        },
     }
 }
 
@@ -2270,9 +2379,16 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// `column_ids` must be non-empty and 1:1 with the recursive catalog nodes
     /// flattened from `columns`, in depth-first preorder. A mismatch is rejected
-    /// with [`crate::DuckLakeError::InvalidConfig`]. Rowids are freshly assigned
-    /// (the source `row_id_start` is not preserved), so indexes keyed on the
-    /// source's rowids do not carry over.
+    /// with [`crate::DuckLakeError::InvalidConfig`].
+    ///
+    /// # Row lineage
+    ///
+    /// The file gets a fresh range off the destination's `next_row_id` by
+    /// default, so the source's rowids do not carry over. That is wrong for a
+    /// file the source recorded with `row_id_start IS NULL`, which carries its
+    /// rowids inline: a number here advertises ids the file does not hold.
+    /// Carry the source's value with [`DataFileInfo::with_source_row_id_start`]
+    /// and its table's `next_row_id` with [`DataFileInfo::with_row_id_floor`].
     ///
     /// # Partitioning
     ///
@@ -2463,6 +2579,82 @@ mod tests {
     use crate::DuckLakeError;
     use arrow::datatypes::Field;
     use std::sync::Arc;
+
+    #[test]
+    fn assign_draws_the_next_range_and_advances() {
+        let file = DataFileInfo::new("a.parquet", 100, 4);
+        let allocation = allocate_row_id_start(7, &file);
+        assert_eq!(allocation.stored, Some(7));
+        assert_eq!(allocation.advance, 4);
+    }
+
+    #[test]
+    fn embedded_records_null_and_mints_nothing() {
+        let file = DataFileInfo::new("a.parquet", 100, 4).with_embedded_row_ids();
+        let allocation = allocate_row_id_start(7, &file);
+        assert_eq!(allocation.stored, None);
+        assert_eq!(allocation.advance, 0);
+    }
+
+    #[test]
+    fn source_row_id_start_maps_null_to_embedded() {
+        let embedded = DataFileInfo::new("a.parquet", 100, 4).with_source_row_id_start(None);
+        assert_eq!(embedded.row_id_start, RowIdStart::Embedded);
+        let carried = DataFileInfo::new("a.parquet", 100, 4).with_source_row_id_start(Some(40));
+        assert_eq!(carried.row_id_start, RowIdStart::Preserved(40));
+    }
+
+    #[test]
+    fn preserved_stores_the_source_range_and_clears_it() {
+        let file = DataFileInfo::new("a.parquet", 100, 4).with_source_row_id_start(Some(40));
+        let allocation = allocate_row_id_start(7, &file);
+        assert_eq!(allocation.stored, Some(40));
+        assert_eq!(allocation.advance, 37, "7 + 37 == 44 == 40 + 4");
+    }
+
+    #[test]
+    fn preserved_below_the_allocator_does_not_rewind_it() {
+        let file = DataFileInfo::new("a.parquet", 100, 4).with_source_row_id_start(Some(2));
+        let allocation = allocate_row_id_start(100, &file);
+        assert_eq!(allocation.stored, Some(2));
+        assert_eq!(allocation.advance, 0);
+    }
+
+    /// Pins the precondition on `with_source_row_id_start`: a carried range is
+    /// not checked against ids the destination already issued.
+    #[test]
+    fn preserved_range_is_not_checked_against_ids_the_destination_issued() {
+        let file = DataFileInfo::new("f.parquet", 1024, 5).with_source_row_id_start(Some(1));
+        let allocation = allocate_row_id_start(3, &file);
+        assert_eq!(allocation.stored, Some(1), "claims [1, 6)");
+        assert_eq!(allocation.advance, 3, "allocator moves 3 -> 6");
+    }
+
+    #[test]
+    fn floor_raises_the_allocator_before_the_range_is_drawn() {
+        let file = DataFileInfo::new("a.parquet", 100, 4).with_row_id_floor(500);
+        let allocation = allocate_row_id_start(7, &file);
+        assert_eq!(allocation.stored, Some(500));
+        assert_eq!(allocation.advance, 497, "7 + 497 == 504 == 500 + 4");
+    }
+
+    #[test]
+    fn floor_applies_without_drawing_a_range() {
+        let file = DataFileInfo::new("a.parquet", 100, 4)
+            .with_source_row_id_start(None)
+            .with_row_id_floor(500);
+        let allocation = allocate_row_id_start(7, &file);
+        assert_eq!(allocation.stored, None);
+        assert_eq!(allocation.advance, 493, "7 + 493 == 500");
+    }
+
+    #[test]
+    fn stale_floor_is_a_no_op() {
+        let file = DataFileInfo::new("a.parquet", 100, 4).with_row_id_floor(5);
+        let allocation = allocate_row_id_start(100, &file);
+        assert_eq!(allocation.stored, Some(100));
+        assert_eq!(allocation.advance, 4);
+    }
 
     #[test]
     fn inlined_index_columns_normalize_and_reject_ambiguous_values() {

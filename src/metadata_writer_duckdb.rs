@@ -2117,9 +2117,11 @@ fn commit_staged_files(
         params![write.table_id],
         |row| row.get(0),
     )?;
+    let mut total_advance = 0i64;
     let mut total_records = 0i64;
     let mut total_bytes = 0i64;
     for file in files {
+        let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         let data_file_id: i64 = tx.query_row(
             "INSERT INTO ducklake_data_file
                  (table_id, path, path_is_relative, file_size_bytes,
@@ -2132,14 +2134,15 @@ fn commit_staged_files(
                 file.file_size_bytes,
                 file.footer_size,
                 file.record_count,
-                next_row_id,
+                row_ids.stored,
                 snapshot_id
             ],
             |row| row.get(0),
         )?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats)?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file)?;
-        next_row_id += file.record_count;
+        next_row_id += row_ids.advance;
+        total_advance += row_ids.advance;
         total_records += file.record_count;
         total_bytes += file.file_size_bytes;
     }
@@ -2150,7 +2153,7 @@ fn commit_staged_files(
              record_count = record_count + ?,
              file_size_bytes = file_size_bytes + ?
          WHERE table_id = ?",
-        params![total_records, total_records, total_bytes, write.table_id],
+        params![total_advance, total_records, total_bytes, write.table_id],
     )?;
     Ok(())
 }
@@ -2816,11 +2819,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         // finalize_snapshot); a no-op if it exists.
         seed_stats_if_missing(&tx, table_id)?;
 
-        let row_id_start: i64 = tx.query_row(
+        let next_row_id: i64 = tx.query_row(
             "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
             params![table_id],
             |row| row.get(0),
         )?;
+        let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
         // RETURNING gives us the sequence-allocated data_file_id to tie the
         // per-column stats rows to, in the same transaction.
@@ -2836,7 +2840,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 file.file_size_bytes,
                 file.footer_size,
                 file.record_count,
-                row_id_start,
+                row_ids.stored,
                 snapshot_id
             ],
             |row| row.get(0),
@@ -2854,7 +2858,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                  record_count    = record_count + ?,
                  file_size_bytes = file_size_bytes + ?
              WHERE table_id = ?",
-            params![file.record_count, file.record_count, file.file_size_bytes, table_id],
+            params![row_ids.advance, file.record_count, file.file_size_bytes, table_id],
         )?;
 
         record_table_write_changes(
@@ -2959,9 +2963,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
             params![table_id],
             |row| row.get(0),
         )?;
+        let mut total_advance: i64 = 0;
         let mut total_records: i64 = 0;
         let mut total_bytes: i64 = 0;
         for file in files {
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
             let data_file_id: i64 = tx.query_row(
                 "INSERT INTO ducklake_data_file
                      (table_id, path, path_is_relative, file_size_bytes,
@@ -2974,14 +2980,15 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     file.file_size_bytes,
                     file.footer_size,
                     file.record_count,
-                    next_row_id,
+                    row_ids.stored,
                     snapshot_id
                 ],
                 |row| row.get(0),
             )?;
             insert_file_column_stats(&tx, table_id, data_file_id, &file.column_stats)?;
             insert_partition_metadata(&tx, table_id, data_file_id, file)?;
-            next_row_id += file.record_count;
+            next_row_id += row_ids.advance;
+            total_advance += row_ids.advance;
             total_records += file.record_count;
             total_bytes += file.file_size_bytes;
         }
@@ -2992,7 +2999,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                  record_count    = record_count + ?,
                  file_size_bytes = file_size_bytes + ?
              WHERE table_id = ?",
-            params![total_records, total_records, total_bytes, table_id],
+            params![total_advance, total_records, total_bytes, table_id],
         )?;
         record_table_write_changes(
             &tx,
@@ -3440,11 +3447,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         )?;
         crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
         seed_stats_if_missing(&tx, table_id)?;
-        let row_id_start = tx.query_row(
+        let next_row_id = tx.query_row(
             "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
             params![table_id],
             |row| row.get::<_, i64>(0),
         )?;
+        let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         let data_file_id = reserve_file_ids(&tx, 1)?[0];
         tx.execute(
             "INSERT INTO ducklake_data_file
@@ -3459,7 +3467,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 file.file_size_bytes,
                 file.footer_size,
                 file.record_count,
-                row_id_start,
+                row_ids.stored,
                 snapshot_id,
             ],
         )?;
@@ -3471,7 +3479,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
              SET next_row_id = next_row_id + ?, record_count = record_count + ?,
                  file_size_bytes = file_size_bytes + ?
              WHERE table_id = ?",
-            params![file.record_count, file.record_count, file.file_size_bytes, table_id],
+            params![row_ids.advance, file.record_count, file.file_size_bytes, table_id],
         )?;
         for entry in deletes {
             apply_delete_entry(&tx, table_id, base_snapshot, snapshot_id, entry)?;

@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
   `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
+- `DataFileInfo::with_source_row_id_start` carries a registered file's `row_id_start` over
+  from its source catalog, NULL included, and `with_row_id_floor` lifts the destination's
+  rowid allocator past the ids that file already holds (#313).
 - `DataFileInfo::with_owner_catalog` / `DeleteFileInfo::with_owner_catalog` mark a registered
   file as a reference to another catalog's object rather than one of this catalog's own (#310).
 - `MetadataWriter::register_existing_data_file_with_delete` registers an existing data file

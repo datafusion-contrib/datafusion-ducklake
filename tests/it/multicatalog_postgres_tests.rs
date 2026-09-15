@@ -5367,6 +5367,178 @@ async fn register_existing_data_file_adopts_column_ids() {
     );
 }
 
+/// Reads back `(row_id_start, record_count)` for every live data file of
+/// `table_id`, in `data_file_id` order, plus the table's `next_row_id` allocator.
+async fn row_id_layout(pool: &sqlx::PgPool, table_id: i64) -> (Vec<(Option<i64>, i64)>, i64) {
+    let files: Vec<(Option<i64>, i64)> = sqlx::query(
+        "SELECT row_id_start, record_count FROM ducklake_data_file
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY data_file_id",
+    )
+    .bind(table_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| {
+        (
+            r.try_get::<Option<i64>, _>(0).unwrap(),
+            r.try_get::<i64, _>(1).unwrap(),
+        )
+    })
+    .collect();
+    let next_row_id: i64 =
+        sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    (files, next_row_id)
+}
+
+/// A file whose source recorded `row_id_start IS NULL` records NULL here too,
+/// and `with_row_id_floor` lifts the destination's allocator past its inline ids.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_carries_an_embedded_rowid_file_as_null() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_rowid_null").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let ids = vec![100_i64, 200_i64];
+
+    // Source file: NULL range, inline ids below the source's `next_row_id` of 900.
+    let promoted = DataFileInfo::new("compacted.parquet", 4096, 12)
+        .with_source_row_id_start(None)
+        .with_row_id_floor(900);
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &promoted,
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let (files, next_row_id) = row_id_layout(&pool, out.table_id).await;
+    assert_eq!(
+        files,
+        vec![(None, 12)],
+        "a file that carries its own rowids records no range here either"
+    );
+    assert_eq!(
+        next_row_id, 900,
+        "the floor lifts the allocator past the ids the file already occupies"
+    );
+
+    // The destination's own next write draws from above the floor.
+    w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(),
+        &ids,
+        &DataFileInfo::new("own.parquet", 512, 2),
+        WriteMode::Append,
+    )
+    .unwrap();
+    let (files, next_row_id) = row_id_layout(&pool, out.table_id).await;
+    assert_eq!(files, vec![(None, 12), (Some(900), 2)]);
+    assert_eq!(next_row_id, 902);
+}
+
+/// A source file with a range keeps it verbatim, and the allocator is pushed
+/// past its end.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_preserves_the_source_row_id_range() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_rowid_carry").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let ids = vec![100_i64, 200_i64];
+
+    let promoted = DataFileInfo::new("f1.parquet", 1024, 3).with_source_row_id_start(Some(40));
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &promoted,
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let (files, next_row_id) = row_id_layout(&pool, out.table_id).await;
+    assert_eq!(files, vec![(Some(40), 3)], "the source's range is kept");
+    assert_eq!(next_row_id, 43, "the allocator clears the adopted range");
+
+    // A stale carried range (one the allocator is already past) never rewinds it.
+    w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(),
+        &ids,
+        &DataFileInfo::new("f2.parquet", 512, 2).with_source_row_id_start(Some(5)),
+        WriteMode::Append,
+    )
+    .unwrap();
+    let (files, next_row_id) = row_id_layout(&pool, out.table_id).await;
+    assert_eq!(files, vec![(Some(40), 3), (Some(5), 2)]);
+    assert_eq!(next_row_id, 43, "next_row_id is monotonic");
+}
+
+/// The default is unchanged: a fresh range off the destination's counter.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_file_assigns_a_fresh_range_by_default() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("pg_rowid_default").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let ids = vec![100_i64, 200_i64];
+
+    let out = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f1.parquet", 1024, 3),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    w.register_existing_data_file(
+        "public",
+        "orders",
+        &cols(),
+        &ids,
+        &DataFileInfo::new("f2.parquet", 512, 2),
+        WriteMode::Append,
+    )
+    .unwrap();
+
+    let (files, next_row_id) = row_id_layout(&pool, out.table_id).await;
+    assert_eq!(files, vec![(Some(0), 3), (Some(3), 2)]);
+    assert_eq!(next_row_id, 5);
+}
+
 /// Promoting a byte-copied parquet into a PARTITIONED table persists the caller's
 /// partition assignment, so the file is prunable exactly like one this crate wrote.
 /// Nothing is rewritten, so the values can only be carried, never derived.

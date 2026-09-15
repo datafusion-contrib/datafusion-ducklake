@@ -1892,9 +1892,11 @@ async fn commit_staged_files(
             .fetch_one(&mut **tx)
             .await?;
     let data_file_ids = reserve_file_ids(tx, files.len() as i64).await?;
+    let mut total_advance = 0i64;
     let mut total_records = 0i64;
     let mut total_bytes = 0i64;
     for (file, data_file_id) in files.iter().zip(data_file_ids) {
+        let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         sqlx::query(
             "INSERT INTO ducklake_data_file
                  (data_file_id, table_id, path, path_is_relative, file_size_bytes,
@@ -1908,13 +1910,14 @@ async fn commit_staged_files(
         .bind(file.file_size_bytes)
         .bind(file.footer_size)
         .bind(file.record_count)
-        .bind(next_row_id)
+        .bind(row_ids.stored)
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
-        next_row_id += file.record_count;
+        next_row_id += row_ids.advance;
+        total_advance += row_ids.advance;
         total_records += file.record_count;
         total_bytes += file.file_size_bytes;
     }
@@ -1926,7 +1929,7 @@ async fn commit_staged_files(
              file_size_bytes = file_size_bytes + ?
          WHERE table_id = ?",
     )
-    .bind(total_records)
+    .bind(total_advance)
     .bind(total_records)
     .bind(total_bytes)
     .bind(write.table_id)
@@ -2642,12 +2645,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            let row_id_start: i64 =
+            let next_row_id: i64 =
                 sqlx::query("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
             // The id comes from the shared next_file_id counter (never the
             // auto-increment), so appends and the update/delete/compaction paths
@@ -2666,7 +2670,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
@@ -2685,7 +2689,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                      file_size_bytes = file_size_bytes + ?
                  WHERE table_id = ?",
             )
-            .bind(file.record_count)
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)
@@ -2805,6 +2809,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
             let file_count = i64::try_from(files.len()).map_err(|_| {
@@ -2816,6 +2821,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             // auto-increment) keep every insert path in one id space.
             let data_file_ids = reserve_file_ids(&mut tx, file_count).await?;
             for (file, data_file_id) in files.iter().zip(data_file_ids) {
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
@@ -2829,14 +2835,15 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
-                .bind(next_row_id)
+                .bind(row_ids.stored)
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                next_row_id += file.record_count;
+                next_row_id += row_ids.advance;
+                total_advance += row_ids.advance;
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
@@ -2848,7 +2855,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                      file_size_bytes = file_size_bytes + ?
                  WHERE table_id = ?",
             )
-            .bind(total_records)
+            .bind(total_advance)
             .bind(total_records)
             .bind(total_bytes)
             .bind(table_id)
@@ -2985,12 +2992,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            let row_id_start: i64 = sqlx::query_scalar(
+            let next_row_id: i64 = sqlx::query_scalar(
                 "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
             )
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
             let data_file_id = reserve_file_ids(&mut tx, 1).await?[0];
             sqlx::query(
                 "INSERT INTO ducklake_data_file
@@ -3005,7 +3013,7 @@ impl MetadataWriter for MySqlMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
@@ -3017,7 +3025,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                  SET next_row_id = next_row_id + ?, record_count = record_count + ?,
                      file_size_bytes = file_size_bytes + ? WHERE table_id = ?",
             )
-            .bind(file.record_count)
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)

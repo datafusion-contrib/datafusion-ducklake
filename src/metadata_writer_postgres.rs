@@ -2981,7 +2981,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            let row_id_start: i64 = stats_row.try_get(0)?;
+            let next_row_id: i64 = stats_row.try_get(0)?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
             let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
@@ -2995,7 +2996,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -3019,7 +3020,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                      file_size_bytes = file_size_bytes + $3
                  WHERE table_id = $4",
             )
-            .bind(file.record_count)
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)
@@ -3146,9 +3147,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
             for file in files {
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
@@ -3161,7 +3164,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
-                .bind(next_row_id)
+                .bind(row_ids.stored)
                 .bind(snapshot_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -3169,7 +3172,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                next_row_id += file.record_count;
+                next_row_id += row_ids.advance;
+                total_advance += row_ids.advance;
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
@@ -3181,7 +3185,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                      file_size_bytes = file_size_bytes + $3
                  WHERE table_id = $4",
             )
-            .bind(total_records)
+            .bind(total_advance)
             .bind(total_records)
             .bind(total_bytes)
             .bind(table_id)
@@ -4054,8 +4058,8 @@ impl MetadataWriter for PostgresMetadataWriter {
             )
             .await?;
 
-            // rowids get a fresh range from the table counter — the source range
-            // isn't preserved (index copy, which would need it, is out of scope).
+            // Rowids: a fresh range by default, or the source's carried value
+            // when the caller supplied one. See `allocate_row_id_start`.
             sqlx::query(
                 "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
                  VALUES ($1, 0, 0, 0)
@@ -4064,12 +4068,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            let row_id_start: i64 = sqlx::query_scalar(
+            let next_row_id: i64 = sqlx::query_scalar(
                 "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1",
             )
             .bind(table_id)
             .fetch_one(&mut *tx)
             .await?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
             // Partition-spec fence + validation. A promoted file is registered
             // as-is, so the caller is asserting it already holds rows of exactly one
@@ -4159,7 +4164,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .bind(file.owner_catalog_id)
             .fetch_one(&mut *tx)
@@ -4201,7 +4206,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                      file_size_bytes = file_size_bytes + $3
                  WHERE table_id = $4",
             )
-            .bind(file.record_count)
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)
@@ -4483,7 +4488,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            let row_id_start: i64 = stats_row.try_get(0)?;
+            let next_row_id: i64 = stats_row.try_get(0)?;
+            let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
             let inserted = sqlx::query(
                 "INSERT INTO ducklake_data_file
@@ -4497,7 +4503,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(file.file_size_bytes)
             .bind(file.footer_size)
             .bind(file.record_count)
-            .bind(row_id_start)
+            .bind(row_ids.stored)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -4521,7 +4527,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                      file_size_bytes = file_size_bytes + $3
                  WHERE table_id = $4",
             )
-            .bind(file.record_count)
+            .bind(row_ids.advance)
             .bind(file.record_count)
             .bind(file.file_size_bytes)
             .bind(table_id)
@@ -4740,9 +4746,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
+            let mut total_advance: i64 = 0;
             let mut total_records: i64 = 0;
             let mut total_bytes: i64 = 0;
             for file in files {
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
@@ -4755,7 +4763,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(file.file_size_bytes)
                 .bind(file.footer_size)
                 .bind(file.record_count)
-                .bind(next_row_id)
+                .bind(row_ids.stored)
                 .bind(snapshot_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -4763,7 +4771,8 @@ impl MetadataWriter for PostgresMetadataWriter {
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
-                next_row_id += file.record_count;
+                next_row_id += row_ids.advance;
+                total_advance += row_ids.advance;
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
@@ -4776,7 +4785,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                      file_size_bytes = file_size_bytes + $3
                  WHERE table_id = $4",
             )
-            .bind(total_records)
+            .bind(total_advance)
             .bind(total_records)
             .bind(total_bytes)
             .bind(table_id)
