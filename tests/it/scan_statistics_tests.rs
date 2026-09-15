@@ -683,3 +683,131 @@ async fn delete_position_outside_a_file_is_not_subtracted() {
     );
     assert_eq!(folded, 8, "nine rows less the one actually deleted");
 }
+
+/// A catalog written by the REAL DuckDB extension, not by this crate.
+///
+/// Both wrong-result bugs this module exists to prevent were invisible to a
+/// suite that only reads catalogs we wrote. Our writer stores NULL for an
+/// over-long string bound; DuckDB truncates it to a rounded-up prefix, which is
+/// what the spec permits and what `add_data_files` ingests from any parquet
+/// writer. So the fixture that breaks the reader is one we cannot produce.
+///
+/// Two tables, deliberately: `s` carries the long strings and NO deletes, `d`
+/// carries the delete. Putting both in one table hides the string case, because
+/// a file with deletes already has its bounds suppressed for a different reason
+/// and the assertion would pass whether or not string bounds are handled.
+///
+/// The CLI is pinned by CI (`DUCKDB_CLI_VERSION`, checksummed). The version is
+/// asserted here so a developer machine with a different `duckdb` on PATH fails
+/// loudly instead of quietly testing another vintage against a reader that has
+/// never seen its catalog columns.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_written_catalog_is_read_correctly() {
+    use std::process::Command;
+
+    let version = Command::new("duckdb").arg("--version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).to_string();
+    assert!(
+        version.contains("v1.5.5"),
+        "fixture must be built by the pinned DuckDB CLI (CI installs v1.5.5), found: {version}"
+    );
+
+    let temp = TempDir::new().unwrap();
+    let catalog_path = temp.path().join("duckdb.db");
+    let data_path = temp.path().join("duckdb_data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    let long = "z".repeat(5000) + "bbb";
+    let sql = format!(
+        "INSTALL ducklake; LOAD ducklake; \
+         ATTACH 'ducklake:sqlite:{cat}' AS lake (DATA_PATH '{data}/', DATA_INLINING_ROW_LIMIT 0); \
+         CREATE TABLE lake.main.s(id INTEGER, n INTEGER, v VARCHAR); \
+         INSERT INTO lake.main.s VALUES (1, 10, 'aaa'), (2, NULL, '{long}'), (3, 30, 'mmm'); \
+         CREATE TABLE lake.main.d(id INTEGER); \
+         INSERT INTO lake.main.d VALUES (1), (2), (3), (4); \
+         DELETE FROM lake.main.d WHERE id = 4;",
+        cat = catalog_path.to_string_lossy(),
+        data = data_path.to_string_lossy(),
+    );
+    let out = Command::new("duckdb")
+        .args(["-csv", "-noheader", ":memory:", "-c", &sql])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "duckdb fixture build failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The bound DuckDB stored must be a truncated prefix — otherwise this
+    // fixture is not exercising the case that broke the reader.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", catalog_path.display()))
+        .await
+        .unwrap();
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT max_value FROM ducklake_file_column_stats WHERE max_value LIKE 'zz%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert!(
+        stored.iter().any(|bound| bound.len() < long.len()),
+        "expected a TRUNCATED string bound from DuckDB, got lengths {:?}",
+        stored.iter().map(String::len).collect::<Vec<_>>()
+    );
+
+    let provider = SqliteMetadataProvider::new(&format!("sqlite:{}", catalog_path.display()))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::new(provider).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+
+    // Integer bounds are stored whole, so they may fold — and must be right.
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.s", 0).await,
+        3
+    );
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT max(id) FROM ducklake.main.s", 0).await,
+        3
+    );
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT min(id) FROM ducklake.main.s", 0).await,
+        1
+    );
+
+    // The string bound is a truncated prefix on a DELETE-FREE file, so nothing
+    // else suppresses it. It must still never answer max(v).
+    let sql = "SELECT max(v) FROM ducklake.main.s";
+    let plan = physical_plan(&ctx, sql).await;
+    assert!(
+        plan.contains("DataSourceExec"),
+        "a foreign-written string bound must not be folded:\n{plan}"
+    );
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let column = arrow::compute::cast(batches[0].column(0), &DataType::Utf8).unwrap();
+    let got = column
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap()
+        .value(0)
+        .to_string();
+    assert_eq!(
+        got, long,
+        "max(v) must be the row's value, not the stored bound"
+    );
+
+    // A delete recorded by a foreign writer: the count must still be right.
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.d", 0).await,
+        3,
+        "count must account for DuckDB's own delete"
+    );
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.d WHERE id > 0", 0).await,
+        3,
+        "and a scan must agree with it"
+    );
+}
