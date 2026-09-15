@@ -852,16 +852,20 @@ async fn duckdb_written_catalog_is_read_correctly() {
     );
 }
 
-/// A `record_count` that UNDER-states its file is corrupt metadata, and the two
-/// ways of handling it differ in what they return.
+/// A `record_count` that UNDER-states its file is corrupt metadata, and the
+/// rule here is: touch nothing. Every physical row is still read, deletes still
+/// apply, and no row is lost or resurrected.
 ///
-/// Bounding only the delete set would drop a position past the recorded count —
-/// and that position's row, no longer deleted, would reappear. Official instead
-/// clamps the DATA scan to `record_count`, so rows past the end are never
-/// returned and no delete can be resurrected. We do the same, so a deleted row
-/// stays deleted and the folded count still matches what the scan emits.
+/// The folded count may then disagree with the scan, and that is deliberate.
+/// Official does the same — its `SetMaxRowCount` clamp is unreachable, since
+/// `DuckLakeFileListEntry::max_row_count` is never assigned, so it too returns
+/// every physical row and lets `count(*)` disagree on such a file. Clamping the
+/// scan to the recorded count would make the numbers agree, at the price of
+/// DESTROYING rows: this filter also feeds the UPDATE source scan, whose
+/// surviving rows are rewritten into a new file, so a clamped-away row is erased
+/// from the catalog and repairing the count cannot bring it back.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_short_record_count_cannot_resurrect_a_deleted_row() {
+async fn a_short_record_count_loses_no_rows() {
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
@@ -931,15 +935,114 @@ async fn a_short_record_count_cannot_resurrect_a_deleted_row() {
                 .to_vec()
         })
         .collect();
-    assert!(
-        !ids.contains(&5),
-        "the deleted row must not come back, got {ids:?}"
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "every live row must survive a short record_count, and the deleted one \
+         must stay deleted"
     );
 
-    let folded = scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t", 0).await;
+    // Deliberately NOT asserted: that count(*) equals the rows returned. On
+    // corrupt metadata it does not, here or upstream. Preserving rows is the
+    // property worth having; making the numbers agree is not worth losing one.
+}
+
+/// The UPDATE source scan reads through the same delete filter, and its
+/// surviving rows are REWRITTEN into a new file while the old one is retired.
+/// So anything that filter drops is not hidden, it is erased from the catalog —
+/// and repairing the metadata afterwards cannot bring it back.
+///
+/// This is why the read path must not clamp rows against a short
+/// `record_count`. A mis-reported count is recoverable; a rewritten file is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_rewrite_cannot_erase_rows_past_a_short_record_count() {
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .write_table(
+            "main",
+            "t",
+            &[batch(vec![1, 2, 3, 4, 5], vec![10, 20, 30, 40, 50])],
+        )
+        .await
+        .unwrap();
+
+    let session_with_writer = || async {
+        let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
+            .await
+            .unwrap();
+        let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
+            .await
+            .unwrap();
+        let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_catalog("ducklake", Arc::new(catalog));
+        ctx
+    };
+
+    // Delete the last row (physical position 4), then under-state the count so
+    // that position sits past the recorded end.
+    session_with_writer()
+        .await
+        .sql("DELETE FROM ducklake.main.t WHERE id = 5")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let pool = sqlx::SqlitePool::connect(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let corrupted = sqlx::query(
+        "UPDATE ducklake_data_file SET record_count = 3 \
+         WHERE record_count = 5 AND end_snapshot IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    pool.close().await;
+    assert_eq!(corrupted, 1, "fixture must actually corrupt the count");
+
+    // The rewrite. Row 4 is past the recorded end and must survive it.
+    session_with_writer()
+        .await
+        .sql("UPDATE ducklake.main.t SET id = 100 WHERE id = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = session(&temp).await;
+    let batches = ctx
+        .sql("SELECT id FROM ducklake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
     assert_eq!(
-        folded,
-        ids.len() as i64,
-        "the folded count must match the rows returned, got {ids:?}"
+        ids,
+        vec![2, 3, 4, 100],
+        "no row may be erased by a rewrite that read through the delete filter"
     );
 }

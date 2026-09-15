@@ -44,8 +44,6 @@ pub struct DeleteFilterExec {
     deleted_positions: Arc<HashSet<i64>>,
     /// Index of the physical-position column in the input schema.
     pos_index: usize,
-    /// The file's recorded `record_count`, when the catalog has one.
-    max_row_count: Option<usize>,
     /// Cached plan properties.
     properties: Arc<PlanProperties>,
 }
@@ -63,7 +61,6 @@ impl DeleteFilterExec {
         file_path: String,
         deleted_positions: Arc<HashSet<i64>>,
         pos_index: usize,
-        max_row_count: Option<usize>,
     ) -> DataFusionResult<Self> {
         let schema = input.schema();
         let field = schema.fields().get(pos_index).ok_or_else(|| {
@@ -81,7 +78,6 @@ impl DeleteFilterExec {
             file_path,
             deleted_positions,
             pos_index,
-            max_row_count,
             properties,
         })
     }
@@ -248,7 +244,6 @@ impl ExecutionPlan for DeleteFilterExec {
             self.file_path.clone(),
             self.deleted_positions.clone(),
             self.pos_index,
-            self.max_row_count,
         )?))
     }
 
@@ -261,7 +256,6 @@ impl ExecutionPlan for DeleteFilterExec {
             input: self.input.execute(partition, context)?,
             deleted_positions: self.deleted_positions.clone(),
             pos_index: self.pos_index,
-            max_row_count: self.max_row_count,
         }))
     }
 }
@@ -271,7 +265,6 @@ struct DeleteFilterStream {
     input: SendableRecordBatchStream,
     deleted_positions: Arc<HashSet<i64>>,
     pos_index: usize,
-    max_row_count: Option<usize>,
 }
 
 impl Stream for DeleteFilterStream {
@@ -289,10 +282,7 @@ impl Stream for DeleteFilterStream {
 
 impl DeleteFilterStream {
     fn filter_batch(&self, batch: &RecordBatch) -> DataFusionResult<RecordBatch> {
-        // Fast path only when there is nothing to do at all. The clamp must not
-        // depend on the set being non-empty: today the exec is built only with
-        // deletes, but that is the caller's invariant, not this method's.
-        if self.deleted_positions.is_empty() && self.max_row_count.is_none() {
+        if self.deleted_positions.is_empty() {
             return Ok(batch.clone());
         }
 
@@ -308,18 +298,15 @@ impl DeleteFilterStream {
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
             let position = pos.value(i);
-            // Clamp the data scan to the file's recorded row count, as official
-            // does (`DuckLakeDeleteFilter::Filter` limits the scan range from
-            // `SetMaxRowCount`). A file holding more rows than the catalog
-            // records is corrupt metadata, and the rows past the end are ones no
-            // delete position can name — dropping the position instead would let
-            // a deleted row reappear.
-            let beyond_file = self
-                .max_row_count
-                .is_some_and(|max| usize::try_from(position).map_or(true, |p| p >= max));
-            if beyond_file {
-                continue;
-            }
+            // No clamp against the file's `record_count`. A short count is
+            // corrupt metadata, and dropping the rows past it would be
+            // destructive rather than merely wrong: this filter also feeds the
+            // UPDATE source scan, whose surviving rows are rewritten into a new
+            // file, so a dropped row would be erased from the catalog and could
+            // not be recovered by repairing the count. Official does not clamp
+            // either — its `SetMaxRowCount` path is unreachable, because
+            // `DuckLakeFileListEntry::max_row_count` is never assigned — and it
+            // likewise lets `count(*)` disagree with its own scan on such a file.
             if !self.deleted_positions.contains(&position) {
                 keep_indices.push(i as u32);
             }
@@ -377,44 +364,12 @@ mod tests {
         (schema, b)
     }
 
-    /// Unclamped: `max_row_count` unset, so only the delete set decides.
     fn stream(schema: SchemaRef, deleted: &[i64]) -> DeleteFilterStream {
-        clamped_stream(schema, deleted, None)
-    }
-
-    fn clamped_stream(
-        schema: SchemaRef,
-        deleted: &[i64],
-        max_row_count: Option<usize>,
-    ) -> DeleteFilterStream {
         DeleteFilterStream {
             input: Box::pin(EmptyRecordBatchStream::new(schema)),
             deleted_positions: Arc::new(deleted.iter().copied().collect::<HashSet<i64>>()),
             pos_index: 1,
-            max_row_count,
         }
-    }
-
-    /// Rows at or past the file's recorded end are not emitted, as official's
-    /// read path does by clamping the scan range. Without this, a delete naming
-    /// such a row would have nothing to match and the row would come back.
-    #[test]
-    fn clamps_rows_past_the_recorded_row_count() {
-        let (schema, b) = batch(&[1, 2, 3, 4, 5], &[0, 1, 2, 3, 4]);
-        let out = clamped_stream(schema, &[4], Some(3))
-            .filter_batch(&b)
-            .unwrap();
-        assert_eq!(ids(&out), vec![1, 2, 3]);
-    }
-
-    /// A negative position cannot name a row, and is dropped rather than kept.
-    #[test]
-    fn clamps_a_negative_position_when_the_row_count_is_known() {
-        let (schema, b) = batch(&[1, 2], &[-1, 0]);
-        let out = clamped_stream(schema, &[], Some(2))
-            .filter_batch(&b)
-            .unwrap();
-        assert_eq!(ids(&out), vec![2]);
     }
 
     fn ids(b: &RecordBatch) -> Vec<i32> {

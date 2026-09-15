@@ -3228,9 +3228,6 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(positions),
                 pos_index,
-                table_file
-                    .max_row_count
-                    .and_then(|v| statistic_usize(v, "record_count")),
             )?)
         } else {
             // No actual deletes for this file: plain scan, scan-level limit OK.
@@ -3469,9 +3466,6 @@ impl DuckLakeTable {
                     table_file.file.path.clone(),
                     Arc::new(p),
                     pos_index,
-                    table_file
-                        .max_row_count
-                        .and_then(|v| statistic_usize(v, "record_count")),
                 )?);
             }
             if !has_embedded {
@@ -3677,9 +3671,6 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
                 pos_index,
-                table_file
-                    .max_row_count
-                    .and_then(|v| statistic_usize(v, "record_count")),
             )?)
         };
 
@@ -3983,9 +3974,6 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
                 pos_index,
-                table_file
-                    .max_row_count
-                    .and_then(|v| statistic_usize(v, "record_count")),
             )?);
         }
 
