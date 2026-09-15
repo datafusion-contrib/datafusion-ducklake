@@ -439,8 +439,11 @@ fn file_row_count(
 /// summary (see the `count(*)`-after-DELETE convergence issue) must take the
 /// inlined-delete map, not just this row.
 ///
-/// Only the delete-free scan path consumes this today, so the restriction costs
-/// nothing: files with deletes are planned by a different exec.
+/// CALLER PRECONDITION: files removed by INLINED deletes are not excluded here,
+/// because this row cannot see them — an inlined delete leaves `delete_file` and
+/// `delete_count` NULL. `scan()` routes any file in `inlined_deletes` to the
+/// with-deletes exec, so the only consumer never sees one; a new consumer must
+/// make the same exclusion itself, or take the inlined-delete map.
 fn file_summary_row_count(file: &DuckLakeTableFile) -> Precision<usize> {
     if file.delete_file.is_some() || file.delete_count.is_some_and(|count| count > 0) {
         return Precision::Absent;
@@ -2673,6 +2676,29 @@ impl DuckLakeTable {
         let mut positions = inlined_positions.cloned().unwrap_or_default();
         if let Some(delete_file) = &table_file.delete_file {
             positions.extend(self.read_delete_file_positions(state, delete_file).await?);
+        }
+        // Keep only positions this file can actually hold.
+        //
+        // A delete file records a row's physical index, and its `file_path`
+        // column is documentation we deliberately ignore, so a delete file
+        // referenced by two data files contributes the other file's positions
+        // here too. Execution already ignored those — it drops a row only when
+        // that row's own position is in the set — but the set's SIZE is now the
+        // published row count, and an unmatched position would subtract a row
+        // that was never removed, making `count(*)` answer below what a scan
+        // returns. Official validates delete positions against the row count
+        // when it reads them; this is the equivalent, and it also stops a shared
+        // delete file deleting a row it does not name.
+        //
+        // With no recorded `record_count` there is nothing to validate against,
+        // so the set is left alone: the scan then publishes no row count either
+        // (`gross_scan_statistics` needs the same field), and the aggregate
+        // reads the data.
+        if let Some(rows) = table_file
+            .max_row_count
+            .and_then(|value| statistic_usize(value, "record_count"))
+        {
+            positions.retain(|position| usize::try_from(*position).is_ok_and(|p| p < rows));
         }
         Ok(positions)
     }

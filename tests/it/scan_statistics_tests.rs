@@ -595,3 +595,91 @@ async fn partition_derived_bounds_never_answer_max() {
         .to_string();
     assert_eq!(got, "us", "max(region) must come from the rows");
 }
+
+/// A delete file records physical positions, and its `file_path` column is
+/// documentation this reader ignores, so one delete file referenced by two data
+/// files contributes the other file's positions. Execution already ignored the
+/// unmatched ones — it drops a row only when that row's own position is in the
+/// set — but the set's SIZE is now the published row count, so an unmatched
+/// position would subtract a row that was never removed and `count(*)` would
+/// answer below what a scan returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_position_outside_a_file_is_not_subtracted() {
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+
+    // A SMALL file (3 rows, positions 0..2) and a BIG one (6 rows, 0..5), so a
+    // delete at position 5 of the big file cannot exist in the small one.
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch(vec![1, 2, 3], vec![10, 20, 30])])
+        .await
+        .unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .append_table(
+            "main",
+            "t",
+            &[batch(vec![10, 11, 12, 13, 14, 15], vec![1, 2, 3, 4, 5, 6])],
+        )
+        .await
+        .unwrap();
+
+    let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    // Last row of the six-row file: physical position 5.
+    ctx.sql("DELETE FROM ducklake.main.t WHERE id = 15")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Point the SAME delete file at the three-row file as well. Position 5 is
+    // not a row it holds.
+    let pool = sqlx::SqlitePool::connect(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let shared = sqlx::query(
+        "INSERT INTO ducklake_delete_file \
+           (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size, \
+            encryption_key, delete_count, begin_snapshot, end_snapshot) \
+         SELECT (SELECT MIN(data_file_id) FROM ducklake_data_file), d.table_id, d.path, \
+                d.path_is_relative, d.file_size_bytes, d.footer_size, d.encryption_key, \
+                d.delete_count, d.begin_snapshot, d.end_snapshot \
+         FROM ducklake_delete_file d WHERE d.end_snapshot IS NULL",
+    )
+    .execute(&pool)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    pool.close().await;
+    assert_eq!(
+        shared, 1,
+        "fixture must actually share the delete file, or this test proves nothing"
+    );
+
+    let ctx = session(&temp).await;
+    let folded = scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t", 0).await;
+    let scanned = scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t WHERE id > 0", 0).await;
+    assert_eq!(
+        folded, scanned,
+        "the folded count must equal what a scan returns"
+    );
+    assert_eq!(folded, 8, "nine rows less the one actually deleted");
+}

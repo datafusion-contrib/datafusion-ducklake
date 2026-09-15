@@ -244,7 +244,10 @@ impl ExecutionPlan for ColumnRenameExec {
         let mut statistics = Statistics::new_unknown(&self.schema());
         if let Some(input) = input_stats.first() {
             statistics.num_rows = input.num_rows;
-            statistics.total_byte_size = input.total_byte_size;
+            // Inexact for the same reason the delete filter downgrades it: this
+            // node can add constant columns and drops the internal position
+            // column, so the input's figure no longer describes the output.
+            statistics.total_byte_size = input.total_byte_size.to_inexact();
         }
         Ok(Arc::new(statistics))
     }

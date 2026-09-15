@@ -130,6 +130,15 @@ impl ExecutionPlan for DeleteFilterExec {
     /// inlined deletes, which leave `delete_file` and `delete_count` NULL and are
     /// therefore invisible to the catalog counters.
     ///
+    /// PRECONDITION: every position names a row this file holds. Subtracting the
+    /// set's size is only right under that invariant — execution drops a row by
+    /// set MEMBERSHIP, so an unmatched position removes nothing at runtime while
+    /// still counting here, and `count(*)` would answer below what the scan
+    /// emits. `DuckLakeTable::deleted_positions_for_file` establishes it by
+    /// dropping positions outside the file's `record_count`, which matters
+    /// because a delete file's `file_path` column is ignored and one such file
+    /// may be referenced by several data files.
+    ///
     /// Column bounds are dropped to unknown. Removing rows can remove the very
     /// row holding an extreme, and nothing here knows which, so an inherited
     /// bound could answer `max(col)` with a value that is no longer present. The
@@ -140,7 +149,11 @@ impl ExecutionPlan for DeleteFilterExec {
     /// `partition_statistics`: that is the method the `StatisticsContext` walk
     /// actually calls, and a child reached by calling `partition_statistics`
     /// directly would answer from the trait default (unknown) whenever it, too,
-    /// only implements the new one.
+    /// only implements the new one. Unlike `NanPruningBarrierExec`, no deprecated
+    /// override is kept alongside — an out-of-tree caller on the old method gets
+    /// `new_unknown` here, which loses the fold but cannot produce a wrong
+    /// answer, whereas the barrier's override exists to keep a *safety* property
+    /// for those callers.
     fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
         vec![ChildStats::At(partition)]
     }
@@ -179,6 +192,16 @@ impl ExecutionPlan for DeleteFilterExec {
         Ok(Arc::new(statistics))
     }
 
+    /// Forward filter pushdown unchanged: this node's output schema is its input
+    /// schema, so a predicate means the same thing on either side of it.
+    ///
+    /// Soundness rests on `filter(delete(R)) == delete(filter(R))`. Deletion is
+    /// keyed by **absolute physical position**, which the parquet reader derives
+    /// from row-group offsets in the footer, so dropping non-matching rows in the
+    /// reader cannot change which surviving row sits at which position. That is
+    /// specifically what reader-produced positions buy: when positions were
+    /// synthesized by counting stream arrivals, pruning a single row shifted
+    /// every position after it and this forwarding would have been corrupting.
     fn gather_filters_for_pushdown(
         &self,
         _phase: FilterPushdownPhase,
