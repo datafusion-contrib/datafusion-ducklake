@@ -37,15 +37,17 @@ use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::table_schema::TableSchema;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -375,6 +377,49 @@ impl ExecutionPlan for RowIdExec {
             &self.input,
         )?;
         Ok(FilterDescription::new().with_child(child))
+    }
+
+    /// Appending `rowid` cannot reorder rows, and the child's columns keep their
+    /// indices because the new column goes last — so a sort over them passes
+    /// through untouched. A sort on `rowid` itself does not: it is synthesized
+    /// here from the reader's physical position and does not exist below.
+    ///
+    /// Downgraded to `Inexact` for the same reason `ColumnRenameExec` does it:
+    /// `Exact` would let the optimizer drop the `SortExec`, and this node
+    /// publishes an empty `EquivalenceProperties` rather than the child's
+    /// ordering.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let input_columns = self.input.schema().fields().len();
+        let touches_rowid = order.iter().any(|sort| {
+            let mut found = false;
+            sort.expr
+                .apply(|expr| {
+                    if let Some(column) = expr.downcast_ref::<Column>()
+                        && column.index() >= input_columns
+                    {
+                        found = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .expect("column scan over a sort expression cannot fail");
+            found
+        });
+        if touches_rowid {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        self.input.try_pushdown_sort(order)?.into_inexact().try_map(
+            |inner| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(RowIdExec::try_new(
+                    inner,
+                    self.row_id_start,
+                    self.pos_index,
+                )?))
+            },
+        )
     }
 
     fn with_new_children(

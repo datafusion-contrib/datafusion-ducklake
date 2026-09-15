@@ -84,6 +84,7 @@ mod table_changes_tests;
 mod table_deletions_repartition_tests;
 mod table_tests;
 mod time_travel_tests;
+mod topn_file_pruning_tests;
 mod type_promotion_tests;
 mod view_tests;
 mod write_inlining_tests;

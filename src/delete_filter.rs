@@ -23,10 +23,11 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
@@ -240,6 +241,32 @@ impl ExecutionPlan for DeleteFilterExec {
     ) -> DataFusionResult<FilterDescription> {
         let child = ChildFilterDescription::from_child(&parent_filters, &self.input)?;
         Ok(FilterDescription::new().with_child(child))
+    }
+
+    /// Dropping deleted rows cannot reorder the rows that remain, so an ordering
+    /// the child can serve still holds above this node. The sort keys need no
+    /// rewriting: this node neither renames nor reorders columns.
+    ///
+    /// Worth being honest about the reach: a file carrying deletes gets its own
+    /// exec, so there is never more than one file below this node and nothing to
+    /// reorder *between* files. What forwarding buys is the within-file half —
+    /// row-group ordering and early termination. Several such files are combined
+    /// under a union, which DataFusion 55 does not propagate a sort through, so
+    /// file-level skipping does not reach this path at all.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        self.input.try_pushdown_sort(order)?.try_map(
+            |inner| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(DeleteFilterExec::try_new(
+                    inner,
+                    self.file_path.clone(),
+                    Arc::clone(&self.deleted_positions),
+                    self.pos_index,
+                )?))
+            },
+        )
     }
 
     fn with_new_children(

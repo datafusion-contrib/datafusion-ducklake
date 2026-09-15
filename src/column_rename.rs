@@ -19,12 +19,13 @@ use datafusion::common::{ScalarValue, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -142,6 +143,69 @@ impl ColumnRenameExec {
                 types_equal_ignoring_field_metadata(input.data_type(), output.data_type())
             })
         })
+    }
+
+    /// Restate sort keys written against this node's output schema in the
+    /// child's column space, or `None` when any key does not land on a
+    /// type-preserving input column.
+    ///
+    /// Unlike [`Self::remap_filter_to_input`], this rewrites the column
+    /// **index** as well as the name. A pushed-down filter is re-resolved
+    /// against the child schema by name
+    /// ([`ChildFilterDescription::from_child`]); a pushed-down sort key is not
+    /// re-resolved at all, so an index left in output space would silently sort
+    /// the child on whichever column happens to sit at that position.
+    ///
+    /// A key that reaches a synthesized Hive constant returns `None`: the
+    /// constant exists only above this node, so the child cannot order by it.
+    fn remap_sort_to_input(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<Option<Vec<PhysicalSortExpr>>> {
+        if !self.is_type_preserving_projection() {
+            return Ok(None);
+        }
+
+        let input_schema = self.input.schema();
+        let mut remapped = Vec::with_capacity(order.len());
+        for sort in order {
+            let mut valid = true;
+            let expr = Arc::clone(&sort.expr)
+                .transform_down(|expr| {
+                    let Some(column) = expr.downcast_ref::<Column>() else {
+                        return Ok(Transformed::no(expr));
+                    };
+                    if self
+                        .output_schema
+                        .fields()
+                        .get(column.index())
+                        .is_none_or(|field| field.name() != column.name())
+                    {
+                        valid = false;
+                        return Ok(Transformed::complete(expr));
+                    }
+                    let input_name = self
+                        .reverse_mapping
+                        .get(column.name())
+                        .map(String::as_str)
+                        .unwrap_or_else(|| column.name());
+                    match input_schema.index_of(input_name) {
+                        Ok(index) => Ok(Transformed::yes(
+                            Arc::new(Column::new(input_name, index)) as Arc<dyn PhysicalExpr>
+                        )),
+                        Err(_) => {
+                            valid = false;
+                            Ok(Transformed::complete(expr))
+                        },
+                    }
+                })?
+                .data;
+            if !valid {
+                return Ok(None);
+            }
+            remapped.push(PhysicalSortExpr::new(expr, sort.options));
+        }
+        Ok(Some(remapped))
     }
 
     /// Remap a predicate over the catalog schema to the physical child schema.
@@ -295,6 +359,38 @@ impl ExecutionPlan for ColumnRenameExec {
             None => ChildFilterDescription::all_unsupported(&parent_filters),
         };
         Ok(FilterDescription::new().with_child(child))
+    }
+
+    /// Renaming a column cannot reorder rows, so any ordering the child can
+    /// serve survives this node. Delegating matters for `ORDER BY … LIMIT n`:
+    /// the scan reads its files in the order the sort asks for, which is what
+    /// lets the Top-N boundary tighten early enough to skip the rest.
+    ///
+    /// Downgraded to `Inexact` even when the child answers `Exact`. `Exact`
+    /// licenses the optimizer to delete the `SortExec` outright, which is only
+    /// sound from a node that republishes the ordering in its own
+    /// `PlanProperties` — and this one builds a fresh, empty
+    /// `EquivalenceProperties` over the output schema. `Inexact` keeps the sort
+    /// and still gets the file reorder, which is the whole benefit here. Lift
+    /// this only together with the equivalence properties.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let Some(remapped) = self.remap_sort_to_input(order)? else {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        };
+        self.input
+            .try_pushdown_sort(&remapped)?
+            .into_inexact()
+            .try_map(|inner| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(ColumnRenameExec::new_with_constants(
+                    inner,
+                    Arc::clone(&self.output_schema),
+                    self.name_mapping.clone(),
+                    self.constants.as_ref().clone(),
+                )))
+            })
     }
 
     fn execute(

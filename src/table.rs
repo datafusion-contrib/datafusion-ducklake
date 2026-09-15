@@ -3685,11 +3685,14 @@ impl DuckLakeTable {
             )?)
         };
 
-        // No `NanPruningBarrierExec` here: `SnapshotFilterExec` does not implement
-        // `gather_filters_for_pushdown`, so DataFusion's default bars every parent
-        // filter and no predicate can reach the reader's float pruning. Give
-        // `SnapshotFilterExec` filter pushdown and this path needs the barrier —
-        // see `build_exec_for_file_with_deletes` for the shape.
+        // No `NanPruningBarrierExec` here: `SnapshotFilterExec` implements neither
+        // `gather_filters_for_pushdown` nor `try_pushdown_sort`, so DataFusion's
+        // defaults bar every parent filter and every sort, and nothing can reach
+        // the reader's float pruning. Give `SnapshotFilterExec` either one and
+        // this path needs the barrier — see `build_exec_for_file_with_deletes`
+        // for the shape. Sort pushdown needs it for the same reason filters do:
+        // it reorders files and row groups from the same NaN-blind statistics
+        // (see `NanPruningBarrierExec::try_pushdown_sort`).
         //
         // Drop rows newer than the read snapshot, then present the catalog schema.
         let filtered: Arc<dyn ExecutionPlan> = Arc::new(SnapshotFilterExec::try_new(

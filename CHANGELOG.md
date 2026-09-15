@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ORDER BY col LIMIT n` now skips whole data files. The scan reads its files in
+  the order the sort asks for and the parquet reader drops any file whose bounds
+  cannot beat the running Top-N boundary, so a "newest N rows" query opens only
+  the files that can contain them. File skipping reaches scans that rename
+  columns and scans that project `rowid`, as well as plain ones. A scan whose
+  files span more than one catalog page or physical schema reads them under a
+  union, which DataFusion does not yet propagate an ordering through, and so
+  does a file carrying deletes — those keep the within-file half, row-group
+  ordering and early termination, but are not skipped whole.
+
+  Two deliberate differences from official DuckLake, both performance-only —
+  results are identical — and both forced by DataFusion owning the Top-N
+  operator: pruning still happens under `NULLS FIRST`, where official switches
+  the optimization off entirely, and an ascending Top-N stops as soon as the
+  boundary cannot be beaten rather than draining the first file.
+
 - Catalog-inlined scans push safe equality, range, null, boolean, and prefix
   filters into metadata queries, retaining DataFusion residual filters (#277).
 
