@@ -2677,39 +2677,12 @@ impl DuckLakeTable {
         if let Some(delete_file) = &table_file.delete_file {
             positions.extend(self.read_delete_file_positions(state, delete_file).await?);
         }
-        // Keep only positions this file can actually hold.
-        //
-        // A delete file records a row's physical index, and its `file_path`
-        // column is documentation we deliberately ignore, so a delete file
-        // referenced by two data files contributes the other file's positions
-        // here too. Execution already ignored those — it drops a row only when
-        // that row's own position is in the set — but the set's SIZE is now the
-        // published row count, and an unmatched position would subtract a row
-        // that was never removed, making `count(*)` answer below what a scan
-        // returns. It also stops a shared delete file deleting a row it does not
-        // name.
-        //
-        // Official reaches the same end on its read path by the opposite move:
-        // it clamps the DATA scan to `record_count` (`DuckLakeDeleteFilter::Filter`),
-        // so a position beyond it can never match. Its change-scan path instead
-        // throws on an out-of-range delete index. Dropping silently is neither,
-        // and the difference shows when `record_count` is WRONG rather than
-        // absent: if it under-states the file, official returns fewer rows while
-        // we return the extra ones — including any the catalog says are deleted.
-        // Adopting official's clamp would close that; with corrupt metadata as
-        // the only way in, and the shared-delete-file shape the more plausible
-        // one for a foreign writer, this is the narrower hazard of the two.
-        //
-        // With no recorded `record_count` there is nothing to bound against, so
-        // the set is left alone: the scan then publishes no row count either
-        // (`gross_scan_statistics` keys on the same field), and the aggregate
-        // reads the data.
-        if let Some(rows) = table_file
-            .max_row_count
-            .and_then(|value| statistic_usize(value, "record_count"))
-        {
-            positions.retain(|position| usize::try_from(*position).is_ok_and(|p| p < rows));
-        }
+        // Positions are NOT filtered here. A position past the file's recorded
+        // end is handled where official handles it — by clamping the data scan
+        // (`DeleteFilterExec`) — because dropping it instead would un-delete its
+        // row whenever `record_count` under-states the file, and would also
+        // empty the set and route the file to the plain-scan branch, skipping
+        // the clamp altogether.
         Ok(positions)
     }
 
@@ -3255,6 +3228,9 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(positions),
                 pos_index,
+                table_file
+                    .max_row_count
+                    .and_then(|v| statistic_usize(v, "record_count")),
             )?)
         } else {
             // No actual deletes for this file: plain scan, scan-level limit OK.
@@ -3493,6 +3469,9 @@ impl DuckLakeTable {
                     table_file.file.path.clone(),
                     Arc::new(p),
                     pos_index,
+                    table_file
+                        .max_row_count
+                        .and_then(|v| statistic_usize(v, "record_count")),
                 )?);
             }
             if !has_embedded {
@@ -3698,6 +3677,9 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
                 pos_index,
+                table_file
+                    .max_row_count
+                    .and_then(|v| statistic_usize(v, "record_count")),
             )?)
         };
 
@@ -4001,6 +3983,9 @@ impl DuckLakeTable {
                 table_file.file.path.clone(),
                 Arc::new(deleted_positions),
                 pos_index,
+                table_file
+                    .max_row_count
+                    .and_then(|v| statistic_usize(v, "record_count")),
             )?);
         }
 
