@@ -705,7 +705,13 @@ async fn delete_position_outside_a_file_is_not_subtracted() {
 async fn duckdb_written_catalog_is_read_correctly() {
     use std::process::Command;
 
-    let version = Command::new("duckdb").arg("--version").output().unwrap();
+    // Absent binary: skip, so an outside contributor running the suite on a
+    // laptop is not red-lighted. Present but the wrong vintage: fail hard, which
+    // is the case that would otherwise test a different writer in silence.
+    let Ok(version) = Command::new("duckdb").arg("--version").output() else {
+        eprintln!("skipping: no `duckdb` on PATH (CI installs the pinned CLI)");
+        return;
+    };
     let version = String::from_utf8_lossy(&version.stdout).to_string();
     assert!(
         version.contains("v1.5.5"),
@@ -737,6 +743,29 @@ async fn duckdb_written_catalog_is_read_correctly() {
         out.status.success(),
         "duckdb fixture build failed: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The ENGINE version does not pin the thing that writes the catalog:
+    // `INSTALL ducklake` resolves the extension at run time, and a core
+    // extension can be rebuilt against an existing engine release. Pin the
+    // extension that every finding in this module was checked against.
+    let extension = Command::new("duckdb")
+        .args([
+            "-csv",
+            "-noheader",
+            ":memory:",
+            "-c",
+            "INSTALL ducklake; LOAD ducklake; SELECT extension_version FROM duckdb_extensions() \
+             WHERE extension_name = 'ducklake';",
+        ])
+        .output()
+        .unwrap();
+    let extension = String::from_utf8_lossy(&extension.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        extension, "d8a1881e",
+        "fixture must be written by the oracle ducklake extension"
     );
 
     // The bound DuckDB stored must be a truncated prefix — otherwise this
@@ -776,6 +805,17 @@ async fn duckdb_written_catalog_is_read_correctly() {
     assert_eq!(
         scalar_i64(&ctx, "SELECT min(id) FROM ducklake.main.s", 0).await,
         1
+    );
+
+    // POSITIVE CONTROL. Every other assertion here is a value, and `max(v)`
+    // asserts only that it scans. If the rollup ever stopped publishing on a
+    // foreign catalog at all — a schema mismatch on DuckDB's column metadata is
+    // the obvious way — `max(v)` would scan for the wrong reason and the whole
+    // test would still pass. This pins that statistics ARE being published.
+    let control = physical_plan(&ctx, "SELECT max(id) FROM ducklake.main.s").await;
+    assert!(
+        control.contains("PlaceholderRowExec"),
+        "a DuckDB-written catalog must still publish statistics:\n{control}"
     );
 
     // The string bound is a truncated prefix on a DELETE-FREE file, so nothing

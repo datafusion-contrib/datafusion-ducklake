@@ -2686,13 +2686,23 @@ impl DuckLakeTable {
         // that row's own position is in the set — but the set's SIZE is now the
         // published row count, and an unmatched position would subtract a row
         // that was never removed, making `count(*)` answer below what a scan
-        // returns. Official validates delete positions against the row count
-        // when it reads them; this is the equivalent, and it also stops a shared
-        // delete file deleting a row it does not name.
+        // returns. It also stops a shared delete file deleting a row it does not
+        // name.
         //
-        // With no recorded `record_count` there is nothing to validate against,
-        // so the set is left alone: the scan then publishes no row count either
-        // (`gross_scan_statistics` needs the same field), and the aggregate
+        // Official reaches the same end on its read path by the opposite move:
+        // it clamps the DATA scan to `record_count` (`DuckLakeDeleteFilter::Filter`),
+        // so a position beyond it can never match. Its change-scan path instead
+        // throws on an out-of-range delete index. Dropping silently is neither,
+        // and the difference shows when `record_count` is WRONG rather than
+        // absent: if it under-states the file, official returns fewer rows while
+        // we return the extra ones — including any the catalog says are deleted.
+        // Adopting official's clamp would close that; with corrupt metadata as
+        // the only way in, and the shared-delete-file shape the more plausible
+        // one for a foreign writer, this is the narrower hazard of the two.
+        //
+        // With no recorded `record_count` there is nothing to bound against, so
+        // the set is left alone: the scan then publishes no row count either
+        // (`gross_scan_statistics` keys on the same field), and the aggregate
         // reads the data.
         if let Some(rows) = table_file
             .max_row_count
@@ -3156,6 +3166,12 @@ impl DuckLakeTable {
     /// rows that are about to be filtered out, and the exec above cannot tighten
     /// them, so letting them through would risk answering `max(col)` with a
     /// deleted row's value.
+    ///
+    /// Keys on `record_count` and nothing else, and that is load-bearing:
+    /// `deleted_positions_for_file` bounds the delete set against the same field,
+    /// so a file without one publishes no count AND keeps every position. Give
+    /// this a fallback (`file_row_count` has a `value_count` one) and the pairing
+    /// breaks silently — a count would be published against an unbounded set.
     fn gross_scan_statistics(
         &self,
         state: &dyn Session,
