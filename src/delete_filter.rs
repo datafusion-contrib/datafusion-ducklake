@@ -18,13 +18,16 @@ use arrow::array::Int64Array;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
+use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{ColumnStatistics, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::Stream;
 
@@ -116,16 +119,62 @@ impl ExecutionPlan for DeleteFilterExec {
         vec![true]
     }
 
-    /// Forward filter pushdown unchanged: this node's output schema is its input
-    /// schema, so a predicate means the same thing on either side of it.
+    /// The input's row count less the rows this node removes, so an unfiltered
+    /// `count(*)` over a table with deletes is still answered from the catalog
+    /// rather than by reading every file — which is what official does, folding
+    /// `count(*)` unconditionally and subtracting delete counts independently.
     ///
-    /// Soundness rests on `filter(delete(R)) == delete(filter(R))`. Deletion is
-    /// keyed by **absolute physical position**, which the parquet reader derives
-    /// from row-group offsets in the footer, so dropping non-matching rows in the
-    /// reader cannot change which surviving row sits at which position. That is
-    /// specifically what reader-produced positions buy: when positions were
-    /// synthesized by counting stream arrivals, pruning a single row shifted
-    /// every position after it and this forwarding would have been corrupting.
+    /// `deleted_positions` is the authority, not the catalog's `delete_count`.
+    /// It is a SET, assembled by merging a file's positional deletes with its
+    /// inlined ones, so a row deleted by both is counted once — and it covers
+    /// inlined deletes, which leave `delete_file` and `delete_count` NULL and are
+    /// therefore invisible to the catalog counters.
+    ///
+    /// Column bounds are dropped to unknown. Removing rows can remove the very
+    /// row holding an extreme, and nothing here knows which, so an inherited
+    /// bound could answer `max(col)` with a value that is no longer present. The
+    /// row count survives because it needs no such knowledge: every deleted
+    /// position is one fewer row, whichever row it was.
+    ///
+    /// Implemented on `statistics_from_inputs` rather than the deprecated
+    /// `partition_statistics`: that is the method the `StatisticsContext` walk
+    /// actually calls, and a child reached by calling `partition_statistics`
+    /// directly would answer from the trait default (unknown) whenever it, too,
+    /// only implements the new one.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let Some(input) = input_stats.first() else {
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema())));
+        };
+        let mut statistics = input.as_ref().clone();
+        // Deleted positions belong to the FILE, not to any one output partition,
+        // so they cannot be attributed to a single partition's count.
+        statistics.num_rows = if args.partition().is_some() {
+            statistics.num_rows.to_inexact()
+        } else {
+            match statistics.num_rows {
+                Precision::Exact(rows) => rows
+                    .checked_sub(self.deleted_positions.len())
+                    .map(Precision::Exact)
+                    .unwrap_or(Precision::Absent),
+                other => other.to_inexact(),
+            }
+        };
+        statistics.column_statistics = statistics
+            .column_statistics
+            .iter()
+            .map(|_| ColumnStatistics::new_unknown())
+            .collect();
+        Ok(Arc::new(statistics))
+    }
+
     fn gather_filters_for_pushdown(
         &self,
         _phase: FilterPushdownPhase,

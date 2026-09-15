@@ -3118,6 +3118,35 @@ impl DuckLakeTable {
         self
     }
 
+    /// The GROSS row count of one file — every row it holds, deleted rows
+    /// included — with all column bounds unknown, sized to `schema`.
+    ///
+    /// This is what the scan UNDER a [`DeleteFilterExec`] reports, because that
+    /// scan really does emit the deleted rows; the exec above it subtracts them
+    /// (see its `partition_statistics`). Publishing the net count in both places
+    /// would subtract twice.
+    ///
+    /// Bounds are unknown rather than inherited: the scan's own bounds describe
+    /// rows that are about to be filtered out, and the exec above cannot tighten
+    /// them, so letting them through would risk answering `max(col)` with a
+    /// deleted row's value.
+    fn gross_scan_statistics(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        schema: &SchemaRef,
+    ) -> Option<Statistics> {
+        if !state.config_options().execution.collect_statistics {
+            return None;
+        }
+        let rows = table_file
+            .max_row_count
+            .and_then(|value| statistic_usize(value, "record_count"))?;
+        let mut statistics = Statistics::new_unknown(schema);
+        statistics.num_rows = Precision::Exact(rows);
+        Some(statistics)
+    }
+
     /// Build an execution plan for a single file with delete filtering
     ///
     /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
@@ -3160,6 +3189,7 @@ impl DuckLakeTable {
             // rows before the delete filter); DataFusion enforces LIMIT above.
             let (table_schema, pos_table_idx, _pos_name) =
                 positional_table_schema(file_cfg.read_schema.clone());
+            let gross = self.gross_scan_statistics(state, table_file, table_schema.table_schema());
             let mut proj = proj_indices.clone();
             proj.push(pos_table_idx);
             let pos_index = proj.len() - 1;
@@ -3173,6 +3203,9 @@ impl DuckLakeTable {
                 .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
                 .with_file_group(FileGroup::new(vec![pf]));
             builder = builder.with_projection_indices(Some(proj))?;
+            if let Some(gross) = gross {
+                builder = builder.with_statistics(gross);
+            }
             let scan = DataSourceExec::from_data_source(builder.build());
 
             Arc::new(DeleteFilterExec::try_new(

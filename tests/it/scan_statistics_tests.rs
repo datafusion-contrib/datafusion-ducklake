@@ -210,15 +210,67 @@ async fn deletes_do_not_corrupt_count_or_bounds() {
         .unwrap();
 
     let ctx = session(&temp).await;
+
+    // Official folds count(*) unconditionally, subtracting deletes. So do we:
+    // the delete filter knows how many positions it drops.
+    let count_sql = "SELECT count(*) FROM ducklake.main.t";
+    let count_plan = physical_plan(&ctx, count_sql).await;
+    assert!(
+        count_plan.contains("PlaceholderRowExec"),
+        "count(*) must still fold after a DELETE:\n{count_plan}"
+    );
     assert_eq!(
-        scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t", 0).await,
+        scalar_i64(&ctx, count_sql, 0).await,
         5,
         "count must exclude deleted rows"
     );
+
+    // Bounds are a different matter: the delete may have removed the extreme,
+    // and nothing in the plan knows whether it did.
+    let max_sql = "SELECT max(id) FROM ducklake.main.t";
+    let max_plan = physical_plan(&ctx, max_sql).await;
+    assert!(
+        max_plan.contains("DataSourceExec"),
+        "max must be read from the data once rows are deleted:\n{max_plan}"
+    );
     assert_eq!(
-        scalar_i64(&ctx, "SELECT max(id) FROM ducklake.main.t", 0).await,
+        scalar_i64(&ctx, max_sql, 0).await,
         11,
         "max must not report a deleted row's value"
+    );
+}
+
+/// An INLINED delete leaves `delete_file` and `delete_count` both NULL, so the
+/// catalog counters cannot see it. The count must still come out right, because
+/// the delete filter counts the positions it actually drops rather than trusting
+/// those counters.
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_delete_is_subtracted_from_the_folded_count() {
+    let temp = TempDir::new().unwrap();
+    seed_two_files(&temp).await;
+
+    let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    // Small enough to be recorded as an inlined delete rather than a delete file.
+    ctx.sql("DELETE FROM ducklake.main.t WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let ctx = session(&temp).await;
+    assert_eq!(
+        scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t", 0).await,
+        5,
+        "one row deleted from six"
     );
 }
 

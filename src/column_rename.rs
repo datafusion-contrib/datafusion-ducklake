@@ -12,10 +12,10 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
-use datafusion::common::ScalarValue;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{ScalarValue, Statistics};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -25,6 +25,7 @@ use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::statistics::{ChildStats, StatisticsArgs};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
@@ -218,6 +219,34 @@ impl ExecutionPlan for ColumnRenameExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// The input's ROW COUNT, and nothing else.
+    ///
+    /// This node maps each input row to exactly one output row, so the count
+    /// carries through unchanged — which is what lets an unfiltered `count(*)`
+    /// still fold when a scan is wrapped here (a table with deletes unions a
+    /// renamed branch in).
+    ///
+    /// Column statistics are deliberately NOT forwarded. This node renames
+    /// columns, can coerce a type, and can materialise partition constants, so an
+    /// inherited bound is not guaranteed to describe the output column sitting at
+    /// the same index. Row counts need no such correspondence; bounds do.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DataFusionResult<Arc<Statistics>> {
+        let mut statistics = Statistics::new_unknown(&self.schema());
+        if let Some(input) = input_stats.first() {
+            statistics.num_rows = input.num_rows;
+            statistics.total_byte_size = input.total_byte_size;
+        }
+        Ok(Arc::new(statistics))
     }
 
     fn with_new_children(
