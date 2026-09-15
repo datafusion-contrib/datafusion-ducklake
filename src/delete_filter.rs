@@ -167,6 +167,10 @@ impl ExecutionPlan for DeleteFilterExec {
                 other => other.to_inexact(),
             }
         };
+        // The input's byte size counts rows this node drops, and nothing here
+        // knows their width, so it can only be an over-estimate from here on —
+        // never an exact figure.
+        statistics.total_byte_size = statistics.total_byte_size.to_inexact();
         statistics.column_statistics = statistics
             .column_statistics
             .iter()
