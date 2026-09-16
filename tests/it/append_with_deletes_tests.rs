@@ -837,6 +837,15 @@ impl MetadataWriter for AppendOnlyWriter {
         self.inner.get_data_path()
     }
 
+    fn get_table_column_nullability(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> datafusion_ducklake::Result<Option<Vec<(String, bool)>>> {
+        self.inner
+            .get_table_column_nullability(schema_name, table_name)
+    }
+
     fn set_data_path(&self, path: &str) -> datafusion_ducklake::Result<()> {
         self.inner.set_data_path(path)
     }

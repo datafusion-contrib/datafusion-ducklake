@@ -4032,7 +4032,18 @@ impl DuckLakeTable {
         predicate: Option<&Arc<dyn PhysicalExpr>>,
         assignments: &[(usize, Arc<dyn PhysicalExpr>)],
     ) -> DataFusionResult<FileUpdateOutput> {
-        let out_schema = rewrite_output_schema(&self.physical_schema);
+        // Assignment expressions may yield NULL even when the catalog field is
+        // NOT NULL. Keep this intermediate batch permissive so DuckLake's shared
+        // validator can report the catalog column path before any delete file is
+        // authored; the writer still uses `physical_schema` as the target schema.
+        let mut out_fields: Vec<Arc<Field>> = self
+            .physical_schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect();
+        out_fields.push(Arc::new(rowid_field()));
+        let out_schema = Arc::new(Schema::new(out_fields));
 
         let mut updated_batches: Vec<RecordBatch> = Vec::new();
         let mut new_positions: Vec<i64> = Vec::new();

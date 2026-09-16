@@ -2533,6 +2533,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Get the data path from catalog metadata.
     fn get_data_path(&self) -> Result<String>;
 
+    /// Return the live top-level column nullability for an existing table.
+    ///
+    /// `None` means the table does not exist. Writers use this read-only lookup
+    /// before opening a write transaction so an incoming nullable Arrow field
+    /// cannot weaken a catalog `nulls_allowed = false` constraint.
+    fn get_table_column_nullability(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<Vec<(String, bool)>>>;
+
     /// Set the data path in catalog metadata.
     fn set_data_path(&self, path: &str) -> Result<()>;
 
