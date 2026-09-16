@@ -11,214 +11,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `ORDER BY col LIMIT n` skips data files whose statistics cannot beat the
-  running Top-N boundary, including scans that rename columns or project
-  `rowid`. Prunes in some cases official DuckLake does not; results are
-  unchanged (#316).
-- Catalog-inlined scans push safe equality, range, null, boolean, and prefix
-  filters into metadata queries, retaining DataFusion residual filters (#277).
-
-- Scoped settings now govern writer compression, row groups, rollover, sorting, partition paths, and the inclusive
-  `data_inlining_row_limit`; supported small writes stay in metadata with stable row IDs and snapshot visibility (#272).
-- `DataFileInfo::with_source_row_id_start` carries a registered file's `row_id_start` over
-  from its source catalog, NULL included, and `with_row_id_floor` lifts the destination's
-  rowid allocator past the ids that file already holds (#313).
-- `DataFileInfo::with_owner_catalog` / `DeleteFileInfo::with_owner_catalog` mark a registered
-  file as a reference to another catalog's object rather than one of this catalog's own (#310).
-- `MetadataWriter::register_existing_data_file_with_delete` registers an existing data file
-  together with an existing positional delete file in one commit, so a byte-identical copy
-  or reference of a file carries its row-level deletes across catalogs. Multicatalog
-  Postgres only; `register_existing_data_file` is now the no-delete shorthand.
-- A pushed-down filter never changes a query's answer, checked by a generated sweep over
-  hostile catalog statistics on every backend (#293).
-- Pushed-down filters narrow the DuckLake file listing in the catalog query itself, using
-  per-column statistics, so planning a selective scan or keyed mutation no longer lists
-  every live file (#293).
+- Catalog-backed data inlining: supported small writes stay in metadata with stable row IDs and
+  snapshot visibility, governed by the inclusive `data_inlining_row_limit` (#272).
+- MySQL inlines supported list, struct, and map batches under the row limit (#272).
+- Optional declared indexes on inlined tables, without changing their column types; MySQL skips
+  them on `LONGTEXT`/`LONGBLOB` columns (#272).
+- Catalog-inlined scans push safe equality, range, null, boolean, and prefix filters into
+  metadata queries, retaining DataFusion residual filters (#277).
+- Pushed-down filters narrow the DuckLake file listing in the catalog query itself, so planning
+  a selective scan or keyed mutation no longer lists every live file (#293).
+- A pushed-down filter never changes a query's answer, checked by a generated sweep over hostile
+  catalog statistics on every backend (#293).
+- `ORDER BY col LIMIT n` skips data files whose statistics cannot beat the running Top-N
+  boundary, including scans that rename columns or project `rowid` (#316).
+- An unfiltered `count(*)`, `min(col)` or `max(col)` folds to a literal from catalog statistics
+  (#305, #312).
+- Scans and plan-time footer reads share the `RuntimeEnv` Parquet metadata cache (#300).
+- SQL `DELETE` commits Parquet-resident and catalog-inlined rows in one snapshot on all four
+  write backends, with exact inline-aware truncate counts (#273).
 - Scoped DuckLake settings resolve per key with table-over-schema-over-global precedence on
-  every metadata backend; SQL writes and compaction honour the resolved values (#271).
-- Read nullable snapshot changes and find commits with live files on DuckDB,
-  SQLite, PostgreSQL, and MySQL (#274).
-- Set supported table-scoped options and coordinate commits on DuckDB, SQLite,
-  MySQL, and both PostgreSQL layouts (#274).
-- Commit staged writes across new or existing tables in one snapshot on all
-  metadata backends; empty staging calls do not publish snapshots (#274).
-- Validate snapshot-column staging before uploading files, and reject settings
-  for unknown options or dropped tables (#274).
-- MySQL inlines supported list, struct, and map batches under the row limit and
-  skips declared indexes on `LONGTEXT`/`LONGBLOB` columns (#272).
-- Add optional declared indexes on inlined tables without changing their column
-  types (#272).
-
-- SQL `DELETE` can commit Parquet-resident and catalog-inlined rows in one
-  snapshot on all four write backends; DuckDB and MySQL now implement combined
-  deletes and exact inline-aware truncate counts (#273).
-
-- `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
-  set how many finished data files a rolling or partitioned write uploads at once, default 4.
-  Written output is identical at any setting (#280).
+  every backend, governing compression, row groups, rollover, sorting and partition paths (#271).
+- Staged writes commit across new or existing tables in one snapshot on all metadata backends;
+  empty staging calls publish no snapshot (#274).
+- Set supported table-scoped options and coordinate commits on DuckDB, SQLite, MySQL, and both
+  PostgreSQL layouts (#274).
+- Read nullable snapshot changes and find commits with live files on DuckDB, SQLite, PostgreSQL,
+  and MySQL (#274).
 - Read-only DuckLake views across metadata backends, with writer-compatible view metadata (#264).
-- Per-file DuckLake `map_by_name` mappings across scans, predicate-based mutations,
-  compaction rewrites, and change feeds, including typed Hive partition constants (#263).
+- Per-file DuckLake `map_by_name` mappings across scans, predicate-based mutations, compaction
+  rewrites, and change feeds, including typed Hive partition constants (#263).
 - Literal column defaults for schema evolution and omitted `INSERT` fields, across metadata
   backends (#259).
-
 - Row lineage and positional deletes take the physical row position from the Parquet reader's
-  `row_number` virtual column, matching official DuckLake. Those scans can now push predicates
-  into row-group / page / bloom pruning, which the previous design had to refuse — measured
-  2.4-3x on selective `rowid` queries over a 5M-row file — and `DELETE` / `UPDATE` position
-  resolution prunes too (`DELETE`; an `UPDATE`'s source scan pushes no predicate). Byte-range
-  splitting replaces the hand-rolled row-group partitioning
-  this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
-  / rewrite paths explicitly (#130).
-
-- An unfiltered `count(*)`, `min(col)` or `max(col)` folds to a literal from catalog statistics;
-  bounds a writer may widen, partition-derived bounds, and bounds on delete-bearing files are
-  excluded from the summary (#305, #312).
-- Scans and plan-time footer reads share the `RuntimeEnv` Parquet metadata cache, so a file's
-  footer is read once per session rather than once per plan and scan (#300).
+  `row_number` virtual column, so those scans now push predicates into Parquet pruning (#130).
+- `DuckLakeTableWriter::with_upload_concurrency` and `DuckLakeWriteOptions::upload_concurrency`
+  set how many data files a rolling or partitioned write uploads at once, default 4 (#280).
+- `MetadataWriter::register_existing_data_file_with_delete` registers an existing data file with
+  an existing positional delete file in one commit; multicatalog Postgres only (#309).
+- `DataFileInfo::with_source_row_id_start` carries a registered file's `row_id_start` from its
+  source catalog, NULL included, and `with_row_id_floor` lifts the destination's allocator (#313).
+- `DataFileInfo::with_owner_catalog` / `DeleteFileInfo::with_owner_catalog` mark a registered
+  file as a reference to another catalog's object (#310).
 - Multicatalog PostgreSQL indexes `ducklake_file_column_stats` for the planning reads. On a large
   existing catalog, build it with `CREATE INDEX CONCURRENTLY` before upgrading (#294).
 
 ### Changed
 
-- **BREAKING** (multicatalog Postgres only): a data/delete file row with `owner_catalog_id` set
-  references a file that catalog owns, so no reclaim path touches it (#309, #310). The next boot
-  migrates additively: existing rows become NULL, i.e. owned.
-- **BREAKING**: `ScheduledFile`, `DataFileInfo` and `DeleteFileInfo` each gain a public field, so
-  a struct literal over them no longer compiles; use the `new()` constructors and builders (#310).
-- The multicatalog orphan sweep's cross-catalog arm now collects reference rows rather than every
-  absolutely-spelled row; a catalog writing its own file into another catalog's `data_path` is
-  unprotected, as it was before #309 (#310).
-
-- Keep data inlining disabled by default; set `data_inlining_row_limit` to a
-  positive threshold to opt in (#272).
-
-- Small writes inline only when `supports_data_inlining` accepts the schema; unsupported schemas fall back to Parquet.
-  `UPDATE` and row-lineage scans reject visible inlined rows with a clear flush-or-disable remedy (#272).
-- Upgrade bundled DuckDB and the CI CLI to 1.5.5; Parquet fixtures explicitly disable default small-write inlining (#273).
-- **BREAKING**: Default features are now `metadata-sqlite` alone, so a default build no longer
+- **BREAKING**: DataFusion 55 and arrow/parquet 59; consumers must move to the same major
+  versions (#282).
+- **BREAKING**: default features are now `metadata-sqlite` alone, so a default build no longer
   compiles DuckDB; add `features = ["duckdb-bundled"]` for the DuckDB provider and writer (#304).
-
-- Files carrying a live delete file are now pruned by their statistics, matching official
-  DuckLake; previously they were kept regardless of the predicate (#293).
 - **BREAKING**: `DuckLakeWriteOptions` is non-exhaustive and gains `parquet_version`,
-  `auto_compact` and `rewrite_delete_threshold`; add `..Default::default()` to literals (#271).
-- Catalog-backed writes now default to Snappy compression, 122,880-row row groups and 512 MB
-  target files, changing Parquet layout and file size versus the previous defaults (#271).
-
-- **BREAKING**: `DuckLakeFileData` and `DataFileChange` are now non-exhaustive and
-  implement `Default`; `DataFileChange` gains `mapping_id`. Downstream metadata
-  providers must preserve the per-file mapping identifier so change feeds adapt
-  physical columns correctly (#263).
-
-- **BREAKING**: `FileRowNumberExec` and `row_id::row_pos_field` are removed, and
-  `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` naming a
-  column that must carry the `parquet.virtual.row_number` extension type (new
-  `row_id::ROW_NUMBER_EXTENSION_TYPE`) — an Int64 column no longer suffices, and the crate
-  offers no public constructor for one, so these two execs are effectively crate-internal now.
-  `ROW_POS_COLUMN_NAME` is also only a *base* name: a scan whose file already has a column of
-  that name uses a suffixed variant, so locating the column by name is no longer reliable (#130).
-- Opening SQLite and multicatalog PostgreSQL writers adds the inline registry
-  required by staged writes, replacements, and truncation (#274).
-
-- **BREAKING**: `DuckLakeWriteOptions` gained an `upload_concurrency` field. Add
-  `..Default::default()` to exhaustive struct literals; no catalog or data migration (#280).
-- Rolling and partitioned writes upload up to 4 files at once, raising peak write memory
-  roughly fourfold (~90 MiB to ~360 MiB per session) and in-flight upload parts from 8 to 32.
-  SQL `INSERT`, compaction and unpartitioned `UPDATE` are unaffected; `with_upload_concurrency(1)`
-  restores the previous behaviour (#280).
-- A custom `ObjectStore` now sees overlapping `put_opts` / `put_multipart_opts` calls from a
-  single write and must be concurrency-safe (#280).
-- A write whose uploads fail issues `DELETE` for that batch's objects; a writer without delete
-  permission logs and leaves them, and a versioned bucket keeps a delete marker (#280).
-- A failing write awaits in-flight uploads before returning, so its error can surface later.
-  The first error in file order is returned and the rest are logged (#280).
-- Staged-file uploads gained a `ducklake.upload_staged_files` span, and the per-file
-  `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
-
-- **BREAKING**: DataFusion 55 and arrow/parquet 59. Consumers must move to the same major
-  versions; no catalog or data migration is needed (#282).
+  `auto_compact`, `rewrite_delete_threshold` and `upload_concurrency`; add
+  `..Default::default()` to literals (#271, #280).
+- **BREAKING**: `DuckLakeFileData` and `DataFileChange` are non-exhaustive and implement
+  `Default`; `DataFileChange` gains `mapping_id`, which providers must preserve (#263).
+- **BREAKING**: `ScheduledFile`, `DataFileInfo` and `DeleteFileInfo` each gain a public field;
+  use the `new()` constructors and builders (#310).
+- **BREAKING**: `FileRowNumberExec` and `row_id::row_pos_field` are removed;
+  `DeleteFilterExec::try_new` / `RowIdExec::try_new` take a trailing `pos_index: usize` for a
+  column carrying `row_id::ROW_NUMBER_EXTENSION_TYPE`; `ROW_POS_COLUMN_NAME` is only a base
+  name (#130).
+- **BREAKING** (multicatalog Postgres only): a data/delete file row with `owner_catalog_id` set
+  references a file that catalog owns, so no reclaim path touches it; the next boot migrates
+  additively, existing rows becoming NULL (#309, #310).
+- Catalog-backed writes default to Snappy compression, 122,880-row row groups and 512 MB target
+  files, changing Parquet layout and file size versus the previous defaults (#271).
+- Data inlining stays disabled by default, opt in with `data_inlining_row_limit`; unsupported
+  schemas fall back to Parquet, and `UPDATE` and row-lineage scans reject inlined rows (#272).
+- Rolling and partitioned writes upload up to 4 files at once, raising peak write memory roughly
+  fourfold; `with_upload_concurrency(1)` restores the previous behaviour (#280).
+- A custom `ObjectStore` must now be concurrency-safe: one write can issue overlapping
+  `put_opts` / `put_multipart_opts` calls (#280).
+- A write whose uploads fail issues `DELETE` for that batch's objects, and awaits in-flight
+  uploads before returning the first error in file order (#280).
+- Staged-file uploads gained a `ducklake.upload_staged_files` span (#280).
+- Files carrying a live delete file are now pruned by their statistics, matching official
+  DuckLake (#293).
 - Compaction reads each merge bin with one parallel scan instead of one execution per source
-  file, so merging N small files no longer serialises N object-store round trips (#279).
+  file (#279).
+- Opening SQLite and multicatalog PostgreSQL writers adds the inline registry required by staged
+  writes, replacements, and truncation (#274).
+- The multicatalog orphan sweep's cross-catalog arm collects reference rows rather than every
+  absolutely-spelled row (#310).
+- Bundled DuckDB and the CI CLI move to 1.5.5 (#273).
 
 ### Fixed
 
-- Multicatalog Postgres: a catalog's own absolute-path file, as `begin_write_to_path` writes,
-  is scheduled and reclaimed again instead of leaking when it lives outside `data_path` (#310).
+- Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB, PostgreSQL and MySQL
+  catalogs; unsupported non-scalar inline values report how to flush or disable inlining (#261).
+- Inlined positions remain in metadata during `DELETE` and `UPDATE`, and unqualified `DELETE` and
+  metadata row counts subtract visible inline positions (#262).
+- Delete-file and compaction commits abort when a source file gains a distinct inline position
+  after planning, and `merge_adjacent_files` skips files masked by inline positions (#262).
+- SQLite and MySQL inline encodings round-trip floats and binary values exactly, and DuckLake
+  temporal and binary encodings are preserved in inlined writes (#272).
+- Inline commits honour expected-base, commit-metadata and partition-spec fences, preserve
+  snapshot-change tokens, and count live rows in DELETE-all (#272).
+- MySQL creates inline-table DDL before opening the write transaction, avoiding implicit partial
+  commits (#272).
+- Reject incomplete inline change feeds, and check the current snapshot before `UPDATE` (#272).
 - Return a typed conflict for stale PostgreSQL single-catalog writes (#272).
-- Reject non-empty `CREATE TABLE AS SELECT` without publishing metadata;
-  use `CREATE TABLE` followed by `INSERT INTO ... SELECT` (#272).
-
-- Preserve DuckLake temporal and binary encodings in inlined writes (#272).
-- Fence partition changes during inline commits and count live rows in
-  DELETE-all (#272).
-- Reject incomplete inline change feeds and check the current snapshot before
-  UPDATE (#272).
-
-- SQLite and MySQL inline encodings now round-trip floats and binary values exactly (#272).
-- Inline commits honor expected-base, commit-metadata, and partition-spec fences and preserve existing snapshot-change
-  tokens (#272).
-- MySQL creates inline-table DDL before opening the write transaction, avoiding implicit partial commits (#272).
+- Reject non-empty `CREATE TABLE AS SELECT` without publishing metadata; use `CREATE TABLE`
+  followed by `INSERT INTO ... SELECT` (#272).
+- Float `min_value` and `max_value` are gated on `contains_nan`, so a matching row can no longer
+  be pruned away unread by `SELECT` or left behind by `DELETE` (#130).
+- Float predicates no longer reach Parquet pruning on a scan of a file carrying a delete file,
+  which silently dropped NaN rows (#130).
+- The internal physical-position column no longer binds to a catalog column of the same name in
+  the CDC feeds (#130).
+- Compaction writes with the table's configured Parquet options, instead of re-encoding a merged
+  or rewritten file with the writer defaults (#278).
+- Compaction re-merges partial files instead of stranding them, so a table taking frequent
+  appends no longer accumulates a floor of files no later pass can reduce (#281).
+- Expiring snapshots reclaims the per-file and per-commit rows official DuckLake deletes; rows
+  orphaned by earlier expires are swept during schema initialization (#295).
+- DuckDB compaction no longer skips eligible data files, and retains historical row visibility
+  (#273).
+- MySQL allocates data and delete file IDs consistently from catalog counters, avoiding
+  collisions across append, update, delete, and compaction (#273).
+- DuckDB and MySQL mutation flows record `changes_made` entries for every data-modifying
+  snapshot (#273).
+- A first write after an abandoned staged table commits and seeds table stats instead of failing
+  with a permanent `Conflict` (#273).
 - Read legacy global schema-version ledgers without assuming per-table provenance (#273).
-
-- Fix DuckDB compaction skipping eligible data files and retain historical row visibility (#273).
 - Invalid write-only catalog settings no longer block table reads; they fail when a write or
   maintenance operation is planned (#271).
 - Legacy two-column `ducklake_metadata` tables migrate both scope columns losslessly (#271).
 - Multicatalog catalog-scoped settings deterministically override shared globals (#271).
 - ZSTD compression level `0` maps to the Parquet library default; non-ZSTD codecs ignore the
   setting (#271).
-- Fixed `UPDATE` and `DELETE` to retain scoped Parquet options (#271).
-
-- A float `min_value` was trusted as a lower bound even when the column's NaN state was unknown
-  or positive; negative NaN sorts below every value, so a matching row could be pruned away
-  unread by `SELECT` and left behind by `DELETE`. Both bounds are now gated on `contains_nan`
-  (#130).
-- Float predicates could reach the Parquet reader's pruning on a scan of a file carrying a
-  delete file, with no `NanPruningBarrierExec` above it, silently dropping NaN rows (#130).
-- The internal physical-position column could bind to a catalog column of the same name in the
-  CDC feeds, making them report the wrong rows (#130).
-- MySQL allocates data and delete file IDs consistently from catalog counters,
-  avoiding collisions across append, update, delete, and compaction paths (#273).
-- DuckDB and MySQL mutation flows now record `changes_made` entries for every
-  data-modifying snapshot (#273).
-- A first write after an abandoned staged table now commits and seeds table stats
-  instead of failing with a permanent `Conflict` (#273).
-
+- `UPDATE` and `DELETE` retain scoped Parquet options (#271).
+- Name-mapped Hive columns retain values through `DELETE`, `UPDATE`, and compaction, and mapped
+  CDC reads no longer return NULL after column renames (#263).
+- Name-mapped Hive paths follow DuckDB's raw segment parser, including backslash separators and
+  invalid multiple-`=` segments; hex integers and exponent-form decimals read compatibly (#263).
+- Map keys and nested nullability match Arrow's read-compatible schema requirements (#263).
+- Field-ID-less Parquet files and inlined rows apply `initial_default` values, and read schemas
+  retain the metadata needed for missing-field adaptation (#263).
 - `NULL` sentinels, BLOB decoding, expression-default reads, and legacy schema migration (#259).
-- Name-mapped Hive columns retain values through `DELETE`, `UPDATE`, and compaction;
-  mapped CDC reads no longer return NULL after column renames. Map keys and nested
-  nullability also match Arrow's read-compatible schema requirements (#263).
-- Name-mapped Hive paths follow DuckDB's raw segment parser, including backslash
-  separators and invalid multiple-`=` segments. Hexadecimal integers and exponent-form
-  decimals read with DuckDB-compatible values (#263).
-- Field-ID-less Parquet files and inlined rows apply `initial_default` values, and
-  read schemas retain the default metadata needed for missing-field adaptation (#263).
-- An upload whose final flush failed panicked with "Already shut down" instead of returning
-  the error (#280).
-- `files_matching` no longer stops pruning a data file once that file carries a delete
-  file (#276).
-- Inlined positions remain in metadata during `DELETE` and `UPDATE`;
-  replacement Parquet delete files contain only Parquet-owned and newly matched
-  live positions (#262).
-- Unqualified `DELETE` and metadata row counts subtract visible inline
-  positions; `rewrite_data_files` includes them in automatic delete-ratio
-  selection (#262).
-- Delete-file and compaction commits abort when a source file gains a distinct
-  inline position after planning, instead of duplicating or resurrecting the
-  deleted row (#262).
-- `merge_adjacent_files` skips data files masked by inline positions, preserving
-  historical rows and valid metadata references (#262).
-- Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB, PostgreSQL and
-  MySQL catalogs; unsupported non-scalar inline values report how to flush or disable
-  inlining (#261).
-
-- Compaction writes with the table's configured Parquet options; a merged or rewritten file was
-  re-encoded with the writer defaults, losing the table's codec and row-group sizing (#278).
-- Compaction re-merges partial files instead of stranding them, so a table taking frequent
-  appends no longer accumulates a floor of files no later pass can reduce (#281).
-- Expiring snapshots reclaims the per-file and per-commit rows official DuckLake deletes; rows
-  orphaned by earlier expires are swept during schema initialization (#295).
+- An upload whose final flush failed panicked with "Already shut down" instead of returning the
+  error (#280).
+- `files_matching` no longer stops pruning a data file once that file carries a delete file
+  (#276).
+- Multicatalog Postgres: a catalog's own absolute-path file, as `begin_write_to_path` writes, is
+  scheduled and reclaimed instead of leaking when it lives outside `data_path` (#310).
 
 ## [0.7.0] - 2026-08-15
 
