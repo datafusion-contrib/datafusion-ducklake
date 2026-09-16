@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-16
+
 ### Added
 
 - `ORDER BY col LIMIT n` skips data files whose statistics cannot beat the
@@ -69,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this removes, on read paths via the optimizer and on the directly-executed `DELETE` / `UPDATE`
   / rewrite paths explicitly (#130).
 
+- An unfiltered `count(*)`, `min(col)` or `max(col)` folds to a literal from catalog statistics;
+  bounds a writer may widen, partition-derived bounds, and bounds on delete-bearing files are
+  excluded from the summary (#305, #312).
+- Scans and plan-time footer reads share the `RuntimeEnv` Parquet metadata cache, so a file's
+  footer is read once per session rather than once per plan and scan (#300).
+- Multicatalog PostgreSQL indexes `ducklake_file_column_stats` for the planning reads. On a large
+  existing catalog, build it with `CREATE INDEX CONCURRENTLY` before upgrading (#294).
+
 ### Changed
 
 - **BREAKING** (multicatalog Postgres only): a data/delete file row with `owner_catalog_id` set
@@ -125,6 +135,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The first error in file order is returned and the rest are logged (#280).
 - Staged-file uploads gained a `ducklake.upload_staged_files` span, and the per-file
   `ducklake.upload_staged_file` spans now overlap in wall-clock time (#280).
+
+- **BREAKING**: DataFusion 55 and arrow/parquet 59. Consumers must move to the same major
+  versions; no catalog or data migration is needed (#282).
+- Compaction reads each merge bin with one parallel scan instead of one execution per source
+  file, so merging N small files no longer serialises N object-store round trips (#279).
 
 ### Fixed
 
@@ -197,6 +212,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Table scans and `COUNT(*)` include scalar rows inlined in SQLite, DuckDB, PostgreSQL and
   MySQL catalogs; unsupported non-scalar inline values report how to flush or disable
   inlining (#261).
+
+- Compaction writes with the table's configured Parquet options; a merged or rewritten file was
+  re-encoded with the writer defaults, losing the table's codec and row-group sizing (#278).
+- Compaction re-merges partial files instead of stranding them, so a table taking frequent
+  appends no longer accumulates a floor of files no later pass can reduce (#281).
+- Expiring snapshots reclaims the per-file and per-commit rows official DuckLake deletes; rows
+  orphaned by earlier expires are swept during schema initialization (#295).
 
 ## [0.7.0] - 2026-08-15
 
@@ -446,7 +468,8 @@ Initial release.
 - Filter pushdown to Parquet
 - Query-scoped snapshot isolation
 
-[Unreleased]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/hotdata-dev/datafusion-ducklake/compare/v0.4.0...v0.5.0

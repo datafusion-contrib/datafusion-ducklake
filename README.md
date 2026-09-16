@@ -43,7 +43,7 @@ crate to build, so it is not a default:
 ```toml
 # Cargo.toml — read (and write) DuckDB-backed catalogs
 [dependencies.datafusion-ducklake]
-version = "0.7"
+version = "0.8"
 features = ["duckdb-bundled"]   # add "write-duckdb" to write them
 ```
 
@@ -51,7 +51,7 @@ features = ["duckdb-bundled"]   # add "write-duckdb" to write them
 # Cargo.toml — read PostgreSQL catalogs
 # (to write them too, use features = ["write-postgres"])
 [dependencies.datafusion-ducklake]
-version = "0.7"
+version = "0.8"
 default-features = false
 features = ["metadata-postgres", "tls-rustls-aws-lc-rs"]
 ```
@@ -343,8 +343,15 @@ A few highlights worth knowing up front:
 - Filter pushdown reaches the catalog: per-column statistics narrow the file-listing query
   itself, so a selective scan no longer lists every file. A few type/backend combinations
   decline it and fall back to in-memory pruning — see COMPATIBILITY.md.
-- Data inlined by DuckDB's ducklake extension is **not read** — see COMPATIBILITY.md for
-  the `COUNT(*)` undercount caveat and how to avoid it.
+- Data inlining: rows inlined by DuckDB's ducklake extension are read and counted by
+  `COUNT(*)` on every backend. Writing small batches inline is opt-in via the
+  `data_inlining_row_limit` setting; `UPDATE` and row-lineage scans still refuse a table with
+  visible inlined rows — see COMPATIBILITY.md.
+- Schema evolution: recursive `list`/`struct`/`map` columns, literal column defaults, and
+  per-file `map_by_name` name mappings are honoured across scans, writes, and change feeds.
+- Read-only DuckLake views are exposed across metadata backends.
+- `ORDER BY col LIMIT n` prunes data files whose statistics cannot beat the running Top-N
+  boundary, and an unfiltered `COUNT(*)`/`MIN`/`MAX` folds to a literal from catalog statistics.
 
 ---
 

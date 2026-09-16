@@ -1899,7 +1899,7 @@ checksum = "a88fd985bc0550c36f557db69543cc9d6393b1509783520b30e902f23c555da6"
 
 [[package]]
 name = "datafusion-ducklake"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arrow 59.2.0",
