@@ -1058,6 +1058,11 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 Ok(SnapshotMetadata {
                     snapshot_id,
                     timestamp,
+                    schema_version: row.get(2)?,
+                    changes_made: row.get(3)?,
+                    author: row.get(4)?,
+                    commit_message: row.get(5)?,
+                    commit_extra_info: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
