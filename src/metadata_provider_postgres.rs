@@ -5,15 +5,15 @@ use crate::inlined_filter::{
     InlinedDataScan, InlinedFilter, InlinedSqlBind, InlinedSqlDialect, render_inlined_filter,
 };
 use crate::metadata_provider::{
-    ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
+    ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
     DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting, SchemaMetadata,
-    SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema, ViewMetadata,
-    ViewWithSchema, block_on, inlined_delete_table_name, inlined_text_projection,
-    is_inlined_data_table, parse_inlined_rows_with_present, reconstruct_columns,
-    reconstruct_columns_with_table, resolve_metadata_settings,
+    DuckLakeTag, FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting, ObjectTag,
+    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
+    inlined_text_projection, is_inlined_data_table, parse_inlined_rows_with_present,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -1983,6 +1983,87 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn get_tags(&self, target: TagTarget, snapshot_id: i64) -> Result<Vec<DuckLakeTag>> {
+        block_on(async {
+            let result =
+                match target {
+                    TagTarget::Object {
+                        object_id,
+                        ..
+                    } => {
+                        sqlx::query(
+                            "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_tag
+                     WHERE object_id = $1 AND $2 >= begin_snapshot
+                       AND ($3 < end_snapshot OR end_snapshot IS NULL)
+                     ORDER BY key",
+                        )
+                        .bind(object_id)
+                        .bind(snapshot_id)
+                        .bind(snapshot_id)
+                        .fetch_all(&self.pool)
+                        .await
+                    },
+                    TagTarget::Column {
+                        table_id,
+                        column_id,
+                    } => sqlx::query(
+                        "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_column_tag
+                     WHERE table_id = $1 AND column_id = $2 AND $3 >= begin_snapshot
+                       AND ($4 < end_snapshot OR end_snapshot IS NULL)
+                     ORDER BY key",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .fetch_all(&self.pool)
+                    .await,
+                };
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DuckLakeTag {
+                        begin_snapshot: row.try_get(0)?,
+                        end_snapshot: row.try_get(1)?,
+                        key: row.try_get(2)?,
+                        value: row.try_get(3)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_view_id_by_name(
+        &self,
+        schema_id: i64,
+        name: &str,
+        snapshot_id: i64,
+    ) -> Result<Option<i64>> {
+        block_on(async {
+            let result = sqlx::query(
+                "SELECT view_id FROM ducklake_view
+                 WHERE schema_id = $1 AND view_name = $2 AND $3 >= begin_snapshot
+                   AND ($4 < end_snapshot OR end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .bind(name)
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_optional(&self.pool)
+            .await;
+            match result {
+                Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
+                Ok(None) => Ok(None),
+                Err(error) if is_missing_statistics_table(&error) => Ok(None),
+                Err(error) => Err(error.into()),
+            }
+        })
+    }
+
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
         block_on(async {
             let rows = bind_repeat!(
@@ -2061,7 +2142,7 @@ impl MetadataProvider for PostgresMetadataProvider {
     fn list_all_columns(&self, snapshot_id: i64) -> Result<Vec<ColumnWithTable>> {
         block_on(async {
             let rows = sqlx::query(
-                "SELECT s.schema_name, t.table_name, c.column_id, c.column_name, c.column_type,
+                "SELECT s.schema_name, t.table_name, t.table_id, c.column_id, c.column_name, c.column_type,
                         c.nulls_allowed, c.parent_column, c.initial_default, c.default_value,
                         c.default_value_type, c.default_value_dialect
                  FROM ducklake_schema s
@@ -2089,24 +2170,26 @@ impl MetadataProvider for PostgresMetadataProvider {
                 .map(|row| {
                     let schema_name: String = row.try_get(0)?;
                     let table_name: String = row.try_get(1)?;
-                    let nulls_allowed: Option<bool> = row.try_get(5)?;
-                    let parent_column: Option<i64> = row.try_get(6)?;
+                    let table_id: i64 = row.try_get(2)?;
+                    let nulls_allowed: Option<bool> = row.try_get(6)?;
+                    let parent_column: Option<i64> = row.try_get(7)?;
                     let column = DuckLakeTableColumn::new(
-                        row.try_get(2)?,
                         row.try_get(3)?,
                         row.try_get(4)?,
+                        row.try_get(5)?,
                         nulls_allowed.unwrap_or(true),
                     )
                     .with_defaults(
-                        row.try_get(7)?,
                         row.try_get(8)?,
                         row.try_get(9)?,
                         row.try_get(10)?,
+                        row.try_get(11)?,
                     );
                     Ok((
                         ColumnWithTable {
                             schema_name,
                             table_name,
+                            table_id,
                             column,
                         },
                         parent_column,
@@ -2114,6 +2197,75 @@ impl MetadataProvider for PostgresMetadataProvider {
                 })
                 .collect();
             reconstruct_columns_with_table(raw?)
+        })
+    }
+
+    fn list_all_object_tags(&self, snapshot_id: i64) -> Result<Vec<ObjectTag>> {
+        block_on(async {
+            let result = sqlx::query(
+                "SELECT object_id, begin_snapshot, end_snapshot, key, value FROM ducklake_tag
+                 WHERE $1 >= begin_snapshot
+                   AND ($2 < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY object_id, key",
+            )
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await;
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ObjectTag {
+                        object_type: None,
+                        object_id: row.try_get(0)?,
+                        tag: DuckLakeTag {
+                            begin_snapshot: row.try_get(1)?,
+                            end_snapshot: row.try_get(2)?,
+                            key: row.try_get(3)?,
+                            value: row.try_get(4)?,
+                        },
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn list_all_column_tags(&self, snapshot_id: i64) -> Result<Vec<ColumnTag>> {
+        block_on(async {
+            let result = sqlx::query(
+                "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
+                 FROM ducklake_column_tag
+                 WHERE $1 >= begin_snapshot
+                   AND ($2 < end_snapshot OR end_snapshot IS NULL)
+                 ORDER BY table_id, column_id, key",
+            )
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await;
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+            rows.into_iter()
+                .map(|row| {
+                    Ok(ColumnTag {
+                        table_id: row.try_get(0)?,
+                        column_id: row.try_get(1)?,
+                        tag: DuckLakeTag {
+                            begin_snapshot: row.try_get(2)?,
+                            end_snapshot: row.try_get(3)?,
+                            key: row.try_get(4)?,
+                            value: row.try_get(5)?,
+                        },
+                    })
+                })
+                .collect()
         })
     }
 

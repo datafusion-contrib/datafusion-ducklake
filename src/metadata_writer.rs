@@ -3,7 +3,7 @@
 //! This module provides the `MetadataWriter` trait for writing metadata to DuckLake catalogs,
 //! along with helper types for column definitions and data file registration.
 
-use crate::metadata_provider::snapshot_change_tokens;
+use crate::metadata_provider::{TagTarget, snapshot_change_tokens};
 use crate::types::{arrow_to_ducklake_type, ducklake_to_arrow_type};
 use crate::{DuckLakeError, Result};
 use arrow::array::{Array, FixedSizeBinaryArray};
@@ -1547,6 +1547,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "commit locking is not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// Set or replace a snapshot-versioned tag on an object or column.
+    ///
+    /// A `None` value remains a live tag with SQL `NULL`, matching DuckLake's
+    /// representation of `COMMENT ON ... IS NULL`. Implementations create one
+    /// metadata-only snapshot and carry `schema_version` forward unchanged.
+    fn set_tag(&self, _target: TagTarget, _key: &str, _value: Option<&str>) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "tags are not supported on this metadata backend".to_string(),
         ))
     }
 

@@ -14,7 +14,7 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_provider::block_on;
+use crate::metadata_provider::{TagTarget, block_on};
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
@@ -389,6 +389,23 @@ CREATE TABLE IF NOT EXISTS ducklake_column (
     default_value_dialect VARCHAR
 );
 
+CREATE TABLE IF NOT EXISTS ducklake_tag (
+    object_id BIGINT,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    key VARCHAR,
+    value VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS ducklake_column_tag (
+    table_id BIGINT,
+    column_id BIGINT,
+    begin_snapshot BIGINT,
+    end_snapshot BIGINT,
+    key VARCHAR,
+    value VARCHAR
+);
+
 -- `partial_max` (DuckLake v1.0) marks a *partial data file* produced by
 -- `merge_adjacent_files`: it is the maximum origin snapshot id among the file's
 -- merged rows, whose per-row origin is stored in the embedded
@@ -669,9 +686,13 @@ impl SqliteMetadataWriter {
 
             bump_schema_version(&mut tx, drop_snapshot).await?;
 
-            for child in
-                ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
-            {
+            for child in [
+                "ducklake_table",
+                "ducklake_column",
+                "ducklake_column_tag",
+                "ducklake_data_file",
+                "ducklake_delete_file",
+            ] {
                 sqlx::query(AssertSqlSafe(format!(
                     "UPDATE {child} SET end_snapshot = ?
                      WHERE table_id = ? AND end_snapshot IS NULL"
@@ -681,6 +702,15 @@ impl SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
+
+            sqlx::query(
+                "UPDATE ducklake_tag SET end_snapshot = ?
+                 WHERE object_id = ? AND end_snapshot IS NULL",
+            )
+            .bind(drop_snapshot)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
 
             record_snapshot_changes(
                 &mut tx,
@@ -1749,6 +1779,9 @@ async fn apply_inlined_deletes(
 /// `existing` columns are empty → `is_ddl` → bumps to 1), so a `schema_version`
 /// of 0 carried forward by a pure data write is unreachable.
 async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result<(i64, i64)> {
+    // The INSERT is the transaction's first statement so it takes SQLite's write
+    // lock up front and waits on the busy timeout; a read first would take a
+    // shared lock whose upgrade fails immediately under a concurrent writer.
     let row = sqlx::query(
         "INSERT INTO ducklake_snapshot (snapshot_id, snapshot_time, schema_version)
          SELECT COALESCE(MAX(snapshot_id), 0) + 1, CURRENT_TIMESTAMP,
@@ -1758,8 +1791,33 @@ async fn insert_snapshot(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> Result
     )
     .fetch_one(&mut **tx)
     .await?;
-    let snapshot_id = row.try_get(0)?;
+    let snapshot_id: i64 = row.try_get(0)?;
     let schema_version = row.try_get(1)?;
+    // A catalog created by the DuckDB extension carries the spec's allocator
+    // watermarks on every snapshot and reads them unconditionally at the head.
+    // This crate does not add those columns to its own catalogs, so carry them
+    // forward only where they already exist.
+    let allocator_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('ducklake_snapshot')
+         WHERE name IN ('next_catalog_id', 'next_file_id')",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if allocator_columns == 2 {
+        sqlx::query(
+            "UPDATE ducklake_snapshot
+             SET next_catalog_id = (SELECT COALESCE(MAX(next_catalog_id), 0)
+                                    FROM ducklake_snapshot WHERE snapshot_id <> ?),
+                 next_file_id = (SELECT COALESCE(MAX(next_file_id), 0)
+                                 FROM ducklake_snapshot WHERE snapshot_id <> ?)
+             WHERE snapshot_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     sqlx::query(
         "INSERT INTO ducklake_snapshot_changes (snapshot_id, changes_made)
          VALUES (?, NULL)",
@@ -2756,6 +2814,71 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             transaction.commit().await?;
             Ok(())
+        })
+    }
+
+    fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
+        validate_name(key, "Tag key")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            match target {
+                TagTarget::Object {
+                    object_id,
+                    ..
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_tag SET end_snapshot = ?
+                         WHERE object_id = ? AND key = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(object_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_tag
+                             (object_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES (?, ?, NULL, ?, ?)",
+                    )
+                    .bind(object_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+                TagTarget::Column {
+                    table_id,
+                    column_id,
+                } => {
+                    sqlx::query(
+                        "UPDATE ducklake_column_tag SET end_snapshot = ?
+                         WHERE table_id = ? AND column_id = ? AND key = ?
+                           AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_column_tag
+                             (table_id, column_id, begin_snapshot, end_snapshot, key, value)
+                         VALUES (?, ?, ?, NULL, ?, ?)",
+                    )
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                },
+            }
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 

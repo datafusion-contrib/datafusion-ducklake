@@ -182,6 +182,34 @@ pub const SQL_TABLE_EXISTS: &str = "SELECT EXISTS(
          AND (? < end_snapshot OR end_snapshot IS NULL)
      )";
 
+pub const SQL_GET_OBJECT_TAGS: &str = "SELECT begin_snapshot, end_snapshot, \"key\", \"value\"
+     FROM ducklake_tag
+     WHERE object_id = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
+     ORDER BY \"key\"";
+
+pub const SQL_GET_COLUMN_TAGS: &str = "SELECT begin_snapshot, end_snapshot, \"key\", \"value\"
+     FROM ducklake_column_tag
+     WHERE table_id = ? AND column_id = ?
+       AND ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
+     ORDER BY \"key\"";
+
+pub const SQL_LIST_OBJECT_TAGS: &str =
+    "SELECT object_id, begin_snapshot, end_snapshot, \"key\", \"value\"
+     FROM ducklake_tag
+     WHERE ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
+     ORDER BY object_id, \"key\"";
+
+pub const SQL_LIST_COLUMN_TAGS: &str =
+    "SELECT table_id, column_id, begin_snapshot, end_snapshot, \"key\", \"value\"
+     FROM ducklake_column_tag
+     WHERE ? >= begin_snapshot
+       AND (? < end_snapshot OR end_snapshot IS NULL)
+     ORDER BY table_id, column_id, \"key\"";
+
 // Queries for table_changes (CDC) - files added/removed between snapshots
 
 pub const SQL_GET_DATA_FILES_ADDED_BETWEEN_SNAPSHOTS: &str = "
@@ -344,6 +372,7 @@ pub const SQL_LIST_ALL_COLUMNS: &str = "
     SELECT
         s.schema_name,
         t.table_name,
+        t.table_id,
         c.column_id,
         c.column_name,
         c.column_type,
@@ -541,6 +570,62 @@ pub struct TableMetadata {
     pub path_is_relative: bool,
 }
 
+/// The kind of catalog object carrying a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagObjectType {
+    Schema,
+    Table,
+    View,
+}
+
+impl TagObjectType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::Table => "table",
+            Self::View => "view",
+        }
+    }
+}
+
+/// A tag target resolved to its stable DuckLake object ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagTarget {
+    Object {
+        object_type: TagObjectType,
+        object_id: i64,
+    },
+    Column {
+        table_id: i64,
+        column_id: i64,
+    },
+}
+
+/// One snapshot-visible DuckLake tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuckLakeTag {
+    pub begin_snapshot: i64,
+    pub end_snapshot: Option<i64>,
+    pub key: String,
+    pub value: Option<String>,
+}
+
+/// One snapshot-visible object tag used by bulk metadata queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectTag {
+    pub object_type: Option<TagObjectType>,
+    pub object_id: i64,
+    pub tag: DuckLakeTag,
+}
+
+/// One snapshot-visible column tag used by bulk metadata queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnTag {
+    pub table_id: i64,
+    pub column_id: i64,
+    pub tag: DuckLakeTag,
+}
+
 /// Table metadata with its schema name (for bulk queries)
 #[derive(Debug, Clone)]
 pub struct TableWithSchema {
@@ -585,6 +670,8 @@ pub struct ColumnWithTable {
     pub schema_name: String,
     /// Name of the table this column belongs to
     pub table_name: String,
+    /// Stable identifier of the containing table.
+    pub table_id: i64,
     /// Column metadata
     pub column: DuckLakeTableColumn,
 }
@@ -1137,7 +1224,7 @@ pub fn reconstruct_columns_with_table(
     for (entry, parent_id) in rows {
         let key = (entry.schema_name, entry.table_name);
         if !grouped.contains_key(&key) {
-            order.push(key.clone());
+            order.push((key.clone(), entry.table_id));
         }
         grouped
             .entry(key)
@@ -1146,7 +1233,7 @@ pub fn reconstruct_columns_with_table(
     }
 
     let mut result = Vec::new();
-    for (schema_name, table_name) in order {
+    for ((schema_name, table_name), table_id) in order {
         let columns = reconstruct_columns(
             grouped
                 .remove(&(schema_name.clone(), table_name.clone()))
@@ -1155,6 +1242,7 @@ pub fn reconstruct_columns_with_table(
         result.extend(columns.into_iter().map(|column| ColumnWithTable {
             schema_name: schema_name.clone(),
             table_name: table_name.clone(),
+            table_id,
             column,
         }));
     }
@@ -1825,6 +1913,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// Check if table exists for a specific snapshot
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool>;
 
+    /// Return tags visible on one schema, table, view, or column.
+    fn get_tags(&self, _target: TagTarget, _snapshot_id: i64) -> Result<Vec<DuckLakeTag>> {
+        Ok(Vec::new())
+    }
+
+    /// Resolve a visible view ID without requiring view query support.
+    fn get_view_id_by_name(
+        &self,
+        _schema_id: i64,
+        _name: &str,
+        _snapshot_id: i64,
+    ) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
     // Bulk query methods for information_schema
 
     /// List all tables across all schemas for a snapshot
@@ -1848,6 +1951,16 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 
     /// List all columns across all tables for a snapshot
     fn list_all_columns(&self, snapshot_id: i64) -> Result<Vec<ColumnWithTable>>;
+
+    /// List all object tags visible at a snapshot.
+    fn list_all_object_tags(&self, _snapshot_id: i64) -> Result<Vec<ObjectTag>> {
+        Ok(Vec::new())
+    }
+
+    /// List all column tags visible at a snapshot.
+    fn list_all_column_tags(&self, _snapshot_id: i64) -> Result<Vec<ColumnTag>> {
+        Ok(Vec::new())
+    }
 
     /// List all files across all tables for a snapshot
     fn list_all_files(&self, snapshot_id: i64) -> Result<Vec<FileWithTable>>;
@@ -2281,6 +2394,7 @@ mod tests {
                 ColumnWithTable {
                     schema_name: "main".into(),
                     table_name: "t".into(),
+                    table_id: 4,
                     column: DuckLakeTableColumn::new(6, "vector".into(), "list".into(), true),
                 },
                 None,
@@ -2289,6 +2403,7 @@ mod tests {
                 ColumnWithTable {
                     schema_name: "main".into(),
                     table_name: "t".into(),
+                    table_id: 4,
                     column: DuckLakeTableColumn::new(7, "element".into(), "float64".into(), true),
                 },
                 Some(6),
