@@ -14,6 +14,24 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
 
+/// `begin_snapshot` of a schema or table row that a write inserted at
+/// `begin_write_transaction` but has not committed yet. No snapshot id reaches
+/// it, so the row stays invisible to every snapshot-scoped read until the commit
+/// stamps the real snapshot id. A write that fails leaves the row pending, and
+/// the next create of the same name reuses it.
+pub(crate) const PENDING_BEGIN_SNAPSHOT: i64 = i64::MAX;
+
+/// A directory path as DuckLake stores it: `data_path`, schema paths, and table
+/// paths end in `/` because readers concatenate the hierarchy without adding
+/// separators.
+pub(crate) fn directory_path(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
 /// Validate a catalog entity name (schema, table, or column).
 ///
 /// Rejects names that are:
@@ -2579,6 +2597,13 @@ mod tests {
     use crate::DuckLakeError;
     use arrow::datatypes::Field;
     use std::sync::Arc;
+
+    #[test]
+    fn directory_path_appends_one_trailing_slash() {
+        assert_eq!(directory_path("main"), "main/");
+        assert_eq!(directory_path("main/"), "main/");
+        assert_eq!(directory_path("s3://bucket/data"), "s3://bucket/data/");
+    }
 
     #[test]
     fn assign_draws_the_next_range_and_advances() {

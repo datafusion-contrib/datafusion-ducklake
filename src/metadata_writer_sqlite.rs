@@ -27,6 +27,7 @@ use crate::metadata_writer::{
     table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
+use crate::metadata_writer::{PENDING_BEGIN_SNAPSHOT, directory_path};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -1020,8 +1021,8 @@ impl SqliteMetadataWriter {
 /// path. Assumes `/`-joined relative names (everything our writer produces).
 const RESOLVED_PATH: &str = "CASE
     WHEN NOT df.path_is_relative THEN df.path
-    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
-    ELSE s.path || '/' || t.path || '/' || df.path
+    WHEN NOT t.path_is_relative THEN RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
+    ELSE RTRIM(s.path, '/') || '/' || RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
 END";
 
 /// Companion to [`RESOLVED_PATH`]: 1 only when the whole chain is relative (so the
@@ -1310,6 +1311,30 @@ async fn migrate_add_partition_id(pool: &SqlitePool) -> Result<()> {
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+/// Give legacy `data_path`, schema path, and table path values the trailing `/`
+/// DuckLake readers expect. Idempotent.
+async fn migrate_directory_paths(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE ducklake_metadata SET value = value || '/'
+         WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2073,8 +2098,10 @@ async fn finalize_table_snapshot(
     base_snapshot: i64,
 ) -> Result<()> {
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
-    // identifies creation even when it has no columns; using an empty live-column
-    // set would misclassify a later schemaless Replace as another create.
+    // identifies creation even when it has no columns: pending from
+    // `begin_write_transaction`, or equal to this snapshot when a caller created
+    // the row at a reserved id through `get_or_create_table`. An empty
+    // live-column set would misclassify a later schemaless Replace as a create.
     let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = sqlx::query_as(
         "SELECT schema.begin_snapshot, table_meta.begin_snapshot
          FROM ducklake_table table_meta
@@ -2133,7 +2160,11 @@ async fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
-    let table_was_created = table_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id).await?;
     let is_ddl = table_was_created
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -2274,10 +2305,10 @@ async fn finalize_table_snapshot(
     }
     let mut ddl_changes = Vec::new();
     if table_was_created {
-        if schema_begin_snapshot == table_begin_snapshot {
-            // A multi-table commit finalizes each staged table in turn; two
-            // tables born with a fresh schema share its begin snapshot, and the
-            // schema's creation must reach the ledger exactly once.
+        if schema_was_created {
+            // The first staged table of a multi-table commit stamps the schema,
+            // so a later table in the same commit finds it published and records
+            // no second creation.
             let schema_entry = format!(
                 "created_schema:{}",
                 crate::metadata_writer::quote_snapshot_name(schema_name),
@@ -2312,6 +2343,35 @@ async fn finalize_table_snapshot(
         )
         .await?;
     }
+    Ok(())
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+async fn publish_pending_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+    )
+    .bind(snapshot_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -2782,13 +2842,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok((schema_id, false));
             }
 
-            let schema_path = path.unwrap_or(name);
+            let schema_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, 1, ?) RETURNING schema_id",
             )
             .bind(name)
-            .bind(schema_path)
+            .bind(&schema_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -2839,14 +2899,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = path.unwrap_or(name);
+            let table_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
                 "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, ?, 1, ?) RETURNING table_id",
             )
             .bind(schema_id)
             .bind(name)
-            .bind(table_path)
+            .bind(&table_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -5472,6 +5532,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        let path = directory_path(path);
         block_on(async {
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL")
                 .execute(&self.pool)
@@ -5481,7 +5542,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "INSERT INTO ducklake_metadata (key, value, scope)
                  VALUES ('data_path', ?, NULL)",
             )
-            .bind(path)
+            .bind(&path)
             .execute(&self.pool)
             .await?;
 
@@ -5557,6 +5618,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .execute(&self.pool)
             .await?;
+            migrate_directory_paths(&self.pool).await?;
             Ok(())
         })
     }
@@ -5618,8 +5680,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                          VALUES (?, ?, 1, ?) RETURNING schema_id",
                     )
                     .bind(schema_name)
-                    .bind(schema_name)
-                    .bind(snapshot_id)
+                    .bind(directory_path(schema_name))
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .fetch_one(&mut *tx)
                     .await?;
                     row.try_get(0)?
@@ -5645,8 +5707,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                     )
                     .bind(schema_id)
                     .bind(table_name)
-                    .bind(table_name)
-                    .bind(snapshot_id)
+                    .bind(directory_path(table_name))
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .fetch_one(&mut *tx)
                     .await?;
                     row.try_get(0)?
@@ -5742,9 +5804,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             // No snapshot row, no column rows, and no Replace retirement are
             // written here — all are deferred to the atomic commit so the head
             // never resolves to an incomplete snapshot. TX-A commits only the
-            // idempotent get-or-create schema/table rows; they carry
-            // begin_snapshot = the reserved id and stay invisible until the
-            // snapshot publishes, since schema/table reads ARE snapshot-scoped.
+            // idempotent get-or-create schema/table rows; a new row carries
+            // begin_snapshot = PENDING_BEGIN_SNAPSHOT, which no snapshot-scoped
+            // read reaches, until the commit stamps the real snapshot id.
             tx.commit().await?;
 
             Ok(WriteSetupResult {
@@ -7542,6 +7604,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_schema_migrates_directory_paths_once() {
+        let (writer, _temp) = create_test_writer().await;
+        writer.set_data_path("/tmp/ducklake-data").unwrap();
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+        async fn paths(pool: &SqlitePool) -> (String, String, String) {
+            let data_path: String = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let schema_path: String = sqlx::query_scalar("SELECT path FROM ducklake_schema")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            let table_path: String = sqlx::query_scalar("SELECT path FROM ducklake_table")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            (data_path, schema_path, table_path)
+        }
+        assert_eq!(
+            paths(&writer.pool).await,
+            (
+                "/tmp/ducklake-data/".to_string(),
+                "main/".to_string(),
+                "users/".to_string()
+            )
+        );
+
+        sqlx::query(
+            "UPDATE ducklake_metadata SET value = '/tmp/ducklake-data' WHERE key = 'data_path'",
+        )
+        .execute(&writer.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ducklake_schema SET path = 'main'")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ducklake_table SET path = 'users'")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            writer.initialize_schema().unwrap();
+            assert_eq!(
+                paths(&writer.pool).await,
+                (
+                    "/tmp/ducklake-data/".to_string(),
+                    "main/".to_string(),
+                    "users/".to_string()
+                )
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_data_path() {
         let (writer, _temp) = create_test_writer().await;
 
@@ -7550,12 +7676,12 @@ mod tests {
 
         // Get data path
         let path = writer.get_data_path().unwrap();
-        assert_eq!(path, "/data/path");
+        assert_eq!(path, "/data/path/");
 
         // Update data path
         writer.set_data_path("/new/path").unwrap();
         let path2 = writer.get_data_path().unwrap();
-        assert_eq!(path2, "/new/path");
+        assert_eq!(path2, "/new/path/");
     }
 
     #[tokio::test(flavor = "multi_thread")]

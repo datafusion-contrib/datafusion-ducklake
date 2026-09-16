@@ -125,9 +125,9 @@ async fn test_create_table_as_select_rejects_rows_without_publishing_metadata() 
         .expect_err("CTAS must not silently discard source rows");
 
     assert!(
-        error
-            .to_string()
-            .contains("CREATE TABLE AS SELECT with rows is not supported"),
+        error.to_string().contains(
+            "CREATE TABLE AS SELECT with rows is not supported through SessionContext::sql"
+        ),
         "{error}"
     );
     assert_eq!(provider.get_current_snapshot().unwrap(), snapshot);

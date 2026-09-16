@@ -14,7 +14,7 @@ use crate::table::DuckLakeTable;
 use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 
 #[cfg(feature = "write")]
-use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode, validate_name};
+use crate::metadata_writer::{ColumnDef, CommitIds, MetadataWriter, WriteMode, validate_name};
 #[cfg(feature = "write")]
 use datafusion::datasource::MemTable;
 #[cfg(feature = "write")]
@@ -26,7 +26,7 @@ use datafusion::error::DataFusionError;
 /// Table names are used to construct file paths, so we must ensure they
 /// don't contain path separators or parent directory references.
 #[cfg(feature = "write")]
-fn validate_table_name(name: &str) -> DataFusionResult<()> {
+pub(crate) fn validate_table_name(name: &str) -> DataFusionResult<()> {
     // Shared name validation (empty, control chars, length)
     validate_name(name, "Table").map_err(|e| DataFusionError::External(Box::new(e)))?;
     if name.contains('/') || name.contains('\\') || name.contains("..") {
@@ -317,7 +317,7 @@ impl SchemaProvider for DuckLakeSchema {
                 })?;
                 if batches.iter().any(|batch| batch.num_rows() > 0) {
                     return Err(DataFusionError::NotImplemented(
-                        "CREATE TABLE AS SELECT with rows is not supported; use CREATE TABLE followed by INSERT INTO ... SELECT".to_string(),
+                        "CREATE TABLE AS SELECT with rows is not supported through SessionContext::sql; run it through execute_ducklake_sql".to_string(),
                     ));
                 }
             }
@@ -334,26 +334,7 @@ impl SchemaProvider for DuckLakeSchema {
             })
             .collect::<DataFusionResult<Vec<_>>>()?;
 
-        // Create table in metadata (creates snapshot, table, columns in a transaction)
-        let setup = writer
-            .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // CREATE TABLE registers no data file, so publish the head here; without
-        // this the new (empty) table never becomes visible on multicatalog
-        // backends that defer the head advance out of begin_write_transaction.
-        let committed = writer
-            .publish_snapshot(
-                setup.table_id,
-                &self.schema_name,
-                &name,
-                setup.snapshot_id,
-                WriteMode::Replace,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.field_ids,
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let committed = publish_empty_table(writer.as_ref(), &self.schema_name, &name, &columns)?;
 
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)
@@ -383,6 +364,36 @@ impl SchemaProvider for DuckLakeSchema {
 
         Ok(Some(Arc::new(writable_table) as Arc<dyn TableProvider>))
     }
+}
+
+/// Create `table_name` with `columns` and no data file, publishing the snapshot
+/// so the empty table becomes visible.
+///
+/// `begin_write_transaction` creates the schema, table, and column rows; the
+/// explicit publish is required because multicatalog backends defer the head
+/// advance out of it, and without a data file nothing else would advance it.
+#[cfg(feature = "write")]
+pub(crate) fn publish_empty_table(
+    writer: &dyn MetadataWriter,
+    schema_name: &str,
+    table_name: &str,
+    columns: &[ColumnDef],
+) -> DataFusionResult<CommitIds> {
+    let setup = writer
+        .begin_write_transaction(schema_name, table_name, columns, WriteMode::Replace)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            schema_name,
+            table_name,
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            columns,
+            &setup.field_ids,
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))
 }
 
 #[cfg(all(test, feature = "write"))]

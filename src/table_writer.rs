@@ -3472,8 +3472,8 @@ where
     upload.shutdown().await
 }
 
-/// Read the parquet footer length (thrift metadata + 8-byte trailer) from the
-/// tail of a finished parquet file on disk. Stored as the nullable
+/// Read the Parquet Thrift metadata length from the tail of a finished file.
+/// The 8-byte length-and-magic trailer is excluded. Stored as the nullable
 /// `footer_size` hint in the catalog; readers fall back to a standard footer
 /// read when it is absent.
 fn read_footer_size(file: &mut std::fs::File) -> Result<i64> {
@@ -3600,9 +3600,8 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
     }
 
     let metadata_len =
-        i32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]])
-            as i64;
-    Ok(metadata_len + 8)
+        u32::from_le_bytes([footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3]]);
+    Ok(i64::from(metadata_len))
 }
 
 #[cfg(test)]
@@ -3953,9 +3952,10 @@ mod tests {
         let buffer = writer.into_inner().unwrap();
 
         let footer_size = calculate_footer_size_from_bytes(&buffer).unwrap();
+        let tail = &buffer[buffer.len() - 8..];
+        let metadata_len = i64::from(u32::from_le_bytes(tail[..4].try_into().unwrap()));
 
-        // Footer should be reasonable size (metadata + 8 bytes)
-        assert!(footer_size >= 8);
-        assert!(footer_size < 10000);
+        assert_eq!(&tail[4..], b"PAR1");
+        assert_eq!(footer_size, metadata_len);
     }
 }

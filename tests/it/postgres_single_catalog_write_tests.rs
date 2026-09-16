@@ -22,7 +22,7 @@ use datafusion_ducklake::MetadataProvider;
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, NullOrder, PartitionTransform, PostgresMetadataProvider,
-    PostgresSingleCatalogMetadataWriter, SortDirection, SortField,
+    PostgresSingleCatalogMetadataWriter, SortDirection, SortField, execute_ducklake_sql,
 };
 
 /// Returns everything the caller must keep alive — dropping the container tears
@@ -183,7 +183,7 @@ async fn paths_are_unscoped_and_relative() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(schema_path, "main", "schema path must not be cat_-scoped");
+    assert_eq!(schema_path, "main/", "schema path must not be cat_-scoped");
     assert!(schema_rel);
 
     let (table_path, table_rel): (String, bool) = sqlx::query_as(
@@ -192,7 +192,7 @@ async fn paths_are_unscoped_and_relative() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(table_path, "users");
+    assert_eq!(table_path, "users/");
     assert!(table_rel);
 
     // The data file lands relative to the resolved table path.
@@ -410,6 +410,55 @@ async fn sql_create_then_insert_then_select() {
         .unwrap()
         .value(0);
     assert_eq!(n, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn sql_create_table_as_select_commits_rows_in_one_snapshot() {
+    let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
+
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let head = catalog.provider().get_current_snapshot().unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_batch(
+        "source",
+        batch(vec![1, 2, 3], vec![Some("one"), None, Some("three")]),
+    )
+    .unwrap();
+
+    execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "CREATE TABLE lake.main.picked AS SELECT id, name FROM source WHERE id <> 2 ORDER BY id",
+    )
+    .await
+    .unwrap();
+
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    assert_eq!(provider.get_current_snapshot().unwrap(), head + 1);
+    let ctx = read_context(&conn_str).await;
+    let batches = ctx
+        .sql("SELECT id, name FROM lake.main.picked ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let names = arrow::compute::cast(batches[0].column(1), &DataType::Utf8).unwrap();
+    let names = names.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(ids.values(), &[1, 3]);
+    assert_eq!(
+        names.iter().collect::<Vec<_>>(),
+        vec![Some("one"), Some("three")]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -905,7 +954,7 @@ async fn set_data_path_replaces_rather_than_duplicates() {
     .await
     .unwrap();
     assert_eq!(rows, 1);
-    assert_eq!(writer.get_data_path().unwrap(), "/tmp/two");
+    assert_eq!(writer.get_data_path().unwrap(), "/tmp/two/");
 }
 
 #[tokio::test(flavor = "multi_thread")]
