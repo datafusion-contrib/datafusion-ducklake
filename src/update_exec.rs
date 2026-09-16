@@ -29,24 +29,11 @@
 //!
 //! # Session lifecycle (important)
 //!
-//! A [`DuckLakeCatalog`](crate::DuckLakeCatalog) pins its snapshot at creation
-//! and never refreshes it, so a `SessionContext` observes ONE catalog generation
-//! for its whole lifetime. An `UPDATE` commits a new snapshot, but the same
-//! session keeps reading the old one. Consequences:
-//!
-//! - A second `UPDATE` in the same session that re-touches a data file modified
-//!   by an earlier `UPDATE` (in that same session) aborts with a
-//!   [`Conflict`](crate::DuckLakeError::Conflict): it resolves against the pinned
-//!   (pre-update) view, so the atomic commit's compare-and-swap disagrees with
-//!   the live catalog. This is the same guard that (correctly) rejects a
-//!   genuinely concurrent writer, so it is safe (the first update is preserved),
-//!   just not retryable in-session.
-//! - A `SELECT` after an `UPDATE`/`INSERT` in the same session returns the
-//!   pre-mutation rows; a just-inserted row cannot be updated in the same
-//!   session (it is invisible to the pinned snapshot).
-//!
-//! To perform multiple mutations, re-open the catalog (or create a fresh
-//! `SessionContext`) between statements so it binds to the latest snapshot.
+//! A writable [`DuckLakeCatalog`](crate::DuckLakeCatalog) advances its shared
+//! snapshot pin only after this operator commits successfully. The next statement
+//! in the same `SessionContext` therefore plans against this update, while a
+//! failed commit leaves the pin unchanged. Commits from other writers do not move
+//! the pin. Catalogs created with `with_snapshot` remain fixed.
 
 use std::fmt::{self, Debug};
 use std::sync::Arc;
@@ -63,6 +50,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream::{self, TryStreamExt};
 
+use crate::catalog::SnapshotPin;
 use crate::compaction::sorted_rewrite_batches;
 use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
 use crate::table::{DuckLakeTable, UpdateSourceScan};
@@ -94,6 +82,7 @@ pub struct DuckLakeUpdateExec {
     /// AND of the WHERE predicates, or `None` to update all rows.
     predicate: Option<Arc<dyn PhysicalExpr>>,
     object_store_url: Arc<ObjectStoreUrl>,
+    snapshot_pin: Option<Arc<SnapshotPin>>,
     cache: Arc<PlanProperties>,
 }
 
@@ -110,6 +99,7 @@ impl DuckLakeUpdateExec {
         assignments: Vec<(usize, Arc<dyn PhysicalExpr>)>,
         predicate: Option<Arc<dyn PhysicalExpr>>,
         object_store_url: Arc<ObjectStoreUrl>,
+        snapshot_pin: Option<Arc<SnapshotPin>>,
     ) -> Self {
         let cache = Self::compute_properties();
         Self {
@@ -122,6 +112,7 @@ impl DuckLakeUpdateExec {
             assignments,
             predicate,
             object_store_url,
+            snapshot_pin,
             cache,
         }
     }
@@ -227,6 +218,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
         let assignments = self.assignments.clone();
         let predicate = self.predicate.clone();
         let object_store_url = self.object_store_url.clone();
+        let snapshot_pin = self.snapshot_pin.clone();
         let output_schema = make_update_count_schema();
 
         let stream = stream::once(async move {
@@ -312,10 +304,13 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .write_batch(&batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
-            session
+            let result = session
                 .finish_with_deletes(&delete_entries)
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if let Some(snapshot_pin) = snapshot_pin.as_ref() {
+                snapshot_pin.advance(result.snapshot_id);
+            }
 
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
             Ok(RecordBatch::try_new(output_schema, vec![count])?)

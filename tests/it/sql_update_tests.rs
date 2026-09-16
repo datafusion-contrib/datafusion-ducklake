@@ -865,12 +865,10 @@ async fn update_change_feed_ignores_unrelated_inserts() {
     );
 }
 
-/// A second UPDATE in the SAME session that re-touches a file the first UPDATE
-/// modified must abort with a clear conflict (the catalog pins its snapshot to
-/// the pre-update generation) — and must NOT corrupt: the first update's result
-/// is preserved and the second row is left unchanged.
+/// A second UPDATE in the same session plans against the first commit and
+/// preserves both changes without triggering the stale-snapshot conflict.
 #[tokio::test(flavor = "multi_thread")]
-async fn update_second_in_session_conflicts_without_corruption() {
+async fn update_second_in_session_uses_refreshed_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     seed_table(&temp_dir, vec![1, 2, 3, 4], vec![10, 20, 30, 40]).await;
 
@@ -884,25 +882,15 @@ async fn update_second_in_session_conflicts_without_corruption() {
         vec![(1, 10), (2, 200), (3, 30), (4, 40)]
     );
 
-    // Second UPDATE (same session, same file) — aborts on the commit CAS.
-    let err = ctx
-        .sql("UPDATE ducklake.main.t SET val = 300 WHERE id = 3")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .expect_err("second in-session UPDATE must conflict, not silently corrupt");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("Re-open the catalog") && msg.contains("THIS session"),
-        "conflict message must explain the pinned-snapshot cause, got: {msg}"
+    assert_eq!(
+        run_dml_count(&ctx, "UPDATE ducklake.main.t SET val = 300 WHERE id = 3").await,
+        1
     );
 
-    // Clean abort: id=2 stays updated, id=3 unchanged, no row lost/duplicated.
     assert_eq!(
         read_pairs(&temp_dir).await,
-        vec![(1, 10), (2, 200), (3, 30), (4, 40)],
-        "aborted UPDATE leaves the first update intact and id=3 unchanged"
+        vec![(1, 10), (2, 200), (3, 300), (4, 40)],
+        "both in-session updates remain visible"
     );
 }
 

@@ -142,8 +142,8 @@ pub use insert_exec::DuckLakeInsertExec;
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
     DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit, RowIdStart,
-    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, WriteMode,
-    WriteResult, WriteSetupResult,
+    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, TruncateResult,
+    WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

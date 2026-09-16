@@ -1,6 +1,7 @@
 //! DuckLake catalog provider implementation
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::Result;
 use crate::information_schema::InformationSchemaProvider;
@@ -28,13 +29,15 @@ struct WriteConfig {
 ///
 /// Connects to a DuckLake catalog database and provides access to schemas and tables.
 /// Uses dynamic metadata lookup - schemas are queried on-demand from the catalog database.
-/// Bound to a specific snapshot ID for query consistency.
+/// Read-only catalogs remain bound to one snapshot. Writable catalogs advance
+/// after their own successful commits while remaining pinned against external
+/// commits.
 #[derive(Debug)]
 pub struct DuckLakeCatalog {
     /// Metadata provider for querying catalog
     provider: Arc<dyn MetadataProvider>,
-    /// Snapshot ID this catalog is bound to (for query consistency)
-    snapshot_id: i64,
+    /// Snapshot used for the next schema or table lookup.
+    snapshot: Arc<SnapshotPin>,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     /// Catalog base path component for resolving relative schema paths (e.g., /prefix/)
@@ -46,6 +49,28 @@ pub struct DuckLakeCatalog {
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
     write_config: Option<WriteConfig>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotPin {
+    snapshot_id: AtomicI64,
+}
+
+impl SnapshotPin {
+    pub(crate) fn new(snapshot_id: i64) -> Self {
+        Self {
+            snapshot_id: AtomicI64::new(snapshot_id),
+        }
+    }
+
+    pub(crate) fn current(&self) -> i64 {
+        self.snapshot_id.load(Ordering::Acquire)
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn advance(&self, snapshot_id: i64) {
+        self.snapshot_id.fetch_max(snapshot_id, Ordering::Release);
+    }
 }
 
 impl DuckLakeCatalog {
@@ -61,7 +86,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: Arc::new(SnapshotPin::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -81,7 +106,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: Arc::new(SnapshotPin::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -139,7 +164,7 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: Arc::new(SnapshotPin::new(snapshot_id)),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -196,21 +221,27 @@ impl DuckLakeCatalog {
             .as_ref()
             .map(|config| Arc::clone(&config.writer))
     }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn advance_snapshot(&self, snapshot_id: i64) {
+        self.snapshot.advance(snapshot_id);
+    }
 }
 
 impl CatalogProvider for DuckLakeCatalog {
     fn schema_names(&self) -> Vec<String> {
+        let snapshot_id = self.snapshot.current();
         // Start with information_schema
         let mut names = vec!["information_schema".to_string()];
 
         // Add data schemas from catalog using the pinned snapshot_id
         let data_schemas = self
             .provider
-            .list_schemas(self.snapshot_id)
+            .list_schemas(snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
                     error = %e,
-                    snapshot_id = %self.snapshot_id,
+                    snapshot_id,
                     "Failed to list schemas from catalog"
                 )
             })
@@ -235,8 +266,9 @@ impl CatalogProvider for DuckLakeCatalog {
             ))));
         }
 
+        let snapshot_id = self.snapshot.current();
         // Query database with the pinned snapshot_id for data schemas
-        match self.provider.get_schema_by_name(name, self.snapshot_id) {
+        match self.provider.get_schema_by_name(name, snapshot_id) {
             Ok(Some(meta)) => {
                 // Resolve schema path hierarchically using path_resolver utility
                 let schema_path =
@@ -257,7 +289,7 @@ impl CatalogProvider for DuckLakeCatalog {
                     meta.schema_id,
                     meta.schema_name,
                     Arc::clone(&self.provider),
-                    self.snapshot_id, // Propagate pinned snapshot_id
+                    snapshot_id, // Propagate pinned snapshot_id
                     self.object_store_url.clone(),
                     schema_path,
                 )
@@ -268,6 +300,7 @@ impl CatalogProvider for DuckLakeCatalog {
                 let schema = if let Some(ref config) = self.write_config {
                     schema
                         .with_writer(Arc::clone(&config.writer))
+                        .with_snapshot_pin(Arc::clone(&self.snapshot))
                         .with_write_options(config.options.clone())
                 } else {
                     schema

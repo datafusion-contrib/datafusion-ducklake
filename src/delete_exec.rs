@@ -24,24 +24,12 @@
 //!
 //! # Session lifecycle (important)
 //!
-//! A [`DuckLakeCatalog`](crate::DuckLakeCatalog) pins its snapshot at creation
-//! and never refreshes it, so a `SessionContext` observes ONE catalog generation
-//! for its whole lifetime. A `DELETE` commits a new snapshot, but the same
-//! session keeps reading the old one. Consequences:
-//!
-//! - A second filtered `DELETE` in the same session that re-touches a data file
-//!   modified by an earlier `DELETE` (in that same session) aborts with a
-//!   [`Conflict`](crate::DuckLakeError::Conflict): it resolves against the pinned
-//!   (pre-delete) view, so its compare-and-swap disagrees with the live catalog.
-//!   This is the SAME guard that (correctly) rejects a genuinely concurrent
-//!   writer — and it is what prevents a stale, non-cumulative delete file from
-//!   resurrecting already-deleted rows.
-//! - A `SELECT` after a `DELETE` (or `INSERT`) in the same session returns the
-//!   pre-mutation rows; a just-inserted row cannot be deleted in the same
-//!   session (it is invisible to the pinned snapshot).
-//!
-//! To perform multiple mutations, re-open the catalog (or create a fresh
-//! `SessionContext`) between statements so it binds to the latest snapshot.
+//! A writable [`DuckLakeCatalog`](crate::DuckLakeCatalog) advances its shared
+//! snapshot pin only after this operator commits successfully. A later delete in
+//! the same session therefore reads the live cumulative delete file instead of
+//! conflicting with its own prior commit. Failed commits and commits from other
+//! writers do not move the pin. Catalogs created with `with_snapshot` remain
+//! fixed.
 
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
@@ -60,6 +48,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
 
+use crate::catalog::SnapshotPin;
 use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter};
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
@@ -100,6 +89,7 @@ pub struct DuckLakeDeleteExec {
     /// Snapshot the table was opened at (the generation the positions were
     /// resolved against); threaded to the commit for conflict diagnostics.
     base_snapshot: i64,
+    snapshot_pin: Option<Arc<SnapshotPin>>,
     cache: Arc<PlanProperties>,
 }
 
@@ -128,8 +118,14 @@ impl DuckLakeDeleteExec {
             table_name,
             table_id,
             base_snapshot,
+            snapshot_pin: None,
             cache,
         }
+    }
+
+    pub(crate) fn with_snapshot_pin(mut self, snapshot_pin: Option<Arc<SnapshotPin>>) -> Self {
+        self.snapshot_pin = snapshot_pin;
+        self
     }
 
     fn compute_properties() -> Arc<PlanProperties> {
@@ -229,6 +225,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
         let table_name = self.table_name.clone();
         let table_id = self.table_id;
         let base_snapshot = self.base_snapshot;
+        let snapshot_pin = self.snapshot_pin.clone();
         let output_schema = make_delete_count_schema();
 
         let stream = stream::once(async move {
@@ -242,6 +239,7 @@ impl ExecutionPlan for DuckLakeDeleteExec {
                 &table_name,
                 table_id,
                 base_snapshot,
+                snapshot_pin,
             )
             .await?;
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![deleted]));
@@ -268,6 +266,7 @@ async fn run_delete(
     table_name: &str,
     table_id: i64,
     base_snapshot: i64,
+    snapshot_pin: Option<Arc<SnapshotPin>>,
 ) -> DataFusionResult<u64> {
     let state: &dyn Session = session_state;
     let table_files = table
@@ -284,9 +283,18 @@ async fn run_delete(
             if table_files.is_empty() && inlined_data.is_empty() {
                 return Ok(0);
             }
-            return writer
-                .commit_truncate(table_id, schema_name, table_name, base_snapshot)
-                .map_err(|e| DataFusionError::External(Box::new(e)));
+            let result = writer
+                .commit_truncate_with_snapshot(table_id, schema_name, table_name, base_snapshot)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if let Some(result) = result {
+                if let Some(snapshot_id) = result.snapshot_id
+                    && let Some(snapshot_pin) = snapshot_pin.as_ref()
+                {
+                    snapshot_pin.advance(snapshot_id);
+                }
+                return Ok(result.records_deleted);
+            }
+            return Ok(0);
         },
         Some(p) => p,
     };
@@ -390,7 +398,7 @@ async fn run_delete(
     // (atomic multi-file DELETE). No new data file is appended, so this uses the
     // dedicated delete-only commit rather than `register_data_file_with_deletes`
     // (which requires an appended file).
-    writer
+    let committed = writer
         .commit_deletes(
             table_id,
             schema_name,
@@ -400,6 +408,9 @@ async fn run_delete(
             &inlined_rows,
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    if let Some(snapshot_pin) = snapshot_pin.as_ref() {
+        snapshot_pin.advance(committed.snapshot_id);
+    }
 
     Ok(total_deleted)
 }

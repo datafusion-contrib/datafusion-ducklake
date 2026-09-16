@@ -5246,11 +5246,22 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn commit_truncate(
         &self,
         table_id: i64,
+        schema_name: &str,
+        table_name: &str,
+        base_snapshot: i64,
+    ) -> Result<u64> {
+        self.commit_truncate_with_snapshot(table_id, schema_name, table_name, base_snapshot)
+            .map(|result| result.map_or(0, |result| result.records_deleted))
+    }
+
+    fn commit_truncate_with_snapshot(
+        &self,
+        table_id: i64,
         // SQLite created the schema/table at begin; names unused (trait parity).
         _schema_name: &str,
         _table_name: &str,
         _base_snapshot: i64,
-    ) -> Result<u64> {
+    ) -> Result<Option<crate::metadata_writer::TruncateResult>> {
         block_on(async {
             // Metadata-only truncate in one snapshot: end every live data file and
             // its live delete file (as drop_table does) and zero the visible stat
@@ -5261,11 +5272,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
 
             // No-op guard: if the table has no live data file there is nothing to
-            // truncate. Return Ok(0) WITHOUT committing so `tx` (and the snapshot
+            // truncate. Return None without committing so `tx` (and the snapshot
             // row insert_snapshot just made) rolls back, leaving no trace — same
             // as `drop_table`'s idempotent early return. Prevents a content-free
-            // snapshot per repeated `DELETE FROM t` when the catalog's pinned
-            // snapshot still sees already-ended files as live.
+            // snapshot per repeated `DELETE FROM t`.
             let has_live_data: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_data_file
                  WHERE table_id = ? AND end_snapshot IS NULL LIMIT 1",
@@ -5275,7 +5285,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             let live_inlined = live_inlined_row_count(&mut tx, table_id).await?;
             if has_live_data.is_none() && live_inlined == 0 {
-                return Ok(0);
+                return Ok(None);
             }
 
             // Rows removed = gross record_count minus still-live delete counts,
@@ -5363,7 +5373,10 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
 
             tx.commit().await?;
-            Ok(live_rows)
+            Ok(Some(crate::metadata_writer::TruncateResult {
+                snapshot_id: Some(snapshot_id),
+                records_deleted: live_rows,
+            }))
         })
     }
 

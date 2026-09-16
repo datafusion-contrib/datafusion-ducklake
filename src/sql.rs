@@ -397,38 +397,31 @@ async fn apply_ducklake_ddl(
         .map_err(DataFusionError::from)?
         .ok_or_else(|| DataFusionError::Plan(format!("table '{table_name}' not found")))?;
 
-    match ddl {
+    let committed_snapshot = match ddl {
         DuckLakeDdl::SetPartition {
             transforms,
             ..
-        } => {
-            writer
-                .set_partition_spec(table.table_id, &transforms)
-                .map_err(DataFusionError::from)?;
-        },
+        } => writer
+            .set_partition_spec(table.table_id, &transforms)
+            .map_err(DataFusionError::from)?,
         DuckLakeDdl::ResetPartition {
             ..
-        } => {
-            writer
-                .reset_partition_spec(table.table_id)
-                .map_err(DataFusionError::from)?;
-        },
+        } => writer
+            .reset_partition_spec(table.table_id)
+            .map_err(DataFusionError::from)?,
         DuckLakeDdl::SetSort {
             fields,
             ..
-        } => {
-            writer
-                .set_sort_spec(table.table_id, &fields)
-                .map_err(DataFusionError::from)?;
-        },
+        } => writer
+            .set_sort_spec(table.table_id, &fields)
+            .map_err(DataFusionError::from)?,
         DuckLakeDdl::ResetSort {
             ..
-        } => {
-            writer
-                .reset_sort_spec(table.table_id)
-                .map_err(DataFusionError::from)?;
-        },
-    }
+        } => writer
+            .reset_sort_spec(table.table_id)
+            .map_err(DataFusionError::from)?,
+    };
+    catalog.advance_snapshot(committed_snapshot);
 
     // DDL returns an empty (0-row) result, matching DataFusion's own DDL.
     let plan = LogicalPlanBuilder::empty(false).build()?;
