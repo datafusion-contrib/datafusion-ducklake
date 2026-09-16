@@ -53,6 +53,7 @@ use crate::metadata_writer::{
     table_storage_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
+use crate::metadata_writer::{PENDING_BEGIN_SNAPSHOT, directory_path};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Decimal128Array,
@@ -518,8 +519,8 @@ fn id_list(ids: &[i64]) -> String {
 
 const RESOLVED_PATH: &str = "CASE
     WHEN NOT df.path_is_relative THEN df.path
-    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
-    ELSE s.path || '/' || t.path || '/' || df.path
+    WHEN NOT t.path_is_relative THEN RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
+    ELSE RTRIM(s.path, '/') || '/' || RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
 END";
 
 const REL_FLAG: &str =
@@ -1249,8 +1250,13 @@ fn record_table_changes(
         params![table_id, snapshot_id],
         |row| row.get(0),
     )?;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id)?;
     let mut changes = Vec::new();
-    if schema_begin_snapshot == snapshot_id {
+    if schema_was_created {
         let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
         let recorded: Option<String> = tx
             .query_row(
@@ -1264,7 +1270,7 @@ fn record_table_changes(
             changes.push(entry);
         }
     }
-    if table_begin_snapshot == snapshot_id {
+    if table_was_created {
         changes.push(format!(
             "created_table:{}",
             quote_snapshot_table(schema_name, table_name)
@@ -1274,6 +1280,23 @@ fn record_table_changes(
     }
     changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata)
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+fn publish_pending_rows(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+        params![snapshot_id, PENDING_BEGIN_SNAPSHOT, table_id],
+    )?;
+    tx.execute(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+        params![snapshot_id, table_id, PENDING_BEGIN_SNAPSHOT],
+    )?;
+    Ok(())
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -2542,7 +2565,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             return Ok((schema_id, false));
         }
 
-        let schema_path = path.unwrap_or(name);
+        let schema_path = directory_path(path.unwrap_or(name));
         let schema_id: i64 = tx.query_row(
             "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
              VALUES (?, ?, true, ?) RETURNING schema_id",
@@ -2590,7 +2613,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
             |row| row.get(0),
         )?;
 
-        let table_path = path.unwrap_or(name);
+        let table_path = directory_path(path.unwrap_or(name));
         let table_id: i64 = tx.query_row(
             "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
              VALUES (?, ?, ?, true, ?) RETURNING table_id",
@@ -4309,6 +4332,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        let path = directory_path(path);
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         tx.execute(
@@ -4371,6 +4395,13 @@ impl MetadataWriter for DuckdbMetadataWriter {
                  SELECT 1 FROM ducklake_metadata WHERE key = 'next_column_id' AND scope IS NULL
              )",
         )?;
+        // Give legacy directory paths the trailing `/` DuckLake readers expect.
+        conn.execute_batch(
+            "UPDATE ducklake_metadata SET value = value || '/'
+             WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/';
+             UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';
+             UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';",
+        )?;
         Ok(())
     }
 
@@ -4426,7 +4457,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, true, ?) RETURNING schema_id",
-                    params![schema_name, schema_name, snapshot_id],
+                    params![schema_name, directory_path(schema_name), PENDING_BEGIN_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }
@@ -4446,7 +4477,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                    params![schema_id, table_name, table_name, snapshot_id],
+                    params![schema_id, table_name, directory_path(table_name), PENDING_BEGIN_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }
@@ -4568,6 +4599,57 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn initialize_schema_migrates_directory_paths_once() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("catalog.ducklake");
+        let writer = DuckdbMetadataWriter::new_with_init(db_path.to_str().unwrap()).unwrap();
+        writer.set_data_path("/tmp/ducklake-data").unwrap();
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+        let paths = |writer: &DuckdbMetadataWriter| {
+            let conn = writer.connection();
+            let data_path: String = conn
+                .query_row(
+                    "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let schema_path: String = conn
+                .query_row("SELECT path FROM ducklake_schema", [], |row| row.get(0))
+                .unwrap();
+            let table_path: String = conn
+                .query_row("SELECT path FROM ducklake_table", [], |row| row.get(0))
+                .unwrap();
+            (data_path, schema_path, table_path)
+        };
+        let expected = (
+            "/tmp/ducklake-data/".to_string(),
+            "main/".to_string(),
+            "users/".to_string(),
+        );
+        assert_eq!(paths(&writer), expected);
+
+        writer
+            .connection()
+            .execute_batch(
+                "UPDATE ducklake_metadata SET value = '/tmp/ducklake-data' WHERE key = 'data_path';
+                 UPDATE ducklake_schema SET path = 'main';
+                 UPDATE ducklake_table SET path = 'users';",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            writer.initialize_schema().unwrap();
+            assert_eq!(paths(&writer), expected);
+        }
+    }
 
     #[test]
     fn duckdb_writer_persists_recursive_columns() {
@@ -4810,7 +4892,10 @@ mod tests {
         let snapshot = provider.get_current_snapshot().unwrap();
         assert_eq!(snapshot, 1, "committed head is snapshot 1");
 
-        assert_eq!(provider.get_data_path().unwrap(), data_path_str);
+        assert_eq!(
+            provider.get_data_path().unwrap(),
+            format!("{data_path_str}/")
+        );
 
         let schema = provider
             .get_schema_by_name("main", snapshot)

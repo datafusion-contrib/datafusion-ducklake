@@ -27,7 +27,7 @@ use datafusion_ducklake::{
     SnapshotCommitMetadata, SourceRetirement, WriteMode, WriteSetupResult,
 };
 use object_store::local::LocalFileSystem;
-use sqlx::{AssertSqlSafe, Row};
+use sqlx::{AssertSqlSafe, MySqlPool, Row};
 use std::sync::Arc;
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
@@ -1401,5 +1401,60 @@ async fn mysql_multi_table_write_commits_nested_inlined_rows_atomically() {
                 .unwrap(),
             vec![expected.clone()]
         );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_initialize_migrates_directory_paths_once() {
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let conn_str = format!("mysql://root@127.0.0.1:{port}/test");
+    let writer = MySqlMetadataWriter::new_with_init(&conn_str).await.unwrap();
+    writer.set_data_path("/tmp/ducklake-data").unwrap();
+    let snapshot_id = writer.create_snapshot().unwrap();
+    let (schema_id, _) = writer
+        .get_or_create_schema("main", None, snapshot_id)
+        .unwrap();
+    writer
+        .get_or_create_table(schema_id, "users", None, snapshot_id)
+        .unwrap();
+    assert_eq!(writer.get_data_path().unwrap(), "/tmp/ducklake-data/");
+
+    let pool = MySqlPool::connect(&conn_str).await.unwrap();
+    sqlx::query(
+        "UPDATE ducklake_metadata SET `value` = '/tmp/ducklake-data' WHERE `key` = 'data_path'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE ducklake_schema SET path = 'main'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_table SET path = 'users'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        writer.initialize_schema().unwrap();
+        let data_path: String = sqlx::query_scalar(
+            "SELECT `value` FROM ducklake_metadata WHERE `key` = 'data_path' AND scope IS NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let schema_path: String = sqlx::query_scalar("SELECT path FROM ducklake_schema")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let table_path: String = sqlx::query_scalar("SELECT path FROM ducklake_table")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(data_path, "/tmp/ducklake-data/");
+        assert_eq!(schema_path, "main/");
+        assert_eq!(table_path, "users/");
     }
 }

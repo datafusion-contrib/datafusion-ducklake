@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CREATE TABLE [IF NOT EXISTS] … AS SELECT` through `execute_ducklake_sql`: the query rows and
+  the table metadata commit in one snapshot on every write backend, columns are nullable as in
+  DuckDB, and an empty result publishes the table without a data file.
+
+### Fixed
+
+- A write that fails after reserving its snapshot no longer surfaces a column-less table when the
+  next commit publishes that snapshot; SQLite, DuckDB, and MySQL keep the row pending until commit.
+- Spec-layout writers store `data_path`, schema paths, and table paths with a trailing `/` and
+  migrate legacy rows on initialization, so DuckDB resolves crate-written data files.
+- `footer_size` now stores the Parquet Thrift metadata length without the eight-byte trailer, so
+  DuckDB's footer prefetch accepts crate-written files.
+
 ## [0.8.0] - 2026-09-16
 
 ### Added

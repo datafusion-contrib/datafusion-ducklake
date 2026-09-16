@@ -36,7 +36,10 @@ PostgreSQL has **two** writers, both behind `write-postgres`:
 Use `PostgresSingleCatalogMetadataWriter` unless you specifically need many
 catalogs in one database. It produces the same catalog shape as the SQLite and
 MySQL writers: no `catalog_id` columns, no `ducklake_catalog*` map tables, and
-unscoped relative paths (`{data_path}/{schema}/{table}/…`).
+unscoped relative paths (`{data_path}/{schema}/{table}/…`). The four spec-layout
+writers store `data_path`, schema paths, and table paths with a trailing `/`, as
+DuckDB does, and initialization appends it to legacy rows so DuckDB can resolve
+crate-written files. The multi-catalog layout keeps its paths as given.
 
 **Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
 multiple independent DuckLake catalogs. Reading multiple catalogs requires
@@ -193,7 +196,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: |
 | `SELECT` against DuckLake tables                                                                                                                                                                                                                                                                                                 | ✅        |
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
-| Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
+| `CREATE TABLE [IF NOT EXISTS] … AS SELECT` via `execute_ducklake_sql` — rows and table metadata in one snapshot, nullable columns as in DuckDB, an empty result publishes no data file; all write backends                                                                                                                       | ✅        |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends)                                                                                                                                                                              | ✅        |
@@ -252,17 +255,25 @@ settings, including `execution.time_zone`, are not inherited.
 
 ---
 
-Non-empty `CREATE TABLE AS SELECT` is rejected before any table metadata is
-published. Create an empty table, reopen the catalog to see its committed
-snapshot, and use `INSERT INTO ... SELECT` to write rows. CTAS support requires
-session and object-store handling that the registration path does not provide.
+`CREATE TABLE … AS SELECT` runs through `execute_ducklake_sql`, which plans the
+query on the session, derives nullable columns from its schema, and commits the
+rows and the table metadata in one snapshot through the session's object store
+with the catalog's write options and schema-scoped settings applied. `IF NOT
+EXISTS` is a no-op on an existing table. `OR REPLACE`, an explicit column list,
+and duplicate result column names fail closed. `SessionContext::sql` still
+rejects a non-empty CTAS before publishing metadata, because DataFusion hands
+the materialized rows to a synchronous registration hook that has no object
+store; an empty CTAS through it keeps creating the empty table.
 
 ## Write concurrency
 
 Write commits allocate a snapshot and publish their data and final metadata in
-one database transaction. Write setup retains each backend's existing schema
-and table reservation behavior; PostgreSQL layouts reserve identifiers without
-publishing schema or table rows.
+one database transaction. Write setup never publishes a schema or table row:
+PostgreSQL layouts reserve identifiers and insert the rows at commit; SQLite,
+DuckDB, and MySQL insert the rows at setup with a pending `begin_snapshot` that
+no snapshot reaches and stamp the committed snapshot at commit. A write that
+fails after setup leaves its row pending and invisible, and the next create of
+that name reuses it.
 
 `DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
 MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field

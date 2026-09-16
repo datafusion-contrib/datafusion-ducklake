@@ -196,6 +196,21 @@ impl DuckLakeCatalog {
             .as_ref()
             .map(|config| Arc::clone(&config.writer))
     }
+
+    /// Write options configured through [`DuckLakeCatalog::with_write_options`],
+    /// or the defaults on a read-only catalog.
+    #[cfg(feature = "write")]
+    pub(crate) fn write_options(&self) -> crate::table_writer::DuckLakeWriteOptions {
+        self.write_config
+            .as_ref()
+            .map(|config| config.options.clone())
+            .unwrap_or_default()
+    }
+
+    /// Object store URL of the catalog's data path.
+    pub(crate) fn object_store_url(&self) -> Arc<ObjectStoreUrl> {
+        Arc::clone(&self.object_store_url)
+    }
 }
 
 impl CatalogProvider for DuckLakeCatalog {

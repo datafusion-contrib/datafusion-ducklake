@@ -103,7 +103,8 @@ async fn writable_open_adds_scope_id_once_and_preserves_global_settings() {
     .unwrap();
 
     assert_eq!(scope_columns, 2);
-    assert_eq!(data_path, "/preserved/path");
+    // Opening a writer migrates the legacy directory path to its `/` form.
+    assert_eq!(data_path, "/preserved/path/");
     let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
     assert_eq!(
         provider

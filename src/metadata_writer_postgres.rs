@@ -683,6 +683,32 @@ pub(crate) async fn migrate_file_ownership_column(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Give legacy `data_path`, schema path, and table path values the trailing `/`
+/// DuckLake readers expect. Idempotent. Used by the single-catalog writer; the
+/// multicatalog layout keeps its paths as given because its cleanup APIs match
+/// `data_path` strings exactly and DuckDB never reads that layout.
+pub(crate) async fn migrate_directory_paths(pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE ducklake_metadata SET value = value || '/'
+         WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Batch size for one `DELETE` inside the orphan purge, and the cap on how many
 /// batches a single call will run. Bounded on purpose: this runs during schema
 /// initialization, which callers do on startup and often behind a lock, so no

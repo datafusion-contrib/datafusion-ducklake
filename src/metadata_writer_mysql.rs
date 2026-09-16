@@ -48,6 +48,7 @@ use crate::metadata_writer::{
     table_storage_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
+use crate::metadata_writer::{PENDING_BEGIN_SNAPSHOT, directory_path};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -72,8 +73,8 @@ fn id_list(ids: &[i64]) -> String {
 
 const RESOLVED_PATH: &str = "CASE
     WHEN NOT df.path_is_relative THEN df.path
-    WHEN NOT t.path_is_relative THEN CONCAT(t.path, '/', df.path)
-    ELSE CONCAT(s.path, '/', t.path, '/', df.path)
+    WHEN NOT t.path_is_relative THEN CONCAT(TRIM(TRAILING '/' FROM t.path), '/', TRIM(LEADING '/' FROM df.path))
+    ELSE CONCAT(TRIM(TRAILING '/' FROM s.path), '/', TRIM(TRAILING '/' FROM t.path), '/', TRIM(LEADING '/' FROM df.path))
 END";
 
 const REL_FLAG: &str =
@@ -1121,8 +1122,13 @@ async fn record_table_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id).await?;
     let mut changes = Vec::new();
-    if schema_begin_snapshot == snapshot_id {
+    if schema_was_created {
         let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
         let recorded: Option<String> = sqlx::query_scalar(
             "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
@@ -1135,7 +1141,7 @@ async fn record_table_changes(
             changes.push(entry);
         }
     }
-    if table_begin_snapshot == snapshot_id {
+    if table_was_created {
         changes.push(format!(
             "created_table:{}",
             quote_snapshot_table(schema_name, table_name)
@@ -1145,6 +1151,55 @@ async fn record_table_changes(
     }
     changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+async fn publish_pending_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+    )
+    .bind(snapshot_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Give legacy `data_path`, schema path, and table path values the trailing `/`
+/// DuckLake readers expect. Idempotent.
+async fn migrate_directory_paths(pool: &MySqlPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE ducklake_metadata SET `value` = CONCAT(`value`, '/')
+         WHERE `key` = 'data_path' AND scope IS NULL AND `value` <> '' AND `value` NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE ducklake_schema SET path = CONCAT(path, '/') WHERE path <> '' AND path NOT LIKE '%/'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE ducklake_table SET path = CONCAT(path, '/') WHERE path <> '' AND path NOT LIKE '%/'")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -2327,14 +2382,14 @@ impl MetadataWriter for MySqlMetadataWriter {
                 return Ok((row.try_get(0)?, false));
             }
 
-            let schema_path = path.unwrap_or(name);
+            let schema_path = directory_path(path.unwrap_or(name));
             // No RETURNING: read the new auto-increment id via last_insert_id().
             let result = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, 1, ?)",
             )
             .bind(name)
-            .bind(schema_path)
+            .bind(&schema_path)
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
@@ -2381,14 +2436,14 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = path.unwrap_or(name);
+            let table_path = directory_path(path.unwrap_or(name));
             let result = sqlx::query(
                 "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, ?, 1, ?)",
             )
             .bind(schema_id)
             .bind(name)
-            .bind(table_path)
+            .bind(&table_path)
             .bind(snapshot_id)
             .execute(&mut *tx)
             .await?;
@@ -4395,6 +4450,7 @@ impl MetadataWriter for MySqlMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        let path = directory_path(path);
         block_on(async {
             sqlx::query(
                 "DELETE FROM ducklake_metadata WHERE `key` = 'data_path' AND scope IS NULL",
@@ -4406,7 +4462,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 "INSERT INTO ducklake_metadata (`key`, `value`, scope)
                  VALUES ('data_path', ?, NULL)",
             )
-            .bind(path)
+            .bind(&path)
             .execute(&self.pool)
             .await?;
 
@@ -4565,6 +4621,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 "SELECT COALESCE(MAX(sort_id), 0) FROM ducklake_sort_info",
             )
             .await?;
+            migrate_directory_paths(&self.pool).await?;
             Ok(())
         })
     }
@@ -4625,8 +4682,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                          VALUES (?, ?, 1, ?)",
                     )
                     .bind(schema_name)
-                    .bind(schema_name)
-                    .bind(snapshot_id)
+                    .bind(directory_path(schema_name))
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64
@@ -4652,8 +4709,8 @@ impl MetadataWriter for MySqlMetadataWriter {
                     )
                     .bind(schema_id)
                     .bind(table_name)
-                    .bind(table_name)
-                    .bind(snapshot_id)
+                    .bind(directory_path(table_name))
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64
