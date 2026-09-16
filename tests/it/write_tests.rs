@@ -2944,3 +2944,78 @@ async fn staged_schema_change_rejects_without_reverting_columns() {
         .collect();
     assert_eq!(values, vec![11, 23]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_first_write_leaves_no_table_for_later_snapshots() {
+    let (writer, temp_dir) = create_test_env().await;
+    let writer = Arc::new(writer);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), create_object_store()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+    let connection = format!("sqlite:{}", temp_dir.path().join("test.db").display());
+    let provider = SqliteMetadataProvider::new(&connection).await.unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+
+    let data_path = temp_dir.path().join("data");
+    let writable = std::fs::metadata(&data_path).unwrap().permissions();
+    let mut read_only = writable.clone();
+    read_only.set_readonly(true);
+    std::fs::set_permissions(&data_path, read_only).unwrap();
+    let failed = table_writer
+        .write_table("main", "failed", from_ref(&batch))
+        .await;
+    std::fs::set_permissions(&data_path, writable).unwrap();
+    assert!(failed.is_err(), "the data directory is not writable");
+    assert_eq!(provider.get_current_snapshot().unwrap(), head);
+
+    // The next commit takes the snapshot id the failed write had reserved.
+    let later = table_writer
+        .write_table("main", "later", from_ref(&batch))
+        .await
+        .unwrap();
+    assert_eq!(later.snapshot_id, head + 1);
+    let schema_id = provider
+        .get_schema_by_name("main", later.snapshot_id)
+        .unwrap()
+        .unwrap()
+        .schema_id;
+    assert!(
+        provider
+            .get_table_by_name(schema_id, "failed", later.snapshot_id)
+            .unwrap()
+            .is_none()
+    );
+
+    // Retrying reuses the pending row instead of adding a second one.
+    let retried = table_writer
+        .write_table("main", "failed", from_ref(&batch))
+        .await
+        .unwrap();
+    assert_eq!(retried.snapshot_id, head + 2);
+    let visible = provider
+        .get_table_by_name(schema_id, "failed", retried.snapshot_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(visible.table_id, retried.table_id);
+    let pool = sqlx::SqlitePool::connect(&connection).await.unwrap();
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_table WHERE table_name = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 1);
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
+    )
+    .bind(retried.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        changes,
+        format!(
+            "created_table:\"main\".\"failed\",inserted_into_table:{}",
+            retried.table_id
+        )
+    );
+}

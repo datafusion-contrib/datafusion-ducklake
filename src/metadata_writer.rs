@@ -14,6 +14,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
 
+/// `begin_snapshot` of a schema or table row that a write inserted at
+/// `begin_write_transaction` but has not committed yet. No snapshot id reaches
+/// it, so the row stays invisible to every snapshot-scoped read until the commit
+/// stamps the real snapshot id. A write that fails leaves the row pending, and
+/// the next create of the same name reuses it.
+pub(crate) const PENDING_BEGIN_SNAPSHOT: i64 = i64::MAX;
+
 /// A directory path as DuckLake stores it: `data_path`, schema paths, and table
 /// paths end in `/` because readers concatenate the hierarchy without adding
 /// separators.

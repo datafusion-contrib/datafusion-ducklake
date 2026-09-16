@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
   by every writer's schema bootstrap and by existing catalogs on their next
   initialization.
+- `CREATE TABLE [IF NOT EXISTS] … AS SELECT` through `execute_ducklake_sql`: the rows and the table
+  metadata commit in one snapshot, with nullable columns as in DuckDB (#308).
 
 ### Changed
 
@@ -170,6 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrate legacy rows on initialization, so DuckDB resolves crate-written data files.
 - `footer_size` stores the Parquet Thrift metadata length without the eight-byte trailer, so
   DuckDB's footer prefetch accepts crate-written files.
+- A write that fails after reserving its snapshot no longer exposes a column-less table to the
+  next commit on SQLite, DuckDB, and MySQL.
 
 ## [0.8.0] - 2026-09-16
 

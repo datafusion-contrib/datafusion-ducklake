@@ -26,7 +26,9 @@ use crate::metadata_writer::{
     table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
-use crate::metadata_writer::{directory_path, is_inlined_system_column, tag_change};
+use crate::metadata_writer::{
+    PENDING_BEGIN_SNAPSHOT, directory_path, is_inlined_system_column, tag_change,
+};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -2190,8 +2192,10 @@ async fn finalize_table_snapshot(
     base_snapshot: i64,
 ) -> Result<()> {
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
-    // identifies creation even when it has no columns; using an empty live-column
-    // set would misclassify a later schemaless Replace as another create.
+    // identifies creation even when it has no columns: pending from
+    // `begin_write_transaction`, or equal to this snapshot when a caller created
+    // the row at a reserved id through `get_or_create_table`. An empty
+    // live-column set would misclassify a later schemaless Replace as a create.
     let (schema_begin_snapshot, table_begin_snapshot): (i64, i64) = sqlx::query_as(
         "SELECT schema.begin_snapshot, table_meta.begin_snapshot
          FROM ducklake_table table_meta
@@ -2250,7 +2254,11 @@ async fn finalize_table_snapshot(
                 .to_string(),
         ));
     }
-    let table_was_created = table_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id).await?;
     let is_ddl = table_was_created
         || catalog_columns_differ(
             &existing_catalog_columns,
@@ -2391,10 +2399,10 @@ async fn finalize_table_snapshot(
     }
     let mut ddl_changes = Vec::new();
     if table_was_created {
-        if schema_begin_snapshot == table_begin_snapshot {
-            // A multi-table commit finalizes each staged table in turn; two
-            // tables born with a fresh schema share its begin snapshot, and the
-            // schema's creation must reach the ledger exactly once.
+        if schema_was_created {
+            // The first staged table of a multi-table commit stamps the schema,
+            // so a later table in the same commit finds it published and records
+            // no second creation.
             let schema_entry = format!(
                 "created_schema:{}",
                 crate::metadata_writer::quote_snapshot_name(schema_name),
@@ -2429,6 +2437,35 @@ async fn finalize_table_snapshot(
         )
         .await?;
     }
+    Ok(())
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+async fn publish_pending_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+    )
+    .bind(snapshot_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -5887,7 +5924,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     )
                     .bind(schema_name)
                     .bind(directory_path(schema_name))
-                    .bind(snapshot_id)
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .fetch_one(&mut *tx)
                     .await?;
                     row.try_get(0)?
@@ -5914,7 +5951,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .bind(schema_id)
                     .bind(table_name)
                     .bind(directory_path(table_name))
-                    .bind(snapshot_id)
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .fetch_one(&mut *tx)
                     .await?;
                     row.try_get(0)?
@@ -6010,9 +6047,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             // No snapshot row, no column rows, and no Replace retirement are
             // written here — all are deferred to the atomic commit so the head
             // never resolves to an incomplete snapshot. TX-A commits only the
-            // idempotent get-or-create schema/table rows; they carry
-            // begin_snapshot = the reserved id and stay invisible until the
-            // snapshot publishes, since schema/table reads ARE snapshot-scoped.
+            // idempotent get-or-create schema/table rows; a new row carries
+            // begin_snapshot = PENDING_BEGIN_SNAPSHOT, which no snapshot-scoped
+            // read reaches, until the commit stamps the real snapshot id.
             tx.commit().await?;
 
             Ok(WriteSetupResult {
