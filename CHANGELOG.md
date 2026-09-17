@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MetadataWriter::register_existing_data_files` promotes many existing files, with their delete
+  files, in one commit, and can establish the table's partition and sort spec on that same
+  snapshot; multicatalog Postgres only (#323).
+- `DataFileInfo::with_partition_values` carries a promoted file's partition values for a spec the
+  same commit is establishing, whose `partition_id` does not exist yet (#323).
+
 ## [0.8.0] - 2026-09-16
 
 ### Added

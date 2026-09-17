@@ -58,8 +58,9 @@ Multi-catalog file ownership: a data or delete file row carries an
 `owner_catalog_id`. `NULL` means the catalog holding the row owns the object and
 reclaims it — including a file it wrote outside its own `cat_{id}/` layout, which
 `begin_write_to_path` does. A row that names another catalog is a *reference* to that
-catalog's file, which is how `register_existing_data_file` (with `with_owner_catalog`)
-lets one catalog share another's files without copying them. Expire and compaction
+catalog's file, which is how `register_existing_data_file` and its batched sibling
+`register_existing_data_files` (with `with_owner_catalog`) let one catalog share another's
+files without copying them. Expire and compaction
 delete such a row without scheduling its object, and `cleanup_old_files_in_catalog`
 does not delete a scheduled object while a reference in any catalog still names it.
 Ownership is deliberately not read off the path spelling: an absolute path says only
