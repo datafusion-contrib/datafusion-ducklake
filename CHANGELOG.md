@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and commit metadata (#318).
 - `StatsSqlDialect::cte_materialization` lets a dialect declare the statistics
   CTE with its engine's materialization modifier; it defaults to none.
+- `MetadataWriter::register_existing_data_files` promotes many existing files, with their delete
+  files, in one commit, and can establish the table's partition and sort spec on that same
+  snapshot; multicatalog Postgres only (#323).
+- `DataFileInfo::with_partition_values` carries a promoted file's partition values for a spec the
+  same commit is establishing, whose `partition_id` does not exist yet (#323).
 
 ### Changed
 

@@ -142,9 +142,9 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit, RowIdStart,
-    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, WriteMode,
-    WriteResult, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
+    PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
+    StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

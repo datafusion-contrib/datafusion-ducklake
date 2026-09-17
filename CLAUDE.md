@@ -250,8 +250,10 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
   `append_table`, the streaming `begin_write` session (one open file per partition, capped by
   `max_open_partitions`), compaction (merges only within a partition, preserving each output's
   generation), and promote (`register_existing_data_file`, which carries caller-supplied values —
-  see its docs for the contract). `enforce_partition_fence` guards every commit path, so a file
-  can never land inconsistent with the table's live spec. See `src/partition.rs`.
+  see its docs for the contract; its plural sibling `register_existing_data_files` promotes N
+  files in one commit and can establish the spec on that same snapshot). `enforce_partition_fence`
+  guards every commit path, so a file can never land inconsistent with the table's live spec.
+  See `src/partition.rs`.
   Not yet supported: `UPDATE`/upsert on a partitioned table — the new row versions span one file
   per partition, but the atomic append+delete commit registers a single data file; the session's
   `finish_with_deletes` refuses it with a typed error. Likewise
