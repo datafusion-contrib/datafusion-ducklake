@@ -5706,6 +5706,803 @@ async fn register_existing_data_file_rejects_mismatched_column_ids() {
     );
 }
 
+/// A whole table's files are adopted in ONE snapshot, not one per file.
+///
+/// This is the fork shape: every file of a source generation registered by
+/// reference, copying no objects. One commit means the destination is never
+/// visible holding a prefix of the batch, so the caller's rollback stops being
+/// load-bearing — and vacuum has one snapshot to keep rather than N.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_promotes_a_whole_table_in_one_snapshot() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let source = mgr.create_catalog("fork_source").await.unwrap();
+    let dest = mgr.create_catalog("fork_dest").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), dest)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    let before = current_head(&pool, dest).await;
+    let batch = vec![
+        PromotedFile::new(
+            DataFileInfo::new("/src/f1.parquet", 1024, 3)
+                .with_absolute_path()
+                .with_owner_catalog(source),
+        ),
+        PromotedFile::new(
+            DataFileInfo::new("/src/f2.parquet", 2048, 5)
+                .with_absolute_path()
+                .with_owner_catalog(source),
+        )
+        .with_delete(
+            DeleteFileInfo::new("/src/d2.parquet", 64, 2)
+                .with_absolute_path()
+                .with_owner_catalog(source),
+        ),
+        PromotedFile::new(
+            DataFileInfo::new("/src/f3.parquet", 512, 2)
+                .with_absolute_path()
+                .with_owner_catalog(source),
+        ),
+    ];
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &batch,
+            None,
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let head = current_head(&pool, dest).await;
+    assert_eq!(
+        head, out.snapshot_id,
+        "the batch's snapshot must be the catalog head"
+    );
+    let snapshots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_catalog_snapshot_map
+         WHERE catalog_id = $1 AND snapshot_id > $2",
+    )
+    .bind(dest)
+    .bind(before)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshots, 1,
+        "three files must land in exactly one snapshot"
+    );
+    // One snapshot, so one changes_made line covering the table's creation and the
+    // insert — three files do not make three entries.
+    assert_eq!(
+        snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
+        Some(
+            format!(
+                "created_schema:\"public\",created_table:\"public\".\"orders\",\
+                 inserted_into_table:{}",
+                out.table_id
+            )
+            .as_str()
+        ),
+    );
+
+    // Every file is live at that one snapshot, each naming the source as owner.
+    let rows = sqlx::query(
+        "SELECT path, begin_snapshot, row_id_start, owner_catalog_id FROM ducklake_data_file
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY path",
+    )
+    .bind(out.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>(0).unwrap(),
+            r.try_get::<i64, _>(1).unwrap(),
+            r.try_get::<Option<i64>, _>(2).unwrap(),
+            r.try_get::<Option<i64>, _>(3).unwrap(),
+        )
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3, "every file of the batch must be live");
+    for (path, begin, _, owner) in &rows {
+        assert_eq!(
+            *begin, out.snapshot_id,
+            "{path} must begin at the batch's snapshot"
+        );
+        assert_eq!(
+            *owner,
+            Some(source),
+            "{path} must reference the source catalog"
+        );
+    }
+
+    // The row-id allocator moves file by file inside the batch, so the adopted
+    // files get disjoint ranges — the same as N separate commits would give.
+    assert_eq!(
+        rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+        vec![Some(0), Some(3), Some(8)],
+        "each file must draw its own range: 3 rows, then 5, then 2"
+    );
+
+    let (records, bytes, next_row_id): (i64, i64, i64) = sqlx::query(
+        "SELECT record_count, file_size_bytes, next_row_id FROM ducklake_table_stats
+         WHERE table_id = $1",
+    )
+    .bind(out.table_id)
+    .fetch_one(&pool)
+    .await
+    .map(|r| {
+        (
+            r.try_get(0).unwrap(),
+            r.try_get(1).unwrap(),
+            r.try_get(2).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!((records, bytes, next_row_id), (10, 3584, 10));
+
+    // The delete file travels with its data file: same snapshot, hanging off the
+    // id assigned to f2, and referencing the source's object.
+    let (delete_path, delete_owner, delete_begin, delete_of): (String, Option<i64>, i64, String) =
+        sqlx::query(
+            "SELECT del.path, del.owner_catalog_id, del.begin_snapshot, df.path
+             FROM ducklake_delete_file AS del
+             JOIN ducklake_data_file AS df ON df.data_file_id = del.data_file_id
+             WHERE del.table_id = $1",
+        )
+        .bind(out.table_id)
+        .fetch_one(&pool)
+        .await
+        .map(|r| {
+            (
+                r.try_get(0).unwrap(),
+                r.try_get(1).unwrap(),
+                r.try_get(2).unwrap(),
+                r.try_get(3).unwrap(),
+            )
+        })
+        .unwrap();
+    assert_eq!(delete_path, "/src/d2.parquet");
+    assert_eq!(delete_owner, Some(source));
+    assert_eq!(delete_begin, out.snapshot_id);
+    assert_eq!(
+        delete_of, "/src/f2.parquet",
+        "the delete must hang off the data file it was paired with"
+    );
+}
+
+/// A partitioned fork is one commit: the columns are created under the source's
+/// ids, the spec is set against them, and the files are fenced — all on the same
+/// snapshot.
+///
+/// Before this, the layout DDL could not be part of the promote at all: the spec
+/// names its keys by column NAME, and the only call that creates the destination's
+/// columns with the SOURCE's `column_ids` is the promote itself. Callers had to
+/// register a throwaway file to mint the columns, SET the spec, then register the
+/// real batch — N+2 snapshots, one retired duplicate row, and a delete file
+/// stranded on the retired bootstrap file.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_establishes_the_layout_in_the_same_commit() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromoteLayout, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("fork_partitioned").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    let layout = PromoteLayout {
+        partition_by: vec![("name".to_string(), PartitionTransform::Identity)],
+        sorted_by: vec![SortField {
+            sort_key_index: 0,
+            expression: "id".to_string(),
+            dialect: "duckdb".to_string(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::NullsFirst,
+        }],
+    };
+    // The generation does not exist yet, so each file carries VALUES only.
+    let batch = vec![
+        PromotedFile::new(
+            DataFileInfo::new("name=us/f1.parquet", 1024, 3)
+                .with_partition_values(vec![(0, Some("us".to_string()))]),
+        ),
+        PromotedFile::new(
+            DataFileInfo::new("name=de/f2.parquet", 512, 2)
+                .with_partition_values(vec![(0, Some("de".to_string()))]),
+        ),
+    ];
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &batch,
+            Some(&layout),
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let snapshots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1",
+    )
+    .bind(cat)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshots, 1,
+        "table, columns, partition spec, sort spec and both files are ONE commit"
+    );
+
+    // The spec is live, keyed on the column created under the ADOPTED id — which
+    // is what the promoted parquet's embedded field-ids resolve against. Getting
+    // this wrong (spec first, from freshly minted ids) makes every file read back
+    // all-NULL, so the id is the assertion that matters.
+    let spec = w.live_partition_spec(out.table_id).unwrap().unwrap();
+    let (key_column_id, transform): (i64, String) = sqlx::query(
+        "SELECT column_id, transform FROM ducklake_partition_column
+         WHERE table_id = $1 AND partition_id = $2 AND partition_key_index = 0",
+    )
+    .bind(out.table_id)
+    .bind(spec.partition_id)
+    .fetch_one(&pool)
+    .await
+    .map(|r| (r.try_get(0).unwrap(), r.try_get(1).unwrap()))
+    .unwrap();
+    assert_eq!(
+        key_column_id, 200,
+        "the key must resolve to the adopted column id"
+    );
+    assert_eq!(transform, "identity");
+    assert_eq!(
+        w.live_sort_spec(out.table_id)
+            .unwrap()
+            .map(|s| s.fields.len()),
+        Some(1),
+        "the sort spec must be live off the same commit"
+    );
+
+    // Both files are stamped with the generation this commit minted, and carry
+    // their values, so each is prunable. No bootstrap registration means no
+    // retired row.
+    let rows = sqlx::query(
+        "SELECT df.path, df.partition_id, fpv.partition_value, df.end_snapshot
+         FROM ducklake_data_file AS df
+         LEFT JOIN ducklake_file_partition_value AS fpv
+           ON fpv.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 ORDER BY df.path",
+    )
+    .bind(out.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.try_get::<String, _>(0).unwrap(),
+            r.try_get::<Option<i64>, _>(1).unwrap(),
+            r.try_get::<Option<String>, _>(2).unwrap(),
+            r.try_get::<Option<i64>, _>(3).unwrap(),
+        )
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "name=de/f2.parquet".to_string(),
+                Some(spec.partition_id),
+                Some("de".to_string()),
+                None
+            ),
+            (
+                "name=us/f1.parquet".to_string(),
+                Some(spec.partition_id),
+                Some("us".to_string()),
+                None
+            ),
+        ],
+        "every file is stamped with the minted generation and nothing is retired"
+    );
+
+    // Creating the table and setting its spec on one snapshot is ONE DDL, so the
+    // schema-version ledger must carry one row, not two.
+    let ddl_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_schema_versions WHERE table_id = $1")
+            .bind(out.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ddl_rows, 1, "one snapshot must bump schema_version once");
+    // Upstream builds its schema-change set from altered tables plus newly created
+    // ones, and does not also report a table created in the same transaction as
+    // altered. A table created and partitioned here is therefore `created_table`
+    // alone — reporting both would make one DDL read as two in DuckDB's
+    // `ducklake_snapshots()`.
+    assert_eq!(
+        snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
+        Some(
+            format!(
+                "created_schema:\"public\",created_table:\"public\".\"orders\",\
+                 inserted_into_table:{}",
+                out.table_id
+            )
+            .as_str()
+        ),
+        "a table created and given its layout on one snapshot is created, not altered"
+    );
+}
+
+/// Establishing a spec on an existing, otherwise-unchanged table still counts as
+/// DDL — the promote must bump `schema_version` the way `set_partition_spec`
+/// does, or a reader caching by version keeps pruning against the old layout.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_bumps_schema_version_for_a_late_layout() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromoteLayout, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("late_layout").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    let created = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f0.parquet", 128, 1),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    let version_before: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(created.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let layout = PromoteLayout {
+        partition_by: vec![("name".to_string(), PartitionTransform::Identity)],
+        ..Default::default()
+    };
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &[PromotedFile::new(
+                DataFileInfo::new("name=us/f1.parquet", 256, 1)
+                    .with_partition_values(vec![(0, Some("us".to_string()))]),
+            )],
+            Some(&layout),
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    let version_after: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(out.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        version_after,
+        version_before + 1,
+        "setting a partition spec is DDL and must bump schema_version"
+    );
+    let ledger: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_schema_versions
+         WHERE table_id = $1 AND begin_snapshot = $2",
+    )
+    .bind(out.table_id)
+    .bind(out.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger, 1, "exactly one ledger row per DDL snapshot");
+
+    // Replace retires the prior generation once for the whole batch, so the
+    // bootstrap file is gone and only the promoted one is live.
+    let live: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(out.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, vec!["name=us/f1.parquet".to_string()]);
+    // The table already existed, so the spec is a genuine alteration and must be
+    // reported as one — the mirror of the created-table case above.
+    assert_eq!(
+        snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
+        Some(format!("altered_table:{0},inserted_into_table:{0}", out.table_id).as_str()),
+    );
+}
+
+/// A `partition_id` supplied alongside a layout that mints one can only name a
+/// generation this very commit retires, so it is refused rather than silently
+/// overwritten — the caller is working from a stale spec and should know.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_rejects_a_stale_partition_id_under_a_new_layout() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromoteLayout, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("stale_pid").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let layout = PromoteLayout {
+        partition_by: vec![("name".to_string(), PartitionTransform::Identity)],
+        ..Default::default()
+    };
+    let err = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &[100, 200],
+            &[PromotedFile::new(
+                DataFileInfo::new("name=us/f1.parquet", 256, 1)
+                    .with_partition(77, vec![(0, Some("us".to_string()))]),
+            )],
+            Some(&layout),
+            WriteMode::Replace,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("with_partition_values"),
+        "the error must name the fix, got: {err}"
+    );
+    assert_eq!(
+        current_head(&pool, cat).await,
+        0,
+        "nothing is committed on a validation failure"
+    );
+}
+
+/// The batch is atomic: one bad file rolls the whole commit back, so the
+/// destination is never left holding a prefix of the fork.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_commits_all_or_nothing() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromoteLayout, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("atomic_promote").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let layout = PromoteLayout {
+        partition_by: vec![("name".to_string(), PartitionTransform::Identity)],
+        ..Default::default()
+    };
+    // The second file's value count disagrees with the one-key spec. The failure
+    // surfaces mid-loop, after the first file's row is already inserted.
+    let batch = vec![
+        PromotedFile::new(
+            DataFileInfo::new("name=us/f1.parquet", 256, 1)
+                .with_partition_values(vec![(0, Some("us".to_string()))]),
+        ),
+        PromotedFile::new(
+            DataFileInfo::new("name=de/f2.parquet", 256, 1).with_partition_values(vec![
+                (0, Some("de".to_string())),
+                (1, Some("2024".to_string())),
+            ]),
+        ),
+    ];
+    assert!(
+        w.register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &[100, 200],
+            &batch,
+            Some(&layout),
+            WriteMode::Replace,
+        )
+        .is_err(),
+        "a file whose values do not fit the spec must abort the batch"
+    );
+
+    assert_eq!(
+        current_head(&pool, cat).await,
+        0,
+        "no snapshot may become visible when part of the batch fails"
+    );
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        files, 0,
+        "the first file's row must roll back with the rest"
+    );
+    let specs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_partition_info")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(specs, 0, "the layout must roll back too");
+}
+
+/// A path may appear once per batch.
+///
+/// Official's plural entry point deduplicates instead (`ducklake_add_data_files`
+/// skips a path it has already processed, so overlapping globs yield one row per
+/// distinct file). That is right for bare paths, which are interchangeable. An
+/// entry here carries the caller's own counts, row-id policy, ownership and delete
+/// file, so keeping the first silently drops the rest — including, in the case
+/// below, a delete file that only the second entry carries. The destination would
+/// then read rows the source had deleted.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_refuses_a_repeated_path() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("repeat_path").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let batch = vec![
+        PromotedFile::new(DataFileInfo::new("f1.parquet", 1024, 3)),
+        // Same path, and the metadata disagrees: this one carries a delete file.
+        PromotedFile::new(DataFileInfo::new("f1.parquet", 1024, 3))
+            .with_delete(DeleteFileInfo::new("d1.parquet", 64, 2)),
+    ];
+    let err = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &[100, 200],
+            &batch,
+            None,
+            WriteMode::Replace,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("more than once"),
+        "the error must name the repeat, got: {err}"
+    );
+    assert_eq!(
+        current_head(&pool, cat).await,
+        0,
+        "nothing is committed on a validation failure"
+    );
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 0, "one object must never get two live rows");
+}
+
+/// Partition values with no generation to hang them off are refused.
+///
+/// The mirror of the stale-`partition_id` rejection, and the one nothing
+/// downstream catches: the fence passes when the file's id and the live id are
+/// both NULL, and value validation is gated on the file's id — so the values would
+/// reach `ducklake_file_partition_value` under a NULL `partition_id` in a table
+/// with no live spec, a shape no reader can use.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_refuses_partition_values_with_no_spec() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("orphan_values").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    // No layout, and the table this creates is unpartitioned.
+    let err = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &[100, 200],
+            &[PromotedFile::new(
+                DataFileInfo::new("f1.parquet", 256, 1)
+                    .with_partition_values(vec![(0, Some("2024".to_string()))]),
+            )],
+            None,
+            WriteMode::Replace,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no live spec") || err.contains("names no partition generation"),
+        "the error must say the values have nothing to belong to, got: {err}"
+    );
+    assert_eq!(current_head(&pool, cat).await, 0);
+    let values: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_file_partition_value")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        values, 0,
+        "no partition value may be stored without a generation"
+    );
+}
+
+/// An empty batch creates the table and its layout with no data — the documented
+/// degenerate case, and the one where the `files.is_empty()` branches run.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_accepts_an_empty_batch() {
+    use datafusion_ducklake::metadata_writer::PromoteLayout;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("empty_batch").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let layout = PromoteLayout {
+        partition_by: vec![("name".to_string(), PartitionTransform::Identity)],
+        ..Default::default()
+    };
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &[100, 200],
+            &[],
+            Some(&layout),
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    assert_eq!(current_head(&pool, cat).await, out.snapshot_id);
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 0);
+    let spec = w.live_partition_spec(out.table_id).unwrap();
+    assert!(
+        spec.is_some(),
+        "the layout must be established even with no files"
+    );
+    // No file landed, so the snapshot reports the table's creation and nothing else.
+    assert_eq!(
+        snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
+        Some("created_schema:\"public\",created_table:\"public\".\"orders\""),
+        "an empty batch must not claim an insert"
+    );
+}
+
+/// A sort-only layout writes the sort generation and does NOT bump
+/// `schema_version` — upstream treats `SET_SORT_KEY` as an altered table without a
+/// schema-version change, unlike `SET_PARTITION_KEY`. The combined test exercises
+/// both specs together, so this is the branch where `partition_by` is empty.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_sort_only_layout_does_not_bump_schema_version() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, PromoteLayout, PromotedFile};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("sort_only").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let ids = vec![100_i64, 200_i64];
+    let created = w
+        .register_existing_data_file(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("f0.parquet", 128, 1),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    let version_before: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(created.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    let layout = PromoteLayout {
+        sorted_by: vec![SortField {
+            sort_key_index: 0,
+            expression: "id".to_string(),
+            dialect: "duckdb".to_string(),
+            direction: SortDirection::Asc,
+            null_order: NullOrder::NullsFirst,
+        }],
+        ..Default::default()
+    };
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &cols(),
+            &ids,
+            &[PromotedFile::new(DataFileInfo::new("f1.parquet", 256, 1))],
+            Some(&layout),
+            WriteMode::Append,
+        )
+        .unwrap();
+
+    assert_eq!(
+        w.live_sort_spec(out.table_id)
+            .unwrap()
+            .map(|s| s.fields.len()),
+        Some(1),
+        "the sort spec must be live off the promote's snapshot"
+    );
+    let version_after: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1")
+            .bind(out.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        version_after, version_before,
+        "a sort order change is not DDL and must carry schema_version forward"
+    );
+    let ledger: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot = $1",
+    )
+    .bind(out.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger, 0, "no schema-version row for a sort-only change");
+    // The table already existed and its columns did not change, so the only DDL
+    // this snapshot reports is the sort change.
+    assert_eq!(
+        snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
+        Some(format!("altered_table:{0},inserted_into_table:{0}", out.table_id).as_str()),
+        "a sort-only layout reports altered_table alongside the insert"
+    );
+}
+
 /// Per-column stats round-trip through the multicatalog writer with the right
 /// value on the right column.
 ///

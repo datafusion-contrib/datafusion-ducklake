@@ -849,6 +849,19 @@ impl DataFileInfo {
         self
     }
 
+    /// Attach per-key partition values WITHOUT a spec generation, for a file
+    /// promoted by [`MetadataWriter::register_existing_data_files`] whose batch
+    /// also establishes the partition spec ([`PromoteLayout::partition_by`]). The
+    /// generation does not exist until that commit mints it, so the batch stamps
+    /// the `partition_id` in; the caller supplies only the values.
+    ///
+    /// Use [`with_partition`](Self::with_partition) whenever the spec is already
+    /// live and its `partition_id` is therefore knowable.
+    pub fn with_partition_values(mut self, partition_values: Vec<(i32, Option<String>)>) -> Self {
+        self.partition_values = partition_values;
+        self
+    }
+
     /// Mark this file as having an absolute path.
     ///
     /// This says only how the path is spelled, NOT who owns the object: a catalog's
@@ -1135,6 +1148,67 @@ impl DeleteFileInfo {
     pub fn with_owner_catalog(mut self, owner_catalog_id: i64) -> Self {
         self.owner_catalog_id = Some(owner_catalog_id);
         self
+    }
+}
+
+/// One file of a [`MetadataWriter::register_existing_data_files`] batch: an
+/// already-written data file to adopt, plus the positional delete file that
+/// travels with it.
+#[derive(Debug, Clone)]
+pub struct PromotedFile {
+    /// The data file to register.
+    pub file: DataFileInfo,
+    /// Its existing positional delete file, registered in the same commit and
+    /// hanging off the `data_file_id` this call assigns. `None` when the source
+    /// file has no live deletes.
+    pub delete: Option<DeleteFileInfo>,
+}
+
+impl PromotedFile {
+    /// Promote `file` with no delete file.
+    pub fn new(file: DataFileInfo) -> Self {
+        Self {
+            file,
+            delete: None,
+        }
+    }
+
+    /// Attach the file's existing positional delete file.
+    pub fn with_delete(mut self, delete: DeleteFileInfo) -> Self {
+        self.delete = Some(delete);
+        self
+    }
+}
+
+/// The table layout a [`MetadataWriter::register_existing_data_files`] batch
+/// establishes on its own snapshot, before its files are fenced against it.
+///
+/// A partition spec names its key columns by NAME, so it can only be set once a
+/// commit has created those columns — and for a promote, the only commit that
+/// creates them under the *source's* `column_ids` is the promote itself. Setting
+/// the spec here closes that gap: the columns are inserted, the spec is written
+/// against them, and the batch's files are fenced against it, all in one snapshot.
+///
+/// An empty field leaves that spec alone; it does not reset one. Use
+/// [`MetadataWriter::reset_partition_spec`] / [`MetadataWriter::reset_sort_spec`]
+/// to remove a spec.
+#[derive(Debug, Clone, Default)]
+pub struct PromoteLayout {
+    /// Partition keys in key order, as for
+    /// [`MetadataWriter::set_partition_spec`]. When non-empty, the batch mints a
+    /// fresh partition generation and stamps its `partition_id` onto every file,
+    /// so each file supplies only its
+    /// [`partition_values`](DataFileInfo::partition_values) — see
+    /// [`DataFileInfo::with_partition_values`].
+    pub partition_by: Vec<(String, crate::partition::PartitionTransform)>,
+    /// Sort keys in key order, as for [`MetadataWriter::set_sort_spec`].
+    pub sorted_by: Vec<crate::sort::SortField>,
+}
+
+impl PromoteLayout {
+    /// True when neither spec is set, i.e. the batch establishes no layout.
+    pub fn is_empty(&self) -> bool {
+        self.partition_by.is_empty() && self.sorted_by.is_empty()
     }
 }
 
@@ -2496,6 +2570,97 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Err(DuckLakeError::InvalidConfig(
             "register_existing_data_file is not supported by this metadata writer".to_string(),
         ))
+    }
+
+    /// Promote MANY existing files — and, optionally, establish the table's
+    /// partition and sort specs — in ONE commit.
+    ///
+    /// The plural sibling of [`register_existing_data_file_with_delete`], with the
+    /// same per-file contract: every rule that method documents about column ids,
+    /// ownership, row lineage, partition assignments and sort order holds here,
+    /// per entry. What changes is the commit boundary. A caller adopting a whole
+    /// table — a database fork, registering every file of a source generation by
+    /// reference — lands ONE snapshot rather than N, and either the whole batch is
+    /// visible or none of it is.
+    ///
+    /// `mode` applies to the batch as a whole: `Replace` retires the prior
+    /// generation once, before any of `files` is inserted, so the batch reads as a
+    /// single new generation rather than N successive replaces (which would leave
+    /// only the last file live). `files` may be empty, which creates the table (and
+    /// its layout) with no data.
+    ///
+    /// A path may appear at most once. Each entry becomes its own
+    /// `ducklake_data_file` row, so a repeat would double the table's record count
+    /// and give one object two row-id ranges. Official's plural entry point
+    /// deduplicates rather than refusing, which is right for it: its entries are
+    /// bare paths from glob expansion, so two for one path are identical and
+    /// dropping one loses nothing. An entry here carries the caller's own record
+    /// count, sizes, row-id policy, partition values, ownership and delete file, so
+    /// two entries for one path can disagree — and silently keeping the first would
+    /// drop a delete file the second carried, making the destination read rows the
+    /// source had deleted.
+    ///
+    /// # Layout
+    ///
+    /// `layout` writes the partition and/or sort spec on this commit's snapshot,
+    /// after the columns are inserted and before the files are fenced. That
+    /// ordering is the point: a partition spec names its key columns by NAME, and
+    /// a column is only resolvable once a commit has created it — but the only
+    /// commit that creates the destination's columns under the SOURCE's
+    /// `column_ids` (which the promoted parquet's embedded field-ids resolve
+    /// against) is this one. Without it, a partitioned promote has to register a
+    /// throwaway file first just to mint the columns, then set the spec, then
+    /// register the real batch.
+    ///
+    /// When `layout` sets a partition spec, its `partition_id` does not exist
+    /// until this commit mints it, so each file carries values only (
+    /// [`DataFileInfo::with_partition_values`]) and the batch stamps the new
+    /// generation onto every one. A file that already carries a `partition_id` is
+    /// rejected: it can only name a generation this call is about to supersede.
+    /// With no partition spec in `layout`, files carry their own `partition_id` as
+    /// usual ([`DataFileInfo::with_partition`]) and are fenced against the live
+    /// generation.
+    ///
+    /// The mirror case is rejected too: partition values on a file that names no
+    /// generation, promoted into a table with no live spec. There is nothing for
+    /// such values to mean, and persisting them would leave
+    /// `ducklake_file_partition_value` rows hanging off a `NULL partition_id`.
+    ///
+    /// # Default
+    ///
+    /// Unsupported, except that a single file with no layout falls through to
+    /// [`register_existing_data_file_with_delete`] — so a backend implementing only
+    /// the singular still serves the degenerate batch. Only multicatalog Postgres,
+    /// whose column ids are reusable across catalogs, implements the rest.
+    ///
+    /// [`register_existing_data_file_with_delete`]: MetadataWriter::register_existing_data_file_with_delete
+    #[allow(clippy::too_many_arguments)]
+    fn register_existing_data_files(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        files: &[PromotedFile],
+        layout: Option<&PromoteLayout>,
+        mode: WriteMode,
+    ) -> Result<CommitIds> {
+        let no_layout = layout.is_none_or(PromoteLayout::is_empty);
+        match files {
+            [only] if no_layout => self.register_existing_data_file_with_delete(
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                &only.file,
+                only.delete.as_ref(),
+                mode,
+            ),
+            _ => Err(DuckLakeError::InvalidConfig(
+                "register_existing_data_files (batched promote / layout) is not supported by                  this metadata writer"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
