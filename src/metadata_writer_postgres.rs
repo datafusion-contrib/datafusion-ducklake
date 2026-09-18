@@ -4078,8 +4078,40 @@ impl MetadataWriter for PostgresMetadataWriter {
         };
         let mints_partition_spec = layout.is_some_and(|layout| !layout.partition_by.is_empty());
 
+        // One path may appear once in a batch. Official's plural entry point
+        // DEDUPLICATES instead, keeping the first and skipping the rest
+        // (`ducklake_add_data_files.cpp:241-246` at d8a1881, pinned by
+        // `test/sql/add_files/add_files_overlapping_globs.test`), because its entries
+        // are bare paths produced by glob expansion: overlapping globs are routine,
+        // and two entries for one path are byte-identical, so dropping one loses
+        // nothing.
+        //
+        // Here an entry is not a path but a `PromotedFile` carrying record count,
+        // sizes, row-id policy, partition values, ownership and its own delete file —
+        // none of it derived, all of it the caller's. Two entries for one path can
+        // disagree on every field, so "keep the first" is a silent choice between
+        // them. The case that decides it: two entries, same path, only the second
+        // carrying the delete file. Deduplicating drops that delete and the
+        // destination then reads rows the source had deleted — a wrong answer
+        // produced by the safer-looking option. Refusing loses nothing, since a
+        // caller passing an explicit list has no glob to overlap.
+        //
+        // Exact spellings only. Two ways of writing one object (relative vs absolute)
+        // are not resolvable here — that needs the table path the commit has not
+        // looked up yet — and official's normalization is likewise about glob and URL
+        // forms, not catalog path resolution.
+        let mut seen_paths = std::collections::HashSet::with_capacity(files.len());
         for entry in files {
             let (file, delete) = (&entry.file, entry.delete.as_ref());
+            if !seen_paths.insert(file.path.as_str()) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "register_existing_data_files: {} appears more than once in the batch. Each \
+                     entry becomes its own ducklake_data_file row, so a repeat would double the \
+                     table's record count and hand one object two row-id ranges. Union the \
+                     entries for a path into one.",
+                    file.path
+                )));
+            }
             // Both ways of getting ownership wrong are refused here, where the caller
             // can still fix them.
             //
@@ -4309,6 +4341,26 @@ impl MetadataWriter for PostgresMetadataWriter {
                          Attach it with DataFileInfo::with_partition (copy the values from the \
                          source catalog, or derive them from the file's Hive path).",
                         file.path
+                    )));
+                }
+                // The mirror of the stale-`partition_id` refusal above: values with no
+                // generation to hang them off. Nothing downstream catches this —
+                // `enforce_partition_fence` passes when both ids are None and
+                // `validate_promoted_partition_values` is gated on the file's id — so
+                // `insert_partition_metadata` would write
+                // `ducklake_file_partition_value` rows under a NULL `partition_id` in a
+                // table with no live spec. No reader can use that shape and no other
+                // write path produces it. Reached only on an unpartitioned table: a
+                // partitioned one is diagnosed above, and a batch that mints a spec has
+                // already stamped every file.
+                if file.partition_id.is_none() && !file.partition_values.is_empty() {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "cannot promote {} into table {table_id}: it carries {} partition \
+                         value(s) but names no partition generation, and the table has no live \
+                         spec for them to belong to. Establish one in this commit \
+                         (PromoteLayout::partition_by), or drop the values.",
+                        file.path,
+                        file.partition_values.len()
                     )));
                 }
                 crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;

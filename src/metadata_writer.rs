@@ -2589,6 +2589,17 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// only the last file live). `files` may be empty, which creates the table (and
     /// its layout) with no data.
     ///
+    /// A path may appear at most once. Each entry becomes its own
+    /// `ducklake_data_file` row, so a repeat would double the table's record count
+    /// and give one object two row-id ranges. Official's plural entry point
+    /// deduplicates rather than refusing, which is right for it: its entries are
+    /// bare paths from glob expansion, so two for one path are identical and
+    /// dropping one loses nothing. An entry here carries the caller's own record
+    /// count, sizes, row-id policy, partition values, ownership and delete file, so
+    /// two entries for one path can disagree — and silently keeping the first would
+    /// drop a delete file the second carried, making the destination read rows the
+    /// source had deleted.
+    ///
     /// # Layout
     ///
     /// `layout` writes the partition and/or sort spec on this commit's snapshot,
@@ -2609,6 +2620,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// With no partition spec in `layout`, files carry their own `partition_id` as
     /// usual ([`DataFileInfo::with_partition`]) and are fenced against the live
     /// generation.
+    ///
+    /// The mirror case is rejected too: partition values on a file that names no
+    /// generation, promoted into a table with no live spec. There is nothing for
+    /// such values to mean, and persisting them would leave
+    /// `ducklake_file_partition_value` rows hanging off a `NULL partition_id`.
     ///
     /// # Default
     ///
