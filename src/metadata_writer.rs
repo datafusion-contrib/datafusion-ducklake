@@ -2534,6 +2534,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn get_data_path(&self) -> Result<String>;
 
     /// Set the data path in catalog metadata.
+    ///
+    /// Returns without writing when the stored path already matches, so
+    /// reopening a catalog leaves the metadata database untouched.
     fn set_data_path(&self, path: &str) -> Result<()>;
 
     /// Initialize DuckLake schema tables if they don't exist.

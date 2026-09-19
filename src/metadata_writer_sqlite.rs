@@ -5473,6 +5473,15 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     fn set_data_path(&self, path: &str) -> Result<()> {
         block_on(async {
+            let current: Option<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+            )
+            .fetch_optional(&self.pool)
+            .await?;
+            if current.as_deref() == Some(path) {
+                return Ok(());
+            }
+
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL")
                 .execute(&self.pool)
                 .await?;
