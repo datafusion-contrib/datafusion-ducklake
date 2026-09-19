@@ -1066,3 +1066,38 @@ async fn postgres_round_trips_nested_inlined_rows() {
         .unwrap();
     assert_eq!(batches, vec![expected]);
 }
+
+/// SQLite bumps the file change counter in the database header on every write
+/// transaction, so it records whether a call wrote at all.
+fn sqlite_change_counter(path: &std::path::Path) -> u32 {
+    let header = std::fs::read(path).unwrap();
+    u32::from_be_bytes(header[24..28].try_into().unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_set_data_path_skips_an_unchanged_write() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("catalog.sqlite");
+    let data_path = temp.path().join("data");
+    let other_path = temp.path().join("other");
+    std::fs::create_dir_all(&data_path).unwrap();
+    std::fs::create_dir_all(&other_path).unwrap();
+
+    let writer =
+        SqliteMetadataWriter::new_with_init(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let after_first = sqlite_change_counter(&db_path);
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    assert_eq!(sqlite_change_counter(&db_path), after_first);
+    assert_eq!(writer.get_data_path().unwrap(), data_path.to_str().unwrap());
+
+    writer.set_data_path(other_path.to_str().unwrap()).unwrap();
+    assert!(sqlite_change_counter(&db_path) > after_first);
+    assert_eq!(
+        writer.get_data_path().unwrap(),
+        other_path.to_str().unwrap()
+    );
+}

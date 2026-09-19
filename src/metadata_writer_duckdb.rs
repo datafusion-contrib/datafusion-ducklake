@@ -4310,6 +4310,17 @@ impl MetadataWriter for DuckdbMetadataWriter {
 
     fn set_data_path(&self, path: &str) -> Result<()> {
         let mut conn = self.connection();
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() == Some(path) {
+            return Ok(());
+        }
+
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
