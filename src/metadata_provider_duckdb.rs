@@ -51,6 +51,22 @@ fn quote_ident(name: &str) -> String {
 struct DuckdbStatsDialect;
 
 impl StatsSqlDialect for DuckdbStatsDialect {
+    /// DuckDB accepts `AS MATERIALIZED`, which keeps the shape gate and the
+    /// `TRY_CAST` below to one evaluation per file rather than one per
+    /// comparison per file.
+    ///
+    /// Emitted unconditionally, where the SQLite and PostgreSQL dialects probe
+    /// first. Those two are reached over a connection string and can meet a
+    /// library or server of any age, so the modifier's availability is a
+    /// property of the deployment rather than of this build. DuckDB comes
+    /// through the `duckdb` crate, whose version fixes the C API a build links
+    /// against — bundled or a system `libduckdb` — so the oldest engine this
+    /// dialect can address is 1.x, and `AS MATERIALIZED` has been accepted
+    /// since 0.10.
+    fn cte_materialization(&self) -> &'static str {
+        "MATERIALIZED "
+    }
+
     /// The *stat* is gated on its shape before it is cast, by
     /// [`duckdb_castable_pattern`]. `TRY_CAST` on its own is not sufficient:
     /// DuckDB reads text this crate never writes — `nan`, `epoch`, `0x10` — into
@@ -291,12 +307,13 @@ fn data_files_sql_filtered(table_id: i64, filters: &[RenderedColumnFilter]) -> O
         .iter()
         .map(|filter| {
             format!(
-                "{alias} AS (
+                "{alias} AS {materialization}(
         SELECT data_file_id, {stats}
         FROM ducklake_file_column_stats
         WHERE column_id = {column_id} AND table_id = {table_id}
     )",
                 alias = filter.alias,
+                materialization = filter.cte_materialization,
                 stats = filter.stats.join(", "),
                 column_id = filter.column_id,
             )
@@ -1549,11 +1566,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
             // logged rather than swallowed, and a failure that is not the
             // filter's fault surfaces from the retry.
             Err(error) if !rendered.is_empty() => {
-                tracing::debug!(
-                    %error,
-                    table_id,
-                    "statistics-filtered file listing failed; listing every file"
-                );
+                crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                 query_data_file_page(
                     &conn,
                     table_id,
@@ -2519,7 +2532,7 @@ mod tests {
         let sql = filtered_listing_sql(predicate, 7, 3);
         assert!(
             sql.starts_with(
-                "WITH col_7_stats AS (\n        SELECT data_file_id, min_value, max_value, value_count\n        \
+                "WITH col_7_stats AS MATERIALIZED (\n        SELECT data_file_id, min_value, max_value, value_count\n        \
                  FROM ducklake_file_column_stats\n        WHERE column_id = 7 AND table_id = 3\n    )"
             ),
             "unexpected CTE section:\n{sql}"

@@ -335,9 +335,43 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
 /// it is about to be read as, and yields SQL `NULL` when it is not.
 /// [`StatsSqlDialect::keep_when_unknown`] turns that `NULL` back into "keep the
 /// file", so a bound this dialect will not read prunes nothing.
-struct SqliteStatsDialect;
+/// Whether `version`, spelled as `sqlite_version()` returns it, is 3.35 or
+/// later — the release that added the `MATERIALIZED` CTE modifier.
+///
+/// Compared component-wise, never as text: `'3.9.0'` sorts above `'3.35.0'`
+/// byte-wise, which would claim the modifier on a library that predates it. A
+/// version that will not parse answers `false`, which costs pruning speed and
+/// never correctness.
+fn sqlite_has_materialized_cte(version: &str) -> bool {
+    let mut components = version.split('.').map(str::parse::<u32>);
+    match (components.next(), components.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (3, 35),
+        _ => false,
+    }
+}
+
+struct SqliteStatsDialect {
+    /// The library accepts `WITH ... AS MATERIALIZED` (SQLite 3.35+).
+    materialized_cte: bool,
+}
 
 impl StatsSqlDialect for SqliteStatsDialect {
+    /// `AS MATERIALIZED` arrived in SQLite 3.35, and it is what stops the
+    /// round-trip guard below being re-run once per comparison per file: a CTE
+    /// referenced once is otherwise flattened into the join.
+    ///
+    /// The version is probed rather than assumed. `sqlx` bundles a library far
+    /// past 3.35, but its `sqlite-unbundled` feature links the host's instead,
+    /// and a host older than 3.35 would reject the whole narrowed listing —
+    /// costing every catalog-side pruning, not just the modifier.
+    fn cte_materialization(&self) -> &'static str {
+        if self.materialized_cte {
+            "MATERIALIZED "
+        } else {
+            ""
+        }
+    }
+
     /// A type not listed here is declined, which drops the comparison and
     /// prunes nothing. `DECIMAL` is the notable one: SQLite's only numeric with
     /// a fractional part is `REAL`, and a `DECIMAL(38, s)` constant can carry
@@ -563,8 +597,14 @@ struct StatsFilterSql {
 /// Adds no bind parameters: [`crate::stats_filter`] inlines every literal, and
 /// the only other values spliced in are `i64`s this process computed. The
 /// caller's parameter list and its order are therefore untouched.
-fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<StatsFilterSql> {
-    let rendered = filter?.render(&SqliteStatsDialect)?;
+fn stats_filter_sql(
+    filter: Option<&StatsFilter>,
+    table_id: i64,
+    materialized_cte: bool,
+) -> Option<StatsFilterSql> {
+    let rendered = filter?.render(&SqliteStatsDialect {
+        materialized_cte,
+    })?;
     let mut cte = String::from("WITH ");
     let mut joins = String::new();
     let mut conditions = String::new();
@@ -576,9 +616,10 @@ fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<Stats
         let stats = column.stats.join(", ");
         let column_id = column.column_id;
         cte.push_str(&format!(
-            "{alias} AS (SELECT data_file_id, {stats}
+            "{alias} AS {materialization}(SELECT data_file_id, {stats}
                  FROM ducklake_file_column_stats
-                 WHERE column_id = {column_id} AND table_id = {table_id})"
+                 WHERE column_id = {column_id} AND table_id = {table_id})",
+            materialization = column.cte_materialization,
         ));
         joins.push_str(&format!(
             "
@@ -621,6 +662,14 @@ struct SchemaCapabilities {
     inlined_data_tables: bool,
     /// The `ducklake_view` table exists.
     views: bool,
+    /// The library accepts `WITH ... AS MATERIALIZED` (SQLite 3.35+), which
+    /// [`SqliteStatsDialect`] declares the statistics CTE with.
+    ///
+    /// A library capability rather than a catalog one, so it is deliberately
+    /// not part of [`Self::all`]: gating the memo on it would make an otherwise
+    /// fully-migrated catalog on an older library re-probe on every call, and a
+    /// stale `false` only costs pruning speed.
+    materialized_cte: bool,
 }
 
 impl SchemaCapabilities {
@@ -689,7 +738,7 @@ impl SqliteMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool, String) = sqlx::query_as(
             "SELECT
                (SELECT COUNT(*) FROM pragma_table_info('ducklake_data_file')
                 WHERE name = 'partial_max') > 0,
@@ -702,7 +751,8 @@ impl SqliteMetadataProvider {
                (SELECT COUNT(*) FROM sqlite_master
                 WHERE type = 'table' AND name = 'ducklake_inlined_data_tables') > 0,
                (SELECT COUNT(*) FROM sqlite_master
-                WHERE type = 'table' AND name = 'ducklake_view') > 0",
+                WHERE type = 'table' AND name = 'ducklake_view') > 0,
+               sqlite_version()",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -713,6 +763,7 @@ impl SqliteMetadataProvider {
             schema_versions: row.3,
             inlined_data_tables: row.4,
             views: row.5,
+            materialized_cte: sqlite_has_materialized_cte(&row.6),
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -1314,7 +1365,7 @@ impl MetadataProvider for SqliteMetadataProvider {
             // `crate::table::FileMetadataPages`: a page whose candidates all
             // fail the filter comes back empty, which reads as "no files left",
             // and every matching file beyond it is never visited.
-            let filter_sql = stats_filter_sql(filter, table_id);
+            let filter_sql = stats_filter_sql(filter, table_id, caps.materialized_cte);
             let build_sql = |filter_sql: Option<&StatsFilterSql>| {
                 let (cte, joins, conditions) = filter_sql.map_or(("", "", ""), |sql| {
                     (
@@ -1364,11 +1415,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 // retry uses the same parameters, and a failure that is not the
                 // filter's fault surfaces from it.
                 Err(error) if filter_sql.is_some() => {
-                    tracing::debug!(
-                        %error,
-                        table_id,
-                        "statistics-filtered file listing failed; listing every file"
-                    );
+                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                     self.fetch_file_page(
                         &build_sql(None),
                         table_id,
@@ -2618,14 +2665,28 @@ mod tests {
         )) as Arc<dyn PhysicalExpr>;
         let (schema, columns) = int32_column(7);
         let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
-        let sql = stats_filter_sql(Some(&filter), 42).expect("rendered");
+        let sql = stats_filter_sql(Some(&filter), 42, true).expect("rendered");
         println!("CTE:\n{}", sql.cte);
         println!("JOINS:{}", sql.joins);
         println!("CONDITIONS:{}", sql.conditions);
 
+        // The CTE is materialized, so the round-trip guard below runs once per
+        // file rather than once per comparison per file.
         assert!(
             sql.cte
-                .starts_with("WITH col_7_stats AS (SELECT data_file_id, ")
+                .starts_with("WITH col_7_stats AS MATERIALIZED (SELECT data_file_id, "),
+            "{}",
+            sql.cte
+        );
+        // A library below 3.35 gets the plain spelling; the modifier would be a
+        // syntax error there and cost the whole narrowed listing.
+        let plain = stats_filter_sql(Some(&filter), 42, false).expect("rendered");
+        assert!(
+            plain
+                .cte
+                .starts_with("WITH col_7_stats AS (SELECT data_file_id, "),
+            "{}",
+            plain.cte
         );
         assert!(sql.cte.contains("min_value, max_value, value_count"));
         assert!(sql.cte.contains("WHERE column_id = 7 AND table_id = 42)"));
@@ -2655,7 +2716,7 @@ mod tests {
         let columns =
             vec![DuckLakeTableColumn::new(2, "f".to_string(), "double".to_string(), true)];
         let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
-        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("CONDITIONS:{}", sql.conditions);
         assert!(sql.cte.contains("min_value, value_count, contains_nan"));
         assert!(
@@ -2672,6 +2733,24 @@ mod tests {
         );
     }
 
+    /// `sqlite_version()` is compared component-wise. Byte-wise it would read
+    /// `3.9.0` as newer than `3.35.0` and emit a modifier that library rejects,
+    /// which costs every catalog-side pruning rather than just the modifier.
+    #[test]
+    fn reads_the_sqlite_version_for_the_materialized_modifier() {
+        assert!(sqlite_has_materialized_cte("3.46.1"));
+        assert!(sqlite_has_materialized_cte("3.35.0"));
+        assert!(sqlite_has_materialized_cte("4.0.0"));
+        assert!(!sqlite_has_materialized_cte("3.34.1"));
+        // RHEL 8 ships this one, and it sorts above "3.35" as text.
+        assert!(!sqlite_has_materialized_cte("3.26.0"));
+        assert!(!sqlite_has_materialized_cte("3.9.2"));
+        // Anything unreadable declines, which costs speed and never rows.
+        assert!(!sqlite_has_materialized_cte(""));
+        assert!(!sqlite_has_materialized_cte("3"));
+        assert!(!sqlite_has_materialized_cte("three.point.five"));
+    }
+
     /// A `DECIMAL` comparison is declined outright, so the column contributes
     /// no CTE, no join and no condition at all.
     #[test]
@@ -2680,7 +2759,7 @@ mod tests {
             DataType::Decimal128(10, 2),
             ScalarValue::Decimal128(Some(1234), 10, 2),
         );
-        assert!(stats_filter_sql(Some(&filter), 1).is_none());
+        assert!(stats_filter_sql(Some(&filter), 1, true).is_none());
     }
 
     /// A date is compared as text, behind a shape test that pins the stat to the
@@ -2689,7 +2768,7 @@ mod tests {
     fn renders_a_date_filter_as_a_guarded_text_comparison() {
         // 19_723 days after the epoch is 2024-01-01.
         let filter = lower_one(DataType::Date32, ScalarValue::Date32(Some(19_723)));
-        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("CONDITIONS:{}", sql.conditions);
         assert!(sql.conditions.contains(
             "CASE WHEN col_1_stats.min_value GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' \
@@ -2707,7 +2786,7 @@ mod tests {
         for days in [4_000_000, -800_000] {
             let filter = lower_one(DataType::Date32, ScalarValue::Date32(Some(days)));
             assert!(
-                stats_filter_sql(Some(&filter), 1).is_none(),
+                stats_filter_sql(Some(&filter), 1, true).is_none(),
                 "date at {days} days must not render"
             );
         }
@@ -2721,7 +2800,7 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, None),
             ScalarValue::TimestampMicrosecond(Some(1_700_000_000_500_000), None),
         );
-        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("NAIVE:{}", sql.conditions);
         assert!(sql.conditions.contains("< '2023-11-14 22:13:20.5'"));
         assert!(
@@ -2733,7 +2812,7 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             ScalarValue::TimestampMicrosecond(Some(1_700_000_000_000_000), Some("UTC".into())),
         );
-        let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
+        let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("ZONED:{}", sql.conditions);
         assert!(sql.conditions.contains("< '2023-11-14 22:13:20+00'"));
         assert!(

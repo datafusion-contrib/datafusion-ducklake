@@ -125,6 +125,13 @@ struct SchemaCapabilities {
     /// fully-migrated catalog on an older server re-probe on every call, and a
     /// stale `false` only costs pruning.
     soft_input_validation: bool,
+    /// The server accepts `WITH ... AS MATERIALIZED` (PostgreSQL 12+), which
+    /// [`PostgresStatsDialect`] declares the statistics CTE with.
+    ///
+    /// A server capability like `soft_input_validation`, and excluded from
+    /// [`Self::all`] for the same reason. A stale `false` costs only the time
+    /// the narrowed listing takes.
+    materialized_cte: bool,
 }
 
 impl SchemaCapabilities {
@@ -216,7 +223,7 @@ impl MulticatalogProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -226,7 +233,8 @@ impl MulticatalogProvider {
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
                to_regclass('ducklake_view') IS NOT NULL,
-               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL",
+               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
+               current_setting('server_version_num')::int >= 120000",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -237,6 +245,7 @@ impl MulticatalogProvider {
             data_file_partition_id: row.3,
             views: row.4,
             soft_input_validation: row.5,
+            materialized_cte: row.6,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -282,6 +291,7 @@ impl MulticatalogProvider {
             };
             let dialect = PostgresStatsDialect {
                 soft_input_validation: caps.soft_input_validation,
+                materialized_cte: caps.materialized_cte,
             };
             let rendered = filter.and_then(|filter| filter.render(&dialect));
             let stats_sql = rendered
@@ -351,11 +361,7 @@ impl MulticatalogProvider {
                 // parameters, and a failure that is not the filter's fault
                 // surfaces from it.
                 Err(error) if stats_sql.is_some() => {
-                    tracing::debug!(
-                        %error,
-                        table_id,
-                        "statistics-filtered file listing failed; listing every file"
-                    );
+                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                     fetch_data_file_page(
                         &self.pool,
                         &listing_sql(None),

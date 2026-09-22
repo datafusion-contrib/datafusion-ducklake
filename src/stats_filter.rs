@@ -49,7 +49,11 @@
 //! aborts the query (PostgreSQL) or silently returns zero (SQLite, MySQL) — the
 //! second of which would prune a matching file. Each dialect supplies a
 //! NULL-on-unparseable construct through [`StatsSqlDialect::try_cast`], and may
-//! decline a type it cannot handle safely, which drops that comparison.
+//! decline a type it cannot handle safely, which drops that comparison. The
+//! same split decides CTE materialization: the planner that receives this SQL
+//! is the catalog's, not DuckDB's, so how the statistics CTE is declared is
+//! this crate's decision to make and its dialects' to spell — see *Why the
+//! statistics CTE is materialized* below.
 //!
 //! **2. Raw string comparisons force a binary collation.** Official inherits
 //! DuckDB's byte-wise collation. A native MySQL catalog defaults to
@@ -128,6 +132,45 @@
 //! difference shows only for a non-float column compared against a float
 //! constant, where this prunes and official cannot; a non-float column holds no
 //! NaN, so its bounds are sound.
+//!
+//! # Why the statistics CTE is materialized
+//!
+//! The CTE selects the raw `min_value` / `max_value` text and every comparison
+//! against it carries the dialect's validity test and its cast. Inlined, that
+//! work lands in the join condition and is redone once per comparison per file,
+//! so an `IN` list of n values reads the same two strings n times over — the
+//! cost of pruning then grows with the *product* of the table's file count and
+//! the predicate's width, which is invisible on a small table and dominates
+//! planning on a large partitioned one. [`StatsSqlDialect::cte_materialization`]
+//! asks for one evaluation per file instead.
+//!
+//! Official materializes the same CTE at oracle commit `d8a1881e`, under the
+//! same `col_<n>_stats` alias, so the shape converges. Two things differ. The
+//! first is which planner reads the hint: official's filter SQL runs in DuckDB
+//! whatever the catalog is, and this crate's runs in the catalog engine, which
+//! is divergence 1 again and is why the spelling has to come from the dialect
+//! at all — one of the four engines has no such modifier.
+//!
+//! The second is how the decision is reached, and it is why this is a cost
+//! model rather than a port. Official chooses on a reference count
+//! (`reference_count > 1` in `GenerateCTESectionFromRequirements`), which is a
+//! sound proxy for *its* shape: its CTE body is a plain projection, all the
+//! casting lives in the conditions, and it names the CTE twice — once in a
+//! `NOT IN` and once in an `IN`. This crate names it once, in a `LEFT JOIN`, so
+//! official's own rule applied here would emit `AS NOT MATERIALIZED` and ask
+//! for precisely the inlining the paragraph above exists to avoid. A reference
+//! count cannot see that, because the expense is not how often the CTE is read
+//! but that each read re-runs a validity test and a cast the count knows
+//! nothing about.
+//!
+//! Upstream has since moved: `71a9e105` replaced the double membership test
+//! with a `LEFT JOIN` (which drops the reference count to 1), and `f67a2bd7`
+//! removed the hint machinery outright 28 minutes later, leaving the choice to
+//! DuckDB. Both land after the pinned oracle. **When the oracle moves past
+//! 2026-08-29, official no longer hints, and this stops being convergence and
+//! becomes a divergence to re-argue** — on the measured-performance limb, since
+//! DuckDB's defaults were never chosen for a native catalog's planner.
+//! Re-adjudicate it then rather than meeting it as drift.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -325,6 +368,28 @@ pub trait StatsSqlDialect {
         format!("'{}'", text.replace('\'', "''"))
     }
 
+    /// The modifier a statistics CTE is declared with, spelled to sit between
+    /// `AS` and the parenthesised body. Whatever the engine accepts there:
+    /// `"MATERIALIZED "`, `"NOT MATERIALIZED "` on a dialect that wants to
+    /// forbid it, or `""` to say nothing and leave the planner to decide.
+    ///
+    /// A stats CTE reads `min_value` / `max_value` as text and every comparison
+    /// against them carries the dialect's validity test and its cast. An engine
+    /// that inlines the CTE into the join folds that work into the join
+    /// condition, where it is re-evaluated once per comparison per file — so an
+    /// `IN` list of n values costs n validity tests and n casts of the same two
+    /// strings. Materializing the CTE converts the text once per file, whatever
+    /// the predicate does with it, and on a table of a few thousand files that
+    /// is the difference between milliseconds and seconds of planning.
+    ///
+    /// The default is `""`, because a modifier the engine does not recognise is
+    /// a syntax error that costs the whole narrowed listing (the providers fall
+    /// back to listing every file), while omitting one only costs time. A
+    /// dialect opts in by naming the spelling its engine accepts.
+    fn cte_materialization(&self) -> &'static str {
+        ""
+    }
+
     /// Keep a file whose condition evaluates to SQL `NULL`.
     ///
     /// The condition sits under `WHERE ... AND`, where `NULL` excludes the row —
@@ -471,6 +536,10 @@ pub struct RenderedColumnFilter {
     /// Stat columns the CTE must select, in a stable order. `data_file_id` is
     /// always required in addition to these and is not listed.
     pub stats: Vec<&'static str>,
+    /// The modifier the CTE is declared with, spelled to sit between `AS` and
+    /// the opening parenthesis: `WITH <alias> AS <cte_materialization>(...)`.
+    /// Empty on a dialect whose engine has no such modifier.
+    pub cte_materialization: &'static str,
     /// The `WHERE` condition, already wrapped in its no-stats and NULL guards.
     pub condition: String,
 }
@@ -533,6 +602,7 @@ impl StatsFilter {
                 .iter()
                 .map(|stat| stat.column_name())
                 .collect(),
+            cte_materialization: dialect.cte_materialization(),
             condition: dialect.keep_when_unknown(&condition),
         })
     }
@@ -3454,6 +3524,87 @@ mod tests {
             rendered[0].condition.contains("Q<true> BETWEEN"),
             "{}",
             rendered[0].condition
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // CTE materialization
+    // ---------------------------------------------------------------------
+
+    /// A dialect whose engine accepts `WITH ... AS MATERIALIZED`.
+    struct Materializing;
+
+    impl StatsSqlDialect for Materializing {
+        fn cte_materialization(&self) -> &'static str {
+            "MATERIALIZED "
+        }
+
+        fn try_cast(
+            &self,
+            expr: &str,
+            literal: &StatsLiteral,
+            data_type: &DataType,
+        ) -> Option<String> {
+            Duck.try_cast(expr, literal, data_type)
+        }
+
+        fn collate_binary(&self, expr: &str) -> String {
+            Duck.collate_binary(expr)
+        }
+
+        fn boolean_is_not_false(&self, expr: &str) -> String {
+            Duck.boolean_is_not_false(expr)
+        }
+    }
+
+    #[test]
+    fn cte_materialization_comes_from_the_dialect() {
+        // The engines differ on whether the modifier exists at all — MySQL has
+        // none — so the choice belongs to the dialect and reaches every CTE the
+        // providers assemble through the rendered filter.
+        let table = ints();
+        let predicate = in_list(
+            table.column("a"),
+            vec![lit(1i32), lit(2i32)],
+            &false,
+            &table.schema,
+        )
+        .expect("in list");
+
+        let rendered = table
+            .render_with(&predicate, &Materializing)
+            .expect("rendered");
+        assert_eq!(rendered[0].cte_materialization, "MATERIALIZED ");
+    }
+
+    #[test]
+    fn cte_materialization_defaults_to_none() {
+        // A dialect that names no modifier gets none: an unrecognised keyword
+        // is a syntax error that costs the whole narrowed listing, while
+        // omitting one only costs time.
+        let table = ints();
+        let predicate = bin(table.column("a"), Operator::Eq, lit(5i32));
+        assert_eq!(table.only(&predicate).cte_materialization, "");
+    }
+
+    #[test]
+    fn every_column_carries_the_materialization() {
+        // The providers splice one CTE per filtered column, so the modifier has
+        // to travel with each of them and not just the first.
+        let table = ints();
+        let predicate = bin(
+            bin(table.column("a"), Operator::Gt, lit(5i32)),
+            Operator::And,
+            bin(table.column("b"), Operator::Lt, lit(9i32)),
+        );
+        let rendered = table
+            .render_with(&predicate, &Materializing)
+            .expect("rendered");
+        assert_eq!(rendered.len(), 2);
+        assert!(
+            rendered
+                .iter()
+                .all(|filter| filter.cte_materialization == "MATERIALIZED ")
         );
     }
 }

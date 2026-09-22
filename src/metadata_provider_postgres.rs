@@ -187,6 +187,13 @@ struct SchemaCapabilities {
     /// fully-migrated catalog on an older server re-probe on every call, and a
     /// stale `false` only costs pruning.
     soft_input_validation: bool,
+    /// The server accepts `WITH ... AS MATERIALIZED` (PostgreSQL 12+), which
+    /// [`PostgresStatsDialect`] declares the statistics CTE with.
+    ///
+    /// A server capability like `soft_input_validation`, and excluded from
+    /// [`Self::all`] for the same reason. A stale `false` costs only the time
+    /// the narrowed listing takes.
+    materialized_cte: bool,
 }
 
 impl SchemaCapabilities {
@@ -253,9 +260,26 @@ pub(crate) async fn fetch_data_file_page(
 pub(crate) struct PostgresStatsDialect {
     /// `pg_input_is_valid` exists (PostgreSQL 16+).
     pub(crate) soft_input_validation: bool,
+    /// The server accepts `WITH ... AS MATERIALIZED` (PostgreSQL 12+).
+    pub(crate) materialized_cte: bool,
 }
 
 impl StatsSqlDialect for PostgresStatsDialect {
+    /// From PostgreSQL 12 on, a CTE referenced once is inlined unless told
+    /// otherwise, which pushes the `CASE` guard and the `CAST` below into the
+    /// join condition, where they are re-evaluated once per comparison per
+    /// file. 12 is also the release that introduced `AS MATERIALIZED`, and
+    /// before it every CTE was an optimization fence — so an older server
+    /// materializes this one regardless and the modifier is left off rather
+    /// than sent to a parser that would reject it.
+    fn cte_materialization(&self) -> &'static str {
+        if self.materialized_cte {
+            "MATERIALIZED "
+        } else {
+            ""
+        }
+    }
+
     /// Both sides are inspected, for different reasons.
     ///
     /// The validity test built below covers only the *stat*, which is a value
@@ -468,12 +492,13 @@ pub(crate) fn stats_filter_sql(
         .iter()
         .map(|filter| {
             format!(
-                "{alias} AS (
+                "{alias} AS {materialization}(
                      SELECT data_file_id, {stats}
                      FROM ducklake_file_column_stats
                      WHERE column_id = {column_id} AND table_id = {table_id}
                  )",
                 alias = filter.alias,
+                materialization = filter.cte_materialization,
                 stats = filter.stats.join(", "),
                 column_id = filter.column_id,
             )
@@ -562,7 +587,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -573,7 +598,8 @@ impl PostgresMetadataProvider {
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partition_id'),
                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regclass('ducklake_view') IS NOT NULL,
-               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL",
+               to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
+               current_setting('server_version_num')::int >= 120000",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -585,6 +611,7 @@ impl PostgresMetadataProvider {
             inlined_data_tables: row.4,
             views: row.5,
             soft_input_validation: row.6,
+            materialized_cte: row.7,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -630,6 +657,7 @@ impl PostgresMetadataProvider {
             };
             let dialect = PostgresStatsDialect {
                 soft_input_validation: caps.soft_input_validation,
+                materialized_cte: caps.materialized_cte,
             };
             let rendered = filter.and_then(|filter| filter.render(&dialect));
             let stats_sql = rendered
@@ -699,11 +727,7 @@ impl PostgresMetadataProvider {
                 // parameters, and a failure that is not the filter's fault
                 // surfaces from it.
                 Err(error) if stats_sql.is_some() => {
-                    tracing::debug!(
-                        %error,
-                        table_id,
-                        "statistics-filtered file listing failed; listing every file"
-                    );
+                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                     fetch_data_file_page(
                         &self.pool,
                         &listing_sql(None),
@@ -2457,18 +2481,31 @@ mod tests {
     }
 
     /// Lower `predicate` over one column and splice it, or `None` when nothing
-    /// pushes down for this server.
+    /// pushes down for this server. Every server these tests describe is
+    /// PostgreSQL 12 or later, so the CTE is materialized;
+    /// `cte_is_not_materialized_before_postgresql_12` covers the other case.
     fn splice(
         predicate: Arc<dyn PhysicalExpr>,
         field: (Field, DuckLakeTableColumn),
         table_id: i64,
         soft_input_validation: bool,
     ) -> Option<StatsFilterSql> {
+        splice_on(predicate, field, table_id, soft_input_validation, true)
+    }
+
+    fn splice_on(
+        predicate: Arc<dyn PhysicalExpr>,
+        field: (Field, DuckLakeTableColumn),
+        table_id: i64,
+        soft_input_validation: bool,
+        materialized_cte: bool,
+    ) -> Option<StatsFilterSql> {
         let schema = Schema::new(vec![field.0]);
         let rendered = lower_predicate(&predicate, &schema, &[field.1])
             .expect("predicate lowers")
             .render(&PostgresStatsDialect {
                 soft_input_validation,
+                materialized_cte,
             })?;
         stats_filter_sql(table_id, &rendered)
     }
@@ -2481,6 +2518,50 @@ mod tests {
             Operator::And,
             Arc::new(BinaryExpr::new(a, Operator::Lt, lit(10i32))),
         ))
+    }
+
+    /// The CTE is materialized, so the `CASE` shape gate and the `CAST` run
+    /// once per file instead of once per comparison per file. PostgreSQL
+    /// otherwise inlines a CTE referenced once and folds all of it into the
+    /// join condition, which makes the cost of pruning grow with the file count
+    /// times the predicate's width.
+    #[test]
+    fn cte_is_materialized() {
+        let spliced = splice(
+            int_range_predicate(),
+            column("a", DataType::Int32, 7),
+            3,
+            true,
+        )
+        .expect("filter splices");
+        assert!(
+            spliced
+                .with_prefix
+                .contains("col_7_stats AS MATERIALIZED ("),
+            "{}",
+            spliced.with_prefix
+        );
+    }
+
+    /// `AS MATERIALIZED` arrived in PostgreSQL 12, the same release that
+    /// started inlining a CTE referenced once. An older server is sent the
+    /// plain spelling — which it materializes anyway — rather than a statement
+    /// its parser would reject, costing the whole narrowed listing.
+    #[test]
+    fn cte_is_not_materialized_before_postgresql_12() {
+        let spliced = splice_on(
+            int_range_predicate(),
+            column("a", DataType::Int32, 7),
+            3,
+            true,
+            false,
+        )
+        .expect("filter splices");
+        assert!(
+            spliced.with_prefix.starts_with("WITH col_7_stats AS ("),
+            "{}",
+            spliced.with_prefix
+        );
     }
 
     /// The shape official assembles — one CTE selecting only the stats the
@@ -2497,7 +2578,7 @@ mod tests {
         .expect("filter splices");
         assert_eq!(
             spliced.with_prefix,
-            "WITH col_7_stats AS (
+            "WITH col_7_stats AS MATERIALIZED (
                      SELECT data_file_id, min_value, max_value, value_count
                      FROM ducklake_file_column_stats
                      WHERE column_id = 7 AND table_id = 3

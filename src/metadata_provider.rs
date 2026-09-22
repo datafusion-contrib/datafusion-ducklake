@@ -7,6 +7,43 @@ use datafusion::common::ScalarValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Report a narrowed file listing that failed and fell back to listing every
+/// live file.
+///
+/// Shared by every provider, because the fallback is one decision spelled five
+/// times: the filter is advisory, so any error retries unfiltered and the
+/// answer is still correct — only slower, sometimes by orders of magnitude on a
+/// table with many files.
+///
+/// The first occurrence in a process is a WARN and the rest are DEBUG. A
+/// listing is paged, so a per-page WARN would bury the first one; but at DEBUG
+/// alone the failure is invisible in production and shows up only as a plan
+/// that got slow, which is the hardest shape to diagnose. The causes are all
+/// environmental rather than per-query — a catalog predating
+/// `ducklake_file_column_stats`, a server or library too old for SQL the
+/// dialect emitted — so one line per process says everything the next one
+/// would.
+pub(crate) fn log_stats_filter_fallback(error: &dyn std::fmt::Display, table_id: i64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(
+            %error,
+            table_id,
+            "statistics-filtered file listing failed; listing every file"
+        );
+    } else {
+        tracing::warn!(
+            %error,
+            table_id,
+            "statistics-filtered file listing failed; listing every file. \
+             Catalog-side file pruning is not in effect here; later \
+             occurrences are logged at debug level"
+        );
+    }
+}
+
 // SQL queries for DuckLake catalog tables
 // These queries are database-agnostic and work with DuckDB, SQLite, PostgreSQL, MySQL
 pub const SQL_GET_LATEST_SNAPSHOT: &str =

@@ -11,13 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Snapshot SQL listings expose schema version, structured changes, raw tokens,
   and commit metadata (#318).
+- `StatsSqlDialect::cte_materialization` lets a dialect declare the statistics
+  CTE with its engine's materialization modifier; it defaults to none.
 
 ### Changed
 
 - **BREAKING**: `SnapshotMetadata` adds `schema_version: Option<i64>`; update
   struct literals (#318).
+- **BREAKING**: `RenderedColumnFilter` adds
+  `cte_materialization: &'static str`; update struct literals.
 - Snapshot SQL listings expand from two to eight columns; select named columns
   to retain a fixed shape (#318).
+- The statistics CTE that narrows a file listing is declared `MATERIALIZED` on
+  the engines that accept it (DuckDB, SQLite 3.35+, PostgreSQL 12+), so each
+  bound is validated and cast once per file rather than once per comparison per
+  file. MySQL has no such modifier and is unchanged.
 
 ## [0.8.0] - 2026-09-16
 

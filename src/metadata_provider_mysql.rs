@@ -59,6 +59,13 @@ fn quote_ident(name: &str) -> String {
 /// compared under that collation can place a value inside a range the engine
 /// puts outside it, and drop a file that matches. [`Self::collate_binary`]
 /// forces byte-wise comparison on every uncast string comparison.
+///
+/// MySQL has no CTE materialization modifier — `WITH ... AS MATERIALIZED` is a
+/// syntax error there — so this dialect keeps
+/// [`StatsSqlDialect::cte_materialization`]'s empty default and the optimizer
+/// decides for itself whether to merge the stats CTE into the join. Its lever
+/// for the same thing is the `NO_MERGE` optimizer hint, which sits in the outer
+/// query block rather than on the CTE and so is not this seam.
 struct MySqlStatsDialect;
 
 impl StatsSqlDialect for MySqlStatsDialect {
@@ -341,9 +348,10 @@ fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<Stats
         let stats = column.stats.join(", ");
         let column_id = column.column_id;
         cte.push_str(&format!(
-            "{alias} AS (SELECT data_file_id, {stats}
+            "{alias} AS {materialization}(SELECT data_file_id, {stats}
                         FROM ducklake_file_column_stats
-                        WHERE column_id = {column_id} AND table_id = {table_id})"
+                        WHERE column_id = {column_id} AND table_id = {table_id})",
+            materialization = column.cte_materialization,
         ));
         joins.push_str(&format!(
             "
@@ -1095,11 +1103,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 // — still lists its files. The retry uses the same parameters,
                 // and a failure that is not the filter's fault surfaces from it.
                 Err(error) if filter_sql.is_some() => {
-                    tracing::debug!(
-                        %error,
-                        table_id,
-                        "statistics-filtered file listing failed; listing every file"
-                    );
+                    crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
                     self.fetch_file_page(
                         &build_sql(None),
                         table_id,
@@ -2337,6 +2341,27 @@ mod tests {
              THEN CAST(col_7_stats.max_value AS DECIMAL(65, 0)) END > 5"
         ));
         assert!(sql.conditions.trim_end().ends_with(") IS NOT FALSE"));
+    }
+
+    /// MySQL has no CTE materialization modifier: `WITH ... AS MATERIALIZED` is
+    /// a syntax error there, and one would cost the whole narrowed listing
+    /// rather than just the modifier. The other dialects declare the CTE with
+    /// one, so this is the seam that has to stay empty.
+    #[test]
+    fn cte_is_not_materialized() {
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Gt, lit(5i32))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
+        let sql = stats_filter_sql(Some(&filter), 42).expect("rendered");
+        assert!(
+            sql.cte.starts_with("WITH col_7_stats AS (SELECT "),
+            "{}",
+            sql.cte
+        );
+        assert!(!sql.cte.contains("MATERIALIZED"), "{}", sql.cte);
     }
 
     /// A raw string bound is compared byte-wise, never under the connection's
