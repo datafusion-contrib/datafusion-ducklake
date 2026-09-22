@@ -4308,6 +4308,31 @@ impl MetadataWriter for DuckdbMetadataWriter {
         }
     }
 
+    fn get_table_column_nullability(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<Vec<(String, bool)>>> {
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT c.column_name, c.nulls_allowed
+             FROM ducklake_column c
+             JOIN ducklake_table t ON t.table_id = c.table_id
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+               AND t.table_name = ? AND t.end_snapshot IS NULL
+               AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+             ORDER BY c.column_order",
+        )?;
+        let rows = statement.query_map(params![schema_name, table_name], |row| {
+            let name: String = row.get(0)?;
+            let nullable: Option<bool> = row.get(1)?;
+            Ok((name, nullable.unwrap_or(true)))
+        })?;
+        let columns = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((!columns.is_empty()).then_some(columns))
+    }
+
     fn set_data_path(&self, path: &str) -> Result<()> {
         let mut conn = self.connection();
         let tx = conn.transaction()?;

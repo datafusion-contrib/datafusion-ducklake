@@ -2095,6 +2095,41 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         })
     }
 
+    fn get_table_column_nullability(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<Option<Vec<(String, bool)>>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT c.column_name, c.nulls_allowed
+                 FROM ducklake_column c
+                 JOIN ducklake_table t ON t.table_id = c.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE s.schema_name = $1 AND s.end_snapshot IS NULL
+                   AND t.table_name = $2 AND t.end_snapshot IS NULL
+                   AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+                 ORDER BY c.column_order",
+            )
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_all(&self.pool)
+            .await?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            rows.into_iter()
+                .map(|row| {
+                    let name: String = row.try_get(0)?;
+                    let nullable = row.try_get::<Option<bool>, _>(1)?.unwrap_or(true);
+                    Ok((name, nullable))
+                })
+                .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
+                .map(Some)
+                .map_err(Into::into)
+        })
+    }
+
     fn set_data_path(&self, path: &str) -> Result<()> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
