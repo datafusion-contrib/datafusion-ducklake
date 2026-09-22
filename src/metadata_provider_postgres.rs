@@ -18,7 +18,9 @@ use crate::metadata_provider::{
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_encode::{is_canonical_date, is_canonical_timestamp, is_canonical_timestamptz};
-use crate::stats_filter::{RenderedColumnFilter, StatsFilter, StatsLiteral, StatsSqlDialect};
+use crate::stats_filter::{
+    RenderedColumnFilter, RenderedPartitionPrefilter, StatsFilter, StatsLiteral, StatsSqlDialect,
+};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use sqlx::AssertSqlSafe;
@@ -360,6 +362,45 @@ impl StatsSqlDialect for PostgresStatsDialect {
     fn boolean_is_not_false(&self, expr: &str) -> String {
         format!("{expr} IS NULL OR {expr} <> false")
     }
+
+    /// `^-?[0-9]+$` pins the character set, and the two `LIKE`s reject the
+    /// leading zero and the `-0` the pattern still admits. Together they accept
+    /// exactly `0` and `-?[1-9][0-9]*`.
+    ///
+    /// The pattern is deliberately unbounded where the statistics patterns above
+    /// carry `{1,255}`, and that is a cost decision: on a 409,600-row
+    /// `ducklake_file_partition_value` the whole listing is **roughly nine times
+    /// faster** with this than with the same test written
+    /// `^(0|-?[1-9][0-9]{0,254})$` (6.8 ms against 63 ms on that fixture),
+    /// because a bounded quantifier forces the slow path in PostgreSQL's regex
+    /// engine. There is nothing to bound here anyway:
+    /// unlike a cast, a long run of digits cannot overflow a comparison that
+    /// never happens — an over-long value simply is not one of the listed
+    /// constants and refutes on its own text.
+    ///
+    /// `COLLATE "C"` on all three operands, not just the pattern match. It is
+    /// what makes `[0-9]` ASCII and nothing else whatever the database's
+    /// collation — a locale that widened the range would admit a digit
+    /// PostgreSQL reads as a different value, or not at all — and on the two
+    /// `LIKE`s it is what keeps the statement runnable: against a column of a
+    /// nondeterministic collation, `LIKE` raises *"nondeterministic collations
+    /// are not supported for LIKE"* on every server through 17, which costs the
+    /// listing its entire statistics filter and not merely this pre-filter.
+    /// Verified raising on 17.11 and fixed upstream in 18.6.
+    ///
+    /// Two things about the pattern must not change. `[0-9]` must never become
+    /// `\d` or `[[:digit:]]`: both admit non-ASCII digits, which are spellings
+    /// of nothing this crate wrote and must keep their file. And no `(?n)` flag
+    /// may be added — newline-sensitive mode makes `$` match before a trailing
+    /// newline, so `E'2\n'` and even `E'2\n3'` would pass and a file would be
+    /// dropped for a value that is not the one it was compared against.
+    fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+        let collated = self.collate_binary(expr);
+        Some(format!(
+            "{collated} ~ '^-?[0-9]+$' \
+             AND {collated} NOT LIKE '0_%' AND {collated} NOT LIKE '-0%'"
+        ))
+    }
 }
 
 /// The PostgreSQL type a statistic is cast to for comparison against a constant
@@ -479,15 +520,38 @@ pub(crate) struct StatsFilterSql {
 /// reads, one `LEFT JOIN` on `data_file_id`, and the conditions ANDed onto the
 /// listing's existing `WHERE`.
 ///
+/// `partitions` narrows the listing by partition value as well, and is applied
+/// in two places. The conjunct on the outer `WHERE` is what drops the files; the
+/// same conjunct inside each CTE body is what stops the CTE converting the
+/// statistics of files that conjunct has already dropped. Only the second one
+/// matters for cost, and only because the CTE is materialized: the outer
+/// conjunct cannot reach inside an optimization fence, so without the inner one
+/// a selective partition filter saves nothing at all.
+///
+/// A pre-filter rides along with the statistics conditions rather than standing
+/// on its own: `None` here means no narrowing at all, which keeps the caller's
+/// unfiltered retry — the one thing that keeps a catalog whose narrowed query
+/// will not run from failing the scan — covering everything this emits.
+///
 /// Every literal is already inlined by [`crate::stats_filter`], so the listing
 /// query's bind placeholders are untouched and its `.bind()` chain does not move.
 pub(crate) fn stats_filter_sql(
     table_id: i64,
     filters: &[RenderedColumnFilter],
+    partitions: &[RenderedPartitionPrefilter],
 ) -> Option<StatsFilterSql> {
     if filters.is_empty() {
         return None;
     }
+    let cte_partitions = partitions
+        .iter()
+        .map(|prefilter| {
+            format!(
+                "\n                       AND {}",
+                prefilter.conjunct("ducklake_file_column_stats")
+            )
+        })
+        .collect::<String>();
     let ctes = filters
         .iter()
         .map(|filter| {
@@ -495,11 +559,11 @@ pub(crate) fn stats_filter_sql(
                 "{alias} AS {materialization}(
                      SELECT data_file_id, {stats}
                      FROM ducklake_file_column_stats
-                     WHERE column_id = {column_id} AND table_id = {table_id}
+                     WHERE column_id = {column_id} AND table_id = {table_id}{cte_partitions}
                  )",
                 alias = filter.alias,
                 materialization = filter.cte_materialization,
-                stats = filter.stats.join(", "),
+                stats = filter.select_list(),
                 column_id = filter.column_id,
             )
         })
@@ -518,15 +582,19 @@ pub(crate) fn stats_filter_sql(
     // `data_file_id IS NULL`, the per-stat `IS NULL` disjuncts, and
     // `StatsSqlDialect::keep_when_unknown` for a comparison that lands on NULL
     // because a present stat would not parse. They are spliced verbatim.
-    let conditions = filters
-        .iter()
-        .map(|filter| {
-            format!(
-                "\n                   AND {condition}",
-                condition = filter.condition
-            )
-        })
-        .collect::<String>();
+    let conditions =
+        filters
+            .iter()
+            .map(|filter| {
+                format!(
+                    "\n                   AND {condition}",
+                    condition = filter.condition
+                )
+            })
+            .chain(partitions.iter().map(|prefilter| {
+                format!("\n                   AND {}", prefilter.conjunct("data"))
+            }))
+            .collect::<String>();
     Some(StatsFilterSql {
         with_prefix: format!("WITH {ctes}\n                 "),
         joins,
@@ -660,9 +728,12 @@ impl PostgresMetadataProvider {
                 materialized_cte: caps.materialized_cte,
             };
             let rendered = filter.and_then(|filter| filter.render(&dialect));
+            let partitions = filter
+                .map(|filter| filter.render_partition_prefilters(&dialect, table_id))
+                .unwrap_or_default();
             let stats_sql = rendered
                 .as_deref()
-                .and_then(|filters| stats_filter_sql(table_id, filters));
+                .and_then(|filters| stats_filter_sql(table_id, filters, &partitions));
 
             // The statistics conditions go inside the query, ahead of the
             // LIMIT, with the keyset ordering untouched. Filtering a page after
@@ -2507,7 +2578,7 @@ mod tests {
                 soft_input_validation,
                 materialized_cte,
             })?;
-        stats_filter_sql(table_id, &rendered)
+        stats_filter_sql(table_id, &rendered, &[])
     }
 
     fn int_range_predicate() -> Arc<dyn PhysicalExpr> {
@@ -2576,10 +2647,19 @@ mod tests {
             true,
         )
         .expect("filter splices");
+        // The raw stats the fail-open disjuncts read, then one column per
+        // conversion the condition needs, each written against the unqualified
+        // statistics column so it resolves inside the CTE body.
         assert_eq!(
             spliced.with_prefix,
             "WITH col_7_stats AS MATERIALIZED (
-                     SELECT data_file_id, min_value, max_value, value_count
+                     SELECT data_file_id, min_value, max_value, value_count, \
+             CASE WHEN (min_value COLLATE \"C\") ~ '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' \
+             AND pg_input_is_valid(min_value, 'numeric') \
+             THEN CAST(min_value AS numeric) END AS min_value_1, \
+             CASE WHEN (max_value COLLATE \"C\") ~ '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' \
+             AND pg_input_is_valid(max_value, 'numeric') \
+             THEN CAST(max_value AS numeric) END AS max_value_1
                      FROM ducklake_file_column_stats
                      WHERE column_id = 7 AND table_id = 3
                  )
@@ -2589,19 +2669,71 @@ mod tests {
             spliced.joins,
             "\n                 LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id"
         );
+        // The condition names those columns; the guard and the cast appear in
+        // it nowhere.
         assert_eq!(
             spliced.conditions,
             "\n                   AND ((col_7_stats.data_file_id IS NULL OR \
              ((col_7_stats.value_count IS NULL OR col_7_stats.value_count > 0) AND \
              (col_7_stats.min_value IS NULL OR col_7_stats.max_value IS NULL OR \
-             (CASE WHEN (col_7_stats.max_value COLLATE \"C\") ~ \
-             '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' AND \
-             pg_input_is_valid(col_7_stats.max_value, 'numeric') \
-             THEN CAST(col_7_stats.max_value AS numeric) END > 5) AND \
-             (CASE WHEN (col_7_stats.min_value COLLATE \"C\") ~ \
-             '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' AND \
-             pg_input_is_valid(col_7_stats.min_value, 'numeric') \
-             THEN CAST(col_7_stats.min_value AS numeric) END < 10))))) IS NOT FALSE"
+             (col_7_stats.max_value_1 > 5) AND (col_7_stats.min_value_1 < 10))))) IS NOT FALSE"
+        );
+    }
+
+    /// An identity partition key narrows the listing without reading a single
+    /// statistic, and the same conjunct goes inside the CTE body so the
+    /// materialized statistics are not computed for files it already excludes.
+    #[test]
+    fn an_identity_partition_key_prefilters_the_listing() {
+        use crate::partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+
+        let a = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(a, Operator::Eq, lit(5i32))) as Arc<dyn PhysicalExpr>;
+        let (field, ducklake_column) = column("a", DataType::Int32, 7);
+        let schema = Schema::new(vec![field]);
+        let filter = lower_predicate(&predicate, &schema, &[ducklake_column])
+            .expect("lowered")
+            .with_partition_prefilters(Some(&PartitionSpec {
+                partition_id: 1,
+                columns: vec![PartitionSpecColumn {
+                    partition_key_index: 0,
+                    column_id: 7,
+                    transform: PartitionTransform::Identity,
+                }],
+                prune_safe: true,
+            }));
+        let dialect = PostgresStatsDialect {
+            soft_input_validation: true,
+            materialized_cte: true,
+        };
+        let rendered = filter.render(&dialect).expect("renders");
+        let partitions = filter.render_partition_prefilters(&dialect, 42);
+        let sql = stats_filter_sql(42, &rendered, &partitions).expect("splices");
+
+        assert!(
+            sql.with_prefix.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = ducklake_file_column_stats.data_file_id"
+            ),
+            "{}",
+            sql.with_prefix
+        );
+        assert!(
+            sql.conditions.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = data.data_file_id \
+                 AND part_0_values.partition_key_index = 0 \
+                 AND part_0_values.partition_value IS NOT NULL \
+                 AND (part_0_values.partition_value COLLATE \"C\") NOT IN ('5') \
+                 AND (part_0_values.partition_value COLLATE \"C\") ~ '^-?[0-9]+$' \
+                 AND (part_0_values.partition_value COLLATE \"C\") NOT LIKE '0_%' \
+                 AND (part_0_values.partition_value COLLATE \"C\") NOT LIKE '-0%')"
+            ),
+            "{}",
+            sql.conditions
         );
     }
 
@@ -2617,15 +2749,20 @@ mod tests {
         )
         .expect("filter splices");
         assert!(
-            spliced.conditions.contains(
-                "CASE WHEN (col_7_stats.max_value COLLATE \"C\") ~ \
+            spliced.with_prefix.contains(
+                "CASE WHEN (max_value COLLATE \"C\") ~ \
                  '^-?[0-9]{1,255}(\\.[0-9]{1,255})?$' \
-                 THEN CAST(col_7_stats.max_value AS numeric) END > 5"
+                 THEN CAST(max_value AS numeric) END AS max_value_1"
             ),
+            "unexpected CTE:\n{}",
+            spliced.with_prefix
+        );
+        assert!(
+            spliced.conditions.contains("col_7_stats.max_value_1 > 5"),
             "unexpected condition:\n{}",
             spliced.conditions
         );
-        assert!(!spliced.conditions.contains("pg_input_is_valid"));
+        assert!(!spliced.with_prefix.contains("pg_input_is_valid"));
     }
 
     /// Soft validation never stands alone: the stat's shape is required too.
@@ -2645,7 +2782,7 @@ mod tests {
                 Arc::new(BinaryExpr::new(f, Operator::Eq, lit(5.0f64))) as Arc<dyn PhysicalExpr>;
             splice(predicate, column("a", DataType::Float64, 2), 3, soft)
                 .expect("a float equality pushes down")
-                .conditions
+                .with_prefix
         };
 
         for soft in [false, true] {
@@ -2675,16 +2812,17 @@ mod tests {
             let t = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
             let predicate =
                 Arc::new(BinaryExpr::new(t, Operator::Lt, lit(value))) as Arc<dyn PhysicalExpr>;
-            splice(predicate, column("a", data_type, 2), 3, soft).map(|sql| sql.conditions)
+            // The conversion lives in the CTE body over the unqualified stat and
+            // the comparison in the condition, so both halves are read together.
+            splice(predicate, column("a", data_type, 2), 3, soft)
+                .map(|sql| format!("{}{}", sql.with_prefix, sql.conditions))
         };
 
         for soft in [false, true] {
             let date = render(ScalarValue::Date32(Some(19_723)), DataType::Date32, soft)
                 .expect("a date pushes down");
             assert!(
-                date.contains(
-                    "(col_2_stats.min_value COLLATE \"C\") ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'"
-                ),
+                date.contains("(min_value COLLATE \"C\") ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'"),
                 "date not compared as text (soft = {soft}): {date}"
             );
             // No cast, and therefore no dependence on the input function.
@@ -2772,7 +2910,7 @@ mod tests {
             true,
         )
         .expect("a canonical timestamp pushes down")
-        .conditions;
+        .with_prefix;
         assert!(sql.contains("([.][0-9]*[1-9])?$"), "{sql}");
     }
 
@@ -2785,11 +2923,19 @@ mod tests {
             Arc::new(BinaryExpr::new(s, Operator::Eq, lit("abc"))) as Arc<dyn PhysicalExpr>;
         let spliced =
             splice(predicate, column("s", DataType::Utf8, 1), 3, true).expect("filter splices");
+        // The collation is named once per file, in the CTE body.
         assert!(
-            spliced.conditions.contains(
-                "'abc' BETWEEN (col_1_stats.min_value COLLATE \"C\") \
-                 AND (col_1_stats.max_value COLLATE \"C\")"
+            spliced.with_prefix.contains(
+                "(min_value COLLATE \"C\") AS min_value_1, \
+                 (max_value COLLATE \"C\") AS max_value_1"
             ),
+            "unexpected CTE:\n{}",
+            spliced.with_prefix
+        );
+        assert!(
+            spliced
+                .conditions
+                .contains("'abc' BETWEEN col_1_stats.min_value_1 AND col_1_stats.max_value_1"),
             "unexpected condition:\n{}",
             spliced.conditions
         );

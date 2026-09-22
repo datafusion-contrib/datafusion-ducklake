@@ -212,6 +212,19 @@ const SQL_CREATE_TABLES: &[&str] = &[
         partition_key_index BIGINT NOT NULL,
         partition_value VARCHAR
     )"#,
+    // The partition pre-filter (`crate::stats_filter`) reads this table once per
+    // listing, restricted to one table's rows for one partition key. Unindexed
+    // that is a scan of every table's partition values. Measured on PostgreSQL 18
+    // over 409,600 rows (50 tables x 8,192 files), 72 ms without this index and
+    // 6.8 ms with it; an independent rebuild of the same shape measured 79 ms and
+    // 25 ms. The magnitude is fixture-bound, the direction is not, and either
+    // index shape wins — the value column earns nothing here, because the
+    // anti-join reads every row for the key regardless.
+    // Both columns are fixed-width, deliberately — `partition_value`
+    // is unbounded text, and indexing it would put a value's length between a
+    // partitioned INSERT and success.
+    r#"CREATE INDEX IF NOT EXISTS idx_file_partition_value_table_key
+        ON ducklake_file_partition_value (table_id, partition_key_index)"#,
     // Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id
     // is allocated from the next_sort_id counter (like partition_id).
     r#"CREATE TABLE IF NOT EXISTS ducklake_sort_info (

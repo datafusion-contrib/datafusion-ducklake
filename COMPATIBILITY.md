@@ -414,6 +414,43 @@ Known edges:
   of it; this crate queries each catalog natively instead, which removes the
   DuckDB dependency at the cost of that dialect fidelity.
 
+- **An identity partition key also narrows the listing, and declines more than
+  it accepts.** A predicate that pins an `identity` partition key to a set of
+  values restricts the file listing against `ducklake_file_partition_value`
+  directly, without reading any statistics. Official does this only for `bucket`
+  keys, where hashing leaves statistics no way to prune at all; for `identity`
+  its statistics path is already cheap enough, because it runs inside DuckDB.
+
+  The comparison is made on the stored text, so it is pushed down only where a
+  value has exactly one spelling. It declines, and prunes nothing, when: the
+  transform is not `identity` (`bucket` hashes; `year` is a range and
+  `month` / `day` / `hour` are not order-preserving); the table has more than one
+  partition-spec generation in its history, since a live file may carry values
+  written under a retired key order; the key's column is not an integer or a
+  string, because a float, decimal, boolean or temporal value has renderings
+  this crate would not write but another writer might (`5.0` for `5`, `1` for
+  `true`, a signed year); the predicate's constant is not of the key column's own
+  type; or the catalog engine cannot prove that a stored integer is spelled the
+  one way this crate spells one. That last case is why the decline is
+  per-backend: the proof is a regular expression on PostgreSQL, MySQL and DuckDB
+  and a cast round trip on SQLite, and a dialect without one pre-filters nothing.
+
+  A stored value that is present but not that canonical spelling — `007`, `+7`,
+  `7.0`, `0x7`, `7e0`, anything with surrounding whitespace, a non-ASCII digit —
+  keeps its file, as do a SQL `NULL` value and a file with no row for the key.
+  Declining costs pruning only and never changes results.
+
+- **`ducklake_file_partition_value` carries an index this crate creates.**
+  `idx_file_partition_value_table_key (table_id, partition_key_index)` is added
+  by every writer's schema bootstrap, and by an existing catalog the next time it
+  is initialized. It is the index the pre-filter above reads through; without it
+  the query scans every table's partition values rather than one table's. The
+  table's columns are untouched, so a catalog carrying it stays readable by
+  official DuckLake, which creates no indexes of its own on any metadata table.
+  Both indexed columns are fixed-width deliberately — `partition_value` is
+  unbounded text, and indexing it would put a value's length between a
+  partitioned `INSERT` and success.
+
 - **Mapped Hive partition paths follow DuckDB 1.5.5 parsing.** The raw object key is
   split on `/` and `\`; a query marker, newline, or second `=` invalidates that path
   segment. Keys are compared without percent decoding, while values are decoded.

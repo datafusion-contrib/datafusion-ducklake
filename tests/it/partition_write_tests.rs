@@ -1542,3 +1542,325 @@ async fn partitioned_staged_uploads_are_order_stable_across_concurrency() {
          of order, so partition labels or row ids landed on the wrong file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The identity-partition pre-filter (`stats_filter` divergence 10)
+// ---------------------------------------------------------------------------
+//
+// The pre-filter narrows the file listing by comparing `partition_value` as
+// TEXT against constants encoded by `stats_encode::encode_scalar`. That is only
+// sound while the write path stores the same encoding, and while no other
+// spelling of a listed value can reach the catalog unrecognised. Both halves are
+// executed here rather than argued: the first test round-trips a real
+// partitioned write and compares the stored text against the encoder the probe
+// uses, and the second rewrites that text to every spelling a lenient integer
+// parser still reads and asserts the answer never moves.
+
+/// A catalog whose `metrics` table is partitioned by two identity keys — one
+/// integer and one string, the two types the pre-filter pushes down — set before
+/// any data is written.
+async fn setup_identity_keys() -> Env {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("test.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let writer = SqliteMetadataWriter::new_with_init(&conn_str)
+        .await
+        .unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("cluster_id", &DataType::Int32, true).unwrap(),
+        ColumnDef::from_arrow("label", &DataType::Utf8, true).unwrap(),
+    ];
+    let s = writer
+        .begin_write_transaction("main", "metrics", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "metrics",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            s.table_id,
+            &[
+                ("cluster_id".to_string(), PartitionTransform::Identity),
+                ("label".to_string(), PartitionTransform::Identity),
+            ],
+        )
+        .unwrap();
+
+    Env {
+        conn_str,
+        table_id: s.table_id,
+        _temp: temp,
+    }
+}
+
+/// One row per partition, with values chosen to stress the encoding: zero, a
+/// positive, a negative, a large magnitude, and a label holding a space (which a
+/// string key must carry verbatim, since only integer keys are canonicalised).
+const IDENTITY_INSERT_SQL: &str = "INSERT INTO ducklake.main.metrics \
+     SELECT * FROM (VALUES \
+        (1, 0, 'eu-west'), \
+        (2, 7, 'us-east'), \
+        (3, -7, 'ap-south'), \
+        (4, 1000000, 'x y')) AS t(id, cluster_id, label)";
+
+async fn write_identity_fixture(env: &Env) {
+    let wctx = write_ctx(&env.conn_str).await;
+    wctx.sql(IDENTITY_INSERT_SQL)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+}
+
+/// `(partition_key_index, partition_value)` for one file, by the `id` its single
+/// row carries — so a case can rewrite exactly one partition's value.
+async fn partition_values(conn_str: &str) -> Vec<(i64, Option<String>)> {
+    let pool = sqlx::SqlitePool::connect(conn_str).await.unwrap();
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "SELECT partition_key_index, partition_value
+         FROM ducklake_file_partition_value
+         ORDER BY data_file_id, partition_key_index",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    rows
+}
+
+async fn set_partition_value(conn_str: &str, key_index: i64, from: &str, to: Option<&str>) {
+    let pool = sqlx::SqlitePool::connect(conn_str).await.unwrap();
+    let affected = sqlx::query(
+        "UPDATE ducklake_file_partition_value SET partition_value = ?
+         WHERE partition_key_index = ? AND partition_value = ?",
+    )
+    .bind(to)
+    .bind(key_index)
+    .bind(from)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(
+        affected, 1,
+        "expected exactly one {from:?} row for key {key_index}"
+    );
+}
+
+async fn ids_where(conn_str: &str, predicate: &str) -> Vec<i32> {
+    use arrow::array::Int32Array;
+    let rctx = read_ctx(conn_str).await;
+    let batches = rctx
+        .sql(&format!(
+            "SELECT id FROM ducklake.main.metrics WHERE {predicate} ORDER BY id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The claim the pre-filter rests on, executed rather than argued: the text the
+/// write path stores in `ducklake_file_partition_value` is byte-identical to
+/// what `stats_encode::encode_scalar` produces for the same value, which is what
+/// `StatsLiteral::text` — the probe's constant — is built from. If either side's
+/// encoding drifted, the probe would stop matching and files would silently
+/// start being excluded.
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_values_are_stored_in_the_encoding_the_prefilter_probes_with() {
+    use datafusion::common::ScalarValue;
+    use datafusion_ducklake::stats_encode::encode_scalar;
+
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+
+    let stored = partition_values(&env.conn_str).await;
+    assert_eq!(stored.len(), 8, "four files x two keys: {stored:?}");
+
+    let mut integers: Vec<String> = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
+    for (key_index, value) in stored {
+        let value = value.expect("no NULL partition values in this fixture");
+        match key_index {
+            0 => integers.push(value),
+            1 => labels.push(value),
+            other => panic!("unexpected partition key index {other}"),
+        }
+    }
+    integers.sort();
+    labels.sort();
+
+    let mut expected_integers: Vec<String> = [0i32, 7, -7, 1_000_000]
+        .into_iter()
+        .map(|v| encode_scalar(&ScalarValue::Int32(Some(v))).expect("encodable"))
+        .collect();
+    expected_integers.sort();
+    let mut expected_labels: Vec<String> = ["eu-west", "us-east", "ap-south", "x y"]
+        .into_iter()
+        .map(|v| encode_scalar(&ScalarValue::from(v)).expect("encodable"))
+        .collect();
+    expected_labels.sort();
+
+    assert_eq!(integers, expected_integers);
+    assert_eq!(labels, expected_labels);
+}
+
+/// The pre-filter is live on both key types, and the whole answer is right.
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_partition_keys_prune_and_keep_the_right_rows() {
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+
+    assert_eq!(ids_where(&env.conn_str, "cluster_id = 7").await, vec![2]);
+    assert_eq!(ids_where(&env.conn_str, "cluster_id = -7").await, vec![3]);
+    assert_eq!(ids_where(&env.conn_str, "cluster_id = 0").await, vec![1]);
+    assert_eq!(
+        ids_where(&env.conn_str, "cluster_id IN (7, 1000000)").await,
+        vec![2, 4]
+    );
+    assert!(ids_where(&env.conn_str, "cluster_id = 99").await.is_empty());
+    // A string key carries its value verbatim, spaces and all, and needs no
+    // canonicalisation — there is only one way to spell a string.
+    assert_eq!(ids_where(&env.conn_str, "label = 'x y'").await, vec![4]);
+    assert_eq!(ids_where(&env.conn_str, "label = 'us-east'").await, vec![2]);
+}
+
+/// The regression this guard exists for. Each spelling below is one some
+/// integer parser reads as 7 — DuckDB reads every one of them that way — while
+/// `apply_partition_bounds` derives no bound from it and keeps the file. The
+/// pre-filter must keep it too: dropping it loses every row in that file, which
+/// is the one failure mode this whole mechanism must not have.
+///
+/// The control case at the end is what stops this passing vacuously: a value
+/// that really is a different partition must still be pruned.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_canonical_partition_value_spelling_never_loses_rows() {
+    for hostile in [
+        "07",   // leading zero
+        "007",  // more leading zeros
+        "+7",   // explicit sign
+        "7.0",  // zero fraction
+        "7.00", // more zero fraction
+        "0x7",  // hexadecimal
+        "7e0",  // exponent
+        " 7",   // leading space
+        "7 ",   // trailing space
+        "\t7",  // leading tab
+        "7\t",  // trailing tab
+        "\n7",  // leading newline
+        "7\n",  // trailing newline
+    ] {
+        let env = setup_identity_keys().await;
+        write_identity_fixture(&env).await;
+        set_partition_value(&env.conn_str, 0, "7", Some(hostile)).await;
+
+        assert_eq!(
+            ids_where(&env.conn_str, "cluster_id = 7").await,
+            vec![2],
+            "partition value {hostile:?} must keep its file"
+        );
+        // The rest of the table is unaffected either way.
+        assert_eq!(ids_where(&env.conn_str, "cluster_id = -7").await, vec![3]);
+    }
+
+    // Control: a genuinely different partition value still prunes, so the cases
+    // above are not passing because the pre-filter does nothing.
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+    set_partition_value(&env.conn_str, 0, "7", Some("8")).await;
+    assert!(
+        ids_where(&env.conn_str, "cluster_id = 7").await.is_empty(),
+        "a file whose partition value is 8 cannot hold cluster_id = 7"
+    );
+}
+
+/// A NULL partition value, and a file with no row for the key at all, are both
+/// kept: neither says anything about the file's rows. Official's clause, which
+/// is a membership test rather than an anti-join, drops both.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_undecidable_partition_value_keeps_its_file() {
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+    set_partition_value(&env.conn_str, 0, "7", None).await;
+    assert_eq!(
+        ids_where(&env.conn_str, "cluster_id = 7").await,
+        vec![2],
+        "a NULL partition value bounds nothing"
+    );
+
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+    let pool = sqlx::SqlitePool::connect(&env.conn_str).await.unwrap();
+    let removed = sqlx::query(
+        "DELETE FROM ducklake_file_partition_value
+         WHERE partition_key_index = 0 AND partition_value = '7'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(removed, 1);
+    assert_eq!(
+        ids_where(&env.conn_str, "cluster_id = 7").await,
+        vec![2],
+        "a file with no row for the key must be kept"
+    );
+}
+
+/// After a re-partition a live file may carry values written under a retired
+/// generation whose key order differs, so nothing may be pruned from them. The
+/// pre-filter takes the same `prune_safe` gate `apply_partition_bounds` does,
+/// and here the two keys are swapped so a mis-mapped value would read as the
+/// other column entirely.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repartitioned_table_prefilters_nothing() {
+    let env = setup_identity_keys().await;
+    write_identity_fixture(&env).await;
+
+    let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
+        .await
+        .unwrap();
+    writer
+        .set_partition_spec(
+            env.table_id,
+            &[
+                ("label".to_string(), PartitionTransform::Identity),
+                ("cluster_id".to_string(), PartitionTransform::Identity),
+            ],
+        )
+        .unwrap();
+
+    // Every answer is still exactly right, because nothing is pruned from a
+    // mapping that may not be the one the files were written under.
+    assert_eq!(ids_where(&env.conn_str, "cluster_id = 7").await, vec![2]);
+    assert_eq!(ids_where(&env.conn_str, "cluster_id = -7").await, vec![3]);
+    assert_eq!(ids_where(&env.conn_str, "label = 'x y'").await, vec![4]);
+}

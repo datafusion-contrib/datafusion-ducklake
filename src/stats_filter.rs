@@ -3,11 +3,21 @@
 //! DuckLake records per-file `min_value` / `max_value` / `null_count` /
 //! `value_count` / `contains_nan` in `ducklake_file_column_stats`. Official
 //! DuckLake narrows the data-file list inside the metadata query itself: one CTE
-//! per filtered column, `LEFT JOIN`ed to `ducklake_data_file` on `data_file_id`,
-//! with the pushed-down filter rewritten against those stat columns
-//! (`ducklake_metadata_manager.cpp`, `ConvertFilterPushdownToSQL`). Files whose
-//! statistics prove they cannot contain a matching row are never listed, so the
-//! cost of planning a selective query stops being proportional to the table.
+//! per filtered column, with the pushed-down filter rewritten against those stat
+//! columns (`ducklake_metadata_manager.cpp`, `ConvertFilterPushdownToSQL`).
+//! Files whose statistics prove they cannot contain a matching row are never
+//! listed, so the cost of planning a selective query stops being proportional to
+//! the table.
+//!
+//! How the CTE is read back differs, and the difference matters twice below. At
+//! the pinned oracle `d8a1881e` official tests membership twice —
+//! `data.data_file_id NOT IN (SELECT data_file_id FROM <cte>) OR
+//! data.data_file_id IN (SELECT ... WHERE <condition>)` — which is where its
+//! reference count of 2 comes from. This crate names the CTE once, in a
+//! `LEFT JOIN`, and reads the no-stats-row case off a NULL `data_file_id`
+//! instead. Upstream moved to a `LEFT JOIN` itself in `71a9e105`, after the
+//! oracle; see *Why the statistics CTE is materialized*, which turns on exactly
+//! that reference count.
 //!
 //! This module is the whole of that rewrite. It takes a physical predicate and
 //! produces a backend-agnostic [`StatsFilter`]; [`StatsFilter::render`] turns
@@ -133,6 +143,68 @@
 //! constant, where this prunes and official cannot; a non-float column holds no
 //! NaN, so its bounds are sound.
 //!
+//! **9. A dialect's conversion of a bound is computed once per file, in the CTE
+//! body.** *A consequence of divergence 1, not an independent choice: this would
+//! not exist if the filter ran in DuckDB.* Official's
+//! `GenerateFileColumnStatsCTEBody` emits a plain projection of the stored text
+//! and puts the cast in the conditions (`CastStatsToTarget`), so an `IN` list of
+//! n values converts the same two strings n times per file. That is nearly free
+//! in DuckDB, where the condition runs over a vectorized column, and it is not
+//! free in a catalog engine evaluating it row by row — and it is why
+//! materializing the CTE (below) does not fix it on its own: what gets
+//! materialized is the raw text, while the conversion lives in the join filter.
+//! Each conversion this crate needs is therefore emitted once as a CTE output
+//! column and the condition names that column. Measured on PostgreSQL 18 over a
+//! synthetic catalog of 8192 files carrying one statistics row each, with a
+//! 32-value `IN` predicate: **roughly twenty times faster**, 2703 ms with the
+//! conversion in the join filter against 127 ms with it in the CTE body, the
+//! same 32 rows from both. Read the ratio, not the milliseconds — every figure
+//! in this module is bound to that fixture, and an independent rebuild of the
+//! same shape reproduced the direction with different magnitudes. Results are
+//! unchanged, and
+//! structurally so: the raw statistics stay in the projection because the
+//! fail-open `IS NULL` disjuncts read them, so the statement is the previous one
+//! with each conversion replaced by a reference to itself, and inlining the CTE
+//! reproduces it verbatim.
+//!
+//! **10. An identity partition key pre-filters the listing, as a bucket key does
+//! in official.** *Also a consequence of divergence 1: in DuckDB the statistics
+//! path already costs almost nothing, so official never needed this for an
+//! identity key.* Official narrows the same listing against
+//! `ducklake_file_partition_value` (`BuildBucketPartitionPruningClause`), and
+//! only for `BUCKET` transforms — `if (field.transform.type !=
+//! DuckLakeTransformType::BUCKET) continue;` — because hashing destroys ordering
+//! so statistics cannot prune a bucket partition at all, while for `identity`
+//! the statistics path suffices *in DuckDB*. It does not suffice here: the
+//! statistics path costs one conversion per file however few files a query
+//! probes. Extending official's own mechanism to the transform it did not need
+//! it for measured, on the same fixture and with the same caveat: **roughly
+//! twenty times again**, 127 ms with divergence 9 alone against 6.8 ms with the
+//! pre-filter. The conjunct goes on the outer `WHERE` *and* inside each
+//! statistics CTE body, because a materialized CTE is an optimization fence the
+//! outer conjunct cannot reach into: with it only on the outer `WHERE` the same
+//! query still takes 122 ms, which is no gain at all.
+//!
+//! The comparison is on the stored *text*, not on a converted value, and that is
+//! the whole of why it is fast: converting the partition value instead lands
+//! back at 117 ms, the unfiltered listing again. Text comparison is sound only
+//! while no other spelling of a listed value exists, so four things narrow it,
+//! all of them keeping files official's clause would drop. It is an anti-join
+//! rather than `data_file_id IN (...)`, so a file with no row for the key is
+//! kept. A NULL partition value is kept. Only types whose value has one
+//! rendering are pushed down at all — integer and string columns
+//! (`PartitionTextMatch`); a float, decimal, boolean or temporal key pre-filters
+//! nothing. And an integer value refutes only once
+//! [`StatsSqlDialect::canonical_integer_text`] has *positively* proven the
+//! stored text is the canonical spelling, because integer parsers are lenient in
+//! ways no blocklist covers — DuckDB reads `2.0`, `0x2`, `2e0` and
+//! whitespace-padded text all as 2, and each of those must keep its file. A
+//! dialect with no way to prove that declines, and the key pre-filters nothing.
+//! Official folds its constant through DuckDB and compares `Value::ToString()`;
+//! this crate compares against the encoding its own write path stored
+//! (`split_batches_by_partition` calls `stats_encode::encode_scalar`, the same
+//! function that produces [`StatsLiteral::text`]).
+//!
 //! # Why the statistics CTE is materialized
 //!
 //! The CTE selects the raw `min_value` / `max_value` text and every comparison
@@ -172,6 +244,7 @@
 //! DuckDB's defaults were never chosen for a native catalog's planner.
 //! Re-adjudicate it then rather than meeting it as drift.
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -233,6 +306,29 @@ pub struct StatsLiteral {
     /// for finite numerics and a quoted literal for everything else, including
     /// non-finite floats.
     unquoted: bool,
+    /// How faithfully [`Self::text`] identifies this value when it is compared
+    /// against a stored partition value as text, or `None` when it does not.
+    partition_match: Option<PartitionTextMatch>,
+}
+
+/// How a value's canonical text relates to the other spellings of that value,
+/// which is what decides whether a partition value may be compared against it
+/// as text (see [`PartitionPrefilter`]).
+///
+/// Derived twice, from the column and from the constant, and both must agree
+/// before anything is pushed down — see [`StatsColumnFilter::partition_text`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTextMatch {
+    /// The stored text IS the value: a string column. Two different texts are
+    /// two different values under every collation, because no collation equates
+    /// fewer strings than byte equality does.
+    Exact,
+    /// One canonical rendering, and an open set of other spellings some
+    /// integer parser also reads — `+2`, `02`, `-0`, `2.0`, `0x2`, `2e0`, and
+    /// anything with surrounding whitespace. Text inequality is value
+    /// inequality only for text proven to be the canonical spelling, which is
+    /// what [`StatsSqlDialect::canonical_integer_text`] tests, positively.
+    CanonicalInteger,
 }
 
 /// Comparison against one order-bearing bound.
@@ -296,12 +392,28 @@ pub struct StatsColumnFilter {
     /// bounds. When the filter *does* mention `null_count` the guard is dropped,
     /// because such a filter can be satisfied by a NULL row.
     pub needs_value_count_guard: bool,
+    /// How this *column's* values are spelled as text, or `None` when they have
+    /// no single spelling — which is what decides whether an identity partition
+    /// key over it may be pre-filtered at all.
+    ///
+    /// Taken from the column, deliberately, where [`StatsLiteral`] takes its own
+    /// from the constant. The two must agree, and requiring that is what closes
+    /// the same asymmetry divergence 8 describes for the float gate: a
+    /// `PhysicalExpr` handed to [`crate::DuckLakeTable::files_matching`] carries
+    /// no guarantee the constant was coerced to the column's type, so a `Utf8`
+    /// constant against an integer partition column would otherwise be read as
+    /// "the stored text IS the value" and skip the canonical-spelling guard —
+    /// excluding a file stored as `007` for `id = '7'`. On the mutation path
+    /// that is a duplicate insert rather than a slow query.
+    pub partition_text: Option<PartitionTextMatch>,
     pub condition: StatsExpr,
 }
 
 impl StatsColumnFilter {
-    /// Stats the CTE must select: everything the condition reads, plus
-    /// `value_count` when it is only the guard.
+    /// Raw statistics the CTE must select: everything the condition reads, plus
+    /// `value_count` when it is only the guard. The CTE also carries one column
+    /// per dialect conversion the condition needs; those come from rendering,
+    /// and [`RenderedColumnFilter::projections`] is the whole select list.
     ///
     /// This is deliberately *not* the same set as [`Self::referenced_stats`].
     /// Official builds its `IS NULL` disjuncts before inserting the guard stat,
@@ -326,6 +438,113 @@ pub struct StatsFilter {
     /// hash-dependent and explicitly not normative. Sorting makes the generated
     /// SQL deterministic and diffable, which the tests rely on.
     pub columns: Vec<StatsColumnFilter>,
+    /// Identity partition keys the predicate pins to a set of values, in key
+    /// order. Empty unless [`Self::with_partition_prefilters`] was called with a
+    /// spec that qualifies.
+    pub partitions: Vec<PartitionPrefilter>,
+}
+
+/// A pre-filter on one identity partition key.
+///
+/// A file's row in `ducklake_file_partition_value` records the single value
+/// every row in it holds for that key, so a file whose value is none of the ones
+/// an equality predicate admits cannot hold a matching row — and, unlike a
+/// statistics bound, that is known without reading the file's statistics at all.
+///
+/// Official builds the same clause against the same table, for `BUCKET` keys
+/// only (`BuildBucketPartitionPruningClause`), because hashing destroys ordering
+/// so statistics cannot prune a bucket partition at all while for `identity`
+/// they suffice — in DuckDB. See the module docs for why they do not suffice
+/// here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartitionPrefilter {
+    /// `ducklake_partition_column.partition_key_index`, which is what
+    /// `ducklake_file_partition_value` keys on.
+    pub partition_key_index: i32,
+    /// The values the predicate admits for this key's column.
+    pub values: Vec<StatsLiteral>,
+}
+
+/// One rendered partition pre-filter, ready to be ANDed into a `WHERE` clause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedPartitionPrefilter {
+    /// `ducklake_partition_column.partition_key_index` this narrows on.
+    pub partition_key_index: i32,
+    /// Alias of the subquery the conjunct opens.
+    alias: String,
+    /// True of a `ducklake_file_partition_value` row whose value proves its file
+    /// holds no matching row.
+    excluded: String,
+    /// `ducklake_data_file.table_id` the rows are scoped to.
+    table_id: i64,
+}
+
+impl RenderedPartitionPrefilter {
+    /// The `WHERE` conjunct that drops a file whose recorded value for this key
+    /// proves it holds no matching row. `file_alias` is whatever the enclosing
+    /// query calls the relation carrying `data_file_id`.
+    ///
+    /// An anti-join, where official emits `data_file_id IN (...)`. The
+    /// membership test excludes a file it cannot decide, and there are three
+    /// such files here that official never meets: one written before the table
+    /// was partitioned, which has no row for this key at all; one whose value is
+    /// SQL NULL, which is a partition in its own right and bounds nothing; and
+    /// one whose value is not the encoding [`crate::stats_encode`] writes. Each
+    /// leaves the inner condition short of a definite `true`, and only a
+    /// definite `true` removes the file.
+    pub fn conjunct(&self, file_alias: &str) -> String {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS {alias} \
+             WHERE {alias}.table_id = {table_id} \
+             AND {alias}.data_file_id = {file_alias}.data_file_id \
+             AND {alias}.partition_key_index = {key} \
+             AND {excluded})",
+            alias = self.alias,
+            table_id = self.table_id,
+            key = self.partition_key_index,
+            excluded = self.excluded,
+        )
+    }
+}
+
+/// The values a condition proves its column must take, or `None` when it proves
+/// no such set.
+///
+/// The `And` / `Or` asymmetry is [`render_expr`]'s, for the same reason. A
+/// conjunction only has to be narrowed by one of its children, so children that
+/// name no set are skipped — official does the same and notes that a
+/// contradictory `a = 1 AND a = 2` over-includes, which costs pruning and never
+/// rows. A disjunction admits every branch, so one branch that is not an
+/// equality admits values no list can name and the whole set is abandoned.
+fn equality_values(expr: &StatsExpr) -> Option<Vec<StatsLiteral>> {
+    match expr {
+        StatsExpr::LiteralWithinBounds(literal) => Some(vec![literal.clone()]),
+        StatsExpr::And(children) => {
+            let values: Vec<_> = children
+                .iter()
+                .filter_map(equality_values)
+                .flatten()
+                .collect();
+            (!values.is_empty()).then_some(values)
+        },
+        StatsExpr::Or(children) => {
+            let mut values = Vec::new();
+            for child in children {
+                values.extend(equality_values(child)?);
+            }
+            (!values.is_empty()).then_some(values)
+        },
+        // A range proves no set, `<>` proves only what the column is not, and
+        // the counts and the float gate read no bound at all. The float gate is
+        // why a float column never reaches here even for an equality: the gate
+        // wraps the condition in an `Or` whose other branch names no set.
+        StatsExpr::NotEveryRowEqual(_)
+        | StatsExpr::BoundCompare {
+            ..
+        }
+        | StatsExpr::CountPositive(_)
+        | StatsExpr::FloatBoundsUnusable => None,
+    }
 }
 
 /// SQL a particular catalog engine needs spelled its own way.
@@ -388,6 +607,27 @@ pub trait StatsSqlDialect {
     /// dialect opts in by naming the spelling its engine accepts.
     fn cte_materialization(&self) -> &'static str {
         ""
+    }
+
+    /// SQL true only of text that is an integer spelled the one way
+    /// [`crate::stats_encode`] spells one — `0`, or a sign-optional run of
+    /// digits with no leading zero. `None` declines, which drops the partition
+    /// pre-filter for an integer key entirely.
+    ///
+    /// This is what lets a partition value be compared as *text* at all. The
+    /// pre-filter excludes a file whose stored value is not in a list of
+    /// encoded constants, and that is only sound while no other spelling of a
+    /// listed value exists. Integer parsers are lenient in ways `LIKE` cannot
+    /// enumerate — DuckDB reads `2.0`, `2.00`, `0x2`, `2e0`, and text with
+    /// leading or trailing whitespace, all as 2 — so the test must be
+    /// *positive*: it admits the canonical spelling and refuses everything
+    /// else, including text no parser reads. A refused value keeps its file.
+    ///
+    /// Returning something that admits a non-canonical spelling is a
+    /// correctness bug: the file is dropped and its rows are lost.
+    fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+        let _ = expr;
+        None
     }
 
     /// Keep a file whose condition evaluates to SQL `NULL`.
@@ -478,10 +718,18 @@ impl StatsLiteral {
             return None;
         }
         let cast = requires_value_comparison(&data_type).then_some(data_type.clone());
+        // From the CONSTANT's type. The column's own answer is recorded
+        // separately (`StatsColumnFilter::partition_text`) and both must agree
+        // before a partition key is pre-filtered, because a mismatch means the
+        // two sides are not encodings of the same thing: an `Int32` column
+        // against a `Float64` constant stores `7` and probes `7.0`, which would
+        // exclude a file holding the very rows the predicate wants.
+        let partition_match = partition_text_for(&data_type);
         Some(Self {
             text,
             cast: cast.clone(),
             unquoted: renders_unquoted(value, &data_type),
+            partition_match,
         })
     }
 
@@ -494,35 +742,143 @@ impl StatsLiteral {
     }
 
     /// The literal as SQL.
-    fn render(&self, ctx: &RenderContext<'_>) -> String {
+    fn render(&self, dialect: &dyn StatsSqlDialect) -> String {
         if self.unquoted {
             self.text.clone()
         } else {
-            ctx.dialect.quote_literal(&self.text)
+            dialect.quote_literal(&self.text)
         }
     }
 
-    /// A stat column cast for comparison against this literal, or `None` if the
-    /// dialect declined the type.
-    fn render_stat(&self, stat: StatKind, ctx: &RenderContext<'_>) -> Option<String> {
-        let raw = ctx.qualify(stat);
+    /// The dialect's conversion of `column` for comparison against this
+    /// literal, or `None` if the dialect declined the type.
+    ///
+    /// `column` is spelled however the caller needs it read — unqualified for a
+    /// statistics column being converted inside a CTE body, qualified for a
+    /// partition value being read one row at a time.
+    fn convert(&self, column: &str, dialect: &dyn StatsSqlDialect) -> Option<String> {
         match &self.cast {
-            Some(data_type) => ctx.dialect.try_cast(&raw, self, data_type),
-            None => Some(ctx.dialect.collate_binary(&raw)),
+            Some(data_type) => dialect.try_cast(column, self, data_type),
+            None => Some(dialect.collate_binary(column)),
         }
     }
+
+    /// A reference to the CTE column holding this stat converted for comparison
+    /// against this literal, or `None` if the dialect declined the type.
+    ///
+    /// The conversion is built over the *unqualified* statistics column, which
+    /// is the spelling that resolves inside the CTE body, and hoisted there; the
+    /// condition names the resulting column instead of repeating the conversion.
+    fn render_stat(&self, stat: StatKind, ctx: &RenderContext<'_>) -> Option<String> {
+        let converted = self.convert(stat.column_name(), ctx.dialect)?;
+        Some(ctx.hoist(stat, converted))
+    }
+}
+
+/// One dialect conversion lifted out of the predicate into the CTE body.
+struct HoistedConversion {
+    stat: StatKind,
+    name: String,
+    expr: String,
 }
 
 /// Everything rendering needs for one column's CTE.
 struct RenderContext<'a> {
     dialect: &'a dyn StatsSqlDialect,
     alias: String,
+    /// Conversions hoisted into the CTE body, in first-use order. A `RefCell`
+    /// because rendering walks the condition tree behind a shared reference.
+    hoisted: RefCell<Vec<HoistedConversion>>,
 }
 
 impl RenderContext<'_> {
-    /// `<alias>.<stat>`
+    /// `<alias>.<stat>` — the raw statistic, which the CTE projects verbatim.
     fn qualify(&self, stat: StatKind) -> String {
         format!("{}.{}", self.alias, stat.column_name())
+    }
+
+    /// Give `expr` — the dialect's conversion of `stat`, written against the
+    /// unqualified statistics column — a column of its own in the CTE body, and
+    /// return the reference that stands in for it in the condition.
+    ///
+    /// Conversions are deduplicated by their SQL, so the n comparisons of an
+    /// `IN` list share one column. A column whose conditions ask for two
+    /// different target types — `a = 5 AND a < 2.5` on an integer column, where
+    /// the cast follows the constant (divergence 8) — gets one column per
+    /// distinct conversion, numbered in first-use order.
+    ///
+    /// A dialect whose conversion is the identity (DuckDB's `collate_binary`)
+    /// gets the raw column back rather than an alias of it.
+    fn hoist(&self, stat: StatKind, expr: String) -> String {
+        if expr == stat.column_name() {
+            return self.qualify(stat);
+        }
+        let mut hoisted = self.hoisted.borrow_mut();
+        let name = match hoisted
+            .iter()
+            .find(|conversion| conversion.stat == stat && conversion.expr == expr)
+        {
+            Some(existing) => existing.name.clone(),
+            None => {
+                let ordinal = hoisted
+                    .iter()
+                    .filter(|conversion| conversion.stat == stat)
+                    .count()
+                    + 1;
+                let name = format!("{}_{ordinal}", stat.column_name());
+                hoisted.push(HoistedConversion {
+                    stat,
+                    name: name.clone(),
+                    expr,
+                });
+                name
+            },
+        };
+        format!("{}.{name}", self.alias)
+    }
+
+    /// The hoisted conversions as CTE projections, ordered by the statistic they
+    /// read and then by first use, so the select list is deterministic.
+    fn into_hoisted(self) -> Vec<CteProjection> {
+        let mut hoisted = self.hoisted.into_inner();
+        hoisted.sort_by_key(|conversion| conversion.stat);
+        hoisted
+            .into_iter()
+            .map(|conversion| CteProjection {
+                name: conversion.name,
+                expr: conversion.expr,
+            })
+            .collect()
+    }
+}
+
+/// One output column of a statistics CTE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CteProjection {
+    /// The column's name inside the CTE; the condition reads it as
+    /// `<alias>.<name>`.
+    pub name: String,
+    /// The expression, written against the unqualified columns of
+    /// `ducklake_file_column_stats`.
+    pub expr: String,
+}
+
+impl CteProjection {
+    /// A statistics column projected as it is stored.
+    fn raw(stat: StatKind) -> Self {
+        Self {
+            name: stat.column_name().to_string(),
+            expr: stat.column_name().to_string(),
+        }
+    }
+
+    /// The projection as it is written in the CTE's select list.
+    pub fn render(&self) -> String {
+        if self.expr == self.name {
+            self.name.clone()
+        } else {
+            format!("{} AS {}", self.expr, self.name)
+        }
     }
 }
 
@@ -533,9 +889,11 @@ pub struct RenderedColumnFilter {
     pub alias: String,
     /// `ducklake_file_column_stats.column_id` the CTE restricts to.
     pub column_id: i64,
-    /// Stat columns the CTE must select, in a stable order. `data_file_id` is
-    /// always required in addition to these and is not listed.
-    pub stats: Vec<&'static str>,
+    /// Columns the CTE must select, in a stable order: every raw statistic the
+    /// condition or its guards read, then the dialect conversions hoisted out of
+    /// the condition. `data_file_id` is always required in addition to these and
+    /// is not listed.
+    pub projections: Vec<CteProjection>,
     /// The modifier the CTE is declared with, spelled to sit between `AS` and
     /// the opening parenthesis: `WITH <alias> AS <cte_materialization>(...)`.
     /// Empty on a dialect whose engine has no such modifier.
@@ -544,7 +902,153 @@ pub struct RenderedColumnFilter {
     pub condition: String,
 }
 
+impl RenderedColumnFilter {
+    /// The CTE's select list, without the leading `data_file_id` every backend
+    /// adds for the join.
+    pub fn select_list(&self) -> String {
+        self.projections
+            .iter()
+            .map(CteProjection::render)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 impl StatsFilter {
+    /// Attach the identity-partition pre-filters `spec` allows for this
+    /// predicate. Replaces whatever was attached before.
+    ///
+    /// Refuses, in the order the conditions are written:
+    ///
+    /// - a spec that is not `prune_safe` — after a re-partition a live file may
+    ///   carry values from a retired generation whose key order differs, so
+    ///   mapping them through this spec could mis-prune. It is the same gate
+    ///   `DuckLakeTable::apply_partition_bounds` applies to the same values.
+    /// - a transform that is not `identity`. `bucket` hashes, and this crate
+    ///   never prunes on it at all; `year` is a range and `month` / `day` /
+    ///   `hour` are not even order-preserving, so none of them turns an equality
+    ///   on the source column into an equality on the stored value.
+    /// - a key whose column the predicate does not constrain, or constrains to
+    ///   something other than a set of values: an equality or an `IN` list, or
+    ///   a conjunction carrying one, and nothing else.
+    /// - a value whose encoded text does not identify it among the spellings
+    ///   another writer might have used (see `PartitionTextMatch`).
+    pub fn with_partition_prefilters(
+        mut self,
+        spec: Option<&crate::partition::PartitionSpec>,
+    ) -> Self {
+        self.partitions = Vec::new();
+        let Some(spec) = spec else {
+            return self;
+        };
+        if !spec.prune_safe {
+            return self;
+        }
+        for key in &spec.columns {
+            if key.transform != crate::partition::PartitionTransform::Identity {
+                continue;
+            }
+            let Some(column) = self
+                .columns
+                .iter()
+                .find(|column| column.column_id == key.column_id)
+            else {
+                continue;
+            };
+            let Some(values) = equality_values(&column.condition) else {
+                continue;
+            };
+            // The column's spelling and every constant's must be the same
+            // answer. Either alone is not enough; see
+            // `StatsColumnFilter::partition_text`.
+            let Some(kind) = column.partition_text else {
+                continue;
+            };
+            if !values
+                .iter()
+                .all(|literal| literal.partition_match == Some(kind))
+            {
+                continue;
+            }
+            self.partitions.push(PartitionPrefilter {
+                partition_key_index: key.partition_key_index,
+                values,
+            });
+        }
+        self
+    }
+
+    /// Render the partition pre-filters for one dialect.
+    ///
+    /// `table_id` scopes the rows, exactly as it does for a statistics CTE.
+    ///
+    /// The comparison is on the stored text, not on a converted value, and that
+    /// is what makes it cheap: a conversion would run on every partition-value
+    /// row the key has, where a `NOT IN` against a handful of strings is a hash
+    /// probe. On the module's synthetic fixture the cast lands at 117 ms against
+    /// 6.8 ms for this, on a listing that takes 127 ms with no pre-filter at all
+    /// — the cast buys nothing over divergence 9 alone. Figures are fixture-bound
+    /// (see divergence 9); the shape of the answer is not.
+    ///
+    /// Text comparison is sound here only because of what surrounds it: both
+    /// sides are byte-collated, so the comparison matches the one
+    /// `apply_partition_bounds` and DataFusion make downstream, and an integer
+    /// value refutes only where [`StatsSqlDialect::canonical_integer_text`]
+    /// proves the stored spelling canonical.
+    ///
+    /// The collation is load-bearing on MySQL for a second reason. A constant
+    /// holding a backslash renders as a `_utf8mb4` hexadecimal literal, and
+    /// comparing that against a column of another collation is error 1267 —
+    /// which the providers' unfiltered retry would catch, but at the cost of the
+    /// *whole* statistics filter and not just this pre-filter. Collating both
+    /// sides removes the mix.
+    pub fn render_partition_prefilters(
+        &self,
+        dialect: &dyn StatsSqlDialect,
+        table_id: i64,
+    ) -> Vec<RenderedPartitionPrefilter> {
+        self.partitions
+            .iter()
+            .filter(|prefilter| !prefilter.values.is_empty())
+            .filter_map(|prefilter| {
+                let alias = format!("part_{}_values", prefilter.partition_key_index);
+                let value = format!("{alias}.partition_value");
+                let list = prefilter
+                    .values
+                    .iter()
+                    .map(|literal| dialect.quote_literal(literal.text()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // Byte-wise, like every other raw string comparison here
+                // (divergence 2). It is also what the comparison downstream
+                // does: `apply_partition_bounds` parses this text into a
+                // `ScalarValue` that DataFusion then compares byte-wise, so a
+                // looser collation would disagree with the pruning this
+                // pre-filters for. On MySQL it is load-bearing for a second
+                // reason: a constant holding a backslash renders as a
+                // `_utf8mb4` hexadecimal literal, and comparing that against a
+                // differently-collated column is error 1267, which would cost
+                // the listing its whole statistics filter and not just this.
+                let compared = dialect.collate_binary(&value);
+                let mut excluded = format!("{value} IS NOT NULL AND {compared} NOT IN ({list})");
+                // A dialect that cannot prove canonical spelling declines, and
+                // the key pre-filters nothing.
+                if prefilter.values.iter().any(|literal| {
+                    literal.partition_match == Some(PartitionTextMatch::CanonicalInteger)
+                }) {
+                    excluded =
+                        format!("{excluded} AND {}", dialect.canonical_integer_text(&value)?);
+                }
+                Some(RenderedPartitionPrefilter {
+                    partition_key_index: prefilter.partition_key_index,
+                    alias,
+                    excluded,
+                    table_id,
+                })
+            })
+            .collect()
+    }
+
     /// Render for one dialect, or `None` when nothing survives.
     ///
     /// A column whose condition cannot be rendered — because the dialect
@@ -567,6 +1071,7 @@ impl StatsFilter {
         let context = RenderContext {
             dialect,
             alias: format!("col_{}_stats", column.column_id),
+            hoisted: RefCell::new(Vec::new()),
         };
         let condition = render_expr(&column.condition, &context)?;
 
@@ -594,15 +1099,25 @@ impl StatsFilter {
         // LEFT JOINs to all-NULL. It must always be kept.
         let data_file_id = format!("{}.data_file_id", context.alias);
         let condition = format!("({data_file_id} IS NULL OR ({body}))");
+        // The raw statistics come first and are projected verbatim, because the
+        // `IS NULL` disjuncts above read them: a conversion of a stat that is
+        // present but malformed is NULL while the stat is not, so guarding on the
+        // converted column instead would fail open on a file the other bound
+        // already rules out. Keeping both leaves the emitted statement the
+        // previous one with each conversion replaced by a reference to itself.
+        let mut projections: Vec<CteProjection> = column
+            .cte_stats()
+            .iter()
+            .map(|stat| CteProjection::raw(*stat))
+            .collect();
+        let alias = context.alias.clone();
+        let cte_materialization = dialect.cte_materialization();
+        projections.extend(context.into_hoisted());
         Some(RenderedColumnFilter {
-            alias: context.alias.clone(),
+            alias,
             column_id: column.column_id,
-            stats: column
-                .cte_stats()
-                .iter()
-                .map(|stat| stat.column_name())
-                .collect(),
-            cte_materialization: dialect.cte_materialization(),
+            projections,
+            cte_materialization,
             condition: dialect.keep_when_unknown(&condition),
         })
     }
@@ -635,12 +1150,15 @@ fn render_expr(expr: &StatsExpr, ctx: &RenderContext<'_>) -> Option<String> {
         StatsExpr::LiteralWithinBounds(literal) => {
             let min = literal.render_stat(StatKind::MinValue, ctx)?;
             let max = literal.render_stat(StatKind::MaxValue, ctx)?;
-            Some(format!("{} BETWEEN {min} AND {max}", literal.render(ctx)))
+            Some(format!(
+                "{} BETWEEN {min} AND {max}",
+                literal.render(ctx.dialect)
+            ))
         },
         StatsExpr::NotEveryRowEqual(literal) => {
             let min = literal.render_stat(StatKind::MinValue, ctx)?;
             let max = literal.render_stat(StatKind::MaxValue, ctx)?;
-            let value = literal.render(ctx);
+            let value = literal.render(ctx.dialect);
             Some(format!("NOT ({min} = {value} AND {max} = {value})"))
         },
         StatsExpr::BoundCompare {
@@ -649,7 +1167,11 @@ fn render_expr(expr: &StatsExpr, ctx: &RenderContext<'_>) -> Option<String> {
             literal,
         } => {
             let bound = literal.render_stat(*stat, ctx)?;
-            Some(format!("{bound} {} {}", op.sql(), literal.render(ctx)))
+            Some(format!(
+                "{bound} {} {}",
+                op.sql(),
+                literal.render(ctx.dialect)
+            ))
         },
         StatsExpr::CountPositive(stat) => Some(format!("{} > 0", ctx.qualify(*stat))),
         StatsExpr::FloatBoundsUnusable => Some(
@@ -663,6 +1185,9 @@ fn render_expr(expr: &StatsExpr, ctx: &RenderContext<'_>) -> Option<String> {
 struct Lowered {
     condition: StatsExpr,
     referenced_stats: BTreeSet<StatKind>,
+    /// How the *column's* values are spelled; see
+    /// [`StatsColumnFilter::partition_text`].
+    partition_text: Option<PartitionTextMatch>,
 }
 
 /// Lower a physical predicate to per-column statistics conditions.
@@ -699,6 +1224,12 @@ pub fn lower_predicate(
                     other => StatsExpr::And(vec![other, lowered.condition]),
                 };
                 existing.referenced_stats.extend(lowered.referenced_stats);
+                // Both conjuncts name the same column, so this is the same
+                // answer twice; taking the intersection rather than the last
+                // one keeps that an invariant instead of an assumption.
+                if existing.partition_text != lowered.partition_text {
+                    existing.partition_text = None;
+                }
             },
             None => by_column.push((column_id, lowered)),
         }
@@ -722,6 +1253,7 @@ pub fn lower_predicate(
                 column_id,
                 needs_value_count_guard: !reads_null_count && reads_bound,
                 referenced_stats: lowered.referenced_stats,
+                partition_text: lowered.partition_text,
                 condition: lowered.condition,
             }
         })
@@ -729,6 +1261,7 @@ pub fn lower_predicate(
 
     Some(StatsFilter {
         columns,
+        partitions: Vec::new(),
     })
 }
 
@@ -764,6 +1297,7 @@ fn lower_conjunct(
         Lowered {
             condition,
             referenced_stats,
+            partition_text: partition_text_for(field.data_type()),
         },
     ))
 }
@@ -795,6 +1329,25 @@ fn needs_float_gate(expr: &StatsExpr) -> bool {
         StatsExpr::LiteralWithinBounds(_)
         | StatsExpr::CountPositive(_)
         | StatsExpr::FloatBoundsUnusable => false,
+    }
+}
+
+/// How a value of `data_type` is spelled as text, or `None` when it has more
+/// than one plausible spelling and so cannot be compared as text at all.
+///
+/// Floats, decimals, booleans and temporals are all `None`: each has renderings
+/// this crate would not write but another writer might — `5.0` for `5`, `.000`
+/// for no fraction, `1` for `true`, a signed year.
+fn partition_text_for(data_type: &DataType) -> Option<PartitionTextMatch> {
+    if matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        Some(PartitionTextMatch::Exact)
+    } else if data_type.is_integer() {
+        Some(PartitionTextMatch::CanonicalInteger)
+    } else {
+        None
     }
 }
 
@@ -1086,6 +1639,15 @@ mod tests {
         fn boolean_is_not_false(&self, expr: &str) -> String {
             format!("{expr} IS NULL OR {expr} <> false")
         }
+
+        /// What the real DuckDB dialect emits, so the partition pre-filter these
+        /// tests assert is the one a backend produces.
+        fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+            Some(format!(
+                "regexp_full_match({expr}, '-?[0-9]+') \
+                 AND {expr} NOT LIKE '0_%' AND {expr} NOT LIKE '-0%'"
+            ))
+        }
     }
 
     /// A dialect that cannot safely reproduce `TRY_CAST` for `BIGINT`, so it
@@ -1185,14 +1747,20 @@ mod tests {
             rendered.remove(0)
         }
 
-        /// The rendered `WHERE` condition for the single filtered column.
+        /// The rendered `WHERE` condition for the single filtered column, with
+        /// every hoisted conversion put back where it used to sit.
+        ///
+        /// See [`inlined_condition`]. Reading the condition this way is what
+        /// lets the assertions below stay written against the SQL the reader of
+        /// a `WHERE` clause cares about, and makes any change to what a dialect
+        /// *produces* — as opposed to where it is evaluated — a failure.
         fn sql(&self, predicate: &Arc<dyn PhysicalExpr>) -> String {
-            self.only(predicate).condition
+            inlined_condition(&self.only(predicate))
         }
 
-        /// The stat columns the single filtered column's CTE must select.
+        /// The raw statistics the single filtered column's CTE must select.
         fn cte_stats(&self, predicate: &Arc<dyn PhysicalExpr>) -> Vec<&'static str> {
-            self.only(predicate).stats
+            raw_projections(&self.only(predicate))
         }
 
         /// `true` when nothing at all pushes down.
@@ -1205,6 +1773,607 @@ mod tests {
     /// `column_id` 2. `column_id` deliberately differs from the field index.
     fn ints() -> Fixture {
         Fixture::new(&[("a", DataType::Int32, 1), ("b", DataType::Int32, 2)])
+    }
+
+    /// The raw statistics a rendered filter's CTE projects, in emitted order.
+    fn raw_projections(filter: &RenderedColumnFilter) -> Vec<&'static str> {
+        filter
+            .projections
+            .iter()
+            .filter(|projection| projection.expr == projection.name)
+            .filter_map(|projection| {
+                [
+                    StatKind::MinValue,
+                    StatKind::MaxValue,
+                    StatKind::NullCount,
+                    StatKind::ValueCount,
+                    StatKind::ContainsNan,
+                ]
+                .into_iter()
+                .find(|stat| stat.column_name() == projection.name)
+                .map(StatKind::column_name)
+            })
+            .collect()
+    }
+
+    /// A rendered condition with every hoisted conversion substituted back in
+    /// place of the CTE column that now holds it.
+    ///
+    /// The result is exactly the SQL this module emitted before divergence 9
+    /// moved the conversions into the CTE body, which is the point of reading it
+    /// this way: hoisting was meant to move an expression, not to change one, so
+    /// every condition assertion in this module is the assertion it was before
+    /// and any change to a dialect's output still fails it.
+    fn inlined_condition(filter: &RenderedColumnFilter) -> String {
+        let mut sql = filter.condition.clone();
+        // Longest name first: `col_1_stats.min_value` is a prefix of
+        // `col_1_stats.min_value_1`, so substituting the raw name first would
+        // leave a stray `_1` behind.
+        let mut projections: Vec<&CteProjection> = filter.projections.iter().collect();
+        projections.sort_by_key(|projection| std::cmp::Reverse(projection.name.len()));
+        for projection in projections {
+            if projection.expr == projection.name {
+                continue;
+            }
+            // Only the two bounds are ever converted, and a conversion names the
+            // column it converts unqualified because it is evaluated inside the
+            // CTE body.
+            let mut expr = projection.expr.clone();
+            for stat in [StatKind::MinValue, StatKind::MaxValue] {
+                expr = expr.replace(
+                    stat.column_name(),
+                    &format!("{}.{}", filter.alias, stat.column_name()),
+                );
+            }
+            sql = sql.replace(&format!("{}.{}", filter.alias, projection.name), &expr);
+        }
+        sql
+    }
+
+    // ---------------------------------------------------------------------
+    // Divergence 9: the conversion is hoisted into the CTE body
+    // ---------------------------------------------------------------------
+
+    /// The projection a rendered filter emits for its CTE, as SQL.
+    fn projections(filter: &RenderedColumnFilter) -> Vec<String> {
+        filter
+            .projections
+            .iter()
+            .map(CteProjection::render)
+            .collect()
+    }
+
+    /// One conversion per bound, named once, written against the unqualified
+    /// statistics column so it resolves inside the CTE body — and the raw stats
+    /// still projected, because the fail-open disjuncts read them.
+    #[test]
+    fn a_conversion_becomes_one_cte_column() {
+        let table = ints();
+        let predicate = bin(table.column("a"), Operator::Eq, lit(5i32));
+        let rendered = table.only(&predicate);
+        assert_eq!(
+            projections(&rendered),
+            vec![
+                "min_value".to_string(),
+                "max_value".to_string(),
+                "value_count".to_string(),
+                "TRY_CAST(min_value AS INTEGER) AS min_value_1".to_string(),
+                "TRY_CAST(max_value AS INTEGER) AS max_value_1".to_string(),
+            ]
+        );
+        assert_eq!(
+            rendered.condition,
+            "((col_1_stats.data_file_id IS NULL OR \
+             ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
+             (col_1_stats.min_value IS NULL OR col_1_stats.max_value IS NULL OR \
+             5 BETWEEN col_1_stats.min_value_1 AND col_1_stats.max_value_1)))) IS NOT FALSE"
+        );
+        assert_eq!(rendered.select_list(), projections(&rendered).join(", "));
+    }
+
+    /// The point of the hoist: an n-value `IN` list converts the same two
+    /// strings once, not n times. This is the shape that measured 3121 ms
+    /// inlined and 135 ms hoisted.
+    #[test]
+    fn an_in_list_shares_one_conversion_per_bound() {
+        let table = ints();
+        let predicate = in_list(
+            table.column("a"),
+            vec![lit(1i32), lit(2i32), lit(3i32)],
+            &false,
+            &table.schema,
+        )
+        .expect("in list");
+        let rendered = table.only(&predicate);
+        assert_eq!(
+            projections(&rendered)
+                .iter()
+                .filter(|projection| projection.contains("TRY_CAST"))
+                .count(),
+            2
+        );
+        assert_eq!(rendered.condition.matches("TRY_CAST").count(), 0);
+        assert_eq!(
+            rendered
+                .condition
+                .matches("col_1_stats.min_value_1")
+                .count(),
+            3
+        );
+    }
+
+    /// Two conditions on one column with different target types — the cast
+    /// follows the constant (divergence 8) — get one CTE column each, numbered
+    /// in first-use order, and neither is confused for the other.
+    #[test]
+    fn two_target_types_on_one_column_get_one_column_each() {
+        let table = ints();
+        let a = table.column("a");
+        let predicate = bin(
+            bin(Arc::clone(&a), Operator::Eq, lit(5i32)),
+            Operator::And,
+            bin(a, Operator::Lt, lit(2i64)),
+        );
+        let rendered = table.only(&predicate);
+        assert_eq!(
+            projections(&rendered),
+            vec![
+                "min_value".to_string(),
+                "max_value".to_string(),
+                "value_count".to_string(),
+                "TRY_CAST(min_value AS INTEGER) AS min_value_1".to_string(),
+                "TRY_CAST(min_value AS BIGINT) AS min_value_2".to_string(),
+                "TRY_CAST(max_value AS INTEGER) AS max_value_1".to_string(),
+            ]
+        );
+        assert!(
+            rendered
+                .condition
+                .contains("5 BETWEEN col_1_stats.min_value_1 AND col_1_stats.max_value_1"),
+            "{}",
+            rendered.condition
+        );
+        assert!(
+            rendered.condition.contains("col_1_stats.min_value_2 < 2"),
+            "{}",
+            rendered.condition
+        );
+        // And the inlined form is still the SQL the dialect produces.
+        assert_eq!(table.sql(&predicate), inlined_condition(&rendered));
+        assert!(
+            inlined_condition(&rendered).contains("TRY_CAST(col_1_stats.min_value AS BIGINT) < 2")
+        );
+    }
+
+    /// A dialect whose conversion is the identity — DuckDB compares `VARCHAR`
+    /// byte-wise already — gets the raw column, not an alias of it. Emitting
+    /// `min_value AS min_value_1` would be a column for nothing.
+    #[test]
+    fn an_identity_conversion_is_not_given_a_column() {
+        let table = Fixture::new(&[("s", DataType::Utf8, 1)]);
+        let predicate = bin(table.column("s"), Operator::Eq, lit("x"));
+        let rendered = table.only(&predicate);
+        assert_eq!(
+            projections(&rendered),
+            vec!["min_value".to_string(), "max_value".to_string(), "value_count".to_string(),]
+        );
+        assert!(
+            rendered
+                .condition
+                .contains("'x' BETWEEN col_1_stats.min_value AND col_1_stats.max_value"),
+            "{}",
+            rendered.condition
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Divergence 10: the identity-partition pre-filter
+    // ---------------------------------------------------------------------
+
+    use crate::partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+
+    /// A single-generation spec with one key over `column_id`.
+    fn spec(column_id: i64, transform: PartitionTransform, prune_safe: bool) -> PartitionSpec {
+        PartitionSpec {
+            partition_id: 1,
+            columns: vec![PartitionSpecColumn {
+                partition_key_index: 0,
+                column_id,
+                transform,
+            }],
+            prune_safe,
+        }
+    }
+
+    fn prefiltered(
+        table: &Fixture,
+        predicate: &Arc<dyn PhysicalExpr>,
+        spec: &PartitionSpec,
+    ) -> StatsFilter {
+        table
+            .lower(predicate)
+            .expect("lowered")
+            .with_partition_prefilters(Some(spec))
+    }
+
+    /// An equality on an identity partition key becomes an anti-join over the
+    /// values the key is pinned to, with the guards that keep every file the
+    /// membership test cannot decide.
+    #[test]
+    fn an_identity_equality_prefilters_the_listing() {
+        let table = ints();
+        let predicate = bin(table.column("a"), Operator::Eq, lit(5i32));
+        let filter = prefiltered(
+            &table,
+            &predicate,
+            &spec(1, PartitionTransform::Identity, true),
+        );
+        let rendered = filter.render_partition_prefilters(&Duck, 42);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(
+            rendered[0].conjunct("data"),
+            "NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+             WHERE part_0_values.table_id = 42 \
+             AND part_0_values.data_file_id = data.data_file_id \
+             AND part_0_values.partition_key_index = 0 \
+             AND part_0_values.partition_value IS NOT NULL \
+             AND part_0_values.partition_value NOT IN ('5') \
+             AND regexp_full_match(part_0_values.partition_value, '-?[0-9]+') \
+             AND part_0_values.partition_value NOT LIKE '0_%' \
+             AND part_0_values.partition_value NOT LIKE '-0%')"
+        );
+    }
+
+    /// An `IN` list pins the key to the whole list, and a string column needs no
+    /// canonicality guard: the stored text IS the value.
+    #[test]
+    fn an_in_list_on_a_string_key_needs_no_canonicality_guard() {
+        let table = Fixture::new(&[("s", DataType::Utf8, 4)]);
+        let predicate = in_list(
+            table.column("s"),
+            vec![lit("a"), lit("b")],
+            &false,
+            &table.schema,
+        )
+        .expect("in list");
+        let filter = prefiltered(
+            &table,
+            &predicate,
+            &spec(4, PartitionTransform::Identity, true),
+        );
+        let rendered = filter.render_partition_prefilters(&Duck, 7);
+        assert_eq!(rendered.len(), 1);
+        let conjunct = rendered[0].conjunct("data");
+        assert!(
+            conjunct.contains("partition_value NOT IN ('a', 'b')"),
+            "{conjunct}"
+        );
+        // The stored text IS the value, so there is no canonicality to prove.
+        assert!(!conjunct.contains("LIKE"), "{conjunct}");
+        assert!(!conjunct.contains("regexp_full_match"), "{conjunct}");
+    }
+
+    /// Everything that refuses to pre-filter. Each of these would be a file
+    /// dropped on something the stored value does not prove.
+    #[test]
+    fn the_partition_prefilter_refuses_what_it_cannot_prove() {
+        let table = ints();
+        let eq = bin(table.column("a"), Operator::Eq, lit(5i32));
+
+        // A spec generation that may not be the one the live files were written
+        // under — the same gate `apply_partition_bounds` applies.
+        assert!(
+            prefiltered(&table, &eq, &spec(1, PartitionTransform::Identity, false))
+                .partitions
+                .is_empty()
+        );
+        // Every transform but identity. `bucket` hashes; the temporal ones map
+        // many source values onto one key.
+        for transform in [
+            PartitionTransform::Year,
+            PartitionTransform::Month,
+            PartitionTransform::Day,
+            PartitionTransform::Hour,
+            PartitionTransform::Bucket(16),
+            PartitionTransform::Unknown("void".to_string()),
+        ] {
+            assert!(
+                prefiltered(&table, &eq, &spec(1, transform.clone(), true))
+                    .partitions
+                    .is_empty(),
+                "{transform:?} must not pre-filter"
+            );
+        }
+        // A key the predicate says nothing about.
+        assert!(
+            prefiltered(&table, &eq, &spec(2, PartitionTransform::Identity, true))
+                .partitions
+                .is_empty()
+        );
+        // A range, and a `<>`: neither pins the key to a set of values.
+        for operator in [Operator::Gt, Operator::LtEq, Operator::NotEq] {
+            let predicate = bin(table.column("a"), operator, lit(5i32));
+            assert!(
+                prefiltered(
+                    &table,
+                    &predicate,
+                    &spec(1, PartitionTransform::Identity, true)
+                )
+                .partitions
+                .is_empty(),
+                "{operator:?} must not pre-filter"
+            );
+        }
+        // `IS NULL` reads a count, not a value.
+        let is_null = Arc::new(IsNullExpr::new(table.column("a"))) as Arc<dyn PhysicalExpr>;
+        assert!(
+            prefiltered(
+                &table,
+                &is_null,
+                &spec(1, PartitionTransform::Identity, true)
+            )
+            .partitions
+            .is_empty()
+        );
+    }
+
+    /// A disjunction is abandoned whole when one branch is not an equality — the
+    /// branch admits values no list can name — while a conjunction keeps the
+    /// equality it does have.
+    #[test]
+    fn the_partition_prefilter_keeps_or_and_and_apart() {
+        let table = ints();
+        let a = table.column("a");
+        let key = spec(1, PartitionTransform::Identity, true);
+
+        let disjunction = bin(
+            bin(Arc::clone(&a), Operator::Eq, lit(5i32)),
+            Operator::Or,
+            bin(Arc::clone(&a), Operator::Gt, lit(100i32)),
+        );
+        assert!(
+            prefiltered(&table, &disjunction, &key)
+                .partitions
+                .is_empty()
+        );
+
+        let conjunction = bin(
+            bin(Arc::clone(&a), Operator::Eq, lit(5i32)),
+            Operator::And,
+            bin(a, Operator::Gt, lit(1i32)),
+        );
+        let filter = prefiltered(&table, &conjunction, &key);
+        assert_eq!(filter.partitions.len(), 1);
+        assert_eq!(filter.partitions[0].values.len(), 1);
+        assert_eq!(filter.partitions[0].values[0].text(), "5");
+    }
+
+    /// A type whose value has more than one plausible rendering is refused: a
+    /// stored spelling outside the list would drop a file that matches.
+    #[test]
+    fn the_partition_prefilter_refuses_ambiguous_encodings() {
+        let key = spec(1, PartitionTransform::Identity, true);
+        for (data_type, literal) in [
+            (DataType::Float64, lit(5.0f64)),
+            (
+                DataType::Decimal128(10, 2),
+                lit(ScalarValue::Decimal128(Some(500), 10, 2)),
+            ),
+            (DataType::Boolean, lit(true)),
+            (DataType::Date32, lit(ScalarValue::Date32(Some(19_723)))),
+        ] {
+            let table = Fixture::new(&[("a", data_type.clone(), 1)]);
+            let predicate = bin(table.column("a"), Operator::Eq, literal);
+            assert!(
+                prefiltered(&table, &predicate, &key).partitions.is_empty(),
+                "{data_type} must not pre-filter"
+            );
+        }
+    }
+
+    /// A float column never reaches the pre-filter even for an equality: the NaN
+    /// gate wraps the condition in a disjunction whose other branch names no set.
+    #[test]
+    fn a_float_key_is_refused_through_the_nan_gate() {
+        let table = Fixture::new(&[("f", DataType::Float64, 1)]);
+        let predicate = bin(table.column("f"), Operator::Eq, lit(5.0f64));
+        let lowered = table.lower(&predicate).expect("lowered");
+        assert!(equality_values(&lowered.columns[0].condition).is_some());
+        assert!(
+            prefiltered(
+                &table,
+                &predicate,
+                &spec(1, PartitionTransform::Identity, true)
+            )
+            .partitions
+            .is_empty()
+        );
+    }
+
+    /// Two identity keys each contribute their own conjunct, and each only ever
+    /// removes files its own stored value rules out.
+    #[test]
+    fn two_identity_keys_each_get_a_conjunct() {
+        let table = Fixture::new(&[("a", DataType::Int32, 1), ("s", DataType::Utf8, 2)]);
+        let predicate = bin(
+            bin(table.column("a"), Operator::Eq, lit(5i32)),
+            Operator::And,
+            bin(table.column("s"), Operator::Eq, lit("x")),
+        );
+        let key = PartitionSpec {
+            partition_id: 1,
+            columns: vec![
+                PartitionSpecColumn {
+                    partition_key_index: 0,
+                    column_id: 1,
+                    transform: PartitionTransform::Identity,
+                },
+                PartitionSpecColumn {
+                    partition_key_index: 1,
+                    column_id: 2,
+                    transform: PartitionTransform::Identity,
+                },
+            ],
+            prune_safe: true,
+        };
+        let rendered = prefiltered(&table, &predicate, &key).render_partition_prefilters(&Duck, 3);
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].partition_key_index, 0);
+        assert_eq!(rendered[1].partition_key_index, 1);
+        assert!(rendered[1].conjunct("data").contains("part_1_values"));
+        assert!(
+            rendered[1]
+                .conjunct("ducklake_file_column_stats")
+                .contains("= ducklake_file_column_stats.data_file_id")
+        );
+    }
+
+    /// A dialect with no way to prove canonical integer spelling declines the
+    /// whole pre-filter for an integer key rather than emitting an unguarded
+    /// one — an unguarded `NOT IN` drops a file whose value is spelled `02`,
+    /// `2.0` or `0x2`, all of which some parser reads as 2. A string key is
+    /// unaffected: there is nothing to prove.
+    #[test]
+    fn a_dialect_that_cannot_prove_canonical_spelling_declines_integer_keys() {
+        /// [`Duck`] without [`StatsSqlDialect::canonical_integer_text`], which
+        /// is the trait's default.
+        struct NoCanonicalInteger;
+
+        impl StatsSqlDialect for NoCanonicalInteger {
+            fn try_cast(
+                &self,
+                expr: &str,
+                literal: &StatsLiteral,
+                data_type: &DataType,
+            ) -> Option<String> {
+                Duck.try_cast(expr, literal, data_type)
+            }
+
+            fn collate_binary(&self, expr: &str) -> String {
+                Duck.collate_binary(expr)
+            }
+
+            fn boolean_is_not_false(&self, expr: &str) -> String {
+                Duck.boolean_is_not_false(expr)
+            }
+        }
+
+        let ints = ints();
+        let integer_key = bin(ints.column("a"), Operator::Eq, lit(5i32));
+        let filter = prefiltered(
+            &ints,
+            &integer_key,
+            &spec(1, PartitionTransform::Identity, true),
+        );
+        assert_eq!(filter.partitions.len(), 1, "lowering still records the key");
+        assert!(
+            filter
+                .render_partition_prefilters(&NoCanonicalInteger, 1)
+                .is_empty(),
+            "an unguarded integer pre-filter must not be emitted"
+        );
+        // ...and the statistics filter itself is untouched by the decline.
+        assert!(filter.render(&NoCanonicalInteger).is_some());
+
+        let strings = Fixture::new(&[("s", DataType::Utf8, 1)]);
+        let string_key = bin(strings.column("s"), Operator::Eq, lit("x"));
+        let filter = prefiltered(
+            &strings,
+            &string_key,
+            &spec(1, PartitionTransform::Identity, true),
+        );
+        assert_eq!(
+            filter
+                .render_partition_prefilters(&NoCanonicalInteger, 1)
+                .len(),
+            1
+        );
+    }
+
+    /// The column's spelling and the constant's must agree, and a mismatch
+    /// declines rather than guessing.
+    ///
+    /// This is the same asymmetry divergence 8 describes for the float gate, on
+    /// the other side. [`crate::DuckLakeTable::files_matching`] is public and
+    /// takes an arbitrary `PhysicalExpr`, so nothing guarantees the constant was
+    /// coerced to the column's type; in-crate paths coerce, so neither case
+    /// below is reachable today, and both are one type check from being a
+    /// duplicate-insert bug on the mutation path.
+    #[test]
+    fn a_constant_of_another_type_than_its_partition_column_declines() {
+        let key = spec(1, PartitionTransform::Identity, true);
+
+        // A `Utf8` constant against an integer column. Taken from the constant
+        // alone this reads as `Exact` — "the stored text IS the value" — and
+        // would skip the canonical-spelling guard, so a file stored as `007`
+        // would be excluded for `id = '7'`.
+        let ints = ints();
+        let string_constant = bin(ints.column("a"), Operator::Eq, lit("7"));
+        let filter = prefiltered(&ints, &string_constant, &key);
+        assert!(
+            filter.partitions.is_empty(),
+            "a Utf8 constant against an integer partition column must not \
+             pre-filter: {:?}",
+            filter.partitions
+        );
+
+        // A `Float64` constant against an integer column. The stored value is
+        // `7` and the probe would be `7.0`, which matches nothing — so the file
+        // holding exactly the wanted rows would be the one excluded.
+        let float_constant = bin(ints.column("a"), Operator::Eq, lit(7.0f64));
+        assert!(
+            prefiltered(&ints, &float_constant, &key)
+                .partitions
+                .is_empty()
+        );
+
+        // And an integer constant against a string column, the mirror image.
+        let strings = Fixture::new(&[("s", DataType::Utf8, 1)]);
+        let integer_constant = bin(strings.column("s"), Operator::Eq, lit(7i32));
+        assert!(
+            prefiltered(&strings, &integer_constant, &key)
+                .partitions
+                .is_empty()
+        );
+
+        // The matched cases still work, so the check is not simply refusing
+        // everything.
+        assert_eq!(
+            prefiltered(&ints, &bin(ints.column("a"), Operator::Eq, lit(7i32)), &key)
+                .partitions
+                .len(),
+            1
+        );
+        assert_eq!(
+            prefiltered(
+                &strings,
+                &bin(strings.column("s"), Operator::Eq, lit("x")),
+                &key
+            )
+            .partitions
+            .len(),
+            1
+        );
+    }
+
+    /// A pre-filter is only ever attached to a filter that has column
+    /// conditions, so nothing it emits escapes the providers' unfiltered retry —
+    /// and `with_partition_prefilters` replaces rather than appends, so calling
+    /// it twice cannot double a conjunct.
+    #[test]
+    fn attaching_prefilters_twice_replaces_them() {
+        let table = ints();
+        let predicate = bin(table.column("a"), Operator::Eq, lit(5i32));
+        let key = spec(1, PartitionTransform::Identity, true);
+        let filter = prefiltered(&table, &predicate, &key).with_partition_prefilters(Some(&key));
+        assert_eq!(filter.partitions.len(), 1);
+        assert!(
+            filter
+                .clone()
+                .with_partition_prefilters(None)
+                .partitions
+                .is_empty()
+        );
     }
 
     fn bin(
@@ -1437,12 +2606,12 @@ mod tests {
         let rendered = table.only(&predicate);
 
         assert!(
-            rendered.stats.contains(&"value_count"),
+            raw_projections(&rendered).contains(&"value_count"),
             "{:?}",
-            rendered.stats
+            rendered.projections
         );
         assert_eq!(
-            rendered.condition,
+            inlined_condition(&rendered),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.max_value IS NULL OR \
@@ -1450,19 +2619,21 @@ mod tests {
         );
         // Exactly one `value_count IS NULL` in the whole condition: the guard's.
         assert_eq!(
-            rendered.condition.matches("value_count IS NULL").count(),
+            inlined_condition(&rendered)
+                .matches("value_count IS NULL")
+                .count(),
             1,
             "{}",
-            rendered.condition
+            inlined_condition(&rendered)
         );
         // And it is not one of the fail-open disjuncts.
         assert!(
-            !rendered.condition.contains(
+            !inlined_condition(&rendered).contains(
                 "col_1_stats.value_count IS NULL OR \
                  col_1_stats.max_value"
             ),
             "{}",
-            rendered.condition
+            inlined_condition(&rendered)
         );
 
         let lowered = table.lower(&predicate).expect("lowered");
@@ -1481,15 +2652,17 @@ mod tests {
         let predicate = Arc::new(IsNotNullExpr::new(table.column("a"))) as Arc<dyn PhysicalExpr>;
         let rendered = table.only(&predicate);
         assert_eq!(
-            rendered.condition,
+            inlined_condition(&rendered),
             "((col_1_stats.data_file_id IS NULL OR \
              (col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0))) IS NOT FALSE"
         );
         assert_eq!(
-            rendered.condition.matches("value_count IS NULL").count(),
+            inlined_condition(&rendered)
+                .matches("value_count IS NULL")
+                .count(),
             1,
             "{}",
-            rendered.condition
+            inlined_condition(&rendered)
         );
 
         let lowered = table.lower(&predicate).expect("lowered");
@@ -1970,14 +3143,14 @@ mod tests {
             vec!["col_2_stats", "col_9_stats"]
         );
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_2_stats.data_file_id IS NULL OR \
              ((col_2_stats.value_count IS NULL OR col_2_stats.value_count > 0) AND \
              (col_2_stats.min_value IS NULL OR \
              TRY_CAST(col_2_stats.min_value AS INTEGER) < 3)))) IS NOT FALSE"
         );
         assert_eq!(
-            rendered[1].condition,
+            inlined_condition(&rendered[1]),
             "((col_9_stats.data_file_id IS NULL OR \
              ((col_9_stats.value_count IS NULL OR col_9_stats.value_count > 0) AND \
              (col_9_stats.max_value IS NULL OR \
@@ -2294,7 +3467,7 @@ mod tests {
             .expect("the INTEGER comparison still renders");
         assert_eq!(rendered.len(), 1);
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.max_value IS NULL OR \
@@ -2333,7 +3506,7 @@ mod tests {
         assert_eq!(rendered.len(), 1);
         assert_eq!(rendered[0].column_id, 2);
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_2_stats.data_file_id IS NULL OR \
              ((col_2_stats.value_count IS NULL OR col_2_stats.value_count > 0) AND \
              (col_2_stats.min_value IS NULL OR \
@@ -2766,11 +3939,11 @@ mod tests {
             .expect("the INTEGER comparison survives");
         assert_eq!(rendered.len(), 1);
         assert_eq!(
-            rendered[0].stats,
+            raw_projections(&rendered[0]),
             vec!["min_value", "max_value", "value_count"]
         );
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.min_value IS NULL OR col_1_stats.max_value IS NULL OR \
@@ -3235,13 +4408,13 @@ mod tests {
             .expect("rendered");
         assert_eq!(rendered.len(), 1);
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "COALESCE((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.max_value IS NULL OR \
              TRY_CAST(col_1_stats.max_value AS INTEGER) > 5))), TRUE)"
         );
-        assert!(!rendered[0].condition.contains("IS NOT FALSE"));
+        assert!(!inlined_condition(&rendered[0]).contains("IS NOT FALSE"));
     }
 
     /// A stored stat, as SQL sees it: absent (`None`), present but not castable
@@ -3346,7 +4519,7 @@ mod tests {
             .render_with(&predicate, &LiteralAware)
             .expect("rendered");
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.max_value IS NULL OR \
@@ -3358,7 +4531,10 @@ mod tests {
         let rendered = table
             .render_with(&predicate, &LiteralAware)
             .expect("rendered");
-        assert_eq!(rendered[0].condition.matches("/* 7 */").count(), 2);
+        assert_eq!(
+            inlined_condition(&rendered[0]).matches("/* 7 */").count(),
+            2
+        );
 
         // Declining on the literal drops only that comparison: the AND keeps
         // the other half, so the decision really is per-comparison and not
@@ -3373,7 +4549,7 @@ mod tests {
             .render_with(&predicate, &LiteralAware)
             .expect("the positive constant still renders");
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.min_value IS NULL OR col_1_stats.max_value IS NULL OR \
@@ -3455,7 +4631,7 @@ mod tests {
             .render_with(&predicate, &BackslashEscaping)
             .expect("rendered");
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.min_value IS NULL OR col_1_stats.max_value IS NULL OR \
@@ -3498,9 +4674,9 @@ mod tests {
         let predicate = bin(strings.column("s"), Operator::Eq, lit("x"));
         let rendered = strings.render_with(&predicate, &Marking).expect("rendered");
         assert!(
-            rendered[0].condition.contains("Q<x> BETWEEN"),
+            inlined_condition(&rendered[0]).contains("Q<x> BETWEEN"),
             "{}",
-            rendered[0].condition
+            inlined_condition(&rendered[0])
         );
 
         // A finite numeric is not.
@@ -3508,7 +4684,7 @@ mod tests {
         let predicate = bin(ints.column("a"), Operator::Gt, lit(5i32));
         let rendered = ints.render_with(&predicate, &Marking).expect("rendered");
         assert_eq!(
-            rendered[0].condition,
+            inlined_condition(&rendered[0]),
             "((col_1_stats.data_file_id IS NULL OR \
              ((col_1_stats.value_count IS NULL OR col_1_stats.value_count > 0) AND \
              (col_1_stats.max_value IS NULL OR \
@@ -3521,9 +4697,9 @@ mod tests {
         let predicate = bin(flags.column("flag"), Operator::Eq, lit(true));
         let rendered = flags.render_with(&predicate, &Marking).expect("rendered");
         assert!(
-            rendered[0].condition.contains("Q<true> BETWEEN"),
+            inlined_condition(&rendered[0]).contains("Q<true> BETWEEN"),
             "{}",
-            rendered[0].condition
+            inlined_condition(&rendered[0])
         );
     }
 

@@ -4478,6 +4478,48 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .execute(&self.pool)
                     .await?;
             }
+            // The partition pre-filter (`crate::stats_filter`) reads
+            // ducklake_file_partition_value once per listing, restricted to one
+            // table's rows for one partition key; unindexed that is a scan of
+            // every table's partition values. MySQL has no
+            // `CREATE INDEX IF NOT EXISTS`, so probe information_schema first,
+            // exactly as the column upgrades above do. Both columns are
+            // fixed-width deliberately — `partition_value` is TEXT, which MySQL
+            // cannot index without a prefix length at all.
+            let has_partition_value_index: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = 'ducklake_file_partition_value' \
+                   AND index_name = 'idx_file_partition_value_table_key'",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            if has_partition_value_index == 0 {
+                // Check-then-create races another process running the same
+                // bootstrap, and the loser gets ER_DUP_KEYNAME. Re-probe on
+                // failure and accept an index that is now there, exactly as
+                // `create_mysql_physical_indexes` does; a real failure still
+                // surfaces.
+                let created = sqlx::query(
+                    "CREATE INDEX idx_file_partition_value_table_key \
+                     ON ducklake_file_partition_value (table_id, partition_key_index)",
+                )
+                .execute(&self.pool)
+                .await;
+                if let Err(error) = created {
+                    let now_exists: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM information_schema.statistics \
+                         WHERE table_schema = DATABASE() \
+                           AND table_name = 'ducklake_file_partition_value' \
+                           AND index_name = 'idx_file_partition_value_table_key'",
+                    )
+                    .fetch_one(&self.pool)
+                    .await?;
+                    if now_exists == 0 {
+                        return Err(error.into());
+                    }
+                }
+            }
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id.
             // MySQL has no `ADD COLUMN IF NOT EXISTS`, so probe information_schema first
             // (idempotent, lossless — NULL means "not partitioned").

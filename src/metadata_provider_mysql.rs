@@ -233,6 +233,31 @@ impl StatsSqlDialect for MySqlStatsDialect {
         format!("{expr} IS NULL OR {expr} <> FALSE")
     }
 
+    /// The character set is pinned with [`mysql_matches_whole`] rather than a
+    /// `$` anchor, for the reason written there: MySQL 8's `REGEXP` is ICU,
+    /// where `$` also matches before a final line terminator. Measured on MySQL
+    /// 8.1, `'^-?[0-9]+$'` returns true for both `'51\n'` and `'51\r'` — two
+    /// spellings of nothing, each of which would drop a file holding rows the
+    /// predicate wants. The whole-value comparison refuses both. The two
+    /// `LIKE`s then reject the leading zero and the `-0` the pattern still
+    /// admits (also measured true under the anchored form).
+    ///
+    /// `[0-9]` must never become `[[:digit:]]`, which matches U+0662 and U+FF12
+    /// here, nor `\d`, which does the same under MariaDB's PCRE2. A non-ASCII
+    /// digit is a spelling of nothing this crate wrote and must keep its file.
+    ///
+    /// MariaDB is not a backend this crate supports, and this guard would need
+    /// re-examining if it became one: its `REGEXP_SUBSTR` returns `''` rather
+    /// than NULL when nothing matches, so a stored empty string would compare
+    /// equal and refute.
+    fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+        let collated = self.collate_binary(expr);
+        Some(format!(
+            "{} AND {collated} NOT LIKE '0_%' AND {collated} NOT LIKE '-0%'",
+            mysql_matches_whole(&collated, "^-?[0-9]+")
+        ))
+    }
+
     /// MySQL gives `\` a second meaning inside a quoted string: unless the
     /// server's `sql_mode` carries `NO_BACKSLASH_ESCAPES` it opens an escape
     /// sequence. `stats_encode` passes `Utf8` through verbatim, so a value
@@ -337,6 +362,20 @@ struct StatsFilterSql {
 /// caller's parameter list and its order are therefore untouched.
 fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<StatsFilterSql> {
     let rendered = filter?.render(&MySqlStatsDialect)?;
+    // See the PostgreSQL provider's `stats_filter_sql` for why the partition
+    // conjunct is applied inside the CTE body as well as on the outer `WHERE`.
+    let partitions = filter
+        .map(|filter| filter.render_partition_prefilters(&MySqlStatsDialect, table_id))
+        .unwrap_or_default();
+    let cte_partitions = partitions
+        .iter()
+        .map(|prefilter| {
+            format!(
+                "\n                          AND {}",
+                prefilter.conjunct("ducklake_file_column_stats")
+            )
+        })
+        .collect::<String>();
     let mut cte = String::from("WITH ");
     let mut joins = String::new();
     let mut conditions = String::new();
@@ -345,12 +384,12 @@ fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<Stats
             cte.push_str(",\n     ");
         }
         let alias = &column.alias;
-        let stats = column.stats.join(", ");
+        let stats = column.select_list();
         let column_id = column.column_id;
         cte.push_str(&format!(
             "{alias} AS {materialization}(SELECT data_file_id, {stats}
                         FROM ducklake_file_column_stats
-                        WHERE column_id = {column_id} AND table_id = {table_id})",
+                        WHERE column_id = {column_id} AND table_id = {table_id}{cte_partitions})",
             materialization = column.cte_materialization,
         ));
         joins.push_str(&format!(
@@ -363,6 +402,13 @@ fn stats_filter_sql(filter: Option<&StatsFilter>, table_id: i64) -> Option<Stats
             "
                    AND {}",
             column.condition
+        ));
+    }
+    for prefilter in &partitions {
+        conditions.push_str(&format!(
+            "
+                   AND {}",
+            prefilter.conjunct("data")
         ));
     }
     cte.push('\n');
@@ -2336,11 +2382,82 @@ mod tests {
             sql.joins
                 .contains("LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id")
         );
-        assert!(sql.conditions.contains(
-            "CASE WHEN col_7_stats.max_value REGEXP '^-?[0-9]{1,20}$' \
-             THEN CAST(col_7_stats.max_value AS DECIMAL(65, 0)) END > 5"
-        ));
+        // The guard and the cast sit in the CTE body, over the unqualified
+        // column, and the condition names the one output column they produce.
+        assert!(
+            sql.cte.contains(
+                "CASE WHEN max_value REGEXP '^-?[0-9]{1,20}$' \
+                 THEN CAST(max_value AS DECIMAL(65, 0)) END AS max_value_1"
+            ),
+            "{}",
+            sql.cte
+        );
+        assert!(
+            sql.conditions.contains("col_7_stats.max_value_1 > 5"),
+            "{}",
+            sql.conditions
+        );
+        assert!(!sql.conditions.contains("CAST("), "{}", sql.conditions);
         assert!(sql.conditions.trim_end().ends_with(") IS NOT FALSE"));
+    }
+
+    /// An identity partition key narrows the listing without reading a single
+    /// statistic, and the same conjunct goes inside the CTE body so the
+    /// materialized statistics are not computed for files it already excludes.
+    #[test]
+    fn an_identity_partition_key_prefilters_the_listing() {
+        use crate::partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit(5i32))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns)
+            .expect("lowered")
+            .with_partition_prefilters(Some(&PartitionSpec {
+                partition_id: 1,
+                columns: vec![PartitionSpecColumn {
+                    partition_key_index: 0,
+                    column_id: 7,
+                    transform: PartitionTransform::Identity,
+                }],
+                prune_safe: true,
+            }));
+        let sql = stats_filter_sql(Some(&filter), 42).expect("rendered");
+        // Inside the CTE body, correlated to the statistics row's file.
+        assert!(
+            sql.cte.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = ducklake_file_column_stats.data_file_id"
+            ),
+            "{}",
+            sql.cte
+        );
+        // And on the outer WHERE, correlated to the listed file. Both carry the
+        // guards that keep a file the membership test cannot decide.
+        assert!(
+            sql.conditions.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = data.data_file_id \
+                 AND part_0_values.partition_key_index = 0 \
+                 AND part_0_values.partition_value IS NOT NULL \
+                 AND CONVERT(part_0_values.partition_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin NOT IN ('5') \
+                 AND CONVERT(part_0_values.partition_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin \
+                 = REGEXP_SUBSTR(CONVERT(part_0_values.partition_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin, '^-?[0-9]+') \
+                 AND CONVERT(part_0_values.partition_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin NOT LIKE '0_%' \
+                 AND CONVERT(part_0_values.partition_value USING utf8mb4) \
+                 COLLATE utf8mb4_0900_bin NOT LIKE '-0%')"
+            ),
+            "{}",
+            sql.conditions
+        );
     }
 
     /// MySQL has no CTE materialization modifier: `WITH ... AS MATERIALIZED` is
@@ -2376,10 +2493,20 @@ mod tests {
             vec![DuckLakeTableColumn::new(3, "s".to_string(), "varchar".to_string(), true)];
         let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
         let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
-        assert!(sql.conditions.contains(
-            "'apple' BETWEEN CONVERT(col_3_stats.min_value USING utf8mb4) COLLATE utf8mb4_0900_bin \
-             AND CONVERT(col_3_stats.max_value USING utf8mb4) COLLATE utf8mb4_0900_bin"
-        ));
+        assert!(
+            sql.cte.contains(
+                "CONVERT(min_value USING utf8mb4) COLLATE utf8mb4_0900_bin AS min_value_1, \
+                 CONVERT(max_value USING utf8mb4) COLLATE utf8mb4_0900_bin AS max_value_1"
+            ),
+            "{}",
+            sql.cte
+        );
+        assert!(
+            sql.conditions
+                .contains("'apple' BETWEEN col_3_stats.min_value_1 AND col_3_stats.max_value_1"),
+            "{}",
+            sql.conditions
+        );
     }
 
     /// A date constant MySQL would refuse to convert is declined here instead:
@@ -2407,8 +2534,13 @@ mod tests {
         // `' 2020-01-01 '`, `2020/01/01` and `20200101`, so the stat has to be
         // pinned to the encoder's spelling before it is converted.
         assert!(
-            sql.conditions.contains("REGEXP_SUBSTR(")
-                && sql.conditions.contains("AS DATE) < '2024-01-01'"),
+            sql.cte.contains("REGEXP_SUBSTR(") && sql.cte.contains("AS DATE) AS min_value_1"),
+            "unexpected date CTE: {}",
+            sql.cte
+        );
+        assert!(
+            sql.conditions
+                .contains("col_1_stats.min_value_1 < '2024-01-01'"),
             "unexpected date condition: {}",
             sql.conditions
         );
@@ -2443,9 +2575,11 @@ mod tests {
         let columns =
             vec![DuckLakeTableColumn::new(1, "t".to_string(), "timestamp_ns".to_string(), true)];
         let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
-        let sql = stats_filter_sql(Some(&filter), 1)
-            .expect("a nanosecond timestamp pushes down")
-            .conditions;
+        let spliced =
+            stats_filter_sql(Some(&filter), 1).expect("a nanosecond timestamp pushes down");
+        // The conversion sits in the CTE body and the comparison in the
+        // condition, so both halves are read together.
+        let sql = format!("{}{}", spliced.cte, spliced.conditions);
 
         // The constant keeps all nine digits, and nothing is cast.
         assert!(sql.contains("'1970-01-01 00:00:00.000000001'"), "{sql}");
@@ -2485,12 +2619,17 @@ mod tests {
         let filter = lower_predicate(&predicate, &schema, &columns).expect("lowered");
         let sql = stats_filter_sql(Some(&filter), 1).expect("rendered");
         assert!(
-            sql.conditions.contains(
-                "_utf8mb4 X'615C' BETWEEN CONVERT(col_3_stats.min_value USING utf8mb4) \
-                 COLLATE utf8mb4_0900_bin"
-            ),
+            sql.conditions
+                .contains("_utf8mb4 X'615C' BETWEEN col_3_stats.min_value_1"),
             "unexpected condition: {}",
             sql.conditions
+        );
+        assert!(
+            sql.cte.contains(
+                "CONVERT(min_value USING utf8mb4) COLLATE utf8mb4_0900_bin AS min_value_1"
+            ),
+            "unexpected CTE: {}",
+            sql.cte
         );
         assert!(
             !sql.conditions.contains('\\'),
@@ -2519,7 +2658,7 @@ mod tests {
         // Read the pattern out of the SQL the dialect actually emitted, so this
         // cannot drift from it.
         let (_, after) = sql
-            .conditions
+            .cte
             .split_once("REGEXP '")
             .expect("the float cast is guarded by a REGEXP");
         let (pattern, _) = after.split_once("' THEN").expect("guarded cast");

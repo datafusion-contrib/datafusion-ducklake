@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A batched promote refuses a repeated path, where official's `ducklake_add_data_files`
   deduplicates one: an entry here carries the caller's own metadata and delete file, not a bare
   glob-expanded path, so keeping the first would silently drop the rest (#323, #328).
+- `StatsSqlDialect::canonical_integer_text` lets a dialect prove that a stored
+  partition value is an integer spelled the one way this crate spells one; it
+  defaults to declining, which drops the partition pre-filter for integer keys.
+- A file listing is narrowed by identity partition value as well as by
+  statistics: a query that pins an identity partition key to a set of values no
+  longer reads the statistics of files that key already excludes — roughly a
+  twentyfold speed-up on a synthetic PostgreSQL 18 fixture of 8192 files with a
+  32-value `IN` predicate (127 ms to 6.8 ms; the ratio reproduces, the absolute
+  figures are bound to that fixture). Applies only to a table with a single partition-spec generation, an
+  `identity` transform, an equality or `IN` predicate, and a key whose values
+  have one textual spelling — string columns, and integer columns whose stored
+  spelling the dialect can positively prove canonical. Everything else, including
+  a dialect that cannot prove it, pre-filters nothing and is unchanged.
+- `ducklake_file_partition_value` gains
+  `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
+  by every writer's schema bootstrap and by existing catalogs on their next
+  initialization.
 
 ### Changed
 
@@ -28,12 +45,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   struct literals (#318).
 - **BREAKING**: `RenderedColumnFilter` adds
   `cte_materialization: &'static str`; update struct literals.
+- **BREAKING**: `RenderedColumnFilter::stats: Vec<&'static str>` becomes
+  `projections: Vec<CteProjection>`, which carries the hoisted conversions as
+  well as the raw statistics; `RenderedColumnFilter::select_list` renders it.
+- **BREAKING**: `StatsFilter` adds `partitions: Vec<PartitionPrefilter>`, filled
+  by the new `StatsFilter::with_partition_prefilters` and rendered by
+  `StatsFilter::render_partition_prefilters`; update struct literals.
+- **BREAKING**: `StatsColumnFilter` adds
+  `partition_text: Option<PartitionTextMatch>`, the column's own answer to how
+  its values are spelled as text; update struct literals. A partition key is
+  pre-filtered only when this and the constant's answer agree, so a constant of
+  another type than the key's column declines rather than comparing two
+  encodings of different things.
 - Snapshot SQL listings expand from two to eight columns; select named columns
   to retain a fixed shape (#318).
 - The statistics CTE that narrows a file listing is declared `MATERIALIZED` on
   the engines that accept it (DuckDB, SQLite 3.35+, PostgreSQL 12+), so each
   bound is validated and cast once per file rather than once per comparison per
   file. MySQL has no such modifier and is unchanged.
+- The statistics CTE also emits each bound's validity test and cast as an output
+  column of its own, so the conversion runs once per file whatever the predicate
+  does with it. Materializing the CTE alone did not achieve that: what it
+  materialized was the raw text, while the conversion stayed in the join filter.
+  Roughly a twentyfold speed-up on the same fixture (2703 ms to 127 ms, with
+  the same caveat about absolute figures), and with identical results — the
+  emitted statement is the previous one with each conversion replaced by a
+  reference to itself.
 
 ## [0.8.0] - 2026-09-16
 

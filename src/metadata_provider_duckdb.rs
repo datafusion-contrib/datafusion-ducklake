@@ -22,7 +22,9 @@ use crate::metadata_provider::{
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
-use crate::stats_filter::{RenderedColumnFilter, StatsFilter, StatsLiteral, StatsSqlDialect};
+use crate::stats_filter::{
+    RenderedColumnFilter, RenderedPartitionPrefilter, StatsFilter, StatsLiteral, StatsSqlDialect,
+};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -108,6 +110,17 @@ impl StatsSqlDialect for DuckdbStatsDialect {
 
     fn boolean_is_not_false(&self, expr: &str) -> String {
         format!("{expr} IS NULL OR {expr} <> false")
+    }
+
+    /// `regexp_full_match` pins the character set — DuckDB's own integer parser
+    /// reads `2.0`, `2.00`, `0x2`, `2e0` and whitespace-padded text as 2, and
+    /// none of those may refute — and the two `LIKE`s reject the leading zero
+    /// and the `-0` the pattern still admits.
+    fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+        Some(format!(
+            "regexp_full_match({expr}, '-?[0-9]+') \
+             AND {expr} NOT LIKE '0_%' AND {expr} NOT LIKE '-0%'"
+        ))
     }
 }
 
@@ -297,12 +310,27 @@ const DATA_FILES_WHERE: &str = "WHERE data.table_id = ?";
 /// `None` also covers a [`SQL_GET_DATA_FILES`] that no longer contains
 /// [`DATA_FILES_WHERE`]: dropping the filter only costs pruning, whereas
 /// splicing at the wrong place would produce a query that is silently wrong.
-fn data_files_sql_filtered(table_id: i64, filters: &[RenderedColumnFilter]) -> Option<String> {
+fn data_files_sql_filtered(table_id: i64, narrowing: ListingNarrowing<'_>) -> Option<String> {
+    let ListingNarrowing {
+        filters,
+        partitions,
+    } = narrowing;
     if filters.is_empty() {
         return None;
     }
     let (from_section, where_section) = SQL_GET_DATA_FILES.split_once(DATA_FILES_WHERE)?;
 
+    // See the PostgreSQL provider's `stats_filter_sql` for why the partition
+    // conjunct is applied inside the CTE body as well as on the outer `WHERE`.
+    let cte_partitions = partitions
+        .iter()
+        .map(|prefilter| {
+            format!(
+                "\n          AND {}",
+                prefilter.conjunct("ducklake_file_column_stats")
+            )
+        })
+        .collect::<String>();
     let ctes = filters
         .iter()
         .map(|filter| {
@@ -310,11 +338,11 @@ fn data_files_sql_filtered(table_id: i64, filters: &[RenderedColumnFilter]) -> O
                 "{alias} AS {materialization}(
         SELECT data_file_id, {stats}
         FROM ducklake_file_column_stats
-        WHERE column_id = {column_id} AND table_id = {table_id}
+        WHERE column_id = {column_id} AND table_id = {table_id}{cte_partitions}
     )",
                 alias = filter.alias,
                 materialization = filter.cte_materialization,
-                stats = filter.stats.join(", "),
+                stats = filter.select_list(),
                 column_id = filter.column_id,
             )
         })
@@ -331,7 +359,12 @@ fn data_files_sql_filtered(table_id: i64, filters: &[RenderedColumnFilter]) -> O
         .collect::<String>();
     let conditions = filters
         .iter()
-        .map(|filter| filter.condition.as_str())
+        .map(|filter| filter.condition.clone())
+        .chain(
+            partitions
+                .iter()
+                .map(|prefilter| prefilter.conjunct("data")),
+        )
         .collect::<Vec<_>>()
         .join("\n      AND ");
 
@@ -345,6 +378,15 @@ fn data_files_sql_filtered(table_id: i64, filters: &[RenderedColumnFilter]) -> O
     ))
 }
 
+/// Everything a lowered predicate contributes to the listing query: the
+/// per-column statistics filters, and the partition pre-filters that narrow the
+/// same listing without reading a statistic at all.
+#[derive(Clone, Copy, Default)]
+struct ListingNarrowing<'a> {
+    filters: &'a [RenderedColumnFilter],
+    partitions: &'a [RenderedPartitionPrefilter],
+}
+
 /// Read one page of the data-file listing, optionally narrowed by catalog
 /// statistics.
 ///
@@ -356,10 +398,10 @@ fn query_data_file_page(
     snapshot_id: i64,
     after_data_file_id: i64,
     limit: i64,
-    filters: &[RenderedColumnFilter],
+    narrowing: ListingNarrowing<'_>,
     capabilities: SchemaCapabilities,
 ) -> Result<Vec<DuckLakeTableFile>, duckdb::Error> {
-    let base = data_files_sql_filtered(table_id, filters)
+    let base = data_files_sql_filtered(table_id, narrowing)
         .unwrap_or_else(|| SQL_GET_DATA_FILES.to_string());
     let base = file_provenance_sql(&base, capabilities);
     // The statistics conditions sit inside the query, ahead of the LIMIT, and
@@ -1544,6 +1586,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
         let rendered = filter
             .and_then(|filter| filter.render(&DuckdbStatsDialect))
             .unwrap_or_default();
+        let partitions = filter
+            .map(|filter| filter.render_partition_prefilters(&DuckdbStatsDialect, table_id))
+            .unwrap_or_default();
         let capabilities = self.schema_capabilities(&conn)?;
         let files = match query_data_file_page(
             &conn,
@@ -1551,7 +1596,10 @@ impl MetadataProvider for DuckdbMetadataProvider {
             snapshot_id,
             after_data_file_id,
             limit,
-            &rendered,
+            ListingNarrowing {
+                filters: &rendered,
+                partitions: &partitions,
+            },
             capabilities,
         ) {
             Ok(files) => files,
@@ -1573,7 +1621,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     snapshot_id,
                     after_data_file_id,
                     limit,
-                    &[],
+                    ListingNarrowing::default(),
                     capabilities,
                 )?
             },
@@ -2440,6 +2488,7 @@ fn file_provenance_sql(sql: &str, capabilities: SchemaCapabilities) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use super::ListingNarrowing;
     use arrow::datatypes::{DataType, Field};
     use duckdb::arrow::array::{Int32Builder, ListBuilder};
     use duckdb::types::{ListType, ValueRef};
@@ -2513,7 +2562,74 @@ mod tests {
             .expect("predicate lowers")
             .render(&DuckdbStatsDialect)
             .expect("filter renders for DuckDB");
-        data_files_sql_filtered(table_id, &rendered).expect("filter splices into the listing")
+        data_files_sql_filtered(
+            table_id,
+            ListingNarrowing {
+                filters: &rendered,
+                ..Default::default()
+            },
+        )
+        .expect("filter splices into the listing")
+    }
+
+    /// An identity partition key narrows the listing without reading a single
+    /// statistic, and the same conjunct goes inside the CTE body so the
+    /// materialized statistics are not computed for files it already excludes.
+    #[test]
+    fn an_identity_partition_key_prefilters_the_listing() {
+        use crate::partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+
+        let a = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(a, Operator::Eq, lit(5i32))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns)
+            .expect("lowered")
+            .with_partition_prefilters(Some(&PartitionSpec {
+                partition_id: 1,
+                columns: vec![PartitionSpecColumn {
+                    partition_key_index: 0,
+                    column_id: 7,
+                    transform: PartitionTransform::Identity,
+                }],
+                prune_safe: true,
+            }));
+        let rendered = filter.render(&DuckdbStatsDialect).expect("renders");
+        let partitions = filter.render_partition_prefilters(&DuckdbStatsDialect, 42);
+        let sql = data_files_sql_filtered(
+            42,
+            ListingNarrowing {
+                filters: &rendered,
+                partitions: &partitions,
+            },
+        )
+        .expect("splices");
+
+        assert_eq!(
+            sql.matches("NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values")
+                .count(),
+            2,
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "AND part_0_values.data_file_id = ducklake_file_column_stats.data_file_id"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "AND part_0_values.data_file_id = data.data_file_id \
+                 AND part_0_values.partition_key_index = 0 \
+                 AND part_0_values.partition_value IS NOT NULL \
+                 AND part_0_values.partition_value NOT IN ('5') \
+                 AND regexp_full_match(part_0_values.partition_value, '-?[0-9]+') \
+                 AND part_0_values.partition_value NOT LIKE '0_%' \
+                 AND part_0_values.partition_value NOT LIKE '-0%')"
+            ),
+            "{sql}"
+        );
     }
 
     /// `a > 5 AND a < 10` on an `INTEGER` column, spliced into the listing the
@@ -2532,7 +2648,12 @@ mod tests {
         let sql = filtered_listing_sql(predicate, 7, 3);
         assert!(
             sql.starts_with(
-                "WITH col_7_stats AS MATERIALIZED (\n        SELECT data_file_id, min_value, max_value, value_count\n        \
+                "WITH col_7_stats AS MATERIALIZED (\n        SELECT data_file_id, \
+                 min_value, max_value, value_count, \
+                 CASE WHEN regexp_full_match(min_value, '^-?[0-9]{1,20}$') \
+                 THEN TRY_CAST(min_value AS INTEGER) END AS min_value_1, \
+                 CASE WHEN regexp_full_match(max_value, '^-?[0-9]{1,20}$') \
+                 THEN TRY_CAST(max_value AS INTEGER) END AS max_value_1\n        \
                  FROM ducklake_file_column_stats\n        WHERE column_id = 7 AND table_id = 3\n    )"
             ),
             "unexpected CTE section:\n{sql}"
@@ -2552,10 +2673,8 @@ mod tests {
                 "\n      AND ((col_7_stats.data_file_id IS NULL OR \
                  ((col_7_stats.value_count IS NULL OR col_7_stats.value_count > 0) AND \
                  (col_7_stats.min_value IS NULL OR col_7_stats.max_value IS NULL OR \
-                 (CASE WHEN regexp_full_match(col_7_stats.max_value, '^-?[0-9]{1,20}$') \
-                 THEN TRY_CAST(col_7_stats.max_value AS INTEGER) END > 5) AND \
-                 (CASE WHEN regexp_full_match(col_7_stats.min_value, '^-?[0-9]{1,20}$') \
-                 THEN TRY_CAST(col_7_stats.min_value AS INTEGER) END < 10))))) IS NOT FALSE"
+                 (col_7_stats.max_value_1 > 5) AND \
+                 (col_7_stats.min_value_1 < 10))))) IS NOT FALSE"
             ),
             "unexpected condition:\n{sql}"
         );
@@ -2729,8 +2848,19 @@ mod tests {
             .render(&DuckdbStatsDialect)
             .expect("filter renders for DuckDB");
 
-        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered, LEGACY_CAPABILITIES)
-            .expect_err("the CTE cannot read a table that is not there");
+        let error = query_data_file_page(
+            &conn,
+            3,
+            0,
+            i64::MIN,
+            10,
+            ListingNarrowing {
+                filters: &rendered,
+                ..Default::default()
+            },
+            LEGACY_CAPABILITIES,
+        )
+        .expect_err("the CTE cannot read a table that is not there");
         assert!(
             is_missing_statistics_table(&error),
             "unrecognised error: {error}"
@@ -2746,8 +2876,16 @@ mod tests {
              statistics table: {error}"
         );
 
-        let files = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &[], LEGACY_CAPABILITIES)
-            .expect("the unfiltered retry still lists every file");
+        let files = query_data_file_page(
+            &conn,
+            3,
+            0,
+            i64::MIN,
+            10,
+            ListingNarrowing::default(),
+            LEGACY_CAPABILITIES,
+        )
+        .expect("the unfiltered retry still lists every file");
         assert_eq!(files.len(), 1);
     }
 
@@ -3072,10 +3210,17 @@ mod tests {
         let canonical = renders(ScalarValue::Date32(Some(19_723)), "date")
             .expect("a canonical date still pushes down");
         assert!(
-            canonical[0].condition.contains(
-                "CASE WHEN regexp_full_match(col_7_stats.min_value, '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') \
-                 THEN TRY_CAST(col_7_stats.min_value AS DATE) END < '2024-01-01'"
+            canonical[0].select_list().contains(
+                "CASE WHEN regexp_full_match(min_value, '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') \
+                 THEN TRY_CAST(min_value AS DATE) END AS min_value_1"
             ),
+            "unexpected CTE projection: {}",
+            canonical[0].select_list()
+        );
+        assert!(
+            canonical[0]
+                .condition
+                .contains("col_7_stats.min_value_1 < '2024-01-01'"),
             "unexpected condition: {}",
             canonical[0].condition
         );
@@ -3153,8 +3298,10 @@ mod tests {
                 column_id: -1,
                 referenced_stats: BTreeSet::from([StatKind::ValueCount]),
                 needs_value_count_guard: false,
+                partition_text: None,
                 condition: StatsExpr::CountPositive(StatKind::ValueCount),
             }],
+            partitions: Vec::new(),
         };
         let rendered = filter
             .render(&DuckdbStatsDialect)
@@ -3163,8 +3310,19 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory DuckDB");
         conn.execute_batch(PAGE_LISTING_SCHEMA)
             .expect("catalog schema");
-        let error = query_data_file_page(&conn, 3, 0, i64::MIN, 10, &rendered, LEGACY_CAPABILITIES)
-            .expect_err("DuckDB cannot parse the alias");
+        let error = query_data_file_page(
+            &conn,
+            3,
+            0,
+            i64::MIN,
+            10,
+            ListingNarrowing {
+                filters: &rendered,
+                ..Default::default()
+            },
+            LEGACY_CAPABILITIES,
+        )
+        .expect_err("DuckDB cannot parse the alias");
         // The point of the widening: the old guard would have re-raised this.
         assert!(
             !is_missing_statistics_table(&error),

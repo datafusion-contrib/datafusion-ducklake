@@ -235,3 +235,133 @@ async fn a_rewritten_file_is_returned_and_reports_an_embedded_rowid() {
         "exactly the UPDATE's output must be flagged as rewritten",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identity-partitioned tables
+// ---------------------------------------------------------------------------
+
+/// Seed a partitioned `t(id, val)` whose partition key is `id` itself, so each
+/// file genuinely holds one value for it and the partition values the writer
+/// stores are true of their files.
+async fn seed_partitioned_table(temp_dir: &TempDir, ids: &[i32]) {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, DuckLakeWriteOptions, WriteMode};
+
+    let data_path = temp_dir.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let conn = conn_str(temp_dir, true);
+    let writer = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let s = writer
+        .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "t",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            s.table_id,
+            &[("id".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    let values = ids
+        .iter()
+        .map(|id| format!("({id}, {})", id * 10))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let writer = SqliteMetadataWriter::new(&conn).await.unwrap();
+    let provider = SqliteMetadataProvider::new(&conn).await.unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+        .unwrap()
+        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    ctx.sql(&format!(
+        "INSERT INTO ducklake.main.t SELECT * FROM (VALUES {values}) AS v(id, val)"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+}
+
+/// `files_matching` is the keyed-mutation entry point: a file it fails to return
+/// makes the mutation insert a duplicate key instead of superseding the row. The
+/// partition pre-filter narrows this listing too, so it has to be exactly as
+/// conservative here as when planning a scan — and it must still be doing
+/// something, which the second assertion pins.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_matching_narrows_an_identity_partitioned_table() {
+    let temp_dir = TempDir::new().unwrap();
+    seed_partitioned_table(&temp_dir, &[1, 2, 102]).await;
+
+    let (ctx, provider) = open_table(&temp_dir).await;
+    let table = as_ducklake(&provider);
+    let predicate = id_equals(102);
+    let matching = table.files_matching(&predicate).unwrap();
+
+    assert_eq!(
+        matching.len(),
+        1,
+        "only the id=102 partition can hold the key, got {:?}",
+        matching.iter().map(|f| &f.file.path).collect::<Vec<_>>(),
+    );
+    let positions = table
+        .resolve_positions(&ctx.state(), &matching[0].file, predicate)
+        .await
+        .unwrap();
+    assert_eq!(positions.into_iter().collect::<Vec<_>>(), vec![0]);
+}
+
+/// The same path, over a partition value spelled in a way the encoder never
+/// writes but an integer parser still reads. Dropping this file would make a
+/// keyed mutation insert a duplicate, which is the worst failure this mechanism
+/// can have — so the pre-filter must decline to refute and hand the file back.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_matching_keeps_a_non_canonically_spelled_partition_value() {
+    for hostile in ["0102", "+102", "102.0", "0x102", " 102", "102\t"] {
+        let temp_dir = TempDir::new().unwrap();
+        seed_partitioned_table(&temp_dir, &[1, 2, 102]).await;
+
+        let pool = sqlx::SqlitePool::connect(&conn_str(&temp_dir, true))
+            .await
+            .unwrap();
+        let affected = sqlx::query(
+            "UPDATE ducklake_file_partition_value SET partition_value = ?
+             WHERE partition_key_index = 0 AND partition_value = '102'",
+        )
+        .bind(hostile)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(affected, 1);
+
+        let (_ctx, provider) = open_table(&temp_dir).await;
+        let table = as_ducklake(&provider);
+        let matching = table.files_matching(&id_equals(102)).unwrap();
+        assert_eq!(
+            matching.len(),
+            1,
+            "partition value {hostile:?} must not withhold the file a keyed \
+             mutation needs, got {:?}",
+            matching.iter().map(|f| &f.file.path).collect::<Vec<_>>(),
+        );
+    }
+}

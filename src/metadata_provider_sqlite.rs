@@ -463,6 +463,16 @@ impl StatsSqlDialect for SqliteStatsDialect {
     fn boolean_is_not_false(&self, expr: &str) -> String {
         format!("{expr} IS NULL OR {expr} <> 0")
     }
+
+    /// The same round trip the integer cast above is vetted with, and it decides
+    /// canonical spelling exactly rather than approximately: SQLite renders an
+    /// integer back to text in one form, so the text round-trips only when it
+    /// was already that form. `02`, `+2`, `2.0`, `0x2`, ` 2`, `-0` and a value
+    /// past `i64::MAX` all come back as something else and are refused. SQLite
+    /// has no regular expressions in a stock build, and this needs none.
+    fn canonical_integer_text(&self, expr: &str) -> Option<String> {
+        Some(format!("{expr} = CAST(CAST({expr} AS INTEGER) AS TEXT)"))
+    }
 }
 
 /// SQL that is true only when `expr` holds text that `CAST(... AS REAL)` reads
@@ -602,9 +612,24 @@ fn stats_filter_sql(
     table_id: i64,
     materialized_cte: bool,
 ) -> Option<StatsFilterSql> {
-    let rendered = filter?.render(&SqliteStatsDialect {
+    let dialect = SqliteStatsDialect {
         materialized_cte,
-    })?;
+    };
+    let rendered = filter?.render(&dialect)?;
+    // See the PostgreSQL provider's `stats_filter_sql` for why the partition
+    // conjunct is applied inside the CTE body as well as on the outer `WHERE`.
+    let partitions = filter
+        .map(|filter| filter.render_partition_prefilters(&dialect, table_id))
+        .unwrap_or_default();
+    let cte_partitions = partitions
+        .iter()
+        .map(|prefilter| {
+            format!(
+                "\n                   AND {}",
+                prefilter.conjunct("ducklake_file_column_stats")
+            )
+        })
+        .collect::<String>();
     let mut cte = String::from("WITH ");
     let mut joins = String::new();
     let mut conditions = String::new();
@@ -613,12 +638,12 @@ fn stats_filter_sql(
             cte.push_str(",\n     ");
         }
         let alias = &column.alias;
-        let stats = column.stats.join(", ");
+        let stats = column.select_list();
         let column_id = column.column_id;
         cte.push_str(&format!(
             "{alias} AS {materialization}(SELECT data_file_id, {stats}
                  FROM ducklake_file_column_stats
-                 WHERE column_id = {column_id} AND table_id = {table_id})",
+                 WHERE column_id = {column_id} AND table_id = {table_id}{cte_partitions})",
             materialization = column.cte_materialization,
         ));
         joins.push_str(&format!(
@@ -631,6 +656,13 @@ fn stats_filter_sql(
             "
                    AND {}",
             column.condition
+        ));
+    }
+    for prefilter in &partitions {
+        conditions.push_str(&format!(
+            "
+                   AND {}",
+            prefilter.conjunct("data")
         ));
     }
     cte.push('\n');
@@ -2688,18 +2720,31 @@ mod tests {
             "{}",
             plain.cte
         );
+        // The raw stats, which the fail-open `IS NULL` disjuncts read, then one
+        // column per conversion the condition needs.
         assert!(sql.cte.contains("min_value, max_value, value_count"));
         assert!(sql.cte.contains("WHERE column_id = 7 AND table_id = 42)"));
         assert!(
             sql.joins
                 .contains("LEFT JOIN col_7_stats ON col_7_stats.data_file_id = data.data_file_id")
         );
-        // Both bounds are read through the round-trip guard, and the whole
-        // condition fails open on a malformed one.
-        assert!(sql.conditions.contains(
-            "CASE WHEN col_7_stats.max_value = CAST(CAST(col_7_stats.max_value AS INTEGER) AS TEXT) \
-             THEN CAST(col_7_stats.max_value AS INTEGER) END > 5"
-        ));
+        // Both bounds are read through the round-trip guard, which sits in the
+        // CTE body over the unqualified column and is named once per file...
+        assert!(
+            sql.cte.contains(
+                "CASE WHEN max_value = CAST(CAST(max_value AS INTEGER) AS TEXT) \
+                 THEN CAST(max_value AS INTEGER) END AS max_value_1"
+            ),
+            "{}",
+            sql.cte
+        );
+        // ...and the comparison reads that column, not the guard again.
+        assert!(
+            sql.conditions.contains("col_7_stats.max_value_1 > 5"),
+            "{}",
+            sql.conditions
+        );
+        assert!(!sql.conditions.contains("CAST("), "{}", sql.conditions);
         assert!(sql.conditions.trim_end().ends_with(") IS NOT FALSE"));
     }
 
@@ -2723,13 +2768,74 @@ mod tests {
             sql.conditions
                 .contains("(col_2_stats.contains_nan IS NULL OR col_2_stats.contains_nan <> 0)")
         );
-        // The bound is only read as a number when the whole text is one.
-        assert!(sql.conditions.contains(
-            "rtrim(ltrim(ltrim(col_2_stats.min_value, '-'), '0123456789'), '0123456789') = '.'"
-        ));
+        // The bound is only read as a number when the whole text is one, and
+        // that test sits in the CTE body.
         assert!(
+            sql.cte
+                .contains("rtrim(ltrim(ltrim(min_value, '-'), '0123456789'), '0123456789') = '.'")
+        );
+        assert!(
+            sql.cte
+                .contains("THEN CAST(min_value AS REAL) END AS min_value_1"),
+            "{}",
+            sql.cte
+        );
+        assert!(
+            sql.conditions.contains("col_2_stats.min_value_1 < 5.0"),
+            "{}",
             sql.conditions
-                .contains("THEN CAST(col_2_stats.min_value AS REAL) END < 5.0")
+        );
+    }
+
+    /// An identity partition key narrows the listing without reading a single
+    /// statistic, and the same conjunct goes inside the CTE body so the
+    /// materialized statistics are not computed for files it already excludes.
+    #[test]
+    fn an_identity_partition_key_prefilters_the_listing() {
+        use crate::partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+
+        let column = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate =
+            Arc::new(BinaryExpr::new(column, Operator::Eq, lit(5i32))) as Arc<dyn PhysicalExpr>;
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+        let columns = vec![DuckLakeTableColumn::new(7, "a".to_string(), "int32".to_string(), true)];
+        let filter = lower_predicate(&predicate, &schema, &columns)
+            .expect("lowered")
+            .with_partition_prefilters(Some(&PartitionSpec {
+                partition_id: 1,
+                columns: vec![PartitionSpecColumn {
+                    partition_key_index: 0,
+                    column_id: 7,
+                    transform: PartitionTransform::Identity,
+                }],
+                prune_safe: true,
+            }));
+        let sql = stats_filter_sql(Some(&filter), 42, true).expect("rendered");
+        // Inside the CTE body, correlated to the statistics row's file.
+        assert!(
+            sql.cte.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = ducklake_file_column_stats.data_file_id"
+            ),
+            "{}",
+            sql.cte
+        );
+        // And on the outer WHERE, correlated to the listed file. Both carry the
+        // guards that keep a file the membership test cannot decide.
+        assert!(
+            sql.conditions.contains(
+                "AND NOT EXISTS (SELECT 1 FROM ducklake_file_partition_value AS part_0_values \
+                 WHERE part_0_values.table_id = 42 \
+                 AND part_0_values.data_file_id = data.data_file_id \
+                 AND part_0_values.partition_key_index = 0 \
+                 AND part_0_values.partition_value IS NOT NULL \
+                 AND part_0_values.partition_value COLLATE BINARY NOT IN ('5') \
+                 AND part_0_values.partition_value \
+                 = CAST(CAST(part_0_values.partition_value AS INTEGER) AS TEXT))"
+            ),
+            "{}",
+            sql.conditions
         );
     }
 
@@ -2770,10 +2876,20 @@ mod tests {
         let filter = lower_one(DataType::Date32, ScalarValue::Date32(Some(19_723)));
         let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("CONDITIONS:{}", sql.conditions);
-        assert!(sql.conditions.contains(
-            "CASE WHEN col_1_stats.min_value GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' \
-             THEN col_1_stats.min_value END COLLATE BINARY < '2024-01-01'"
-        ));
+        assert!(
+            sql.cte.contains(
+                "CASE WHEN min_value GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' \
+                 THEN min_value END COLLATE BINARY AS min_value_1"
+            ),
+            "{}",
+            sql.cte
+        );
+        assert!(
+            sql.conditions
+                .contains("col_1_stats.min_value_1 < '2024-01-01'"),
+            "{}",
+            sql.conditions
+        );
     }
 
     /// A constant outside the canonical four-digit-year encoding is declined:
@@ -2802,10 +2918,14 @@ mod tests {
         );
         let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("NAIVE:{}", sql.conditions);
-        assert!(sql.conditions.contains("< '2023-11-14 22:13:20.5'"));
         assert!(
             sql.conditions
-                .contains("OR (substr(col_1_stats.min_value, 20) GLOB '.[0-9]*'")
+                .contains("col_1_stats.min_value_1 < '2023-11-14 22:13:20.5'")
+        );
+        assert!(
+            sql.cte.contains("OR (substr(min_value, 20) GLOB '.[0-9]*'"),
+            "{}",
+            sql.cte
         );
 
         let filter = lower_one(
@@ -2814,10 +2934,16 @@ mod tests {
         );
         let sql = stats_filter_sql(Some(&filter), 1, true).expect("rendered");
         println!("ZONED:{}", sql.conditions);
-        assert!(sql.conditions.contains("< '2023-11-14 22:13:20+00'"));
         assert!(
             sql.conditions
-                .contains("col_1_stats.min_value GLOB '*+00' AND substr(col_1_stats.min_value, 1, length(col_1_stats.min_value) - 3) GLOB")
+                .contains("col_1_stats.min_value_1 < '2023-11-14 22:13:20+00'")
+        );
+        assert!(
+            sql.cte.contains(
+                "min_value GLOB '*+00' AND substr(min_value, 1, length(min_value) - 3) GLOB"
+            ),
+            "{}",
+            sql.cte
         );
     }
 

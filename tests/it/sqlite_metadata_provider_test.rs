@@ -1773,3 +1773,234 @@ async fn filtered_file_page_reads_no_statistics_for_pruned_files() {
         "the unfiltered page failed for some reason other than the planted row: {error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Identity-partition pre-filter (stats_filter divergence 10)
+// ---------------------------------------------------------------------------
+
+/// Add the partition-value table the pre-filter reads. SQLite's `init_schema`
+/// above predates it, which is also what makes the fall-back test below
+/// meaningful.
+async fn create_partition_value_table(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE ducklake_file_partition_value (
+            data_file_id INTEGER NOT NULL,
+            table_id INTEGER NOT NULL,
+            partition_key_index INTEGER NOT NULL,
+            partition_value TEXT
+        )",
+    )
+    .execute(&provider.pool)
+    .await?;
+    Ok(())
+}
+
+async fn insert_partition_value(
+    provider: &SqliteMetadataProvider,
+    data_file_id: i64,
+    partition_value: Option<&str>,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value
+             (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES (?, 1, 0, ?)",
+    )
+    .bind(data_file_id)
+    .bind(partition_value)
+    .execute(&provider.pool)
+    .await?;
+    Ok(())
+}
+
+/// Bounds wide enough that the statistics can never prune, so every file this
+/// listing drops was dropped by the partition pre-filter and nothing else.
+async fn insert_unprunable_stats(provider: &SqliteMetadataProvider) -> anyhow::Result<()> {
+    for data_file_id in 1..=3i64 {
+        insert_column_stats(provider, data_file_id, Some("-1000"), Some("1000")).await?;
+    }
+    Ok(())
+}
+
+/// A single-generation identity spec over `column_id` 7, key index 0.
+fn identity_spec(prune_safe: bool) -> datafusion_ducklake::PartitionSpec {
+    use datafusion_ducklake::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+    PartitionSpec {
+        partition_id: 1,
+        columns: vec![PartitionSpecColumn {
+            partition_key_index: 0,
+            column_id: 7,
+            transform: PartitionTransform::Identity,
+        }],
+        prune_safe,
+    }
+}
+
+/// `a = value` on the `INT32` column 7, with the partition pre-filter attached.
+fn int32_equality_with_partitions(value: i32, prune_safe: bool) -> StatsFilter {
+    int32_filter(Operator::Eq, value).with_partition_prefilters(Some(&identity_spec(prune_safe)))
+}
+
+/// `s = value` on a `VARCHAR` column 7, with the partition pre-filter attached.
+fn string_equality_with_partitions(value: &str) -> StatsFilter {
+    let column = Arc::new(PhysColumn::new("s", 0)) as Arc<dyn PhysicalExpr>;
+    let predicate =
+        Arc::new(BinaryExpr::new(column, Operator::Eq, lit(value))) as Arc<dyn PhysicalExpr>;
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let columns = vec![DuckLakeTableColumn::new(7, "s".to_string(), "varchar".to_string(), true)];
+    lower_predicate(&predicate, &schema, &columns)
+        .expect("predicate lowers")
+        .with_partition_prefilters(Some(&identity_spec(true)))
+}
+
+/// The listing drops the files whose recorded partition value is not the one the
+/// predicate asks for — with statistics that prune nothing, so this is the
+/// pre-filter and only the pre-filter.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_prunes_by_identity_partition_value() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+    for (data_file_id, value) in [(1i64, "1"), (2, "2"), (3, "3")] {
+        insert_partition_value(&provider, data_file_id, Some(value))
+            .await
+            .unwrap();
+    }
+
+    let filter = int32_equality_with_partitions(2, true);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![2]);
+
+    // Nothing at all matches, and the listing says so rather than falling back.
+    let filter = int32_equality_with_partitions(9, true);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert!(file_ids(&filtered).is_empty());
+}
+
+/// Every shape the pre-filter must keep, each of which a membership test written
+/// as `data_file_id IN (...)` — official's spelling — would drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_keeps_partition_values_it_cannot_decide() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+    // File 1: no partition-value row at all (written before the table was
+    // partitioned). File 2: SQL NULL, a partition in its own right. File 3: a
+    // value that is definitely not 7.
+    insert_partition_value(&provider, 2, None).await.unwrap();
+    insert_partition_value(&provider, 3, Some("3"))
+        .await
+        .unwrap();
+
+    let filter = int32_equality_with_partitions(7, true);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 2]);
+}
+
+/// A value spelled some other way than `stats_encode` spells it keeps its file.
+/// `02` parses as 2, so dropping it for `a = 2` would lose every row in the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_keeps_a_non_canonical_integer_partition_value() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+    for (data_file_id, value) in [(1i64, "02"), (2, "+2"), (3, "3")] {
+        insert_partition_value(&provider, data_file_id, Some(value))
+            .await
+            .unwrap();
+    }
+
+    let filter = int32_equality_with_partitions(2, true);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 2]);
+}
+
+/// A string key compares the stored text directly, because the stored text IS
+/// the value.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_prunes_by_string_partition_value() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    for (data_file_id, value) in [(1i64, "eu-west"), (2, "us-east"), (3, "ap-south")] {
+        insert_column_stats(&provider, data_file_id, Some("a"), Some("zzzz"))
+            .await
+            .unwrap();
+        insert_partition_value(&provider, data_file_id, Some(value))
+            .await
+            .unwrap();
+    }
+
+    let filter = string_equality_with_partitions("us-east");
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![2]);
+}
+
+/// A table that has been re-partitioned pre-filters nothing: a live file may
+/// carry values from a retired generation whose key order differs, so mapping
+/// them through the current spec could drop a file that matches. The same gate
+/// `DuckLakeTable::apply_partition_bounds` applies to the same values.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_does_not_prefilter_after_a_repartition() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+    for (data_file_id, value) in [(1i64, "1"), (2, "2"), (3, "3")] {
+        insert_partition_value(&provider, data_file_id, Some(value))
+            .await
+            .unwrap();
+    }
+
+    let filter = int32_equality_with_partitions(2, false);
+    assert!(filter.partitions.is_empty());
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 2, 3]);
+}
+
+/// A catalog with no `ducklake_file_partition_value` still lists its files: the
+/// narrowed query cannot run there, and the provider's unfiltered retry is what
+/// keeps a missing table from failing the scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_file_page_falls_back_without_a_partition_value_table() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+
+    let filter = int32_equality_with_partitions(2, true);
+    assert_eq!(filter.partitions.len(), 1);
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 100, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&filtered), vec![1, 2, 3]);
+}
+
+/// The pre-filter narrows inside the query, ahead of `LIMIT`, like the
+/// statistics conditions beside it. Filtering a page after fetching it would
+/// return an empty page here, which the keyset iterator reads as "no files
+/// left" and every matching file beyond it is never visited.
+#[tokio::test(flavor = "multi_thread")]
+async fn partition_prefilter_applies_before_limit() {
+    let provider = create_provider_with_file_stats().await.unwrap();
+    create_partition_value_table(&provider).await.unwrap();
+    insert_unprunable_stats(&provider).await.unwrap();
+    for (data_file_id, value) in [(1i64, "1"), (2, "2"), (3, "9")] {
+        insert_partition_value(&provider, data_file_id, Some(value))
+            .await
+            .unwrap();
+    }
+
+    let filter = int32_equality_with_partitions(9, true);
+    let page = provider
+        .get_table_file_metadata_page_filtered(1, 1, None, 1, Some(&filter))
+        .expect("filtered page");
+    assert_eq!(file_ids(&page), vec![3]);
+}

@@ -1445,6 +1445,97 @@ async fn restore_then(store: &CatalogStore, then: &[String]) {
     store.exec_all(&statements).await;
 }
 
+/// Spellings of an integer that some engine still reads as that same number, or
+/// that no engine reads at all. Every one of them must keep its file: the first
+/// kind because the file really does hold the matching rows, the second because
+/// a catalog whose partition value is unreadable says nothing about its file.
+///
+/// The `\n` and `\r` entries are the reason `mysql_matches_whole` exists rather
+/// than a `$` anchor. Measured on MySQL 8.1, `'51' || CHAR(10)` and
+/// `'51' || CHAR(13)` both satisfy `REGEXP '^-?[0-9]+$'`, because MySQL 8's
+/// `REGEXP` is ICU and `$` matches before a final line terminator. Nothing
+/// else in the suite exercises that on MySQL, which is the engine it is for.
+type Respell = fn(&str) -> String;
+const HOSTILE_INTEGER_SPELLINGS: &[(&str, Respell)] = &[
+    ("leading_zero", |value| format!("0{value}")),
+    ("explicit_sign", |value| format!("+{value}")),
+    ("zero_fraction", |value| format!("{value}.0")),
+    ("leading_space", |value| format!(" {value}")),
+    ("trailing_space", |value| format!("{value} ")),
+    ("leading_tab", |value| format!("\t{value}")),
+    ("trailing_tab", |value| format!("{value}\t")),
+    ("leading_newline", |value| format!("\n{value}")),
+    ("trailing_newline", |value| format!("{value}\n")),
+    ("trailing_carriage_return", |value| format!("{value}\r")),
+    ("hexadecimal", |value| match value.parse::<i64>() {
+        Ok(n) if n < 0 => format!("-0x{:x}", n.unsigned_abs()),
+        Ok(n) => format!("0x{n:x}"),
+        Err(_) => value.to_string(),
+    }),
+    ("exponent", |value| format!("{value}e0")),
+    ("arabic_indic_digits", |value| {
+        value
+            .chars()
+            .map(|c| {
+                c.to_digit(10)
+                    .and_then(|d| char::from_u32(0x0660 + d))
+                    .unwrap_or(c)
+            })
+            .collect()
+    }),
+];
+
+/// `(data_file_id, value)` for every file carrying a non-NULL value on partition
+/// key 0, read back through the provider rather than recomputed.
+async fn truthful_partition_values(store: &CatalogStore, table_id: i64) -> Vec<(i64, String)> {
+    let inner = store.open().await;
+    let snapshot_id = inner.get_current_snapshot().expect("current snapshot");
+    inner
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 1024)
+        .expect("file page")
+        .into_iter()
+        .filter_map(|metadata| {
+            metadata
+                .file
+                .partition_values
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .and_then(|(_, value)| value.clone())
+                .map(|value| (metadata.file.data_file_id, value))
+        })
+        .collect()
+}
+
+/// One `UPDATE` per file, with the new spelling spliced as a plain literal.
+///
+/// Built in Rust rather than concatenated in SQL, because SQL concatenation is
+/// not portable across these four and the differences are silent. `||` is *not*
+/// concatenation on MySQL — with the default `sql_mode` it is logical OR, so
+/// `'0' || partition_value` evaluates to `1`, a well-formed value that is merely
+/// false about its file. Both paths then prune it identically and the scenario
+/// passes while testing nothing. `concat()` would need SQLite 3.44. A literal
+/// means all four backends see the same bytes.
+///
+/// Every spelling here is digits plus `+ - . x e`, whitespace or Arabic-Indic
+/// digits — no quote and no backslash — so a single-quoted literal is safe in
+/// every dialect without escaping.
+fn rewrite_partition_values(truthful: &[(i64, String)], respell: Respell) -> Vec<String> {
+    truthful
+        .iter()
+        .map(|(data_file_id, value)| {
+            let spelled = respell(value);
+            assert!(
+                !spelled.contains('\'') && !spelled.contains('\\'),
+                "spelling {spelled:?} would need SQL escaping"
+            );
+            format!(
+                "UPDATE ducklake_file_partition_value SET partition_value = '{spelled}' \
+                 WHERE data_file_id = {data_file_id} AND partition_key_index = 0"
+            )
+        })
+        .collect()
+}
+
 /// Run the whole property sweep against one catalog.
 ///
 /// `exhaustive` selects the full cross product; otherwise a representative
@@ -1453,7 +1544,7 @@ async fn restore_then(store: &CatalogStore, then: &[String]) {
 async fn sweep(store: &CatalogStore, exhaustive: bool) {
     let backend = store.label();
     let started = std::time::Instant::now();
-    let (ids, files, _table_id) = column_ids(store).await;
+    let (ids, files, table_id) = column_ids(store).await;
     assert_eq!(files.len(), INSERTS.len(), "{backend}: one file per INSERT");
 
     // A copy to restore from. Every scenario rewrites the statistics table and
@@ -1554,6 +1645,119 @@ async fn sweep(store: &CatalogStore, exhaustive: bool) {
     }
     store
         .exec("CREATE TABLE ducklake_file_column_stats AS SELECT * FROM zz_stats_backup")
+        .await;
+
+    // --- Half three: the same property over a partitioned catalog ---------
+    //
+    // The identity-partition pre-filter narrows this listing on
+    // `ducklake_file_partition_value` without reading a statistic at all, so it
+    // is a second way for pushdown to change an answer — and the oracle above is
+    // exactly the one that catches it. Without this the sweep is blind to it:
+    // the fixture has no partition spec, so the pre-filter never renders.
+    //
+    // Partition values must be TRUE of their files or the property holds of no
+    // mechanism at all — a value claiming a file is all `id = 3` when it holds
+    // 1..3 is `Fidelity::FalseFact` again, and nothing prunes correctly from a
+    // lie. So a file is given a value only where its real statistics say the
+    // column is single-valued, and every other file is given SQL NULL, which
+    // both the pre-filter and `apply_partition_bounds` read as "says nothing".
+    for key in ["id", "s"] {
+        let column_id = ids[key];
+        restore_then(
+            store,
+            &[
+                "DELETE FROM ducklake_file_partition_value".to_string(),
+                "DELETE FROM ducklake_partition_column".to_string(),
+                "DELETE FROM ducklake_partition_info".to_string(),
+                format!(
+                    "INSERT INTO ducklake_partition_info \
+                     (partition_id, table_id, begin_snapshot, end_snapshot) \
+                     VALUES (1, {table_id}, 0, NULL)"
+                ),
+                format!(
+                    "INSERT INTO ducklake_partition_column \
+                     (partition_id, table_id, partition_key_index, column_id, transform) \
+                     VALUES (1, {table_id}, 0, {column_id}, 'identity')"
+                ),
+                format!(
+                    "INSERT INTO ducklake_file_partition_value \
+                     (data_file_id, table_id, partition_key_index, partition_value) \
+                     SELECT data_file_id, {table_id}, 0, \
+                            CASE WHEN min_value = max_value THEN min_value END \
+                     FROM ducklake_file_column_stats \
+                     WHERE table_id = {table_id} AND column_id = {column_id}"
+                ),
+            ],
+        )
+        .await;
+        scenarios += 1;
+        {
+            let inner = store.open().await;
+            for predicate in &all_predicates {
+                check_pair(
+                    &inner,
+                    &format!("partitioned_by_{key}"),
+                    Fidelity::HostileEncoding,
+                    &predicate.sql,
+                    &mut tally,
+                )
+                .await;
+            }
+        }
+
+        // Now spell those same values the way another writer might have. Each of
+        // these still denotes the value it replaced to some parser, so every
+        // file must be kept and no answer may move. This is the hostile-encoding
+        // half, aimed at the pre-filter rather than at the statistics.
+        //
+        // Integer keys only, and that asymmetry is the point rather than an
+        // omission: a string's stored text IS its value, so there is no second
+        // spelling of it to be hostile with. The same rewrites over the string
+        // key would produce `' alpha'`, which is not another way of writing
+        // `'alpha'` — it is a well-formed value that is simply false about its
+        // file, `Fidelity::FalseFact`, and pruning on it is correct.
+        if key != "id" {
+            continue;
+        }
+        let truthful = truthful_partition_values(store, table_id).await;
+        assert!(
+            !truthful.is_empty(),
+            "{backend}: no file is single-valued on `{key}`, so the hostile \
+             spellings below would rewrite nothing and prove nothing"
+        );
+        for (label, respell) in HOSTILE_INTEGER_SPELLINGS {
+            store
+                .exec_all(&rewrite_partition_values(&truthful, *respell))
+                .await;
+            scenarios += 1;
+            {
+                let inner = store.open().await;
+                for predicate in &all_predicates {
+                    check_pair(
+                        &inner,
+                        &format!("partitioned_by_{key}_spelled_with_a_{label}"),
+                        Fidelity::HostileEncoding,
+                        &predicate.sql,
+                        &mut tally,
+                    )
+                    .await;
+                }
+            }
+            // Put the truthful spelling back before the next variation.
+            store
+                .exec_all(&rewrite_partition_values(&truthful, |value| {
+                    value.to_string()
+                }))
+                .await;
+        }
+    }
+    // Leave the catalog unpartitioned again.
+    store
+        .exec_all(&[
+            "DELETE FROM ducklake_file_partition_value".to_string(),
+            "DELETE FROM ducklake_partition_column".to_string(),
+            "DELETE FROM ducklake_partition_info".to_string(),
+        ])
         .await;
 
     let elapsed = started.elapsed();

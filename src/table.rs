@@ -1535,8 +1535,13 @@ impl DuckLakeTable {
         // selective mutation then tracks the result rather than the table.
         // Fail open here too: `None` means "no SQL filter", and the in-memory
         // pruning still runs over every file that does come back.
+        // Identity partition keys narrow the same listing without reading any
+        // statistics at all; see `StatsFilter::with_partition_prefilters` for
+        // the conditions, which include the same single-generation gate
+        // `apply_partition_bounds` applies to the same values.
         let stats_filter =
-            stats_filter::lower_predicate(predicate, &self.physical_schema, &self.columns);
+            stats_filter::lower_predicate(predicate, &self.physical_schema, &self.columns)
+                .map(|filter| filter.with_partition_prefilters(self.partition_spec.as_ref()));
 
         // Decryption keys for the files these pages carry, which is not every
         // file at the snapshot: the catalog filter above leaves files unlisted,
@@ -4415,7 +4420,8 @@ impl TableProvider for DuckLakeTable {
         let stats_filter = datafusion::physical_expr::conjunction_opt(conjuncts.iter().cloned())
             .and_then(|predicate| {
                 stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
-            });
+            })
+            .map(|filter| filter.with_partition_prefilters(self.partition_spec.as_ref()));
         let pruning = match self.pruning_predicates(conjuncts) {
             Ok(pruning) => pruning,
             Err(error) => {

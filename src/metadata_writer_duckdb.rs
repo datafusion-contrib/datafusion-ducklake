@@ -824,6 +824,13 @@ CREATE TABLE IF NOT EXISTS ducklake_file_partition_value (
     partition_value VARCHAR
 );
 
+-- The partition pre-filter (`crate::stats_filter`) reads this table once per
+-- listing, restricted to one table's rows for one partition key; unindexed that
+-- is a scan of every table's partition values. Both columns are fixed-width
+-- deliberately: `partition_value` is unbounded text.
+CREATE INDEX IF NOT EXISTS idx_file_partition_value_table_key
+    ON ducklake_file_partition_value (table_id, partition_key_index);
+
 -- Sort spec generations (DuckLake spec); end_snapshot NULL == active. sort_id is
 -- allocated from the next_sort_id counter (like partition_id).
 CREATE TABLE IF NOT EXISTS ducklake_sort_info (

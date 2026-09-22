@@ -294,9 +294,12 @@ impl MulticatalogProvider {
                 materialized_cte: caps.materialized_cte,
             };
             let rendered = filter.and_then(|filter| filter.render(&dialect));
+            let partitions = filter
+                .map(|filter| filter.render_partition_prefilters(&dialect, table_id))
+                .unwrap_or_default();
             let stats_sql = rendered
                 .as_deref()
-                .and_then(|filters| stats_filter_sql(table_id, filters));
+                .and_then(|filters| stats_filter_sql(table_id, filters, &partitions));
 
             // The statistics conditions go inside the query, ahead of the
             // LIMIT, with the keyset ordering untouched. Filtering a page after
