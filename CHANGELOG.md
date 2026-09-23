@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emitted statement is the previous one with each conversion replaced by a
   reference to itself.
 
+### Fixed
+
+- A list column no longer costs every other column of its table filter, sort and limit
+  pushdown. A scan reads each file's list elements under the name the catalog gives them,
+  the way official DuckLake normalizes its reader's columns, instead of the name the
+  file happens to record.
+
 ## [0.8.0] - 2026-09-16
 
 ### Added

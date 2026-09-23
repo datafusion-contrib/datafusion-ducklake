@@ -499,6 +499,10 @@ impl RecordBatchStream for ColumnRenameStream {
 /// so a difference confined to it is a relabel rather than a conversion. The
 /// read path attaches no other nested metadata.
 ///
+/// A list's element name is compared as strictly as any other, which it can
+/// afford to be because every schema this crate builds spells it the same; see
+/// [`crate::types::LIST_ELEMENT_NAME`].
+///
 /// Types with no nested fields, and the container types the read path never
 /// produces (dictionaries, unions, run-end encoding), fall back to strict
 /// equality.
@@ -780,84 +784,217 @@ mod tests {
         assert_eq!(column.index(), 0);
     }
 
-    /// A read schema tags a nested column's children with the field ids the file
-    /// records; the catalog schema does not. Stripping that metadata on the way
-    /// out is a relabel, not a cast, so the scan keeps its pushdown.
-    #[test]
-    fn nested_field_metadata_alone_still_allows_pushdown() {
-        let element = |metadata: Option<(&str, &str)>| {
-            let field = Field::new("element", DataType::Float32, true);
-            match metadata {
-                Some((key, value)) => {
-                    field.with_metadata(HashMap::from([(key.to_string(), value.to_string())]))
-                },
-                None => field,
-            }
+    /// Every container the read path builds, with a nested child that differs
+    /// only in the metadata a field carries.
+    ///
+    /// `left` is the read-schema side, tagged with the `PARQUET:field_id` the
+    /// file records; `right` is the catalog side, which carries no storage
+    /// metadata. Each pair must compare equal.
+    fn metadata_only_container_pairs() -> Vec<(DataType, DataType)> {
+        let tagged = |name: &str, data_type: DataType| {
+            Field::new(name, data_type, true).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "3".to_string(),
+            )]))
         };
-        let input_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
+        let bare = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        let entries = |child: Field| {
             Field::new(
-                "v",
-                DataType::List(Arc::new(element(Some(("PARQUET:field_id", "3"))))),
-                true,
-            ),
-        ]));
-        let output_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("v", DataType::List(Arc::new(element(None))), true),
-        ]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
-        let exec = ColumnRenameExec::new(input, output_schema, HashMap::new());
-        let filter: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-
-        assert!(exec.is_pure_type_preserving_rename());
-        assert!(exec.supports_limit_pushdown());
-        let description = exec
-            .gather_filters_for_pushdown(
-                FilterPushdownPhase::Pre,
-                vec![filter],
-                &ConfigOptions::new(),
+                "entries",
+                DataType::Struct(
+                    vec![Arc::new(Field::new("key", DataType::Utf8, false)), Arc::new(child)]
+                        .into(),
+                ),
+                false,
             )
-            .unwrap();
-        assert!(matches!(
-            description.parent_filters()[0][0].discriminant,
-            PushedDown::Yes
-        ));
+        };
+        vec![
+            (
+                DataType::List(Arc::new(tagged("item", DataType::Float32))),
+                DataType::List(Arc::new(bare("item", DataType::Float32))),
+            ),
+            (
+                DataType::LargeList(Arc::new(tagged("item", DataType::Float32))),
+                DataType::LargeList(Arc::new(bare("item", DataType::Float32))),
+            ),
+            (
+                DataType::ListView(Arc::new(tagged("item", DataType::Float32))),
+                DataType::ListView(Arc::new(bare("item", DataType::Float32))),
+            ),
+            (
+                DataType::LargeListView(Arc::new(tagged("item", DataType::Float32))),
+                DataType::LargeListView(Arc::new(bare("item", DataType::Float32))),
+            ),
+            (
+                DataType::FixedSizeList(Arc::new(tagged("item", DataType::Float32)), 2),
+                DataType::FixedSizeList(Arc::new(bare("item", DataType::Float32)), 2),
+            ),
+            (
+                DataType::Map(Arc::new(entries(tagged("value", DataType::Int32))), false),
+                DataType::Map(Arc::new(entries(bare("value", DataType::Int32))), false),
+            ),
+            (
+                DataType::Struct(vec![Arc::new(tagged("a", DataType::Int32))].into()),
+                DataType::Struct(vec![Arc::new(bare("a", DataType::Int32))].into()),
+            ),
+        ]
     }
 
-    /// The relaxation is metadata-only: a nested child renamed or retyped is
-    /// still a real conversion and must block pushdown.
+    /// Build a node whose single column `v` is `input_type` below and
+    /// `output_type` above, with no rename.
+    fn rename_exec_over(input_type: DataType, output_type: DataType) -> ColumnRenameExec {
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("v", input_type, true),
+        ]))));
+        ColumnRenameExec::new(
+            input,
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("v", output_type, true),
+            ])),
+            HashMap::new(),
+        )
+    }
+
+    /// A read schema tags a nested column's children with the field ids the file
+    /// records; the catalog schema does not. Stripping that metadata on the way
+    /// out is a relabel, not a cast, so the scan keeps its pushdown — and keeps
+    /// it for the plain columns beside the nested one, which is what the
+    /// whole-schema comparison would otherwise cost them.
+    #[test]
+    fn nested_field_metadata_alone_still_allows_pushdown() {
+        for (input_type, output_type) in metadata_only_container_pairs() {
+            let exec = rename_exec_over(input_type.clone(), output_type.clone());
+            let filter: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+
+            assert!(
+                exec.is_pure_type_preserving_rename(),
+                "{input_type:?} -> {output_type:?} differs by field metadata alone"
+            );
+            assert!(exec.supports_limit_pushdown());
+            let description = exec
+                .gather_filters_for_pushdown(
+                    FilterPushdownPhase::Pre,
+                    vec![filter],
+                    &ConfigOptions::new(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    description.parent_filters()[0][0].discriminant,
+                    PushedDown::Yes
+                ),
+                "{input_type:?} -> {output_type:?} must not cost `id` its pushdown"
+            );
+        }
+    }
+
+    /// The relaxation reaches metadata and nothing else. Every name a caller can
+    /// select a value by — a struct's child, a map's wrapper, key and value, and
+    /// a list's element, which agrees across schemas rather than being exempted
+    /// ([`crate::types::LIST_ELEMENT_NAME`]) — is a real conversion when it
+    /// differs, as are a retype and a nullability change.
     #[test]
     fn nested_child_name_or_type_difference_blocks_pushdown() {
-        let list = |child: Field| DataType::List(Arc::new(child));
-        let cases = [
+        let field = |name: &str, data_type: DataType| Field::new(name, data_type, true);
+        let entries = |name: &str, key: Field, value: Field| {
+            Field::new(
+                name,
+                DataType::Struct(vec![Arc::new(key), Arc::new(value)].into()),
+                false,
+            )
+        };
+        let key = |name: &str| Field::new(name, DataType::Utf8, false);
+        let mut cases = vec![
+            // A struct child renamed.
             (
-                list(Field::new("element", DataType::Float32, true)),
-                list(Field::new("item", DataType::Float32, true)),
+                DataType::Struct(vec![Arc::new(field("a", DataType::Float32))].into()),
+                DataType::Struct(vec![Arc::new(field("b", DataType::Float32))].into()),
+            ),
+            // A map's wrapper, its key and its value, each renamed in turn.
+            (
+                DataType::Map(
+                    Arc::new(entries(
+                        "entries",
+                        key("key"),
+                        field("value", DataType::Int32),
+                    )),
+                    false,
+                ),
+                DataType::Map(
+                    Arc::new(entries(
+                        "key_value",
+                        key("key"),
+                        field("value", DataType::Int32),
+                    )),
+                    false,
+                ),
             ),
             (
-                list(Field::new("element", DataType::Float32, true)),
-                list(Field::new("element", DataType::Float64, true)),
+                DataType::Map(
+                    Arc::new(entries(
+                        "entries",
+                        key("key"),
+                        field("value", DataType::Int32),
+                    )),
+                    false,
+                ),
+                DataType::Map(
+                    Arc::new(entries(
+                        "entries",
+                        key("k"),
+                        field("value", DataType::Int32),
+                    )),
+                    false,
+                ),
             ),
             (
-                list(Field::new("element", DataType::Float32, false)),
-                list(Field::new("element", DataType::Float32, true)),
+                DataType::Map(
+                    Arc::new(entries(
+                        "entries",
+                        key("key"),
+                        field("value", DataType::Int32),
+                    )),
+                    false,
+                ),
+                DataType::Map(
+                    Arc::new(entries("entries", key("key"), field("v", DataType::Int32))),
+                    false,
+                ),
             ),
         ];
+        // Every list-family container, with its element renamed, retyped, and
+        // made non-nullable in turn.
+        let containers: [fn(Field) -> DataType; 5] = [
+            |child| DataType::List(Arc::new(child)),
+            |child| DataType::LargeList(Arc::new(child)),
+            |child| DataType::ListView(Arc::new(child)),
+            |child| DataType::LargeListView(Arc::new(child)),
+            |child| DataType::FixedSizeList(Arc::new(child), 2),
+        ];
+        for container in containers {
+            cases.push((
+                container(field("item", DataType::Float32)),
+                container(field("element", DataType::Float32)),
+            ));
+            cases.push((
+                container(field("item", DataType::Float32)),
+                container(field("item", DataType::Float64)),
+            ));
+            cases.push((
+                container(Field::new("item", DataType::Float32, false)),
+                container(field("item", DataType::Float32)),
+            ));
+        }
+        // A fixed-size list's width is part of its type, not a relabel.
+        cases.push((
+            DataType::FixedSizeList(Arc::new(field("item", DataType::Float32)), 2),
+            DataType::FixedSizeList(Arc::new(field("item", DataType::Float32)), 3),
+        ));
 
         for (input_type, output_type) in cases {
-            let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::new(
-                vec![Field::new("v", input_type.clone(), true)],
-            ))));
-            let exec = ColumnRenameExec::new(
-                input,
-                Arc::new(Schema::new(vec![Field::new(
-                    "v",
-                    output_type.clone(),
-                    true,
-                )])),
-                HashMap::new(),
-            );
+            let exec = rename_exec_over(input_type.clone(), output_type.clone());
             assert!(
                 !exec.is_pure_type_preserving_rename(),
                 "{input_type:?} -> {output_type:?} is a conversion, not a relabel"

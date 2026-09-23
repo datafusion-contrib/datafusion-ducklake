@@ -30,8 +30,8 @@ use crate::types::{
     DuckLakeDefaultExprAdapterFactory, INITIAL_DEFAULT_METADATA_KEY,
     build_arrow_schema_from_fields, build_read_schema_with_field_id_mapping,
     build_read_schema_with_field_id_mapping_from_schema, build_read_schema_with_name_mapping,
-    ducklake_to_arrow_type, extract_parquet_field_ids, parse_ducklake_default_scalar,
-    parse_ducklake_scalar,
+    ducklake_to_arrow_type, extract_parquet_field_ids, normalize_list_element_names,
+    parse_ducklake_default_scalar, parse_ducklake_scalar,
 };
 
 #[cfg(feature = "write")]
@@ -1064,7 +1064,10 @@ pub(crate) fn cached_parquet_reader_factory(
 ///
 /// `fallback_schema` is used verbatim for a file that carries no field ids at
 /// all (an external or pre-DuckLake parquet file), where names are the only
-/// thing to match on.
+/// thing to match on. Verbatim includes un-normalized: it is the catalog schema,
+/// which already spells a list's element
+/// [`crate::types::LIST_ELEMENT_NAME`] and carries none of the storage metadata
+/// [`normalize_list_element_names`] exists to strip.
 pub(crate) async fn read_parquet_file_layout(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
@@ -1092,7 +1095,7 @@ pub(crate) async fn read_parquet_file_layout(
             Some(facts.arrow_schema.as_ref()),
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        (Arc::new(schema), mapping)
+        (Arc::new(normalize_list_element_names(&schema)), mapping)
     };
 
     // Does the file carry a data column no longer in the current schema? Any
@@ -1162,10 +1165,8 @@ pub(crate) fn apply_name_mapping_to_layout(
         })
         .collect::<DataFusionResult<HashMap<_, _>>>()?;
     let mut layout = layout.as_ref().clone();
-    layout.read_schema = Arc::new(apply_initial_default_metadata(
-        &mapped.schema,
-        columns,
-        &mapped.names,
+    layout.read_schema = Arc::new(normalize_list_element_names(
+        &apply_initial_default_metadata(&mapped.schema, columns, &mapped.names),
     ));
     layout.name_mapping = mapped.names;
     layout.constants = constants;
@@ -1817,7 +1818,11 @@ impl DuckLakeTable {
                 .map(|value| (partition.logical_name, value))
             })
             .collect::<DataFusionResult<HashMap<_, _>>>()?;
-        let schema = apply_initial_default_metadata(&mapped.schema, &self.columns, &mapped.names);
+        let schema = normalize_list_element_names(&apply_initial_default_metadata(
+            &mapped.schema,
+            &self.columns,
+            &mapped.names,
+        ));
         Ok((Arc::new(schema), mapped.names, constants))
     }
 
@@ -2415,8 +2420,11 @@ impl DuckLakeTable {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let read_schema =
-            apply_initial_default_metadata(&read_schema, &self.columns, &name_mapping);
+        let read_schema = normalize_list_element_names(&apply_initial_default_metadata(
+            &read_schema,
+            &self.columns,
+            &name_mapping,
+        ));
         Ok((Arc::new(read_schema), name_mapping, HashMap::new()))
     }
 

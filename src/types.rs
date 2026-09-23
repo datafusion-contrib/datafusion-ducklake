@@ -512,7 +512,7 @@ fn parse_list_type(type_str: &str, depth: usize) -> Result<Option<DataType>> {
 
     let element_type = ducklake_to_arrow_type_inner(inner, depth + 1)?;
     Ok(Some(DataType::List(Arc::new(Field::new(
-        "item",
+        LIST_ELEMENT_NAME,
         element_type,
         true,
     )))))
@@ -816,6 +816,118 @@ pub(crate) fn build_strict_arrow_schema(columns: &[DuckLakeTableColumn]) -> Resu
 /// happens to be present.
 pub(crate) const ABSENT_FIELD_PREFIX: &str = "__ducklake_absent_field_";
 
+/// The name the catalog schema gives a list's element field.
+///
+/// A list has exactly one element and nothing resolves it by name, so the name
+/// is pure convention and every layer picks a different one: the parquet LIST
+/// spec writes `element`, older writers `array`, DuckDB `list`, and arrow-rs
+/// reports back whatever the file records. Official DuckLake reconciles them by
+/// normalizing the reader's own columns onto one spelling
+/// (`NormalizeListChildNames` in `ducklake_multi_file_reader.cpp`); `item` is
+/// that spelling here, and [`normalize_list_element_names`] is where a file's
+/// columns are brought onto it.
+pub(crate) const LIST_ELEMENT_NAME: &str = "item";
+
+/// Rename every list element in `schema` to [`LIST_ELEMENT_NAME`], at any depth.
+///
+/// A read schema takes each nested node's name from the file, which for a list
+/// element means whichever of `element`, `array` or `list` its writer chose.
+/// Bringing it onto the catalog's spelling is what official DuckLake does to its
+/// reader's columns, and it matters for two reasons. A read schema that differs
+/// from the catalog schema by a name nothing reads costs the *whole* table its
+/// filter, sort and limit pushdown, because
+/// [`ColumnRenameExec`](crate::column_rename::ColumnRenameExec) decides that for
+/// the schema at once. And a list element's name is observable — `arrow_typeof`
+/// renders it — so a predicate that reads the list's type would otherwise answer
+/// one way inside the reader and another above the scan.
+///
+/// Every element is renamed, not only one spelled `array` or `element` the way
+/// official DuckLake's own rule reads. A file may spell it anything at all —
+/// arrow-rs reports back what the file records — and a file spelling it `foo`
+/// would be left observable by the conditional rule, which is the bug over
+/// again.
+///
+/// A synthetic element, named for a field id the file does not carry, keeps that
+/// name: it is the only record that nothing physical answers to it. Its metadata
+/// is cleared like every other element's.
+///
+/// Dictionaries, unions and run-end encoding fall through, so a list nested
+/// inside one is not normalized. The read path produces none of them, and
+/// [`types_equal_ignoring_field_metadata`](crate::column_rename::types_equal_ignoring_field_metadata)
+/// carves them out of its own recursion for the same reason.
+///
+/// This is for the schema a file is *read* with. The schemas
+/// [`build_read_schema_with_field_id_mapping`] and
+/// [`build_read_schema_with_name_mapping`] return still describe the file as it
+/// is spelled, which is what a caller driving arrow-rs with one of them needs.
+pub(crate) fn normalize_list_element_names(schema: &Schema) -> Schema {
+    fn normalize(data_type: &DataType) -> DataType {
+        let element = |field: &Arc<Field>| {
+            // The element's `PARQUET:field_id` goes with its name. This is the
+            // schema the reader compares against, `arrow_typeof` renders a
+            // field's metadata as well as its name, and a list is the one place
+            // a predicate can reach a nested field's rendering — so an id left
+            // here answers one way inside the reader and another above the scan,
+            // exactly as the name did. `build_read_schema_with_field_id_mapping`
+            // is untouched and still publishes every id, element included.
+            let field = field
+                .as_ref()
+                .clone()
+                .with_data_type(normalize(field.data_type()))
+                .with_metadata(Default::default());
+            if field.name().starts_with(ABSENT_FIELD_PREFIX) {
+                Arc::new(field)
+            } else {
+                Arc::new(field.with_name(LIST_ELEMENT_NAME))
+            }
+        };
+        match data_type {
+            DataType::List(field) => DataType::List(element(field)),
+            DataType::LargeList(field) => DataType::LargeList(element(field)),
+            DataType::ListView(field) => DataType::ListView(element(field)),
+            DataType::LargeListView(field) => DataType::LargeListView(element(field)),
+            DataType::FixedSizeList(field, size) => DataType::FixedSizeList(element(field), *size),
+            DataType::Map(entries, sorted) => DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(normalize(entries.data_type())),
+                ),
+                *sorted,
+            ),
+            DataType::Struct(fields) => DataType::Struct(
+                fields
+                    .iter()
+                    .map(|field| {
+                        Arc::new(
+                            field
+                                .as_ref()
+                                .clone()
+                                .with_data_type(normalize(field.data_type())),
+                        )
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(normalize(field.data_type())),
+            )
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
+
 fn read_compatible_data_type(data_type: &DataType, nullable_struct_fields: bool) -> DataType {
     let rewrite_field = |field: &Arc<Field>, nullable: bool| {
         Arc::new(
@@ -936,7 +1048,7 @@ impl<'a> TableFieldTree<'a> {
                     )));
                 }
                 let mut child = self.arrow_field(child_indices[0], visiting)?;
-                child = child.with_name("item");
+                child = child.with_name(LIST_ELEMENT_NAME);
                 DataType::List(Arc::new(child))
             },
             "map" => {
@@ -1118,6 +1230,12 @@ fn physical_mapped_field(
                         .with_name(format!("__ducklake_absent_field_{}", child.column_id))
                         .with_nullable(true),
                 };
+            // Superseded for a read schema: every in-crate user of
+            // `build_read_schema_with_name_mapping` passes its result through
+            // `normalize_list_element_names`, which renames the element
+            // unconditionally, so this spelling reaches no scan. It stays
+            // because the function is public, and there the name describes the
+            // file rather than the schema a scan reads it under.
             if matches!(element.name().as_str(), "array" | "element") {
                 element = element.with_name("list");
             }
