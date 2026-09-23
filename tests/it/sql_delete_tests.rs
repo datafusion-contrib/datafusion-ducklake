@@ -557,3 +557,52 @@ async fn delete_second_in_session_conflicts_without_resurrection() {
         "aborted DELETE must not resurrect id 2 nor delete id 4"
     );
 }
+
+/// A DELETE resolves its rows by *physical* position, and with
+/// `datafusion.execution.parquet.pushdown_filters` on the reader evaluates the
+/// predicate itself and hands back only the surviving rows. The position column
+/// must still number each row where it sits in the file, not where it sits in
+/// the filtered batch — a delete file's `pos` is a physical index, so a position
+/// renumbered by the filter would write a delete for a row that never matched.
+///
+/// The fixture interleaves the ids it writes, so the matching rows are scattered
+/// through the file and the two numberings share no row: `id >= 150` matches 51
+/// rows sitting at physical positions 1, 3, 5, …, 101, while batch-relative
+/// numbering would name positions 0..=50 and delete the wrong half of the table.
+///
+/// Both settings are exercised, because the scan takes the session's parquet
+/// options and the knob is what decides whether the reader filters at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_resolves_physical_positions_under_filter_pushdown() {
+    // [1, 200, 2, 199, 3, 198, …, 100, 101]
+    let ids: Vec<i32> = (0..100).flat_map(|i| [i + 1, 200 - i]).collect();
+    let survivors: Vec<i32> = (1..150).collect();
+
+    for pushdown in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let writer = Arc::new(new_writer(&temp).await);
+        DuckLakeTableWriter::new(writer, object_store())
+            .unwrap()
+            .write_table("main", "t", &[id_batch(&ids)])
+            .await
+            .unwrap();
+
+        let ctx = writable_ctx(&temp).await;
+        ctx.sql(&format!(
+            "SET datafusion.execution.parquet.pushdown_filters = {pushdown}"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+        let count = run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id >= 150").await;
+        assert_eq!(count, 51, "ids 150..=200, with filter pushdown {pushdown}");
+        assert_eq!(
+            read_ids(&temp).await,
+            survivors,
+            "ids 1..=149 must survive, with filter pushdown {pushdown}"
+        );
+    }
+}

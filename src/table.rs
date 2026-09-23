@@ -43,6 +43,7 @@ use crate::metadata_writer::{MetadataWriter, WriteMode};
 #[cfg(feature = "write")]
 use crate::update_exec::DuckLakeUpdateExec;
 use datafusion::common::DFSchema;
+use datafusion::common::config::TableParquetOptions;
 use datafusion::common::pruning::{PrunableStatistics, PruningStatistics};
 #[cfg(feature = "write")]
 use datafusion::logical_expr::Operator;
@@ -845,7 +846,7 @@ type SchemaMapping = (
 /// or it doesn't (INSERT-only case — synthesize from `row_id_start + position`).
 #[derive(Debug, Clone)]
 struct FileReadConfig {
-    /// Schema we pass to `ParquetSource::new` for this file. When
+    /// Schema we pass to [`session_parquet_source`] for this file. When
     /// `embedded_rowid_parquet_name` is `Some`, this schema has the embedded
     /// rowid column appended at the end (under its parquet name).
     read_schema: SchemaRef,
@@ -1058,6 +1059,40 @@ pub(crate) fn cached_parquet_reader_factory(
         object_store,
         metadata_cache,
     )))
+}
+
+/// Build a [`ParquetSource`] over `schema` carrying the session's
+/// `datafusion.execution.parquet.*` settings, so one of them means the same
+/// thing on a DuckLake table as on a plain parquet one. Every query-time
+/// `ParquetSource` this crate builds goes through here, which `clippy.toml`
+/// enforces by disallowing the constructor everywhere else.
+///
+/// The settings have to be attached explicitly: `ParquetSource::new` starts from
+/// `TableParquetOptions::default()` and nothing later consults the session, so a
+/// bare source reads the defaults for everything the reader takes from there —
+/// `pruning`, `reorder_filters`, `enable_page_index`, `bloom_filter_on_read`,
+/// `max_predicate_cache_size`, `max_in_list_size` and the `coerce_int96` pair.
+/// `max_in_list_size` is the one that fails quietly: an `IN` list longer than it
+/// contributes nothing to row-group statistics pruning, and the scan still
+/// reports a pruning predicate while pruning no row group at all.
+/// `pushdown_filters` is not among them — `ParquetSource` reads that one off the
+/// session itself and ORs it with its own.
+///
+/// Only the `global` section is taken, not the whole of
+/// `Session::default_table_options().parquet`: the `crypto` and
+/// `column_specific_options` sections beside it come from whatever
+/// `TableOptions` the embedder installed, and an explicit decryption property
+/// there wins over the encryption factory this crate attaches per file.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn session_parquet_source(
+    state: &dyn Session,
+    schema: impl Into<TableSchema>,
+) -> ParquetSource {
+    let options = TableParquetOptions {
+        global: state.config_options().execution.parquet.clone(),
+        ..Default::default()
+    };
+    ParquetSource::new(schema).with_table_parquet_options(options)
 }
 
 /// Resolve one file's columns against `columns` by field id.
@@ -1479,6 +1514,12 @@ impl DuckLakeTable {
     /// files. A file that carries no usable bound is kept, while usable bounds on
     /// other files can still prune them.
     ///
+    /// It also depends on a cap this call reads from nowhere: an `IN` list longer
+    /// than DataFusion's default `max_in_list_size` contributes no bound, because
+    /// there is no `Session` here to read the session's value from. A scan passes
+    /// its own, so a caller that has raised it gets a superset of the files the
+    /// same predicate leaves a scan — fail-open, like everything else here.
+    ///
     /// Partition values contribute bounds only on their own partition column, and
     /// only when the table has never been re-partitioned (after a re-partition a
     /// live file's values may belong to a retired spec generation whose key order
@@ -1523,7 +1564,7 @@ impl DuckLakeTable {
             .cloned();
         // Fail open: an un-prunable predicate means "keep everything", never an
         // error the caller could mistake for "no files match".
-        let pruning = match self.pruning_predicates(conjuncts) {
+        let pruning = match self.pruning_predicates(conjuncts, None) {
             Ok(pruning) => pruning,
             Err(error) => {
                 tracing::debug!(%error, "skipping predicate-based file pruning");
@@ -2179,16 +2220,27 @@ impl DuckLakeTable {
     /// per-file statistics are indexed by. The single place pruning predicates
     /// are constructed, whether the conjuncts came from scan filters or from a
     /// caller's own expression.
+    ///
+    /// `max_in_list_size` caps how long an `IN` list may be before it stops
+    /// contributing a bound; a longer one prunes nothing. A scan passes the
+    /// session's `datafusion.execution.parquet.max_in_list_size`, so file-level
+    /// pruning here and row-group pruning in the reader answer to one setting.
+    /// `None` keeps DataFusion's own default, for the callers that have no
+    /// session to read it from.
     fn pruning_predicates(
         &self,
         conjuncts: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
+        max_in_list_size: Option<usize>,
     ) -> DataFusionResult<Vec<PruningPredicate>> {
         conjuncts
             .into_iter()
             .map(|conjunct| {
-                PruningPredicateBuilder::new()
-                    .with_file_schema(Arc::clone(&self.physical_schema))
-                    .try_build(conjunct)
+                let mut builder = PruningPredicateBuilder::new()
+                    .with_file_schema(Arc::clone(&self.physical_schema));
+                if let Some(max_in_list_size) = max_in_list_size {
+                    builder = builder.with_max_in_list_size(max_in_list_size);
+                }
+                builder.try_build(conjunct)
             })
             .collect()
     }
@@ -2238,11 +2290,11 @@ impl DuckLakeTable {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         #[cfg(feature = "encryption")]
         if let Some(factory) = self.encryption_keys.factory.get() {
-            return Ok(ParquetSource::new(schema)
+            return Ok(session_parquet_source(state, schema)
                 .with_encryption_factory(Arc::clone(factory))
                 .with_parquet_file_reader_factory(reader_factory));
         }
-        Ok(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory))
+        Ok(session_parquet_source(state, schema).with_parquet_file_reader_factory(reader_factory))
     }
 
     fn scan_config_builder(&self, source: Arc<dyn FileSource>) -> FileScanConfigBuilder {
@@ -4430,7 +4482,11 @@ impl TableProvider for DuckLakeTable {
                 stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
             })
             .map(|filter| filter.with_partition_prefilters(self.partition_spec.as_ref()));
-        let pruning = match self.pruning_predicates(conjuncts) {
+        // The same cap the reader applies to row-group pruning
+        // (`session_parquet_source`), so an `IN` list that prunes row groups
+        // prunes files too instead of the two layers disagreeing.
+        let max_in_list_size = state.config_options().execution.parquet.max_in_list_size;
+        let pruning = match self.pruning_predicates(conjuncts, Some(max_in_list_size)) {
             Ok(pruning) => pruning,
             Err(error) => {
                 tracing::debug!(%error, "skipping plan-time file pruning");
@@ -5434,7 +5490,7 @@ mod tests {
         let state = SessionContext::new().state();
         let filters = [col("id").eq(lit(999_999_i64))];
         let conjuncts = table.physical_conjuncts(&state, &filters).unwrap();
-        let pruning = table.pruning_predicates(conjuncts).unwrap();
+        let pruning = table.pruning_predicates(conjuncts, None).unwrap();
         let mut after = None;
         let mut retained = Vec::new();
         loop {
@@ -5487,7 +5543,8 @@ mod tests {
         )?;
         let state = SessionContext::new().state();
         let filters = [col("range_value").eq(lit(1_i64)), col("partition_key").eq(lit(1_i64))];
-        let predicates = table.pruning_predicates(table.physical_conjuncts(&state, &filters)?)?;
+        let predicates =
+            table.pruning_predicates(table.physical_conjuncts(&state, &filters)?, None)?;
         let file = |data_file_id| DuckLakeTableFile {
             data_file_id,
             file: DuckLakeFileData::new(format!("file-{data_file_id}.parquet"), true, 1),
@@ -5531,6 +5588,69 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(retained, vec![1]);
+        Ok(())
+    }
+
+    /// Plan-time file pruning caps an `IN` list at the value it is given, the
+    /// same way the reader caps row-group pruning at the session's
+    /// `max_in_list_size`. Past the cap the list contributes no bound and every
+    /// file is kept, which is why a scan hands its own session value down rather
+    /// than leaving the two layers to disagree.
+    #[test]
+    fn a_long_in_list_prunes_files_only_under_a_raised_cap() -> Result<()> {
+        let table = DuckLakeTable::new(
+            2,
+            "events",
+            Arc::new(LazyMillionFileProvider::default()),
+            1,
+            Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
+            String::new(),
+        )?;
+        let state = SessionContext::new().state();
+        // 30 entries, longer than DataFusion's default cap of 20.
+        let listed: Vec<Expr> = (0..30).map(|i| lit(1_000 + i as i64)).collect();
+        let filters = [col("range_value").in_list(listed, false)];
+        let conjuncts = table.physical_conjuncts(&state, &filters)?;
+
+        let file = |data_file_id| DuckLakeTableFile {
+            data_file_id,
+            file: DuckLakeFileData::new(format!("file-{data_file_id}.parquet"), true, 1),
+            delete_file_id: None,
+            delete_file: None,
+            row_id_start: None,
+            snapshot_id: Some(1),
+            begin_snapshot: Some(1),
+            schema_version: Some(0),
+            partial_max: None,
+            max_row_count: Some(1),
+            delete_count: None,
+            partition_id: None,
+            partition_values: Vec::new(),
+        };
+        let files = vec![file(1), file(2)];
+        // File 1 spans the listed values; file 2 is far above every one of them.
+        let statistics = |min: i64, max: i64| {
+            let mut statistics = Statistics::new_unknown(table.physical_schema.as_ref());
+            statistics.column_statistics[0].min_value =
+                Precision::Exact(ScalarValue::Int64(Some(min)));
+            statistics.column_statistics[0].max_value =
+                Precision::Exact(ScalarValue::Int64(Some(max)));
+            Arc::new(statistics)
+        };
+        let file_statistics =
+            HashMap::from([(1, statistics(1_000, 1_029)), (2, statistics(9_000, 9_100))]);
+
+        let retain = |max_in_list_size| -> Result<Vec<i64>> {
+            let predicates = table.pruning_predicates(conjuncts.clone(), max_in_list_size)?;
+            Ok(table
+                .prune_table_files_iteratively(&predicates, &files, &file_statistics)
+                .into_iter()
+                .map(|file| file.data_file_id)
+                .collect())
+        };
+
+        assert_eq!(retain(Some(4_096))?, vec![1]);
+        assert_eq!(retain(None)?, vec![1, 2]);
         Ok(())
     }
 

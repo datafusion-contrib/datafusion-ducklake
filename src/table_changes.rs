@@ -44,8 +44,8 @@ use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
-    delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
-    validated_record_count,
+    delete_file_schema, read_parquet_file_layout, read_parquet_footer_facts,
+    session_parquet_source, validated_file_size, validated_record_count,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
 
@@ -686,11 +686,12 @@ impl TableChangesTable {
         let read_schema = self.file_read_schema(layout);
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let parquet_source = if let Some(factory) = encryption_factory {
-            ParquetSource::new(read_schema)
+            session_parquet_source(state, read_schema)
                 .with_encryption_factory(Arc::clone(factory))
                 .with_parquet_file_reader_factory(reader_factory)
         } else {
-            ParquetSource::new(read_schema).with_parquet_file_reader_factory(reader_factory)
+            session_parquet_source(state, read_schema)
+                .with_parquet_file_reader_factory(reader_factory)
         };
         self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
             .await
@@ -706,7 +707,7 @@ impl TableChangesTable {
         proj_info: &ProjectionInfo,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
-        let parquet_source = ParquetSource::new(self.file_read_schema(layout))
+        let parquet_source = session_parquet_source(state, self.file_read_schema(layout))
             .with_parquet_file_reader_factory(reader_factory);
         self.build_exec_for_file_impl(state, data_file, layout, proj_info, parquet_source)
             .await
@@ -936,7 +937,7 @@ impl TableChangesTable {
             let builder = FileScanConfigBuilder::new(
                 self.object_store_url.as_ref().clone(),
                 Arc::new(
-                    ParquetSource::new(schema)
+                    session_parquet_source(state, schema)
                         .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
                 ),
             )
@@ -961,7 +962,7 @@ impl TableChangesTable {
                 let builder = FileScanConfigBuilder::new(
                     self.object_store_url.as_ref().clone(),
                     Arc::new(
-                        ParquetSource::new(table_schema)
+                        session_parquet_source(state, table_schema)
                             .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
                     ),
                 )
@@ -1012,7 +1013,8 @@ impl TableChangesTable {
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             Arc::new(
-                ParquetSource::new(table_schema).with_parquet_file_reader_factory(reader_factory),
+                session_parquet_source(state, table_schema)
+                    .with_parquet_file_reader_factory(reader_factory),
             ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
@@ -1061,7 +1063,10 @@ impl TableChangesTable {
         };
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory)),
+            Arc::new(
+                session_parquet_source(state, schema)
+                    .with_parquet_file_reader_factory(reader_factory),
+            ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
         Ok(DataSourceExec::from_data_source(builder.build()))

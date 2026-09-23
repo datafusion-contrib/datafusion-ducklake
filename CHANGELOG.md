@@ -78,6 +78,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pushdown. A scan reads each file's list elements under the name the catalog gives them,
   the way official DuckLake normalizes its reader's columns, instead of the name the
   file happens to record.
+- A scan honours the session's `datafusion.execution.parquet.*` options instead of the
+  reader defaults — `max_in_list_size` among them, which decides whether a long `IN` list
+  prunes row groups at all.
+- `coerce_int96` reaches a scan with them, so a session that sets it changes the timestamps
+  a DuckLake table returns for a promoted file that carries INT96 — the one of these
+  options that changes values rather than only cost.
+- Plan-time file pruning takes the session's `max_in_list_size` too, so it and row-group
+  pruning answer to one cap — visible where the statistics filter does not already narrow
+  the listing.
 
 ## [0.8.0] - 2026-09-16
 

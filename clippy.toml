@@ -1,0 +1,10 @@
+# Every query-time `ParquetSource` this crate builds must come from
+# `session_parquet_source`, or it silently reads `TableParquetOptions::default()`
+# instead of the session's `datafusion.execution.parquet.*` settings. Most of
+# those sites cannot be reached from a test — the change feeds build their scans
+# inside `TableChangesExec`/`DeletedRowsExec` at execution time, so no plan walk
+# finds them — so the helper is the thing that gets enforced, at every call site
+# at once, by the lint CI already runs.
+disallowed-methods = [
+  { path = "datafusion_datasource_parquet::source::ParquetSource::new", reason = "build query-time sources through session_parquet_source" },
+]

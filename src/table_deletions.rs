@@ -32,7 +32,7 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::listing::PartitionedFile;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
+use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
@@ -56,8 +56,8 @@ use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
-    read_parquet_file_layout, read_parquet_footer_facts, validated_file_size,
-    validated_record_count,
+    read_parquet_file_layout, read_parquet_footer_facts, session_parquet_source,
+    validated_file_size, validated_record_count,
 };
 use crate::table_changes::{check_column_count, present_catalog_schema};
 
@@ -428,7 +428,10 @@ impl TableDeletionsTable {
         };
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(ParquetSource::new(schema).with_parquet_file_reader_factory(reader_factory)),
+            Arc::new(
+                session_parquet_source(state, schema)
+                    .with_parquet_file_reader_factory(reader_factory),
+            ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
 
@@ -487,7 +490,8 @@ impl TableDeletionsTable {
         let builder = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
             Arc::new(
-                ParquetSource::new(table_schema).with_parquet_file_reader_factory(reader_factory),
+                session_parquet_source(state, table_schema)
+                    .with_parquet_file_reader_factory(reader_factory),
             ),
         )
         .with_file_group(FileGroup::new(vec![pf]));
