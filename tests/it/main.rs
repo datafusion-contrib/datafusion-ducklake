@@ -45,6 +45,7 @@ mod keyed_mutation_after_compaction_tests;
 mod list_column_pushdown_tests;
 mod maintenance_sqlite_tests;
 mod metadata_contract_tests;
+mod metadata_provider_blocking_tests;
 mod missing_delete_file_tests;
 mod multicatalog_hardening_tests;
 mod multicatalog_postgres_tests;
