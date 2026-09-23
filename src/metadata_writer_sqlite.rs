@@ -600,10 +600,14 @@ impl SqliteMetadataWriter {
             path.push(".commit.lock");
             PathBuf::from(path)
         });
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            SqlitePoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&url)
+                .await
+        })
+        .await?;
 
         // Existing catalogs must migrate even when callers skip `initialize_schema`
         migrate_snapshot_changes_nullable(&pool).await?;

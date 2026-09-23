@@ -510,10 +510,14 @@ pub struct MySqlMetadataProvider {
 impl MySqlMetadataProvider {
     /// Creates a new provider for an existing DuckLake catalog.
     pub async fn new(connection_string: &str) -> Result<Self> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(5)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            MySqlPoolOptions::new()
+                .max_connections(5)
+                .connect(&url)
+                .await
+        })
+        .await?;
 
         Ok(Self {
             pool,
@@ -524,6 +528,16 @@ impl MySqlMetadataProvider {
     /// Creates a provider over an existing connection pool. Replaces
     /// struct-literal construction, which stopped compiling when the
     /// schema-capability memo field was added.
+    ///
+    /// Adopting a pool moves nothing. The connections it already holds stay
+    /// registered with the I/O driver of the runtime that opened them, while any
+    /// connection it opens later — during a catalog call, say — registers with the
+    /// runtime this crate drives catalog I/O on, so an adopted pool can end up
+    /// spread across two drivers. Both halves work while both runtimes are being
+    /// driven: a sqlx socket is only ever reported readable by the driver it was
+    /// registered with, so what a synchronous `MetadataProvider` call must not do
+    /// is block the runtime its own connections came from. `new` leaves nothing to
+    /// arrange, opening the whole pool on the catalog runtime.
     pub fn from_pool(pool: MySqlPool) -> Self {
         Self {
             pool,

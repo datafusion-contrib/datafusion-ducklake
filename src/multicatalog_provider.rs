@@ -161,10 +161,14 @@ pub struct MulticatalogProvider {
 impl MulticatalogProvider {
     /// Build a pool from a connection string, then resolve the catalog by name.
     pub async fn new(connection_string: &str, catalog_name: &str) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(DEFAULT_MAX_CONNECTIONS)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            PgPoolOptions::new()
+                .max_connections(DEFAULT_MAX_CONNECTIONS)
+                .connect(&url)
+                .await
+        })
+        .await?;
         Self::with_pool(pool, catalog_name).await
     }
 
@@ -172,6 +176,16 @@ impl MulticatalogProvider {
     ///
     /// Returns [`crate::DuckLakeError::CatalogNotFound`] if no row in
     /// `ducklake_catalog` matches `catalog_name`.
+    ///
+    /// Adopting a pool moves nothing. The connections it already holds stay
+    /// registered with the I/O driver of the runtime that opened them, while any
+    /// connection it opens later — during a catalog call, say — registers with the
+    /// runtime this crate drives catalog I/O on, so an adopted pool can end up
+    /// spread across two drivers. Both halves work while both runtimes are being
+    /// driven: a sqlx socket is only ever reported readable by the driver it was
+    /// registered with, so what a synchronous `MetadataProvider` call must not do
+    /// is block the runtime its own connections came from. `new` leaves nothing to
+    /// arrange, opening the whole pool on the catalog runtime.
     pub async fn with_pool(pool: PgPool, catalog_name: &str) -> Result<Self> {
         let row = sqlx::query("SELECT catalog_id FROM ducklake_catalog WHERE catalog_name = $1")
             .bind(catalog_name)
@@ -190,6 +204,16 @@ impl MulticatalogProvider {
 
     /// Bind to an existing pool with an already-known `catalog_id`. Skips the
     /// name lookup. Caller is responsible for ensuring the id exists.
+    ///
+    /// Adopting a pool moves nothing. The connections it already holds stay
+    /// registered with the I/O driver of the runtime that opened them, while any
+    /// connection it opens later — during a catalog call, say — registers with the
+    /// runtime this crate drives catalog I/O on, so an adopted pool can end up
+    /// spread across two drivers. Both halves work while both runtimes are being
+    /// driven: a sqlx socket is only ever reported readable by the driver it was
+    /// registered with, so what a synchronous `MetadataProvider` call must not do
+    /// is block the runtime its own connections came from. `new` leaves nothing to
+    /// arrange, opening the whole pool on the catalog runtime.
     pub async fn with_pool_and_id(pool: PgPool, catalog_id: i64) -> Result<Self> {
         Ok(Self {
             inlined_provider: PostgresMetadataProvider::from_pool(pool.clone()),

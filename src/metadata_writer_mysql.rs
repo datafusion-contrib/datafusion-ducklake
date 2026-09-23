@@ -510,10 +510,14 @@ impl MySqlMetadataWriter {
         connection_string: &str,
         max_connections: u32,
     ) -> Result<Self> {
-        let pool = MySqlPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            MySqlPoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&url)
+                .await
+        })
+        .await?;
         Ok(Self {
             pool,
         })

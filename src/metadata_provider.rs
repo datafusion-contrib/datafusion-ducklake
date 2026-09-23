@@ -1919,12 +1919,223 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 }
 
 #[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
-/// Helper function to bridge async sqlx operations to sync MetadataProvider trait
+/// The runtime that drives catalog I/O for every sqlx-backed provider and
+/// writer in this crate.
+///
+/// [`MetadataProvider`] is synchronous, and so are four of the DataFusion
+/// catalog methods it answers: `CatalogProvider::schema_names`,
+/// `CatalogProvider::schema`, `SchemaProvider::table_names` and
+/// `SchemaProvider::table_exist` are plain `fn`. Those four alone put a catalog
+/// round trip inside a blocking context somewhere in this crate.
+///
+/// They are also the only methods that need one. `SchemaProvider::table` and
+/// `table_type`, where a query's metadata I/O actually happens, are `async
+/// fn`; and DataFusion ships `AsyncSchemaProvider`, `AsyncCatalogProvider` and
+/// `AsyncCatalogProviderList`, which resolve the names a statement mentions up
+/// front and hand planning a synchronous snapshot. This crate implements the
+/// synchronous traits directly, so spelling [`MetadataProvider`] async would
+/// narrow this bridge to the four listing and existence calls rather than
+/// remove it. Either way it stays, and has to work wherever the embedder calls
+/// from.
+///
+/// What that blocking context must not do is depend on the embedder's runtime
+/// for the answer. Driving a catalog future there costs one of its threads per
+/// in-flight call, and once in-flight calls outnumber the threads that runtime
+/// can spare, the future nobody is left to poll is the one every blocked thread
+/// is waiting for — the runtime stops entirely, timers included. Owning the
+/// driver removes the cycle: a caller blocked on a catalog call is never also
+/// the thread that call's readiness comes from, so the number of concurrent
+/// calls stops being a correctness threshold.
+///
+/// Two workers, because nothing is computed on them. They drive the I/O driver
+/// and whatever the connection pools spawn; the futures themselves are polled
+/// by the calling threads. The blocking pool is capped far below tokio's
+/// default of 512 for the same reason: what reaches it is address resolution
+/// while a pool opens a connection, and an embedder has no way to size a
+/// runtime this crate builds for itself.
+///
+/// Process-wide and never shut down: an embedder can hold one provider per
+/// catalog, and a runtime apiece would cost threads per catalog for work that
+/// shares a driver perfectly well.
+fn catalog_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(16)
+            .thread_name("ducklake-catalog")
+            .enable_all()
+            .build()
+            .expect("failed to start the DuckLake catalog runtime")
+    })
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+/// Drives `future` to completion on this thread, parking between polls.
+///
+/// `futures::executor::block_on` refuses to run inside another of its own
+/// executors, which a provider method reached from inside another one does.
+/// Parking has no such guard and needs no executor of its own: the wakes come
+/// from the driver [`catalog_runtime`] owns.
+///
+/// A thread holds one park permit however many times it is unparked, so the
+/// permit cannot say which call a wake was meant for. Each call therefore keeps
+/// its own flag, set by its waker and cleared only by itself, and treats the
+/// permit as a hint that some flag may have changed: a nested call that parked
+/// would otherwise spend the permit deposited for the call around it, leaving
+/// that one parked with nothing left to wake it. This is the shape — and the
+/// reason — `futures::executor::block_on` uses.
+fn park_until_ready<F: std::future::Future>(future: F) -> F::Output {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Unpark {
+        thread: std::thread::Thread,
+        woken: AtomicBool,
+    }
+
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // Only on the false -> true edge. Once the flag is set the wait
+            // loop reads it without parking at all, and permits do not
+            // accumulate, so a second unpark would buy nothing.
+            if !self.woken.swap(true, Ordering::Release) {
+                self.thread.unpark();
+            }
+        }
+    }
+
+    let mut future = std::pin::pin!(future);
+    let unpark = Arc::new(Unpark {
+        thread: std::thread::current(),
+        woken: AtomicBool::new(false),
+    });
+    let waker = std::task::Waker::from(Arc::clone(&unpark));
+    let mut context = std::task::Context::from_waker(&waker);
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            // A wake that raced the last poll leaves a permit behind on a
+            // thread this crate does not own, where the next park to run on it
+            // would spend it on someone else's wait. Take it back if it is
+            // there — best-effort, because `wake_by_ref` sets the flag before
+            // it unparks, so a waker caught between those two lines leaves the
+            // flag reading `true` with its permit still to come, and the park
+            // below then consumes nothing. Neither outcome can cost anyone a
+            // wakeup, because a permit decides nothing on its own: a park loop
+            // re-reads its own condition, and has to, since a wake landing
+            // after this leaves a permit again.
+            if unpark.woken.swap(false, Ordering::Acquire) {
+                std::thread::park_timeout(std::time::Duration::ZERO);
+            }
+            return output;
+        }
+        // A park can return without a wake, so the flag — not the park — is
+        // what decides whether to poll again.
+        while !unpark.woken.swap(false, Ordering::Acquire) {
+            std::thread::park();
+        }
+    }
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+thread_local! {
+    /// Whether this thread is already inside [`block_on`].
+    static IN_CATALOG_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+/// Marks this thread as inside [`block_on`] for as long as it is held.
+struct CatalogCall;
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+impl CatalogCall {
+    fn enter() -> Self {
+        IN_CATALOG_CALL.with(|inside| inside.set(true));
+        Self
+    }
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+impl Drop for CatalogCall {
+    fn drop(&mut self) {
+        IN_CATALOG_CALL.with(|inside| inside.set(false));
+    }
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+/// Awaits a catalog future from a synchronous [`MetadataProvider`] method.
+///
+/// Works the same under a `current_thread` runtime, a `multi_thread` one, and
+/// on a thread with no runtime at all: the future is driven here, against the
+/// driver [`catalog_runtime`] owns.
 pub(crate) fn block_on<F, T>(f: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+    // A provider method reached from inside another one has nothing left to
+    // hand off — the outer call already left the caller's runtime — and
+    // `Handle::current` names the catalog runtime from here, so the flavour
+    // check below would read the wrong runtime and blow up under a
+    // `current_thread` caller.
+    //
+    // No method in this crate takes that path today: every provider that
+    // delegates to another does so as a plain call outside `block_on`
+    // (`SqliteMetadataProvider::get_data_path` through
+    // `get_metadata_settings`, `get_table_file_metadata_page` through its
+    // filtered form, the four `MulticatalogProvider` methods that forward to
+    // their inlined provider). The guard is for the first one that awaits a
+    // catalog call inside a catalog future instead.
+    if IN_CATALOG_CALL.with(std::cell::Cell::get) {
+        let _catalog = catalog_runtime().enter();
+        return park_until_ready(f);
+    }
+
+    // Hand this worker's queue to another thread for as long as it blocks, so
+    // the embedder's other tasks keep running. Only a multi-threaded runtime
+    // can do that — `block_in_place` panics under a `current_thread` runtime —
+    // and it is an optimisation, not what makes the call complete: the future
+    // below is driven either way.
+    let hand_off_worker = matches!(
+        tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+    );
+    let drive = || {
+        let _nested = CatalogCall::enter();
+        // Sockets, timers and tasks the future creates bind to the catalog
+        // runtime, so their readiness comes from its driver rather than from a
+        // runtime this call may itself have blocked.
+        let _catalog = catalog_runtime().enter();
+        park_until_ready(f)
+    };
+    if hand_off_worker {
+        tokio::task::block_in_place(drive)
+    } else {
+        drive()
+    }
+}
+
+#[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql", feature = "metadata-sqlite"))]
+/// Opens a connection pool on the catalog runtime.
+///
+/// A sqlx connection registers its socket with the I/O driver of the runtime
+/// that opened it, and only that driver ever reports it readable. A pool opened
+/// on the caller's runtime would leave every later query against it waiting on
+/// the caller's driver still being driven — which is exactly what a blocking
+/// `MetadataProvider` call on a single-threaded runtime stops. Opening it here
+/// puts the whole pool on the driver [`block_on`] runs against.
+pub(crate) async fn connect_on_catalog_runtime<F, T>(connect: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match catalog_runtime().spawn(connect).await {
+        Ok(pool) => pool,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => panic!("the DuckLake catalog runtime dropped a connection attempt: {err}"),
+    }
 }
 
 #[cfg(test)]
@@ -1934,6 +2145,160 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    #[cfg(any(
+        feature = "metadata-postgres",
+        feature = "metadata-mysql",
+        feature = "metadata-sqlite"
+    ))]
+    mod blocking_bridge {
+        use super::super::block_on;
+
+        /// The shape a provider method reached from inside another one takes.
+        fn nested() -> i32 {
+            block_on(async { block_on(async { 41 }) + 1 })
+        }
+
+        #[test]
+        fn a_nested_call_completes_off_a_runtime() {
+            assert_eq!(nested(), 42);
+        }
+
+        #[test]
+        fn a_nested_call_completes_under_a_current_thread_runtime() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert_eq!(runtime.block_on(async { nested() }), 42);
+        }
+
+        #[test]
+        fn a_nested_call_completes_under_a_multi_thread_runtime() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            assert_eq!(runtime.block_on(async { nested() }), 42);
+        }
+
+        /// A wake for an outer call that lands while a nested one is parked.
+        ///
+        /// A thread holds one park permit however many times it is unparked, so
+        /// a call that parks without a record of its own wakes takes whatever
+        /// permit it finds — including the one deposited for the call around
+        /// it, which is then left parked with nothing to wake it.
+        ///
+        /// Every step here is ordered by a channel rather than by a delay: the
+        /// nested future registers its waker and says so, the outer call is
+        /// woken, and only then is the nested future allowed to finish. So the
+        /// permit that wake deposits is always there for the nested park loop
+        /// to take, and the outer call has to find its way back from its own
+        /// record of the wake.
+        #[test]
+        fn a_wake_during_a_nested_call_still_reaches_the_call_around_it() {
+            use std::sync::mpsc::sync_channel;
+            use std::task::{Context, Poll, Waker};
+
+            let (finished_tx, finished_rx) = sync_channel(1);
+            std::thread::Builder::new()
+                .name("nested-wake".to_string())
+                .spawn(move || {
+                    let (waker_tx, waker_rx) = sync_channel::<Waker>(1);
+                    let (registered_tx, registered_rx) = sync_channel::<()>(1);
+                    let (release_tx, mut release_rx) = tokio::sync::oneshot::channel::<()>();
+
+                    let waker_thread = std::thread::spawn(move || {
+                        let waker = waker_rx.recv().expect("the outer future is polled");
+                        registered_rx
+                            .recv()
+                            .expect("the nested future registers before it parks");
+                        waker.wake();
+                        let _ = release_tx.send(());
+                    });
+
+                    let mut registered = Some(registered_tx);
+                    let nested = std::future::poll_fn(move |context: &mut Context<'_>| {
+                        match std::pin::Pin::new(&mut release_rx).poll(context) {
+                            Poll::Ready(released) => {
+                                released.expect("the release channel is not dropped");
+                                Poll::Ready(())
+                            },
+                            Poll::Pending => {
+                                // The waker is stored by the poll above, so the
+                                // release that follows this cannot be missed.
+                                if let Some(registered) = registered.take() {
+                                    registered.send(()).unwrap();
+                                }
+                                Poll::Pending
+                            },
+                        }
+                    });
+
+                    let mut nested = Some(nested);
+                    let mut polls = 0;
+                    let outer = std::future::poll_fn(move |context: &mut Context<'_>| {
+                        polls += 1;
+                        match nested.take() {
+                            Some(nested) => {
+                                waker_tx.send(context.waker().clone()).unwrap();
+                                block_on(nested);
+                                Poll::Pending
+                            },
+                            None => Poll::Ready(polls),
+                        }
+                    });
+
+                    let polls = block_on(outer);
+                    waker_thread.join().unwrap();
+                    let _ = finished_tx.send(polls);
+                })
+                .unwrap();
+
+            // The deadline is enforced from this thread, because the shape
+            // under test is a call that never returns: the thread making it
+            // cannot report it.
+            let polls = finished_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the outer call never returned: the nested one took its wake");
+            assert_eq!(polls, 2, "the outer future is polled again once woken");
+        }
+
+        /// A call that returns leaves nothing behind for the next one, so the
+        /// thread that made it can still hand its worker off.
+        #[test]
+        fn a_completed_call_stops_counting_as_nested() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert_eq!(nested(), 42);
+                assert!(!super::super::IN_CATALOG_CALL.with(std::cell::Cell::get));
+            });
+        }
+
+        /// Nor does a call that unwinds.
+        ///
+        /// The nested branch is the one that neither checks the runtime flavour
+        /// nor hands a worker off, so a thread left marked as inside a call
+        /// would quietly stop doing either for every catalog call it made
+        /// afterwards — no panic, no error, just an embedder's runtime blocked
+        /// where it used to be handed over. `CatalogCall` clears the mark from
+        /// `Drop`, which unwinding runs; this is what says so.
+        #[test]
+        fn a_panicking_call_leaves_the_thread_outside_a_call() {
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(async { panic!("this catalog future panics on purpose") })
+            }));
+
+            assert!(unwound.is_err(), "the panic reaches the caller");
+            assert!(!super::super::IN_CATALOG_CALL.with(std::cell::Cell::get));
+            assert_eq!(nested(), 42, "a later call still nests as it should");
+        }
+    }
 
     fn column(name: &str, column_type: &str) -> DuckLakeTableColumn {
         DuckLakeTableColumn::new(1, name.to_string(), column_type.to_string(), true)

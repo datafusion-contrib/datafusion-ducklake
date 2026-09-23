@@ -65,10 +65,14 @@ pub struct MulticatalogManager {
 impl MulticatalogManager {
     /// Connect to PostgreSQL and initialize the multicatalog schema.
     pub async fn connect(connection_string: &str, max_connections: u32) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&url)
+                .await
+        })
+        .await?;
         initialize_multicatalog_schema(&pool).await?;
         Ok(Self::new(pool))
     }

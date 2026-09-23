@@ -818,10 +818,14 @@ impl PostgresMetadataWriter {
         catalog_id: i64,
         max_connections: u32,
     ) -> Result<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(connection_string)
-            .await?;
+        let url = connection_string.to_string();
+        let pool = crate::metadata_provider::connect_on_catalog_runtime(async move {
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect(&url)
+                .await
+        })
+        .await?;
         Self::with_pool(pool, catalog_id).await
     }
 

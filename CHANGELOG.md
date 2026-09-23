@@ -74,6 +74,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent catalog lookups no longer deadlock the caller's tokio runtime, and a lookup through
+  a pool this crate opened — `SqliteMetadataProvider::new`, `PostgresMetadataProvider::new`,
+  `MySqlMetadataProvider::new`, or a metadata writer's constructor — runs under a
+  `current_thread` runtime or off a runtime entirely, where it used to panic. A pool adopted
+  through `from_pool` or `with_pool` is not moved: its connections keep taking their readiness
+  from the runtime that opened them, so a lookup through one under a `current_thread` runtime
+  still fails, now with the pool's acquire timeout rather than a panic.
 - A list column no longer costs every other column of its table filter, sort and limit
   pushdown. A scan reads each file's list elements under the name the catalog gives them,
   the way official DuckLake normalizes its reader's columns, instead of the name the
