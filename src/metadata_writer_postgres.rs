@@ -4096,6 +4096,12 @@ impl MetadataWriter for PostgresMetadataWriter {
         // produced by the safer-looking option. Refusing loses nothing, since a
         // caller passing an explicit list has no glob to overlap.
         //
+        // The residual is narrower than the refusal: the argument above only bites
+        // when the entries DISAGREE. Two structurally identical entries have no
+        // delete file to lose and no field to choose between, so refusing those is
+        // stricter than official with nothing gained. Splitting the two cases is
+        // #328.
+        //
         // Exact spellings only. Two ways of writing one object (relative vs absolute)
         // are not resolvable here — that needs the table path the commit has not
         // looked up yet — and official's normalization is likewise about glob and URL

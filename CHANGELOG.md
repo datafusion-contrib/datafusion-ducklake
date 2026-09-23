@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same commit is establishing, whose `partition_id` does not exist yet (#323).
 - A batched promote refuses a repeated path, where official's `ducklake_add_data_files`
   deduplicates one: an entry here carries the caller's own metadata and delete file, not a bare
-  glob-expanded path, so keeping the first would silently drop the rest (#323).
+  glob-expanded path, so keeping the first would silently drop the rest (#323, #328).
 
 ### Changed
 
