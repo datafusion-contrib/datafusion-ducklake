@@ -7392,7 +7392,7 @@ mod tests {
                 let ctx = SessionContext::new();
                 ctx.runtime_env().register_object_store(
                     store_url.as_ref(),
-                    Arc::clone(&counting) as Arc<dyn ObjectStore>,
+                    Arc::clone(&counting) as Arc<dyn object_store::ObjectStore>,
                 );
                 let facts = read_parquet_footer_facts(
                     &ctx.state(),
