@@ -6362,6 +6362,278 @@ async fn register_existing_data_files_refuses_partition_values_with_no_spec() {
     );
 }
 
+/// A promoted file keeps its statistics, and the table roll-up is rebuilt from
+/// them in the same commit.
+///
+/// This is the fork shape again: no object is written, so there is no footer to
+/// harvest — and a footer would not carry `contains_nan` anyway, without which a
+/// float `max_value` is never trusted. The caller copies the source catalog's
+/// rows for the same bytes, and they must land verbatim under the assigned
+/// `data_file_id`. The roll-up must then resolve each column's TYPE through the
+/// adopted ids: `id` is numeric, so its bounds widen to `12`, not to the
+/// lexically larger `3`. A later Replace recomputes from the live generation
+/// only, so the retired files' bounds drop out.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
+    use datafusion_ducklake::metadata_writer::PromotedFile;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let source = mgr.create_catalog("stats_source").await.unwrap();
+    let dest = mgr.create_catalog("stats_dest").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), dest)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let columns = vec![
+        ColumnDef::new("id", "int64", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+        ColumnDef::new("score", "double", true).unwrap(),
+    ];
+    let ids = vec![100_i64, 200_i64, 300_i64];
+    let stat = |column_id: i64,
+                min: Option<&str>,
+                max: Option<&str>,
+                null_count: i64,
+                value_count: i64,
+                contains_nan: Option<bool>,
+                size: i64| ColumnStat {
+        column_id,
+        min_value: min.map(str::to_string),
+        max_value: max.map(str::to_string),
+        null_count: Some(null_count),
+        value_count: Some(value_count),
+        contains_nan,
+        column_size_bytes: Some(size),
+    };
+    let f1_stats = vec![
+        stat(100, Some("1"), Some("3"), 0, 3, None, 111),
+        stat(200, Some("ann"), Some("cat"), 1, 2, None, 222),
+        stat(300, Some("0.5"), Some("2.5"), 0, 3, Some(false), 333),
+    ];
+    // f2's score column holds a NaN: bounds omitted, flag set, as DuckLake records it.
+    let f2_stats = vec![
+        stat(100, Some("10"), Some("12"), 0, 3, None, 444),
+        stat(200, Some("bob"), Some("zed"), 0, 3, None, 555),
+        stat(300, None, None, 0, 3, Some(true), 666),
+    ];
+    let batch = vec![
+        PromotedFile::new(
+            DataFileInfo::new("/src/f1.parquet", 1024, 3)
+                .with_absolute_path()
+                .with_owner_catalog(source)
+                .with_column_stats(f1_stats.clone()),
+        ),
+        PromotedFile::new(
+            DataFileInfo::new("/src/f2.parquet", 2048, 3)
+                .with_absolute_path()
+                .with_owner_catalog(source)
+                .with_column_stats(f2_stats.clone()),
+        ),
+    ];
+    let out = w
+        .register_existing_data_files(
+            "public",
+            "orders",
+            &columns,
+            &ids,
+            &batch,
+            None,
+            WriteMode::Replace,
+        )
+        .unwrap();
+
+    // Per-file rows, verbatim, under the id each file was assigned.
+    let rows = file_column_stats(&pool, out.table_id).await;
+    let want: Vec<(String, ColumnStat)> = f1_stats
+        .iter()
+        .map(|s| ("/src/f1.parquet".to_string(), s.clone()))
+        .chain(
+            f2_stats
+                .iter()
+                .map(|s| ("/src/f2.parquet".to_string(), s.clone())),
+        )
+        .collect();
+    assert_eq!(
+        rows, want,
+        "every stat handed in must be stored as given under its file"
+    );
+
+    // The roll-up, rebuilt from those rows on the same commit. `id` widens
+    // numerically (12 > 3); `name` widens lexically and one file had a NULL;
+    // `score` has no bound because f2 recorded none, and a known NaN.
+    let rollup = table_column_stats(&pool, out.table_id).await;
+    assert_eq!(
+        rollup,
+        vec![
+            (100, Some("1".into()), Some("12".into()), Some(false), None),
+            (
+                200,
+                Some("ann".into()),
+                Some("zed".into()),
+                Some(true),
+                None
+            ),
+            (300, None, None, Some(false), Some(true)),
+        ],
+        "the roll-up must be computed from the promoted rows, with the column \
+         types resolved through the adopted ids"
+    );
+
+    // A Replace through the singular entry point — the degenerate batch —
+    // retires f1 and f2, and the roll-up follows the live generation: f3's
+    // bounds alone, and no row at all for the columns it recorded nothing for.
+    let f3 = DataFileInfo::new("/src/f3.parquet", 512, 2)
+        .with_absolute_path()
+        .with_owner_catalog(source)
+        .with_column_stats(vec![stat(100, Some("50"), Some("60"), 0, 2, None, 777)]);
+    w.register_existing_data_file("public", "orders", &columns, &ids, &f3, WriteMode::Replace)
+        .unwrap();
+    assert_eq!(
+        table_column_stats(&pool, out.table_id).await,
+        vec![(100, Some("50".into()), Some("60".into()), Some(false), None)],
+        "a Replace must rebuild the roll-up from the live generation only"
+    );
+}
+
+/// A stat naming a column the promote does not create is refused, as is one
+/// naming a column twice for one file — and nothing is committed.
+///
+/// The rows are stored verbatim and the roll-up groups by `column_id`, so an
+/// unknown id would put a table-wide bound on a column the table does not have,
+/// and a repeat would let one file count as two against the roll-up's coverage
+/// rule. Both mean the caller built the batch from the wrong column set.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn register_existing_data_files_refuses_stats_for_columns_it_does_not_adopt() {
+    use datafusion_ducklake::metadata_writer::PromotedFile;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("stats_refused").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+
+    let stat = |column_id: i64| ColumnStat {
+        column_id,
+        min_value: Some("1".into()),
+        max_value: Some("2".into()),
+        null_count: Some(0),
+        value_count: Some(3),
+        contains_nan: None,
+        column_size_bytes: Some(10),
+    };
+    let attempts = [
+        (
+            vec![stat(100), stat(999)],
+            "not among the adopted column_ids",
+        ),
+        (vec![stat(100), stat(100)], "more than once"),
+    ];
+    for (stats, expected) in attempts {
+        let batch = vec![PromotedFile::new(
+            DataFileInfo::new("f1.parquet", 1024, 3).with_column_stats(stats),
+        )];
+        let err = w
+            .register_existing_data_files(
+                "public",
+                "orders",
+                &cols(),
+                &[100, 200],
+                &batch,
+                None,
+                WriteMode::Replace,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, DuckLakeError::InvalidConfig(_)),
+            "a bad stat is the caller's error, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected) && msg.contains("f1.parquet"),
+            "the error must name the file and the fault ({expected}), got: {msg}"
+        );
+    }
+    assert_eq!(
+        current_head(&pool, cat).await,
+        0,
+        "nothing is committed on a validation failure"
+    );
+    let files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let stats: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_file_column_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        (files, stats),
+        (0, 0),
+        "a refused batch must leave no file row and no stats row behind"
+    );
+}
+
+/// Every live file's `ducklake_file_column_stats` rows for `table_id`, as
+/// `(path, stat)`, ordered by path then column.
+async fn file_column_stats(pool: &PgPool, table_id: i64) -> Vec<(String, ColumnStat)> {
+    sqlx::query(
+        "SELECT d.path, s.column_id, s.min_value, s.max_value, s.null_count, s.value_count,
+                s.contains_nan, s.column_size_bytes
+         FROM ducklake_file_column_stats s
+         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+         WHERE s.table_id = $1 AND d.end_snapshot IS NULL
+         ORDER BY d.path, s.column_id",
+    )
+    .bind(table_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        (
+            r.get::<String, _>(0),
+            ColumnStat {
+                column_id: r.get(1),
+                min_value: r.get(2),
+                max_value: r.get(3),
+                null_count: r.get(4),
+                value_count: r.get(5),
+                contains_nan: r.get(6),
+                column_size_bytes: r.get(7),
+            },
+        )
+    })
+    .collect()
+}
+
+/// The `ducklake_table_column_stats` roll-up for `table_id`, as
+/// `(column_id, min, max, contains_null, contains_nan)`, ordered by column.
+async fn table_column_stats(
+    pool: &PgPool,
+    table_id: i64,
+) -> Vec<(
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    Option<bool>,
+)> {
+    sqlx::query_as(
+        "SELECT column_id, min_value, max_value, contains_null, contains_nan
+         FROM ducklake_table_column_stats WHERE table_id = $1 ORDER BY column_id",
+    )
+    .bind(table_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
 /// An empty batch creates the table and its layout with no data — the documented
 /// degenerate case, and the one where the `files.is_empty()` branches run.
 #[tokio::test(flavor = "multi_thread")]

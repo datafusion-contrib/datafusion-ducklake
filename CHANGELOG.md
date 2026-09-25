@@ -74,6 +74,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A promoted file keeps its statistics. `register_existing_data_file_with_delete` and
+  `register_existing_data_files` now persist the `DataFileInfo::column_stats` they are handed
+  to `ducklake_file_column_stats` and recompute the table's `ducklake_table_column_stats`
+  roll-up in the same commit, as every other register path does; they used to drop them
+  silently, so a table adopted by reference — a database fork — had no per-file bounds to
+  prune with and no `column_size_bytes` for any file it referenced, until a rewrite happened
+  to produce some. A stat naming a column outside the adopted `column_ids`, or naming one
+  column twice for a file, is refused rather than rolled up into a bound for a column the
+  table does not have.
 - Concurrent catalog lookups no longer deadlock the caller's tokio runtime, and a lookup through
   a pool this crate opened — `SqliteMetadataProvider::new`, `PostgresMetadataProvider::new`,
   `MySqlMetadataProvider::new`, or a metadata writer's constructor — runs under a

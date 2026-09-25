@@ -757,7 +757,9 @@ pub struct DataFileInfo {
     /// Per-column statistics (min/max/null counts) to persist to
     /// `ducklake_file_column_stats`. Empty when stats were not computed (e.g. a
     /// caller that predates stats support); backends must treat an empty vector
-    /// as "no stats rows for this file", which is spec-safe.
+    /// as "no stats rows for this file", which is spec-safe. A promote
+    /// ([`MetadataWriter::register_existing_data_files`]) stores them as given
+    /// and requires each `column_id` to be one of the adopted ids.
     pub column_stats: Vec<ColumnStat>,
     /// The partition spec generation (`ducklake_partition_info.partition_id`) this
     /// file was written under, or `None` for a file of an unpartitioned table.
@@ -2490,6 +2492,27 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// message naming the fix — not the partition fence's concurrency wording, which
     /// would misdescribe what went wrong.
     ///
+    /// # Column statistics
+    ///
+    /// Nothing is read here either, so statistics can only be *carried*:
+    /// [`DataFileInfo::column_stats`] is persisted as given to
+    /// `ducklake_file_column_stats` under the assigned `data_file_id`, and the
+    /// table's `ducklake_table_column_stats` roll-up is recomputed in the same
+    /// commit, as every other register path does. A promoted file is the same
+    /// bytes the source catalog described, so the source's rows for it are
+    /// exactly right for the copy — `contains_nan` included, which a footer
+    /// re-read could not recover, and without which a float `max_value` is
+    /// never trusted. Copy them rather than re-harvesting.
+    ///
+    /// Each stat names a column by `column_id`, and that id must be one of the
+    /// adopted `column_ids`: the rows are stored verbatim and the roll-up groups
+    /// by id, so a stat for any other column would put a table-wide bound on a
+    /// column the table does not have. One naming another id, or naming one id
+    /// twice for one file, is refused with [`crate::DuckLakeError::InvalidConfig`].
+    /// A source that recorded no statistics for a file yields an empty vector,
+    /// which persists nothing; the roll-up then reports that file's columns as
+    /// unknown, which is what the source reported too.
+    ///
     /// # Sort order
     ///
     /// A table's sort order is NOT enforced here: promoting an unsorted file into a
@@ -2577,8 +2600,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ///
     /// The plural sibling of [`register_existing_data_file_with_delete`], with the
     /// same per-file contract: every rule that method documents about column ids,
-    /// ownership, row lineage, partition assignments and sort order holds here,
-    /// per entry. What changes is the commit boundary. A caller adopting a whole
+    /// ownership, row lineage, partition assignments, column statistics and sort
+    /// order holds here, per entry. What changes is the commit boundary. A caller adopting a whole
     /// table — a database fork, registering every file of a source generation by
     /// reference — lands ONE snapshot rather than N, and either the whole batch is
     /// visible or none of it is.

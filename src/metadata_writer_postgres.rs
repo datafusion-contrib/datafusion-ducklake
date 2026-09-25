@@ -4199,6 +4199,37 @@ impl MetadataWriter for PostgresMetadataWriter {
                     file.path
                 )));
             }
+            // A file's statistics are stored as given, under the ids adopted
+            // above, so each must name one of them. A stat for any other column
+            // is not merely dead weight: `recompute_table_column_stats` rolls
+            // every per-file row up by `column_id`, so it would put a table-wide
+            // bound on a column the table does not have. And a column may be
+            // described once per file: the roll-up's coverage rule counts
+            // contributions against the live file count, so a repeat lets one
+            // file stand in for two and claims a bound not every file has. Both
+            // are a caller working from the wrong column set — refused here,
+            // where it can still fix them.
+            let mut seen_columns =
+                std::collections::HashSet::with_capacity(file.column_stats.len());
+            for stat in &file.column_stats {
+                if !column_ids.contains(&stat.column_id) {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_files: {} carries statistics for column_id {}, \
+                         which is not among the adopted column_ids {column_ids:?}. A promoted \
+                         file's statistics are stored as given, so they must describe the \
+                         columns this registration creates.",
+                        file.path, stat.column_id
+                    )));
+                }
+                if !seen_columns.insert(stat.column_id) {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_files: {} carries statistics for column_id {} \
+                         more than once. One row per column per file, or the table roll-up \
+                         counts this file twice.",
+                        file.path, stat.column_id
+                    )));
+                }
+            }
         }
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -4428,6 +4459,15 @@ impl MetadataWriter for PostgresMetadataWriter {
                 // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
                 // with the table's spec.
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+                // And its per-column zone maps, under the id just assigned. A
+                // promoted file is registered as-is, so these are the source
+                // catalog's rows for the same bytes — which is why the caller
+                // copies them rather than re-reading the footer: `contains_nan`
+                // is not in a footer, and without it a float max is never
+                // trusted. Empty means no rows, and the roll-up below then
+                // reports the file's columns as unknown, exactly as the source did.
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
 
                 // An existing positional delete file travels with its data file: same
                 // commit, same snapshot, hanging off the id just assigned. The path is
@@ -4453,6 +4493,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
                 }
             }
+
+            // Refresh the table-wide roll-up from what is live now, as every
+            // other register path does. Once for the batch, not once per file:
+            // the roll-up is a pass over the table's live rows, and under Replace
+            // it is also what drops the retired generation's bounds — so it runs
+            // for an empty batch too.
+            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
 
             // A layout is DDL, but only worth its own entry when finalize did not
             // already record one for this table on this snapshot: a table created
