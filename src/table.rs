@@ -935,6 +935,19 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) row_group_count: usize,
 }
 
+/// The parquet reader's metadata size hint for a file whose catalog records
+/// `footer_size`. DuckLake records the footer's thrift metadata length alone,
+/// while the reader's suffix fetch must also cover the 8-byte tail (metadata
+/// length plus `PAR1`), so the hint adds it and the footer arrives in one read.
+/// A recorded value that already includes the tail over-fetches 8 bytes. A
+/// missing, zero, or negative value gives no hint.
+pub(crate) fn metadata_size_hint(footer_size: Option<i64>) -> Option<usize> {
+    footer_size
+        .filter(|&size| size > 0)
+        .and_then(|size| usize::try_from(size).ok())
+        .and_then(|size| size.checked_add(8))
+}
+
 /// The [`ObjectMeta`] DuckLake's own scan-time `PartitionedFile::new(path,
 /// size)` builds (see [`DuckLakeTable::partitioned_file`]): epoch
 /// `last_modified`, no e_tag or version. A plan-time footer probe that builds
@@ -966,6 +979,10 @@ fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
 /// parameter rather than resolved via a `head()` call, which would cost
 /// exactly the round trip this function exists to avoid.
 ///
+/// `footer_size` is the catalog's recorded footer size, when known. It becomes
+/// the reader's metadata size hint (see [`metadata_size_hint`]) so a cold footer
+/// read is one ranged read rather than a length probe followed by the footer.
+///
 /// `encryption_key` is the file's DuckLake encryption key when it has one; it
 /// is only usable with the `encryption` feature, and this function cannot
 /// open an encrypted file without it. Note an encrypted footer is never
@@ -978,6 +995,7 @@ pub(crate) async fn read_parquet_footer_facts(
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
     file_size_bytes: Option<i64>,
+    footer_size: Option<i64>,
     encryption_key: Option<&str>,
 ) -> DataFusionResult<ParquetFooterFacts> {
     let object_store = state.runtime_env().object_store(object_store_url)?;
@@ -1018,6 +1036,7 @@ pub(crate) async fn read_parquet_footer_facts(
     };
 
     let metadata = DFParquetMetadata::new(object_store.as_ref(), &object_meta)
+        .with_metadata_size_hint(metadata_size_hint(footer_size))
         .with_file_metadata_cache(Some(
             state.runtime_env().cache_manager.get_file_metadata_cache(),
         ))
@@ -1103,11 +1122,13 @@ pub(crate) fn session_parquet_source(
 /// which already spells a list's element
 /// [`crate::types::LIST_ELEMENT_NAME`] and carries none of the storage metadata
 /// [`normalize_list_element_names`] exists to strip.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_parquet_file_layout(
     state: &dyn Session,
     object_store_url: &ObjectStoreUrl,
     resolved_path: &str,
     file_size_bytes: Option<i64>,
+    footer_size: Option<i64>,
     encryption_key: Option<&str>,
     columns: &[DuckLakeTableColumn],
     fallback_schema: &SchemaRef,
@@ -1117,6 +1138,7 @@ pub(crate) async fn read_parquet_file_layout(
         object_store_url,
         resolved_path,
         file_size_bytes,
+        footer_size,
         encryption_key,
     )
     .await?;
@@ -1878,10 +1900,7 @@ impl DuckLakeTable {
             &resolved_path,
             validated_file_size(file.file_size_bytes, &resolved_path)?,
         );
-        if let Some(footer_size) = file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = metadata_size_hint(file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
         Ok(pf)
@@ -2208,11 +2227,23 @@ impl DuckLakeTable {
         filters: &[Expr],
     ) -> DataFusionResult<Vec<Arc<dyn PhysicalExpr>>> {
         let df_schema = DFSchema::try_from(self.physical_schema.as_ref().clone())?;
-        filters
+        // Each conjunct converts on its own. One that cannot be expressed over
+        // the parquet-backed columns (a predicate on the synthetic `rowid`) is
+        // left out, which only weakens pruning: every remaining conjunct is still
+        // implied by the whole filter, and the filter is re-applied above the scan.
+        Ok(filters
             .iter()
             .flat_map(datafusion::logical_expr::utils::split_conjunction)
-            .map(|expr| state.create_physical_expr(expr.clone(), &df_schema))
-            .collect()
+            .filter_map(
+                |expr| match state.create_physical_expr(expr.clone(), &df_schema) {
+                    Ok(physical) => Some(physical),
+                    Err(error) => {
+                        tracing::debug!(%error, %expr, "conjunct left out of plan-time pruning");
+                        None
+                    },
+                },
+            )
+            .collect())
     }
 
     /// Build one [`PruningPredicate`] per conjunct against `physical_schema` (the
@@ -2406,10 +2437,6 @@ impl DuckLakeTable {
             object_path,
             validated_file_size(file.file_size_bytes, &resolved_path)?,
         );
-        let metadata_size_hint = file
-            .footer_size
-            .filter(|&size| size > 0)
-            .and_then(|size| usize::try_from(size).ok());
 
         // Resolve decryption properties (if any) before touching the store, the
         // same way `read_parquet_footer_facts` does.
@@ -2443,7 +2470,7 @@ impl DuckLakeTable {
         // saves nothing new for that path beyond sharing the code with the
         // unencrypted one.
         let metadata = DFParquetMetadata::new(object_store.as_ref(), &object_meta)
-            .with_metadata_size_hint(metadata_size_hint)
+            .with_metadata_size_hint(metadata_size_hint(file.footer_size))
             .with_file_metadata_cache(Some(
                 state.runtime_env().cache_manager.get_file_metadata_cache(),
             ))
@@ -2666,10 +2693,7 @@ impl DuckLakeTable {
             &resolved_delete_path,
             validated_file_size(delete_file.file_size_bytes, &resolved_delete_path)?,
         );
-        if let Some(footer_size) = delete_file.footer_size
-            && footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = metadata_size_hint(delete_file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
@@ -3380,6 +3404,7 @@ impl DuckLakeTable {
             self.object_store_url.as_ref(),
             &resolved_path,
             Some(file.file_size_bytes),
+            file.footer_size,
             encryption_key,
             &self.columns,
             &self.physical_schema,
@@ -3714,10 +3739,7 @@ impl DuckLakeTable {
                 &resolved_path,
                 validated_file_size(table_file.file.file_size_bytes, &resolved_path)?,
             );
-            if let Some(footer_size) = table_file.file.footer_size
-                && footer_size > 0
-                && let Ok(hint) = usize::try_from(footer_size)
-            {
+            if let Some(hint) = metadata_size_hint(table_file.file.footer_size) {
                 pf = pf.with_metadata_size_hint(hint);
             }
             let builder = self
@@ -4462,7 +4484,8 @@ impl TableProvider for DuckLakeTable {
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let inlined_deletes = self.inlined_deletes_by_file()?;
         // One physical form of the filters feeds both pruning paths; see
-        // `physical_conjuncts`. A failure to convert them means "prune
+        // `physical_conjuncts`, which leaves out any conjunct it cannot convert.
+        // A failure to build the schema they convert against means "prune
         // nothing", never an error — the filters are re-applied above this scan
         // regardless (`supports_filters_pushdown` declares them Inexact).
         let conjuncts = match self.physical_conjuncts(state, filters) {
@@ -7104,6 +7127,7 @@ mod tests {
         inner: Arc<dyn object_store::ObjectStore>,
         file_len: u64,
         footer_reads: AtomicUsize,
+        range_reads: AtomicUsize,
     }
 
     impl FooterCountingStore {
@@ -7112,6 +7136,7 @@ mod tests {
                 inner,
                 file_len,
                 footer_reads: AtomicUsize::new(0),
+                range_reads: AtomicUsize::new(0),
             }
         }
 
@@ -7119,7 +7144,13 @@ mod tests {
             self.footer_reads.load(Ordering::SeqCst)
         }
 
+        /// Every ranged read, wherever in the file it lands.
+        fn range_reads(&self) -> usize {
+            self.range_reads.load(Ordering::SeqCst)
+        }
+
         fn count_footer_ranges(&self, ranges: &[std::ops::Range<u64>]) {
+            self.range_reads.fetch_add(ranges.len(), Ordering::SeqCst);
             for range in ranges {
                 if range.end == self.file_len {
                     self.footer_reads.fetch_add(1, Ordering::SeqCst);
@@ -7163,6 +7194,9 @@ mod tests {
             // see the struct doc), but counted for completeness: `get_range`
             // (built on this) and any future reader that fetches the footer
             // as a single `get_opts` range would otherwise go uncounted.
+            if options.range.is_some() {
+                self.range_reads.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(range) = &options.range
                 && let Ok(resolved) = range.as_range(self.file_len)
                 && resolved.end == self.file_len
@@ -7325,6 +7359,67 @@ mod tests {
             footer_reads_after_cold_scan,
             "a warm scan must issue zero additional footer reads once the reader factory \
              shares the session's metadata cache (#1323)",
+        );
+
+        Ok(())
+    }
+
+    /// A cold plan-time footer read given the catalog's `footer_size` fetches the
+    /// footer in one ranged read, whether or not the recorded value counts the
+    /// 8-byte tail. Without it the reader first probes the 8-byte
+    /// length suffix, so the same read costs one extra round trip per file.
+    #[tokio::test]
+    async fn footer_facts_use_the_catalog_footer_size_as_the_size_hint() -> Result<()> {
+        let bytes = footer_cache_fixture_bytes();
+        let file_len = bytes.len() as u64;
+        let len_bytes: [u8; 4] = bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap();
+        // The footer size DuckLake records: the thrift metadata length alone.
+        let footer_size = i64::from(u32::from_le_bytes(len_bytes));
+
+        let cold_reads = |footer_size: Option<i64>| {
+            let bytes = bytes.clone();
+            async move {
+                let inner: Arc<dyn object_store::ObjectStore> =
+                    Arc::new(object_store::memory::InMemory::new());
+                let path = ObjectPath::from("footer-hint.parquet");
+                inner
+                    .put(&path, bytes.into())
+                    .await
+                    .expect("seed the fixture file");
+                let counting = Arc::new(FooterCountingStore::new(inner, file_len));
+                let store_url = ObjectStoreUrl::parse("memory://").unwrap();
+                // A fresh context each time, so the metadata cache starts cold.
+                let ctx = SessionContext::new();
+                ctx.runtime_env().register_object_store(
+                    store_url.as_ref(),
+                    Arc::clone(&counting) as Arc<dyn ObjectStore>,
+                );
+                let facts = read_parquet_footer_facts(
+                    &ctx.state(),
+                    &store_url,
+                    "footer-hint.parquet",
+                    Some(file_len as i64),
+                    footer_size,
+                    None,
+                )
+                .await
+                .expect("footer read succeeds");
+                assert_eq!(facts.row_group_count, 1);
+                counting.range_reads()
+            }
+        };
+
+        let unhinted = cold_reads(None).await;
+        let hinted = cold_reads(Some(footer_size)).await;
+        // A recorded value that already counts the 8-byte tail over-fetches
+        // rather than falling back to a second read.
+        let hinted_with_tail = cold_reads(Some(footer_size + 8)).await;
+        assert_eq!(hinted_with_tail, hinted);
+        assert_eq!(
+            hinted + 1,
+            unhinted,
+            "the footer-size hint must save exactly the length probe \
+             (hinted {hinted} reads, unhinted {unhinted})"
         );
 
         Ok(())

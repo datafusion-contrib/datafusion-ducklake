@@ -704,6 +704,18 @@ async fn test_scan_prunes_files_on_rowid_path() -> DataFusionResult<()> {
         "unfiltered row-lineage scan keeps every file"
     );
 
+    // A `rowid` conjunct cannot resolve against the parquet-backed columns. It is
+    // left out of pruning on its own, and the conjunct beside it still prunes.
+    let rowid_and_a = col("rowid")
+        .gt_eq(lit(0_i64))
+        .and(col("a").lt(lit(5000_i32)));
+    let plan = table.scan(&state, None, &[rowid_and_a], None).await?;
+    assert_eq!(
+        paths_for(&plan).len(),
+        1,
+        "a rowid conjunct does not disable pruning on the other conjunct"
+    );
+
     // Correctness: rowid projection over the pruned scan returns every low-range
     // row exactly once.
     let ctx = SessionContext::new();
@@ -730,6 +742,21 @@ async fn test_scan_prunes_files_on_rowid_path() -> DataFusionResult<()> {
         distinct_rowids, 1000,
         "each surviving row has a distinct rowid"
     );
+
+    // Correctness with the rowid conjunct present: pruning on `a` alone must not
+    // drop a row the full filter keeps.
+    let batches = ctx
+        .sql("SELECT COUNT(*) FROM c.main.tbl WHERE rowid >= 0 AND a < 5000")
+        .await?
+        .collect()
+        .await?;
+    let rows = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count is Int64")
+        .value(0);
+    assert_eq!(rows, 1000, "rowid AND a returns every low-range row");
 
     Ok(())
 }

@@ -56,8 +56,8 @@ use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
     ParquetFileLayout, apply_name_mapping_to_layout, cached_parquet_reader_factory,
-    read_parquet_file_layout, read_parquet_footer_facts, session_parquet_source,
-    validated_file_size, validated_record_count,
+    metadata_size_hint, read_parquet_file_layout, read_parquet_footer_facts,
+    session_parquet_source, validated_file_size, validated_record_count,
 };
 use crate::table_changes::{check_column_count, present_catalog_schema};
 
@@ -182,8 +182,10 @@ impl TableDeletionsTable {
             state,
             self.object_store_url.as_ref(),
             &resolved,
-            // `file_layout` is keyed only by path — no catalog size in reach
-            // here, so `read_parquet_file_layout` resolves it via `head()`.
+            // `file_layout` is keyed only by path — no catalog size or footer
+            // size in reach here, so `read_parquet_file_layout` resolves the
+            // size via `head()` and reads the footer without a hint.
+            None,
             None,
             None,
             columns,
@@ -384,6 +386,7 @@ impl TableDeletionsTable {
             &resolved,
             size_bytes,
             None,
+            None,
         )
         .await?;
         Ok(facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned())
@@ -408,9 +411,7 @@ impl TableDeletionsTable {
             &resolved_path,
             validated_file_size(size_bytes, &resolved_path)?,
         );
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = metadata_size_hint(Some(footer_size)) {
             pf = pf.with_metadata_size_hint(hint);
         }
 
@@ -464,9 +465,7 @@ impl TableDeletionsTable {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let reader_factory = cached_parquet_reader_factory(state, self.object_store_url.as_ref())?;
         let mut pf = PartitionedFile::new(path, validated_file_size(size_bytes, path)?);
-        if footer_size > 0
-            && let Ok(hint) = usize::try_from(footer_size)
-        {
+        if let Some(hint) = metadata_size_hint(Some(footer_size)) {
             pf = pf.with_metadata_size_hint(hint);
         }
 

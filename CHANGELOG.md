@@ -57,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-filtered only when this and the constant's answer agree, so a constant of
   another type than the key's column declines rather than comparing two
   encodings of different things.
+- A cold parquet footer read takes one object-store read instead of two when the catalog
+  records the file's footer size, including on the row-lineage path and DuckDB catalogs.
 - Snapshot SQL listings expand from two to eight columns; select named columns
   to retain a fixed shape (#318).
 - The statistics CTE that narrows a file listing is declared `MATERIALIZED` on
@@ -76,6 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A promoted file keeps the column statistics it is handed and the table roll-up is rebuilt
   from them in the same commit; a stat for a column outside the adopted ids is refused (#333).
+- A filter that cannot prune files, such as one on `rowid`, no longer disables file pruning
+  for the rest of the query (#331).
 - Concurrent catalog lookups no longer deadlock the caller's tokio runtime, and a lookup through
   a pool this crate opened — `SqliteMetadataProvider::new`, `PostgresMetadataProvider::new`,
   `MySqlMetadataProvider::new`, or a metadata writer's constructor — runs under a
