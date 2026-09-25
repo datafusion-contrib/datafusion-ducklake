@@ -4124,6 +4124,10 @@ impl MetadataWriter for PostgresMetadataWriter {
         // looked up yet — and official's normalization is likewise about glob and URL
         // forms, not catalog path resolution.
         let mut seen_paths = std::collections::HashSet::with_capacity(files.len());
+        // Indexed once for the batch: every stat of every file is checked against
+        // it, and a wide table's batch would otherwise scan the id list per stat.
+        let adopted_column_ids: std::collections::HashSet<i64> =
+            column_ids.iter().copied().collect();
         for entry in files {
             let (file, delete) = (&entry.file, entry.delete.as_ref());
             if !seen_paths.insert(file.path.as_str()) {
@@ -4212,7 +4216,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut seen_columns =
                 std::collections::HashSet::with_capacity(file.column_stats.len());
             for stat in &file.column_stats {
-                if !column_ids.contains(&stat.column_id) {
+                if !adopted_column_ids.contains(&stat.column_id) {
                     return Err(crate::DuckLakeError::InvalidConfig(format!(
                         "register_existing_data_files: {} carries statistics for column_id {}, \
                          which is not among the adopted column_ids {column_ids:?}. A promoted \
