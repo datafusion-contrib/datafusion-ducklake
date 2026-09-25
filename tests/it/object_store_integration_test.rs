@@ -12,11 +12,46 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use tempfile::TempDir;
-use testcontainers::ImageExt;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
+use testcontainers::{GenericImage, ImageExt};
 
-const MINIO_IMAGE_NAME: &str = "quay.io/minio/minio";
+/// The MinIO server image, split into name and tag because that is how
+/// testcontainers overrides them.
+///
+/// This is Bitnami's build of MinIO RELEASE.2025-02-28T09-55-16Z. MinIO
+/// publishes no community image any more: it deleted `minio/*` from Docker Hub
+/// on 2026-09-11 and closed `quay.io/minio` on 2026-09-24 (anonymous pulls get
+/// a token with an empty access list, so every tag 401s), which is where this
+/// test had moved when Docker Hub went. `bitnamilegacy` is Broadcom's frozen
+/// archive of the Bitnami catalogue: nothing there is updated, so the tag
+/// cannot move under us, but the namespace itself is not promised forever. If
+/// it goes, mirror the image into a registry we own rather than hunting for a
+/// fourth publisher.
+///
+/// A `GenericImage` rather than `testcontainers_modules::minio::MinIO`: the
+/// module pinned here (0.11) names `minio/minio:RELEASE.2022-02-07T08-17-33Z`,
+/// an image that no longer exists anywhere, and waits for `API:` on STDOUT,
+/// where that 2022 release printed its banner. The 2025 release prints it on
+/// STDERR, so the module's readiness check never matches and the start times
+/// out. `testcontainers-modules` 0.15 pins this very release and waits on
+/// stderr for the same reason; until this crate moves to it, the image, the
+/// wait and the port are spelled out here.
+const MINIO_IMAGE_NAME: &str = "bitnamilegacy/minio";
+const MINIO_IMAGE_TAG: &str = "2025.2.28-debian-12-r1";
+
+/// Where the Bitnami image keeps object data. The official image's CMD was
+/// `server /data`; this image runs as uid 1001, `/data` does not exist and
+/// that user cannot create it, so the server is pointed at the directory the
+/// image ships writable instead.
+const MINIO_DATA_DIR: &str = "/bitnami/minio/data";
+
+/// Root credentials the test runs MinIO with. The official image defaulted to
+/// these; Bitnami's defaults to `minio` / `miniosecret`, so they are set
+/// explicitly on the container. The DuckDB secret and settings in the helpers
+/// above spell the same pair inline in their SQL.
+const MINIO_USER: &str = "minioadmin";
+const MINIO_PASSWORD: &str = "minioadmin";
 
 /// Helper to create test data using DuckDB with local filesystem
 async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
@@ -217,8 +252,20 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("MinIO integration tests not available"));
     }
 
-    // Docker Hub no longer serves `minio/minio`; Quay still publishes the same pinned tag
-    let minio = MinIO::default().with_name(MINIO_IMAGE_NAME).start().await?;
+    // The official image's CMD was `server /data`. Bitnami's entrypoint execs
+    // its argv verbatim, so this is the same invocation with the binary named
+    // (nothing prepends `minio` for us) and the data dir moved to the one the
+    // non-root image can write. The credentials are explicit because this
+    // image's own defaults are not minioadmin. Readiness is the server's own
+    // `API:` banner, which this release writes to stderr (see MINIO_IMAGE_NAME).
+    let minio = GenericImage::new(MINIO_IMAGE_NAME, MINIO_IMAGE_TAG)
+        .with_exposed_port(9000.tcp())
+        .with_wait_for(WaitFor::message_on_stderr("API:"))
+        .with_cmd(["minio", "server", MINIO_DATA_DIR])
+        .with_env_var("MINIO_ROOT_USER", MINIO_USER)
+        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_PASSWORD)
+        .start()
+        .await?;
     let minio_port = minio.get_host_port_ipv4(9000).await?;
     let minio_endpoint = format!("http://127.0.0.1:{}", minio_port);
 
@@ -229,7 +276,7 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
     use aws_credential_types::Credentials;
     use aws_sdk_s3::config::{Region, SharedCredentialsProvider};
 
-    let creds = Credentials::new("minioadmin", "minioadmin", None, None, "test");
+    let creds = Credentials::new(MINIO_USER, MINIO_PASSWORD, None, None, "test");
     let s3_config = aws_sdk_s3::Config::builder()
         .endpoint_url(&minio_endpoint)
         .region(Region::new("us-east-1"))
@@ -277,8 +324,8 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
         AmazonS3Builder::new()
             .with_endpoint(&minio_endpoint)
             .with_bucket_name("test-bucket")
-            .with_access_key_id("minioadmin")
-            .with_secret_access_key("minioadmin")
+            .with_access_key_id(MINIO_USER)
+            .with_secret_access_key(MINIO_PASSWORD)
             .with_region("us-east-1")
             .with_allow_http(true)
             .build()?,

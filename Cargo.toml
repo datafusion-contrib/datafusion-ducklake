@@ -61,7 +61,7 @@ datafusion = "55"
 object_store = { version = "0.13", features = ["aws", "fs"] }
 bytes = "1"
 testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["minio", "postgres", "mysql"] }
+testcontainers-modules = { version = "0.11", features = ["postgres", "mysql"] }
 tempfile = "3.14"
 anyhow = "1.0"
 regex = "1"
