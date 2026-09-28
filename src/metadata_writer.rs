@@ -161,6 +161,36 @@ pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
     })
 }
 
+/// The preserved row ids of an inlined stage, checked against its row count.
+/// `None` when the stage draws fresh ids from the allocator.
+pub(crate) fn preserved_inlined_row_ids(
+    write: &StagedTableWrite,
+    record_count: usize,
+) -> Result<Option<&[i64]>> {
+    match &write.inlined_row_ids {
+        None => Ok(None),
+        Some(ids) if ids.len() == record_count => Ok(Some(ids.as_slice())),
+        Some(ids) => Err(DuckLakeError::InvalidConfig(format!(
+            "inlined stage carries {} preserved row ids for {record_count} rows",
+            ids.len()
+        ))),
+    }
+}
+
+/// Refuse a stage with preserved inlined row ids on a writer that cannot store
+/// them (its [`MetadataWriter::supports_inline_update`] is `false`).
+#[cfg_attr(not(any(feature = "write-duckdb", feature = "write-mysql")), allow(dead_code))]
+pub(crate) fn reject_preserved_inlined_row_ids(writes: &[StagedTableWrite]) -> Result<()> {
+    if writes.iter().any(|write| write.inlined_row_ids.is_some()) {
+        return Err(DuckLakeError::Unsupported(
+            "inlined rows with preserved row ids (inline UPDATE) are not supported by this \
+             metadata writer"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
     let mut groups = BTreeMap::new();
     for row in rows {
@@ -1395,6 +1425,13 @@ pub struct StagedTableWrite {
     pub(crate) positional_deletes: Vec<DeleteFileEntry>,
     pub(crate) inlined_deletes: Vec<InlinedRowRef>,
     pub(crate) inlined_flush: bool,
+    /// Row ids for [`StagedTableData::Inlined`] rows, aligned with the batches'
+    /// rows in order. `None` draws fresh ids from `next_row_id` (an insert).
+    /// `Some` keeps the given ids and leaves the allocator untouched: an UPDATE
+    /// writes each new row version with the row id of the version it replaces.
+    /// Only writers whose [`MetadataWriter::supports_inline_update`] is `true`
+    /// accept `Some`.
+    pub(crate) inlined_row_ids: Option<Vec<i64>>,
 }
 
 impl StagedTableWrite {
@@ -2757,6 +2794,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// clean "not supported" error for backends that don't (DuckDB, MySQL),
     /// rather than doing the file rewrites and only failing at commit.
     fn supports_update(&self) -> bool {
+        false
+    }
+
+    /// Whether SQL `UPDATE` can read and write inlined rows on this writer.
+    ///
+    /// When `true`, [`Self::commit_multi_table`] accepts a stage that combines
+    /// inlined row versions carrying preserved row ids
+    /// ([`StagedTableWrite`]'s `inlined_row_ids`), positional deletes and
+    /// inlined-row deletes in one snapshot. When `false`, `UPDATE` refuses a
+    /// table with visible inlined rows and always writes its new row versions
+    /// to Parquet.
+    fn supports_inline_update(&self) -> bool {
         false
     }
 }

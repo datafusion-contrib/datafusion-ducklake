@@ -345,7 +345,8 @@ A few highlights worth knowing up front:
   decline it and fall back to in-memory pruning — see COMPATIBILITY.md.
 - Data inlining: rows inlined by DuckDB's ducklake extension are read and counted by
   `COUNT(*)` on every backend. Writing small batches inline is opt-in via the
-  `data_inlining_row_limit` setting; `UPDATE` and row-lineage scans still refuse a table with
+  `data_inlining_row_limit` setting. `UPDATE` rewrites inlined rows on SQLite and multicatalog
+  PostgreSQL and refuses them on DuckDB and MySQL; row-lineage scans still refuse a table with
   visible inlined rows — see COMPATIBILITY.md.
 - Schema evolution: recursive `list`/`struct`/`map` columns, literal column defaults, and
   per-file `map_by_name` name mappings are honoured across scans, writes, and change feeds.

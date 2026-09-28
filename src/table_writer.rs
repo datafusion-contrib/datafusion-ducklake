@@ -126,8 +126,8 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            // Keep inlining opt-in until inline UPDATE, rowid, CDC, SQL flush, and
-            // automatic maintenance are supported. Explicit settings still apply (#270).
+            // Keep inlining opt-in until rowid, CDC, SQL flush, and automatic
+            // maintenance are supported. Explicit settings still apply (#270).
             data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(0))?,
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
@@ -412,6 +412,21 @@ impl TableWriteOptions {
         self.expected_base_snapshot_id = Some(snapshot_id);
         self
     }
+}
+
+/// The new row versions of an `UPDATE` committed by
+/// [`DuckLakeTableWriter::commit_update`].
+pub(crate) enum UpdateVersions {
+    /// Store the rows inline. `batches` hold the table's data columns only;
+    /// `row_ids` are the preserved row ids, aligned with the batch rows.
+    Inlined {
+        batches: Vec<RecordBatch>,
+        row_ids: Vec<i64>,
+    },
+    /// Parquet files already written through a session opened with
+    /// [`DuckLakeTableWriter::begin_write_with_embedded_rowid`]; uploaded at
+    /// commit.
+    Files(Box<TableWriteSession>),
 }
 
 #[derive(Debug)]
@@ -1805,6 +1820,7 @@ impl DuckLakeTableWriter {
                     positional_deletes: Vec::new(),
                     inlined_deletes: Vec::new(),
                     inlined_flush: false,
+                    inlined_row_ids: None,
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
@@ -1892,6 +1908,7 @@ impl DuckLakeTableWriter {
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
                 inlined_flush: false,
+                inlined_row_ids: None,
             },
             object_paths,
             files_written,
@@ -1919,13 +1936,136 @@ impl DuckLakeTableWriter {
         Ok(ObjectPath::from(path.trim_start_matches('/')))
     }
 
-    fn should_inline(&self, rows: usize, arrow_schema: &Schema, batches: &[RecordBatch]) -> bool {
+    pub(crate) fn should_inline(
+        &self,
+        rows: usize,
+        arrow_schema: &Schema,
+        batches: &[RecordBatch],
+    ) -> bool {
         rows > 0
             && self
                 .data_inlining_row_limit
                 .is_some_and(|limit| rows <= limit)
             && self.metadata.supports_data_inlining(arrow_schema)
             && self.metadata.supports_data_inlining_values(batches)
+    }
+
+    /// Commit an `UPDATE` whose old or new row versions live in inlined storage,
+    /// in ONE snapshot: the new row versions (`versions`), the positional deletes
+    /// that end old versions held in Parquet files, and the inlined-row deletes
+    /// that end old versions held inline.
+    ///
+    /// The commit goes through [`MetadataWriter::commit_multi_table`] with a
+    /// single stage whose `base_snapshot_id` is `base_snapshot` (the snapshot
+    /// the UPDATE read). That applies the same fences as the other write paths:
+    /// the positional deletes' target-file and delete-file compare-and-swap
+    /// checks plus the inlined-delete source-file check, and the inlined-row
+    /// deletes' check that no inlined row, flush, insert or inlined delete
+    /// changed the table after `base_snapshot`. An inlined stage also checks
+    /// that the partition spec did not change.
+    ///
+    /// Inlined new versions keep the row ids of the rows they replace
+    /// (`row_ids`, aligned with the batch rows); Parquet new versions embed
+    /// them in the file. When the commit is definitely rejected, the uploaded
+    /// data and delete files are removed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn commit_update(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        base_snapshot: i64,
+        versions: UpdateVersions,
+        positional_deletes: &[DeleteFileEntry],
+        inlined_deletes: &[InlinedRowRef],
+    ) -> Result<WriteResult> {
+        validate_delete_entries(WriteMode::Append, positional_deletes)?;
+        let mut object_paths = positional_deletes
+            .iter()
+            .map(|entry| {
+                self.staged_object_path(
+                    schema_name,
+                    table_name,
+                    &entry.delete.path,
+                    entry.delete.path_is_relative,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (table_id, columns, column_ids, data, row_ids, files_written, records_written) =
+            match versions {
+                UpdateVersions::Inlined {
+                    batches,
+                    row_ids,
+                } => {
+                    let columns = arrow_schema_to_column_defs(arrow_schema)?;
+                    let setup = self.metadata.begin_write_transaction(
+                        schema_name,
+                        table_name,
+                        &columns,
+                        WriteMode::Append,
+                    )?;
+                    let rows = row_ids.len() as i64;
+                    (
+                        setup.table_id,
+                        columns,
+                        setup.field_ids,
+                        StagedTableData::Inlined(batches),
+                        Some(row_ids),
+                        0,
+                        rows,
+                    )
+                },
+                UpdateVersions::Files(mut session) => {
+                    let files = session.upload_all().await?;
+                    for file in &files {
+                        object_paths.push(self.staged_object_path(
+                            schema_name,
+                            table_name,
+                            &file.path,
+                            file.path_is_relative,
+                        )?);
+                    }
+                    let rows = files.iter().map(|file| file.record_count).sum();
+                    let count = files.len();
+                    (
+                        session.table_id,
+                        std::mem::take(&mut session.columns),
+                        std::mem::take(&mut session.field_ids),
+                        StagedTableData::Files(files),
+                        None,
+                        count,
+                        rows,
+                    )
+                },
+            };
+        let mut transaction = self.transaction();
+        transaction.writes.push(PreparedTableWrite {
+            write: StagedTableWrite {
+                table_id,
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+                base_snapshot_id: base_snapshot,
+                mode: WriteMode::Append,
+                columns,
+                column_ids,
+                data,
+                snapshot_id_columns: Vec::new(),
+                positional_deletes: positional_deletes.to_vec(),
+                inlined_deletes: inlined_deletes.to_vec(),
+                inlined_flush: false,
+                inlined_row_ids: row_ids,
+            },
+            object_paths,
+            files_written,
+            records_written,
+        });
+        let mut results = transaction.commit().await?;
+        match (results.pop(), results.is_empty()) {
+            (Some(result), true) => Ok(result),
+            _ => Err(crate::DuckLakeError::Internal(
+                "UPDATE commit returned an unexpected number of table results".to_string(),
+            )),
+        }
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -2302,6 +2442,7 @@ impl DuckLakeWriteTransaction<'_> {
                 positional_deletes: positional_deletes.to_vec(),
                 inlined_deletes: inlined_deletes.to_vec(),
                 inlined_flush: false,
+                inlined_row_ids: None,
             },
             object_paths,
             files_written: 0,
@@ -3315,38 +3456,7 @@ impl TableWriteSession {
         // Reject an unsupported combination before uploading anything, so a misuse
         // leaves no orphan object in storage.
         validate_delete_entries(self.mode, deletes)?;
-        let file_infos: Vec<DataFileInfo> = if let Some(sink) = self.partition_sink.take() {
-            let file_infos = sink.into_file_infos(&self.object_store).await?;
-            if file_infos.is_empty() {
-                // No rows reached any partition. Fall through to the single-file
-                // path, whose 0-row marker is what carries a Replace truncation
-                // (and is exempt from the partition fence).
-                vec![self.upload_staged().await?]
-            } else {
-                file_infos
-            }
-        } else if let Some(mut roller) = self.roller.take() {
-            // `finish` writes the parquet footer locally; nothing is uploaded yet.
-            if let Some(staged) = roller.finish()? {
-                self.rolled.push(staged);
-            }
-            if self.rolled.is_empty() {
-                // No rows arrived. Fall through to the single-file path, whose 0-row
-                // marker is what carries a Replace truncation (and is exempt from the
-                // partition fence) — same behaviour as a non-rolling session.
-                vec![self.upload_staged().await?]
-            } else {
-                upload_staged_files_ordered(
-                    std::mem::take(&mut self.rolled),
-                    &self.object_store,
-                    &self.column_ids,
-                    self.upload_concurrency,
-                )
-                .await?
-            }
-        } else {
-            vec![self.upload_staged().await?]
-        };
+        let file_infos = self.upload_all().await?;
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
         // One appended file goes through the single-file commit, so a backend that
         // implements only that form keeps working; N>1 needs the multi-file commit.
@@ -3391,6 +3501,43 @@ impl TableWriteSession {
             files_written: file_infos.len(),
             records_written,
         })
+    }
+
+    /// Upload every file this session produced (partition files, rolled files,
+    /// or the single staged file) and return their [`DataFileInfo`]s, leaving
+    /// the metadata commit to the caller. A session that received no rows
+    /// uploads its single 0-row file, which carries a Replace truncation.
+    async fn upload_all(&mut self) -> Result<Vec<DataFileInfo>> {
+        if let Some(sink) = self.partition_sink.take() {
+            let file_infos = sink.into_file_infos(&self.object_store).await?;
+            if file_infos.is_empty() {
+                // No rows reached any partition. Fall through to the single-file
+                // path, whose 0-row marker is what carries a Replace truncation
+                // (and is exempt from the partition fence).
+                return Ok(vec![self.upload_staged().await?]);
+            }
+            return Ok(file_infos);
+        }
+        if let Some(mut roller) = self.roller.take() {
+            // `finish` writes the parquet footer locally; nothing is uploaded yet.
+            if let Some(staged) = roller.finish()? {
+                self.rolled.push(staged);
+            }
+            if self.rolled.is_empty() {
+                // No rows arrived. Fall through to the single-file path, whose 0-row
+                // marker is what carries a Replace truncation (and is exempt from the
+                // partition fence) — same behaviour as a non-rolling session.
+                return Ok(vec![self.upload_staged().await?]);
+            }
+            return upload_staged_files_ordered(
+                std::mem::take(&mut self.rolled),
+                &self.object_store,
+                &self.column_ids,
+                self.upload_concurrency,
+            )
+            .await;
+        }
+        Ok(vec![self.upload_staged().await?])
     }
 
     /// Finalise + upload the staged parquet and return its [`DataFileInfo`],

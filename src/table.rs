@@ -4336,6 +4336,96 @@ pub(crate) fn rewrite_scanned_batch(
     }))
 }
 
+/// Rewrite the visible inlined rows of one inlined data table for an `UPDATE`:
+/// select the rows matching `predicate` (every row when it is `None`), apply
+/// `assignments`, and keep each row's row id.
+///
+/// Returns `None` when no row matches. Otherwise returns the new row versions
+/// in [`rewrite_output_schema`] form (`[physical columns..., rowid]`, the same
+/// shape [`rewrite_scanned_batch`] produces for Parquet rows) and the identities
+/// of the old versions, which the commit ends.
+#[cfg(feature = "write")]
+pub(crate) fn rewrite_inlined_rows(
+    physical_schema: &SchemaRef,
+    inlined: &crate::metadata_provider::DuckLakeInlinedData,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+) -> DataFusionResult<Option<(RecordBatch, Vec<crate::metadata_writer::InlinedRowRef>)>> {
+    let batch = &inlined.batch;
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(None);
+    }
+    if inlined.row_ids.len() != n || batch.num_columns() != physical_schema.fields().len() {
+        return Err(DataFusionError::Internal(format!(
+            "inlined rows of '{}' do not match the table's {} columns and their row ids",
+            inlined.table_name,
+            physical_schema.fields().len()
+        )));
+    }
+
+    // Coerce to the catalog types the assignment and predicate expressions
+    // were planned against.
+    let phys_cols = (0..physical_schema.fields().len())
+        .map(|i| {
+            crate::column_rename::coerce_column(
+                batch.column(i),
+                physical_schema.field(i).data_type(),
+            )
+        })
+        .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+    let phys_batch = RecordBatch::try_new(Arc::clone(physical_schema), phys_cols.clone())?;
+
+    // A NULL predicate result is a non-match (SQL semantics).
+    let mask: BooleanArray = match predicate {
+        Some(p) => {
+            let arr = p.evaluate(&phys_batch)?.into_array(n)?;
+            let b = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "UPDATE predicate did not evaluate to a boolean".to_string(),
+                )
+            })?;
+            BooleanArray::from(
+                (0..n)
+                    .map(|i| b.is_valid(i) && b.value(i))
+                    .collect::<Vec<bool>>(),
+            )
+        },
+        None => BooleanArray::from(vec![true; n]),
+    };
+    if mask.true_count() == 0 {
+        return Ok(None);
+    }
+
+    let matched = arrow::compute::filter_record_batch(&phys_batch, &mask)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let matched_rows = matched.num_rows();
+    let mut out_cols: Vec<ArrayRef> = matched.columns().to_vec();
+    for (col_idx, expr) in assignments {
+        let val = expr.evaluate(&matched)?.into_array(matched_rows)?;
+        out_cols[*col_idx] =
+            crate::column_rename::coerce_column(&val, physical_schema.field(*col_idx).data_type())?;
+    }
+
+    let mut row_ids = Vec::with_capacity(matched_rows);
+    let mut old_versions = Vec::with_capacity(matched_rows);
+    for (row, row_id) in inlined.row_ids.iter().enumerate() {
+        if mask.value(row) {
+            row_ids.push(*row_id);
+            old_versions.push(crate::metadata_writer::InlinedRowRef {
+                table_name: inlined.table_name.clone(),
+                row_id: *row_id,
+            });
+        }
+    }
+    out_cols.push(Arc::new(Int64Array::from(row_ids)));
+
+    Ok(Some((
+        RecordBatch::try_new(rewrite_output_schema(physical_schema), out_cols)?,
+        old_versions,
+    )))
+}
+
 /// Per-source-file read plan + metadata for an `UPDATE`, produced by
 /// [`DuckLakeTable::build_update_scan`] at plan time and consumed by
 /// [`DuckLakeUpdateExec`] at execute time.
@@ -4798,19 +4888,23 @@ impl TableProvider for DuckLakeTable {
             ));
         }
 
-        // UPDATE rewrites Parquet-resident rows only; visible inlined rows would
-        // be silently skipped. Refuse loudly instead (same detection DELETE uses).
-        let inlined = self.provider.get_inlined_data(
-            self.table_id,
-            self.provider.get_current_snapshot()?,
-            &self.columns,
-        )?;
-        if inlined.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(crate::DuckLakeError::Unsupported(format!(
-                "UPDATE on a table with inlined rows is not supported; \
-                 {INLINED_DATA_REMEDIATION}"
-            ))
-            .into());
+        // A writer that can commit inline row versions rewrites visible inlined
+        // rows at execute time (see `DuckLakeUpdateExec`). On any other writer
+        // UPDATE rewrites Parquet-resident rows only, and visible inlined rows
+        // would be silently skipped: refuse loudly instead.
+        if !writer.supports_inline_update() {
+            let inlined = self.provider.get_inlined_data(
+                self.table_id,
+                self.provider.get_current_snapshot()?,
+                &self.columns,
+            )?;
+            if inlined.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "UPDATE on a table with inlined rows is not supported; \
+                     {INLINED_DATA_REMEDIATION}"
+                ))
+                .into());
+            }
         }
 
         // Assignment / filter expressions reference the table's DATA columns

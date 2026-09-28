@@ -2544,11 +2544,13 @@ async fn commit_inlined_at_snapshot(
     .bind(write.table_id)
     .execute(&mut **tx)
     .await?;
+    let preserved_row_ids = crate::metadata_writer::preserved_inlined_row_ids(write, record_count)?;
     let mut row_id: i64 =
         sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?")
             .bind(write.table_id)
             .fetch_one(&mut **tx)
             .await?;
+    let mut preserved = preserved_row_ids.map(|ids| ids.iter());
     let column_list = write
         .columns
         .iter()
@@ -2562,7 +2564,16 @@ async fn commit_inlined_at_snapshot(
                 quote_ident(&physical_name),
                 column_list
             ));
-            query.push_bind(row_id);
+            let this_row_id = match preserved.as_mut() {
+                Some(ids) => *ids
+                    .next()
+                    .expect("preserved row ids checked against row count"),
+                None => {
+                    row_id += 1;
+                    row_id - 1
+                },
+            };
+            query.push_bind(this_row_id);
             query.push(", ").push_bind(snapshot_id);
             query.push(", NULL");
             for (array, column) in batch.columns().iter().zip(&write.columns) {
@@ -2580,18 +2591,23 @@ async fn commit_inlined_at_snapshot(
             }
             query.push(')');
             query.build().execute(&mut **tx).await?;
-            row_id += 1;
         }
     }
     let record_count = i64::try_from(record_count).map_err(|_| {
         crate::DuckLakeError::InvalidConfig("multi-table inline row count exceeds i64".to_string())
     })?;
+    // Preserved row ids were issued earlier, so the allocator does not move.
+    let advance = if write.inlined_row_ids.is_some() {
+        0
+    } else {
+        record_count
+    };
     sqlx::query(
         "UPDATE ducklake_table_stats
          SET next_row_id = next_row_id + ?, record_count = record_count + ?
          WHERE table_id = ?",
     )
-    .bind(record_count)
+    .bind(advance)
     .bind(record_count)
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -2603,6 +2619,10 @@ impl MetadataWriter for SqliteMetadataWriter {
     /// SQLite implements the atomic append-with-deletes commit, so it supports
     /// row-level `UPDATE`.
     fn supports_update(&self) -> bool {
+        true
+    }
+
+    fn supports_inline_update(&self) -> bool {
         true
     }
 
@@ -3947,6 +3967,24 @@ impl MetadataWriter for SqliteMetadataWriter {
                 for write in writes {
                     detect_replace_conflict(&mut tx, write.table_id, expected).await?;
                 }
+            }
+            // Same source-file fence the single-table positional-delete commits
+            // apply: an inlined delete that landed on a target file after the
+            // base snapshot moved its live rows, so the resolved positions are
+            // stale.
+            for write in writes {
+                let file_ids = write
+                    .positional_deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(
+                    &mut tx,
+                    write.table_id,
+                    write.base_snapshot_id,
+                    &file_ids,
+                )
+                .await?;
             }
             let mut had_live_data = Vec::with_capacity(writes.len());
             for write in writes {
@@ -5865,6 +5903,7 @@ mod tests {
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
                 inlined_flush: false,
+                inlined_row_ids: None,
             });
         }
         let commit = writer
