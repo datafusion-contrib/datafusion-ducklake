@@ -6,11 +6,16 @@ name: CI
 # pull request would be blocked from merging forever. The triggers therefore
 # match every push and pull request, and each expensive job short-circuits
 # internally via its "Detect code changes" step.
+#
+# `merge_group` runs the same checks on the merge queue's candidate commit. The
+# queue waits for the required checks to report there, so without this trigger
+# every queued pull request would stay pending forever.
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  merge_group:
 
 # Without this, pushing three times to a pull request leaves three full five-job
 # fan-outs alive at once, all competing for the same runner pool — the queueing
@@ -71,14 +76,27 @@ jobs:
         with:
           # Two commits, so HEAD^1 exists: on a pull_request HEAD is the merge
           # commit and HEAD^1 is the base; on a push to main HEAD^1 is the
-          # previous commit. Either way the diff is this change's own files.
+          # previous commit. Either way the diff is this change's own files. A
+          # merge_group run diffs against the queue's base instead (see below).
           fetch-depth: 2
 
       - name: Detect code changes
         id: changes
         shell: bash
+        env:
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
-          files=$(git diff --name-only HEAD^1 HEAD)
+          # A merge group can stack several pull requests on the queue's base, so
+          # HEAD^1 would see only the last one's files; a docs-only PR at the top
+          # of a group would then skip the build for the code beneath it. Diff
+          # against the base the whole group sits on. Both endpoints only need
+          # their trees, so a depth-1 fetch of the base is enough.
+          base=HEAD^1
+          if [[ -n "$MERGE_GROUP_BASE" ]]; then
+            git fetch --no-tags --depth=1 origin "$MERGE_GROUP_BASE"
+            base=$MERGE_GROUP_BASE
+          fi
+          files=$(git diff --name-only "$base" HEAD)
           echo "Changed files:"; echo "$files"
           # Assigned first rather than piped: `grep -q` exits on its first match
           # and would SIGPIPE git, which `pipefail` turns into a failed
@@ -283,14 +301,27 @@ jobs:
         with:
           # Two commits, so HEAD^1 exists: on a pull_request HEAD is the merge
           # commit and HEAD^1 is the base; on a push to main HEAD^1 is the
-          # previous commit. Either way the diff is this change's own files.
+          # previous commit. Either way the diff is this change's own files. A
+          # merge_group run diffs against the queue's base instead (see below).
           fetch-depth: 2
 
       - name: Detect code changes
         id: changes
         shell: bash
+        env:
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
-          files=$(git diff --name-only HEAD^1 HEAD)
+          # A merge group can stack several pull requests on the queue's base, so
+          # HEAD^1 would see only the last one's files; a docs-only PR at the top
+          # of a group would then skip the build for the code beneath it. Diff
+          # against the base the whole group sits on. Both endpoints only need
+          # their trees, so a depth-1 fetch of the base is enough.
+          base=HEAD^1
+          if [[ -n "$MERGE_GROUP_BASE" ]]; then
+            git fetch --no-tags --depth=1 origin "$MERGE_GROUP_BASE"
+            base=$MERGE_GROUP_BASE
+          fi
+          files=$(git diff --name-only "$base" HEAD)
           echo "Changed files:"; echo "$files"
           # Assigned first rather than piped: `grep -q` exits on its first match
           # and would SIGPIPE git, which `pipefail` turns into a failed
@@ -402,14 +433,27 @@ jobs:
         with:
           # Two commits, so HEAD^1 exists: on a pull_request HEAD is the merge
           # commit and HEAD^1 is the base; on a push to main HEAD^1 is the
-          # previous commit. Either way the diff is this change's own files.
+          # previous commit. Either way the diff is this change's own files. A
+          # merge_group run diffs against the queue's base instead (see below).
           fetch-depth: 2
 
       - name: Detect code changes
         id: changes
         shell: bash
+        env:
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
-          files=$(git diff --name-only HEAD^1 HEAD)
+          # A merge group can stack several pull requests on the queue's base, so
+          # HEAD^1 would see only the last one's files; a docs-only PR at the top
+          # of a group would then skip the build for the code beneath it. Diff
+          # against the base the whole group sits on. Both endpoints only need
+          # their trees, so a depth-1 fetch of the base is enough.
+          base=HEAD^1
+          if [[ -n "$MERGE_GROUP_BASE" ]]; then
+            git fetch --no-tags --depth=1 origin "$MERGE_GROUP_BASE"
+            base=$MERGE_GROUP_BASE
+          fi
+          files=$(git diff --name-only "$base" HEAD)
           echo "Changed files:"; echo "$files"
           # Assigned first rather than piped: `grep -q` exits on its first match
           # and would SIGPIPE git, which `pipefail` turns into a failed
