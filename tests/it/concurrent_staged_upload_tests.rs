@@ -25,6 +25,18 @@ use tempfile::TempDir;
 use datafusion_ducklake::{DuckLakeTableWriter, MetadataWriter, SqliteMetadataWriter, WriteMode};
 use sqlx::sqlite::SqlitePool;
 
+/// Writer options for a test that must see a load roll into several files: a file
+/// rolls only once its first row group is complete, and a mostly-distinct column
+/// is written without a dictionary, which Parquet V2 then delta-encodes to almost
+/// nothing. Row groups no larger than one input batch, written as Parquet V1, keep
+/// the load both rolling at batch boundaries and large enough to roll.
+fn rolling_write_options() -> datafusion_ducklake::DuckLakeWriteOptions {
+    let mut options = datafusion_ducklake::DuckLakeWriteOptions::default();
+    options.max_row_group_rows = Some(64);
+    options.parquet_version = Some(parquet::file::properties::WriterVersion::PARQUET_1_0);
+    options
+}
+
 /// One committed data file as the catalog records it: `(row_id_start, id min,
 /// id max, record_count)`. Everything an out-of-order registration could corrupt.
 type CommittedFile = (Option<i64>, Option<String>, Option<String>, i64);
@@ -85,6 +97,7 @@ async fn rolling_append(
     let mut session = DuckLakeTableWriter::new(writer.clone(), object_store.clone())
         .unwrap()
         .with_target_file_size(4 * 1024)
+        .with_options(&rolling_write_options())
         .with_upload_concurrency(upload_concurrency)
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap();
@@ -359,6 +372,7 @@ async fn a_failed_upload_removes_the_files_that_already_landed() {
     let mut session = DuckLakeTableWriter::new(writer.clone(), Arc::clone(&store))
         .unwrap()
         .with_target_file_size(4 * 1024)
+        .with_options(&rolling_write_options())
         .with_upload_concurrency(CONCURRENCY)
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap();

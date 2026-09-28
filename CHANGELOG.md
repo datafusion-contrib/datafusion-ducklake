@@ -60,6 +60,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pre-filtered only when this and the constant's answer agree, so a constant of
   another type than the key's column declines rather than comparing two
   encodings of different things.
+- New data files keep a dictionary only on repeating columns and give those a bloom filter,
+  as official's writer does; existing files are unaffected.
+- A data file rolls over at `target_file_size` only after its first row group is complete, as
+  official's does.
 - A cold parquet footer read takes one object-store read instead of two when the catalog
   records the file's footer size, on every read path including the change feeds.
 - The change feeds take each file's size from the catalog instead of a `HEAD` request.

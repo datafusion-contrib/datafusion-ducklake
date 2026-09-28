@@ -138,6 +138,8 @@ pub mod stats_filter;
 pub mod table_writer;
 #[cfg(feature = "write")]
 pub mod update_exec;
+#[cfg(feature = "write")]
+mod write_encoding;
 
 // Result type for DuckLake operations
 pub type Result<T> = std::result::Result<T, DuckLakeError>;

@@ -226,6 +226,22 @@ files written by `INSERT`, `UPDATE`, `DELETE`, and maintenance. When the setting
 is absent, this crate retains its existing Parquet V2 default; DuckDB `COPY`
 defaults to Parquet V1. Set `parquet_version = V1` explicitly when identical
 absent-setting behavior is required.
+
+Dictionary encoding and bloom filters follow DuckDB's writer. A data file buffers its first row
+group, counts each top-level column, and keeps a dictionary only when the column's distinct values
+number at most a fifth of the row group's rows; only a dictionary-encoded column gets a bloom filter
+(false-positive rate 0.01), and an all-NULL column gets neither. arrow-rs fixes a file's encoding
+once, so later row groups in the same file follow the first one's choice, except that a dictionary
+outgrowing the limit falls back to plain encoding partway. Nested columns keep arrow-rs's defaults.
+Existing files are unaffected and read as before.
+
+Because the first row group is buffered before it is written, a data file rolls over at
+`target_file_size` only once that row group is complete, as DuckDB's does: a file holds at least one
+row group, or the whole write when it is smaller. Each open file holds that row group in memory
+until it is written, including every open partition file of a partitioned write. SQL writes use
+DuckDB's 122,880-row row group; `DuckLakeTableWriter` without `with_max_row_group_rows` uses
+arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
+
 Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
 multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 

@@ -18,9 +18,21 @@ use tempfile::TempDir;
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::sort::{NullOrder, SortDirection};
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeWriteOptions, MetadataWriter, SqliteMetadataProvider,
-    SqliteMetadataWriter, WriteMode, execute_ducklake_sql,
+    ColumnDef, DuckLakeCatalog, MetadataWriter, SqliteMetadataProvider, SqliteMetadataWriter,
+    WriteMode, execute_ducklake_sql,
 };
+
+/// Writer options for a test that must see a load roll into several files: a file
+/// rolls only once its first row group is complete, and a mostly-distinct column
+/// is written without a dictionary, which Parquet V2 then delta-encodes to almost
+/// nothing. Row groups no larger than one input batch, written as Parquet V1, keep
+/// the load both rolling at batch boundaries and large enough to roll.
+fn rolling_write_options() -> datafusion_ducklake::DuckLakeWriteOptions {
+    let mut options = datafusion_ducklake::DuckLakeWriteOptions::default();
+    options.max_row_group_rows = Some(64);
+    options.parquet_version = Some(parquet::file::properties::WriterVersion::PARQUET_1_0);
+    options
+}
 
 struct Env {
     conn_str: String,
@@ -74,7 +86,7 @@ async fn setup() -> Env {
 async fn write_ctx(conn_str: &str, target_file_size: usize, batch_size: usize) -> SessionContext {
     let writer = SqliteMetadataWriter::new_with_init(conn_str).await.unwrap();
     let provider = SqliteMetadataProvider::new(conn_str).await.unwrap();
-    let mut options = DuckLakeWriteOptions::default();
+    let mut options = rolling_write_options();
     options.target_file_size = Some(target_file_size);
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
         .unwrap()
@@ -192,6 +204,7 @@ async fn begin_write_rolls_by_default_and_single_file_opts_out() {
         DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
             .unwrap()
             .with_target_file_size(8 * 1024)
+            .with_options(&rolling_write_options())
     };
 
     // Default: rolls.
@@ -331,6 +344,7 @@ async fn rolling_session_with_deletes_commits_every_rolled_file() {
         DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
             .unwrap()
             .with_target_file_size(8 * 1024)
+            .with_options(&rolling_write_options())
     };
     let mut session = writer
         .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
@@ -452,7 +466,8 @@ async fn low_level_bulk_write_sorts_and_yields_non_overlapping_files() {
     let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
         .unwrap()
         // Small target so this write rolls into several files.
-        .with_target_file_size(8 * 1024);
+        .with_target_file_size(8 * 1024)
+        .with_options(&rolling_write_options());
     let result = table_writer
         .append_table("main", "events", &batches)
         .await

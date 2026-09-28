@@ -30,6 +30,18 @@ use datafusion_ducklake::{
 use sqlx::Row;
 use sqlx::sqlite::SqlitePool;
 
+/// Writer options for a test that must see a load roll into several files: a file
+/// rolls only once its first row group is complete, and a mostly-distinct column
+/// is written without a dictionary, which Parquet V2 then delta-encodes to almost
+/// nothing. Row groups no larger than one input batch, written as Parquet V1, keep
+/// the load both rolling at batch boundaries and large enough to roll.
+fn rolling_write_options() -> datafusion_ducklake::DuckLakeWriteOptions {
+    let mut options = datafusion_ducklake::DuckLakeWriteOptions::default();
+    options.max_row_group_rows = Some(64);
+    options.parquet_version = Some(parquet::file::properties::WriterVersion::PARQUET_1_0);
+    options
+}
+
 /// A writable SQLite-backed catalog + a data dir, in a temp dir.
 async fn create_writer(temp_dir: &TempDir) -> SqliteMetadataWriter {
     let db_path = temp_dir.path().join("test.db");
@@ -454,6 +466,7 @@ async fn multi_file_update_commits_every_file_and_its_own_stats_in_one_snapshot(
     let mut session = DuckLakeTableWriter::new(writer.clone(), object_store.clone())
         .unwrap()
         .with_target_file_size(4 * 1024)
+        .with_options(&rolling_write_options())
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap();
     for batch in &new_versions {
@@ -600,6 +613,7 @@ async fn conditional_multi_file_append_with_deletes_rejects_a_stale_base() {
     let mut stale = DuckLakeTableWriter::new(writer.clone(), object_store.clone())
         .unwrap()
         .with_target_file_size(4 * 1024)
+        .with_options(&rolling_write_options())
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap()
         .with_options(&options);
@@ -660,6 +674,7 @@ async fn conditional_multi_file_append_with_deletes_rejects_a_stale_base() {
     let mut fresh = DuckLakeTableWriter::new(writer.clone(), object_store.clone())
         .unwrap()
         .with_target_file_size(4 * 1024)
+        .with_options(&rolling_write_options())
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap()
         .with_options(&options);

@@ -20,6 +20,18 @@ use datafusion_ducklake::{
     SqliteMetadataWriter, WriteMode, execute_ducklake_sql,
 };
 
+/// Writer options for a test that must see a load roll into several files: a file
+/// rolls only once its first row group is complete, and a mostly-distinct column
+/// is written without a dictionary, which Parquet V2 then delta-encodes to almost
+/// nothing. Row groups no larger than one input batch, written as Parquet V1, keep
+/// the load both rolling at batch boundaries and large enough to roll.
+fn rolling_write_options() -> datafusion_ducklake::DuckLakeWriteOptions {
+    let mut options = datafusion_ducklake::DuckLakeWriteOptions::default();
+    options.max_row_group_rows = Some(64);
+    options.parquet_version = Some(parquet::file::properties::WriterVersion::PARQUET_1_0);
+    options
+}
+
 struct Env {
     conn_str: String,
     table_id: i64,
@@ -320,7 +332,8 @@ async fn partitioned_write_rolls_within_each_partition() {
         Arc::new(object_store::local::LocalFileSystem::new());
     let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store)
         .unwrap()
-        .with_target_file_size(8 * 1024);
+        .with_target_file_size(8 * 1024)
+        .with_options(&rolling_write_options());
 
     let result = table_writer
         .append_table("main", "events", &batches)
@@ -1474,6 +1487,7 @@ async fn partitioned_staged_uploads_are_order_stable_across_concurrency() {
         let mut session = DuckLakeTableWriter::new(Arc::new(writer), object_store)
             .unwrap()
             .with_target_file_size(8 * 1024)
+            .with_options(&rolling_write_options())
             .with_upload_concurrency(concurrency)
             .begin_write("main", "events", schema.as_ref(), WriteMode::Append)
             .unwrap();

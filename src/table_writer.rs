@@ -30,6 +30,7 @@ use crate::metadata_writer::{
 use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
 use crate::table::delete_file_schema;
+use crate::write_encoding::RowGroupSampledWriter;
 
 // The partition-group shape is shared with the split logic in `partition`.
 pub use crate::partition::PartitionGroup;
@@ -542,7 +543,8 @@ impl DuckLakeTableWriter {
 
     /// Override the target data file size (approx encoded bytes) at which a write
     /// rolls over to a new file, estimated from the writer's flushed + in-progress
-    /// size and checked at batch boundaries. Combined with a sort order, each file
+    /// size and checked at batch boundaries once the file's first row group is
+    /// complete, so a file holds at least one row group. Combined with a sort order, each file
     /// holds a contiguous value range with a tight min/max, enabling file-level
     /// pruning. Defaults to [`DEFAULT_TARGET_FILE_SIZE`].
     pub fn with_target_file_size(mut self, bytes: usize) -> Self {
@@ -870,7 +872,7 @@ impl DuckLakeTableWriter {
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1307,7 +1309,7 @@ impl DuckLakeTableWriter {
 
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = ArrowWriter::try_new(staging, schema_with_ids.clone(), Some(props))?;
+        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
         let mut row_count: i64 = 0;
         let mut nan_flags: Vec<Option<bool>> = Vec::new();
         while let Some(batch) = batches.next().await {
@@ -2429,7 +2431,7 @@ fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<Recor
 /// One parquet file being written to local staging.
 #[derive(Debug)]
 struct OpenFile {
-    writer: ArrowWriter<std::io::BufWriter<std::fs::File>>,
+    writer: RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>,
     temp: NamedTempFile,
     /// Path relative to the table directory (includes any Hive subpath).
     catalog_path: String,
@@ -2513,7 +2515,9 @@ impl RollingFileWriter {
     /// Append `batch`, opening a file if none is in progress. Returns the finished
     /// [`StagedFile`] when this batch pushed the current file to `target_file_size`
     /// (rollover is evaluated at batch boundaries, so a file always holds a whole
-    /// number of batches and any input ordering is preserved *across* files).
+    /// number of batches and any input ordering is preserved *across* files). A
+    /// file reports no size until its first row group is complete, so it never
+    /// rolls before holding one; see [`crate::write_encoding`].
     ///
     /// `batch` must carry the table's data columns positionally; the field-id-tagged
     /// schema is re-imposed here.
@@ -2559,6 +2563,8 @@ impl RollingFileWriter {
         self.open.is_some()
     }
 
+    /// Open the next file. Its encoding is chosen from its first row group; see
+    /// [`crate::write_encoding`].
     fn open_file(&mut self) -> Result<OpenFile> {
         let catalog_path = match self.first_catalog_path.take() {
             Some(path) => path,
@@ -2574,11 +2580,8 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = ArrowWriter::try_new(
-            staging,
-            self.schema_with_ids.clone(),
-            Some(self.props.clone()),
-        )?;
+        let writer =
+            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
         Ok(OpenFile {
             writer,
             temp,
@@ -2976,7 +2979,7 @@ pub struct TableWriteSession {
     /// written to disk as they arrive rather than buffered in memory, so peak
     /// memory stays bounded by the parquet row-group size regardless of table
     /// size. The finished file is streamed to object storage in `finish()`.
-    writer: Option<ArrowWriter<std::io::BufWriter<std::fs::File>>>,
+    writer: Option<RowGroupSampledWriter<std::io::BufWriter<std::fs::File>>>,
     /// Local staging file backing `writer`. Kept alive for the session; the
     /// finished parquet is uploaded from it and the file is removed on drop.
     temp: Option<NamedTempFile>,

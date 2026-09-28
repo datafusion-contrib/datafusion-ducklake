@@ -2568,9 +2568,12 @@ async fn rewrite_inherits_the_tables_write_options() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_merge_records_the_origin_it_wrote_not_the_one_the_catalog_claimed() {
     let temp = TempDir::new().unwrap();
-    // A big seed so it can be held out of the first merge by size alone.
+    // A big seed so it can be held out of the first merge by size alone. The values
+    // are scrambled so they are not delta-encoded down to a few bytes.
     let ids: Vec<i32> = (0..4000).collect();
-    let vals: Vec<i32> = (0..4000).map(|i| i * 2).collect();
+    let vals: Vec<i32> = (0..4000_i64)
+        .map(|i| ((i * 2_654_435_761) % 1_000_003) as i32)
+        .collect();
     seed(&temp, ids, vals).await; // snapshot 1, file A
     append(&temp, vec![9001], vec![1]).await; // snapshot 2, file B
     append(&temp, vec![9002], vec![2]).await; // snapshot 3, file C
