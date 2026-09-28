@@ -180,6 +180,165 @@ mod integration_tests {
         Ok(())
     }
 
+    /// An `ObjectStore` over the local filesystem that records each `head()` and
+    /// each ranged read's length and end offset, so a test can see how a cold
+    /// footer was fetched.
+    #[derive(Debug)]
+    struct RequestLog {
+        inner: object_store::local::LocalFileSystem,
+        heads: std::sync::atomic::AtomicUsize,
+        // (range length, bytes between the range's end and the file's end)
+        reads: std::sync::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl std::fmt::Display for RequestLog {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RequestLog({})", self.inner)
+        }
+    }
+
+    impl RequestLog {
+        /// Record any kind of ranged read — bounded, offset or suffix — resolved
+        /// against the file's size, so a length probe of any shape is seen.
+        async fn record(&self, location: &object_store::path::Path, range: object_store::GetRange) {
+            use object_store::ObjectStoreExt;
+            let size = self.inner.head(location).await.map(|m| m.size).unwrap_or(0);
+            let range = range.as_range(size).expect("a ranged read within the file");
+            self.reads
+                .lock()
+                .unwrap()
+                .push((range.end - range.start, size.saturating_sub(range.end)));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for RequestLog {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if options.head {
+                self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            } else if let Some(range) = &options.range {
+                self.record(location, range.clone()).await;
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &object_store::path::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            for range in ranges {
+                self.record(location, range.clone().into()).await;
+            }
+            self.inner.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The change feeds read each file's footer with the catalog's recorded file
+    /// size and footer size: no `head()` to learn the size, and no 8-byte probe of
+    /// the footer's length before the footer itself. The fixture is written by
+    /// DuckDB, so its `footer_size` is the spec's thrift-length-only value.
+    #[tokio::test]
+    async fn test_change_feeds_read_cold_footers_with_catalog_sizes() -> DataFusionResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let catalog_path = temp_dir.path().join("multi_snapshot.ducklake");
+        common::create_catalog_multiple_snapshots(&catalog_path)
+            .map_err(common::to_datafusion_error)?;
+
+        for sql in [
+            "SELECT * FROM ducklake_table_changes('main.events', 0, 100)",
+            "SELECT * FROM ducklake_table_deletions('main.events', 0, 100)",
+        ] {
+            let log = Arc::new(RequestLog {
+                inner: object_store::local::LocalFileSystem::new(),
+                heads: Default::default(),
+                reads: Default::default(),
+            });
+            // A fresh context per feed, so every footer read is cold.
+            let ctx = create_context_with_functions(catalog_path.to_str().unwrap()).await?;
+            ctx.runtime_env().register_object_store(
+                &url::Url::parse("file:///").unwrap(),
+                Arc::clone(&log) as Arc<dyn object_store::ObjectStore>,
+            );
+
+            let batches = ctx.sql(sql).await?.collect().await?;
+            assert!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+                "{sql}: sanity, the feed returns rows"
+            );
+
+            assert_eq!(
+                log.heads.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{sql}: a footer read must take the file size from the catalog, not head()"
+            );
+            let reads = log.reads.lock().unwrap().clone();
+            assert!(!reads.is_empty(), "{sql}: sanity, footers were read");
+            assert!(
+                !reads.contains(&(8, 0)),
+                "{sql}: no 8-byte footer-length probe; reads were {reads:?}"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Test that ducklake_table_changes returns pure deletes as `delete` rows
     /// carrying the deleted rows' old values, matching official DuckLake.
     ///

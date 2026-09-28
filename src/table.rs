@@ -1002,12 +1002,12 @@ pub(crate) async fn read_parquet_footer_facts(
     let object_path = ObjectPath::from(resolved_path);
     let size = match file_size_bytes {
         Some(size) => validated_file_size(size, resolved_path)?,
-        // The caller doesn't have the catalog's recorded size in reach (a
-        // `file_layout` lookup, keyed only by path). One `head()` — not a
-        // ranged read, so it never shows up as a footer read — resolves the
-        // true size so the `ObjectMeta` built below still matches what a
-        // scan's own `PartitionedFile` would carry, and the cache entry is
-        // still shared rather than silently keyed apart from it.
+        // The catalog records no size for this file (a delete file whose
+        // `file_size_bytes` is NULL). One `head()` — not a ranged read, so it
+        // never shows up as a footer read — resolves the true size so the
+        // `ObjectMeta` built below still matches what a scan's own
+        // `PartitionedFile` would carry, and the cache entry is still shared
+        // rather than silently keyed apart from it.
         None => object_store.head(&object_path).await?.size,
     };
     let object_meta = epoch_object_meta(object_path, size);

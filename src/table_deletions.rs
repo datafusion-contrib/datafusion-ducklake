@@ -162,12 +162,18 @@ impl TableDeletionsTable {
     }
 
     /// The read layout of one data file, memoized by resolved path.
+    ///
+    /// `size_bytes` and `footer_size` are the catalog's recorded values for the
+    /// file, so a cold footer read needs no `head()` and no length probe.
+    #[allow(clippy::too_many_arguments)]
     async fn file_layout(
         &self,
         state: &dyn Session,
         columns: &[DuckLakeTableColumn],
         path: &str,
         is_relative: bool,
+        size_bytes: i64,
+        footer_size: Option<i64>,
         mapping_id: Option<i64>,
     ) -> DataFusionResult<Arc<ParquetFileLayout>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
@@ -182,11 +188,8 @@ impl TableDeletionsTable {
             state,
             self.object_store_url.as_ref(),
             &resolved,
-            // `file_layout` is keyed only by path — no catalog size or footer
-            // size in reach here, so `read_parquet_file_layout` resolves the
-            // size via `head()` and reads the footer without a hint.
-            None,
-            None,
+            Some(size_bytes),
+            footer_size,
             None,
             columns,
             &self.table_schema,
@@ -239,6 +242,7 @@ impl TableDeletionsTable {
                     p,
                     delete_file.current_delete_path_is_relative.unwrap_or(true),
                     delete_file.current_delete_file_size_bytes,
+                    delete_file.current_delete_footer_size,
                 )
                 .await?
             },
@@ -302,6 +306,8 @@ impl TableDeletionsTable {
                 columns,
                 &delete_file.data_file_path,
                 delete_file.data_file_path_is_relative,
+                delete_file.data_file_size_bytes,
+                delete_file.data_file_footer_size,
                 delete_file.data_mapping_id,
             )
             .await?;
@@ -377,6 +383,7 @@ impl TableDeletionsTable {
         path: &str,
         is_relative: bool,
         size_bytes: Option<i64>,
+        footer_size: Option<i64>,
     ) -> DataFusionResult<Option<String>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -385,7 +392,7 @@ impl TableDeletionsTable {
             self.object_store_url.as_ref(),
             &resolved,
             size_bytes,
-            None,
+            footer_size,
             None,
         )
         .await?;

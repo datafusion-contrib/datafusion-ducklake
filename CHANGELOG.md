@@ -58,7 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another type than the key's column declines rather than comparing two
   encodings of different things.
 - A cold parquet footer read takes one object-store read instead of two when the catalog
-  records the file's footer size, including on the row-lineage path and DuckDB catalogs.
+  records the file's footer size, on every read path including the change feeds.
+- The change feeds take each file's size from the catalog instead of a `HEAD` request.
 - Snapshot SQL listings expand from two to eight columns; select named columns
   to retain a fixed shape (#318).
 - The statistics CTE that narrows a file listing is declared `MATERIALIZED` on

@@ -539,12 +539,18 @@ impl TableChangesTable {
     }
 
     /// The read layout of one data file, memoized by resolved path.
+    ///
+    /// `size_bytes` and `footer_size` are the catalog's recorded values for the
+    /// file, so a cold footer read needs no `head()` and no length probe.
+    #[allow(clippy::too_many_arguments)]
     async fn file_layout(
         &self,
         state: &dyn Session,
         columns: &[DuckLakeTableColumn],
         path: &str,
         is_relative: bool,
+        size_bytes: i64,
+        footer_size: Option<i64>,
         mapping_id: Option<i64>,
     ) -> DataFusionResult<Arc<ParquetFileLayout>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
@@ -561,11 +567,8 @@ impl TableChangesTable {
             state,
             self.object_store_url.as_ref(),
             &resolved,
-            // `file_layout` is keyed only by path — no catalog size or footer
-            // size in reach here, so `read_parquet_file_layout` resolves the
-            // size via `head()` and reads the footer without a hint.
-            None,
-            None,
+            Some(size_bytes),
+            footer_size,
             None,
             columns,
             &self.table_schema,
@@ -842,6 +845,7 @@ impl TableChangesTable {
         path: &str,
         is_relative: bool,
         size_bytes: Option<i64>,
+        footer_size: Option<i64>,
     ) -> DataFusionResult<Option<String>> {
         let resolved = resolve_path(&self.table_path, path, is_relative)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -850,7 +854,7 @@ impl TableChangesTable {
             self.object_store_url.as_ref(),
             &resolved,
             size_bytes,
-            None,
+            footer_size,
             None,
         )
         .await?;
@@ -1257,6 +1261,8 @@ impl TableChangesTable {
                         columns,
                         &dfc.data_file_path,
                         dfc.data_file_path_is_relative,
+                        dfc.data_file_size_bytes,
+                        dfc.data_file_footer_size,
                         dfc.data_mapping_id,
                     )
                     .await?;
@@ -1280,6 +1286,7 @@ impl TableChangesTable {
                             p,
                             dfc.current_delete_path_is_relative.unwrap_or(true),
                             dfc.current_delete_file_size_bytes,
+                            dfc.current_delete_footer_size,
                         )
                         .await?
                     },
@@ -1512,6 +1519,8 @@ impl TableProvider for TableChangesTable {
                         &columns,
                         &data_file.path,
                         data_file.path_is_relative,
+                        data_file.file_size_bytes,
+                        data_file.footer_size,
                         data_file.mapping_id,
                     )
                     .await?,
@@ -1565,6 +1574,8 @@ impl TableProvider for TableChangesTable {
                         &columns,
                         &data_file.path,
                         data_file.path_is_relative,
+                        data_file.file_size_bytes,
+                        data_file.footer_size,
                         data_file.mapping_id,
                     )
                     .await?,
