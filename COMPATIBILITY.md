@@ -148,8 +148,9 @@ provider, run writer initialization with a schema-migration role before reading.
 Inlined columns preserve DuckLake's physical encodings:
 
 - **DuckDB:** Native unsigned integers, temporal values, and nested columns.
-- **PostgreSQL multicatalog writer:** Decimal text for `UInt64`, text for dates
-  and timestamps, native `TIME`, and `BYTEA` for strings and binary values. The
+- **PostgreSQL multicatalog writer:** Not the DuckLake layout. All rows go to
+  one shared table, with the values of a row in one encoded `BYTEA` cell (see
+  [Shared inline storage](#shared-inline-storage-multicatalog-postgresql)). The
   standard single-catalog writer keeps small writes in Parquet.
 - **SQLite:** Decimal text for `UInt64`, text for dates and timestamps, and
   DuckDB-compatible nested literals. Binary leaves use escaped bytes.
@@ -159,11 +160,13 @@ Inlined columns preserve DuckLake's physical encodings:
   without session-time-zone conversion. Nanosecond timestamps use `BIGINT`;
   nested values use text.
 
-PostgreSQL maps a 16-byte fixed binary column to `UUID` only when its DuckLake
-logical type is `uuid`. Other fixed binary values use `BYTEA`. High-level DuckDB
-and PostgreSQL writes
-with sub-microsecond intervals take the Parquet path; Arrow 59 cannot write that
-interval type to Parquet, so those writes still return an unsupported-type error.
+The PostgreSQL per-table layout maps a 16-byte fixed binary column to `UUID`
+only when its DuckLake logical type is `uuid`. Other fixed binary values use
+`BYTEA`. High-level DuckDB writes with sub-microsecond intervals take the Parquet
+path; Arrow 59 cannot write that interval type to Parquet, so those writes still
+return an unsupported-type error. The multicatalog PostgreSQL writer stores a
+top-level interval inline exactly; a sub-microsecond interval nested in a list,
+struct, or map takes the Parquet path.
 
 Call `MetadataWriter::set_inlined_index_columns(table_id, columns)` to declare
 indexes, then `ensure_inlined_indexes(table_id)` to backfill existing physical
@@ -171,7 +174,9 @@ tables. New physical tables apply those declarations. Repeated calls are safe
 and preserve column types. No index is created without a declaration. Indexes
 are a library extension and are optional; no scan-speed guarantee is implied.
 Declarations validate strictly when set. Write and ensure paths skip declared
-columns that a later schema change removes or renames.
+columns that a later schema change removes or renames. The multicatalog
+PostgreSQL writer validates and stores declarations but creates no index: its
+shared table has no column per value.
 
 ### Inlined scan filters
 
@@ -184,7 +189,58 @@ Comparisons require a compatible physical encoding. SQLite UInt64 comparisons
 normalize both TEXT and VARCHAR decimal values, including mixed padded and
 unpadded rows. Unsupported encodings and missing schema-version columns fall
 back to residual filtering. Metadata queries read all data columns; output
-projection occurs in DataFusion. Index declarations remain optional.
+projection occurs in DataFusion. Index declarations remain optional. The
+multicatalog PostgreSQL layout pushes no predicate into the catalog query: it
+reads the visible inlined rows of the table, and DataFusion filters them.
+
+### Shared inline storage (multicatalog PostgreSQL)
+
+The multicatalog PostgreSQL layout (`MulticatalogManager`,
+`PostgresMetadataWriter`, `MulticatalogProvider`) does not use the DuckLake
+inline tables. It keeps all inlined rows of all catalogs in one table and all
+inlined deletions of Parquet rows in a second table:
+
+- `ducklake_inlined_row (table_id, row_id, begin_snapshot, end_snapshot,
+  schema_version, data BYTEA)`, primary key `(table_id, row_id,
+  begin_snapshot)`, and a partial index on `(table_id, begin_snapshot)` of the
+  live rows.
+- `ducklake_inlined_file_delete (table_id, file_id, row_id, begin_snapshot)`,
+  primary key `(table_id, file_id, row_id)`.
+
+Thus the number of PostgreSQL relations does not change with the number of
+catalogs, tables, or schema versions, and an inline write runs no DDL.
+
+`data` holds the values of the row, keyed by top-level column id. Strings and
+binary values are stored as their bytes; floats in their shortest round-trip
+text (NaN, infinities, and `-0.0` included); intervals as their three
+components; other values as the DuckLake literal text; nested values as DuckDB
+literal text. All supported types round-trip exactly. A column that a row does
+not have reads as the column's `initial_default` (NULL when there is none), the
+same as a Parquet file written before the column existed. Rows of older schema
+versions thus read correctly after columns are added, dropped, or re-added. Encoding costs about 0.7 µs and decoding about 2 µs per row of eight
+mixed columns (release build); a one-row inline write or read is dominated by
+its database round trips.
+
+`MulticatalogManager::connect`, `initialize_multicatalog_schema`,
+`PostgresMetadataWriter::with_pool` and `initialize_schema` create the two
+tables. When the store has relations of the per-table layout that earlier
+versions wrote (`ducklake_inlined_data_<table_id>_<schema_version>` registered in
+`ducklake_inlined_data_tables`, and `ducklake_inlined_delete_<table_id>`), they
+move their rows into the shared tables and drop them. This occurs in one
+transaction under an advisory lock, so concurrent openers wait and a failure
+leaves the old layout. A value moves as its bytes (for `BYTEA` columns) or as
+PostgreSQL's text of it, which is what the earlier reader parsed. The column of
+a value is the version of that column name live when the row began. After the
+migration, an earlier version of this crate must not write to the store: it
+would create per-table relations again, which this version does not read until
+the next initialization migrates them. A `MulticatalogProvider` on a store that
+no writer or manager of this version opened yet reads the per-table layout.
+
+`expire_snapshots_in_catalog` deletes the inlined rows of fully expired tables,
+row versions that no surviving snapshot of the catalog sees, and the inlined
+deletions of removed data files and expired tables. `drop_catalog` deletes all
+inlined rows and deletions of the catalog, and `purge_orphaned_metadata_postgres`
+deletes those whose table has no row in `ducklake_table`.
 
 ---
 
@@ -197,8 +253,8 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
 | `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
-| SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends)                                                                                                                                                                              | ✅        |
-| SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations)                                                                                                                                    | ✅        |
+| SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends; small deletes of Parquet rows go to `ducklake_inlined_delete_<id>` on SQLite and `ducklake_inlined_file_delete` on multicatalog PostgreSQL — see Deletion inlining)        | ✅        |
+| SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; inline-aware on SQLite and multicatalog PostgreSQL, refuses tables with visible inlined rows on DuckDB and MySQL — see Data inlining under Limitations)                                                               | ✅        |
 | Snapshot-based consistency (bound at catalog creation)                                                                                                                                                                                                                                                                           | ✅        |
 | Filter pushdown to Parquet (row-group / page pruning)                                                                                                                                                                                                                                                                            | ✅        |
 | Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file                                                                                                                                                    | ✅        |
@@ -294,20 +350,59 @@ their snapshot to `DuckLakeTableWriter::flush_inlined_data` from Rust
 before using operations that require Parquet storage. There is no SQL flush hook.
 Setting the row limit to zero affects future writes and does not flush existing
 rows. Arrow 59 cannot flush `Interval(MonthDayNano)` values. Automatic compaction
-and removal of physical inline tables during maintenance remain unsupported.
+and removal of physical inline tables during maintenance remain unsupported; on
+multicatalog PostgreSQL, `expire_snapshots_in_catalog` reclaims inlined rows.
 
 High-level row staging honors the scoped `data_inlining_row_limit`, defaulting
 to `0` so writes stay in Parquet. Set a positive limit to opt in; the threshold
-is inclusive. This stages the feature until inline UPDATE, rowid, CDC, SQL flush,
-and automatic inline-table maintenance are supported. Current DuckLake defaults
+is inclusive. This stages the feature until rowid, CDC, SQL flush, and
+automatic inline-table maintenance are supported. Current DuckLake defaults
 to `10`; matching that default is deferred until these paths are ready (see
 [#270](https://github.com/datafusion-contrib/datafusion-ducklake/issues/270)).
 Explicit settings and direct-writer options still apply. Unsupported schemas
 or writer capabilities fall back to Parquet. Inline inserts, deletes, and flushes retain the merged
 `inlined_insert`, `inlined_delete`, and `inline_flush` ledger tokens.
 
-Opening SQLite and multicatalog PostgreSQL writers creates a missing inline
-registry; standard PostgreSQL staged commits create it on demand. SQLite also
+SQL `UPDATE` is inline-aware on SQLite and multicatalog PostgreSQL
+(`MetadataWriter::supports_inline_update`). It ends the old version of each
+matching row and writes a new version in one snapshot. An inlined old version
+gets its `end_snapshot` set, the same as an inline `DELETE`. A Parquet old
+version is ended the same way as a SQL `DELETE` ends it: with an inlined deletion
+or a positional delete file (see Deletion inlining below). The new versions are
+stored inline when their count is within the scoped `data_inlining_row_limit`
+and the schema and values can be inlined, otherwise in a Parquet file. Every
+new version keeps the row id of the version it replaces, inline or in Parquet,
+and the allocator does not advance. The commit applies the positional-delete
+compare-and-swap and source-file checks and the inline-delete checks, so an
+`UPDATE` planned before a concurrent flush, compaction, inline insert, inline
+delete, or update of the same rows aborts with `DuckLakeError::Conflict` and
+commits nothing. DuckDB and MySQL writers keep refusing an `UPDATE` of a table
+with visible inlined rows.
+
+#### Deletion inlining
+
+SQLite and multicatalog PostgreSQL writers support deletion inlining (`MetadataWriter::supports_inlined_file_deletes`). DuckDB, MySQL, and single-catalog PostgreSQL writers do not, and keep writing delete files.
+
+When a SQL `DELETE` or `UPDATE` removes at most `data_inlining_row_limit` rows that live in Parquet files (counted over the whole statement), the statement writes no delete file. It records each removed row in `ducklake_inlined_delete_<table_id>` (`file_id`, `row_id`, `begin_snapshot`), the table layout of DuckDB's DuckLake extension. `row_id` is the physical position of the row in the data file. The SQLite writer creates the table on first use; the multicatalog PostgreSQL writer records the row in the shared `ducklake_inlined_file_delete` instead (see Shared inline storage). The statement then changes only the metadata catalog: it writes no object. A statement above the limit, or with a limit of `0`, writes delete files as before.
+
+The commit uses one snapshot and the same fences as a delete file: the data file must be live, its live delete file must be the one the statement read, and no other inlined deletion may have landed on the data file after the statement's snapshot. A concurrent delete file, flush, compaction, or inlined deletion on the same data file therefore makes the stale statement abort with `DuckLakeError::Conflict`. Inlined deletions on different data files commute.
+
+A data file can have a delete file and inlined deletions at the same time. The two sets never overlap: a new delete file carries forward only the positions of the previous delete file, and a statement never deletes a row that is already deleted. Scans, `COUNT(*)`, `UPDATE`, `DELETE`, `rewrite_data_files`, and time travel apply the union. `merge_adjacent_files` skips a data file with inlined deletions, the same as a data file with a delete file. `rewrite_data_files` counts inlined deletions toward its threshold and drops the deleted rows.
+
+`DuckLakeTable::flush_inlined_deletes(&state)` moves the inlined deletions of the table's live data files into delete files, in one snapshot, and removes them from `ducklake_inlined_delete_<table_id>` (`ducklake_inlined_file_delete` on multicatalog PostgreSQL). Each new delete file holds every deleted position of its data file with the snapshot that deleted it (the `_ducklake_internal_snapshot_id` column), and is visible from the first inlined deletion on, with `partial_max` set to its last deletion snapshot. Older delete files of the data file stop being visible from that snapshot. This is the layout DuckDB's `ducklake_flush_inlined_data` writes, and reads at every snapshot, including snapshots before the flush, return the same rows as before. The flush reads at the table's snapshot and is fenced on it: if a data file got a new deletion, a flush, a compaction, or was retired after that snapshot, the flush aborts with `DuckLakeError::Conflict`. A writer that read at a snapshot before a flush and now sees a flushed delete file that holds later deletions also aborts. `MetadataWriter::tables_with_inlined_file_deletes()` lists the tables of the writer's catalog that have inlined deletions of rows in live data files, with their counts. A maintenance job calls it, then calls `flush_inlined_deletes` on each listed table. `MetadataWriter::inlined_file_delete_rows(table_id, snapshot)` returns the rows of one table.
+
+Inlined deletions of a data file that compaction retired stay, because time travel to a snapshot before the compaction needs them. `expire_snapshots` (SQLite) and `expire_snapshots_in_catalog` (multicatalog PostgreSQL) remove them together with the data file.
+
+Scans on every backend apply the `_ducklake_internal_snapshot_id` column of a delete file, so delete files that DuckDB's flush writes also read correctly at earlier snapshots. `MetadataProvider::get_table_row_count` subtracts the full `delete_count` of such a file, so at a snapshot before the file's `partial_max` it can count fewer rows than `SELECT COUNT(*)` returns.
+
+`datafusion_ducklake::is_conflict(&DataFusionError)` (and
+`DuckLakeError::is_conflict`) recognizes such an abort through DataFusion's
+error wrappers. The catalog is unchanged after a conflict: re-open the catalog
+at the latest snapshot and retry.
+
+Opening a SQLite writer creates a missing inline registry; standard PostgreSQL
+staged commits create it on demand. Opening a multicatalog PostgreSQL writer
+creates the shared inline tables and migrates the per-table layout. SQLite also
 migrates legacy non-null change ledgers.
 
 Snapshot-change readers on all backends preserve NULL changes and snapshots
@@ -525,9 +620,12 @@ Known edges:
   DuckLake extension inlines `INSERT`s of up to 10 rows by default. SQLite,
   DuckDB, PostgreSQL, and MySQL scans honor their snapshot visibility, so
   `SELECT` and `COUNT(*)` include them. Inlined *Parquet‑row* deletes
-  (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
+  (`ducklake_inlined_delete_<table_id>`; `ducklake_inlined_file_delete` on
+  multicatalog PostgreSQL) are applied by scans, `UPDATE`,
   `DELETE`, and compaction on all four backends; the `rowid` path remains
-  unsupported for inlined rows. Lists, structs, and maps inline on SQLite,
+  unsupported for inlined rows. SQL `UPDATE` rewrites inlined rows on SQLite and
+  multicatalog PostgreSQL, and refuses a table with visible inlined rows on DuckDB
+  and MySQL. Lists, structs, and maps inline on SQLite,
   DuckDB, MySQL, and the multicatalog PostgreSQL writer when every field passes
   the shared type gate. Unsupported schemas fall back to Parquet. Inlined rows containing
   `Interval(MonthDayNano)` remain readable, but Arrow 59 cannot flush that
@@ -542,3 +640,4 @@ Known edges:
   snapshot whose only change is an inlined Parquet‑row delete emits no `delete`
   rows even though scans at the window's two ends differ. Flush or avoid
   inlined deletes on tables consumed through the change feed.
+  This crate records its own inlined Parquet-row deletes and their flushes with the `inlined_delete` ledger token, so the change feed rejects a window that contains one instead of returning incomplete rows.

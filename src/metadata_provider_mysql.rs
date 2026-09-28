@@ -2222,6 +2222,7 @@ WITH current_delete AS (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = ?
       AND ddf.begin_snapshot <= ?
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
       AND (ddf.begin_snapshot >= ?
            OR ({pm} IS NOT NULL AND {pm} >= ?))
 ),
@@ -2262,6 +2263,7 @@ LEFT JOIN LATERAL (
     WHERE ddf.table_id = ?
       AND ddf.data_file_id = current_delete.data_file_id
       AND ddf.begin_snapshot < current_delete.begin_snapshot
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true
@@ -2297,6 +2299,7 @@ LEFT JOIN LATERAL (
     WHERE ddf.table_id = ?
       AND ddf.data_file_id = data.data_file_id
       AND ddf.begin_snapshot < data.end_snapshot
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true

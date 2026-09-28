@@ -104,6 +104,12 @@ pub(crate) fn staged_table_write_changes(
     if write.inlined_flush {
         return format!("inline_flush:{}", write.table_id);
     }
+    if !write.inlined_delete_flushes.is_empty() {
+        // The flush does not change the table's rows. `inlined_delete` also
+        // makes a change feed over this snapshot refuse rather than read the
+        // rewritten delete files as new deletions.
+        return format!("inline_flush:{0},inlined_delete:{0}", write.table_id);
+    }
     let insert = match &write.data {
         StagedTableData::Files(_) => Some(false),
         StagedTableData::Inlined(_) => Some(true),
@@ -113,7 +119,9 @@ pub(crate) fn staged_table_write_changes(
         write.table_id,
         insert,
         !write.positional_deletes.is_empty() || (write.mode == WriteMode::Replace && had_files),
-        !write.inlined_deletes.is_empty() || (write.mode == WriteMode::Replace && had_inlined_rows),
+        !write.inlined_deletes.is_empty()
+            || !write.inlined_file_deletes.is_empty()
+            || (write.mode == WriteMode::Replace && had_inlined_rows),
     )
 }
 
@@ -159,6 +167,36 @@ pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
             .iter()
             .any(|candidate| kind.eq_ignore_ascii_case(candidate))
     })
+}
+
+/// The preserved row ids of an inlined stage, checked against its row count.
+/// `None` when the stage draws fresh ids from the allocator.
+pub(crate) fn preserved_inlined_row_ids(
+    write: &StagedTableWrite,
+    record_count: usize,
+) -> Result<Option<&[i64]>> {
+    match &write.inlined_row_ids {
+        None => Ok(None),
+        Some(ids) if ids.len() == record_count => Ok(Some(ids.as_slice())),
+        Some(ids) => Err(DuckLakeError::InvalidConfig(format!(
+            "inlined stage carries {} preserved row ids for {record_count} rows",
+            ids.len()
+        ))),
+    }
+}
+
+/// Refuse a stage with preserved inlined row ids on a writer that cannot store
+/// them (its [`MetadataWriter::supports_inline_update`] is `false`).
+#[cfg_attr(not(any(feature = "write-duckdb", feature = "write-mysql")), allow(dead_code))]
+pub(crate) fn reject_preserved_inlined_row_ids(writes: &[StagedTableWrite]) -> Result<()> {
+    if writes.iter().any(|write| write.inlined_row_ids.is_some()) {
+        return Err(DuckLakeError::Unsupported(
+            "inlined rows with preserved row ids (inline UPDATE) are not supported by this \
+             metadata writer"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
@@ -1230,6 +1268,163 @@ pub struct DeleteFileEntry {
     pub delete: DeleteFileInfo,
 }
 
+/// Positional deletions of rows that live in one Parquet data file, stored in
+/// the metadata catalog's `ducklake_inlined_delete_<table_id>` table (DuckLake
+/// "deletion inlining") instead of in a delete file on object storage.
+///
+/// Each position becomes one `(file_id, row_id, begin_snapshot)` row, where
+/// `row_id` is the zero-based physical position of the row in the data file.
+/// The positions must be live at the base snapshot: not in the live delete file
+/// and not already inlined. The commit applies the same compare-and-swap on the
+/// file's live delete file as a [`DeleteFileEntry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinedFileDeleteEntry {
+    /// The Parquet data file whose rows are deleted.
+    pub data_file_id: i64,
+    /// The live delete file the caller resolved against for `data_file_id`
+    /// (compare-and-swap guard), or `None` if none was live.
+    pub expected_prev_delete_file: Option<i64>,
+    /// Newly deleted physical row positions (not cumulative).
+    pub positions: Vec<i64>,
+}
+
+/// Materialization of one data file's inlined deletions into a positional
+/// delete file (a flush of inlined deletes).
+///
+/// The new delete file holds every position of the file's delete-file history
+/// since `begin_snapshot` plus the inlined positions, each with its deletion
+/// snapshot in the `_ducklake_internal_snapshot_id` column, so time travel
+/// reads the same rows as before the flush. The commit:
+/// - checks that the data file is live, that its live delete file is still
+///   `expected_prev_delete_file`, and that the file has exactly
+///   `inlined_rows` inlined deletions;
+/// - ends the delete file visible at `begin_snapshot` (if any) at
+///   `begin_snapshot`, and makes every later delete file of the data file
+///   invisible (its `end_snapshot` becomes its `begin_snapshot`);
+/// - registers `delete` with `begin_snapshot` and `partial_max`, and removes
+///   the file's rows from `ducklake_inlined_delete_<table_id>`.
+#[derive(Debug, Clone)]
+pub struct InlinedDeleteFlushEntry {
+    /// The Parquet data file whose inlined deletions are materialized.
+    pub data_file_id: i64,
+    /// The live delete file the flush read, or `None` if none was live.
+    pub expected_prev_delete_file: Option<i64>,
+    /// Number of `ducklake_inlined_delete_<table_id>` rows of this data file
+    /// that the flush read and removes.
+    pub inlined_rows: usize,
+    /// The earliest `begin_snapshot` of those rows: the first snapshot the new
+    /// delete file is visible at.
+    pub begin_snapshot: i64,
+    /// The largest per-row deletion snapshot in the new delete file.
+    pub partial_max: i64,
+    /// The new cumulative delete file.
+    pub delete: DeleteFileInfo,
+}
+
+/// One row of a data file's delete-file history, from
+/// [`MetadataWriter::delete_file_history`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteFileVersion {
+    /// Catalog `delete_file_id`.
+    pub delete_file_id: i64,
+    /// Path (relative to the table path when `path_is_relative`).
+    pub path: String,
+    /// Whether `path` is relative to the table's path.
+    pub path_is_relative: bool,
+    /// Size of the delete file in bytes.
+    pub file_size_bytes: i64,
+    /// Size of the Parquet footer in bytes, when recorded.
+    pub footer_size: Option<i64>,
+    /// Parquet modular encryption key, when set.
+    pub encryption_key: Option<String>,
+    /// First snapshot the delete file is visible at.
+    pub begin_snapshot: i64,
+    /// First snapshot the delete file is no longer visible at, or `None`.
+    pub end_snapshot: Option<i64>,
+}
+
+/// One row of `ducklake_inlined_delete_<table_id>`, from
+/// [`MetadataWriter::inlined_file_delete_rows`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlinedFileDeleteRow {
+    /// The Parquet data file of the deleted row.
+    pub data_file_id: i64,
+    /// Zero-based physical position of the deleted row in that file.
+    pub row_id: i64,
+    /// Snapshot that deleted the row.
+    pub begin_snapshot: i64,
+}
+
+/// A table with inlined Parquet-row deletions that a flush can materialize,
+/// from [`MetadataWriter::tables_with_inlined_file_deletes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlinedDeleteBacklog {
+    /// Schema of the table.
+    pub schema_name: String,
+    /// Name of the table.
+    pub table_name: String,
+    /// Catalog id of the table.
+    pub table_id: i64,
+    /// Number of inlined deletions of rows in the table's live data files.
+    pub rows: u64,
+}
+
+/// Validate the inlined Parquet-row deletions of one stage: one entry per data
+/// file, a data file not also targeted by a positional delete or a flush of
+/// the same stage, and distinct, non-negative positions.
+pub(crate) fn validate_inlined_file_deletes(write: &StagedTableWrite) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for entry in &write.positional_deletes {
+        seen.insert(entry.data_file_id);
+    }
+    for entry in &write.inlined_delete_flushes {
+        if !seen.insert(entry.data_file_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "a stage targets data file {} more than once",
+                entry.data_file_id
+            )));
+        }
+    }
+    for entry in &write.inlined_file_deletes {
+        if !seen.insert(entry.data_file_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "a stage targets data file {} more than once",
+                entry.data_file_id
+            )));
+        }
+        if entry.positions.is_empty() {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "inlined deletion of data file {} has no positions",
+                entry.data_file_id
+            )));
+        }
+        let mut positions = std::collections::HashSet::with_capacity(entry.positions.len());
+        for position in &entry.positions {
+            if *position < 0 || !positions.insert(*position) {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "inlined deletion of data file {} has an invalid or repeated position \
+                     {position}",
+                    entry.data_file_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a stage with inlined Parquet-row deletions or a flush of them on a
+/// writer whose [`MetadataWriter::supports_inlined_file_deletes`] is `false`.
+pub(crate) fn reject_inlined_file_deletes(writes: &[StagedTableWrite]) -> Result<()> {
+    if writes.iter().any(|write| {
+        !write.inlined_file_deletes.is_empty() || !write.inlined_delete_flushes.is_empty()
+    }) {
+        return Err(DuckLakeError::Unsupported(
+            "inlined deletion of Parquet rows is not supported by this metadata writer".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the `deletes` of a
 /// [`MetadataWriter::register_data_file_with_deletes`] call before any work.
 ///
@@ -1362,7 +1557,9 @@ pub struct CommitIds {
 /// Stable identity of one visible inlined row selected for deletion.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InlinedRowRef {
-    /// Physical `ducklake_inlined_data_*` table registered for the table.
+    /// Physical `ducklake_inlined_data_*` table registered for the table. On
+    /// multicatalog PostgreSQL, whose inlined rows share one table, the same
+    /// name form identifies the table id and schema version of the rows.
     pub table_name: String,
     /// Stable DuckLake row id within that table.
     pub row_id: i64,
@@ -1395,6 +1592,19 @@ pub struct StagedTableWrite {
     pub(crate) positional_deletes: Vec<DeleteFileEntry>,
     pub(crate) inlined_deletes: Vec<InlinedRowRef>,
     pub(crate) inlined_flush: bool,
+    /// Row ids for [`StagedTableData::Inlined`] rows, aligned with the batches'
+    /// rows in order. `None` draws fresh ids from `next_row_id` (an insert).
+    /// `Some` keeps the given ids and leaves the allocator untouched: an UPDATE
+    /// writes each new row version with the row id of the version it replaces.
+    /// Only writers whose [`MetadataWriter::supports_inline_update`] is `true`
+    /// accept `Some`.
+    pub(crate) inlined_row_ids: Option<Vec<i64>>,
+    /// Deletions of Parquet rows to store in `ducklake_inlined_delete_<id>`.
+    /// Only writers whose [`MetadataWriter::supports_inlined_file_deletes`] is
+    /// `true` accept a non-empty list.
+    pub(crate) inlined_file_deletes: Vec<InlinedFileDeleteEntry>,
+    /// Inlined Parquet-row deletions to materialize into delete files.
+    pub(crate) inlined_delete_flushes: Vec<InlinedDeleteFlushEntry>,
 }
 
 impl StagedTableWrite {
@@ -1462,6 +1672,18 @@ impl StagedTableWrite {
     #[must_use]
     pub const fn inlined_flush(&self) -> bool {
         self.inlined_flush
+    }
+
+    /// Returns the staged inlined deletions of Parquet rows.
+    #[must_use]
+    pub fn inlined_file_deletes(&self) -> &[InlinedFileDeleteEntry] {
+        &self.inlined_file_deletes
+    }
+
+    /// Returns the staged flushes of inlined Parquet-row deletions.
+    #[must_use]
+    pub fn inlined_delete_flushes(&self) -> &[InlinedDeleteFlushEntry] {
+        &self.inlined_delete_flushes
     }
 }
 
@@ -2758,6 +2980,68 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// rather than doing the file rewrites and only failing at commit.
     fn supports_update(&self) -> bool {
         false
+    }
+
+    /// Whether SQL `UPDATE` can read and write inlined rows on this writer.
+    ///
+    /// When `true`, [`Self::commit_multi_table`] accepts a stage that combines
+    /// inlined row versions carrying preserved row ids
+    /// ([`StagedTableWrite`]'s `inlined_row_ids`), positional deletes and
+    /// inlined-row deletes in one snapshot. When `false`, `UPDATE` refuses a
+    /// table with visible inlined rows and always writes its new row versions
+    /// to Parquet.
+    fn supports_inline_update(&self) -> bool {
+        false
+    }
+
+    /// Whether this writer stores small deletions of Parquet rows in
+    /// `ducklake_inlined_delete_<table_id>` (DuckLake deletion inlining).
+    ///
+    /// When `true`, [`Self::commit_multi_table`] accepts stages with inlined
+    /// Parquet-row deletions ([`InlinedFileDeleteEntry`]) and flushes of them
+    /// ([`InlinedDeleteFlushEntry`]), and [`Self::delete_file_history`] is
+    /// implemented. SQL `DELETE` and `UPDATE` then record the removal of at
+    /// most `data_inlining_row_limit` Parquet rows as inlined deletions instead
+    /// of writing delete files. When `false` (the default), they always write
+    /// delete files.
+    fn supports_inlined_file_deletes(&self) -> bool {
+        false
+    }
+
+    /// Every row of `ducklake_inlined_delete_<table_id>` whose
+    /// `begin_snapshot` is at most `snapshot_id`. Empty when the table has
+    /// none.
+    fn inlined_file_delete_rows(
+        &self,
+        _table_id: i64,
+        _snapshot_id: i64,
+    ) -> Result<Vec<InlinedFileDeleteRow>> {
+        Err(DuckLakeError::Unsupported(
+            "inlined deletion of Parquet rows is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// The live tables of this writer's catalog that have inlined deletions of
+    /// rows in live data files, with the number of such rows: the tables a
+    /// maintenance job passes to
+    /// [`DuckLakeTable::flush_inlined_deletes`](crate::DuckLakeTable::flush_inlined_deletes).
+    fn tables_with_inlined_file_deletes(&self) -> Result<Vec<InlinedDeleteBacklog>> {
+        Err(DuckLakeError::Unsupported(
+            "inlined deletion of Parquet rows is not supported by this metadata writer".to_string(),
+        ))
+    }
+
+    /// Every `ducklake_delete_file` row of one data file, ordered by
+    /// `begin_snapshot`. A flush of inlined deletions uses it to carry the
+    /// file's delete history into the new delete file.
+    fn delete_file_history(
+        &self,
+        _table_id: i64,
+        _data_file_id: i64,
+    ) -> Result<Vec<DeleteFileVersion>> {
+        Err(DuckLakeError::Unsupported(
+            "delete file history is not supported by this metadata writer".to_string(),
+        ))
     }
 }
 

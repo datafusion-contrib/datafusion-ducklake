@@ -23,6 +23,28 @@
 //!    `TableWriteSession::finish_with_deletes`.
 //! 4. Yield a single row `count: UInt64` = rows updated.
 //!
+//! # Inlined rows
+//!
+//! On a writer whose [`MetadataWriter::supports_inline_update`] is `true`
+//! (SQLite, multicatalog PostgreSQL), the visible inlined rows are rewritten
+//! too: each matching inlined row's old version is ended in its inlined data
+//! table, the same as an inline `DELETE`. When the number of updated rows is
+//! within the writer's `data_inlining_row_limit` and the rows can be inlined,
+//! the new versions are stored inline, keeping each row's row id; otherwise
+//! they go to Parquet as above. Whenever inlined storage is involved the
+//! commit goes through
+//! [`DuckLakeTableWriter::commit_update`](crate::table_writer::DuckLakeTableWriter)
+//! (one [`MetadataWriter::commit_multi_table`] stage), which applies the
+//! positional-delete checks and the inline-delete checks in the same snapshot.
+//! Other writers refuse an `UPDATE` of a table with visible inlined rows at
+//! plan time.
+//!
+//! On a writer that also supports deletion inlining
+//! ([`MetadataWriter::supports_inlined_file_deletes`]), the old versions held in
+//! Parquet are ended with inlined deletions (`ducklake_inlined_delete_<id>`)
+//! instead of delete files when their number is within the same limit, so a
+//! small UPDATE writes nothing to object storage.
+//!
 //! Limitations (shared with [`DuckLakeInsertExec`](crate::insert_exec)):
 //! collects matched rows into memory before writing; runs in a single DataFusion
 //! output partition.
@@ -51,7 +73,7 @@
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -64,9 +86,11 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use futures::stream::{self, TryStreamExt};
 
 use crate::compaction::sorted_rewrite_batches;
-use crate::metadata_writer::{DeleteFileEntry, MetadataWriter, WriteMode};
-use crate::table::{DuckLakeTable, UpdateSourceScan};
-use crate::table_writer::DuckLakeTableWriter;
+use crate::metadata_writer::{
+    DeleteFileEntry, InlinedFileDeleteEntry, InlinedRowRef, MetadataWriter, WriteMode,
+};
+use crate::table::{DuckLakeTable, UpdateSourceScan, rewrite_inlined_rows};
+use crate::table_writer::{DuckLakeTableWriter, UpdateVersions};
 
 /// Schema for the output of update operations (count of rows updated).
 fn make_update_count_schema() -> SchemaRef {
@@ -233,6 +257,7 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let object_store = context
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
+            let inline_update = writer.supports_inline_update();
             let table_writer = DuckLakeTableWriter::new(writer, object_store)
                 .map(|writer| writer.with_options(table.write_options()))
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -244,8 +269,10 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // untouched (only orphan objects, cleaned by maintenance).
             let mut updated_batches: Vec<RecordBatch> = Vec::new();
             let mut delete_entries: Vec<DeleteFileEntry> = Vec::new();
+            let mut inlined_file_deletes: Vec<InlinedFileDeleteEntry> = Vec::new();
             let mut total_updated: u64 = 0;
 
+            let mut superseded = Vec::new();
             for scan in &scans {
                 let batches =
                     datafusion::physical_plan::collect(Arc::clone(&scan.scan), context.clone())
@@ -261,13 +288,33 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 }
                 total_updated += out.matched_count as u64;
                 updated_batches.extend(out.updated_batches);
+                superseded.push((scan, out.cumulative_positions, out.new_positions));
+            }
 
+            // End the old Parquet versions: as inlined deletions in the catalog
+            // when their number fits the inlining limit, else with one
+            // cumulative delete file per source file.
+            let parquet_rows = superseded
+                .iter()
+                .map(|(_, _, positions)| positions.len())
+                .sum::<usize>();
+            let inline_file_deletes =
+                inline_update && table_writer.should_inline_file_deletes(parquet_rows);
+            for (scan, cumulative_positions, new_positions) in superseded {
+                if inline_file_deletes {
+                    inlined_file_deletes.push(InlinedFileDeleteEntry {
+                        data_file_id: scan.data_file_id,
+                        expected_prev_delete_file: scan.delete_file_id,
+                        positions: new_positions,
+                    });
+                    continue;
+                }
                 let delete_info = table_writer
                     .write_delete_file(
                         &schema_name,
                         &table_name,
                         &scan.source_path,
-                        &out.cumulative_positions,
+                        &cumulative_positions,
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -278,15 +325,70 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 });
             }
 
+            // Visible inlined rows: rewrite the matching ones and end their old
+            // versions in the same commit. Only a writer that can commit inline
+            // row versions gets here with inlined rows; any other writer
+            // refused the UPDATE at plan time.
+            let physical_schema = table.physical_schema();
+            let mut inlined_deletes: Vec<InlinedRowRef> = Vec::new();
+            if inline_update {
+                let inlined = table
+                    .inlined_data_with_row_ids()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                for data in &inlined {
+                    if let Some((batch, old_versions)) = rewrite_inlined_rows(
+                        &physical_schema,
+                        data,
+                        predicate.as_ref(),
+                        &assignments,
+                    )? {
+                        total_updated += old_versions.len() as u64;
+                        updated_batches.push(batch);
+                        inlined_deletes.extend(old_versions);
+                    }
+                }
+            }
+
             // No matching rows: genuine no-op, publish nothing.
             if total_updated == 0 {
                 let count: ArrayRef = Arc::new(UInt64Array::from(vec![0u64]));
                 return Ok(RecordBatch::try_new(output_schema, vec![count])?);
             }
 
+            // Store the new row versions inline when the writer's
+            // `data_inlining_row_limit` admits them, exactly as an INSERT of the
+            // same rows would be stored.
+            if inline_update {
+                let (data_batches, row_ids) =
+                    split_rowid(&updated_batches, physical_schema.fields().len())?;
+                if table_writer.should_inline(
+                    total_updated as usize,
+                    physical_schema.as_ref(),
+                    &data_batches,
+                ) {
+                    table_writer
+                        .commit_update(
+                            &schema_name,
+                            &table_name,
+                            physical_schema.as_ref(),
+                            base_snapshot,
+                            UpdateVersions::Inlined {
+                                batches: data_batches,
+                                row_ids,
+                            },
+                            &delete_entries,
+                            &inlined_deletes,
+                            &inlined_file_deletes,
+                        )
+                        .await
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                    let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
+                    return Ok(RecordBatch::try_new(output_schema, vec![count])?);
+                }
+            }
+
             // Append the rewritten rows (embedding their original rowids) AND
             // apply every positional delete in ONE snapshot.
-            let physical_schema = table.physical_schema();
             let sort_spec = table
                 .live_sort_spec()
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -312,10 +414,28 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                     .write_batch(&batch)
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;
             }
-            session
-                .finish_with_deletes(&delete_entries)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            if inlined_deletes.is_empty() && inlined_file_deletes.is_empty() {
+                session
+                    .finish_with_deletes(&delete_entries)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            } else {
+                // Some old versions are inlined rows: end them in the same
+                // snapshot that registers the new Parquet file(s).
+                table_writer
+                    .commit_update(
+                        &schema_name,
+                        &table_name,
+                        physical_schema.as_ref(),
+                        base_snapshot,
+                        UpdateVersions::Files(Box::new(session)),
+                        &delete_entries,
+                        &inlined_deletes,
+                        &inlined_file_deletes,
+                    )
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            }
 
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
             Ok(RecordBatch::try_new(output_schema, vec![count])?)
@@ -326,6 +446,33 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             stream.map_err(|e: DataFusionError| e),
         )))
     }
+}
+
+/// Split rewritten `[physical columns..., rowid]` batches into data-only
+/// batches and the row ids, in row order.
+fn split_rowid(
+    batches: &[RecordBatch],
+    physical_len: usize,
+) -> DataFusionResult<(Vec<RecordBatch>, Vec<i64>)> {
+    let mut data = Vec::with_capacity(batches.len());
+    let mut row_ids = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(physical_len)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                DataFusionError::Internal("rewritten rowid column is not Int64".to_string())
+            })?;
+        if ids.null_count() > 0 {
+            return Err(DataFusionError::Internal(
+                "rewritten row carries no rowid".to_string(),
+            ));
+        }
+        row_ids.extend(ids.values().iter().copied());
+        data.push(batch.project(&(0..physical_len).collect::<Vec<_>>())?);
+    }
+    Ok((data, row_ids))
 }
 
 #[cfg(test)]

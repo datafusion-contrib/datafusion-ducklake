@@ -50,6 +50,10 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     // reference lookup. Additive and idempotent; MUST run here for the same reason as
     // the migration above — this is the bootstrap path callers actually use.
     crate::metadata_writer_postgres::migrate_file_ownership_column(pool).await?;
+    // Catalog-inlined rows and deletions live in two shared tables, not in a
+    // relation per table and schema version. Creates them, and moves the rows
+    // of a store written with per-table relations into them. Idempotent.
+    crate::inline_store_postgres::initialize(pool).await?;
     Ok(())
 }
 
@@ -248,6 +252,8 @@ impl MulticatalogManager {
             "ducklake_partition_column",
             "ducklake_sort_info",
             "ducklake_sort_expression",
+            "ducklake_inlined_row",
+            "ducklake_inlined_file_delete",
         ] {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {} WHERE table_id IN (
@@ -512,9 +518,13 @@ impl MulticatalogManager {
         // after the table is fully expired; future vacuum reclaims
         // them. This mirrors the official DuckLake's `DropTables`
         // (which leaves `ducklake_schema_versions` to vacuum likewise).
-        for child_table in
-            ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
-        {
+        for child_table in [
+            "ducklake_table",
+            "ducklake_column",
+            "ducklake_data_file",
+            "ducklake_delete_file",
+            "ducklake_inlined_row",
+        ] {
             sqlx::query(AssertSqlSafe(format!(
                 "UPDATE {} SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
@@ -825,6 +835,37 @@ impl MulticatalogManager {
         .fetch_all(&mut *tx)
         .await?;
         let data_file_ids = schedule_pg_files(&mut tx, catalog_id, dead_data_files).await?;
+        // Inlined deletions of rows in the removed data files die with their
+        // file too, and so do those of a fully expired table.
+        sqlx::query(
+            "DELETE FROM ducklake_inlined_file_delete
+             WHERE file_id = ANY($1) OR table_id = ANY($2)",
+        )
+        .bind(&data_file_ids)
+        .bind(&dead_tables)
+        .execute(&mut *tx)
+        .await?;
+        // Inlined rows: every version of a fully expired table, and every ended
+        // version of this catalog's tables that no surviving snapshot of the
+        // catalog sees any more.
+        sqlx::query(
+            "DELETE FROM ducklake_inlined_row r
+             WHERE r.table_id = ANY($2)
+                OR (r.end_snapshot IS NOT NULL
+                    AND r.table_id IN (
+                        SELECT t.table_id FROM ducklake_table t
+                        JOIN ducklake_catalog_schema_map csm
+                          ON csm.schema_id = t.schema_id AND csm.catalog_id = $1)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM ducklake_catalog_snapshot_map m
+                        WHERE m.catalog_id = $1
+                          AND m.snapshot_id >= r.begin_snapshot
+                          AND m.snapshot_id < r.end_snapshot))",
+        )
+        .bind(catalog_id)
+        .bind(&dead_tables)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM ducklake_data_file WHERE data_file_id = ANY($1)")
             .bind(&data_file_ids)
             .execute(&mut *tx)
@@ -888,7 +929,7 @@ impl MulticatalogManager {
         //    Official's list is twelve (ducklake_metadata_manager.cpp, DeleteSnapshots).
         //    ducklake_column_tag, ducklake_inlined_data_tables and
         //    ducklake_column_mapping are omitted because this schema does not have
-        //    them. IF ANY OF THE THREE IS EVER ADDED, ADD IT HERE TOO — official
+        //    them (inlined rows are in ducklake_inlined_row, reclaimed in step 4). IF ANY OF THE THREE IS EVER ADDED, ADD IT HERE TOO — official
         //    reclaims it, and a table-scoped table this loop misses orphans forever.
         //    ducklake_table_stats is in it because this writer
         //    creates and maintains it — the comment that used to say otherwise was

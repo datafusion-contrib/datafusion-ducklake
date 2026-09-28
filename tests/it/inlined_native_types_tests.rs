@@ -32,10 +32,14 @@ use sqlx::AssertSqlSafe;
 #[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
 use tempfile::TempDir;
 
+/// The multicatalog PostgreSQL layout keeps inlined rows in the shared
+/// `ducklake_inlined_row`: values round-trip exactly, including those the
+/// per-table layout could not store (sub-microsecond intervals), and a relation
+/// of the per-table layout is migrated into it on the next initialization.
 #[cfg(feature = "write-postgres")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 #[tokio::test(flavor = "multi_thread")]
-async fn postgres_inlined_types_preserve_reference_storage() {
+async fn postgres_inlined_types_round_trip_in_shared_storage() {
     use datafusion_ducklake::{
         MulticatalogManager, MulticatalogProvider, PostgresMetadataWriter,
         initialize_multicatalog_schema,
@@ -82,24 +86,16 @@ async fn postgres_inlined_types_preserve_reference_storage() {
         .await
         .unwrap();
     assert_eq!(u64_result.files_written, 0);
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_inlined_row WHERE table_id = $1")
+            .bind(u64_result.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 3);
 
-    let native_table: String = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
-    )
-    .bind(u64_result.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let native_type: String = sqlx::query_scalar(
-        "SELECT data_type FROM information_schema.columns \
-         WHERE table_name = $1 AND column_name = 'value'",
-    )
-    .bind(&native_table)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(native_type, "character varying");
-
+    // A relation of the per-table layout, as an earlier version wrote it, is
+    // moved into the shared table and dropped by the next initialization.
     let legacy_table = format!("ducklake_inlined_data_{}_legacy", u64_result.table_id);
     sqlx::query(AssertSqlSafe(format!(
         "CREATE TABLE \"{legacy_table}\"(\
@@ -128,36 +124,21 @@ async fn postgres_inlined_types_preserve_reference_storage() {
     .execute(&pool)
     .await
     .unwrap();
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let legacy_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&legacy_table)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!legacy_exists);
 
+    // Index declarations are validated and stored; the shared layout has no
+    // per-column physical index to build.
     writer
         .set_inlined_index_columns(u64_result.table_id, &["value".to_string()])
         .unwrap();
     writer.ensure_inlined_indexes(u64_result.table_id).unwrap();
     writer.ensure_inlined_indexes(u64_result.table_id).unwrap();
-
-    let legacy_type: String = sqlx::query_scalar(
-        "SELECT data_type FROM information_schema.columns \
-         WHERE table_name = $1 AND column_name = 'value'",
-    )
-    .bind(&legacy_table)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(legacy_type, "character varying");
-    let index_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM pg_indexes \
-         WHERE tablename IN ($1, $2) AND indexname IN ($3, $4, $5, $6)",
-    )
-    .bind(&native_table)
-    .bind(&legacy_table)
-    .bind(format!("{native_table}_row_id_idx"))
-    .bind(format!("{native_table}_value_idx"))
-    .bind(format!("{legacy_table}_row_id_idx"))
-    .bind(format!("{legacy_table}_value_idx"))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(index_count, 2);
 
     let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
         .await
@@ -183,6 +164,7 @@ async fn postgres_inlined_types_preserve_reference_storage() {
         .collect::<Vec<_>>();
     actual.sort_unstable();
     assert_eq!(actual, vec![0, i64::MAX as u64 + 1, u64::MAX, u64::MAX]);
+    // The filter is applied by DataFusion above the scan, not in PostgreSQL.
     let filtered = provider
         .scan_inlined_data(
             u64_result.table_id,
@@ -195,25 +177,7 @@ async fn postgres_inlined_types_preserve_reference_storage() {
             }),
         )
         .unwrap();
-    assert_eq!(filtered.materialized_row_count, 3);
-
-    let mut connection = pool.acquire().await.unwrap();
-    sqlx::query("SET enable_seqscan = off")
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-    let plan: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "EXPLAIN SELECT row_id FROM \"{native_table}\" \
-         WHERE value = $1"
-    )))
-    .bind((i64::MAX as u64 + 1).to_string())
-    .fetch_all(&mut *connection)
-    .await
-    .unwrap();
-    assert!(
-        plan.iter()
-            .any(|line| line.contains(&format!("{native_table}_value_idx")))
-    );
+    assert_eq!(filtered.materialized_row_count, 4);
 
     let raw = [0x55_u8; 16];
     let raw_columns = vec![ColumnDef::new("raw", "blob", false).unwrap()];
@@ -229,7 +193,7 @@ async fn postgres_inlined_types_preserve_reference_storage() {
         vec![Arc::new(FixedSizeBinaryArray::try_from_iter([raw.as_slice()].into_iter()).unwrap())],
     )
     .unwrap();
-    writer
+    let raw_commit = writer
         .register_inlined_data(
             raw_setup.table_id,
             "main",
@@ -244,28 +208,26 @@ async fn postgres_inlined_types_preserve_reference_storage() {
             None,
         )
         .unwrap();
-    let raw_table: String = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
-    )
-    .bind(raw_setup.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let raw_type: String = sqlx::query_scalar(
-        "SELECT data_type FROM information_schema.columns \
-         WHERE table_name = $1 AND column_name = 'raw'",
-    )
-    .bind(&raw_table)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(raw_type, "bytea");
-    let stored_raw: Vec<u8> =
-        sqlx::query_scalar(AssertSqlSafe(format!("SELECT raw FROM \"{raw_table}\"")))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(stored_raw, raw);
+    let raw_columns_read = provider
+        .get_table_structure(raw_commit.table_id, raw_commit.snapshot_id)
+        .unwrap();
+    let raw_batches = provider
+        .get_inlined_data(
+            raw_commit.table_id,
+            raw_commit.snapshot_id,
+            &raw_columns_read,
+        )
+        .unwrap();
+    let raw_read =
+        match datafusion::common::ScalarValue::try_from_array(raw_batches[0].column(0), 0).unwrap()
+        {
+            datafusion::common::ScalarValue::Binary(Some(bytes))
+            | datafusion::common::ScalarValue::LargeBinary(Some(bytes))
+            | datafusion::common::ScalarValue::BinaryView(Some(bytes))
+            | datafusion::common::ScalarValue::FixedSizeBinary(_, Some(bytes)) => bytes,
+            other => panic!("unexpected {other:?}"),
+        };
+    assert_eq!(raw_read, raw);
 
     let typed_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -293,75 +255,55 @@ async fn postgres_inlined_types_preserve_reference_storage() {
     let typed_result = DuckLakeTableWriter::new(writer.clone(), Arc::new(InMemory::new()))
         .unwrap()
         .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(1))
-        .write_table("main", "typed_values", &[typed_batch])
+        .write_table("main", "typed_values", std::slice::from_ref(&typed_batch))
         .await
         .unwrap();
-    let typed_table: String = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
-    )
-    .bind(typed_result.table_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let physical_types: Vec<(String, String)> = sqlx::query_as(
-        "SELECT column_name, data_type FROM information_schema.columns \
-         WHERE table_name = $1 AND column_name IN \
-         ('event_date', 'event_time', 'event_us', 'event_ns') \
-         ORDER BY column_name",
-    )
-    .bind(&typed_table)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        physical_types,
-        vec![
-            ("event_date".to_string(), "character varying".to_string()),
-            ("event_ns".to_string(), "character varying".to_string()),
-            (
-                "event_time".to_string(),
-                "time without time zone".to_string(),
-            ),
-            ("event_us".to_string(), "character varying".to_string(),),
-        ]
-    );
+    assert_eq!(typed_result.files_written, 0);
     let columns = provider
         .get_table_structure(typed_result.table_id, typed_result.snapshot_id)
         .unwrap();
     let batches = provider
         .get_inlined_data(typed_result.table_id, typed_result.snapshot_id, &columns)
         .unwrap();
-    assert_eq!(
-        batches[0]
-            .column(3)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap()
-            .value(0),
-        1_000_002_003
-    );
+    assert_eq!(batches[0].columns(), typed_batch.columns());
 
+    // A sub-microsecond interval: PostgreSQL's INTERVAL cannot hold it, the
+    // shared encoding can.
+    let interval = IntervalMonthDayNano::new(-1, 2, 3_001);
     let interval_batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Interval(IntervalUnit::MonthDayNano),
             false,
         )])),
-        vec![Arc::new(IntervalMonthDayNanoArray::from(vec![
-            IntervalMonthDayNano::new(0, 0, 3_001),
-        ]))],
+        vec![Arc::new(IntervalMonthDayNanoArray::from(vec![interval]))],
     )
     .unwrap();
-    let error = DuckLakeTableWriter::new(writer, Arc::new(InMemory::new()))
+    let interval_result = DuckLakeTableWriter::new(writer, Arc::new(InMemory::new()))
         .unwrap()
         .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(1))
         .write_table("main", "submicrosecond_interval", &[interval_batch])
         .await
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("MonthDayNano") && message.contains("parquet"),
-        "{message}"
+        .unwrap();
+    assert_eq!(interval_result.files_written, 0);
+    let columns = provider
+        .get_table_structure(interval_result.table_id, interval_result.snapshot_id)
+        .unwrap();
+    let batches = provider
+        .get_inlined_data(
+            interval_result.table_id,
+            interval_result.snapshot_id,
+            &columns,
+        )
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<IntervalMonthDayNanoArray>()
+            .unwrap()
+            .value(0),
+        interval
     );
 }
 

@@ -264,6 +264,7 @@ current_delete AS (
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
       AND df.begin_snapshot <= p.finish_snapshot
+      AND (df.end_snapshot IS NULL OR df.end_snapshot > df.begin_snapshot)
       AND (df.begin_snapshot >= p.start_snapshot
            OR (df.partial_max IS NOT NULL AND df.partial_max >= p.start_snapshot))
 ),
@@ -280,6 +281,7 @@ all_deletes AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
+      AND (df.end_snapshot IS NULL OR df.end_snapshot > df.begin_snapshot)
 )
 
 SELECT
@@ -937,7 +939,9 @@ pub struct DuckLakeNameMapping {
 /// One physical inlined-data table's visible rows with their stable row ids.
 #[derive(Debug, Clone)]
 pub struct DuckLakeInlinedData {
-    /// Catalog physical table that owns the rows.
+    /// Catalog physical table that owns the rows. On multicatalog PostgreSQL,
+    /// whose inlined rows share one table, a name of the same form that
+    /// identifies their table id and schema version.
     pub table_name: String,
     /// Stable DuckLake row ids, aligned with `batch` rows.
     pub row_ids: Vec<i64>,

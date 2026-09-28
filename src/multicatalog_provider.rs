@@ -9,6 +9,11 @@
 //!
 //! Catalog-scoped queries are implemented here. Reads keyed by globally unique table IDs reuse the
 //! single-catalog provider's storage-level implementation.
+//!
+//! Inlined rows and deletions are the exception: this layout keeps them in the
+//! shared tables of `inline_store_postgres`, not in DuckLake's per-table
+//! relations, and reads the per-table layout only on a store that no writer of
+//! this version has initialized yet.
 
 use arrow::record_batch::RecordBatch;
 
@@ -156,6 +161,10 @@ pub struct MulticatalogProvider {
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    // Positive-only memo: the store keeps inlined rows and deletions in the
+    // shared tables (see `inline_store_postgres`). Until a writer or manager of
+    // this version has initialized the store, reads use the per-table layout.
+    shared_inline_store: Arc<OnceLock<()>>,
 }
 
 impl MulticatalogProvider {
@@ -199,6 +208,7 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
+            shared_inline_store: Arc::new(OnceLock::new()),
         })
     }
 
@@ -220,11 +230,25 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
+            shared_inline_store: Arc::new(OnceLock::new()),
         })
     }
 
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Whether the store keeps inlined data in the shared tables. Positive
+    /// answers are memoized: the shared tables are never dropped.
+    async fn uses_shared_inline_store(&self) -> Result<bool> {
+        if self.shared_inline_store.get().is_some() {
+            return Ok(true);
+        }
+        let shared = crate::inline_store_postgres::shared_store_exists(&self.pool).await?;
+        if shared {
+            let _ = self.shared_inline_store.set(());
+        }
+        Ok(shared)
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -1392,10 +1416,22 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
-        self.inlined_provider
-            .get_inlined_data(table_id, snapshot_id, columns)
+        if !block_on(self.uses_shared_inline_store())? {
+            return self
+                .inlined_provider
+                .get_inlined_data(table_id, snapshot_id, columns);
+        }
+        block_on(crate::inline_store_postgres::scan(
+            &self.pool,
+            table_id,
+            snapshot_id,
+            columns,
+        ))
     }
 
+    /// The shared layout keeps a row's values in one encoded cell, so the
+    /// filter is not pushed into PostgreSQL: every visible row of the table is
+    /// read, and DataFusion applies the filter (the table declares it inexact).
     fn scan_inlined_data(
         &self,
         table_id: i64,
@@ -1403,8 +1439,14 @@ impl MetadataProvider for MulticatalogProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&crate::inlined_filter::InlinedFilter>,
     ) -> Result<crate::inlined_filter::InlinedDataScan> {
-        self.inlined_provider
-            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+        if !block_on(self.uses_shared_inline_store())? {
+            return self
+                .inlined_provider
+                .scan_inlined_data(table_id, snapshot_id, columns, filter);
+        }
+        Ok(crate::inlined_filter::InlinedDataScan::from_batches(
+            self.get_inlined_data(table_id, snapshot_id, columns)?,
+        ))
     }
 
     fn get_inlined_data_with_row_ids(
@@ -1413,8 +1455,19 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        self.inlined_provider
-            .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)
+        if !block_on(self.uses_shared_inline_store())? {
+            return self.inlined_provider.get_inlined_data_with_row_ids(
+                table_id,
+                snapshot_id,
+                columns,
+            );
+        }
+        block_on(crate::inline_store_postgres::scan_with_row_ids(
+            &self.pool,
+            table_id,
+            snapshot_id,
+            columns,
+        ))
     }
 
     fn get_inlined_deletes(
@@ -1422,8 +1475,16 @@ impl MetadataProvider for MulticatalogProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
-        self.inlined_provider
-            .get_inlined_deletes(table_id, snapshot_id)
+        if !block_on(self.uses_shared_inline_store())? {
+            return self
+                .inlined_provider
+                .get_inlined_deletes(table_id, snapshot_id);
+        }
+        block_on(crate::inline_store_postgres::file_deletes(
+            &self.pool,
+            table_id,
+            snapshot_id,
+        ))
     }
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
@@ -1873,6 +1934,7 @@ WITH current_delete AS (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.begin_snapshot <= $3
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
       AND (ddf.begin_snapshot >= $2
            OR ({pm} IS NOT NULL AND {pm} >= $2))
 ),
@@ -1896,6 +1958,7 @@ LEFT JOIN LATERAL (
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = current_delete.data_file_id
       AND ddf.begin_snapshot < current_delete.begin_snapshot
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true
@@ -1913,6 +1976,7 @@ LEFT JOIN LATERAL (
     WHERE ddf.table_id = $1
       AND ddf.data_file_id = data.data_file_id
       AND ddf.begin_snapshot < data.end_snapshot
+      AND (ddf.end_snapshot IS NULL OR ddf.end_snapshot > ddf.begin_snapshot)
     ORDER BY ddf.begin_snapshot DESC
     LIMIT 1
 ) prev ON true

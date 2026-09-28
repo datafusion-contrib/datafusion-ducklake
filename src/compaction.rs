@@ -1234,6 +1234,190 @@ impl DuckLakeTable {
     }
 }
 
+/// Outcome of [`DuckLakeTable::flush_inlined_deletes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InlinedDeleteFlushResult {
+    /// Number of data files whose inlined deletions went into a new delete file.
+    pub files_flushed: usize,
+    /// Number of `ducklake_inlined_delete_<table_id>` rows removed.
+    pub rows_flushed: usize,
+    /// Snapshot of the flush, or `None` when there was nothing to flush (no
+    /// snapshot committed).
+    pub snapshot_id: Option<i64>,
+}
+
+impl DuckLakeTable {
+    /// Materialize the table's inlined deletions of Parquet rows
+    /// (`ducklake_inlined_delete_<table_id>`) into positional delete files, in
+    /// one snapshot, and remove them from the inlined table.
+    ///
+    /// For each live data file with inlined deletions, the new delete file
+    /// holds the file's live deleted positions and its inlined ones, each with
+    /// the snapshot that deleted it in the `_ducklake_internal_snapshot_id`
+    /// column, and is visible from the earliest inlined deletion on. A read at
+    /// any snapshot, including one before the flush, therefore sees the same
+    /// rows. Inlined deletions of data files that are no longer live (already
+    /// rewritten by compaction) stay: they serve time travel, and
+    /// `expire_snapshots` removes them with their data file.
+    ///
+    /// The flush reads at this table's snapshot and is fenced on it: if
+    /// another writer deleted rows of, flushed, compacted or retired one of
+    /// the data files after that snapshot, the commit aborts with
+    /// [`DuckLakeError::Conflict`] and changes nothing; re-open the catalog
+    /// and retry. [`MetadataWriter::tables_with_inlined_file_deletes`](crate::MetadataWriter::tables_with_inlined_file_deletes)
+    /// lists the tables that have something to flush.
+    ///
+    /// Requires a writer whose
+    /// [`supports_inlined_file_deletes`](crate::MetadataWriter::supports_inlined_file_deletes)
+    /// is `true`.
+    pub async fn flush_inlined_deletes(
+        &self,
+        state: &dyn Session,
+    ) -> Result<InlinedDeleteFlushResult> {
+        let nothing = InlinedDeleteFlushResult {
+            files_flushed: 0,
+            rows_flushed: 0,
+            snapshot_id: None,
+        };
+        let writer = self.writer().ok_or_else(|| {
+            DuckLakeError::InvalidConfig(
+                "flush_inlined_deletes: table is read-only; open the catalog with a writer"
+                    .to_string(),
+            )
+        })?;
+        if !writer.supports_inlined_file_deletes() {
+            return Err(DuckLakeError::Unsupported(
+                "flush_inlined_deletes: this metadata writer does not support inlined deletion \
+                 of Parquet rows"
+                    .to_string(),
+            ));
+        }
+        let schema_name = self.schema_name().ok_or_else(|| {
+            DuckLakeError::Internal("writable table has no schema name".to_string())
+        })?;
+        let base = self.base_snapshot();
+        let rows = writer.inlined_file_delete_rows(self.table_id(), base)?;
+        if rows.is_empty() {
+            return Ok(nothing);
+        }
+        let mut by_file: HashMap<i64, Vec<crate::metadata_writer::InlinedFileDeleteRow>> =
+            HashMap::new();
+        for row in rows {
+            by_file.entry(row.data_file_id).or_default().push(row);
+        }
+
+        let object_store = state
+            .runtime_env()
+            .object_store(self.object_store_url().as_ref())?;
+        let table_writer = DuckLakeTableWriter::new(Arc::clone(writer), object_store)?
+            .with_options(&self.write_options);
+
+        let mut flushes = Vec::new();
+        let mut rows_flushed = 0usize;
+        let mut table_files = self.files()?;
+        table_files.sort_by_key(|file| file.data_file_id);
+        for tf in &table_files {
+            let Some(inlined) = by_file.get(&tf.data_file_id) else {
+                continue;
+            };
+            let begin_snapshot = inlined
+                .iter()
+                .map(|row| row.begin_snapshot)
+                .min()
+                .expect("a grouped file has at least one row");
+
+            // Each position's deletion snapshot: the earliest of the delete
+            // files (visible at or after `begin_snapshot`) that hold it, and
+            // of its inlined rows. A delete file without per-row snapshots
+            // deleted its positions at its own `begin_snapshot`.
+            let mut deleted_at: HashMap<i64, i64> = HashMap::new();
+            for version in writer.delete_file_history(self.table_id(), tf.data_file_id)? {
+                let visible_after = version
+                    .end_snapshot
+                    .is_none_or(|end| end > begin_snapshot && end > version.begin_snapshot);
+                if !visible_after || version.begin_snapshot > base {
+                    continue;
+                }
+                let mut file = crate::metadata_provider::DuckLakeFileData::new(
+                    version.path.clone(),
+                    version.path_is_relative,
+                    version.file_size_bytes,
+                );
+                file.footer_size = version.footer_size;
+                file.encryption_key = version.encryption_key.clone();
+                for (position, snapshot) in self
+                    .read_delete_file_entries(state, &file)
+                    .await
+                    .map_err(|e| DuckLakeError::Internal(e.to_string()))?
+                {
+                    let snapshot = snapshot.unwrap_or(version.begin_snapshot);
+                    deleted_at
+                        .entry(position)
+                        .and_modify(|at| *at = (*at).min(snapshot))
+                        .or_insert(snapshot);
+                }
+            }
+            for row in inlined {
+                deleted_at
+                    .entry(row.row_id)
+                    .and_modify(|at| *at = (*at).min(row.begin_snapshot))
+                    .or_insert(row.begin_snapshot);
+            }
+            let mut entries: Vec<(i64, i64)> = deleted_at.into_iter().collect();
+            entries.sort_unstable();
+            let positions = entries
+                .iter()
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>();
+            let snapshots = entries
+                .iter()
+                .map(|(_, snapshot)| *snapshot)
+                .collect::<Vec<_>>();
+            let partial_max = snapshots
+                .iter()
+                .copied()
+                .max()
+                .expect("a flushed file has at least one position");
+            let delete = table_writer
+                .write_delete_file_with_snapshots(
+                    schema_name,
+                    self.table_name(),
+                    &tf.file.path,
+                    &positions,
+                    &snapshots,
+                )
+                .await?;
+            rows_flushed += inlined.len();
+            flushes.push(crate::metadata_writer::InlinedDeleteFlushEntry {
+                data_file_id: tf.data_file_id,
+                expected_prev_delete_file: tf.delete_file_id,
+                inlined_rows: inlined.len(),
+                begin_snapshot,
+                partial_max,
+                delete,
+            });
+        }
+        if flushes.is_empty() {
+            return Ok(nothing);
+        }
+        let files_flushed = flushes.len();
+        let result = table_writer
+            .commit_inlined_delete_flush(
+                schema_name,
+                self.table_name(),
+                self.physical_schema().as_ref(),
+                base,
+                flushes,
+            )
+            .await?;
+        Ok(InlinedDeleteFlushResult {
+            files_flushed,
+            rows_flushed,
+            snapshot_id: Some(result.snapshot_id),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

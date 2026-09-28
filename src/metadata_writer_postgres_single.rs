@@ -31,10 +31,10 @@ use crate::metadata_writer::{
     top_level_column_ids, validate_name,
 };
 use crate::metadata_writer_postgres::{
-    SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
+    InlineLayout, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
     apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_inlined_at_snapshot,
-    detect_replace_conflict as detect_staged_conflict, quote_ident, set_postgres_table_setting,
-    validate_staged_table, with_postgres_commit_lock,
+    detect_replace_conflict_in, quote_ident, set_postgres_table_setting, validate_staged_table,
+    with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -1104,7 +1104,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for write in writes {
                 validate_staged_table(&mut tx, write).await?;
                 if let Some(expected) = expected_base_snapshot_id {
-                    detect_staged_conflict(write.table_id, expected, &mut tx).await?;
+                    detect_replace_conflict_in(
+                        write.table_id,
+                        expected,
+                        &mut tx,
+                        InlineLayout::PerTable,
+                    )
+                    .await?;
                 }
                 let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut *tx).await?;
                 let names: Vec<String> = sqlx::query_scalar(
@@ -1150,7 +1156,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         commit_files_at_snapshot(&mut tx, snapshot_id, &write, files).await?;
                     },
                     StagedTableData::Inlined(batches) => {
-                        commit_inlined_at_snapshot(&mut tx, snapshot_id, &write, batches).await?;
+                        commit_inlined_at_snapshot(
+                            &mut tx,
+                            snapshot_id,
+                            &write,
+                            batches,
+                            InlineLayout::PerTable,
+                        )
+                        .await?;
                     },
                     StagedTableData::None => {},
                 }
@@ -1168,6 +1181,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     snapshot_id,
                     write.base_snapshot_id,
                     &write.inlined_deletes,
+                    InlineLayout::PerTable,
                 )
                 .await?;
                 let changes = staged_table_write_changes(&write, files, inline);

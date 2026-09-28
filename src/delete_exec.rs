@@ -15,6 +15,18 @@
 //! - **Delete-all** (no `WHERE`): a metadata-only truncate — end every live data
 //!   file in one new snapshot. Much cheaper than positional-deleting every row.
 //!
+//! **Deletion inlining.** When the writer supports it
+//! ([`MetadataWriter::supports_inlined_file_deletes`]) and the statement deletes
+//! at most `data_inlining_row_limit` Parquet rows in total, the filtered path
+//! writes no delete file: it records each deleted `(data file, position)` in the
+//! catalog's `ducklake_inlined_delete_<table_id>` table, in the same single
+//! snapshot and behind the same fences (the target file is live, its live delete
+//! file is unchanged, and no inlined deletion landed on it since the snapshot
+//! the DELETE read). A statement above the limit writes delete files as before;
+//! they carry only the Parquet positions forward, never the inlined ones.
+//! [`DuckLakeTable::flush_inlined_deletes`] later moves inlined deletions into
+//! delete files.
+//!
 //! A file rewritten by an UPDATE or by compaction is handled like any other. A
 //! delete file's `pos` is a row's physical index in the data file, which a
 //! rewrite leaves meaningful: the rewritten rows sit at `0..n-1`. What a rewrite
@@ -60,9 +72,11 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
 
-use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter};
+use crate::metadata_writer::{
+    DeleteFileEntry, InlinedFileDeleteEntry, InlinedRowRef, MetadataWriter,
+};
 use crate::table::DuckLakeTable;
-use crate::table_writer::DuckLakeTableWriter;
+use crate::table_writer::{DuckLakeTableWriter, UpdateVersions};
 
 /// Schema for the output of a delete operation: the count of rows deleted.
 /// Same shape DataFusion expects from `insert_into`.
@@ -303,6 +317,7 @@ async fn run_delete(
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
     let mut inlined_rows: Vec<InlinedRowRef> = Vec::new();
     let mut total_deleted: u64 = 0;
+    let mut matched_files = Vec::new();
     let inlined_deletes = table.inlined_deletes_by_file()?;
 
     for inlined in &inlined_data {
@@ -362,6 +377,30 @@ async fn run_delete(
             continue;
         }
 
+        total_deleted += newly_deleted.len() as u64;
+        matched_files.push((tf, existing, newly_deleted));
+    }
+
+    // Record the removal of few Parquet rows as inlined deletions in the
+    // catalog (no object-store write); otherwise write one cumulative delete
+    // file per affected data file.
+    let parquet_rows = matched_files
+        .iter()
+        .map(|(_, _, newly_deleted)| newly_deleted.len())
+        .sum::<usize>();
+    let inline_file_deletes = table_writer.should_inline_file_deletes(parquet_rows);
+    let mut inlined_file_deletes: Vec<InlinedFileDeleteEntry> = Vec::new();
+    for (tf, existing, newly_deleted) in matched_files {
+        if inline_file_deletes {
+            let mut positions: Vec<i64> = newly_deleted.into_iter().collect();
+            positions.sort_unstable();
+            inlined_file_deletes.push(InlinedFileDeleteEntry {
+                data_file_id: tf.data_file_id,
+                expected_prev_delete_file: tf.delete_file_id,
+                positions,
+            });
+            continue;
+        }
         // Carry forward prior Parquet positions and add only newly matched live
         // rows. Inlined positions stay in their metadata table until a dedicated
         // flush materializes and retires them.
@@ -378,7 +417,25 @@ async fn run_delete(
             expected_prev_delete_file: tf.delete_file_id,
             delete: delete_info,
         });
-        total_deleted += newly_deleted.len() as u64;
+    }
+
+    if !inlined_file_deletes.is_empty() {
+        // One snapshot through the multi-table commit, which applies the
+        // delete-file compare-and-swap and the inlined-deletion fences.
+        table_writer
+            .commit_update(
+                schema_name,
+                table_name,
+                table.physical_schema().as_ref(),
+                base_snapshot,
+                UpdateVersions::None,
+                &entries,
+                &inlined_rows,
+                &inlined_file_deletes,
+            )
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        return Ok(total_deleted);
     }
 
     if entries.is_empty() && inlined_rows.is_empty() {

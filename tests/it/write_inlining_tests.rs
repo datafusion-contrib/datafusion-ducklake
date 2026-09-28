@@ -741,3 +741,61 @@ async fn duckdb_multi_table_write_commits_parquet_and_inline_rows() {
         )
     );
 }
+
+/// The DuckDB writer cannot commit inline row versions, so SQL UPDATE keeps
+/// refusing a table with visible inlined rows, and changes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_update_refuses_tables_with_inlined_rows() {
+    let temp = TempDir::new().unwrap();
+    let catalog_path = temp.path().join("metadata.duckdb");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(
+        DuckdbMetadataWriter::new_with_init(catalog_path.to_string_lossy().into_owned()).unwrap(),
+    );
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    assert!(!writer.supports_inline_update());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("val", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(Int32Array::from(vec![10, 20]))],
+    )
+    .unwrap();
+    DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
+        .write_table("main", "t", &[batch])
+        .await
+        .unwrap();
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy()).unwrap();
+    let catalog =
+        datafusion_ducklake::DuckLakeCatalog::with_writer(Arc::new(provider), writer).unwrap();
+    let ctx = datafusion::prelude::SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(catalog));
+    let error = match ctx.sql("UPDATE lake.main.t SET val = 0 WHERE id = 1").await {
+        Ok(df) => df.collect().await.expect_err("UPDATE must refuse"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("UPDATE on a table with inlined rows is not supported"),
+        "{error}"
+    );
+    let rows = ctx
+        .sql("SELECT val FROM lake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let vals = rows[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(vals.values().to_vec(), vec![10, 20]);
+}

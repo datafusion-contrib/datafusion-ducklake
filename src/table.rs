@@ -2682,8 +2682,38 @@ impl DuckLakeTable {
         state: &dyn Session,
         delete_file: &DuckLakeFileData,
     ) -> DataFusionResult<HashSet<i64>> {
-        // Get the standard delete file schema
-        let delete_schema = delete_file_schema();
+        // A cumulative delete file (written by a flush of inlined deletions)
+        // records each position's deletion snapshot; a position deleted after
+        // the snapshot this table reads is not deleted yet.
+        Ok(self
+            .read_delete_file_entries(state, delete_file)
+            .await?
+            .into_iter()
+            .filter(|(_, snapshot)| snapshot.is_none_or(|snapshot| snapshot <= self.snapshot_id))
+            .map(|(position, _)| position)
+            .collect())
+    }
+
+    /// Every `(pos, deletion snapshot)` of a delete file. The snapshot is the
+    /// file's `_ducklake_internal_snapshot_id` column, or `None` for a file
+    /// without one (all its positions are deleted from the file's
+    /// `begin_snapshot` on).
+    pub(crate) async fn read_delete_file_entries(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+    ) -> DataFusionResult<Vec<(i64, Option<i64>)>> {
+        // The standard delete file schema, plus the optional per-row snapshot
+        // column, which reads as NULL from a file that lacks it.
+        let delete_schema = {
+            let mut fields: Vec<Field> = delete_file_schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            fields.push(crate::row_id::embedded_snapshot_id_field());
+            Arc::new(Schema::new(fields))
+        };
 
         // Resolve the delete file path
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
@@ -2726,13 +2756,11 @@ impl DuckLakeTable {
             },
         };
 
-        // Extract all positions from all batches
-        let mut positions = HashSet::new();
+        let mut entries = Vec::new();
         for batch in batches {
-            extract_deleted_positions_from_batch(&batch, &mut positions)?;
+            extract_delete_entries_from_batch(&batch, &mut entries)?;
         }
-
-        Ok(positions)
+        Ok(entries)
     }
 
     pub(crate) fn inlined_deletes_by_file(&self) -> DataFusionResult<HashMap<i64, HashSet<i64>>> {
@@ -4142,14 +4170,16 @@ impl DuckLakeTable {
 
         let matched_count = new_positions.len();
         let mut cumulative = scan.existing_parquet_deleted.clone();
-        cumulative.extend(new_positions);
+        cumulative.extend(new_positions.iter().copied());
         let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
         cumulative_positions.sort_unstable();
+        new_positions.sort_unstable();
 
         Ok(FileUpdateOutput {
             updated_batches,
             matched_count,
             cumulative_positions,
+            new_positions,
         })
     }
 }
@@ -4336,6 +4366,96 @@ pub(crate) fn rewrite_scanned_batch(
     }))
 }
 
+/// Rewrite the visible inlined rows of one inlined data table for an `UPDATE`:
+/// select the rows matching `predicate` (every row when it is `None`), apply
+/// `assignments`, and keep each row's row id.
+///
+/// Returns `None` when no row matches. Otherwise returns the new row versions
+/// in [`rewrite_output_schema`] form (`[physical columns..., rowid]`, the same
+/// shape [`rewrite_scanned_batch`] produces for Parquet rows) and the identities
+/// of the old versions, which the commit ends.
+#[cfg(feature = "write")]
+pub(crate) fn rewrite_inlined_rows(
+    physical_schema: &SchemaRef,
+    inlined: &crate::metadata_provider::DuckLakeInlinedData,
+    predicate: Option<&Arc<dyn PhysicalExpr>>,
+    assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+) -> DataFusionResult<Option<(RecordBatch, Vec<crate::metadata_writer::InlinedRowRef>)>> {
+    let batch = &inlined.batch;
+    let n = batch.num_rows();
+    if n == 0 {
+        return Ok(None);
+    }
+    if inlined.row_ids.len() != n || batch.num_columns() != physical_schema.fields().len() {
+        return Err(DataFusionError::Internal(format!(
+            "inlined rows of '{}' do not match the table's {} columns and their row ids",
+            inlined.table_name,
+            physical_schema.fields().len()
+        )));
+    }
+
+    // Coerce to the catalog types the assignment and predicate expressions
+    // were planned against.
+    let phys_cols = (0..physical_schema.fields().len())
+        .map(|i| {
+            crate::column_rename::coerce_column(
+                batch.column(i),
+                physical_schema.field(i).data_type(),
+            )
+        })
+        .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
+    let phys_batch = RecordBatch::try_new(Arc::clone(physical_schema), phys_cols.clone())?;
+
+    // A NULL predicate result is a non-match (SQL semantics).
+    let mask: BooleanArray = match predicate {
+        Some(p) => {
+            let arr = p.evaluate(&phys_batch)?.into_array(n)?;
+            let b = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                DataFusionError::Execution(
+                    "UPDATE predicate did not evaluate to a boolean".to_string(),
+                )
+            })?;
+            BooleanArray::from(
+                (0..n)
+                    .map(|i| b.is_valid(i) && b.value(i))
+                    .collect::<Vec<bool>>(),
+            )
+        },
+        None => BooleanArray::from(vec![true; n]),
+    };
+    if mask.true_count() == 0 {
+        return Ok(None);
+    }
+
+    let matched = arrow::compute::filter_record_batch(&phys_batch, &mask)
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let matched_rows = matched.num_rows();
+    let mut out_cols: Vec<ArrayRef> = matched.columns().to_vec();
+    for (col_idx, expr) in assignments {
+        let val = expr.evaluate(&matched)?.into_array(matched_rows)?;
+        out_cols[*col_idx] =
+            crate::column_rename::coerce_column(&val, physical_schema.field(*col_idx).data_type())?;
+    }
+
+    let mut row_ids = Vec::with_capacity(matched_rows);
+    let mut old_versions = Vec::with_capacity(matched_rows);
+    for (row, row_id) in inlined.row_ids.iter().enumerate() {
+        if mask.value(row) {
+            row_ids.push(*row_id);
+            old_versions.push(crate::metadata_writer::InlinedRowRef {
+                table_name: inlined.table_name.clone(),
+                row_id: *row_id,
+            });
+        }
+    }
+    out_cols.push(Arc::new(Int64Array::from(row_ids)));
+
+    Ok(Some((
+        RecordBatch::try_new(rewrite_output_schema(physical_schema), out_cols)?,
+        old_versions,
+    )))
+}
+
 /// Per-source-file read plan + metadata for an `UPDATE`, produced by
 /// [`DuckLakeTable::build_update_scan`] at plan time and consumed by
 /// [`DuckLakeUpdateExec`] at execute time.
@@ -4386,6 +4506,9 @@ pub(crate) struct FileUpdateOutput {
     /// Physical positions to mask on the source file afterwards: the rows this
     /// update supersedes unioned with any already-deleted rows (sorted).
     pub(crate) cumulative_positions: Vec<i64>,
+    /// Only the positions of the rows this update supersedes (sorted): what an
+    /// inlined deletion records.
+    pub(crate) new_positions: Vec<i64>,
 }
 
 #[async_trait]
@@ -4798,19 +4921,23 @@ impl TableProvider for DuckLakeTable {
             ));
         }
 
-        // UPDATE rewrites Parquet-resident rows only; visible inlined rows would
-        // be silently skipped. Refuse loudly instead (same detection DELETE uses).
-        let inlined = self.provider.get_inlined_data(
-            self.table_id,
-            self.provider.get_current_snapshot()?,
-            &self.columns,
-        )?;
-        if inlined.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(crate::DuckLakeError::Unsupported(format!(
-                "UPDATE on a table with inlined rows is not supported; \
-                 {INLINED_DATA_REMEDIATION}"
-            ))
-            .into());
+        // A writer that can commit inline row versions rewrites visible inlined
+        // rows at execute time (see `DuckLakeUpdateExec`). On any other writer
+        // UPDATE rewrites Parquet-resident rows only, and visible inlined rows
+        // would be silently skipped: refuse loudly instead.
+        if !writer.supports_inline_update() {
+            let inlined = self.provider.get_inlined_data(
+                self.table_id,
+                self.provider.get_current_snapshot()?,
+                &self.columns,
+            )?;
+            if inlined.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "UPDATE on a table with inlined rows is not supported; \
+                     {INLINED_DATA_REMEDIATION}"
+                ))
+                .into());
+            }
         }
 
         // Assignment / filter expressions reference the table's DATA columns
@@ -4970,21 +5097,18 @@ fn combine_execution_plans(
     }
 }
 
-/// Extract deleted row positions from a delete file RecordBatch
+/// Extract `(pos, deletion snapshot)` pairs from a delete file RecordBatch.
 ///
-/// Delete files have schema: (file_path: VARCHAR, pos: INT64)
-/// We only extract the "pos" column - the "file_path" column is metadata/documentation
-/// only (for Iceberg compatibility). The metadata catalog already tells us which delete
-/// file is associated with which data file.
-fn extract_deleted_positions_from_batch(
+/// Delete files have schema `(file_path: VARCHAR, pos: INT64)`, optionally
+/// with a per-row `_ducklake_internal_snapshot_id: INT64`. The `file_path`
+/// column is provenance only (for Iceberg compatibility): the metadata catalog
+/// already says which data file a delete file belongs to.
+fn extract_delete_entries_from_batch(
     batch: &RecordBatch,
-    positions: &mut HashSet<i64>,
+    entries: &mut Vec<(i64, Option<i64>)>,
 ) -> DataFusionResult<()> {
-    // Get the pos column index by name (not magic number)
     let schema = batch.schema();
     let pos_idx = schema.index_of(DELETE_POS_COL)?;
-
-    // Get the pos column
     let pos_array = batch
         .column(pos_idx)
         .as_any()
@@ -4992,11 +5116,25 @@ fn extract_deleted_positions_from_batch(
         .ok_or_else(|| {
             DataFusionError::Internal(format!("{} column not found or wrong type", DELETE_POS_COL))
         })?;
+    let snapshots = match schema.index_of(crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME) {
+        Ok(index) => Some(
+            batch
+                .column(index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "delete file snapshot column has the wrong type".to_string(),
+                    )
+                })?,
+        ),
+        Err(_) => None,
+    };
 
-    // Extract all non-null positions
     for i in 0..batch.num_rows() {
         if !pos_array.is_null(i) {
-            positions.insert(pos_array.value(i));
+            let snapshot = snapshots.and_then(|column| column.is_valid(i).then(|| column.value(i)));
+            entries.push((pos_array.value(i), snapshot));
         }
     }
 
