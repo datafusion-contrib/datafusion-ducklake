@@ -264,6 +264,7 @@ current_delete AS (
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
       AND df.begin_snapshot <= p.finish_snapshot
+      AND (df.end_snapshot IS NULL OR df.end_snapshot > df.begin_snapshot)
       AND (df.begin_snapshot >= p.start_snapshot
            OR (df.partial_max IS NOT NULL AND df.partial_max >= p.start_snapshot))
 ),
@@ -280,6 +281,7 @@ all_deletes AS (
     FROM ducklake_delete_file df
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
+      AND (df.end_snapshot IS NULL OR df.end_snapshot > df.begin_snapshot)
 )
 
 SELECT

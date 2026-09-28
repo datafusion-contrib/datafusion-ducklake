@@ -2540,21 +2540,25 @@ SELECT
      WHERE pd.table_id = ?
        AND pd.data_file_id = cd.data_file_id
        AND pd.begin_snapshot < cd.begin_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path,
     (SELECT path_is_relative FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = cd.data_file_id
        AND pd.begin_snapshot < cd.begin_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path_is_relative,
     (SELECT file_size_bytes FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = cd.data_file_id
        AND pd.begin_snapshot < cd.begin_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_file_size,
     (SELECT footer_size FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = cd.data_file_id
        AND pd.begin_snapshot < cd.begin_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
     cd.begin_snapshot AS snapshot_id
@@ -2562,6 +2566,7 @@ FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
 WHERE cd.table_id = ?
   AND cd.begin_snapshot <= ?
+  AND (cd.end_snapshot IS NULL OR cd.end_snapshot > cd.begin_snapshot)
   AND (cd.begin_snapshot >= ?
        OR ({pm} IS NOT NULL AND {pm} >= ?))
   AND data.table_id = ?
@@ -2588,21 +2593,25 @@ SELECT
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
        AND pd.begin_snapshot < data.end_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path,
     (SELECT path_is_relative FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
        AND pd.begin_snapshot < data.end_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_path_is_relative,
     (SELECT file_size_bytes FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
        AND pd.begin_snapshot < data.end_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_file_size,
     (SELECT footer_size FROM ducklake_delete_file pd
      WHERE pd.table_id = ?
        AND pd.data_file_id = data.data_file_id
        AND pd.begin_snapshot < data.end_snapshot
+       AND (pd.end_snapshot IS NULL OR pd.end_snapshot > pd.begin_snapshot)
      ORDER BY pd.begin_snapshot DESC LIMIT 1) AS prev_delete_footer_size,
 
     data.end_snapshot AS snapshot_id

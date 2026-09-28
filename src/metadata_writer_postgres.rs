@@ -15,14 +15,16 @@ use crate::metadata_provider::block_on;
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
-    ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata, StagedTableData,
-    StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    encode_inlined_index_columns, inlined_delete_conflicts, inlined_delete_groups,
-    live_inlined_index_columns, parse_inlined_index_columns, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, table_write_changes, top_level_column_ids,
-    validate_delete_entries, validate_inlined_index_columns, validate_name, validate_table_setting,
+    DeleteFileVersion, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedDeleteBacklog,
+    InlinedDeleteFlushEntry, InlinedFileDeleteEntry, InlinedFileDeleteRow, InlinedRowRef,
+    MetadataWriter, MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
+    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_inlined_file_deletes,
+    validate_inlined_index_columns, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -1090,6 +1092,29 @@ async fn detect_new_inlined_deletes(
 ) -> Result<()> {
     if data_file_ids.is_empty() {
         return Ok(());
+    }
+
+    // A flush of inlined deletions registers a delete file whose visibility
+    // starts before the flush, with per-row deletion snapshots. A writer that
+    // read at `base_snapshot` after such a flush saw that file filtered to
+    // `base_snapshot`, so a position the file deletes after `base_snapshot`
+    // was live to it: its plan is stale although the live delete file id
+    // matches.
+    let backdated: Option<i64> = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_delete_file
+         WHERE data_file_id = ANY($1) AND end_snapshot IS NULL
+           AND partial_max IS NOT NULL AND partial_max > $2
+         LIMIT 1",
+    )
+    .bind(data_file_ids)
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(data_file_id) = backdated {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "data file {data_file_id} of table {table_id} has deletions committed after snapshot \
+             {base_snapshot}; re-open the catalog and re-plan"
+        )));
     }
 
     let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
@@ -2249,9 +2274,11 @@ pub(crate) async fn commit_files_at_snapshot(
             .bind(write.table_id)
             .fetch_one(&mut **tx)
             .await?;
+    let mut total_advance = 0;
     let mut total_records = 0;
     let mut total_bytes = 0;
     for file in files {
+        let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
         let data_file_id: i64 = sqlx::query_scalar(
             "INSERT INTO ducklake_data_file
                  (table_id, path, path_is_relative, file_size_bytes, footer_size,
@@ -2265,13 +2292,14 @@ pub(crate) async fn commit_files_at_snapshot(
         .bind(file.file_size_bytes)
         .bind(file.footer_size)
         .bind(file.record_count)
-        .bind(next_row_id)
+        .bind(row_ids.stored)
         .bind(snapshot_id)
         .fetch_one(&mut **tx)
         .await?;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
-        next_row_id += file.record_count;
+        next_row_id += row_ids.advance;
+        total_advance += row_ids.advance;
         total_records += file.record_count;
         total_bytes += file.file_size_bytes;
     }
@@ -2282,7 +2310,7 @@ pub(crate) async fn commit_files_at_snapshot(
              file_size_bytes = file_size_bytes + $3
          WHERE table_id = $4",
     )
-    .bind(total_records)
+    .bind(total_advance)
     .bind(total_records)
     .bind(total_bytes)
     .bind(write.table_id)
@@ -2359,11 +2387,13 @@ pub(crate) async fn commit_inlined_at_snapshot(
     .bind(write.table_id)
     .execute(&mut **tx)
     .await?;
+    let preserved_row_ids = crate::metadata_writer::preserved_inlined_row_ids(write, record_count)?;
     let mut row_id: i64 =
         sqlx::query_scalar("SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1")
             .bind(write.table_id)
             .fetch_one(&mut **tx)
             .await?;
+    let mut preserved = preserved_row_ids.map(|ids| ids.iter());
     let column_list = write
         .columns
         .iter()
@@ -2377,7 +2407,16 @@ pub(crate) async fn commit_inlined_at_snapshot(
                 quote_ident(&physical_name),
                 column_list
             ));
-            query.push_bind(row_id);
+            let this_row_id = match preserved.as_mut() {
+                Some(ids) => *ids
+                    .next()
+                    .expect("preserved row ids checked against row count"),
+                None => {
+                    row_id += 1;
+                    row_id - 1
+                },
+            };
+            query.push_bind(this_row_id);
             query.push(", ").push_bind(snapshot_id);
             query.push(", NULL");
             for ((array, sql_type), column) in
@@ -2397,18 +2436,23 @@ pub(crate) async fn commit_inlined_at_snapshot(
             }
             query.push(')');
             query.build().execute(&mut **tx).await?;
-            row_id += 1;
         }
     }
     let record_count = i64::try_from(record_count).map_err(|_| {
         crate::DuckLakeError::InvalidConfig("multi-table inline row count exceeds i64".to_string())
     })?;
+    // Preserved row ids were issued earlier, so the allocator does not move.
+    let advance = if write.inlined_row_ids.is_some() {
+        0
+    } else {
+        record_count
+    };
     sqlx::query(
         "UPDATE ducklake_table_stats
          SET next_row_id = next_row_id + $1, record_count = record_count + $2
          WHERE table_id = $3",
     )
-    .bind(record_count)
+    .bind(advance)
     .bind(record_count)
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -2474,6 +2518,213 @@ pub(crate) async fn apply_positional_deletes_at_snapshot(
         .bind(entry.delete.footer_size)
         .bind(entry.delete.delete_count)
         .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Lock the data file's catalog row, check that it is live, and check that
+/// its live delete file is still `expected` (the compare-and-swap every
+/// positional-delete commit applies). Returns the file's `record_count`.
+async fn fence_delete_target(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    data_file_id: i64,
+    expected: Option<i64>,
+    base_snapshot: i64,
+) -> Result<Option<i64>> {
+    let live: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT record_count FROM ducklake_data_file
+         WHERE data_file_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(data_file_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(record_count) = live else {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "delete on data file {data_file_id} could not commit: the file is no longer live \
+             since snapshot {base_snapshot}"
+        )));
+    };
+    let current: Option<i64> = sqlx::query_scalar(
+        "SELECT delete_file_id FROM ducklake_delete_file
+         WHERE data_file_id = $1 AND end_snapshot IS NULL",
+    )
+    .bind(data_file_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if current != expected {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "delete on data file {data_file_id} could not commit: its live delete file changed \
+             from {expected:?} to {current:?} since snapshot {base_snapshot}"
+        )));
+    }
+    Ok(record_count)
+}
+
+/// Create `ducklake_inlined_delete_<table_id>` when it does not exist yet, with
+/// the layout DuckDB's DuckLake extension uses.
+async fn ensure_inlined_delete_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+) -> Result<String> {
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {} (file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)",
+        quote_ident(&table)
+    )))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} (file_id, row_id)",
+        quote_ident(&format!("{table}_file_idx")),
+        quote_ident(&table)
+    )))
+    .execute(&mut **tx)
+    .await?;
+    Ok(table)
+}
+
+/// Record inlined deletions of Parquet rows at `snapshot_id`. The caller has
+/// run [`detect_new_inlined_deletes`] on the target files under the catalog
+/// lock.
+pub(crate) async fn apply_inlined_file_deletes_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    entries: &[InlinedFileDeleteEntry],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let table = ensure_inlined_delete_table(tx, table_id).await?;
+    for entry in entries {
+        let record_count = fence_delete_target(
+            tx,
+            entry.data_file_id,
+            entry.expected_prev_delete_file,
+            base_snapshot,
+        )
+        .await?;
+        if let Some(record_count) = record_count
+            && entry
+                .positions
+                .iter()
+                .any(|position| *position >= record_count)
+        {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "inlined deletion of data file {} names a position past its {record_count} rows",
+                entry.data_file_id
+            )));
+        }
+        let already: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT row_id FROM {} WHERE file_id = $1 AND row_id = ANY($2) LIMIT 1",
+            quote_ident(&table)
+        )))
+        .bind(entry.data_file_id)
+        .bind(&entry.positions)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some(position) = already {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "row {position} of data file {} was already deleted since snapshot \
+                 {base_snapshot}",
+                entry.data_file_id
+            )));
+        }
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO {} (file_id, row_id, begin_snapshot)
+             SELECT $1, position, $3 FROM UNNEST($2::BIGINT[]) AS position",
+            quote_ident(&table)
+        )))
+        .bind(entry.data_file_id)
+        .bind(&entry.positions)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Materialize inlined deletions into the delete files of `entries` at
+/// `snapshot_id` (see [`InlinedDeleteFlushEntry`]).
+pub(crate) async fn apply_inlined_delete_flushes_at_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_id: i64,
+    base_snapshot: i64,
+    entries: &[InlinedDeleteFlushEntry],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&table)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !exists {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "table {table_id} has no inlined deletions to flush"
+        )));
+    }
+    for entry in entries {
+        fence_delete_target(
+            tx,
+            entry.data_file_id,
+            entry.expected_prev_delete_file,
+            base_snapshot,
+        )
+        .await?;
+        let removed = sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM {} WHERE file_id = $1",
+            quote_ident(&table)
+        )))
+        .bind(entry.data_file_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if removed != entry.inlined_rows as u64 {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "data file {} has {removed} inlined deletions, the flush read {}; re-plan",
+                entry.data_file_id, entry.inlined_rows
+            )));
+        }
+        // The new file carries the history from `begin_snapshot` on: end the
+        // delete file visible at that snapshot there, and hide every later one.
+        sqlx::query(
+            "UPDATE ducklake_delete_file SET end_snapshot = $2
+             WHERE data_file_id = $1 AND begin_snapshot < $2
+               AND (end_snapshot IS NULL OR end_snapshot > $2)",
+        )
+        .bind(entry.data_file_id)
+        .bind(entry.begin_snapshot)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE ducklake_delete_file SET end_snapshot = begin_snapshot
+             WHERE data_file_id = $1 AND begin_snapshot >= $2
+               AND (end_snapshot IS NULL OR end_snapshot > begin_snapshot)",
+        )
+        .bind(entry.data_file_id)
+        .bind(entry.begin_snapshot)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO ducklake_delete_file
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                  footer_size, delete_count, begin_snapshot, partial_max)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(entry.data_file_id)
+        .bind(table_id)
+        .bind(&entry.delete.path)
+        .bind(entry.delete.path_is_relative)
+        .bind(entry.delete.file_size_bytes)
+        .bind(entry.delete.footer_size)
+        .bind(entry.delete.delete_count)
+        .bind(entry.begin_snapshot)
+        .bind(entry.partial_max)
         .execute(&mut **tx)
         .await?;
     }
@@ -3648,6 +3899,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             for write in writes {
+                validate_inlined_file_deletes(write)?;
                 validate_staged_table(&mut tx, write).await?;
                 assert_table_not_in_other_catalog(self.catalog_id, write.table_id, &mut tx).await?;
             }
@@ -3655,6 +3907,36 @@ impl MetadataWriter for PostgresMetadataWriter {
                 for write in writes {
                     detect_replace_conflict(write.table_id, expected, &mut tx).await?;
                 }
+            }
+            // Same source-file fence the single-table positional-delete commits
+            // apply: an inlined delete that landed on a target file after the
+            // base snapshot moved its live rows, so the resolved positions are
+            // stale.
+            for write in writes {
+                let file_ids = write
+                    .positional_deletes
+                    .iter()
+                    .map(|entry| entry.data_file_id)
+                    .chain(
+                        write
+                            .inlined_file_deletes
+                            .iter()
+                            .map(|entry| entry.data_file_id),
+                    )
+                    .chain(
+                        write
+                            .inlined_delete_flushes
+                            .iter()
+                            .map(|entry| entry.data_file_id),
+                    )
+                    .collect::<Vec<_>>();
+                detect_new_inlined_deletes(
+                    write.table_id,
+                    write.base_snapshot_id,
+                    &file_ids,
+                    &mut tx,
+                )
+                .await?;
             }
             let mut had_live_data = Vec::with_capacity(writes.len());
             for write in writes {
@@ -3747,6 +4029,21 @@ impl MetadataWriter for PostgresMetadataWriter {
                     snapshot_id,
                     write.base_snapshot_id,
                     &write.inlined_deletes,
+                )
+                .await?;
+                apply_inlined_file_deletes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.inlined_file_deletes,
+                )
+                .await?;
+                apply_inlined_delete_flushes_at_snapshot(
+                    &mut tx,
+                    write.table_id,
+                    write.base_snapshot_id,
+                    &write.inlined_delete_flushes,
                 )
                 .await?;
                 let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
@@ -5463,6 +5760,11 @@ impl MetadataWriter for PostgresMetadataWriter {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
+            let file_ids = positional
+                .iter()
+                .map(|entry| entry.data_file_id)
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(table_id, base_snapshot, &file_ids, &mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -6515,6 +6817,145 @@ impl MetadataWriter for PostgresMetadataWriter {
     /// so it supports row-level `UPDATE`.
     fn supports_update(&self) -> bool {
         true
+    }
+
+    fn supports_inline_update(&self) -> bool {
+        true
+    }
+
+    fn supports_inlined_file_deletes(&self) -> bool {
+        true
+    }
+
+    fn inlined_file_delete_rows(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<InlinedFileDeleteRow>> {
+        block_on(async {
+            let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&table)
+                .fetch_one(&self.pool)
+                .await?;
+            if !exists {
+                return Ok(Vec::new());
+            }
+            let rows = sqlx::query(AssertSqlSafe(format!(
+                "SELECT file_id, row_id, begin_snapshot FROM {}
+                 WHERE begin_snapshot <= $1 ORDER BY file_id, row_id",
+                quote_ident(&table)
+            )))
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(InlinedFileDeleteRow {
+                        data_file_id: row.try_get(0)?,
+                        row_id: row.try_get(1)?,
+                        begin_snapshot: row.try_get(2)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn tables_with_inlined_file_deletes(&self) -> Result<Vec<InlinedDeleteBacklog>> {
+        block_on(async {
+            let tables = sqlx::query(
+                "SELECT s.schema_name, t.table_name, t.table_id
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+                 JOIN ducklake_catalog_schema_map m
+                   ON m.schema_id = s.schema_id AND m.catalog_id = $1
+                 WHERE t.end_snapshot IS NULL
+                 ORDER BY s.schema_name, t.table_name",
+            )
+            .bind(self.catalog_id)
+            .fetch_all(&self.pool)
+            .await?;
+            let mut candidates = Vec::with_capacity(tables.len());
+            for row in tables {
+                let table_id: i64 = row.try_get(2)?;
+                candidates.push((
+                    row.try_get::<String, _>(0)?,
+                    row.try_get::<String, _>(1)?,
+                    table_id,
+                    crate::metadata_provider::inlined_delete_table_name(table_id)?,
+                ));
+            }
+            let names = candidates
+                .iter()
+                .map(|candidate| candidate.3.clone())
+                .collect::<Vec<_>>();
+            let existing: std::collections::HashSet<String> = sqlx::query_scalar(
+                "SELECT c.relname::TEXT FROM pg_class c
+                 WHERE c.relkind = 'r' AND c.relname = ANY($1) AND pg_table_is_visible(c.oid)",
+            )
+            .bind(&names)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .collect();
+            let mut backlog = Vec::new();
+            for (schema_name, table_name, table_id, inline_table) in candidates {
+                if !existing.contains(&inline_table) {
+                    continue;
+                }
+                let rows: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT COUNT(*)::BIGINT FROM {} d
+                     JOIN ducklake_data_file f
+                       ON f.data_file_id = d.file_id AND f.end_snapshot IS NULL",
+                    quote_ident(&inline_table)
+                )))
+                .fetch_one(&self.pool)
+                .await?;
+                if rows > 0 {
+                    backlog.push(InlinedDeleteBacklog {
+                        schema_name,
+                        table_name,
+                        table_id,
+                        rows: rows as u64,
+                    });
+                }
+            }
+            Ok(backlog)
+        })
+    }
+
+    fn delete_file_history(
+        &self,
+        table_id: i64,
+        data_file_id: i64,
+    ) -> Result<Vec<DeleteFileVersion>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT delete_file_id, path, path_is_relative, file_size_bytes, footer_size,
+                        encryption_key, begin_snapshot, end_snapshot
+                 FROM ducklake_delete_file
+                 WHERE table_id = $1 AND data_file_id = $2
+                 ORDER BY begin_snapshot, delete_file_id",
+            )
+            .bind(table_id)
+            .bind(data_file_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(DeleteFileVersion {
+                        delete_file_id: row.try_get(0)?,
+                        path: row.try_get(1)?,
+                        path_is_relative: row.try_get(2)?,
+                        file_size_bytes: row.try_get(3)?,
+                        footer_size: row.try_get(4)?,
+                        encryption_key: row.try_get(5)?,
+                        begin_snapshot: row.try_get(6)?,
+                        end_snapshot: row.try_get(7)?,
+                    })
+                })
+                .collect()
+        })
     }
 }
 

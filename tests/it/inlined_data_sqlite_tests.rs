@@ -2184,8 +2184,11 @@ async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
     assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
 }
 
+/// SQLite supports inline UPDATE: the inlined row and the Parquet row are both
+/// rewritten in one snapshot, the new versions stay inline within the limit,
+/// and the pre-update snapshot still reads the old values.
 #[tokio::test(flavor = "multi_thread")]
-async fn update_refuses_tables_with_inlined_rows() {
+async fn update_rewrites_inlined_and_parquet_rows() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
     let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
@@ -2196,35 +2199,52 @@ async fn update_refuses_tables_with_inlined_rows() {
         .await
         .unwrap();
 
-    // Explicitly enable inlining to exercise the current-snapshot UPDATE guard
-    let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
-    let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
-    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
-        .unwrap()
-        .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
-    let ctx = SessionContext::new();
-    ctx.register_catalog("ducklake", Arc::new(catalog));
-    ctx.sql("INSERT INTO ducklake.main.t VALUES (3, 30)")
+    let session = || async {
+        let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+        let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
+        let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
+            .unwrap()
+            .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
+        let ctx = SessionContext::new();
+        ctx.register_catalog("ducklake", Arc::new(catalog));
+        ctx
+    };
+    session()
+        .await
+        .sql("INSERT INTO ducklake.main.t VALUES (3, 30)")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-    let error = match ctx
-        .sql("UPDATE ducklake.main.t SET val = 99 WHERE id = 1")
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
         .await
-    {
-        Ok(df) => df.collect().await.expect_err("UPDATE must refuse"),
-        Err(e) => e,
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("UPDATE on a table with inlined rows is not supported")
-            && message.contains("flush inlined data to Parquet"),
-        "{message}"
+        .unwrap();
+    session()
+        .await
+        .sql("UPDATE ducklake.main.t SET val = val + 1 WHERE id IN (1, 3)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before + 1, "one snapshot");
+    assert_eq!(read_rows(&t, None).await, vec![(1, 11), (2, 20), (3, 31)]);
+    assert_eq!(
+        read_rows(&t, Some(before)).await,
+        vec![(1, 10), (2, 20), (3, 30)]
     );
-    // Nothing changed.
-    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
+    let data_files: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(data_files, 1, "the new versions are inline");
 }
 
 #[tokio::test(flavor = "multi_thread")]

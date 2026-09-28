@@ -144,7 +144,7 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
-pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
+pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode, is_conflict};
 pub use metadata_provider::{
     DuckLakeFileData, DuckLakeTableFile, MetadataProvider, SnapshotChangeMetadata,
 };
@@ -166,7 +166,7 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
-pub use compaction::{CompactionResult, MergeOptions, RewriteOptions};
+pub use compaction::{CompactionResult, InlinedDeleteFlushResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write")]
@@ -174,9 +174,11 @@ pub use insert_exec::DuckLakeInsertExec;
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter, MultiTableCommit,
-    PromoteLayout, PromotedFile, RowIdStart, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteResult, WriteSetupResult,
+    DeleteFileEntry, DeleteFileInfo, DeleteFileVersion, InlinedDeleteBacklog,
+    InlinedDeleteFlushEntry, InlinedFileDeleteEntry, InlinedFileDeleteRow, InlinedRowRef,
+    MetadataWriter, MultiTableCommit, PromoteLayout, PromotedFile, RowIdStart,
+    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, WriteMode,
+    WriteResult, WriteSetupResult,
 };
 #[cfg(feature = "write-duckdb")]
 pub use metadata_writer_duckdb::DuckdbMetadataWriter;

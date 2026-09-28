@@ -3760,6 +3760,7 @@ impl MetadataWriter for MySqlMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<MultiTableCommit> {
+        crate::metadata_writer::reject_preserved_inlined_row_ids(writes)?;
         if writes.is_empty() {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "commit_multi_table requires at least one table stage".to_string(),
@@ -4861,6 +4862,9 @@ mod tests {
             positional_deletes: Vec::new(),
             inlined_deletes: Vec::new(),
             inlined_flush: false,
+            inlined_row_ids: None,
+            inlined_file_deletes: Vec::new(),
+            inlined_delete_flushes: Vec::new(),
         };
         let committed = writer
             .commit_multi_table(

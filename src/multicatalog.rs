@@ -825,6 +825,29 @@ impl MulticatalogManager {
         .fetch_all(&mut *tx)
         .await?;
         let data_file_ids = schedule_pg_files(&mut tx, catalog_id, dead_data_files).await?;
+        // Inlined deletions of rows in the removed data files
+        // (`ducklake_inlined_delete_<table_id>`) die with their file too.
+        let tables_of_dead_files: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT table_id FROM ducklake_data_file WHERE data_file_id = ANY($1)",
+        )
+        .bind(&data_file_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        for table_id in tables_of_dead_files {
+            let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&table)
+                .fetch_one(&mut *tx)
+                .await?;
+            if exists {
+                sqlx::query(AssertSqlSafe(format!(
+                    "DELETE FROM \"{table}\" WHERE file_id = ANY($1)"
+                )))
+                .bind(&data_file_ids)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         sqlx::query("DELETE FROM ducklake_data_file WHERE data_file_id = ANY($1)")
             .bind(&data_file_ids)
             .execute(&mut *tx)
