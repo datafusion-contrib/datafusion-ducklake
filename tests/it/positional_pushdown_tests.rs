@@ -207,7 +207,7 @@ async fn plan_of(ctx: &SessionContext, sql: &str) -> String {
 // NaN safety on the paths that gained filter pushdown
 // ---------------------------------------------------------------------------
 
-/// `build_exec_for_file_with_rowid`: a rowid scan used to refuse all pushdown,
+/// `build_exec_for_files_with_rowid`: a rowid scan used to refuse all pushdown,
 /// so it skipped the NaN barrier. Now that predicates reach the reader, the
 /// barrier must be there — otherwise the footer max (a finite value, since
 /// parquet bounds exclude NaN) prunes away the row group holding the NaN row.
@@ -467,7 +467,7 @@ async fn deletes_stay_correct_under_reader_pruning() {
 }
 
 /// A `LIMIT` must never sink below the delete filter, where it would count rows
-/// the delete file removes. `DeleteFilterExec` opts out of limit pushdown; this
+/// the delete file removes. The delete filters opt out of limit pushdown; this
 /// pins the end-to-end consequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn limit_is_applied_after_deletes() {
@@ -959,8 +959,9 @@ async fn a_predicate_on_a_renamed_column_is_pushed_correctly() {
 }
 
 /// A predicate on the synthetic `rowid` column must never be pushed: `rowid` is
-/// derived from a virtual column, and DataFusion refuses a pushed predicate that
-/// references one. `RowIdExec` rejects it, and the answer must still be right.
+/// computed above the scan, which has no such column. The row-lineage node
+/// forwards only filters over columns its input carries, so this one stays above
+/// it, and the answer must still be right.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_predicate_on_rowid_is_answered_without_being_pushed() {
     let temp = TempDir::new().unwrap();

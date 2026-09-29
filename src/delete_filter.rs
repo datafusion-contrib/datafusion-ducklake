@@ -1,13 +1,17 @@
-//! Custom execution plan for filtering deleted rows
+//! Custom execution plan for filtering deleted rows of one data file
 //!
-//! Wraps a positional scan and drops rows whose **physical file position**
-//! appears in a positional delete file. The physical position is read from the
-//! reader-produced position column (see
-//! `row_id::positional_table_schema`) — never
-//! from stream arrival order — so filtering is correct regardless of how the
-//! scan is pruned, filtered, partitioned or merged. The position column is
-//! passed through unchanged for any downstream consumer (e.g. `RowIdExec`); the
-//! final projection drops it.
+//! Wraps a positional scan of a single file and drops rows whose **physical
+//! file position** is in a delete set resolved at planning. The physical
+//! position is read from the reader-produced position column (see
+//! `row_id::positional_table_schema`) — never from stream arrival order — so
+//! filtering is correct regardless of how the scan is pruned, filtered,
+//! partitioned or merged. The position column is passed through unchanged for
+//! any downstream consumer; the final projection drops it.
+//!
+//! The table's read scans apply deletes with `LazyDeleteFilterExec`, which
+//! reads each file's delete set when the scan reaches it. This node serves the
+//! scans that resolve one file's deletes up front: the UPDATE source scan and
+//! the read of a name-mapped partial file below its `partial_max`.
 
 use std::collections::HashSet;
 use std::pin::Pin;

@@ -85,6 +85,7 @@ pub(crate) mod open_time_filter_barrier;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
+pub(crate) mod row_lineage;
 pub mod schema;
 mod snapshot_changes;
 pub mod snapshot_filter;

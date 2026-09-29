@@ -773,7 +773,7 @@ async fn postgres_sort_ddl_records_snapshot_changes() {
 
 /// The postgres `set_delete_file` write — fenced, cumulative,
 /// ≤1-live-delete-file-per-data-file. Asserts the metadata effects directly (the
-/// read-side application via `DeleteFilterExec` is backend-agnostic and covered
+/// read-side application via `LazyDeleteFilterExec` is backend-agnostic and covered
 /// by the sqlite round-trip in `positional_delete_tests`).
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
@@ -3185,7 +3185,7 @@ async fn drop_table_in_catalog_isolates_other_catalogs() {
 
 // ---------------------------------------------------------------------------
 // Row lineage / row_id_start coverage for the postgres writer. The read path
-// (RowIdExec) hard-errors on data files whose row_id_start is NULL and have
+// (RowLineageExec) errors on data files whose row_id_start is NULL and have
 // no embedded `_ducklake_internal_row_id` column, so the writer must populate
 // the column on every file it produces. These tests pin that contract.
 // ---------------------------------------------------------------------------

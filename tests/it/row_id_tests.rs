@@ -37,8 +37,8 @@ fn create_catalog_rowid_two_files(catalog_path: &Path) -> Result<()> {
 }
 
 /// Same as the two-file catalog, but DELETE the rows where i is odd.
-/// Verifies that DeleteFilterExec runs after RowIdExec so deleted rowids
-/// are correctly elided from the output.
+/// Verifies that the delete filter runs after the row-lineage node, so deleted
+/// rowids are correctly elided from the output.
 fn create_catalog_rowid_with_deletes(catalog_path: &Path) -> Result<()> {
     let conn = duckdb::Connection::open_in_memory()?;
     crate::common::ensure_ducklake_installed();
@@ -227,7 +227,8 @@ async fn rowid_preserved_under_deletes() -> DataFusionResult<()> {
 #[tokio::test]
 async fn rowid_only_projection() -> DataFusionResult<()> {
     // Edge case: physical projection is empty (just rowid). Verifies that
-    // RowIdExec works when ParquetExec emits zero-column count batches.
+    // rowid is still computed when the scan reads no data column, only the
+    // per-file values and row positions it derives from.
     let temp =
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let path = temp.path().join("rowid_only.ducklake");

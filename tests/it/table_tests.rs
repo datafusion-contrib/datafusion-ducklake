@@ -651,8 +651,8 @@ async fn test_scan_with_live_deletes_is_correct() -> DataFusionResult<()> {
     Ok(())
 }
 
-/// Pruning also applies on the row-lineage scan path (rowid projected), which
-/// builds a separate per-file exec for each surviving file. Verified by file
+/// Pruning also applies on the row-lineage scan path (rowid projected), whose
+/// scan resolves each surviving file's rowids as it opens it. Verified by file
 /// path since that path does not always attach statistics.
 #[tokio::test]
 async fn test_scan_prunes_files_on_rowid_path() -> DataFusionResult<()> {

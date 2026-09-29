@@ -19,15 +19,15 @@
 //! DuckDB's reader-level `COLUMN_IDENTIFIER_FILE_ROW_NUMBER` virtual column
 //! (`ducklake_multi_file_reader.cpp::GetVirtualColumnExpression`).
 //!
-//! Downstream, [`RowIdExec`] reads that column to compute `rowid`, and
-//! `DeleteFilterExec` reads it to filter deleted positions — neither counts
-//! stream rows, so both are correct regardless of partitioning or merge order.
+//! Downstream, the table scan's row-lineage node reads that column to compute
+//! `rowid`, and the delete filters read it to filter deleted positions — none
+//! counts stream rows, so all are correct regardless of partitioning or merge
+//! order. [`RowIdExec`] computes `rowid` the same way over a single file.
 //!
 //! Files written by `UPDATE` / compaction store the original rowids inline in
 //! the parquet as a column tagged with [`ROW_ID_PARQUET_FIELD_ID`] (typically
-//! named `_ducklake_internal_row_id`). Those files do NOT use [`RowIdExec`] —
-//! `DuckLakeTable` reads the embedded column directly via the parquet scan and
-//! renames it. See `table.rs::build_exec_for_file_with_rowid`.
+//! named `_ducklake_internal_row_id`); the scan reads that column instead,
+//! resolved per file as the reader opens it (see `row_lineage.rs`).
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,9 +63,12 @@ pub const ROWID_COLUMN_NAME: &str = "rowid";
 pub const ROW_NUMBER_EXTENSION_TYPE: &str = "parquet.virtual.row_number";
 
 /// Base name of the internal physical-row-position column: a parquet virtual
-/// column consumed by [`RowIdExec`] / `DeleteFilterExec`. Projected away before
-/// the table's output schema (by `ColumnRenameExec`), so it never reaches the
-/// user, and never written to a parquet file or the catalog.
+/// column consumed by the table scan's delete filter and row-lineage node
+/// (`LazyDeleteFilterExec`, `RowLineageExec`), and by `DeleteFilterExec` on the
+/// scans that still read one file with its deletes resolved at planning (the
+/// UPDATE source, a name-mapped partial file). Projected away before the
+/// table's output schema, so it never reaches the user, and never written to a
+/// parquet file or the catalog.
 ///
 /// The double-underscore prefix makes a clash with a real catalog column
 /// unlikely but not impossible — DuckLake reserves no names — so a scan whose
@@ -252,16 +255,17 @@ pub(crate) fn positional_table_schema_reserving<'a>(
 // ---------------------------------------------------------------------------
 
 /// Execution plan that appends a synthetic `rowid` BIGINT column computed as
-/// `row_id_start + __ducklake_row_pos`, reading the reader-produced position
-/// column (possibly via a `DeleteFilterExec`).
+/// `row_id_start + __ducklake_row_pos` over the scan of a single file, reading
+/// the reader-produced position column.
+///
+/// The table's own scans resolve `rowid` per file with `RowLineageExec`
+/// instead, over many files at once; this node is the single-file form, kept
+/// as public API.
 ///
 /// Stateless w.r.t. row order: it reads a per-row value and appends a per-row
 /// value, so it is correct under any partitioning. The position column is passed
-/// through unchanged for any downstream consumer; the final projection
-/// (`ColumnRenameExec`) drops it. If `row_id_start` is `None` the rowid column is
-/// emitted as all-NULL (the per-file plan in `table.rs` hard-errors before
-/// reaching here for non-embedded files with no `row_id_start`, so this is a
-/// defensive fallback only).
+/// through unchanged for any downstream consumer. If `row_id_start` is `None`
+/// the rowid column is emitted as all-NULL.
 #[derive(Debug)]
 pub struct RowIdExec {
     input: Arc<dyn ExecutionPlan>,

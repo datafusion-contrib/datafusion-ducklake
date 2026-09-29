@@ -1,8 +1,9 @@
 # Physical row positions in DuckLake reads
 
 Status: current
-Scope: `src/row_id.rs`, `src/delete_filter.rs`, `src/table.rs`, `src/table_changes.rs`,
-`src/table_deletions.rs`
+Scope: `src/table.rs`, `src/field_id_adapter.rs`, `src/lazy_delete_filter.rs`,
+`src/row_lineage.rs`, `src/open_time_filter_barrier.rs`, `src/row_id.rs`, `src/delete_filter.rs`,
+`src/table_changes.rs`, `src/table_deletions.rs`
 DataFusion version: 55.0.0
 
 ---
@@ -48,21 +49,60 @@ This matches official DuckLake, which computes `rowid` from DuckDB's reader-leve
 `COLUMN_IDENTIFIER_FILE_ROW_NUMBER` virtual column
 (`ducklake_multi_file_reader.cpp::GetVirtualColumnExpression`).
 
+## How a read scan is shaped
+
+A table scan binds each data file as the reader opens it, as official DuckLake's multi-file reader
+does, so planning reads no data or delete file.
+
+- **Open-time binding.** `FieldIdExprAdapterFactory` (`field_id_adapter.rs`) runs inside
+  DataFusion's parquet opener. It rewrites the scan's projection and predicate from catalog columns
+  to the opened file's columns by parquet field id: renamed and widened columns, columns the file
+  predates (their `initial_default` or NULL), struct children by nested field id.
+- **One scan per read layout.** Every file resolved by field id shares one `DataSourceExec`. A
+  name-mapped file reads under the schema its mapping describes, so files sharing a mapping share a
+  scan, with `ColumnRenameExec` above it to present the catalog schema. The groups are unioned.
+- **Per-file values ride as partition values.** A positional scan carries the data file's catalog
+  id (and, for `rowid`, its `row_id_start`) as per-file partition values, beside the reader's
+  row-number virtual column.
+
+The positional read nodes, bottom to top:
+
+- `SnapshotFilterExec` — only for a merged partial file read at a snapshot below its
+  `partial_max`: drops rows whose embedded origin snapshot is newer than the read snapshot.
+- `RowLineageExec` (`row_lineage.rs`) — the row's `rowid`: the file's embedded
+  `_ducklake_internal_row_id` when the file carries one (found by field id, reported per file by
+  the adapter), otherwise `row_id_start + position`. A file with neither fails when it is read.
+- `LazyDeleteFilterExec` (`lazy_delete_filter.rs`) — drops deleted positions. It reads a file's
+  delete set (its delete file plus inlined deletions) the first time the scan returns rows of that
+  file, and caches it for the scan. While one file is read, the delete sets of the next files the
+  scan is planned to read are read in the background; the order is approximate under work stealing
+  and only warms the cache. Each read runs a fresh copy of the delete-file scan, because a
+  `DataSourceExec` keeps its partitions' shared work queue for the life of the plan and yields
+  nothing when executed again. At the current snapshot its row count is the catalog's
+  (`record_count` less `delete_count` and inlined deletions), so `count(*)` reads no delete file.
+
 ## Column layout
 
-The position column is appended **last** in the scan's table schema, after the file columns. Every
-positional call site therefore appends its table-schema index to its projection, so the position
-lands last in the scan's output batches too.
+The scan's table schema is DataFusion's `[file columns, partition columns, virtual columns]`, so
+the position — the row-number virtual column — is **last**, after the data file id and
+`row_id_start` partition values. A `rowid` scan also appends two file-column probes after the data
+columns, the embedded rowid and whether the file carries one, which the adapter answers per file.
 
-Consumers take that index explicitly rather than looking the column up by name:
+Consumers take each index explicitly rather than looking a column up by name:
 
-- `DeleteFilterExec::try_new(input, file_path, deleted_positions, pos_index)`
-- `RowIdExec::try_new(input, row_id_start, pos_index)`
+- `LazyDeleteFilterExec::try_new(input, file_id_index, pos_index, files, object_store_url)`
+- `RowLineageExec::try_new(input, LineageColumns { embedded, has_embedded, file_id, row_id_start,
+  position }, data_columns, paths)`
 
 Two consumers derive the index arithmetically instead — `table_deletions.rs` and `table_changes.rs`
 compute `table_len + embedded_rowid? + embedded_snapshot?`. Those sites carry a `debug_assert!` that
 the arithmetic agrees with the scan's actual last column. All the internal columns are `Int64`, so a
 misalignment would not fail a downcast; it would return wrong rowids.
+
+`DeleteFilterExec` (one data file, positions read at planning) and `RowIdExec` remain in the public
+`delete_filter` and `row_id` modules. The table's read scans no longer build `RowIdExec`.
+`DeleteFilterExec` still backs the UPDATE source scan and the per-file read of a name-mapped partial
+file below its `partial_max`, which keep the plan-time path.
 
 ### Why not look it up by name
 
@@ -70,11 +110,12 @@ misalignment would not fail a downcast; it would return wrong rowids.
 column names and official DuckLake validates none, so a table may legitimately have a column called
 `__ducklake_row_pos`. `row_id::unique_row_pos_name` suffixes the internal name until it does not
 collide with the file's own columns — the same disambiguation DataFusion applies to its internal
-row-index column. A name lookup would bind the user's column instead.
+row-index column. A name lookup would bind the user's column instead. The data file id and
+`row_id_start` columns are named the same way (`unused_column_name`).
 
-The position column is never written to a Parquet file and never appears in the catalog. It exists
-only between the scan and its consumers, and `ColumnRenameExec` drops it before the table's output
-schema.
+The position, data file id and `row_id_start` columns are never written to a Parquet file and never
+appear in the catalog. They exist only between the scan and its consumers: `LazyDeleteFilterExec`
+drops the file id and position, and `RowLineageExec` replaces the probes with `rowid`.
 
 ## Filter pushdown on positional paths
 
@@ -82,15 +123,31 @@ Absolute positions make pruning safe: `filter(delete(R)) == delete(filter(R))`, 
 keyed by position and a predicate is row-local, so dropping non-matching rows in the reader cannot
 change which surviving row sits at which position.
 
-Three nodes forward pushdown so a predicate can reach the reader:
+These nodes forward pushdown so a predicate can reach the reader:
 
-- `DeleteFilterExec` — output schema equals input schema; forwards everything unchanged.
-- `RowIdExec` — appends `rowid` last; forwards filters over input columns, rejects filters on
-  `rowid` itself (DataFusion refuses any pushed predicate referencing a virtual column, and `rowid`
-  is derived from one).
-- `ColumnRenameExec` — forwards under `is_type_preserving_projection()`, which permits dropping the
-  position column. It rewrites column *names*; `ChildFilterDescription::from_child` re-resolves
-  indices by name.
+- `LazyDeleteFilterExec` and `RowLineageExec` — forward each filter whose columns the input
+  carries (`ChildFilterDescription::from_child` resolves them by name). A filter on `rowid` has no
+  input column to resolve to, so it stays above `RowLineageExec`.
+- `ColumnRenameExec` — on a name-mapped group, forwards under `is_type_preserving_projection()`. It
+  rewrites column *names*; `ChildFilterDescription::from_child` re-resolves indices by name.
+- `OpenTimeFilterBarrierExec` (`open_time_filter_barrier.rs`) — above a field-id scan with a struct
+  or map column. It forwards every filter so the scan still prunes with it, but reports as pushed
+  only those `reader_keeps_predicate` accepts. The reader builds its row filter per file from the
+  rewritten predicate and skips a conjunct it cannot apply; for any other predicate the `FilterExec`
+  above stays.
+
+### Repartitioning
+
+`LazyDeleteFilterExec`, `RowLineageExec` and `SnapshotFilterExec` decline input partitioning. A
+round-robin repartition below them would drain the scan eagerly, every output partition wanting a
+batch, so a `LIMIT` above could not stop the scan opening file after file. The scan under them is
+split into file groups at construction instead (`DuckLakeTable::split_scan`, honouring
+`target_partitions`, `repartition_file_scans` and `repartition_file_min_size`). The pass-through
+nodes above them (`ColumnRenameExec`, `NanPruningBarrierExec`, `OpenTimeFilterBarrierExec`) report
+what the node below reports, so a repartition lands above the whole per-row stack. A `FilterExec`
+above that stack still asks for one: with `pushdown_filters` off a filtered `LIMIT` reads every
+file, as over any DataFusion parquet scan of a single file group; an unfiltered `LIMIT`, and a
+filtered one with `pushdown_filters` on, stop at the files they reach.
 
 ### The NaN barrier
 
@@ -104,14 +161,17 @@ Current placement:
 
 ```
 build_exec_for_files_without_deletes    barrier
-build_exec_for_file_with_rowid          barrier
-build_exec_for_file_with_deletes        barrier
+build_exec_for_files_with_deletes       barrier
+build_exec_for_files_with_rowid         barrier
+build_exec_for_partial_files            barrier
 build_exec_for_partial_file             none needed - see below
 ```
 
-`build_exec_for_partial_file` has no barrier because `SnapshotFilterExec` does not implement
-`gather_filters_for_pushdown`, so DataFusion's default bars every parent filter and no predicate
-reaches the reader. **Give `SnapshotFilterExec` filter pushdown and that path needs a barrier too.**
+`build_exec_for_partial_files` (field-id partial files) places the barrier above the whole stack.
+`build_exec_for_partial_file` (a name-mapped partial file) has none because `SnapshotFilterExec`
+does not implement `gather_filters_for_pushdown`, so DataFusion's default bars every parent filter
+and no predicate reaches that reader. **Give `SnapshotFilterExec` filter pushdown and that path
+needs a barrier too.**
 
 ### `resolve_positions` (the DELETE/UPDATE write path)
 

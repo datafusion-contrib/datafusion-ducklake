@@ -152,6 +152,18 @@ async fn analyze(ctx: &SessionContext, sql: &str) -> String {
         .to_string()
 }
 
+/// Whether an `EXPLAIN ANALYZE` blob has a node named exactly `name`: the text
+/// before the `:` of a row's plan cell, so one node's name matching inside
+/// another's does not count.
+fn has_node(plan: &str, name: &str) -> bool {
+    plan.lines().any(|line| {
+        line.split('|')
+            .nth(2)
+            .and_then(|cell| cell.trim_start().split(':').next())
+            == Some(name)
+    })
+}
+
 /// Parse a `name=<total> total → <matched> matched` metric out of an
 /// `EXPLAIN ANALYZE` blob.
 fn pruning_metric(plan: &str, name: &str) -> Option<(usize, usize)> {
@@ -427,7 +439,7 @@ async fn topn_with_nulls_first_still_prunes_and_is_correct() {
     );
 }
 
-/// A file carrying deletes is read under a [`DeleteFilterExec`], which sits
+/// A file carrying deletes is read under a `LazyDeleteFilterExec`, which sits
 /// between the sort and the scan. Deleting rows cannot reorder the rows that
 /// remain, so that node forwards the ordering; this pins that it does, and that
 /// the delete is still applied.
@@ -469,7 +481,7 @@ async fn topn_is_correct_when_a_file_carries_deletes() {
     .await;
     println!("{plan}");
     assert!(
-        plan.contains("DeleteFilterExec"),
+        has_node(&plan, "LazyDeleteFilterExec"),
         "the deleted file should be read under a delete filter\n{plan}"
     );
 
@@ -480,11 +492,10 @@ async fn topn_is_correct_when_a_file_carries_deletes() {
     );
 }
 
-/// Projecting `rowid` puts a [`RowIdExec`] between the sort and the scan. A
-/// single-file table is what makes this reachable: the rowid path builds one
-/// exec per file, and `UnionExec` — which DataFusion 55 gives no
-/// `try_pushdown_sort` — would otherwise sit above them and bar the ordering
-/// before it ever reached this node.
+/// Projecting `rowid` puts the row-lineage node between the sort and the scan,
+/// and the ordering must still reach the scan through it. A single-file table
+/// keeps any `UnionExec` — which DataFusion 55 gives no `try_pushdown_sort` —
+/// out of the way.
 #[tokio::test(flavor = "multi_thread")]
 async fn topn_prunes_with_rowid() {
     let temp = TempDir::new().unwrap();
@@ -522,7 +533,7 @@ async fn topn_prunes_with_rowid() {
     // Assert the fixture: the sort really is travelling through the rowid node,
     // not past it, and no union intervenes.
     assert!(
-        plan.contains("RowIdExec"),
+        plan.contains("RowLineageExec"),
         "the rowid node should be in the plan\n{plan}"
     );
     assert!(

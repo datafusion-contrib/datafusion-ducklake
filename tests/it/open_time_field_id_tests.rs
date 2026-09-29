@@ -1316,6 +1316,227 @@ async fn a_delete_file_with_deletion_snapshots_applies_only_earlier_deletions() 
     Ok(())
 }
 
+/// A session over the fixture catalog with row lineage on, its local files read
+/// through `store`.
+async fn lineage_session(
+    temp: &TempDir,
+    store: &Arc<ReadRecordingStore>,
+    config: SessionConfig,
+) -> anyhow::Result<SessionContext> {
+    let provider =
+        SqliteMetadataProvider::new(&format!("sqlite:{}", catalog_path(temp).display())).await?;
+    let ctx = SessionContext::new_with_config(config);
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file://")?,
+        Arc::clone(store) as Arc<dyn ObjectStore>,
+    );
+    ctx.register_catalog(
+        "ducklake",
+        Arc::new(DuckLakeCatalog::new(provider)?.with_row_lineage(true)),
+    );
+    Ok(ctx)
+}
+
+/// Rows of `sql` from DuckDB and from this crate with row lineage on, under both
+/// pushdown settings, asserting planning reads no file.
+async fn lineage_rows_match_duckdb(temp: &TempDir, sql: &str) -> anyhow::Result<()> {
+    let conn = duckdb_lake(temp)?;
+    let expected = duckdb_rows(&conn, &sql.replace("{table}", "lake.t"))?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    assert!(!expected.is_empty());
+    for (pushdown, config) in [(false, SessionConfig::new()), (true, pushdown_config())] {
+        let store = ReadRecordingStore::new();
+        let ctx = lineage_session(temp, &store, config).await?;
+        let plan = physical_plan(&ctx, &sql.replace("{table}", "ducklake.main.t")).await?;
+        assert_eq!(
+            store.take(),
+            Vec::<ObjectPath>::new(),
+            "planning a rowid scan must read no file (pushdown_filters = {pushdown})"
+        );
+        let rows = text_rows(&collect(plan, ctx.task_ctx()).await?);
+        assert_eq!(rows, expected, "pushdown_filters = {pushdown}: {sql}");
+    }
+    Ok(())
+}
+
+/// Row ids over plain files, a file with a deleted row, a file an UPDATE rewrote
+/// (which embeds its rows' ids), and a struct child added with a default.
+#[tokio::test]
+async fn rowids_resolve_per_file_as_duckdb_does() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT, s STRUCT(x INT))", [])?;
+    for file in 0..4 {
+        conn.execute(
+            &format!(
+                "INSERT INTO lake.t VALUES ({a}, {{'x': {a}}}), ({b}, NULL), ({c}, {{'x': {c}}})",
+                a = file * 10,
+                b = file * 10 + 1,
+                c = file * 10 + 2,
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM lake.t WHERE id = 11", [])?;
+    conn.execute("UPDATE lake.t SET s = {'x': 99} WHERE id = 20", [])?;
+    conn.execute("ALTER TABLE lake.t ADD COLUMN s.z INT DEFAULT 7", [])?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+
+    lineage_rows_match_duckdb(
+        &temp,
+        "SELECT CAST(rowid AS VARCHAR) AS r, CAST(id AS VARCHAR) AS i, \
+         CAST(s['z'] AS VARCHAR) AS z FROM {table} ORDER BY id",
+    )
+    .await?;
+    lineage_rows_match_duckdb(
+        &temp,
+        "SELECT CAST(id AS VARCHAR) AS i, CAST(rowid AS VARCHAR) AS r FROM {table} \
+         WHERE s['z'] = 7 ORDER BY id",
+    )
+    .await?;
+    lineage_rows_match_duckdb(
+        &temp,
+        "SELECT CAST(id AS VARCHAR) AS i FROM {table} WHERE rowid IN (2, 20, 31) ORDER BY id",
+    )
+    .await?;
+    Ok(())
+}
+
+/// Row ids after `ducklake_merge_adjacent_files`, whose merged file embeds its
+/// rows' original ids.
+#[tokio::test]
+async fn rowids_survive_merging_files_as_duckdb_reads_them() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT)", [])?;
+    for file in 0..3 {
+        conn.execute(
+            &format!(
+                "INSERT INTO lake.t VALUES ({}), ({})",
+                file * 10,
+                file * 10 + 1
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM lake.t WHERE id = 10", [])?;
+    conn.execute("CALL ducklake_merge_adjacent_files('lake')", [])?;
+    let files: i64 = conn.query_row(
+        "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+         WHERE end_snapshot IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(
+        files < 3,
+        "some of the three files merge, got {files} live files"
+    );
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    lineage_rows_match_duckdb(
+        &temp,
+        "SELECT CAST(rowid AS VARCHAR) AS r, CAST(id AS VARCHAR) AS i FROM {table} ORDER BY id",
+    )
+    .await
+}
+
+/// `LIMIT 1` with `rowid` reads only the files it reaches.
+#[tokio::test]
+async fn limit_one_with_rowid_reads_only_what_it_needs() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    create_table_with_deletes(&temp)?;
+    let store = ReadRecordingStore::new();
+    let ctx = lineage_session(
+        &temp,
+        &store,
+        SessionConfig::new().with_target_partitions(1),
+    )
+    .await?;
+    let plan = physical_plan(&ctx, "SELECT rowid, id FROM ducklake.main.t LIMIT 1").await?;
+    assert_eq!(store.take(), Vec::<ObjectPath>::new());
+    let batches = collect(plan, ctx.task_ctx()).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let opened = distinct(&store.take()).len();
+    assert!(
+        (2..=4).contains(&opened),
+        "LIMIT 1 read {opened} of {} files",
+        2 * LATER_FILES
+    );
+    Ok(())
+}
+
+/// A file with neither an embedded row id nor a catalog `row_id_start` fails the
+/// read when it is opened, as official fails it, not while planning.
+#[tokio::test]
+async fn a_file_without_lineage_fails_when_read() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT)", [])?;
+    conn.execute("INSERT INTO lake.t VALUES (1), (2)", [])?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    let pool = SqlitePool::connect(&format!("sqlite:{}", catalog_path(&temp).display())).await?;
+    sqlx::query("UPDATE ducklake_data_file SET row_id_start = NULL")
+        .execute(&pool)
+        .await?;
+    pool.close().await;
+
+    let store = ReadRecordingStore::new();
+    let ctx = lineage_session(&temp, &store, SessionConfig::new()).await?;
+    let plan = physical_plan(&ctx, "SELECT rowid FROM ducklake.main.t").await?;
+    let error = collect(plan, ctx.task_ctx())
+        .await
+        .expect_err("a file without lineage cannot give row ids");
+    assert!(
+        error
+            .to_string()
+            .contains("row lineage cannot be reconstructed"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+/// With `rowid` projected, a predicate the reader's row filter may decline
+/// stays in a `FilterExec`, one it always applies does not.
+#[tokio::test]
+async fn a_filter_the_reader_may_skip_stays_above_a_rowid_scan() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute(
+        "CREATE TABLE lake.t (id INT, s STRUCT(x INT, m MAP(VARCHAR, INT)))",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO lake.t VALUES (1, {'x': 1, 'm': MAP {'k': 13}}), \
+         (2, {'x': 2, 'm': MAP {'k': 14}})",
+        [],
+    )?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    let store = ReadRecordingStore::new();
+    let ctx = lineage_session(&temp, &store, pushdown_config()).await?;
+    let render = |sql: &'static str| {
+        let ctx = ctx.clone();
+        async move {
+            let plan = physical_plan(&ctx, sql).await?;
+            anyhow::Ok(displayable(plan.as_ref()).indent(true).to_string())
+        }
+    };
+    let through_map = render("SELECT rowid FROM ducklake.main.t WHERE s['m']['k'] = 13").await?;
+    assert!(
+        through_map.contains("RowLineageExec") && has_filter_exec(&through_map),
+        "a lookup through a map must stay above the scan:\n{through_map}"
+    );
+    let through_structs = render("SELECT rowid FROM ducklake.main.t WHERE s['x'] = 1").await?;
+    assert!(
+        through_structs.contains("RowLineageExec") && !has_filter_exec(&through_structs),
+        "a struct child the reader always applies is left to it:\n{through_structs}"
+    );
+    Ok(())
+}
+
 /// A writable session opened before official DuckLake deletes again from a file
 /// (writing one cumulative delete file that records each deletion's snapshot)
 /// must carry that newer deletion into the delete file its own DELETE writes:
@@ -1402,6 +1623,86 @@ async fn a_stale_session_delete_keeps_deletions_made_after_its_snapshot() -> any
             vec![0, 1, 2],
             "ids 1, 2 and 3 sit at positions 0, 1, 2"
         );
+    }
+    Ok(())
+}
+
+/// A file `ducklake_merge_adjacent_files` merged, read at a snapshot before its
+/// last merged insert, keeps only the rows each row's embedded origin snapshot
+/// allows — with and without `rowid` — as DuckDB reads it, and planning reads
+/// no file.
+#[tokio::test]
+async fn a_merged_file_read_at_an_earlier_snapshot_matches_duckdb() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT, s STRUCT(x INT))", [])?;
+    conn.execute("INSERT INTO lake.t VALUES (1, {'x': 1}), (2, NULL)", [])?;
+    conn.execute("INSERT INTO lake.t VALUES (3, {'x': 3}), (4, {'x': 4})", [])?;
+    let earlier: i64 =
+        conn.query_row("SELECT max(snapshot_id) FROM lake.snapshots()", [], |row| {
+            row.get(0)
+        })?;
+    conn.execute("INSERT INTO lake.t VALUES (5, {'x': 5}), (6, {'x': 6})", [])?;
+    conn.execute("CALL ducklake_merge_adjacent_files('lake')", [])?;
+    let partial: i64 = conn.query_row(
+        "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file \
+         WHERE end_snapshot IS NULL AND partial_max IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(partial >= 1, "the merge writes a partial file");
+    let queries = [
+        "SELECT CAST(id AS VARCHAR) AS i, CAST(s['x'] AS VARCHAR) AS x FROM {table} ORDER BY id",
+        "SELECT CAST(rowid AS VARCHAR) AS r, CAST(id AS VARCHAR) AS i FROM {table} ORDER BY id",
+    ];
+    let expected = queries
+        .iter()
+        .map(|sql| {
+            duckdb_rows(
+                &conn,
+                &sql.replace("{table}", &format!("lake.t AT (VERSION => {earlier})")),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(expected[0].len(), 4);
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+
+    for config in [SessionConfig::new(), pushdown_config()] {
+        let store = ReadRecordingStore::new();
+        let provider =
+            SqliteMetadataProvider::new(&format!("sqlite:{}", catalog_path(&temp).display()))
+                .await?;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.runtime_env().register_object_store(
+            &url::Url::parse("file://")?,
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        );
+        ctx.register_catalog(
+            "ducklake",
+            Arc::new(
+                DuckLakeCatalog::with_snapshot(Arc::new(provider), earlier)?.with_row_lineage(true),
+            ),
+        );
+        for (sql, expected) in queries.iter().zip(&expected) {
+            let plan = physical_plan(&ctx, &sql.replace("{table}", "ducklake.main.t")).await?;
+            let rendered = displayable(plan.as_ref()).indent(true).to_string();
+            assert_eq!(
+                store.take(),
+                Vec::<ObjectPath>::new(),
+                "planning reads no file:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("SnapshotFilterExec"),
+                "the merged file is read under a snapshot filter:\n{rendered}"
+            );
+            assert_eq!(
+                &text_rows(&collect(plan, ctx.task_ctx()).await?),
+                expected,
+                "{sql}"
+            );
+            store.take();
+        }
     }
     Ok(())
 }
@@ -1641,6 +1942,46 @@ async fn a_delete_file_read_that_fails_once_is_read_again() -> anyhow::Result<()
         let store = ReadRecordingStore::new();
         let config = SessionConfig::new().with_target_partitions(1);
         let ctx = session(&temp, &store, config).await?;
+        assert_flaky_read_is_retried(&ctx, &store, &flaky, sql, expected).await?;
+    }
+    Ok(())
+}
+
+/// Under the session's default partitioning, `LIMIT 1` over `rowid` reads only a
+/// few files.
+#[tokio::test]
+async fn limit_one_over_rowid_under_default_partitioning_reads_few_files() -> anyhow::Result<()> {
+    let temp = thousand_row_files(true)?;
+    let store = ReadRecordingStore::new();
+    let ctx = lineage_session(&temp, &store, SessionConfig::new()).await?;
+    let sql = "SELECT rowid, id FROM ducklake.main.t LIMIT 1";
+    assert_limit_one_reads_few_files(&ctx, &store, "rowid", sql, 6).await
+}
+
+/// [`a_missing_delete_file_after_the_first_fails_the_query`], with row lineage.
+#[tokio::test]
+async fn a_missing_delete_file_after_the_first_fails_a_rowid_query() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let missing = create_three_files_with_deletes(&temp).await?;
+    std::fs::remove_file(&missing)?;
+    for config in partitioning_configs() {
+        let label = format!("lineage, {} partitions", config.target_partitions());
+        let ctx = lineage_session(&temp, &ReadRecordingStore::new(), config).await?;
+        assert_missing_delete_file_fails(&ctx, &label).await?;
+    }
+    Ok(())
+}
+
+/// [`a_delete_file_read_that_fails_once_is_read_again`], with row lineage.
+#[tokio::test]
+async fn a_delete_file_read_that_fails_once_is_read_again_under_row_lineage() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let flaky = file_name(&create_three_files_with_deletes(&temp).await?);
+    for (sql, expected) in FLAKY_READ_COUNTS {
+        let store = ReadRecordingStore::new();
+        let config = SessionConfig::new().with_target_partitions(1);
+        let ctx = lineage_session(&temp, &store, config).await?;
         assert_flaky_read_is_retried(&ctx, &store, &flaky, sql, expected).await?;
     }
     Ok(())

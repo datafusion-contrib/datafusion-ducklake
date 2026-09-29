@@ -424,7 +424,7 @@ async fn positional_scan_pushes_a_predicate_to_the_reader() -> DataFusionResult<
     let plan = explain_positional("EXPLAIN SELECT rowid, i FROM c.main.t WHERE i > 500000").await?;
     assert!(
         plan.contains("predicate="),
-        "the predicate must reach the reader through RowIdExec/ColumnRenameExec:\n{plan}"
+        "the predicate must reach the reader through the row-lineage node:\n{plan}"
     );
     Ok(())
 }

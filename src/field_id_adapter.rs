@@ -42,9 +42,11 @@ use datafusion::logical_expr::ScalarUDF;
 use datafusion::physical_expr::expressions::{CastExpr, Column, IsNotNullExpr, Literal};
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion::physical_expr_adapter::{PhysicalExprAdapter, PhysicalExprAdapterFactory};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::column_rename::{coerce_column, types_equal_ignoring_field_metadata};
 use crate::metadata_provider::DuckLakeTableColumn;
+use crate::row_id::{ROW_ID_PARQUET_FIELD_ID, SNAPSHOT_ID_PARQUET_FIELD_ID};
 use crate::types::{
     ABSENT_FIELD_PREFIX, DuckLakeDefaultExprAdapterFactory, arrow_schema_field_ids,
     build_read_schema_with_field_id_mapping_from_schema, parse_ducklake_default_scalar,
@@ -57,13 +59,37 @@ use crate::types::{
 #[derive(Debug)]
 pub(crate) struct FieldIdExprAdapterFactory {
     columns: Arc<[DuckLakeTableColumn]>,
+    row_lineage: Option<Arc<RowLineageProbes>>,
+}
+
+/// Names of the scan columns that report a file's embedded lineage columns;
+/// each `None` when the scan does not ask for it.
+#[derive(Debug, Default)]
+pub(crate) struct RowLineageProbes {
+    /// Resolves to the file's `_ducklake_internal_row_id` column, found by
+    /// [`ROW_ID_PARQUET_FIELD_ID`], or NULL when it stores none.
+    pub(crate) embedded: Option<String>,
+    /// Resolves to whether the file stores that column.
+    pub(crate) has_embedded: Option<String>,
+    /// Resolves to the file's `_ducklake_internal_snapshot_id` column, found by
+    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`], or NULL when it stores none: each row's
+    /// origin snapshot in a file compaction merged.
+    pub(crate) embedded_snapshot: Option<String>,
 }
 
 impl FieldIdExprAdapterFactory {
     pub(crate) fn new(columns: &[DuckLakeTableColumn]) -> Self {
         Self {
             columns: columns.into(),
+            row_lineage: None,
         }
+    }
+
+    /// Also resolve the scan columns named by `probes` per file, as official's
+    /// `GetVirtualColumnExpression` resolves a file's row id.
+    pub(crate) fn with_row_lineage(mut self, probes: RowLineageProbes) -> Self {
+        self.row_lineage = Some(Arc::new(probes));
+        self
     }
 }
 
@@ -110,6 +136,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
             .create(Arc::clone(&read_schema), Arc::clone(&physical_file_schema))?;
         Ok(Arc::new(FieldIdExprAdapter {
             columns: Arc::clone(&self.columns),
+            row_lineage: self.row_lineage.clone(),
             scan_schema,
             logical_file_schema,
             read_schema,
@@ -143,6 +170,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 #[derive(Debug)]
 struct FieldIdExprAdapter {
     columns: Arc<[DuckLakeTableColumn]>,
+    row_lineage: Option<Arc<RowLineageProbes>>,
     /// The scan's logical schema: the catalog columns, then its virtual columns.
     scan_schema: SchemaRef,
     /// The catalog columns alone.
@@ -356,6 +384,46 @@ impl FieldIdExprAdapter {
         }))
     }
 
+    /// A row-lineage probe column resolved in this file, or `None` when `name`
+    /// is not one.
+    fn row_lineage_probe(&self, name: &str) -> Option<Arc<dyn PhysicalExpr>> {
+        let probes = self.row_lineage.as_ref()?;
+        let tagged = |field_id: i32| {
+            self.physical_file_schema.fields().iter().position(|field| {
+                field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .is_some_and(|id| *id == field_id.to_string())
+            })
+        };
+        let int64_or_null = |index: Option<usize>| -> Arc<dyn PhysicalExpr> {
+            match index {
+                Some(index) => {
+                    let field = self.physical_file_schema.field(index);
+                    let column: Arc<dyn PhysicalExpr> = Arc::new(Column::new(field.name(), index));
+                    if field.data_type() == &DataType::Int64 {
+                        column
+                    } else {
+                        Arc::new(CastExpr::new(column, DataType::Int64, None))
+                    }
+                },
+                None => Arc::new(Literal::new(ScalarValue::Int64(None))),
+            }
+        };
+        if probes.has_embedded.as_deref() == Some(name) {
+            return Some(Arc::new(Literal::new(ScalarValue::Boolean(Some(
+                tagged(ROW_ID_PARQUET_FIELD_ID).is_some(),
+            )))));
+        }
+        if probes.embedded.as_deref() == Some(name) {
+            return Some(int64_or_null(tagged(ROW_ID_PARQUET_FIELD_ID)));
+        }
+        if probes.embedded_snapshot.as_deref() == Some(name) {
+            return Some(int64_or_null(tagged(SNAPSHOT_ID_PARQUET_FIELD_ID)));
+        }
+        None
+    }
+
     /// The file's type at `path` under `root`.
     fn file_type_at(
         &self,
@@ -499,6 +567,9 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
                 let Some(column) = expr.downcast_ref::<Column>() else {
                     return Ok(Transformed::no(expr));
                 };
+                if let Some(resolved) = self.row_lineage_probe(column.name()) {
+                    return Ok(Transformed::new(resolved, true, TreeNodeRecursion::Jump));
+                }
                 let Ok(index) = self.logical_file_schema.index_of(column.name()) else {
                     // A virtual column, which the reader appends after the
                     // file's own columns.

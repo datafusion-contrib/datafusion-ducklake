@@ -1,6 +1,6 @@
 //! Round-trip tests for the positional-delete write path:
 //! `MetadataWriter::set_delete_file` registers a positional `(file_path, pos)`
-//! delete file, and a subsequent read applies it via `DeleteFilterExec`. These
+//! delete file, and a subsequent read applies it via `LazyDeleteFilterExec`. These
 //! validate the fenced, cumulative, ≤1-live-per-data-file write end-to-end
 //! through the SQLite backend (the one the crate's tests can run without a
 //! container), asserting surviving VALUES — a positional bug silently deletes

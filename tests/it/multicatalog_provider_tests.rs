@@ -436,7 +436,7 @@ async fn get_table_files_for_select_returns_visible_files_at_snapshot() {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn get_table_files_for_select_returns_row_id_start_and_record_count() {
-    // The DuckLake row-lineage read path (RowIdExec) needs row_id_start to
+    // The DuckLake row-lineage read path (RowLineageExec) needs row_id_start to
     // reconstruct rowids. The multicatalog reader used to drop these columns
     // on the floor, so any consumer using row lineage saw the file as if no
     // row_id_start were set — matching the single-catalog reader closes the

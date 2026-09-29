@@ -29,11 +29,12 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::projection::ProjectionMapping;
-use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr, PhysicalSortExpr};
 use datafusion::physical_plan::execution_plan::{Boundedness, reset_plan_states};
 use datafusion::physical_plan::filter_pushdown::{
     ChildFilterDescription, FilterDescription, FilterPushdownPhase,
 };
+use datafusion::physical_plan::sort_pushdown::SortOrderPushdownResult;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     ChildStats, ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan,
@@ -44,6 +45,7 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
 use tokio::sync::OnceCell;
 
+use crate::row_lineage::references_only_prefix;
 use crate::table::{DELETE_POS_COL, DELETE_SNAPSHOT_COL, is_object_store_not_found};
 
 /// One data file's deletes, as the catalog lists them.
@@ -276,6 +278,35 @@ impl ExecutionPlan for LazyDeleteFilterExec {
                 &parent_filters,
                 &self.input,
             )?),
+        )
+    }
+
+    /// An ordering over the kept columns is served by the input, where they sit
+    /// at the same positions ahead of the dropped ones. `Inexact`: the nodes
+    /// above may not republish it.
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        if self.kept != (0..self.kept.len()).collect::<Vec<_>>()
+            || !references_only_prefix(order, self.kept.len())
+        {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+        self.input.try_pushdown_sort(order)?.into_inexact().try_map(
+            |inner| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new(Self::assemble(
+                    inner,
+                    self.file_id_index,
+                    self.pos_index,
+                    self.kept.clone(),
+                    Arc::clone(&self.schema),
+                    Arc::clone(&self.files),
+                    Arc::clone(&self.loaded),
+                    self.object_store_url.clone(),
+                    Arc::clone(&self.read_order),
+                )))
+            },
         )
     }
 

@@ -77,12 +77,13 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `PathResolver`: Maintains base URL and path for hierarchical resolution (catalog -> schema -> table -> file)
    - Handles S3, MinIO, and local filesystem paths uniformly
 
-6. **Delete File Filtering** (`src/delete_filter.rs`)
-   - `DeleteFilterExec`: Custom execution plan that wraps Parquet scans and filters deleted rows
-   - Implements MOR (Merge-On-Read) pattern for row-level deletes
+6. **Open-Time Scan and Delete Filtering** (`src/field_id_adapter.rs`, `src/lazy_delete_filter.rs`, `src/row_lineage.rs`, `src/open_time_filter_barrier.rs`)
+   - `FieldIdExprAdapterFactory`: binds each file's columns by field id as the parquet opener opens it, so planning reads no footer
+   - `LazyDeleteFilterExec`: Merge-On-Read deletes over a multi-file scan; reads a file's delete set when the scan first returns its rows, reading the next files' sets ahead
+   - `RowLineageExec`: `rowid` per file (embedded row id, else `row_id_start` + position)
+   - `OpenTimeFilterBarrierExec`: keeps a filter above the scan unless the reader is guaranteed to apply it in every file
    - Delete files contain `(file_path: VARCHAR, pos: INT64)` schema
-   - Efficiently filters rows by position during query execution
-   - Supports COUNT(*) optimization (zero-column batches)
+   - `DeleteFilterExec` (`src/delete_filter.rs`, one file, positions read at planning) remains for the UPDATE source scan and name-mapped partial files
 
 7. **Type Mapping** (`src/types.rs`)
    - Converts DuckLake type strings to Arrow DataTypes
@@ -135,11 +136,11 @@ When querying a DuckLake table:
    - File paths (relative to table path or absolute)
 7. `DuckLakeTable` resolves file paths to ObjectStoreUrl and relative paths
 8. For each file, check if delete file exists (from metadata join)
-9. Files without deletes are grouped into a single efficient `ParquetExec`
-10. Files with deletes get individual `ParquetExec` wrapped in `DeleteFilterExec`
+9. Files are grouped by read layout (with/without deletes, rowid, name mapping); each group is one scan, its files bound by field id as they open
+10. A positional scan carries each row's position and its file's id; `LazyDeleteFilterExec` and `RowLineageExec` apply deletes and `rowid` per file
 11. All execution plans are combined with `UnionExec` if multiple plans exist
 12. DataFusion scans Parquet files using registered object stores
-13. Delete filters apply row position filtering during streaming execution
+13. Delete sets are read when the scan reaches their data file, not at planning
 
 ### Path Resolution Hierarchy
 
@@ -180,16 +181,17 @@ The `DuckLakeTable` provider handles URL resolution by:
 - **Footer Size Optimization**: Parquet footer sizes stored in metadata and passed via `with_metadata_size_hint()`
   - Reduces I/O from 2 reads to 1 read per file (especially beneficial for S3/MinIO)
   - Applied to both data files and delete files
-- Files without delete files are grouped into a single `ParquetExec` for efficiency
-- Files with delete files get individual `ParquetExec` wrapped in `DeleteFilterExec`
+- One scan per read layout; files are bound by field id at open, so planning reads no data or delete file
+  (except name-mapped partial files read below `partial_max`, which keep a per-file read)
+- Per-row nodes (`LazyDeleteFilterExec`, `RowLineageExec`, `SnapshotFilterExec`) decline repartitioning below them, so a `LIMIT` stops early; their scan is split into file groups instead
 
 ### Delete File Implementation
 - **Delete files** contain row positions to exclude: `(file_path: VARCHAR, pos: INT64)`
 - Metadata join in `SQL_GET_DATA_FILES` associates delete files with data files
-- `DeleteFilterExec` wraps Parquet scans and filters rows by global position
-- Supports MOR (Merge-On-Read) pattern for efficient row-level deletes
-- Handles edge cases: COUNT(*) optimization, empty batches, all rows deleted
-- See `delete_filter.rs` and `tests/it/delete_filter_tests.rs` for implementation and tests
+- `LazyDeleteFilterExec` filters rows by physical position, reading each delete set lazily (fresh delete-file scan per attempt)
+- At the current snapshot, `count(*)` is answered from catalog counts (`record_count` − `delete_count` − inlined), reading no delete file
+- Handles edge cases: empty batches, all rows deleted, missing delete file (fails when rows are read)
+- See `lazy_delete_filter.rs`, `docs/physical-row-positions.md` and `tests/it/open_time_field_id_tests.rs`
 
 ### Filter Pushdown
 - Implements `supports_filters_pushdown()` returning `Inexact` for all filters
@@ -198,7 +200,8 @@ The `DuckLakeTable` provider handles URL resolution by:
   - Page-level filtering with late materialization
   - Bloom filter lookups (if available)
 - Marks filters as `Inexact` because delete filtering happens after Parquet scan
-- DataFusion automatically reapplies filters after `DeleteFilterExec` for correctness
+- A filter kept above the scan is reapplied after the delete filter; one pushed below it removes the
+  same rows either way, since deletes are keyed by physical row position
 
 ### Type System
 

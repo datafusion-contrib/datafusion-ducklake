@@ -100,6 +100,12 @@ impl ExecutionPlan for SnapshotFilterExec {
         vec![&self.input]
     }
 
+    /// No repartition below this node: a round-robin repartition would drain
+    /// the scan eagerly, so a `LIMIT` above could not stop it.
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
     /// Order-preserving: drops rows but never reorders them.
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
