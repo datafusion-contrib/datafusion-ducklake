@@ -952,7 +952,7 @@ pub(crate) fn metadata_size_hint(footer_size: Option<i64>) -> Option<usize> {
 /// size)` builds (see [`DuckLakeTable::partitioned_file`]): epoch
 /// `last_modified`, no e_tag or version. A plan-time footer probe that builds
 /// this exact shape can share the `RuntimeEnv` `FileMetadataCache` entry with
-/// the scan's own `CachedParquetFileReaderFactory` read (#1323) —
+/// the scan's own `CachedParquetFileReaderFactory` read —
 /// `CachedFileMetadataEntry::is_valid_for` requires an exact `size` AND
 /// `last_modified` match (the cache itself keys only by location), so any
 /// other `last_modified` would silently miss the entry the scan populates,
@@ -968,7 +968,7 @@ fn epoch_object_meta(location: ObjectPath, size: u64) -> ObjectMeta {
 }
 
 /// Read `resolved_path`'s parquet footer once, through `state`'s shared
-/// `RuntimeEnv` file-metadata cache (#1323) rather than the uncached
+/// `RuntimeEnv` file-metadata cache rather than the uncached
 /// one-shot `ParquetObjectReader` this used before: a warm cache serves this
 /// from memory, whether the entry was populated by an earlier call here or by
 /// the scan's own `CachedParquetFileReaderFactory` (same cache key — see
@@ -1064,7 +1064,7 @@ pub(crate) async fn read_parquet_footer_facts(
 /// store through `state`'s shared file-metadata cache (the `RuntimeEnv`'s
 /// `FileMetadataCache`, sized by `with_metadata_cache_limit`), rather than the
 /// uncached `DefaultParquetFileReaderFactory` a bare `ParquetSource::new`
-/// falls back to (#1323). Every query-time `ParquetSource` this crate builds
+/// falls back to. Every query-time `ParquetSource` this crate builds
 /// should attach one, so a footer fetched once (by this scan, another scan, or
 /// the caller's own footer sampling) is never re-fetched for the life of the
 /// cache.
@@ -2307,8 +2307,7 @@ impl DuckLakeTable {
     /// Build the parquet source for a scan, with the table's encryption factory
     /// attached when one is installed, and a [`CachedParquetFileReaderFactory`]
     /// attached so the scan reads footers through `state`'s shared
-    /// file-metadata cache instead of re-fetching them per file per query
-    /// (#1323).
+    /// file-metadata cache instead of re-fetching them per file per query.
     ///
     /// Accepts either a plain file schema or a [`TableSchema`] — the latter is
     /// how a *positional* scan asks the reader for the physical-position virtual
@@ -2423,7 +2422,7 @@ impl DuckLakeTable {
         // field ids. Checked FIRST, before any I/O: a renamed file used to pay
         // a footer fetch here on every `scan()` whose result this branch then
         // discarded outright (the dominant plan-time footer cost, worse than
-        // the execute-time read #1323 originally fixed, since it ran even for
+        // the execute-time read the shared cache originally fixed, since it ran even for
         // files this method never needed to open at all).
         if let Some(mapping_id) = file.mapping_id {
             return self.mapped_schema(mapping_id, &resolved_path);
@@ -2461,7 +2460,7 @@ impl DuckLakeTable {
         let decryption_properties = None;
 
         // Read the footer through `state`'s shared `RuntimeEnv` file-metadata
-        // cache (#1323) — the same cache key a scan's own
+        // cache — the same cache key a scan's own
         // `CachedParquetFileReaderFactory` read uses (see `epoch_object_meta`),
         // so whichever of the two runs first for a given file populates the
         // entry the other then hits for free. Note an encrypted footer is
@@ -7132,7 +7131,7 @@ mod tests {
         );
     }
 
-    // --- #1323: the DuckLake scan attaches the footer metadata cache ---
+    // --- the DuckLake scan attaches the footer metadata cache ---
 
     /// Real parquet bytes for a single row group matching `fixed_table`'s
     /// `id`/`region` (Int64, Int64) schema, so a scan can actually read a
@@ -7168,7 +7167,7 @@ mod tests {
     /// method a footer fetch could arrive through: `get_ranges` directly
     /// (`DFParquetMetadata`'s own call, and the only one this crate's footer
     /// reads use now that both the scan and `file_schema_mapping` route
-    /// through it — #1323), `get_opts` (a single bounded range there would
+    /// through it), `get_opts` (a single bounded range there would
     /// also qualify), and `get_range`, whose `ObjectStoreExt` default
     /// implementation calls `get_opts` on `self` and so is covered by the
     /// same override. Delegates every other `ObjectStore` method to `inner`
@@ -7301,7 +7300,7 @@ mod tests {
     /// `create_parquet_source` must attach a [`CachedParquetFileReaderFactory`]
     /// — reading through `state`'s shared file-metadata cache — rather than
     /// leaving DataFusion to fall back to the uncached
-    /// `DefaultParquetFileReaderFactory` (#1323). Builds a real
+    /// `DefaultParquetFileReaderFactory`. Builds a real
     /// `DataSourceExec`/`FileScanConfig` scan plan, exactly as a caller of
     /// `create_parquet_source` does, and downcasts down to the `ParquetSource`
     /// to inspect the attached factory.
@@ -7334,7 +7333,7 @@ mod tests {
 
         let factory = found_source
             .parquet_file_reader_factory()
-            .expect("a query-time ParquetSource must attach a reader factory (#1323)");
+            .expect("a query-time ParquetSource must attach a reader factory");
         let debug = format!("{factory:?}");
         assert!(
             debug.contains("CachedParquetFileReaderFactory"),
@@ -7347,7 +7346,7 @@ mod tests {
     /// End-to-end: scanning the same file twice on one `SessionContext` must
     /// issue the footer/page-index read only on the cold run. The warm run's
     /// `ParquetSource` reads through the same `RuntimeEnv` file-metadata cache
-    /// the cold run just populated (#1323), so it performs zero range reads
+    /// the cold run just populated, so it performs zero range reads
     /// whose end lands on the file's length.
     // Reads the table's object-store URL, which is only compiled with `write`.
     #[cfg(feature = "write")]
@@ -7409,7 +7408,7 @@ mod tests {
             counting.footer_reads(),
             footer_reads_after_cold_scan,
             "a warm scan must issue zero additional footer reads once the reader factory \
-             shares the session's metadata cache (#1323)",
+             shares the session's metadata cache",
         );
 
         Ok(())

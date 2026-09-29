@@ -1,4 +1,4 @@
-//! Round-trip tests for the positional-delete write path (#864 / #862):
+//! Round-trip tests for the positional-delete write path:
 //! `MetadataWriter::set_delete_file` registers a positional `(file_path, pos)`
 //! delete file, and a subsequent read applies it via `DeleteFilterExec`. These
 //! validate the fenced, cumulative, ≤1-live-per-data-file write end-to-end
@@ -397,7 +397,7 @@ async fn resolve_write_and_apply_positional_delete() {
     );
 }
 
-/// #864 fence: a concurrent APPEND that adds an unrelated data file must NOT
+/// Fence: a concurrent APPEND that adds an unrelated data file must NOT
 /// block a positional delete on a still-live data file. The resolved positions
 /// are physical row indices in the target file, which an append never moves, so
 /// the delete commits even against a pre-append `base_snapshot` and both files
@@ -481,7 +481,7 @@ async fn set_delete_file_allows_concurrent_append_to_other_file() {
     );
 }
 
-/// #864 fence: a positional delete on a data file that a concurrent Replace has
+/// Fence: a positional delete on a data file that a concurrent Replace has
 /// RETIRED must be rejected — the resolved positions refer to a file that is no
 /// longer live, so committing them would mask the wrong generation.
 #[tokio::test(flavor = "multi_thread")]

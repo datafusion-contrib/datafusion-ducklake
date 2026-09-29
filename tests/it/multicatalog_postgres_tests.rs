@@ -771,7 +771,7 @@ async fn postgres_sort_ddl_records_snapshot_changes() {
     assert_eq!(end_snapshot, reset_snapshot);
 }
 
-/// #864: the postgres `set_delete_file` write — fenced, cumulative,
+/// The postgres `set_delete_file` write — fenced, cumulative,
 /// ≤1-live-delete-file-per-data-file. Asserts the metadata effects directly (the
 /// read-side application via `DeleteFilterExec` is backend-agnostic and covered
 /// by the sqlite round-trip in `positional_delete_tests`).
