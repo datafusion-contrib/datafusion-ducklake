@@ -90,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Expiring the last snapshot that can read a dropped table now drops that table's
+  catalog-inlined storage — the `ducklake_inlined_data_<table_id>_<schema_version>` tables,
+  their `ducklake_inlined_data_tables` rows and the `ducklake_inlined_delete_<table_id>`
+  table — as official DuckLake's `DeleteSnapshots` does, on SQLite, DuckDB, MySQL and
+  multicatalog PostgreSQL. Before, these stayed in the metadata database forever.
+  `MulticatalogManager::drop_catalog` drops the same storage for every table of the catalog,
+  and `purge_orphaned_metadata_postgres` drops what earlier versions left behind.
 - A promoted file keeps the column statistics it is handed and the table roll-up is rebuilt
   from them in the same commit; a stat for a column outside the adopted ids is refused (#333).
 - A filter that cannot prune files, such as one on `rowid`, no longer disables file pruning

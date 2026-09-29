@@ -40,6 +40,7 @@ mod inlined_data_sqlite_tests;
 mod inlined_delete_fixture;
 mod inlined_delete_tests;
 mod inlined_native_types_tests;
+mod inlined_storage_reclaim_tests;
 mod insert_partitioning_tests;
 mod keyed_mutation_after_compaction_tests;
 mod list_column_pushdown_tests;

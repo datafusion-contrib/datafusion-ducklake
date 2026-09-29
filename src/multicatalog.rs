@@ -168,8 +168,9 @@ impl MulticatalogManager {
     /// Removes the catalog row, its mapping-table entries, and every
     /// entity reachable through those mappings: snapshots, schemas,
     /// tables, columns, data and delete file records, schema-version
-    /// history. Idempotent — returns `false` if no catalog by that name
-    /// exists.
+    /// history, and the catalog-inlined data and delete tables of its
+    /// tables (physical tables and registry rows). Idempotent — returns
+    /// `false` if no catalog by that name exists.
     ///
     /// # Concurrency
     ///
@@ -235,6 +236,20 @@ impl MulticatalogManager {
         // applies. Dropping a catalog without them orphans exactly what expire used
         // to orphan (#248), and on SQLite a reused data_file_id would then inherit
         // a dead file's stats and partition values.
+        //
+        // The catalog-inlined storage goes first, while the table rows still name
+        // it: the physical inlined-data and inlined-delete tables and their
+        // registry rows. Nothing can read them once the catalog is gone, and no
+        // later expire can reach them, because expire works through the catalog.
+        let catalog_tables: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT t.table_id FROM ducklake_table t
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+             WHERE m.catalog_id = $1",
+        )
+        .bind(catalog_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        drop_inlined_storage_pg(&mut tx, &catalog_tables).await?;
         for child_table in [
             "ducklake_data_file",
             "ducklake_delete_file",
@@ -886,13 +901,16 @@ impl MulticatalogManager {
         // 6. Reclaim per-table metadata for fully-expired tables. This is official's
         //    twelve-table list from DeleteSnapshots.
         //    Official's list is twelve (ducklake_metadata_manager.cpp, DeleteSnapshots).
-        //    ducklake_column_tag, ducklake_inlined_data_tables and
-        //    ducklake_column_mapping are omitted because this schema does not have
-        //    them. IF ANY OF THE THREE IS EVER ADDED, ADD IT HERE TOO — official
-        //    reclaims it, and a table-scoped table this loop misses orphans forever.
+        //    ducklake_column_tag and ducklake_column_mapping are omitted because this
+        //    schema does not have them. IF EITHER IS EVER ADDED, ADD IT HERE TOO —
+        //    official reclaims it, and a table-scoped table this loop misses orphans
+        //    forever. ducklake_inlined_data_tables is reclaimed by
+        //    `drop_inlined_storage_pg` together with the physical tables its rows
+        //    name, as official does in the same block.
         //    ducklake_table_stats is in it because this writer
         //    creates and maintains it — the comment that used to say otherwise was
         //    wrong — and the SQLite expire path already reclaimed it.
+        drop_inlined_storage_pg(&mut tx, &dead_tables).await?;
         for table in [
             "ducklake_table",
             "ducklake_table_stats",
@@ -1220,4 +1238,54 @@ async fn schedule_pg_files(
         .await?;
     }
     Ok(ids)
+}
+
+/// Drop the catalog-inlined storage of tables that nothing can read any more.
+///
+/// For each table id this drops every physical inlined-data table registered in
+/// `ducklake_inlined_data_tables` (`ducklake_inlined_data_<table_id>_<schema_version>`),
+/// the table's inlined file-deletion table (`ducklake_inlined_delete_<table_id>`, which
+/// the official extension creates and this crate reads), and the registry rows.
+/// This is the block official `DuckLakeMetadataManager::DeleteSnapshots` runs for its
+/// `cleanup_tables`. Call it only for tables no surviving snapshot can read: a fully
+/// expired table, or a table of a catalog that is being dropped. PostgreSQL DDL is
+/// transactional, so the drops commit or roll back with the caller's transaction.
+async fn drop_inlined_storage_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table_ids: &[i64],
+) -> Result<()> {
+    if table_ids.is_empty() {
+        return Ok(());
+    }
+    let registry_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+            .fetch_one(&mut **tx)
+            .await?;
+    let mut physical: Vec<String> = if registry_exists {
+        sqlx::query_scalar(
+            "DELETE FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)
+             RETURNING table_name",
+        )
+        .bind(table_ids)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    for &table_id in table_ids {
+        physical.push(crate::metadata_provider::inlined_delete_table_name(
+            table_id,
+        )?);
+    }
+    physical.sort();
+    physical.dedup();
+    for name in physical {
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {}",
+            crate::metadata_writer_postgres::quote_ident(&name)
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }

@@ -714,10 +714,96 @@ impl MySqlMetadataWriter {
             )
             .execute(&mut *tx)
             .await?;
+            let inlined = unreachable_inlined_storage(&mut tx, &dead_tables).await?;
             tx.commit().await?;
+            drop_inlined_storage(&self.pool, inlined).await?;
             Ok(candidates)
         })
     }
+}
+
+/// Catalog-inlined storage that no snapshot can read any more, found after
+/// expire has deleted the `ducklake_table` rows of fully-expired tables.
+struct UnreachableInlinedStorage {
+    /// Table ids whose `ducklake_inlined_data_tables` rows are to be deleted.
+    registry_ids: Vec<i64>,
+    /// Physical tables to drop.
+    physical: Vec<String>,
+}
+
+/// Find the catalog-inlined storage of tables that nothing can read any more:
+/// every physical table in `ducklake_inlined_data_tables` whose table row is
+/// gone, and the `ducklake_inlined_delete_<table_id>` table (created by the
+/// official extension, read by this crate) of every fully-expired table. This
+/// is the `cleanup_tables` block of official
+/// `DuckLakeMetadataManager::DeleteSnapshots`.
+///
+/// Keying the registry side on "no table row" rather than on this expire's
+/// dead tables alone also picks up storage that an earlier expire failed to
+/// finish dropping (see [`drop_inlined_storage`]), so a crash there is repaired
+/// by the next expire.
+async fn unreachable_inlined_storage(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    dead_tables: &[i64],
+) -> Result<UnreachableInlinedStorage> {
+    let registry_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = DATABASE() AND table_name = 'ducklake_inlined_data_tables'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut registry_ids = Vec::new();
+    let mut physical = Vec::new();
+    if registry_exists > 0 {
+        let rows = sqlx::query(
+            "SELECT r.table_id, r.table_name FROM ducklake_inlined_data_tables r
+             WHERE NOT EXISTS (SELECT 1 FROM ducklake_table t WHERE t.table_id = r.table_id)",
+        )
+        .fetch_all(&mut **tx)
+        .await?;
+        for row in rows {
+            registry_ids.push(row.try_get::<i64, _>(0)?);
+            physical.push(row.try_get::<String, _>(1)?);
+        }
+    }
+    for &table_id in dead_tables {
+        physical.push(crate::metadata_provider::inlined_delete_table_name(
+            table_id,
+        )?);
+    }
+    registry_ids.sort_unstable();
+    registry_ids.dedup();
+    physical.sort();
+    physical.dedup();
+    Ok(UnreachableInlinedStorage {
+        registry_ids,
+        physical,
+    })
+}
+
+/// Drop the storage [`unreachable_inlined_storage`] found, then delete its
+/// registry rows. MySQL DDL commits the open transaction implicitly, so this
+/// runs after expire has committed. The registry rows go last: if the process
+/// stops part way, they still name the tables that are left, and the next
+/// expire drops those (`DROP TABLE IF EXISTS`) and deletes the rows.
+async fn drop_inlined_storage(pool: &MySqlPool, storage: UnreachableInlinedStorage) -> Result<()> {
+    for name in &storage.physical {
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(name)
+        )))
+        .execute(pool)
+        .await?;
+    }
+    if !storage.registry_ids.is_empty() {
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM ducklake_inlined_data_tables WHERE table_id IN ({})",
+            id_list(&storage.registry_ids)
+        )))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Atomically reserve `n` consecutive ids from a monotonic counter stored in

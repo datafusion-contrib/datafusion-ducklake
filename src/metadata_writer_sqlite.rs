@@ -888,6 +888,12 @@ impl SqliteMetadataWriter {
             //    dropped table's orphaned ducklake_table_stats row is removed).
             if !dead_tables.is_empty() {
                 let dead = id_list(&dead_tables);
+                // The catalog-inlined storage of a fully-expired table: its
+                // physical inlined-data tables, its inlined-delete table and
+                // their ducklake_inlined_data_tables rows. Official drops these
+                // in the same block of DeleteSnapshots; no snapshot can read
+                // them any more, and nothing else ever will drop them.
+                drop_inlined_storage(&mut tx, &dead_tables).await?;
                 // `ducklake_schema_versions` is keyed by table_id and has no
                 // end_snapshot; reclaim its rows here once the table is fully
                 // expired (a recreate-after-drop gets a fresh table_id, so this
@@ -1579,6 +1585,48 @@ async fn replaced_storage(
         }
     }
     Ok((replaced, false))
+}
+
+/// Drop the catalog-inlined storage of tables that nothing can read any more:
+/// every physical table registered for them in `ducklake_inlined_data_tables`,
+/// their `ducklake_inlined_delete_<table_id>` tables (created by the official
+/// extension, read by this crate), and the registry rows. Mirrors the
+/// `cleanup_tables` block of official `DuckLakeMetadataManager::DeleteSnapshots`.
+/// SQLite DDL is transactional, so this commits or rolls back with `tx`.
+async fn drop_inlined_storage(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_ids: &[i64],
+) -> Result<()> {
+    if table_ids.is_empty() {
+        return Ok(());
+    }
+    let ids = id_list(table_ids);
+    let mut physical: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id IN ({ids})"
+    )))
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query(AssertSqlSafe(format!(
+        "DELETE FROM ducklake_inlined_data_tables WHERE table_id IN ({ids})"
+    )))
+    .execute(&mut **tx)
+    .await?;
+    for &table_id in table_ids {
+        physical.push(crate::metadata_provider::inlined_delete_table_name(
+            table_id,
+        )?);
+    }
+    physical.sort();
+    physical.dedup();
+    for name in physical {
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(&name)
+        )))
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
 }
 
 async fn inlined_table_names(

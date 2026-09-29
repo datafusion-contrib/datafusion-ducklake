@@ -779,6 +779,84 @@ pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
             );
         }
     }
+    purge_orphaned_inlined_storage(pool).await
+}
+
+/// Maximum number of orphaned catalog-inlined tables one purge drops. Each is a
+/// `DROP TABLE`, which takes an exclusive lock, so the cap is lower than
+/// [`ORPHAN_PURGE_BATCH`]. A larger backlog drains over the next sweeps.
+const ORPHAN_INLINED_PURGE_MAX: i64 = 1_000;
+
+/// Drop catalog-inlined tables whose DuckLake table row is already gone.
+///
+/// Expire and `drop_catalog` used to delete a table's `ducklake_table` rows but
+/// keep its physical `ducklake_inlined_data_<table_id>_<schema_version>` tables,
+/// their `ducklake_inlined_data_tables` registry rows, and its
+/// `ducklake_inlined_delete_<table_id>` table. Nothing can read those once the
+/// table row is gone, and nothing else will drop them. The same anti-join
+/// argument as for the rows above makes this safe: a writer inserts the table
+/// row before, or in the same transaction as, the inlined storage for it.
+async fn purge_orphaned_inlined_storage(pool: &PgPool) -> Result<()> {
+    let has_registry: bool =
+        sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    let registered: Vec<(i64, String)> = if has_registry {
+        sqlx::query_as(
+            "SELECT r.table_id, r.table_name FROM ducklake_inlined_data_tables r
+             WHERE NOT EXISTS (SELECT 1 FROM ducklake_table t WHERE t.table_id = r.table_id)
+             LIMIT $1",
+        )
+        .bind(ORPHAN_INLINED_PURGE_MAX)
+        .fetch_all(pool)
+        .await?
+    } else {
+        Vec::new()
+    };
+    let deletes: Vec<String> = sqlx::query_scalar(
+        "SELECT c.tablename::text FROM pg_catalog.pg_tables c
+         WHERE c.schemaname = current_schema()
+           AND c.tablename ~ '^ducklake_inlined_delete_[0-9]{1,18}$'
+           AND NOT EXISTS (
+               SELECT 1 FROM ducklake_table t
+               WHERE t.table_id = substring(c.tablename FROM 25)::bigint)
+         LIMIT $1",
+    )
+    .bind(ORPHAN_INLINED_PURGE_MAX)
+    .fetch_all(pool)
+    .await?;
+    let removed = registered.len() + deletes.len();
+    for (table_id, table_name) in registered {
+        let mut tx = pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM ducklake_inlined_data_tables WHERE table_id = $1 AND table_name = $2",
+        )
+        .bind(table_id)
+        .bind(&table_name)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(&table_name)
+        )))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    for table_name in deletes {
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP TABLE IF EXISTS {}",
+            quote_ident(&table_name)
+        )))
+        .execute(pool)
+        .await?;
+    }
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            "dropped orphaned DuckLake inlined tables whose ducklake_table row was already gone"
+        );
+    }
     Ok(())
 }
 
