@@ -262,7 +262,7 @@ async fn nan_rows_survive_a_filtered_rowid_scan() {
     );
 }
 
-/// `build_exec_for_file_with_deletes` had no NaN barrier on either branch. Its
+/// `build_exec_for_files_with_deletes` had no NaN barrier on either branch. Its
 /// plain-scan branch has always accepted pushed predicates, so this was a live
 /// gap; its positional branch gains pushdown with this change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

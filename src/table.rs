@@ -11,8 +11,9 @@ use chrono::{DateTime, Utc};
 use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
-use crate::field_id_adapter::FieldIdExprAdapterFactory;
+use crate::field_id_adapter::{DefaultFill, FieldIdExprAdapterFactory};
 use crate::inlined_filter::translate_inlined_filters;
+use crate::lazy_delete_filter::{FileDeletes, LazyDeleteFilterExec, read_delete_positions};
 use crate::metadata_provider::{
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
@@ -24,7 +25,8 @@ use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::row_id::{
     ROW_ID_PARQUET_FIELD_ID, ROWID_COLUMN_NAME, RowIdExec, SNAPSHOT_ID_PARQUET_FIELD_ID,
-    positional_table_schema, positional_table_schema_reserving, rowid_field,
+    positional_table_schema, positional_table_schema_reserving, row_pos_virtual_field, rowid_field,
+    unique_row_pos_name,
 };
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::stats_filter::{self, StatsFilter};
@@ -77,7 +79,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
-use futures::StreamExt;
 use object_store::ObjectMeta;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjectPath;
@@ -89,6 +90,10 @@ use datafusion::execution::parquet_encryption::EncryptionFactory;
 // Delete file schema constants (public for testing)
 pub const DELETE_FILE_PATH_COL: &str = "file_path";
 pub const DELETE_POS_COL: &str = "pos";
+/// The per-deletion snapshot column official DuckLake writes into a delete file
+/// that accumulates deletions across snapshots. Identified by name, as official
+/// identifies it.
+pub(crate) const DELETE_SNAPSHOT_COL: &str = "_ducklake_internal_snapshot_id";
 
 /// Parquet field-id DuckLake's own `ducklake` extension assigns to a positional
 /// delete file's `file_path` column (its `FILENAME` virtual column). We stamp it
@@ -820,6 +825,18 @@ pub fn delete_file_schema() -> SchemaRef {
         Field::new(DELETE_POS_COL, DataType::Int64, false)
             .with_metadata(parquet_field_id_metadata(DELETE_POS_FIELD_ID)),
     ]))
+}
+
+/// [`delete_file_schema`] with the per-deletion snapshot column a delete file may
+/// carry; a file without it reads the column as NULL.
+fn delete_file_read_schema() -> SchemaRef {
+    let mut fields: Vec<Field> = delete_file_schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields.push(Field::new(DELETE_SNAPSHOT_COL, DataType::Int64, true));
+    Arc::new(Schema::new(fields))
 }
 
 /// One catalog metadata page, resolved: its files, the per-file statistics that
@@ -2546,48 +2563,14 @@ impl DuckLakeTable {
         Ok(positions)
     }
 
-    /// Turn a failed delete-file scan into a caller-facing error, replacing the
-    /// raw parquet failure with a "delete file is missing" message when the file
-    /// really is absent from the object store.
-    ///
-    /// The absence cannot be read off the error alone: DataFusion's parquet
-    /// reader flattens the metadata-fetch failure into a `ParquetError::General`
-    /// string, so the underlying `object_store::Error::NotFound` is no longer in
-    /// the source chain. Probing the store is only done once a scan has already
-    /// failed, so the happy path pays nothing.
-    async fn classify_delete_file_read_error(
-        &self,
-        state: &dyn Session,
-        resolved_delete_path: &str,
-        err: DataFusionError,
-    ) -> DataFusionError {
-        let missing = if is_object_store_not_found(&err) {
-            true
-        } else {
-            match state
-                .runtime_env()
-                .object_store(self.object_store_url.as_ref())
-            {
-                Ok(store) => matches!(
-                    store.head(&ObjectPath::from(resolved_delete_path)).await,
-                    Err(object_store::Error::NotFound { .. })
-                ),
-                Err(_) => false,
-            }
-        };
-        if missing {
-            DataFusionError::Execution(format!(
-                "Delete file '{resolved_delete_path}' referenced in catalog metadata was not found. This may indicate catalog corruption or that the file was deleted outside of DuckLake."
-            ))
-        } else {
-            err
-        }
-    }
-
-    /// Read a delete file and return the set of physical row positions it marks
-    /// deleted (the `pos` column). Callers use this to form the cumulative
-    /// (prior ∪ new) position set when superseding a data file's live delete
-    /// file via [`crate::metadata_writer::MetadataWriter::set_delete_file`].
+    /// Read a delete file and return EVERY physical row position it marks
+    /// deleted (the `pos` column), whatever snapshot recorded each deletion.
+    /// Callers use this to form the cumulative (prior ∪ new) position set when
+    /// superseding a data file's live delete file via
+    /// [`crate::metadata_writer::MetadataWriter::set_delete_file`]: a delete file
+    /// official DuckLake wrote can hold deletions made after this table's
+    /// snapshot, and a superseding file that left them out would restore those
+    /// rows.
     ///
     /// The delete file is already associated with a specific data file via
     /// metadata; only `pos` is read (the `file_path` column is documentation).
@@ -2596,13 +2579,48 @@ impl DuckLakeTable {
         state: &dyn Session,
         delete_file: &DuckLakeFileData,
     ) -> DataFusionResult<HashSet<i64>> {
-        // Get the standard delete file schema
-        let delete_schema = delete_file_schema();
+        self.read_delete_file_positions_at(state, delete_file, None)
+            .await
+    }
 
-        // Resolve the delete file path
+    /// The positions a delete file removes from a read at this table's
+    /// snapshot: those whose recorded deletion snapshot, where the file records
+    /// one, is not after it. For read paths only; a write that supersedes the
+    /// file takes [`Self::read_delete_file_positions`].
+    async fn read_visible_delete_file_positions(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+    ) -> DataFusionResult<HashSet<i64>> {
+        self.read_delete_file_positions_at(state, delete_file, Some(self.snapshot_id))
+            .await
+    }
+
+    async fn read_delete_file_positions_at(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+        read_snapshot: Option<i64>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        let (scan, resolved_delete_path) = self.delete_file_scan(state, delete_file)?;
+        read_delete_positions(
+            &scan,
+            &state.task_ctx(),
+            self.object_store_url.as_ref(),
+            &resolved_delete_path,
+            read_snapshot,
+        )
+        .await
+    }
+
+    /// The scan of `delete_file`'s `(file_path, pos)` rows, and its resolved
+    /// path. Building it reads nothing.
+    pub(crate) fn delete_file_scan(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+    ) -> DataFusionResult<(Arc<dyn ExecutionPlan>, String)> {
         let resolved_delete_path = self.resolve_file_path(delete_file)?;
-
-        // Create PartitionedFile with footer size hint if available
         let mut pf = PartitionedFile::new(
             &resolved_delete_path,
             validated_file_size(delete_file.file_size_bytes, &resolved_delete_path)?,
@@ -2610,43 +2628,18 @@ impl DuckLakeTable {
         if let Some(hint) = metadata_size_hint(delete_file.footer_size) {
             pf = pf.with_metadata_size_hint(hint);
         }
-
-        // Create file scan config for the delete file
+        // DataSourceExec over our own ParquetSource, which carries the
+        // encryption factory.
         let file_scan_config = FileScanConfigBuilder::new(
             self.object_store_url.as_ref().clone(),
-            Arc::new(self.create_parquet_source(state, delete_schema)?),
+            Arc::new(self.create_parquet_source(state, delete_file_read_schema())?),
         )
         .with_file_group(FileGroup::new(vec![pf]))
         .build();
-
-        // Use DataSourceExec directly to preserve our ParquetSource with encryption factory
-        let exec = DataSourceExec::from_data_source(file_scan_config);
-
-        // Execute and collect all batches
-        let task_ctx = state.task_ctx();
-        let stream = exec.execute(0, task_ctx)?;
-
-        let collected = stream
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<DataFusionResult<Vec<_>>>();
-        let batches: Vec<RecordBatch> = match collected {
-            Ok(batches) => batches,
-            Err(e) => {
-                return Err(self
-                    .classify_delete_file_read_error(state, &resolved_delete_path, e)
-                    .await);
-            },
-        };
-
-        // Extract all positions from all batches
-        let mut positions = HashSet::new();
-        for batch in batches {
-            extract_deleted_positions_from_batch(&batch, &mut positions)?;
-        }
-
-        Ok(positions)
+        Ok((
+            DataSourceExec::from_data_source(file_scan_config),
+            resolved_delete_path,
+        ))
     }
 
     pub(crate) fn inlined_deletes_by_file(&self) -> DataFusionResult<HashMap<i64, HashSet<i64>>> {
@@ -2678,7 +2671,10 @@ impl DuckLakeTable {
     ) -> DataFusionResult<HashSet<i64>> {
         let mut positions = inlined_positions.cloned().unwrap_or_default();
         if let Some(delete_file) = &table_file.delete_file {
-            positions.extend(self.read_delete_file_positions(state, delete_file).await?);
+            positions.extend(
+                self.read_visible_delete_file_positions(state, delete_file)
+                    .await?,
+            );
         }
         // Positions are NOT filtered against the file's recorded `record_count`,
         // for two reasons that point the same way.
@@ -2957,12 +2953,20 @@ impl DuckLakeTable {
                 DataSourceExec::from_data_source(builder.build());
 
             let mut exec = if !name_mapping.is_empty() || parquet_exec.schema() != output_schema {
-                Arc::new(ColumnRenameExec::new_with_constants(
-                    parquet_exec,
-                    output_schema.clone(),
-                    name_mapping,
-                    constants,
-                )) as Arc<dyn ExecutionPlan>
+                let defaults = if resolved_by_field_id {
+                    HashMap::new()
+                } else {
+                    self.mapped_nested_defaults(&read_schema, projection)?
+                };
+                Arc::new(
+                    ColumnRenameExec::new_with_constants(
+                        parquet_exec,
+                        output_schema.clone(),
+                        name_mapping,
+                        constants,
+                    )
+                    .with_defaults(defaults),
+                ) as Arc<dyn ExecutionPlan>
             } else {
                 parquet_exec
             };
@@ -2979,6 +2983,36 @@ impl DuckLakeTable {
         }
 
         combine_execution_plans(execs)
+    }
+
+    /// By output column name, the struct children a name-mapped file's
+    /// `read_schema` marks absent that take a default: official DuckLake fills
+    /// every child a file predates from its `initial_default`, whichever way the
+    /// file's columns are mapped.
+    fn mapped_nested_defaults(
+        &self,
+        read_schema: &Schema,
+        projection: Option<&Vec<usize>>,
+    ) -> DataFusionResult<HashMap<String, Arc<DefaultFill>>> {
+        let indices: Vec<usize> = match projection {
+            Some(indices) => indices.clone(),
+            None => (0..self.physical_schema.fields().len()).collect(),
+        };
+        let mut defaults = HashMap::new();
+        for index in indices {
+            let (Some(read_field), Some(column)) =
+                (read_schema.fields().get(index), self.columns.get(index))
+            else {
+                continue;
+            };
+            let catalog_field = self.physical_schema.field(index);
+            if let Some(fill) =
+                DefaultFill::build(read_field.data_type(), catalog_field.data_type(), column)?
+            {
+                defaults.insert(self.schema.field(index).name().clone(), Arc::new(fill));
+            }
+        }
+        Ok(defaults)
     }
 
     /// Group key for a name-mapped file: physical field names and types, then
@@ -3045,6 +3079,25 @@ impl DuckLakeTable {
             }
         }
         Arc::new(unsafe_columns)
+    }
+
+    /// Split a scan that feeds a per-row node (the delete filter) into file
+    /// groups, as DataFusion's `repartition_file_scans` splits a scan whose
+    /// parent can use the parallelism. That node declines repartitioning below
+    /// it, so the optimizer leaves this scan alone; the split honours the
+    /// session's `target_partitions`, `repartition_file_scans` and
+    /// `repartition_file_min_size`, and so leaves a small scan whole.
+    fn split_scan(
+        &self,
+        scan: Arc<dyn ExecutionPlan>,
+        state: &dyn Session,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let options = state.config_options();
+        let target = state.config().target_partitions();
+        if !options.optimizer.repartition_file_scans || target <= 1 {
+            return Ok(scan);
+        }
+        Ok(scan.repartitioned(target, options)?.unwrap_or(scan))
     }
 
     /// Split a freshly built scan across `target_partitions` byte ranges.
@@ -3183,152 +3236,193 @@ impl DuckLakeTable {
         self.write_options = options;
         self
     }
-    /// The GROSS row count of one file — every row it holds, deleted rows
-    /// included — with all column bounds unknown, sized to `schema`.
+    /// Build one scan per read layout over the files with deletes, each file's
+    /// columns resolved as the reader opens it and its deletes read the first
+    /// time the scan returns rows of it (see [`LazyDeleteFilterExec`]). Reads no
+    /// file.
     ///
-    /// This is what the scan UNDER a [`DeleteFilterExec`] reports, because that
-    /// scan really does emit the deleted rows; the exec above it subtracts them
-    /// (see its `partition_statistics`). Publishing the net count in both places
-    /// would subtract twice.
-    ///
-    /// Bounds are unknown rather than inherited: the scan's own bounds describe
-    /// rows that are about to be filtered out, and the exec above cannot tighten
-    /// them, so letting them through would risk answering `max(col)` with a
-    /// deleted row's value.
-    ///
-    /// Keys on `record_count` and nothing else, and that is load-bearing:
-    /// `deleted_positions_for_file` bounds the delete set against the same field,
-    /// so a file without one publishes no count AND keeps every position. Give
-    /// this a fallback (`file_row_count` has a `value_count` one) and the pairing
-    /// breaks silently — a count would be published against an unbounded set.
-    fn gross_scan_statistics(
+    /// Files are grouped the way [`Self::build_exec_for_files_without_deletes`]
+    /// groups them: one scan resolved per file by field id, and one per distinct
+    /// name-mapped layout. No scan takes a `LIMIT`, which would stop it before
+    /// the rows that survive the deletes.
+    fn build_exec_for_files_with_deletes(
         &self,
         state: &dyn Session,
-        table_file: &DuckLakeTableFile,
-        schema: &SchemaRef,
-    ) -> Option<Statistics> {
-        if !state.config_options().execution.collect_statistics {
-            return None;
-        }
-        let rows = table_file
-            .max_row_count
-            .and_then(|value| statistic_usize(value, "record_count"))?;
-        let mut statistics = Statistics::new_unknown(schema);
-        statistics.num_rows = Precision::Exact(rows);
-        Some(statistics)
-    }
-
-    /// Build an execution plan for a single file with delete filtering
-    ///
-    /// Creates a Parquet scan wrapped with a delete filter to exclude deleted rows.
-    async fn build_exec_for_file_with_deletes(
-        &self,
-        state: &dyn Session,
-        table_file: &DuckLakeTableFile,
-        inlined_positions: Option<&HashSet<i64>>,
+        files: &[&DuckLakeTableFile],
+        inlined_deletes: &HashMap<i64, HashSet<i64>>,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
-
-        // Deletes filter by physical row position, so this is a positional path:
-        // the scan must also read the reader-produced position column.
-        let deleted_positions = self
-            .deleted_positions_for_file(state, table_file, inlined_positions)
-            .await?;
-        let deleted_positions = (!deleted_positions.is_empty()).then_some(deleted_positions);
+        const FIELD_ID_GROUP_KEY: &str = "\u{0}field-id";
+        let mut groups: Vec<(SchemaMapping, Vec<&DuckLakeTableFile>, bool)> = Vec::new();
+        let mut group_index: HashMap<String, usize> = HashMap::new();
+        for table_file in files {
+            let (mapping, key, resolved_by_field_id) = match table_file.file.mapping_id {
+                Some(mapping_id) => {
+                    let resolved_path = self.resolve_file_path(&table_file.file)?;
+                    let mapping = self.mapped_schema(mapping_id, &resolved_path)?;
+                    let key = Self::mapped_group_key(&mapping);
+                    (mapping, key, false)
+                },
+                None => (
+                    (
+                        Arc::clone(&self.physical_schema),
+                        HashMap::new(),
+                        HashMap::new(),
+                    ),
+                    FIELD_ID_GROUP_KEY.to_string(),
+                    true,
+                ),
+            };
+            match group_index.get(&key) {
+                Some(&index) => groups[index].1.push(table_file),
+                None => {
+                    group_index.insert(key, groups.len());
+                    groups.push((mapping, vec![table_file], resolved_by_field_id));
+                },
+            }
+        }
 
         let output_schema = match projection {
             Some(indices) => Arc::new(self.schema.project(indices)?),
             None => self.schema.clone(),
         };
-
-        // Explicit parquet projection over `read_schema`. rowid is never
-        // projected on this path, so always read only the physical columns —
-        // for an embedded-rowid file, `read_schema` has a trailing embedded
-        // column we must NOT read here. With `projection = None` that means the
-        // physical columns `0..physical_len` (not "all of read_schema").
-        let proj_indices: Vec<usize> = match projection {
+        let physical_projection: Vec<usize> = match projection {
             Some(indices) => indices.clone(),
             None => (0..self.physical_schema.fields().len()).collect(),
         };
+        let collect_statistics = state.config_options().execution.collect_statistics;
+        // A delete file's `delete_count` counts every deletion it holds, and one
+        // that records each deletion's snapshot can hold deletions made after a
+        // historical read snapshot. Official answers `count(*)` from catalog counts
+        // only at the current snapshot; so does this.
+        let at_current_snapshot = !files.iter().any(|file| file.delete_file.is_some())
+            || self
+                .provider
+                .get_current_snapshot()
+                .is_ok_and(|current| current == self.snapshot_id);
 
-        let exec_after_delete: Arc<dyn ExecutionPlan> = if let Some(positions) = deleted_positions {
-            // Positional path: read the physical position alongside the data so
-            // deletes are matched by position. No scan-level limit (it would drop
-            // rows before the delete filter); DataFusion enforces LIMIT above.
-            let (table_schema, pos_table_idx, _pos_name) =
-                positional_table_schema(file_cfg.read_schema.clone());
-            let gross = self.gross_scan_statistics(state, table_file, table_schema.table_schema());
-            let mut proj = proj_indices.clone();
-            proj.push(pos_table_idx);
-            let pos_index = proj.len() - 1;
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
+        for ((read_schema, name_mapping, constants), group_files, resolved_by_field_id) in groups {
+            // The scan's table schema: the read columns, the data file's catalog
+            // id as a per-file partition value, and the reader's row position.
+            let file_id_name = unused_column_name(&read_schema, "__ducklake_data_file_id");
+            let pos_name =
+                unique_row_pos_name(read_schema.as_ref(), std::iter::once(file_id_name.as_str()));
+            let table_schema = TableSchema::builder(Arc::clone(&read_schema))
+                .with_table_partition_cols(vec![Arc::new(Field::new(
+                    &file_id_name,
+                    DataType::Int64,
+                    false,
+                ))])
+                .with_virtual_columns(vec![row_pos_virtual_field(&pos_name)])
+                .build();
+            let file_id_index = read_schema.fields().len();
+            let pos_index = file_id_index + 1;
 
-            let pf = self.partitioned_data_file(
-                table_file,
-                file_cfg.embedded_rowid_parquet_name.is_some(),
-                file_statistics,
-            )?;
-            let mut builder = self
-                .scan_config_builder(Arc::new(self.create_parquet_source(state, table_schema)?))
-                .with_file_group(FileGroup::new(vec![pf]));
-            builder = builder.with_projection_indices(Some(proj))?;
-            if let Some(gross) = gross {
-                builder = builder.with_statistics(gross);
+            let mut partitioned_files = Vec::with_capacity(group_files.len());
+            let mut deletes = HashMap::with_capacity(group_files.len());
+            let mut gross_rows = Some(0usize);
+            for table_file in &group_files {
+                let mut pf = self.partitioned_data_file(table_file, false, file_statistics)?;
+                pf.partition_values = vec![ScalarValue::Int64(Some(table_file.data_file_id))];
+                if let Some(statistics) = pf.statistics.take() {
+                    let mut statistics = statistics.as_ref().clone();
+                    statistics
+                        .column_statistics
+                        .push(ColumnStatistics::new_unknown());
+                    pf = pf.with_statistics(Arc::new(statistics));
+                }
+                partitioned_files.push(pf);
+                gross_rows = gross_rows
+                    .zip(
+                        table_file
+                            .max_row_count
+                            .and_then(|value| statistic_usize(value, "record_count")),
+                    )
+                    .map(|(total, rows)| total + rows);
+
+                let inlined = inlined_deletes
+                    .get(&table_file.data_file_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let (delete_file, file_deleted) = match &table_file.delete_file {
+                    Some(delete_file) => (
+                        Some(self.delete_file_scan(state, delete_file)?),
+                        table_file
+                            .delete_count
+                            .filter(|_| at_current_snapshot)
+                            .and_then(|value| statistic_usize(value, "delete_count")),
+                    ),
+                    None => (None, Some(0)),
+                };
+                deletes.insert(
+                    table_file.data_file_id,
+                    FileDeletes {
+                        delete_file,
+                        catalog_deleted: file_deleted.map(|deleted| deleted + inlined.len()),
+                        inlined,
+                        read_snapshot: Some(self.snapshot_id),
+                    },
+                );
             }
-            let scan = DataSourceExec::from_data_source(builder.build());
 
-            Arc::new(DeleteFilterExec::try_new(
-                scan,
-                table_file.file.path.clone(),
-                Arc::new(positions),
-                pos_index,
-            )?)
-        } else {
-            // No actual deletes for this file: plain scan, scan-level limit OK.
-            let pf = self.partitioned_data_file(
-                table_file,
-                file_cfg.embedded_rowid_parquet_name.is_some(),
-                file_statistics,
-            )?;
+            let mut scan_projection = physical_projection.clone();
+            scan_projection.extend([file_id_index, pos_index]);
             let mut builder = self
                 .scan_config_builder(Arc::new(
-                    self.create_parquet_source(state, file_cfg.read_schema.clone())?,
+                    self.create_parquet_source(state, table_schema.clone())?,
                 ))
-                .with_limit(limit)
-                .with_file_group(FileGroup::new(vec![pf]));
-            builder = builder.with_projection_indices(Some(proj_indices.clone()))?;
-            DataSourceExec::from_data_source(builder.build())
-        };
-
-        // ColumnRenameExec presents the catalog schema and, on the positional
-        // path, drops the internal physical-position column.
-        let mut exec: Arc<dyn ExecutionPlan> = if !file_cfg.name_mapping.is_empty()
-            || !file_cfg.constants.is_empty()
-            || exec_after_delete.schema() != output_schema
-        {
-            Arc::new(ColumnRenameExec::new_with_constants(
-                exec_after_delete,
-                output_schema,
-                file_cfg.name_mapping.clone(),
-                file_cfg.constants.clone(),
-            ))
-        } else {
-            exec_after_delete
-        };
-
-        // Both branches above can let a predicate reach the parquet reader's
-        // pruning, so both need the NaN barrier: footer float bounds exclude
-        // NaN, and pruning on them would silently drop NaN rows. The plain-scan
-        // branch (a file whose delete file resolves to no positions) has always
-        // been pushdown-capable and was missing this.
-        let nan_unsafe_columns =
-            self.nan_unsafe_float_columns(std::slice::from_ref(&table_file), file_statistics);
-        if !nan_unsafe_columns.is_empty() {
-            exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
+                .with_file_group(FileGroup::new(partitioned_files))
+                .with_projection_indices(Some(scan_projection))?;
+            if resolved_by_field_id {
+                builder = builder.with_expr_adapter(Some(Arc::new(
+                    FieldIdExprAdapterFactory::new(&self.columns),
+                )));
+            }
+            if collect_statistics && let Some(rows) = gross_rows {
+                let mut gross = Statistics::new_unknown(table_schema.table_schema());
+                gross.num_rows = Precision::Exact(rows);
+                builder = builder.with_statistics(gross);
+            }
+            let scan = self.split_scan(DataSourceExec::from_data_source(builder.build()), state)?;
+            let read_order = scan_read_order(&scan);
+            let mut exec: Arc<dyn ExecutionPlan> = Arc::new(
+                LazyDeleteFilterExec::try_new(
+                    scan,
+                    physical_projection.len(),
+                    physical_projection.len() + 1,
+                    deletes,
+                    self.object_store_url.as_ref().clone(),
+                )?
+                .with_read_order(read_order),
+            );
+            if !name_mapping.is_empty() || !constants.is_empty() || exec.schema() != output_schema {
+                let defaults = if resolved_by_field_id {
+                    HashMap::new()
+                } else {
+                    self.mapped_nested_defaults(&read_schema, projection)?
+                };
+                exec = Arc::new(
+                    ColumnRenameExec::new_with_constants(
+                        exec,
+                        Arc::clone(&output_schema),
+                        name_mapping,
+                        constants,
+                    )
+                    .with_defaults(defaults),
+                );
+            }
+            if resolved_by_field_id && has_struct_or_map_column(&read_schema) {
+                exec = Arc::new(OpenTimeFilterBarrierExec::new(exec));
+            }
+            let nan_unsafe_columns = self.nan_unsafe_float_columns(&group_files, file_statistics);
+            if !nan_unsafe_columns.is_empty() {
+                exec = Arc::new(NanPruningBarrierExec::new(exec, nan_unsafe_columns));
+            }
+            execs.push(exec);
         }
-        Ok(exec)
+        combine_execution_plans(execs)
     }
 
     /// Inspect a single file's parquet metadata for the row-lineage scan
@@ -3731,7 +3825,7 @@ impl DuckLakeTable {
         // `gather_filters_for_pushdown` nor `try_pushdown_sort`, so DataFusion's
         // defaults bar every parent filter and every sort, and nothing can reach
         // the reader's float pruning. Give `SnapshotFilterExec` either one and
-        // this path needs the barrier — see `build_exec_for_file_with_deletes`
+        // this path needs the barrier — see `build_exec_for_files_with_deletes`
         // for the shape. Sort pushdown needs it for the same reason filters do:
         // it reorders files and row groups from the same NaN-blind statistics
         // (see `NanPruningBarrierExec::try_pushdown_sort`).
@@ -4578,18 +4672,14 @@ impl TableProvider for DuckLakeTable {
                     limit,
                 )?);
             }
-            for table_file in files_with_deletes {
-                execs.push(
-                    self.build_exec_for_file_with_deletes(
-                        state,
-                        table_file,
-                        inlined_deletes.get(&table_file.data_file_id),
-                        &file_statistics,
-                        projection,
-                        limit,
-                    )
-                    .await?,
-                );
+            if !files_with_deletes.is_empty() {
+                execs.push(self.build_exec_for_files_with_deletes(
+                    state,
+                    &files_with_deletes,
+                    &inlined_deletes,
+                    &file_statistics,
+                    projection,
+                )?);
             }
             for table_file in needs_filter {
                 let output_schema = match projection {
@@ -4971,6 +5061,42 @@ fn has_struct_or_map_column(schema: &Schema) -> bool {
         .any(|field| matches!(field.data_type(), DataType::Struct(_) | DataType::Map(_, _)))
 }
 
+/// Per partition of `scan`, the catalog ids of the data files it reads, in the
+/// order it reads them: the first partition value of each file. Empty for a
+/// plan that is not a file scan.
+fn scan_read_order(scan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<i64>> {
+    let Some(config) = scan.downcast_ref::<DataSourceExec>().and_then(|exec| {
+        exec.data_source()
+            .downcast_ref::<datafusion::datasource::physical_plan::FileScanConfig>()
+    }) else {
+        return Vec::new();
+    };
+    config
+        .file_groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .filter_map(|file| match file.partition_values.first() {
+                    Some(ScalarValue::Int64(Some(id))) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `base`, or `base` suffixed until no field of `schema` is named it.
+fn unused_column_name(schema: &Schema, base: &str) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 0;
+    while schema.field_with_name(&name).is_ok() {
+        suffix += 1;
+        name = format!("{base}_{suffix}");
+    }
+    name
+}
+
 /// Combines multiple execution plans into a single plan
 fn combine_execution_plans(
     execs: Vec<Arc<dyn ExecutionPlan>>,
@@ -4983,41 +5109,8 @@ fn combine_execution_plans(
     }
 }
 
-/// Extract deleted row positions from a delete file RecordBatch
-///
-/// Delete files have schema: (file_path: VARCHAR, pos: INT64)
-/// We only extract the "pos" column - the "file_path" column is metadata/documentation
-/// only (for Iceberg compatibility). The metadata catalog already tells us which delete
-/// file is associated with which data file.
-fn extract_deleted_positions_from_batch(
-    batch: &RecordBatch,
-    positions: &mut HashSet<i64>,
-) -> DataFusionResult<()> {
-    // Get the pos column index by name (not magic number)
-    let schema = batch.schema();
-    let pos_idx = schema.index_of(DELETE_POS_COL)?;
-
-    // Get the pos column
-    let pos_array = batch
-        .column(pos_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| {
-            DataFusionError::Internal(format!("{} column not found or wrong type", DELETE_POS_COL))
-        })?;
-
-    // Extract all non-null positions
-    for i in 0..batch.num_rows() {
-        if !pos_array.is_null(i) {
-            positions.insert(pos_array.value(i));
-        }
-    }
-
-    Ok(())
-}
-
 /// Check if a DataFusion error is caused by an object store NotFound error.
-fn is_object_store_not_found(err: &DataFusionError) -> bool {
+pub(crate) fn is_object_store_not_found(err: &DataFusionError) -> bool {
     if let DataFusionError::ObjectStore(os_err) = err {
         return matches!(&**os_err, object_store::Error::NotFound { .. });
     }

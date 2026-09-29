@@ -32,6 +32,8 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 
+use crate::field_id_adapter::DefaultFill;
+
 /// Custom execution plan that renames columns from Parquet file names to current DuckLake names
 #[derive(Debug)]
 pub struct ColumnRenameExec {
@@ -45,6 +47,9 @@ pub struct ColumnRenameExec {
     reverse_mapping: Arc<HashMap<String, String>>,
     /// Per-file values synthesized from Hive path segments.
     constants: Arc<HashMap<String, ScalarValue>>,
+    /// By output column: the struct children the input predates that take a
+    /// default (see [`DefaultFill`]).
+    defaults: Arc<HashMap<String, Arc<DefaultFill>>>,
     /// Cached plan properties with updated schema
     properties: Arc<PlanProperties>,
 }
@@ -85,8 +90,16 @@ impl ColumnRenameExec {
             name_mapping,
             reverse_mapping: Arc::new(reverse_mapping),
             constants: Arc::new(constants),
+            defaults: Arc::new(HashMap::new()),
             properties,
         }
+    }
+
+    /// Fill, in each named output column, the struct children its input
+    /// predates with their defaults.
+    pub(crate) fn with_defaults(mut self, defaults: HashMap<String, Arc<DefaultFill>>) -> Self {
+        self.defaults = Arc::new(defaults);
+        self
     }
 
     /// Returns whether this node only renames columns without casting,
@@ -101,6 +114,7 @@ impl ColumnRenameExec {
     pub fn is_pure_type_preserving_rename(&self) -> bool {
         let input_schema = self.input.schema();
         self.constants.is_empty()
+            && self.defaults.is_empty()
             && input_schema.fields().len() == self.output_schema.fields().len()
             && input_schema
                 .fields()
@@ -133,16 +147,17 @@ impl ColumnRenameExec {
     /// stop at `DeleteFilterExec` below regardless.
     pub(crate) fn is_type_preserving_projection(&self) -> bool {
         let input_schema = self.input.schema();
-        self.output_schema.fields().iter().all(|output| {
-            let input_name = self
-                .reverse_mapping
-                .get(output.name())
-                .map(String::as_str)
-                .unwrap_or(output.name());
-            input_schema.field_with_name(input_name).is_ok_and(|input| {
-                types_equal_ignoring_field_metadata(input.data_type(), output.data_type())
+        self.defaults.is_empty()
+            && self.output_schema.fields().iter().all(|output| {
+                let input_name = self
+                    .reverse_mapping
+                    .get(output.name())
+                    .map(String::as_str)
+                    .unwrap_or(output.name());
+                input_schema.field_with_name(input_name).is_ok_and(|input| {
+                    types_equal_ignoring_field_metadata(input.data_type(), output.data_type())
+                })
             })
-        })
     }
 
     /// Restate sort keys written against this node's output schema in the
@@ -327,16 +342,24 @@ impl ExecutionPlan for ColumnRenameExec {
         }
 
         // Must call new() to rebuild properties from new child's partitioning
-        Ok(Arc::new(ColumnRenameExec::new_with_constants(
+        let mut exec = ColumnRenameExec::new_with_constants(
             Arc::clone(&children[0]),
             Arc::clone(&self.output_schema),
             self.name_mapping.clone(),
             self.constants.as_ref().clone(),
-        )))
+        );
+        exec.defaults = Arc::clone(&self.defaults);
+        Ok(Arc::new(exec))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
         self.is_pure_type_preserving_rename()
+    }
+
+    /// As the node below would have it: a leaf scan gains from repartitioning,
+    /// a per-row node that declines it does not (`benefits_through`).
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        crate::lazy_delete_filter::benefits_through(&self.input)
     }
 
     fn gather_filters_for_pushdown(
@@ -384,12 +407,14 @@ impl ExecutionPlan for ColumnRenameExec {
             .try_pushdown_sort(&remapped)?
             .into_inexact()
             .try_map(|inner| -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-                Ok(Arc::new(ColumnRenameExec::new_with_constants(
+                let mut exec = ColumnRenameExec::new_with_constants(
                     inner,
                     Arc::clone(&self.output_schema),
                     self.name_mapping.clone(),
                     self.constants.as_ref().clone(),
-                )))
+                );
+                exec.defaults = Arc::clone(&self.defaults);
+                Ok(Arc::new(exec))
             })
     }
 
@@ -405,6 +430,7 @@ impl ExecutionPlan for ColumnRenameExec {
             output_schema: Arc::clone(&self.output_schema),
             reverse_mapping: Arc::clone(&self.reverse_mapping),
             constants: Arc::clone(&self.constants),
+            defaults: Arc::clone(&self.defaults),
         }))
     }
 }
@@ -416,6 +442,7 @@ struct ColumnRenameStream {
     /// Mapping from output column name -> input column name (for renamed columns only)
     reverse_mapping: Arc<HashMap<String, String>>,
     constants: Arc<HashMap<String, ScalarValue>>,
+    defaults: Arc<HashMap<String, Arc<DefaultFill>>>,
 }
 
 impl Stream for ColumnRenameStream {
@@ -466,7 +493,12 @@ impl Stream for ColumnRenameStream {
                                 // self-consistent: it advertises and emits the catalog
                                 // schema regardless of the file's physical Arrow type.
                                 // Identical types clone cheaply.
-                                coerce_column(batch.column(idx), output_field.data_type())
+                                let column =
+                                    coerce_column(batch.column(idx), output_field.data_type())?;
+                                match self.defaults.get(output_field.name()) {
+                                    Some(defaults) => defaults.apply(&column),
+                                    None => Ok(column),
+                                }
                             })
                             .collect();
 
@@ -698,6 +730,7 @@ mod tests {
             output_schema: Arc::clone(&output_schema),
             reverse_mapping: Arc::new(reverse_mapping),
             constants: Arc::new(HashMap::new()),
+            defaults: Arc::new(HashMap::new()),
         };
 
         // The stream should report the output schema

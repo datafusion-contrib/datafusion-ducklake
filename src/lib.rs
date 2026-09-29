@@ -77,6 +77,7 @@ pub mod error;
 pub(crate) mod field_id_adapter;
 pub mod information_schema;
 pub mod inlined_filter;
+pub(crate) mod lazy_delete_filter;
 pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;

@@ -88,19 +88,62 @@ async fn test_delete_files_work_normally() -> DataFusionResult<()> {
     Ok(())
 }
 
+/// A bare `COUNT(*)` is answered from catalog counts, as official DuckLake's
+/// `DuckLakeGetPartitionStats` answers it: `SUM(record_count) - SUM(delete_count)`,
+/// with no delete file read. So it returns the catalog's count even when a delete
+/// file is missing from storage — the same number DuckDB returns on the same
+/// catalog — while any query that reads rows still fails on the missing file
+/// (`test_missing_delete_file_returns_error`, and the filtered count below).
 #[tokio::test]
-async fn test_missing_delete_file_count_query_errors() -> DataFusionResult<()> {
+async fn test_missing_delete_file_count_is_answered_from_the_catalog() -> DataFusionResult<()> {
     let temp_dir =
         TempDir::new().map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let catalog_path = temp_dir.path().join("missing_delete_count.ducklake");
     common::create_catalog_with_deletes(&catalog_path).map_err(common::to_datafusion_error)?;
     let removed = remove_delete_files(temp_dir.path());
     assert!(!removed.is_empty());
+
+    let duckdb_count: i64 = {
+        let conn = duckdb::Connection::open_in_memory()
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        common::ensure_ducklake_installed();
+        conn.execute("LOAD ducklake;", [])
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        common::attach_catalog_without_inlining(&conn, &catalog_path, "lake")
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        conn.query_row("SELECT COUNT(*) FROM lake.products", [], |row| row.get(0))
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+    };
+    assert_eq!(
+        duckdb_count, 3,
+        "DuckDB answers from the catalog: 5 rows less 2 deleted"
+    );
+
     let catalog = create_catalog(&catalog_path.to_string_lossy())?;
     let ctx = SessionContext::new();
     ctx.register_catalog("test", catalog);
-    let df = ctx.sql("SELECT COUNT(*) FROM test.main.products").await?;
-    let result = df.collect().await;
-    assert!(result.is_err(), "COUNT should error on missing delete file");
+    let batches = ctx
+        .sql("SELECT COUNT(*) FROM test.main.products")
+        .await?
+        .collect()
+        .await?;
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("count(*) is Int64")
+        .value(0);
+    assert_eq!(count, duckdb_count);
+
+    let read = ctx
+        .sql("SELECT COUNT(*) FROM test.main.products WHERE id > 0")
+        .await?
+        .collect()
+        .await;
+    let error = read.expect_err("a count that reads rows must fail on the missing delete file");
+    assert!(
+        error.to_string().contains("Delete file") && error.to_string().contains("not found"),
+        "unexpected error: {error}"
+    );
     Ok(())
 }

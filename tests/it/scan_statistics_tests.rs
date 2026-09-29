@@ -598,13 +598,14 @@ async fn partition_derived_bounds_never_answer_max() {
 
 /// A delete file records physical positions, and its `file_path` column is
 /// documentation this reader ignores, so one delete file referenced by two data
-/// files contributes the other file's positions. Execution already ignored the
-/// unmatched ones — it drops a row only when that row's own position is in the
-/// set — but the set's SIZE is now the published row count, so an unmatched
-/// position would subtract a row that was never removed and `count(*)` would
-/// answer below what a scan returns.
+/// files contributes the other file's positions. A scan drops a row only when
+/// that row's own position is in the set, so it returns the true rows. A bare
+/// `count(*)` is answered from catalog counts, as official DuckLake's
+/// `DuckLakeGetPartitionStats` answers it (`SUM(record_count) - SUM(delete_count)`),
+/// and the shared file's `delete_count` is counted against both data files — so
+/// on this catalog the two disagree, exactly as they do in official.
 #[tokio::test(flavor = "multi_thread")]
-async fn delete_position_outside_a_file_is_not_subtracted() {
+async fn a_shared_delete_file_is_counted_once_per_data_file_as_official_does() {
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
@@ -678,10 +679,14 @@ async fn delete_position_outside_a_file_is_not_subtracted() {
     let folded = scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t", 0).await;
     let scanned = scalar_i64(&ctx, "SELECT count(*) FROM ducklake.main.t WHERE id > 0", 0).await;
     assert_eq!(
-        folded, scanned,
-        "the folded count must equal what a scan returns"
+        scanned, 8,
+        "a scan returns the nine rows less the one actually deleted"
     );
-    assert_eq!(folded, 8, "nine rows less the one actually deleted");
+    assert_eq!(
+        folded, 7,
+        "the catalog count is nine rows less the delete_count of each data file's \
+         delete file, one each"
+    );
 }
 
 /// A catalog written by the REAL DuckDB extension, not by this crate.

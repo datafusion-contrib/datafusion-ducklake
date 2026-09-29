@@ -76,6 +76,12 @@ impl ExecutionPlan for OpenTimeFilterBarrierExec {
         vec![&self.input]
     }
 
+    /// As the node below would have it: a leaf scan gains from repartitioning,
+    /// a per-row node that declines it does not (`benefits_through`).
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        crate::lazy_delete_filter::benefits_through(&self.input)
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         vec![true]
     }

@@ -81,6 +81,18 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
                 .create(logical_file_schema, physical_file_schema);
         }
 
+        // The scan's logical schema is the catalog columns, then any virtual
+        // columns the scan asks the reader for (a row position), which the file
+        // does not store and which need no resolving.
+        let scan_schema = logical_file_schema;
+        let logical_file_schema = if scan_schema.fields().len() > self.columns.len() {
+            Arc::new(Schema::new(
+                scan_schema.fields()[..self.columns.len()].to_vec(),
+            ))
+        } else {
+            Arc::clone(&scan_schema)
+        };
+
         // The read schema names each column as this file stores it, carries an
         // absent column's `initial_default`, and keeps the file's own nested
         // names (a list element the file calls `element`); `CatalogTypeExpr`
@@ -98,6 +110,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
             .create(Arc::clone(&read_schema), Arc::clone(&physical_file_schema))?;
         Ok(Arc::new(FieldIdExprAdapter {
             columns: Arc::clone(&self.columns),
+            scan_schema,
             logical_file_schema,
             read_schema,
             physical_file_schema,
@@ -130,6 +143,9 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
 #[derive(Debug)]
 struct FieldIdExprAdapter {
     columns: Arc<[DuckLakeTableColumn]>,
+    /// The scan's logical schema: the catalog columns, then its virtual columns.
+    scan_schema: SchemaRef,
+    /// The catalog columns alone.
     logical_file_schema: SchemaRef,
     read_schema: SchemaRef,
     physical_file_schema: SchemaRef,
@@ -206,7 +222,7 @@ impl FieldIdExprAdapter {
         let Ok(physical_index) = self.physical_file_schema.index_of(read_field.name()) else {
             return Ok(None);
         };
-        let Ok(catalog_result) = expr.return_field(&self.logical_file_schema) else {
+        let Ok(catalog_result) = expr.return_field(&self.scan_schema) else {
             return Ok(None);
         };
         let root: Arc<dyn PhysicalExpr> = Arc::new(Column::new(read_field.name(), physical_index));
@@ -472,7 +488,7 @@ fn nested_initial_default(
 
 impl PhysicalExprAdapter for FieldIdExprAdapter {
     fn rewrite(&self, expr: Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
-        let catalog_result = expr.return_field(&self.logical_file_schema).ok();
+        let catalog_result = expr.return_field(&self.scan_schema).ok();
         // Top-down, and not into what it produces: a replacement already refers to
         // this file's columns, whose names can be another catalog column's.
         let per_file = Arc::clone(&expr)
@@ -484,7 +500,16 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
                     return Ok(Transformed::no(expr));
                 };
                 let Ok(index) = self.logical_file_schema.index_of(column.name()) else {
-                    return Ok(Transformed::no(expr));
+                    // A virtual column, which the reader appends after the
+                    // file's own columns.
+                    return match self.physical_file_schema.index_of(column.name()) {
+                        Ok(physical_index) => Ok(Transformed::new(
+                            Arc::new(Column::new(column.name(), physical_index)),
+                            true,
+                            TreeNodeRecursion::Jump,
+                        )),
+                        Err(_) => Ok(Transformed::no(expr)),
+                    };
                 };
                 Ok(Transformed::new(
                     self.catalog_column(index)?,
@@ -531,7 +556,7 @@ pub(crate) enum ChildFill {
 impl DefaultFill {
     /// The fill a value read as `read` needs to present `catalog`, where the read
     /// type names each child the file predates with an absent-field name.
-    fn build(
+    pub(crate) fn build(
         read: &DataType,
         catalog: &DataType,
         column: &DuckLakeTableColumn,
@@ -582,7 +607,7 @@ impl DefaultFill {
     }
 
     /// Apply the fill to `array`, already of the catalog's type.
-    fn apply(&self, array: &ArrayRef) -> DataFusionResult<ArrayRef> {
+    pub(crate) fn apply(&self, array: &ArrayRef) -> DataFusionResult<ArrayRef> {
         Ok(match self {
             Self::Struct(fills) => {
                 let array = array.as_struct();

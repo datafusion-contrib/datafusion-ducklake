@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `count(*)` on a table with delete files is answered from catalog counts, as official does,
+  without reading any delete file (#306).
 - **BREAKING**: `MetadataWriter::get_table_column_nullability` is a new required method with no
   default; every external `MetadataWriter` implementation must return the live top-level
   `nulls_allowed` of an existing table, or `None` when the table does not exist (#319).
@@ -97,14 +99,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A scan binds a file without deletes by field id when it opens it, as official does, not while
-  planning, so without row lineage planning reads no such file and `LIMIT 1` opens few (#306).
+- Reading a past snapshot no longer applies deletions made after it that official DuckLake
+  recorded, with their snapshots, in the same delete file (#306).
+- Without row lineage, a scan binds each file's columns and deletes at open, as official does:
+  planning reads no file, and an unfiltered `LIMIT` opens only the files it reaches (#306).
 - With `pushdown_filters` on, `min`/`max` over a column dropped and re-added under its old name
   no longer skips rows of files written after the re-add, returning a wrong bound (#306).
 - With `pushdown_filters` on, a filter on a struct child, renamed or added since a file was
   written or not, no longer returns rows that do not match (#306).
-- A struct child added with a default reads it in older files without deletes, as official
-  does: NULL only under a NULL struct. Name-mapped files and row lineage still read NULL (#306).
+- A struct child added with a default reads it in older files, name-mapped or with deletes, as
+  official does: NULL only under a NULL struct. Row-lineage scans still read NULL (#306).
 - A promoted file keeps the column statistics it is handed and the table roll-up is rebuilt
   from them in the same commit; a stat for a column outside the adopted ids is refused (#333).
 - A filter that cannot prune files, such as one on `rowid`, no longer disables file pruning

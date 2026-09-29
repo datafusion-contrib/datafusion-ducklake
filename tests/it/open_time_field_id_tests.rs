@@ -51,6 +51,8 @@ const EVOLVED_QUERY: &str = "SELECT CAST(id AS VARCHAR) AS id_text, \
 struct ReadRecordingStore {
     inner: Arc<dyn ObjectStore>,
     reads: Mutex<Vec<ObjectPath>>,
+    /// File names whose next read fails, once each.
+    fail_once: Mutex<HashSet<String>>,
 }
 
 impl ReadRecordingStore {
@@ -58,11 +60,31 @@ impl ReadRecordingStore {
         Arc::new(Self {
             inner: Arc::new(LocalFileSystem::new()),
             reads: Mutex::new(Vec::new()),
+            fail_once: Mutex::new(HashSet::new()),
         })
     }
 
-    fn record(&self, location: &ObjectPath) {
+    /// Records the read, and fails it if `location` was set to fail once.
+    fn record(&self, location: &ObjectPath) -> object_store::Result<()> {
         self.reads.lock().unwrap().push(location.clone());
+        let name = location.filename().unwrap_or_default();
+        if self.fail_once.lock().unwrap().remove(name) {
+            return Err(object_store::Error::Generic {
+                store: "ReadRecordingStore",
+                source: format!("injected transient failure reading {location}").into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Make the next read of the file named `name` fail.
+    fn fail_next_read(&self, name: &str) {
+        self.fail_once.lock().unwrap().insert(name.to_string());
+    }
+
+    /// Whether every injected failure has been hit.
+    fn failures_spent(&self) -> bool {
+        self.fail_once.lock().unwrap().is_empty()
     }
 
     /// The reads recorded since the last call, then forgets them.
@@ -102,7 +124,7 @@ impl ObjectStore for ReadRecordingStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.record(location);
+        self.record(location)?;
         self.inner.get_opts(location, options).await
     }
 
@@ -111,7 +133,7 @@ impl ObjectStore for ReadRecordingStore {
         location: &ObjectPath,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        self.record(location);
+        self.record(location)?;
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -945,5 +967,681 @@ async fn a_filter_the_reader_may_skip_stays_above_the_scan() -> anyhow::Result<(
         !through_structs.contains("FilterExec"),
         "a struct child the reader always applies is left to it:\n{through_structs}"
     );
+    Ok(())
+}
+
+/// `LATER_FILES` data files, each with a row deleted: DuckDB writes one delete
+/// file per data file. Returns DuckDB's rows for `sql`.
+fn create_table_with_deletes(temp: &TempDir) -> anyhow::Result<()> {
+    let conn = duckdb_lake(temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT, v VARCHAR)", [])?;
+    for file in 0..LATER_FILES {
+        conn.execute(
+            &format!(
+                "INSERT INTO lake.t VALUES ({a}, 'a{a}'), ({b}, 'b{b}'), ({c}, 'c{c}')",
+                a = file * 10,
+                b = file * 10 + 1,
+                c = file * 10 + 2,
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM lake.t WHERE id % 10 = 1", [])?;
+    conn.execute("DETACH lake", [])?;
+    Ok(())
+}
+
+/// Files with deletes resolve at open too: planning reads neither a data file
+/// nor a delete file, and the scan returns what DuckDB does.
+#[tokio::test]
+async fn planning_reads_no_file_of_a_table_with_deletes() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    create_table_with_deletes(&temp)?;
+    let sql = "SELECT CAST(id AS VARCHAR) AS id_text, CAST(v AS VARCHAR) AS v_text \
+               FROM {table} ORDER BY id";
+    let conn = duckdb_lake(&temp)?;
+    let expected = duckdb_rows(&conn, &sql.replace("{table}", "lake.t"))?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    assert_eq!(expected.len(), 2 * LATER_FILES as usize);
+
+    for config in [SessionConfig::new(), pushdown_config()] {
+        let store = ReadRecordingStore::new();
+        let ctx = session(&temp, &store, config).await?;
+        let plan = physical_plan(&ctx, &sql.replace("{table}", "ducklake.main.t")).await?;
+        assert_eq!(
+            store.take(),
+            Vec::<ObjectPath>::new(),
+            "planning must read no data or delete file"
+        );
+        let batches = collect(plan, ctx.task_ctx()).await?;
+        assert_eq!(text_rows(&batches), expected);
+        let read = store.take();
+        assert!(
+            read.iter().any(|path| path.as_ref().contains("delete")),
+            "execution reads the delete files"
+        );
+    }
+    Ok(())
+}
+
+/// `LIMIT 1` over files with deletes reads only the data and delete files of the
+/// data files it reaches.
+#[tokio::test]
+async fn limit_one_over_files_with_deletes_reads_only_what_it_needs() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    create_table_with_deletes(&temp)?;
+    let store = ReadRecordingStore::new();
+    let ctx = session(
+        &temp,
+        &store,
+        SessionConfig::new().with_target_partitions(1),
+    )
+    .await?;
+    let plan = physical_plan(&ctx, "SELECT * FROM ducklake.main.t LIMIT 1").await?;
+    assert_eq!(store.take(), Vec::<ObjectPath>::new());
+    let batches = collect(plan, ctx.task_ctx()).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let read = store.take();
+    let opened = distinct(&read).len();
+    // One data file and its delete file, and possibly the next data file the
+    // scan is already opening.
+    assert!(
+        (2..=4).contains(&opened),
+        "LIMIT 1 read {opened} of {} files",
+        2 * LATER_FILES
+    );
+    Ok(())
+}
+
+/// Row counts and bounds over files with deletes match DuckDB's.
+#[tokio::test]
+async fn aggregates_over_files_with_deletes_match_duckdb() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    create_table_with_deletes(&temp)?;
+    let sql = "SELECT CAST(count(*) AS VARCHAR) AS n, CAST(min(id) AS VARCHAR) AS lo, \
+               CAST(max(id) AS VARCHAR) AS hi, CAST(count(v) AS VARCHAR) AS nv FROM {table}";
+    let (expected, got) = both_engines(&temp, sql, sql).await?;
+    assert_eq!(got, expected);
+    let store = ReadRecordingStore::new();
+    let ctx = session(&temp, &store, SessionConfig::new()).await?;
+    let got = text_rows(
+        &ctx.sql(&sql.replace("{table}", "ducklake.main.t"))
+            .await?
+            .collect()
+            .await?,
+    );
+    assert_eq!(got, expected);
+    Ok(())
+}
+
+/// A struct child added with a default reads it in a file that also has
+/// deletes, and NULL where its struct is NULL.
+#[tokio::test]
+async fn a_defaulted_struct_child_reads_its_default_in_a_file_with_deletes() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT, s STRUCT(x INT))", [])?;
+    conn.execute(
+        "INSERT INTO lake.t VALUES (1, {'x': 10}), (2, NULL), (3, {'x': 30}), (9, {'x': 90})",
+        [],
+    )?;
+    conn.execute("DELETE FROM lake.t WHERE id = 9", [])?;
+    conn.execute("ALTER TABLE lake.t ADD COLUMN s.z INT DEFAULT 7", [])?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+    let got = both_engines_both_pushdowns(
+        &temp,
+        "SELECT CAST(id AS VARCHAR), CAST(s['z'] AS VARCHAR) FROM {table} ORDER BY id",
+        "SELECT CAST(id AS VARCHAR) AS id_text, CAST(s['z'] AS VARCHAR) AS z_text \
+         FROM {table} ORDER BY id",
+    )
+    .await?;
+    let text = |value: &str| Some(value.to_string());
+    assert_eq!(
+        got,
+        vec![vec![text("1"), text("7")], vec![text("2"), None], vec![text("3"), text("7")]]
+    );
+    both_engines_both_pushdowns(
+        &temp,
+        "SELECT CAST(id AS VARCHAR) FROM {table} WHERE s['z'] = 7 ORDER BY id",
+        "SELECT CAST(id AS VARCHAR) AS id_text FROM {table} WHERE s['z'] = 7 ORDER BY id",
+    )
+    .await?;
+    Ok(())
+}
+
+/// The same guarantee over files with deletes: a predicate the reader's row
+/// filter may decline stays in a `FilterExec`, one it always applies does not.
+#[tokio::test]
+async fn a_filter_the_reader_may_skip_stays_above_a_scan_with_deletes() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute(
+        "CREATE TABLE lake.t (id INT, s STRUCT(x INT, m MAP(VARCHAR, INT)))",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO lake.t VALUES (1, {'x': 1, 'm': MAP {'k': 13}}), \
+         (2, {'x': 2, 'm': MAP {'k': 14}}), (3, {'x': 3, 'm': MAP {'k': 15}})",
+        [],
+    )?;
+    conn.execute("DELETE FROM lake.t WHERE id = 3", [])?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+
+    let store = ReadRecordingStore::new();
+    let ctx = session(&temp, &store, pushdown_config()).await?;
+    let through_map = displayable(
+        physical_plan(
+            &ctx,
+            "SELECT id FROM ducklake.main.t WHERE s['m']['k'] = 13",
+        )
+        .await?
+        .as_ref(),
+    )
+    .indent(true)
+    .to_string();
+    assert!(
+        through_map.contains("LazyDeleteFilterExec") && has_filter_exec(&through_map),
+        "a lookup through a map must stay above the scan:\n{through_map}"
+    );
+    let through_structs = displayable(
+        physical_plan(&ctx, "SELECT id FROM ducklake.main.t WHERE s['x'] = 1")
+            .await?
+            .as_ref(),
+    )
+    .indent(true)
+    .to_string();
+    assert!(
+        through_structs.contains("LazyDeleteFilterExec") && !has_filter_exec(&through_structs),
+        "a struct child the reader always applies is left to it:\n{through_structs}"
+    );
+    Ok(())
+}
+
+/// Whether a rendered plan has a `FilterExec` node.
+fn has_filter_exec(plan: &str) -> bool {
+    plan.lines()
+        .any(|line| line.trim_start().starts_with("FilterExec"))
+}
+
+/// A struct child added with a default reads that default in a file registered
+/// by name mapping (`ducklake_add_data_files`), with and without deletes, and
+/// NULL where its struct is NULL — as official fills every child a file predates.
+#[tokio::test]
+async fn a_defaulted_struct_child_reads_its_default_in_a_name_mapped_file() -> anyhow::Result<()> {
+    for with_delete in [false, true] {
+        let temp = TempDir::new()?;
+        let external = temp.path().join("external.parquet");
+        let conn = duckdb_lake(&temp)?;
+        conn.execute(
+            &format!(
+                "COPY (SELECT * FROM (VALUES (1, {{'x': 10}}), (2, NULL), (4, {{'x': 40}}), \
+                 (5, {{'x': 50}})) v(id, s)) TO '{}' (FORMAT PARQUET)",
+                external.display()
+            ),
+            [],
+        )?;
+        conn.execute("CREATE TABLE lake.t (id INT, s STRUCT(x INT))", [])?;
+        conn.execute(
+            &format!(
+                "CALL ducklake_add_data_files('lake', 't', '{}')",
+                external.display()
+            ),
+            [],
+        )?;
+        conn.execute("ALTER TABLE lake.t ADD COLUMN s.z INT DEFAULT 7", [])?;
+        conn.execute("INSERT INTO lake.t VALUES (3, {'x': 30, 'z': 9})", [])?;
+        if with_delete {
+            conn.execute("DELETE FROM lake.t WHERE id = 5", [])?;
+        }
+        conn.execute("DETACH lake", [])?;
+        drop(conn);
+
+        let text = |value: &str| Some(value.to_string());
+        let children = both_engines_both_pushdowns(
+            &temp,
+            "SELECT CAST(id AS VARCHAR), CAST(s['z'] AS VARCHAR) FROM {table} ORDER BY id",
+            "SELECT CAST(id AS VARCHAR) AS id_text, CAST(s['z'] AS VARCHAR) AS z_text \
+             FROM {table} ORDER BY id",
+        )
+        .await?;
+        let mut expected = vec![
+            vec![text("1"), text("7")],
+            vec![text("2"), None],
+            vec![text("3"), text("9")],
+            vec![text("4"), text("7")],
+        ];
+        if !with_delete {
+            expected.push(vec![text("5"), text("7")]);
+        }
+        assert_eq!(children, expected, "with_delete = {with_delete}");
+        for filter in ["s['z'] = 7", "s['z'] IS NULL"] {
+            both_engines_both_pushdowns(
+                &temp,
+                &format!("SELECT CAST(id AS VARCHAR) FROM {{table}} WHERE {filter} ORDER BY id"),
+                &format!(
+                    "SELECT CAST(id AS VARCHAR) AS id_text FROM {{table}} WHERE {filter} \
+                     ORDER BY id"
+                ),
+            )
+            .await?;
+        }
+        both_engines_both_pushdowns(
+            &temp,
+            "SELECT CAST(count(s['z']) AS VARCHAR) FROM {table}",
+            "SELECT CAST(count(s['z']) AS VARCHAR) AS n FROM {table}",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A second delete from a file with committed deletes makes official DuckLake
+/// rewrite the file's delete file with each deletion's snapshot
+/// (`_ducklake_internal_snapshot_id`) and retire the old one. Read at the
+/// snapshot of the first delete, only that deletion applies — rows, a count that
+/// reads them, and a bare `count(*)` — as DuckDB reads it.
+#[tokio::test]
+async fn a_delete_file_with_deletion_snapshots_applies_only_earlier_deletions() -> anyhow::Result<()>
+{
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id INT)", [])?;
+    conn.execute("INSERT INTO lake.t VALUES (1), (2), (3), (4)", [])?;
+    conn.execute("DELETE FROM lake.t WHERE id = 1", [])?;
+    let first: i64 =
+        conn.query_row("SELECT max(snapshot_id) FROM lake.snapshots()", [], |row| {
+            row.get(0)
+        })?;
+    conn.execute("DELETE FROM lake.t WHERE id = 2", [])?;
+    let delete_files: i64 = conn.query_row(
+        "SELECT count(*) FROM __ducklake_metadata_lake.ducklake_delete_file",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        delete_files, 1,
+        "official keeps one delete file, with snapshots"
+    );
+    let queries = [
+        "SELECT CAST(id AS VARCHAR) AS id_text FROM {table} ORDER BY id",
+        "SELECT CAST(count(*) AS VARCHAR) AS n FROM {table}",
+        "SELECT CAST(count(*) AS VARCHAR) AS n FROM {table} WHERE id > 0",
+    ];
+    let mut expected = Vec::new();
+    for sql in queries {
+        expected.push((
+            duckdb_rows(
+                &conn,
+                &sql.replace("{table}", &format!("lake.t AT (VERSION => {first})")),
+            )?,
+            duckdb_rows(&conn, &sql.replace("{table}", "lake.t"))?,
+        ));
+    }
+    assert_eq!(
+        expected[0].0.len(),
+        3,
+        "at the first delete only id 1 is gone"
+    );
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+
+    for (snapshot, pick_historical) in [(Some(first), true), (None, false)] {
+        let provider =
+            SqliteMetadataProvider::new(&format!("sqlite:{}", catalog_path(&temp).display()))
+                .await?;
+        let ctx = SessionContext::new_with_config(pushdown_config());
+        let catalog = match snapshot {
+            Some(snapshot) => DuckLakeCatalog::with_snapshot(Arc::new(provider), snapshot)?,
+            None => DuckLakeCatalog::new(provider)?,
+        };
+        ctx.register_catalog("ducklake", Arc::new(catalog));
+        for (sql, (historical, current)) in queries.iter().zip(&expected) {
+            let got = text_rows(
+                &ctx.sql(&sql.replace("{table}", "ducklake.main.t"))
+                    .await?
+                    .collect()
+                    .await?,
+            );
+            let want = if pick_historical {
+                historical
+            } else {
+                current
+            };
+            assert_eq!(&got, want, "snapshot {snapshot:?}: {sql}");
+        }
+    }
+    Ok(())
+}
+
+/// A writable session opened before official DuckLake deletes again from a file
+/// (writing one cumulative delete file that records each deletion's snapshot)
+/// must carry that newer deletion into the delete file its own DELETE writes:
+/// the positions it supersedes are every position of the live file, whatever
+/// snapshot recorded them.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test]
+async fn a_stale_session_delete_keeps_deletions_made_after_its_snapshot() -> anyhow::Result<()> {
+    use datafusion_ducklake::SqliteMetadataWriter;
+
+    for session_opened_after in [false, true] {
+        let temp = TempDir::new()?;
+        let conn = duckdb_lake(&temp)?;
+        conn.execute("CREATE TABLE lake.t (id INT)", [])?;
+        conn.execute("INSERT INTO lake.t VALUES (1), (2), (3), (4), (5), (6)", [])?;
+        conn.execute("DELETE FROM lake.t WHERE id = 1", [])?;
+        let url = format!("sqlite:{}", catalog_path(&temp).display());
+        let open_writable = || async {
+            let provider = SqliteMetadataProvider::new(&url).await?;
+            let writer = SqliteMetadataWriter::new(&url).await?;
+            let ctx = SessionContext::new();
+            ctx.register_catalog(
+                "ducklake",
+                Arc::new(DuckLakeCatalog::with_writer(
+                    Arc::new(provider),
+                    Arc::new(writer),
+                )?),
+            );
+            anyhow::Ok(ctx)
+        };
+        let early = if session_opened_after {
+            None
+        } else {
+            Some(open_writable().await?)
+        };
+        conn.execute("DELETE FROM lake.t WHERE id = 2", [])?;
+        conn.execute("DETACH lake", [])?;
+        drop(conn);
+
+        let ctx = match early {
+            Some(ctx) => ctx,
+            None => open_writable().await?,
+        };
+        ctx.sql("DELETE FROM ducklake.main.t WHERE id = 3")
+            .await?
+            .collect()
+            .await?;
+
+        // The catalog row and the file it names. Reading the table back is not
+        // possible here: this crate's SQLite writer records the new delete file
+        // with a NULL `delete_file_id` in a catalog DuckDB created, which then
+        // hides it from both engines (see the writer's `delete_file_id` issue).
+        let pool = SqlitePool::connect(&url).await?;
+        let live: Vec<(Option<i64>, String, i64)> = sqlx::query_as(
+            "SELECT delete_file_id, path, delete_count FROM ducklake_delete_file \
+             WHERE end_snapshot IS NULL",
+        )
+        .fetch_all(&pool)
+        .await?;
+        pool.close().await;
+        assert_eq!(live.len(), 1, "one live delete file");
+        let (_, path, delete_count) = &live[0];
+        assert_eq!(
+            *delete_count, 3,
+            "the new delete file counts ids 1, 2 and 3 (opened after = {session_opened_after})"
+        );
+        let file = std::fs::File::open(temp.path().join("data").join("main").join("t").join(path))
+            .or_else(|_| std::fs::File::open(path))?;
+        let mut positions = Vec::new();
+        for batch in ParquetRecordBatchReaderBuilder::try_new(file)?.build()? {
+            let batch = batch?;
+            let pos = batch
+                .column_by_name("pos")
+                .expect("a delete file has a pos column")
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("pos is Int64")
+                .clone();
+            positions.extend(pos.iter().flatten());
+        }
+        positions.sort_unstable();
+        assert_eq!(
+            positions,
+            vec![0, 1, 2],
+            "ids 1, 2 and 3 sit at positions 0, 1, 2"
+        );
+    }
+    Ok(())
+}
+
+/// [`LATER_FILES`] data files of 1000 rows each, more than a batch holds, so
+/// DataFusion would repartition above the scan if nothing stopped it; with
+/// `delete`, one row of each is deleted through its own delete file.
+fn thousand_row_files(delete: bool) -> anyhow::Result<TempDir> {
+    let temp = TempDir::new()?;
+    let conn = duckdb_lake(&temp)?;
+    conn.execute("CREATE TABLE lake.t (id BIGINT, v VARCHAR)", [])?;
+    for file in 0..i64::from(LATER_FILES) {
+        conn.execute(
+            &format!(
+                "INSERT INTO lake.t SELECT range, 'v' || range FROM range({}, {})",
+                file * 1000,
+                file * 1000 + 1000
+            ),
+            [],
+        )?;
+    }
+    if delete {
+        conn.execute("DELETE FROM lake.t WHERE id % 1000 = 7", [])?;
+    }
+    conn.execute("DETACH lake", [])?;
+    Ok(temp)
+}
+
+/// Asserts that `sql`, a `LIMIT 1` run under the session's default partitioning,
+/// has no repartition below its per-row nodes, where it would drain the scan
+/// eagerly and read file after file, and opens at most `bound` files.
+async fn assert_limit_one_reads_few_files(
+    ctx: &SessionContext,
+    store: &ReadRecordingStore,
+    label: &str,
+    sql: &str,
+    bound: usize,
+) -> anyhow::Result<()> {
+    let plan = physical_plan(ctx, sql).await?;
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    let per_row_node = rendered
+        .lines()
+        .position(|line| line.contains("LazyDeleteFilterExec") || line.contains("RowLineageExec"))
+        .unwrap_or(usize::MAX);
+    assert!(
+        !rendered
+            .lines()
+            .enumerate()
+            .any(|(index, line)| index > per_row_node && line.contains("RepartitionExec")),
+        "{label}: no repartition below the per-row nodes:\n{rendered}"
+    );
+    let batches = collect(plan, ctx.task_ctx()).await?;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let opened = distinct(&store.take()).len();
+    assert!(
+        (1..=bound).contains(&opened),
+        "{label}: LIMIT 1 read {opened} files, expected at most {bound}"
+    );
+    Ok(())
+}
+
+/// Under the session's default partitioning, `LIMIT 1` reads only a few files,
+/// with deletes or without.
+#[tokio::test]
+async fn limit_one_under_default_partitioning_reads_few_files() -> anyhow::Result<()> {
+    assert!(
+        SessionConfig::new().target_partitions() > 1,
+        "the default must be parallel here"
+    );
+    for (label, delete, bound) in [("no deletes", false, 2), ("deletes", true, 6)] {
+        let temp = thousand_row_files(delete)?;
+        let store = ReadRecordingStore::new();
+        let ctx = session(&temp, &store, SessionConfig::new()).await?;
+        let sql = "SELECT id, v FROM ducklake.main.t LIMIT 1";
+        assert_limit_one_reads_few_files(&ctx, &store, label, sql, bound).await?;
+    }
+    Ok(())
+}
+
+/// Three data files of 1000 rows (ids `0..3000`), each with one row deleted
+/// through its own delete file. Returns the delete file of the second data file.
+async fn create_three_files_with_deletes(temp: &TempDir) -> anyhow::Result<std::path::PathBuf> {
+    let conn = duckdb_lake(temp)?;
+    conn.execute("CREATE TABLE lake.t (id BIGINT, v VARCHAR)", [])?;
+    for file in 0..3_i64 {
+        conn.execute(
+            &format!(
+                "INSERT INTO lake.t SELECT range, 'v' || range FROM range({}, {})",
+                file * 1000,
+                file * 1000 + 1000
+            ),
+            [],
+        )?;
+    }
+    conn.execute("DELETE FROM lake.t WHERE id % 1000 = 7", [])?;
+    conn.execute("DETACH lake", [])?;
+    drop(conn);
+
+    let pool = SqlitePool::connect(&format!("sqlite:{}", catalog_path(temp).display())).await?;
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT del.path FROM ducklake_delete_file del \
+         JOIN ducklake_data_file data USING (data_file_id) \
+         WHERE del.end_snapshot IS NULL ORDER BY data.row_id_start",
+    )
+    .fetch_all(&pool)
+    .await?;
+    pool.close().await;
+    assert_eq!(names.len(), 3, "one delete file per data file");
+    let second = Path::new(&names[1])
+        .file_name()
+        .expect("a delete file path names a file")
+        .to_owned();
+    find_file(&temp.path().join("data"), &second)
+        .ok_or_else(|| anyhow::anyhow!("delete file {second:?} is not under the data path"))
+}
+
+fn find_file(dir: &Path, name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name() == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Default partitioning, one partition, and one partition with filters pushed
+/// into the reader.
+fn partitioning_configs() -> [SessionConfig; 3] {
+    [
+        SessionConfig::new(),
+        SessionConfig::new().with_target_partitions(1),
+        pushdown_config().with_target_partitions(1),
+    ]
+}
+
+/// Asserts that every query reading the rows of a data file whose delete file
+/// is missing fails with the missing delete file.
+async fn assert_missing_delete_file_fails(ctx: &SessionContext, label: &str) -> anyhow::Result<()> {
+    for sql in [
+        "SELECT count(*) FROM ducklake.main.t WHERE id < 1500",
+        "SELECT * FROM ducklake.main.t",
+        "SELECT count(*) FROM ducklake.main.t WHERE v IS NOT NULL",
+    ] {
+        let error = ctx
+            .sql(sql)
+            .await?
+            .collect()
+            .await
+            .expect_err("the missing delete file must fail the query");
+        assert!(
+            error.to_string().contains("Delete file") && error.to_string().contains("not found"),
+            "{sql} ({label}): {error}"
+        );
+    }
+    Ok(())
+}
+
+/// A delete file missing from storage fails every query that reads its data
+/// file's rows, even when it is not the first the scan reaches: its delete set is
+/// read ahead of the scan, and a failed read ahead must not leave the file
+/// looking as though nothing was deleted from it.
+#[tokio::test]
+async fn a_missing_delete_file_after_the_first_fails_the_query() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let missing = create_three_files_with_deletes(&temp).await?;
+    std::fs::remove_file(&missing)?;
+    for config in partitioning_configs() {
+        let label = format!("{} partitions", config.target_partitions());
+        let ctx = session(&temp, &ReadRecordingStore::new(), config).await?;
+        assert_missing_delete_file_fails(&ctx, &label).await?;
+    }
+    Ok(())
+}
+
+/// The name of the file at `path`.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .expect("a delete file has a UTF-8 name")
+        .to_string()
+}
+
+/// Queries over [`create_three_files_with_deletes`] and their counts.
+const FLAKY_READ_COUNTS: [(&str, &str); 3] = [
+    (
+        "SELECT count(*) FROM ducklake.main.t WHERE id < 1500",
+        "1498",
+    ),
+    (
+        "SELECT count(*) FROM ducklake.main.t WHERE v IS NOT NULL",
+        "2997",
+    ),
+    (
+        "SELECT count(*) FROM ducklake.main.t WHERE id % 1000 = 7",
+        "0",
+    ),
+];
+
+/// Asserts that `sql` returns `expected` when the next read of `flaky` fails,
+/// and that the failure was hit. The session must have one partition, so the
+/// second file's delete set is read ahead while the first file is read, and that
+/// read is the one that fails.
+async fn assert_flaky_read_is_retried(
+    ctx: &SessionContext,
+    store: &ReadRecordingStore,
+    flaky: &str,
+    sql: &str,
+    expected: &str,
+) -> anyhow::Result<()> {
+    store.fail_next_read(flaky);
+    let batches = ctx.sql(sql).await?.collect().await?;
+    assert!(
+        store.failures_spent(),
+        "{sql}: the injected failure was hit"
+    );
+    assert_eq!(
+        text_rows(&batches),
+        vec![vec![Some(expected.to_string())]],
+        "{sql}"
+    );
+    Ok(())
+}
+
+/// A read of a delete file that fails once and then succeeds gives the right
+/// rows: the read ahead of the scan fails, and the read when the scan reaches the
+/// data file reads the delete file afresh.
+#[tokio::test]
+async fn a_delete_file_read_that_fails_once_is_read_again() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let flaky = file_name(&create_three_files_with_deletes(&temp).await?);
+    for (sql, expected) in FLAKY_READ_COUNTS {
+        let store = ReadRecordingStore::new();
+        let config = SessionConfig::new().with_target_partitions(1);
+        let ctx = session(&temp, &store, config).await?;
+        assert_flaky_read_is_retried(&ctx, &store, &flaky, sql, expected).await?;
+    }
     Ok(())
 }
