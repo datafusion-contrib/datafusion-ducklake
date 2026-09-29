@@ -2554,6 +2554,7 @@ mod tests {
                 is_nullable: true,
                 data_type: None,
                 nested_column_ids: Vec::new(),
+                nested_initial_defaults: Default::default(),
                 initial_default: None,
                 default_value: None,
                 default_value_type: None,

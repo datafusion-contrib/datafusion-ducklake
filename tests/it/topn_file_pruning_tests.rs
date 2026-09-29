@@ -325,11 +325,10 @@ async fn topn_results_are_correct_in_both_directions() {
     );
 }
 
-/// Renaming a column in the catalog puts a [`ColumnRenameExec`] between the sort
-/// and the scan — the parquet files still carry the original name, so the scan
-/// reads `timestamp` and the node relabels it to `event_time`. Before that node
-/// forwarded sort pushdown, DataFusion's default barred it and the file order
-/// stayed as written, so nothing was skipped.
+/// Renaming a column in the catalog leaves the parquet files carrying the
+/// original name, so each file stores `event_time` as `timestamp`. The scan
+/// resolves that per file by field id and presents `event_time` itself, and the
+/// sort, and the Top-N pruning that follows it, must still reach the files.
 ///
 /// The rename is applied straight to the catalog because the parquet files must
 /// keep the old name; rewriting them would erase the mapping this exercises.
@@ -356,8 +355,6 @@ async fn topn_prunes_through_a_column_rename() {
 
     let ctx = session(&temp).await;
 
-    // Assert the fixture: the rename really did take, so the assertions below
-    // are running through the rename node rather than past it.
     let plan = analyze(
         &ctx,
         "SELECT * FROM ducklake.main.events ORDER BY event_time DESC LIMIT 1",
@@ -365,8 +362,8 @@ async fn topn_prunes_through_a_column_rename() {
     .await;
     println!("{plan}");
     assert!(
-        plan.contains("ColumnRenameExec"),
-        "the rename node should be in the plan\n{plan}"
+        !plan.contains("ColumnRenameExec"),
+        "the scan presents the renamed column itself, with no rename node above it\n{plan}"
     );
 
     assert_eq!(

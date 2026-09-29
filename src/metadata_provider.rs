@@ -659,6 +659,9 @@ pub struct DuckLakeTableColumn {
     pub is_nullable: bool,
     pub(crate) data_type: Option<DataType>,
     pub(crate) nested_column_ids: Vec<i64>,
+    /// `initial_default` of each nested node that has one, by its column id:
+    /// the value a struct child takes in files written before it was added.
+    pub(crate) nested_initial_defaults: HashMap<i64, String>,
     /// Value substituted for this column in files that predate it
     pub initial_default: Option<String>,
     /// Value applied when a new write omits this column
@@ -961,6 +964,7 @@ impl DuckLakeTableColumn {
             is_nullable,
             data_type: None,
             nested_column_ids: Vec::new(),
+            nested_initial_defaults: HashMap::new(),
             initial_default: None,
             default_value: None,
             default_value_type: None,
@@ -1129,12 +1133,16 @@ pub fn reconstruct_columns(
             rows: &[(DuckLakeTableColumn, Option<i64>)],
             children: &HashMap<i64, Vec<usize>>,
             ids: &mut Vec<i64>,
+            initial_defaults: &mut HashMap<i64, String>,
         ) {
             if let Some(child_indices) = children.get(&column_id) {
                 for child_index in child_indices {
-                    let child_id = rows[*child_index].0.column_id;
-                    ids.push(child_id);
-                    collect_ids(child_id, rows, children, ids);
+                    let child = &rows[*child_index].0;
+                    ids.push(child.column_id);
+                    if let Some(initial_default) = &child.initial_default {
+                        initial_defaults.insert(child.column_id, initial_default.clone());
+                    }
+                    collect_ids(child.column_id, rows, children, ids, initial_defaults);
                 }
             }
         }
@@ -1143,6 +1151,7 @@ pub fn reconstruct_columns(
             &rows,
             &children,
             &mut column.nested_column_ids,
+            &mut column.nested_initial_defaults,
         );
         result.push(column);
     }

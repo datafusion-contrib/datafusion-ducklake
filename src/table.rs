@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
+use crate::field_id_adapter::FieldIdExprAdapterFactory;
 use crate::inlined_filter::translate_inlined_filters;
 use crate::metadata_provider::{
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
@@ -18,6 +19,7 @@ use crate::metadata_provider::{
     DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, INLINED_DATA_REMEDIATION, MetadataProvider,
 };
 use crate::nan_pruning_barrier::NanPruningBarrierExec;
+use crate::open_time_filter_barrier::OpenTimeFilterBarrierExec;
 use crate::partition::PartitionSpec;
 use crate::path_resolver::resolve_path;
 use crate::row_id::{
@@ -29,9 +31,8 @@ use crate::stats_filter::{self, StatsFilter};
 use crate::types::{
     DuckLakeDefaultExprAdapterFactory, INITIAL_DEFAULT_METADATA_KEY,
     build_arrow_schema_from_fields, build_read_schema_with_field_id_mapping,
-    build_read_schema_with_field_id_mapping_from_schema, build_read_schema_with_name_mapping,
-    ducklake_to_arrow_type, extract_parquet_field_ids, normalize_list_element_names,
-    parse_ducklake_default_scalar, parse_ducklake_scalar,
+    build_read_schema_with_name_mapping, ducklake_to_arrow_type, extract_parquet_field_ids,
+    normalize_list_element_names, parse_ducklake_default_scalar, parse_ducklake_scalar,
 };
 
 #[cfg(feature = "write")]
@@ -837,6 +838,19 @@ type SchemaMapping = (
     HashMap<String, String>,
     HashMap<String, ScalarValue>,
 );
+
+/// The files of one scan over files without deletes, and how it reads them.
+struct ScanGroup {
+    /// The read schema, renames and path-derived constants the group shares.
+    mapping: SchemaMapping,
+    files: Vec<PartitionedFile>,
+    /// Summary statistics of `files`, kept positionally so the rollup can
+    /// refuse a group where any file lacks one.
+    summaries: Vec<Arc<Statistics>>,
+    /// Whether the scan resolves each file by field id as it opens it, rather
+    /// than reading every file under `mapping`.
+    resolved_by_field_id: bool,
+}
 
 /// Per-file read configuration computed for the row-lineage scan path.
 ///
@@ -2407,105 +2421,6 @@ impl DuckLakeTable {
         Ok(())
     }
 
-    /// Compute the field_id -> physical-name read schema and rename mapping for a
-    /// SINGLE file. Physical column names can differ across files (e.g. a column
-    /// renamed after some files were written), so this is resolved per file.
-    async fn file_schema_mapping(
-        &self,
-        state: &dyn Session,
-        file: &DuckLakeFileData,
-    ) -> DataFusionResult<SchemaMapping> {
-        let resolved_path = self.resolve_file_path(file)?;
-
-        // A file with a physical rename mapping resolves entirely from the
-        // mapping row (`mapped_schema`) — never from the file's own footer
-        // field ids. Checked FIRST, before any I/O: a renamed file used to pay
-        // a footer fetch here on every `scan()` whose result this branch then
-        // discarded outright (the dominant plan-time footer cost, worse than
-        // the execute-time read the shared cache originally fixed, since it ran even for
-        // files this method never needed to open at all).
-        if let Some(mapping_id) = file.mapping_id {
-            return self.mapped_schema(mapping_id, &resolved_path);
-        }
-
-        let object_store = state
-            .runtime_env()
-            .object_store(self.object_store_url.as_ref())?;
-        let object_path = ObjectPath::from(resolved_path.as_str());
-        let object_meta = epoch_object_meta(
-            object_path,
-            validated_file_size(file.file_size_bytes, &resolved_path)?,
-        );
-
-        // Resolve decryption properties (if any) before touching the store, the
-        // same way `read_parquet_footer_facts` does.
-        #[cfg(feature = "encryption")]
-        let decryption_properties = match file.encryption_key.as_deref() {
-            Some(key) if !key.is_empty() => {
-                let key_bytes = crate::encryption::DuckLakeEncryptionFactory::decode_key(key)?;
-                let props =
-                    parquet::encryption::decrypt::FileDecryptionProperties::builder(key_bytes)
-                        .build()
-                        .map_err(|e| {
-                            DataFusionError::Execution(format!(
-                                "Failed to create decryption properties: {}",
-                                e
-                            ))
-                        })?;
-                Some(props)
-            },
-            _ => None,
-        };
-        #[cfg(not(feature = "encryption"))]
-        let decryption_properties = None;
-
-        // Read the footer through `state`'s shared `RuntimeEnv` file-metadata
-        // cache — the same cache key a scan's own
-        // `CachedParquetFileReaderFactory` read uses (see `epoch_object_meta`),
-        // so whichever of the two runs first for a given file populates the
-        // entry the other then hits for free. Note an encrypted footer is
-        // never cached either way (`DFParquetMetadata::fetch_metadata` treats
-        // a fetch made with decryption properties as uncacheable), so this
-        // saves nothing new for that path beyond sharing the code with the
-        // unencrypted one.
-        let metadata = DFParquetMetadata::new(object_store.as_ref(), &object_meta)
-            .with_metadata_size_hint(metadata_size_hint(file.footer_size))
-            .with_file_metadata_cache(Some(
-                state.runtime_env().cache_manager.get_file_metadata_cache(),
-            ))
-            .with_decryption_properties(decryption_properties)
-            .fetch_metadata()
-            .await?;
-
-        let field_id_map = extract_parquet_field_ids(&metadata);
-
-        // No field_ids means external file - use current schema directly
-        if field_id_map.is_empty() {
-            return Ok((self.schema.clone(), HashMap::new(), HashMap::new()));
-        }
-
-        let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
-            metadata.file_metadata().schema_descr(),
-            metadata.file_metadata().key_value_metadata(),
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let (read_schema, name_mapping) = build_read_schema_with_field_id_mapping_from_schema(
-            &self.columns,
-            self.physical_schema.as_ref(),
-            &field_id_map,
-            Some(&arrow_schema),
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let read_schema = normalize_list_element_names(&apply_initial_default_metadata(
-            &read_schema,
-            &self.columns,
-            &name_mapping,
-        ));
-        Ok((Arc::new(read_schema), name_mapping, HashMap::new()))
-    }
-
     fn present_file_read_config(
         &self,
         plan: Arc<dyn ExecutionPlan>,
@@ -2927,7 +2842,12 @@ impl DuckLakeTable {
     ///
     /// Groups multiple files into a single efficient execution plan since they don't
     /// need delete filtering.
-    async fn build_exec_for_files_without_deletes(
+    ///
+    /// Reads no data file. A file with a name mapping resolves from that catalog
+    /// row. Every other file shares one scan over the table's physical schema whose
+    /// [`FieldIdExprAdapterFactory`] resolves the file's columns by field id as the
+    /// reader opens it, which is when the file's schema is first known.
+    fn build_exec_for_files_without_deletes(
         &self,
         state: &dyn Session,
         files: &[&DuckLakeTableFile],
@@ -2936,44 +2856,34 @@ impl DuckLakeTable {
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // Physical column names can differ across files (e.g. a column renamed
-        // after some files were written), so the field_id -> physical-name read
-        // schema must be resolved PER FILE. Group files that share the same
-        // physical schema into one ParquetSource and union the groups; the common
-        // case (no schema evolution) stays a single group / single scan.
-        let mut groups: Vec<(SchemaMapping, Vec<PartitionedFile>, Vec<Arc<Statistics>>)> =
-            Vec::new();
+        // A name-mapped file reads under the schema its mapping describes, which
+        // can differ from file to file. Files sharing a mapped schema share one
+        // ParquetSource and the groups are unioned. Every file without a mapping
+        // joins the one group resolved per file by field id, keyed apart from
+        // any mapped schema so the two resolutions never share a scan.
+        const FIELD_ID_GROUP_KEY: &str = "\u{0}field-id";
+        let mut groups: Vec<ScanGroup> = Vec::new();
         let mut group_index: HashMap<String, usize> = HashMap::new();
 
         for table_file in files {
-            let mapping = self.file_schema_mapping(state, &table_file.file).await?;
             let pf = self.partitioned_data_file(table_file, false, file_statistics)?;
-
-            // Group key: physical field names + types, then the rename mapping.
-            let (read_schema, name_mapping, constants) = &mapping;
-            let mut key = String::new();
-            for f in read_schema.fields() {
-                key.push_str(f.name());
-                key.push('\u{1}');
-                key.push_str(&format!("{:?}", f.data_type()));
-                key.push('\u{2}');
-            }
-            let mut pairs: Vec<(&String, &String)> = name_mapping.iter().collect();
-            pairs.sort();
-            for (k, v) in pairs {
-                key.push_str(k);
-                key.push('\u{3}');
-                key.push_str(v);
-                key.push('\u{4}');
-            }
-            let mut constants: Vec<_> = constants.iter().collect();
-            constants.sort_by_key(|(name, _)| *name);
-            for (name, value) in constants {
-                key.push_str(name);
-                key.push('\u{5}');
-                key.push_str(&format!("{value:?}"));
-                key.push('\u{6}');
-            }
+            let (mapping, key, resolved_by_field_id) = match table_file.file.mapping_id {
+                Some(mapping_id) => {
+                    let resolved_path = self.resolve_file_path(&table_file.file)?;
+                    let mapping = self.mapped_schema(mapping_id, &resolved_path)?;
+                    let key = Self::mapped_group_key(&mapping);
+                    (mapping, key, false)
+                },
+                None => (
+                    (
+                        Arc::clone(&self.physical_schema),
+                        HashMap::new(),
+                        HashMap::new(),
+                    ),
+                    FIELD_ID_GROUP_KEY.to_string(),
+                    true,
+                ),
+            };
 
             // Kept positionally alongside the group's files so the rollup can
             // refuse a group where any file lacks a summary, rather than
@@ -2981,14 +2891,19 @@ impl DuckLakeTable {
             let summary = summary_statistics.get(&table_file.data_file_id).cloned();
             match group_index.get(&key) {
                 Some(&gi) => {
-                    groups[gi].1.push(pf);
+                    groups[gi].files.push(pf);
                     if let Some(summary) = summary {
-                        groups[gi].2.push(summary);
+                        groups[gi].summaries.push(summary);
                     }
                 },
                 None => {
                     group_index.insert(key, groups.len());
-                    groups.push((mapping, vec![pf], summary.into_iter().collect()));
+                    groups.push(ScanGroup {
+                        mapping,
+                        files: vec![pf],
+                        summaries: summary.into_iter().collect(),
+                        resolved_by_field_id,
+                    });
                 },
             }
         }
@@ -3003,10 +2918,16 @@ impl DuckLakeTable {
         // row-group/page pruning (footer bounds exclude NaN).
         let nan_unsafe_columns = self.nan_unsafe_float_columns(files, file_statistics);
 
-        // Build one scan per physical-schema group; ColumnRenameExec coerces each
-        // group to the catalog schema (renamed columns or a differing Arrow type).
+        // Build one scan per group. ColumnRenameExec coerces a mapped group to the
+        // catalog schema; the field-id group already reads as the catalog schema.
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
-        for ((read_schema, name_mapping, constants), partitioned_files, group_summary) in groups {
+        for ScanGroup {
+            mapping: (read_schema, name_mapping, constants),
+            files: partitioned_files,
+            summaries: group_summary,
+            resolved_by_field_id,
+        } in groups
+        {
             let (file_group, summary) = self.roll_up_scan_statistics(
                 state,
                 FileGroup::new(partitioned_files),
@@ -3021,6 +2942,11 @@ impl DuckLakeTable {
                 .with_file_group(file_group);
             if let Some(summary) = summary {
                 builder = builder.with_statistics(summary);
+            }
+            if resolved_by_field_id {
+                builder = builder.with_expr_adapter(Some(Arc::new(
+                    FieldIdExprAdapterFactory::new(&self.columns),
+                )));
             }
 
             if let Some(proj) = projection {
@@ -3040,6 +2966,9 @@ impl DuckLakeTable {
             } else {
                 parquet_exec
             };
+            if resolved_by_field_id && has_struct_or_map_column(&read_schema) {
+                exec = Arc::new(OpenTimeFilterBarrierExec::new(exec));
+            }
             if !nan_unsafe_columns.is_empty() {
                 exec = Arc::new(NanPruningBarrierExec::new(
                     exec,
@@ -3050,6 +2979,35 @@ impl DuckLakeTable {
         }
 
         combine_execution_plans(execs)
+    }
+
+    /// Group key for a name-mapped file: physical field names and types, then
+    /// the rename mapping, then the path-derived constants.
+    fn mapped_group_key((read_schema, name_mapping, constants): &SchemaMapping) -> String {
+        let mut key = String::new();
+        for f in read_schema.fields() {
+            key.push_str(f.name());
+            key.push('\u{1}');
+            key.push_str(&format!("{:?}", f.data_type()));
+            key.push('\u{2}');
+        }
+        let mut pairs: Vec<(&String, &String)> = name_mapping.iter().collect();
+        pairs.sort();
+        for (k, v) in pairs {
+            key.push_str(k);
+            key.push('\u{3}');
+            key.push_str(v);
+            key.push('\u{4}');
+        }
+        let mut constants: Vec<_> = constants.iter().collect();
+        constants.sort_by_key(|(name, _)| *name);
+        for (name, value) in constants {
+            key.push_str(name);
+            key.push('\u{5}');
+            key.push_str(&format!("{value:?}"));
+            key.push('\u{6}');
+        }
+        key
     }
 
     /// Float columns whose stored max is unusable for at least one of `files`
@@ -3225,7 +3183,6 @@ impl DuckLakeTable {
         self.write_options = options;
         self
     }
-
     /// The GROSS row count of one file — every row it holds, deleted rows
     /// included — with all column bounds unknown, sized to `schema`.
     ///
@@ -3471,7 +3428,6 @@ impl DuckLakeTable {
 
         Ok(cfg)
     }
-
     /// Build a plan for a single file when the synthetic `rowid` column is in
     /// the projection. Always uses per-file scans because each file may have a
     /// different layout (embedded rowid vs. synthesized) and a distinct
@@ -4613,17 +4569,14 @@ impl TableProvider for DuckLakeTable {
                 });
 
             if !files_without_deletes.is_empty() {
-                execs.push(
-                    self.build_exec_for_files_without_deletes(
-                        state,
-                        &files_without_deletes,
-                        &file_statistics,
-                        &summary_statistics,
-                        projection,
-                        limit,
-                    )
-                    .await?,
-                );
+                execs.push(self.build_exec_for_files_without_deletes(
+                    state,
+                    &files_without_deletes,
+                    &file_statistics,
+                    &summary_statistics,
+                    projection,
+                    limit,
+                )?);
             }
             for table_file in files_with_deletes {
                 execs.push(
@@ -5006,6 +4959,16 @@ impl TableProvider for DuckLakeTable {
             self.object_store_url.clone(),
         )))
     }
+}
+
+/// Whether `schema` has a top-level struct or map column: the only columns a
+/// predicate can reach in a form the reader's row filter may decline per file
+/// (see [`crate::field_id_adapter::reader_keeps_predicate`]).
+fn has_struct_or_map_column(schema: &Schema) -> bool {
+    schema
+        .fields()
+        .iter()
+        .any(|field| matches!(field.data_type(), DataType::Struct(_) | DataType::Map(_, _)))
 }
 
 /// Combines multiple execution plans into a single plan
@@ -7166,7 +7129,7 @@ mod tests {
     /// warm [`CachedParquetFileReaderFactory`] must not repeat. Covers every
     /// method a footer fetch could arrive through: `get_ranges` directly
     /// (`DFParquetMetadata`'s own call, and the only one this crate's footer
-    /// reads use now that both the scan and `file_schema_mapping` route
+    /// reads use, since both the scan and `read_parquet_footer_facts` route
     /// through it), `get_opts` (a single bounded range there would
     /// also qualify), and `get_range`, whose `ObjectStoreExt` default
     /// implementation calls `get_opts` on `self` and so is covered by the

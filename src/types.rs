@@ -1391,6 +1391,42 @@ pub fn extract_parquet_field_ids(metadata: &ParquetMetaData) -> HashMap<i32, Str
     field_ids_dropping_duplicates(entries.into_iter())
 }
 
+/// The `field_id -> name` map of a file's Arrow schema, as the parquet reader
+/// derives it from the file: every node the reader tags with
+/// [`PARQUET_FIELD_ID_META_KEY`], top-level and nested, with the same
+/// duplicate rule as [`extract_parquet_field_ids`]. This is the form a scan sees
+/// when it resolves a file as the reader opens it, where the file's Arrow schema
+/// is available and its parquet metadata is not.
+pub(crate) fn arrow_schema_field_ids(schema: &Schema) -> HashMap<i32, String> {
+    fn collect(field: &Field, entries: &mut Vec<(i32, String)>) {
+        if let Some(id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|value| value.parse().ok())
+        {
+            entries.push((id, field.name().clone()));
+        }
+        match field.data_type() {
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _)
+            | DataType::Map(child, _) => collect(child, entries),
+            DataType::Struct(fields) => {
+                for child in fields {
+                    collect(child, entries);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    let mut entries = Vec::new();
+    for field in schema.fields() {
+        collect(field, &mut entries);
+    }
+    field_ids_dropping_duplicates(entries.into_iter())
+}
+
 /// Collect a `field_id -> name` map, dropping any `field_id` shared by more than
 /// one field. DuckLake assigns exactly one field_id per catalog column node, so
 /// a collision is malformed/adversarial parquet; binding the catalog
@@ -2083,6 +2119,7 @@ mod tests {
                 .into(),
             )),
             nested_column_ids: vec![2, 3, 4],
+            nested_initial_defaults: Default::default(),
             initial_default: None,
             default_value: None,
             default_value_type: None,
@@ -2143,6 +2180,7 @@ mod tests {
                 vec![Arc::new(Field::new("c", DataType::Int32, true))].into(),
             )),
             nested_column_ids: vec![4],
+            nested_initial_defaults: Default::default(),
             initial_default: None,
             default_value: None,
             default_value_type: None,
@@ -2230,6 +2268,7 @@ mod tests {
                     true,
                 )))),
                 nested_column_ids: vec![2],
+                nested_initial_defaults: Default::default(),
                 initial_default: None,
                 default_value: None,
                 default_value_type: None,
@@ -2248,6 +2287,7 @@ mod tests {
                     .into(),
                 )),
                 nested_column_ids: vec![4, 5],
+                nested_initial_defaults: Default::default(),
                 initial_default: None,
                 default_value: None,
                 default_value_type: None,
@@ -2273,6 +2313,7 @@ mod tests {
                     false,
                 )),
                 nested_column_ids: vec![7, 8],
+                nested_initial_defaults: Default::default(),
                 initial_default: None,
                 default_value: None,
                 default_value_type: None,
@@ -2289,6 +2330,7 @@ mod tests {
                     true,
                 )))),
                 nested_column_ids: vec![10, 11],
+                nested_initial_defaults: Default::default(),
                 initial_default: None,
                 default_value: None,
                 default_value_type: None,
@@ -3629,6 +3671,7 @@ mod tests {
                 .into(),
             )),
             nested_column_ids: vec![2, 3],
+            nested_initial_defaults: Default::default(),
             initial_default: None,
             default_value: None,
             default_value_type: None,
@@ -3679,6 +3722,7 @@ mod tests {
             is_nullable: true,
             data_type: Some(DataType::Map(Arc::new(entries), false)),
             nested_column_ids: vec![2, 3],
+            nested_initial_defaults: Default::default(),
             initial_default: None,
             default_value: None,
             default_value_type: None,
