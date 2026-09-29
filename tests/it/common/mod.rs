@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod s3;
+
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::Path;

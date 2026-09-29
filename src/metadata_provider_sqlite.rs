@@ -239,7 +239,7 @@ fn build_inlined_batch(
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                datafusion::common::ScalarValue::iter_to_array(values.into_iter())?
+                datafusion::common::ScalarValue::iter_to_array(values)?
             },
             other => {
                 let values = rows
@@ -259,7 +259,7 @@ fn build_inlined_batch(
                         }
                     })
                     .collect::<Result<Vec<_>>>()?;
-                datafusion::common::ScalarValue::iter_to_array(values.into_iter())?
+                datafusion::common::ScalarValue::iter_to_array(values)?
             },
         };
         arrays.push(array);

@@ -69,6 +69,14 @@ rstest = "0.26"
 aws-sdk-s3 = "1.75"
 aws-credential-types = "1.2"
 sqllogictest = "0.23"
+# In-process S3 server for the object-store tests (tests/it/common/s3.rs):
+# s3s speaks the S3 REST API and verifies SigV4, s3s-fs backs it with a temp
+# directory, and hyper-util serves it on a loopback port. s3s needs Rust 1.96,
+# which is why rust-toolchain.toml is ahead of `rust-version`: the library
+# itself still builds on 1.94.
+s3s = "0.17"
+s3s-fs = "0.17"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 
 [features]
 default = ["metadata-sqlite"]

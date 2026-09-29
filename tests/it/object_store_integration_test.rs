@@ -1,10 +1,11 @@
 #![cfg(feature = "metadata-duckdb")]
-//! Integration test for object store support (S3/MinIO)
+//! Integration test for object store support (S3)
 //!
 //! This test verifies that DataFusion-DuckLake works correctly with object stores
-//! by spinning up a MinIO container, configuring DuckDB to write directly to S3,
-//! and running queries against the remote data.
+//! by starting an in-process S3 server (see `common::s3`), configuring DuckDB to
+//! write directly to S3, and running queries against the remote data.
 
+use crate::common::s3::{REGION, S3Server};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::*;
 use datafusion_ducklake::{DuckLakeCatalog, DuckdbMetadataProvider};
@@ -12,46 +13,6 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use std::sync::Arc;
 use tempfile::TempDir;
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt};
-
-/// The MinIO server image, split into name and tag because that is how
-/// testcontainers overrides them.
-///
-/// This is Bitnami's build of MinIO RELEASE.2025-02-28T09-55-16Z. MinIO
-/// publishes no community image any more: it deleted `minio/*` from Docker Hub
-/// on 2026-09-11 and closed `quay.io/minio` on 2026-09-24 (anonymous pulls get
-/// a token with an empty access list, so every tag 401s), which is where this
-/// test had moved when Docker Hub went. `bitnamilegacy` is Broadcom's frozen
-/// archive of the Bitnami catalogue: nothing there is updated, so the tag
-/// cannot move under us, but the namespace itself is not promised forever. If
-/// it goes, mirror the image into a registry we own rather than hunting for a
-/// fourth publisher.
-///
-/// A `GenericImage` rather than `testcontainers_modules::minio::MinIO`: the
-/// module pinned here (0.11) names `minio/minio:RELEASE.2022-02-07T08-17-33Z`,
-/// an image that no longer exists anywhere, and waits for `API:` on STDOUT,
-/// where that 2022 release printed its banner. The 2025 release prints it on
-/// STDERR, so the module's readiness check never matches and the start times
-/// out. `testcontainers-modules` 0.15 pins this very release and waits on
-/// stderr for the same reason; until this crate moves to it, the image, the
-/// wait and the port are spelled out here.
-const MINIO_IMAGE_NAME: &str = "bitnamilegacy/minio";
-const MINIO_IMAGE_TAG: &str = "2025.2.28-debian-12-r1";
-
-/// Where the Bitnami image keeps object data. The official image's CMD was
-/// `server /data`; this image runs as uid 1001, `/data` does not exist and
-/// that user cannot create it, so the server is pointed at the directory the
-/// image ships writable instead.
-const MINIO_DATA_DIR: &str = "/bitnami/minio/data";
-
-/// Root credentials the test runs MinIO with. The official image defaulted to
-/// these; Bitnami's defaults to `minio` / `miniosecret`, so they are set
-/// explicitly on the container. The DuckDB secret and settings in the helpers
-/// above spell the same pair inline in their SQL.
-const MINIO_USER: &str = "minioadmin";
-const MINIO_PASSWORD: &str = "minioadmin";
 
 /// Helper to create test data using DuckDB with local filesystem
 async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
@@ -94,10 +55,10 @@ async fn create_local_test_catalog(catalog_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Helper to create test data using DuckDB with S3/MinIO data path
+/// Helper to create test data using DuckDB with an S3 data path
 async fn create_s3_test_catalog(
     catalog_path: &str,
-    s3_endpoint: &str,
+    s3: &S3Server,
     bucket_name: &str,
     data_path: &str,
 ) -> anyhow::Result<()> {
@@ -108,31 +69,25 @@ async fn create_s3_test_catalog(
     crate::common::ensure_ducklake_installed();
     conn.execute("LOAD ducklake;", [])?;
 
-    eprintln!("Configuring S3 secret for endpoint: {}", s3_endpoint);
-
-    // Create S3 secret for MinIO
-    // Extract host:port from endpoint
-    let endpoint_without_protocol = s3_endpoint
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-
-    eprintln!("Endpoint without protocol: {}", endpoint_without_protocol);
+    eprintln!("Configuring S3 secret for endpoint: {}", s3.endpoint_url);
 
     let create_secret_sql = format!(
         "CREATE SECRET s3_secret (
             TYPE S3,
-            KEY_ID 'minioadmin',
-            SECRET 'minioadmin',
-            REGION 'us-east-1',
+            KEY_ID '{}',
+            SECRET '{}',
+            REGION '{REGION}',
             ENDPOINT '{}',
-            USE_SSL false,
+            USE_SSL {},
             URL_STYLE 'path',
             URL_COMPATIBILITY_MODE true
         );",
-        endpoint_without_protocol
+        s3.user,
+        s3.password,
+        s3.host_port(),
+        s3.use_ssl()
     );
 
-    eprintln!("Creating secret with SQL: {}", create_secret_sql);
     conn.execute(&create_secret_sql, [])?;
     eprintln!("S3 secret created");
 
@@ -144,15 +99,12 @@ async fn create_s3_test_catalog(
 
     // Try setting S3 options directly via SET commands
     eprintln!("Setting S3 configuration via SET commands...");
-    conn.execute(
-        &format!("SET s3_endpoint='{}';", endpoint_without_protocol),
-        [],
-    )?;
-    conn.execute("SET s3_access_key_id='minioadmin';", [])?;
-    conn.execute("SET s3_secret_access_key='minioadmin';", [])?;
-    conn.execute("SET s3_use_ssl=false;", [])?;
+    conn.execute(&format!("SET s3_endpoint='{}';", s3.host_port()), [])?;
+    conn.execute(&format!("SET s3_access_key_id='{}';", s3.user), [])?;
+    conn.execute(&format!("SET s3_secret_access_key='{}';", s3.password), [])?;
+    conn.execute(&format!("SET s3_use_ssl={};", s3.use_ssl()), [])?;
     conn.execute("SET s3_url_style='path';", [])?;
-    conn.execute("SET s3_region='us-east-1';", [])?;
+    conn.execute(&format!("SET s3_region='{REGION}';"), [])?;
     eprintln!("S3 configuration set");
 
     // Test S3 write capability with a simple table
@@ -242,62 +194,13 @@ async fn create_s3_test_catalog(
 }
 
 #[tokio::test]
-#[cfg_attr(feature = "skip-tests-with-docker", ignore)]
-async fn test_minio_object_store_integration() -> anyhow::Result<()> {
-    // Tests DataFusion-DuckLake reading from S3/MinIO with DuckDB-created data
+async fn test_s3_object_store_integration() -> anyhow::Result<()> {
+    // Tests DataFusion-DuckLake reading from S3 with DuckDB-created data
+    let s3 = S3Server::start();
+    eprintln!("S3 server on {}", s3.endpoint_url);
 
-    // Skip test if Docker is not available
-    if !is_docker_available().await {
-        eprintln!("Skipping MinIO integration test: Docker not available");
-        return Err(anyhow::anyhow!("MinIO integration tests not available"));
-    }
-
-    // The official image's CMD was `server /data`. Bitnami's entrypoint execs
-    // its argv verbatim, so this is the same invocation with the binary named
-    // (nothing prepends `minio` for us) and the data dir moved to the one the
-    // non-root image can write. The credentials are explicit because this
-    // image's own defaults are not minioadmin. Readiness is the server's own
-    // `API:` banner, which this release writes to stderr (see MINIO_IMAGE_NAME).
-    let minio = GenericImage::new(MINIO_IMAGE_NAME, MINIO_IMAGE_TAG)
-        .with_exposed_port(9000.tcp())
-        .with_wait_for(WaitFor::message_on_stderr("API:"))
-        .with_cmd(["minio", "server", MINIO_DATA_DIR])
-        .with_env_var("MINIO_ROOT_USER", MINIO_USER)
-        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_PASSWORD)
-        .start()
-        .await?;
-    let minio_port = minio.get_host_port_ipv4(9000).await?;
-    let minio_endpoint = format!("http://127.0.0.1:{}", minio_port);
-
-    eprintln!("MinIO started on {}", minio_endpoint);
-
-    // Create bucket using AWS SDK (following testcontainers-modules pattern)
-    eprintln!("Creating test bucket using AWS SDK...");
-    use aws_credential_types::Credentials;
-    use aws_sdk_s3::config::{Region, SharedCredentialsProvider};
-
-    let creds = Credentials::new(MINIO_USER, MINIO_PASSWORD, None, None, "test");
-    let s3_config = aws_sdk_s3::Config::builder()
-        .endpoint_url(&minio_endpoint)
-        .region(Region::new("us-east-1"))
-        .credentials_provider(SharedCredentialsProvider::new(creds))
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
-
-    let bucket_name = "test-bucket";
-    s3_client.create_bucket().bucket(bucket_name).send().await?;
-
+    let bucket_name = s3.create_bucket("test-bucket").await?;
     eprintln!("Bucket '{}' created successfully", bucket_name);
-
-    // Verify bucket exists by listing
-    let buckets = s3_client.list_buckets().send().await?.buckets;
-    eprintln!(
-        "Found {} bucket(s) in MinIO",
-        buckets.as_ref().map_or(0, |b| b.len())
-    );
 
     // Create temporary directory for test catalog metadata
     let temp_dir = TempDir::new()?;
@@ -306,34 +209,31 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
 
     // Generate test data - DuckDB writes directly to S3
     eprintln!("Generating test data on S3...");
-    create_s3_test_catalog(
-        &catalog_path_str,
-        &minio_endpoint,
-        "test-bucket",
-        "ducklake-data/",
-    )
-    .await?;
+    create_s3_test_catalog(&catalog_path_str, &s3, &bucket_name, "ducklake-data/").await?;
     assert_parquet_data_files(
         &catalog_path_str,
         &[("inventory", 1, 4), ("products", 1, 5)],
     )?;
-    eprintln!("Test data written to MinIO");
+    eprintln!("Test data written to S3");
 
     // Configure S3 client for DataFusion
     let s3_client: Arc<dyn ObjectStore> = Arc::new(
         AmazonS3Builder::new()
-            .with_endpoint(&minio_endpoint)
-            .with_bucket_name("test-bucket")
-            .with_access_key_id(MINIO_USER)
-            .with_secret_access_key(MINIO_PASSWORD)
-            .with_region("us-east-1")
+            .with_endpoint(&s3.endpoint_url)
+            .with_bucket_name(&bucket_name)
+            .with_access_key_id(&s3.user)
+            .with_secret_access_key(&s3.password)
+            .with_region(REGION)
             .with_allow_http(true)
             .build()?,
     );
 
     // Register object store with DataFusion runtime
     let runtime = Arc::new(RuntimeEnvBuilder::new().build()?);
-    runtime.register_object_store(&url::Url::parse("s3://test-bucket")?, s3_client.clone());
+    runtime.register_object_store(
+        &url::Url::parse(&format!("s3://{bucket_name}"))?,
+        s3_client.clone(),
+    );
 
     // Create session context with the runtime
     let session_config = SessionConfig::new();
@@ -428,18 +328,9 @@ async fn test_minio_object_store_integration() -> anyhow::Result<()> {
     );
     eprintln!("Filter query successful");
 
-    eprintln!("All MinIO integration tests passed");
+    eprintln!("All S3 integration tests passed");
 
     Ok(())
-}
-
-/// Check if Docker is available
-async fn is_docker_available() -> bool {
-    tokio::process::Command::new("docker")
-        .arg("--version")
-        .output()
-        .await
-        .is_ok()
 }
 
 #[tokio::test]
