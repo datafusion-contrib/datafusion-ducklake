@@ -14,6 +14,7 @@
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{Region, SharedCredentialsProvider};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
 
@@ -32,9 +33,22 @@ pub struct S3Server {
 }
 
 struct InProcess {
-    // Field order is drop order: stop the server before its root goes away.
-    _shutdown: oneshot::Sender<()>,
+    shutdown: Option<oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
     _root: TempDir,
+}
+
+impl Drop for InProcess {
+    /// Stop the server and wait for its thread, so that no request is still
+    /// writing into the root when `_root` removes it after this returns.
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl S3Server {
@@ -73,7 +87,7 @@ impl S3Server {
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("s3-test-server".into())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -90,7 +104,17 @@ impl S3Server {
                         tokio::select! {
                             _ = &mut shutdown_rx => break,
                             accepted = listener.accept() => {
-                                let Ok((socket, _)) = accepted else { continue };
+                                let socket = match accepted {
+                                    Ok((socket, _)) => socket,
+                                    // A persistent error, such as no free file
+                                    // descriptors, would spin this loop. Wait
+                                    // before the next try instead.
+                                    Err(e) => {
+                                        eprintln!("S3 test server accept failed: {e}");
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                        continue;
+                                    },
+                                };
                                 let conn = http
                                     .serve_connection(
                                         hyper_util::rt::TokioIo::new(socket),
@@ -112,7 +136,8 @@ impl S3Server {
             user: DEFAULT_USER.to_string(),
             password: DEFAULT_PASSWORD.to_string(),
             _in_process: Some(InProcess {
-                _shutdown: shutdown_tx,
+                shutdown: Some(shutdown_tx),
+                thread: Some(thread),
                 _root: root,
             }),
         }

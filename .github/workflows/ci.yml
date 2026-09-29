@@ -418,6 +418,34 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         run: cargo check --tests
 
+      # `rust-toolchain.toml` pins a newer compiler than `rust-version`, because
+      # the in-process S3 test server (a dev-dependency) needs it. So no other job
+      # builds on the declared minimum, and a lockfile bump could raise it
+      # silently. Check the library alone on that version: without and with every
+      # library feature, against the committed lockfile.
+      - name: Read rust-version
+        if: steps.changes.outputs.code == 'true'
+        id: msrv
+        run: |
+          msrv=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "datafusion-ducklake") | .rust_version')
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        if: steps.changes.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Check the library on rust-version
+        if: steps.changes.outputs.code == 'true'
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          cargo "+$MSRV" check --locked --lib --no-default-features
+          cargo "+$MSRV" check --locked --lib --no-default-features --features \
+            "metadata-duckdb metadata-postgres metadata-mysql metadata-sqlite encryption write-sqlite write-postgres write-duckdb write-mysql"
+
 
   test-full:
     name: Test (single-catalog backends + encryption, Docker)
