@@ -54,11 +54,12 @@ multiple independent DuckLake catalogs. Reading multiple catalogs requires
 > PostgreSQL writes no longer *require* this path: `PostgresSingleCatalogMetadataWriter`
 > writes the standard spec-compliant layout and supports SQL `CREATE TABLE` and `INSERT INTO`.
 
-Multi-catalog file ownership: a data or delete file row carries an
-`owner_catalog_id`. `NULL` means the catalog holding the row owns the object and
-reclaims it — including a file it wrote outside its own `cat_{id}/` layout, which
-`begin_write_to_path` does. A row that names another catalog is a *reference* to that
-catalog's file, which is how `register_existing_data_file` and its batched sibling
+Multi-catalog file ownership is recorded in dedicated tables. A data or delete file
+row with no entry in
+`ducklake_catalog_data_file_reference` / `ducklake_catalog_delete_file_reference`
+is owned by the catalog holding it, which reclaims the object — including a file it
+wrote outside its own `cat_{id}/` layout, which `begin_write_to_path` does. A row with
+an entry is a *reference* to the named catalog's file, which is how `register_existing_data_file` and its batched sibling
 `register_existing_data_files` (with `with_owner_catalog`) let one catalog share another's
 files without copying them. Expire and compaction
 delete such a row without scheduling its object, and `cleanup_old_files_in_catalog`

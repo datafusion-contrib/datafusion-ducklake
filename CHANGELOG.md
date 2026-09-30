@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MulticatalogManager::table_file_owners` and `has_live_references` report file ownership, so
+  callers need not query the crate's tables for it (#310).
 - A `data_path` may use any object store URL scheme, for example `gs://`, `gcs://`, `az://` or
   `abfss://`, not only `s3://`. Its store is found by `scheme://authority/` in the DataFusion
   `RuntimeEnv`. Before, such a path was taken for a local path.
@@ -46,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `count(*)` on a table with delete files is answered from catalog counts, as official does,
   without reading any delete file (#306).
+- Multicatalog Postgres records file references in dedicated `ducklake_catalog_*_file_reference`
+  tables; boot copies a v0.8.0 store's `owner_catalog_id` column and keeps writing it (#310).
 - **BREAKING**: `MetadataWriter::get_table_column_nullability` is a new required method with no
   default; every external `MetadataWriter` implementation must return the live top-level
   `nulls_allowed` of an existing table, or `None` when the table does not exist (#319).

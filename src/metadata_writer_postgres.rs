@@ -295,10 +295,9 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         end_snapshot BIGINT,
         PRIMARY KEY (table_id, column_id, begin_snapshot)
     )"#,
-    // `owner_catalog_id` is this layout's file-ownership marker. NULL — the catalog
-    // holding the row owns the object and reclaims it; set — the row references a
-    // file the named catalog owns, so this catalog never schedules or deletes it.
-    // See DataFileInfo::owner_catalog_id and migrate_file_ownership_column.
+    // File ownership is NOT stored here: a reference to another catalog's file is
+    // recorded in
+    // `ducklake_catalog_data_file_reference` instead. See migrate_file_ownership.
     r#"CREATE TABLE IF NOT EXISTS ducklake_data_file (
         data_file_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         table_id BIGINT NOT NULL,
@@ -313,8 +312,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT,
         partial_max BIGINT,
-        partition_id BIGINT,
-        owner_catalog_id BIGINT
+        partition_id BIGINT
     )"#,
     // Per-table running counters maintained inside the writer's transaction
     // so concurrent writes hand out non-overlapping rowid ranges. `next_row_id`
@@ -409,9 +407,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         -- Max embedded per-row snapshot of a cumulative delete file (current
         -- DuckLake spec). This crate's writer emits per-snapshot delete files
         -- and leaves it NULL; readers use it to window cumulative files by row.
-        partial_max BIGINT,
-        -- Ownership marker, as on ducklake_data_file.
-        owner_catalog_id BIGINT
+        partial_max BIGINT
     )"#,
     // Idempotent guard: an existing single-catalog Postgres catalog populated by
     // another tool may not have schema_version on ducklake_snapshot.
@@ -556,8 +552,8 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     // it. TRUE on every row inserted here — a catalog only ever schedules what it owns
     // — and NULL exactly on rows predating the rule, which may name another catalog's
     // live file and are therefore held to the stricter layout check in
-    // `retain_unreferenced`. It is a boolean, not an `owner_catalog_id` like the file
-    // tables carry: there a set value names ANOTHER catalog, and reusing the name for
+    // `retain_unreferenced`. It is a boolean, not an `owner_catalog_id` like the
+    // reference tables carry: there the value names ANOTHER catalog, and reusing the name for
     // the opposite polarity invites a query that gets it backwards.
     r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
         catalog_id BIGINT NOT NULL,
@@ -569,6 +565,23 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     )"#,
     r#"CREATE INDEX IF NOT EXISTS idx_scheduled_for_deletion_catalog
         ON ducklake_files_scheduled_for_deletion(catalog_id)"#,
+    // File ownership, kept out of the file tables. A row here marks a
+    // `ducklake_data_file` / `ducklake_delete_file` row as a *reference* to a file
+    // that `owner_catalog_id` owns, which a database fork registers instead of
+    // copying the object. No row means the catalog holding the file row owns the
+    // object and reclaims it, however its path is spelled. Only
+    // `register_existing_data_files` writes these; expire, compaction and
+    // `drop_catalog` delete them with their file rows. Keyed by the file id alone:
+    // both ids are store-wide identities, so the referring catalog is the one the
+    // file row belongs to.
+    r#"CREATE TABLE IF NOT EXISTS ducklake_catalog_data_file_reference (
+        data_file_id BIGINT PRIMARY KEY,
+        owner_catalog_id BIGINT NOT NULL
+    )"#,
+    r#"CREATE TABLE IF NOT EXISTS ducklake_catalog_delete_file_reference (
+        delete_file_id BIGINT PRIMARY KEY,
+        owner_catalog_id BIGINT NOT NULL
+    )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_dropped_data_path (
         data_path VARCHAR PRIMARY KEY,
         dropped_at TIMESTAMPTZ DEFAULT NOW()
@@ -649,49 +662,209 @@ pub(crate) async fn migrate_column_default_metadata(pool: &PgPool) -> Result<()>
     Ok(())
 }
 
-/// Record file ownership on its own column, and re-point the reference indexes at it.
+/// Bring a store's file-ownership records to the current shape. Idempotent, and
+/// runs on every boot.
 ///
-/// Before this, ownership was read off `path_is_relative`: an absolute-path row was
-/// taken to be a reference to a file another catalog owns. But that flag already
-/// meant "this path is spelled absolutely", which
-/// [`crate::DuckLakeTableWriter::begin_write_to_path`] produces for a catalog's OWN
-/// file. The two facts were indistinguishable, so such a file stopped being
-/// scheduled by expire and compaction, and — when it lived outside `data_path`,
-/// which is the reason that entry point exists — was never reclaimed at all.
+/// Ownership lives in `ducklake_catalog_data_file_reference` and
+/// `ducklake_catalog_delete_file_reference`, which `SQL_CREATE_MULTICATALOG_TABLES`
+/// creates. v0.8.0 stored it as an `owner_catalog_id` column on
+/// `ducklake_data_file` and `ducklake_delete_file` instead. A store that v0.8.0
+/// bootstrapped still has that column, and this crate keeps it working for one
+/// release so that a rollback to
+/// v0.8.0 stays safe:
 ///
-/// `owner_catalog_id` separates them: NULL means the catalog holding the row owns
-/// the object, set means the row references a file the named catalog owns. Adding
-/// the column leaves every pre-existing row NULL, i.e. owned, which is what every
-/// absolute row meant before the flag was overloaded — so an upgrade restores their
-/// reclaim path rather than reinterpreting them.
+/// - the reference rows in it are copied into the reference tables here, on every
+///   boot, which also picks up a reference a v0.8.0 process registered since;
+/// - [`legacy_owner_columns`] reports it, and every read of ownership also honours
+///   it while it exists, and registration writes it too.
 ///
-/// Additive and idempotent, and runs on every boot: `ADD COLUMN IF NOT EXISTS` on
-/// tables the `SQL_CREATE_*_TABLES` statements have already created, then the index
-/// swap. The two indexes are created HERE rather than alongside the tables because their
-/// predicate names the new column, which on an existing store does not exist until
-/// the `ALTER`s above have run. They carry new names rather than redefining the old
-/// ones: `CREATE INDEX IF NOT EXISTS` keeps whatever predicate an index already
-/// has, so a same-named index would silently stay on `NOT path_is_relative`.
-pub(crate) async fn migrate_file_ownership_column(pool: &PgPool) -> Result<()> {
+/// A fresh store never gets the column. Nothing here adds it, and nothing here
+/// drops it: dropping it would let a rolled-back v0.8.0 read every reference as
+/// owned and delete a file another catalog reads.
+///
+/// Every schema change checks the system catalogs first, so on a current store
+/// this blocks no reader or writer of the file tables. A bare
+/// `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` would: it takes an `ACCESS EXCLUSIVE`
+/// lock before it finds that the column exists.
+pub(crate) async fn migrate_file_ownership(pool: &PgPool) -> Result<()> {
+    // `scheduled_by_owner` lives on this layout's own scheduling table, which has
+    // carried layout-specific columns since it gained `catalog_id`.
+    if !column_exists(
+        pool,
+        "ducklake_files_scheduled_for_deletion",
+        "scheduled_by_owner",
+    )
+    .await?
+    {
+        sqlx::query(
+            "ALTER TABLE ducklake_files_scheduled_for_deletion
+             ADD COLUMN IF NOT EXISTS scheduled_by_owner BOOLEAN",
+        )
+        .execute(pool)
+        .await?;
+    }
+    let legacy = legacy_owner_columns(&mut *pool.acquire().await?).await?;
+    // The v0.8.0 partial index `idx_*_file_owner_catalog` serves both copies.
+    if legacy.data_file {
+        sqlx::query(
+            "INSERT INTO ducklake_catalog_data_file_reference (data_file_id, owner_catalog_id)
+             SELECT data_file_id, owner_catalog_id FROM ducklake_data_file
+             WHERE owner_catalog_id IS NOT NULL
+             ON CONFLICT (data_file_id) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if legacy.delete_file {
+        sqlx::query(
+            "INSERT INTO ducklake_catalog_delete_file_reference (delete_file_id, owner_catalog_id)
+             SELECT delete_file_id, owner_catalog_id FROM ducklake_delete_file
+             WHERE owner_catalog_id IS NOT NULL
+             ON CONFLICT (delete_file_id) DO NOTHING",
+        )
+        .execute(pool)
+        .await?;
+    }
+    // Indexes from before v0.8.0, when an absolute path was read as a reference.
+    // `DROP INDEX IF EXISTS` takes no lock when the index is absent.
     for stmt in [
-        "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS owner_catalog_id BIGINT",
-        "ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS owner_catalog_id BIGINT",
-        "ALTER TABLE ducklake_files_scheduled_for_deletion
-         ADD COLUMN IF NOT EXISTS scheduled_by_owner BOOLEAN",
-        // Cleanup asks "does any catalog still reference this object", answered by a
-        // scan of the reference rows. These partial indexes keep that set — bounded
-        // by how many cross-catalog references exist, not by the size of the file
-        // tables — servable as an index-only scan.
-        "CREATE INDEX IF NOT EXISTS idx_data_file_owner_catalog
-         ON ducklake_data_file(path) WHERE owner_catalog_id IS NOT NULL",
-        "CREATE INDEX IF NOT EXISTS idx_delete_file_owner_catalog
-         ON ducklake_delete_file(path) WHERE owner_catalog_id IS NOT NULL",
-        // Their predecessors indexed `NOT path_is_relative`, which no longer answers
-        // any question this crate asks.
         "DROP INDEX IF EXISTS idx_data_file_absolute_path",
         "DROP INDEX IF EXISTS idx_delete_file_absolute_path",
     ] {
         sqlx::query(AssertSqlSafe(stmt)).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Whether `table` has a live column named `column`, resolved through the
+/// connection's `search_path` exactly as an unqualified query would be.
+async fn column_exists<'e, E>(executor: E, table: &str, column: &str) -> Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_attribute
+             WHERE attrelid = to_regclass($1) AND attname = $2
+               AND attnum > 0 AND NOT attisdropped
+         )",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_one(executor)
+    .await?)
+}
+
+/// Which file tables still carry the v0.8.0 `owner_catalog_id` column. See
+/// [`migrate_file_ownership`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LegacyOwnerColumns {
+    pub(crate) data_file: bool,
+    pub(crate) delete_file: bool,
+}
+
+/// Read [`LegacyOwnerColumns`] for this store. Checked per operation rather than
+/// cached, because a v0.8.0 process booting against the store adds the column.
+pub(crate) async fn legacy_owner_columns(
+    conn: &mut sqlx::PgConnection,
+) -> Result<LegacyOwnerColumns> {
+    Ok(LegacyOwnerColumns {
+        data_file: column_exists(&mut *conn, "ducklake_data_file", "owner_catalog_id").await?,
+        delete_file: column_exists(&mut *conn, "ducklake_delete_file", "owner_catalog_id").await?,
+    })
+}
+
+/// SQL boolean: the `ducklake_data_file` row aliased `df` is this catalog's own
+/// file, not a reference to another catalog's.
+pub(crate) fn data_file_owned_sql(legacy: LegacyOwnerColumns) -> &'static str {
+    if legacy.data_file {
+        "(NOT EXISTS (SELECT 1 FROM ducklake_catalog_data_file_reference r
+                      WHERE r.data_file_id = df.data_file_id)
+          AND df.owner_catalog_id IS NULL)"
+    } else {
+        "(NOT EXISTS (SELECT 1 FROM ducklake_catalog_data_file_reference r
+                      WHERE r.data_file_id = df.data_file_id))"
+    }
+}
+
+/// [`data_file_owned_sql`] for the `ducklake_delete_file` row aliased `df`.
+pub(crate) fn delete_file_owned_sql(legacy: LegacyOwnerColumns) -> &'static str {
+    if legacy.delete_file {
+        "(NOT EXISTS (SELECT 1 FROM ducklake_catalog_delete_file_reference r
+                      WHERE r.delete_file_id = df.delete_file_id)
+          AND df.owner_catalog_id IS NULL)"
+    } else {
+        "(NOT EXISTS (SELECT 1 FROM ducklake_catalog_delete_file_reference r
+                      WHERE r.delete_file_id = df.delete_file_id))"
+    }
+}
+
+/// SQL query: the stored `path` of every reference row in any catalog, as one
+/// `path` column. Bounded by how many references exist: the reference tables are
+/// joined to the file tables by primary key, and the legacy arms use the v0.8.0
+/// partial indexes.
+pub(crate) fn reference_paths_sql(legacy: LegacyOwnerColumns) -> String {
+    let mut arms = vec![
+        "SELECT df.path FROM ducklake_data_file df
+         JOIN ducklake_catalog_data_file_reference r ON r.data_file_id = df.data_file_id",
+        "SELECT df.path FROM ducklake_delete_file df
+         JOIN ducklake_catalog_delete_file_reference r ON r.delete_file_id = df.delete_file_id",
+    ];
+    if legacy.data_file {
+        arms.push("SELECT path FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL");
+    }
+    if legacy.delete_file {
+        arms.push("SELECT path FROM ducklake_delete_file WHERE owner_catalog_id IS NOT NULL");
+    }
+    arms.join(" UNION ")
+}
+
+/// Which file table a reference row points into.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FileTable {
+    Data,
+    Delete,
+}
+
+/// Mark file row `file_id` as a reference to a file that `owner_catalog_id` owns.
+/// Also writes the v0.8.0 `owner_catalog_id` column while the store still has it,
+/// so a rolled-back v0.8.0 process sees the reference too.
+async fn record_file_reference(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: FileTable,
+    file_id: i64,
+    owner_catalog_id: i64,
+    legacy: LegacyOwnerColumns,
+) -> Result<()> {
+    let (reference_table, file_table, key, has_legacy) = match table {
+        FileTable::Data => (
+            "ducklake_catalog_data_file_reference",
+            "ducklake_data_file",
+            "data_file_id",
+            legacy.data_file,
+        ),
+        FileTable::Delete => (
+            "ducklake_catalog_delete_file_reference",
+            "ducklake_delete_file",
+            "delete_file_id",
+            legacy.delete_file,
+        ),
+    };
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO {reference_table} ({key}, owner_catalog_id) VALUES ($1, $2)"
+    )))
+    .bind(file_id)
+    .bind(owner_catalog_id)
+    .execute(&mut **tx)
+    .await?;
+    if has_legacy {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {file_table} SET owner_catalog_id = $2 WHERE {key} = $1"
+        )))
+        .bind(file_id)
+        .bind(owner_catalog_id)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -746,6 +919,18 @@ pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
             "ducklake_snapshot_changes",
             "ducklake_snapshot",
             "snapshot_id",
+        ),
+        // A v0.8.0 process expiring a reference deletes its file row but not the
+        // reference row, which it does not know about.
+        (
+            "ducklake_catalog_data_file_reference",
+            "ducklake_data_file",
+            "data_file_id",
+        ),
+        (
+            "ducklake_catalog_delete_file_reference",
+            "ducklake_delete_file",
+            "delete_file_id",
         ),
     ];
 
@@ -1221,8 +1406,8 @@ const COMPACTION_REL_FLAG: &str =
     "(df.path_is_relative AND t.path_is_relative AND s.path_is_relative)";
 
 /// Insert `(id, resolved_path, rel, owned)` rows (as produced by
-/// [`COMPACTION_RESOLVED_PATH`] / [`COMPACTION_REL_FLAG`] plus the file row's
-/// `owner_catalog_id IS NULL`) into `ducklake_files_scheduled_for_deletion`, scoped
+/// [`COMPACTION_RESOLVED_PATH`] / [`COMPACTION_REL_FLAG`] plus
+/// [`data_file_owned_sql`]) into `ducklake_files_scheduled_for_deletion`, scoped
 /// to `catalog_id`. Mirrors the multicatalog expire path's `schedule_pg_files`,
 /// including its ownership rule: a file row naming another catalog as its owner is
 /// a reference, so the row is retired by the caller but the object is never
@@ -4238,6 +4423,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let legacy = legacy_owner_columns(&mut tx).await?;
 
             // No begin_write_transaction: derive the conflict base (catalog head)
             // and a table-id hint (used only if the table doesn't exist yet) here.
@@ -4436,16 +4622,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 batch_records = batch_records.saturating_add(file.record_count);
                 batch_bytes = batch_bytes.saturating_add(file.file_size_bytes);
 
-                // `owner_catalog_id` is the one thing registration decides that no
-                // other write path does: NULL for a file this catalog owns (including
-                // one promoted from outside its own layout), the source's catalog id
-                // for a reference. Every reclaim path reads it.
                 let data_file_id: i64 = sqlx::query_scalar(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot,
-                          owner_catalog_id)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
+                          footer_size, record_count, row_id_start, begin_snapshot)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&file.path)
@@ -4455,9 +4636,16 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(file.record_count)
                 .bind(row_ids.stored)
                 .bind(snapshot_id)
-                .bind(file.owner_catalog_id)
                 .fetch_one(&mut *tx)
                 .await?;
+                // Ownership is the one thing registration decides that no other
+                // write path does: no reference row for a file this catalog owns
+                // (including one promoted from outside its own layout), one naming
+                // the source's catalog for a reference. Every reclaim path reads it.
+                if let Some(owner) = file.owner_catalog_id {
+                    record_file_reference(&mut tx, FileTable::Data, data_file_id, owner, legacy)
+                        .await?;
+                }
                 // Persist the caller-supplied partition assignment. Without this a
                 // promoted file lands with no partition_id and no
                 // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
@@ -4478,11 +4666,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                 // stored as given (a fork marks it absolute, pointing at the source's
                 // object), like the data file's.
                 if let Some(delete) = &entry.delete {
-                    sqlx::query(
+                    let delete_file_id: i64 = sqlx::query_scalar(
                         "INSERT INTO ducklake_delete_file
                              (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                              footer_size, delete_count, begin_snapshot, owner_catalog_id)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                              footer_size, delete_count, begin_snapshot)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delete_file_id",
                     )
                     .bind(data_file_id)
                     .bind(table_id)
@@ -4492,9 +4680,18 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .bind(delete.footer_size)
                     .bind(delete.delete_count)
                     .bind(snapshot_id)
-                    .bind(delete.owner_catalog_id)
-                    .execute(&mut *tx)
+                    .fetch_one(&mut *tx)
                     .await?;
+                    if let Some(owner) = delete.owner_catalog_id {
+                        record_file_reference(
+                            &mut tx,
+                            FileTable::Delete,
+                            delete_file_id,
+                            owner,
+                            legacy,
+                        )
+                        .await?;
+                    }
                 }
             }
 
@@ -5671,10 +5868,12 @@ impl MetadataWriter for PostgresMetadataWriter {
                     // Merge: the partial output serves every snapshot the sources
                     // did, so schedule their physical files (resolving paths as the
                     // multicatalog expire path does) and REMOVE their catalog rows.
+                    let legacy = legacy_owner_columns(&mut tx).await?;
+                    let data_owned = data_file_owned_sql(legacy);
                     let dead_data = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.data_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
                                 {COMPACTION_REL_FLAG} AS rel,
-                                df.owner_catalog_id IS NULL AS owned
+                                {data_owned} AS owned
                          FROM ducklake_data_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -5685,10 +5884,11 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
                     schedule_compaction_files(&mut tx, self.catalog_id, dead_data).await?;
 
+                    let delete_owned = delete_file_owned_sql(legacy);
                     let dead_del = sqlx::query(AssertSqlSafe(format!(
                         "SELECT df.delete_file_id, {COMPACTION_RESOLVED_PATH} AS resolved_path,
                                 {COMPACTION_REL_FLAG} AS rel,
-                                df.owner_catalog_id IS NULL AS owned
+                                {delete_owned} AS owned
                          FROM ducklake_delete_file df
                          JOIN ducklake_table t ON t.table_id = df.table_id
                          JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -5699,6 +5899,24 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
                     schedule_compaction_files(&mut tx, self.catalog_id, dead_del).await?;
 
+                    // Reference rows go with their file rows, while those still
+                    // exist to name the delete files.
+                    sqlx::query(
+                        "DELETE FROM ducklake_catalog_delete_file_reference
+                         WHERE delete_file_id IN (
+                             SELECT delete_file_id FROM ducklake_delete_file
+                             WHERE data_file_id = ANY($1))",
+                    )
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query(
+                        "DELETE FROM ducklake_catalog_data_file_reference
+                         WHERE data_file_id = ANY($1)",
+                    )
+                    .bind(&source_data_ids)
+                    .execute(&mut *tx)
+                    .await?;
                     sqlx::query("DELETE FROM ducklake_delete_file WHERE data_file_id = ANY($1)")
                         .bind(&source_data_ids)
                         .execute(&mut *tx)
@@ -6331,9 +6549,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             // Upgrade a pre-existing store's ducklake_column to the composite PK
             // (legacy single-row column_id PK → versioned-capable). Idempotent.
             migrate_ducklake_column_to_composite_pk(&self.pool).await?;
-            // Record file ownership on its own column instead of inferring it from
-            // path relativity, and create the indexes that serve it. Idempotent.
-            migrate_file_ownership_column(&self.pool).await?;
+            // Carry a v0.8.0 store's ownership column into the reference tables.
+            // Idempotent.
+            migrate_file_ownership(&self.pool).await?;
             Ok(())
         })
     }

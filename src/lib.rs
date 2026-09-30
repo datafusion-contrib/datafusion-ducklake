@@ -195,7 +195,7 @@ pub use metadata_writer_postgres_single::PostgresSingleCatalogMetadataWriter;
 #[cfg(feature = "write-sqlite")]
 pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]
-pub use multicatalog::{MulticatalogManager, initialize_multicatalog_schema};
+pub use multicatalog::{FileOwners, MulticatalogManager, initialize_multicatalog_schema};
 #[cfg(feature = "multicatalog-postgres")]
 pub use multicatalog_provider::MulticatalogProvider;
 #[cfg(feature = "write")]

@@ -45,12 +45,21 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     // bootstrap path — runtimedb and the multicatalog tests call it — so the
     // migration MUST run here, not only in PostgresMetadataWriter::initialize_schema.
     crate::metadata_writer_postgres::migrate_ducklake_column_to_composite_pk(pool).await?;
-    // Give every file row an explicit owner (NULL = this catalog's own) rather than
-    // reading ownership off `path_is_relative`, and build the indexes that serve the
-    // reference lookup. Additive and idempotent; MUST run here for the same reason as
-    // the migration above — this is the bootstrap path callers actually use.
-    crate::metadata_writer_postgres::migrate_file_ownership_column(pool).await?;
+    // Carry a v0.8.0 store's `owner_catalog_id` column into the reference tables.
+    // Idempotent; MUST run here for the same reason as the migration above — this
+    // is the bootstrap path callers actually use.
+    crate::metadata_writer_postgres::migrate_file_ownership(pool).await?;
     Ok(())
+}
+
+/// The owning catalog of each file object behind a table's file rows. See
+/// [`MulticatalogManager::table_file_owners`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileOwners {
+    /// `data_file_id` to the id of the catalog that owns the object.
+    pub data_files: std::collections::HashMap<i64, i64>,
+    /// `delete_file_id` to the id of the catalog that owns the object.
+    pub delete_files: std::collections::HashMap<i64, i64>,
 }
 
 /// Manages DuckLake catalogs within a shared metadata database.
@@ -235,6 +244,32 @@ impl MulticatalogManager {
         // applies. Dropping a catalog without them orphans exactly what expire used
         // to orphan (#248), and on SQLite a reused data_file_id would then inherit
         // a dead file's stats and partition values.
+        // Reference rows are keyed by file id, not `table_id`, so they go first,
+        // while the file rows that scope them still exist.
+        for (reference_table, file_table, key) in [
+            (
+                "ducklake_catalog_data_file_reference",
+                "ducklake_data_file",
+                "data_file_id",
+            ),
+            (
+                "ducklake_catalog_delete_file_reference",
+                "ducklake_delete_file",
+                "delete_file_id",
+            ),
+        ] {
+            sqlx::query(AssertSqlSafe(format!(
+                "DELETE FROM {reference_table} WHERE {key} IN (
+                    SELECT f.{key} FROM {file_table} f
+                    JOIN ducklake_table t ON t.table_id = f.table_id
+                    JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+                    WHERE m.catalog_id = $1
+                )"
+            )))
+            .bind(catalog_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         for child_table in [
             "ducklake_data_file",
             "ducklake_delete_file",
@@ -806,9 +841,11 @@ impl MulticatalogManager {
 
         // 4. Data files orphaned (in this catalog): schedule paths, then drop the rows.
         //    `= ANY($2)` with an empty array is simply false — no special-casing needed.
+        let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut tx).await?;
+        let data_owned = crate::metadata_writer_postgres::data_file_owned_sql(legacy);
         let dead_data_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
-                    df.owner_catalog_id IS NULL AS owned
+                    {data_owned} AS owned
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -825,6 +862,12 @@ impl MulticatalogManager {
         .fetch_all(&mut *tx)
         .await?;
         let data_file_ids = schedule_pg_files(&mut tx, catalog_id, dead_data_files).await?;
+        sqlx::query(
+            "DELETE FROM ducklake_catalog_data_file_reference WHERE data_file_id = ANY($1)",
+        )
+        .bind(&data_file_ids)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM ducklake_data_file WHERE data_file_id = ANY($1)")
             .bind(&data_file_ids)
             .execute(&mut *tx)
@@ -857,9 +900,10 @@ impl MulticatalogManager {
 
         // 5. Delete files orphaned by the data files above, a dead table, or no surviving
         //    snapshot.
+        let delete_owned = crate::metadata_writer_postgres::delete_file_owned_sql(legacy);
         let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
             "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
-                    df.owner_catalog_id IS NULL AS owned
+                    {delete_owned} AS owned
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
              JOIN ducklake_schema s ON s.schema_id = t.schema_id
@@ -878,6 +922,12 @@ impl MulticatalogManager {
         .fetch_all(&mut *tx)
         .await?;
         let delete_file_ids = schedule_pg_files(&mut tx, catalog_id, dead_delete_files).await?;
+        sqlx::query(
+            "DELETE FROM ducklake_catalog_delete_file_reference WHERE delete_file_id = ANY($1)",
+        )
+        .bind(&delete_file_ids)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("DELETE FROM ducklake_delete_file WHERE delete_file_id = ANY($1)")
             .bind(&delete_file_ids)
             .execute(&mut *tx)
@@ -1057,25 +1107,114 @@ impl MulticatalogManager {
     /// Rust, the way [`crate::maintenance::delete_orphaned_files_multicatalog`] has
     /// always compared against real object locations.
     ///
-    /// The partial indexes `idx_data_file_owner_catalog` /
-    /// `idx_delete_file_owner_catalog` serve this as an index-only scan, so the
-    /// scanned set is bounded by how many cross-catalog references exist rather than
-    /// by the size of the file tables.
+    /// The scanned set is bounded by how many cross-catalog references exist rather
+    /// than by the size of the file tables: the reference tables are joined to the
+    /// file tables by primary key.
     ///
     /// A catalog's OWN absolute-path file is deliberately absent: it is not a
     /// reference, and including it would make the catalog defer its own reclaim
     /// against itself forever.
     pub async fn all_reference_paths(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT path FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL
-             UNION
-             SELECT path FROM ducklake_delete_file WHERE owner_catalog_id IS NOT NULL",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let mut conn = self.pool.acquire().await?;
+        let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
+        let q = crate::metadata_writer_postgres::reference_paths_sql(legacy);
+        let rows = sqlx::query(AssertSqlSafe(q.as_str()))
+            .fetch_all(&mut *conn)
+            .await?;
         rows.into_iter()
             .map(|r| Ok(r.try_get::<String, _>(0)?))
             .collect()
+    }
+
+    /// The catalog that owns each file object behind `table_id`'s file rows in
+    /// catalog `catalog_id`, keyed by `data_file_id` and `delete_file_id`.
+    ///
+    /// A row this catalog owns maps to `catalog_id`. A reference maps to the catalog
+    /// it names, which for a fork of a fork is the root of the chain: a reference is
+    /// always registered with the owner of the object, not with the catalog it was
+    /// copied from. Retired rows are included, because a file live at an older
+    /// snapshot can be retired at a later one.
+    ///
+    /// Use this rather than querying the file tables for ownership: the crate
+    /// records it in tables of its own, not in columns on `ducklake_data_file` and
+    /// `ducklake_delete_file`.
+    pub async fn table_file_owners(&self, catalog_id: i64, table_id: i64) -> Result<FileOwners> {
+        let mut conn = self.pool.acquire().await?;
+        let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
+        let owner = |reference: &str, legacy_column: bool| {
+            if legacy_column {
+                format!("COALESCE({reference}.owner_catalog_id, f.owner_catalog_id, $1)")
+            } else {
+                format!("COALESCE({reference}.owner_catalog_id, $1)")
+            }
+        };
+        let mut owners = FileOwners::default();
+        for (map, file_table, reference_table, key, legacy_column) in [
+            (
+                &mut owners.data_files,
+                "ducklake_data_file",
+                "ducklake_catalog_data_file_reference",
+                "data_file_id",
+                legacy.data_file,
+            ),
+            (
+                &mut owners.delete_files,
+                "ducklake_delete_file",
+                "ducklake_catalog_delete_file_reference",
+                "delete_file_id",
+                legacy.delete_file,
+            ),
+        ] {
+            let owner = owner("r", legacy_column);
+            let rows: Vec<(i64, i64)> = sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT f.{key}, {owner}
+                 FROM {file_table} f
+                 JOIN ducklake_table t ON t.table_id = f.table_id
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+                 LEFT JOIN {reference_table} r ON r.{key} = f.{key}
+                 WHERE m.catalog_id = $1 AND f.table_id = $2"
+            )))
+            .bind(catalog_id)
+            .bind(table_id)
+            .fetch_all(&mut *conn)
+            .await?;
+            map.extend(rows);
+        }
+        Ok(owners)
+    }
+
+    /// Whether any catalog in the store holds a live (`end_snapshot IS NULL`) data
+    /// or delete file row that references another catalog's file.
+    ///
+    /// Cheap on a store that holds no references: the reference tables are empty,
+    /// and only their rows are joined to the file tables.
+    pub async fn has_live_references(&self) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
+        let mut arms = vec![
+            "SELECT 1 FROM ducklake_catalog_data_file_reference r
+             JOIN ducklake_data_file f ON f.data_file_id = r.data_file_id
+             WHERE f.end_snapshot IS NULL",
+            "SELECT 1 FROM ducklake_catalog_delete_file_reference r
+             JOIN ducklake_delete_file f ON f.delete_file_id = r.delete_file_id
+             WHERE f.end_snapshot IS NULL",
+        ];
+        if legacy.data_file {
+            arms.push(
+                "SELECT 1 FROM ducklake_data_file
+                 WHERE owner_catalog_id IS NOT NULL AND end_snapshot IS NULL",
+            );
+        }
+        if legacy.delete_file {
+            arms.push(
+                "SELECT 1 FROM ducklake_delete_file
+                 WHERE owner_catalog_id IS NOT NULL AND end_snapshot IS NULL",
+            );
+        }
+        let q = format!("SELECT EXISTS ({})", arms.join(" UNION ALL "));
+        Ok(sqlx::query_scalar(AssertSqlSafe(q.as_str()))
+            .fetch_one(&mut *conn)
+            .await?)
     }
 
     /// Push the scheduled rows for `paths` in `catalog_name` back to "scheduled
@@ -1116,7 +1255,7 @@ impl MulticatalogManager {
     /// referencing a file under the swept one is in neither the group nor its
     /// nested-prefix merge, so scoping this arm would make its references invisible
     /// and the sweep would delete a file that catalog is reading. The rows are cheap
-    /// to include — the partial indexes on `owner_catalog_id` serve them — and a path
+    /// to include — they are bounded by how many references exist — and a path
     /// outside the swept root simply never matches a listed object, so widening the
     /// arm cannot preserve anything that should have been reclaimed.
     ///
@@ -1131,6 +1270,9 @@ impl MulticatalogManager {
         &self,
         data_paths: &[String],
     ) -> Result<Vec<(String, bool)>> {
+        let mut conn = self.pool.acquire().await?;
+        let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut conn).await?;
+        let references = crate::metadata_writer_postgres::reference_paths_sql(legacy);
         let q = format!(
             "WITH root_catalog AS (
                  SELECT catalog_id FROM ducklake_catalog
@@ -1154,15 +1296,11 @@ impl MulticatalogManager {
              FROM ducklake_files_scheduled_for_deletion
              WHERE catalog_id IN (SELECT catalog_id FROM root_catalog)
              UNION ALL
-             SELECT path AS p, FALSE AS rel
-             FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL
-             UNION ALL
-             SELECT path AS p, FALSE AS rel
-             FROM ducklake_delete_file WHERE owner_catalog_id IS NOT NULL"
+             SELECT path AS p, FALSE AS rel FROM ({references}) refs"
         );
         let rows = sqlx::query(AssertSqlSafe(q.as_str()))
             .bind(data_paths)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await?;
         rows.into_iter()
             .map(|r| Ok((r.try_get::<String, _>(0)?, r.try_get::<bool, _>(1)?)))
@@ -1173,8 +1311,8 @@ impl MulticatalogManager {
 /// Schedule the physical files behind dead `(id, resolved_path, rel, owned)` rows
 /// and return EVERY dead id, scheduled or not, so the caller deletes all the rows.
 ///
-/// A catalog owns a file unless the row names another catalog as its owner
-/// (`ducklake_data_file.owner_catalog_id`, or the delete-file equivalent). A row that
+/// A catalog owns a file unless a reference row names another catalog as its owner
+/// (`ducklake_catalog_data_file_reference`, or the delete-file equivalent). A row that
 /// does is a *reference* to a file another catalog owns — a database fork registers
 /// the source's files this way instead of copying them. Such a row is dropped like
 /// any other dead row, but its object is never scheduled: the owner reclaims it

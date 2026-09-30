@@ -5796,8 +5796,10 @@ async fn register_existing_data_files_promotes_a_whole_table_in_one_snapshot() {
 
     // Every file is live at that one snapshot, each naming the source as owner.
     let rows = sqlx::query(
-        "SELECT path, begin_snapshot, row_id_start, owner_catalog_id FROM ducklake_data_file
-         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY path",
+        "SELECT df.path, df.begin_snapshot, df.row_id_start, r.owner_catalog_id
+         FROM ducklake_data_file df
+         LEFT JOIN ducklake_catalog_data_file_reference r ON r.data_file_id = df.data_file_id
+         WHERE df.table_id = $1 AND df.end_snapshot IS NULL ORDER BY df.path",
     )
     .bind(out.table_id)
     .fetch_all(&pool)
@@ -5855,9 +5857,11 @@ async fn register_existing_data_files_promotes_a_whole_table_in_one_snapshot() {
     // id assigned to f2, and referencing the source's object.
     let (delete_path, delete_owner, delete_begin, delete_of): (String, Option<i64>, i64, String) =
         sqlx::query(
-            "SELECT del.path, del.owner_catalog_id, del.begin_snapshot, df.path
+            "SELECT del.path, r.owner_catalog_id, del.begin_snapshot, df.path
              FROM ducklake_delete_file AS del
              JOIN ducklake_data_file AS df ON df.data_file_id = del.data_file_id
+             LEFT JOIN ducklake_catalog_delete_file_reference r
+               ON r.delete_file_id = del.delete_file_id
              WHERE del.table_id = $1",
         )
         .bind(out.table_id)
@@ -7805,6 +7809,274 @@ async fn cleanup_in_catalog_keeps_a_file_an_absolute_reference_still_names() {
     assert_eq!(scheduled(cat_a).await, 0);
 }
 
+/// A store that v0.8.0 bootstrapped keeps its references through the upgrade, and
+/// stays safe to roll back to v0.8.0.
+///
+/// v0.8.0 recorded a reference as an `owner_catalog_id` column on the file
+/// tables. While a store still has that column, a reference that exists only there
+/// (one a v0.8.0 process registered) must still defer the owner's cleanup, the
+/// bootstrap must copy it into the reference table, and a new reference must be
+/// written to the column too, so a rolled-back v0.8.0 sees it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_v0_8_store_keeps_its_references_and_its_ownership_column() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_in_catalog,
+    };
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    use datafusion_ducklake::path_resolver::{join_paths, parse_object_store_url};
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    // The v0.8.0 shape of the file tables.
+    for stmt in [
+        "ALTER TABLE ducklake_data_file ADD COLUMN owner_catalog_id BIGINT",
+        "ALTER TABLE ducklake_delete_file ADD COLUMN owner_catalog_id BIGINT",
+        "CREATE INDEX idx_data_file_owner_catalog
+         ON ducklake_data_file(path) WHERE owner_catalog_id IS NOT NULL",
+        "CREATE INDEX idx_delete_file_owner_catalog
+         ON ducklake_delete_file(path) WHERE owner_catalog_id IS NOT NULL",
+    ] {
+        sqlx::query(AssertSqlSafe(stmt))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat_a = mgr.create_catalog("cat_a").await.unwrap();
+    let cat_b = mgr.create_catalog("cat_b").await.unwrap();
+    let wa = PostgresMetadataWriter::with_pool(pool.clone(), cat_a)
+        .await
+        .unwrap();
+    let wb = PostgresMetadataWriter::with_pool(pool.clone(), cat_b)
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let data_str = data.to_str().unwrap().to_string();
+    wa.set_data_path(&data_str).unwrap();
+    wb.set_data_path(&data_str).unwrap();
+
+    // A: f1 then f2, so expiring the first snapshot schedules f1.
+    let table_dir = data.join(format!("cat_{cat_a}")).join("public").join("t");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    std::fs::write(table_dir.join("f1.parquet"), b"f1").unwrap();
+    std::fs::write(table_dir.join("f2.parquet"), b"f2").unwrap();
+    let a1 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    let snap1 = wa
+        .register_data_file(
+            a1.table_id,
+            "public",
+            "t",
+            a1.snapshot_id,
+            &DataFileInfo::new("f1.parquet", 2, 5),
+            WriteMode::Replace,
+            a1.base_snapshot_id,
+            &cols(),
+            &a1.column_ids,
+        )
+        .unwrap()
+        .snapshot_id;
+    let a2 = wa
+        .begin_write_transaction("public", "t", &cols(), WriteMode::Replace)
+        .unwrap();
+    wa.register_data_file(
+        a2.table_id,
+        "public",
+        "t",
+        a2.snapshot_id,
+        &DataFileInfo::new("f2.parquet", 2, 5),
+        WriteMode::Replace,
+        a2.base_snapshot_id,
+        &cols(),
+        &a2.column_ids,
+    )
+    .unwrap();
+
+    // B references f1. Registration writes both records while the column exists.
+    let (_, base) = parse_object_store_url(&data_str).unwrap();
+    let f1_abs = join_paths(&base, &format!("cat_{cat_a}/public/t/f1.parquet")).unwrap();
+    let b1 = wb
+        .register_existing_data_file(
+            "public",
+            "t",
+            &cols(),
+            &a1.column_ids,
+            &DataFileInfo::new(f1_abs.clone(), 2, 5)
+                .with_absolute_path()
+                .with_owner_catalog(cat_a),
+            WriteMode::Replace,
+        )
+        .unwrap();
+    let column_owner: Option<i64> =
+        sqlx::query_scalar("SELECT owner_catalog_id FROM ducklake_data_file WHERE table_id = $1")
+            .bind(b1.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        column_owner,
+        Some(cat_a),
+        "a rolled-back v0.8.0 reads only the column, so it must be written too"
+    );
+
+    // Make it a reference only v0.8.0 knows about: column set, no reference row.
+    sqlx::query("DELETE FROM ducklake_catalog_data_file_reference")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        mgr.has_live_references().await.unwrap(),
+        "a reference held only in the v0.8.0 column is still a reference"
+    );
+    assert_eq!(
+        mgr.table_file_owners(cat_b, b1.table_id)
+            .await
+            .unwrap()
+            .data_files
+            .into_values()
+            .collect::<Vec<_>>(),
+        vec![cat_a]
+    );
+
+    mgr.expire_snapshots_in_catalog("cat_a", ExpireCriteria::Versions(vec![snap1]))
+        .await
+        .unwrap();
+    let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+    let deleted =
+        cleanup_old_files_in_catalog(&mgr, "cat_a", os.clone(), CleanupCriteria::All, false)
+            .await
+            .unwrap();
+    assert!(
+        deleted.is_empty() && table_dir.join("f1.parquet").exists(),
+        "a reference held only in the v0.8.0 column must still defer the owner: {deleted:?}"
+    );
+
+    // The next boot copies it into the reference table and leaves the column.
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let copied: Option<i64> = sqlx::query_scalar(
+        "SELECT r.owner_catalog_id FROM ducklake_catalog_data_file_reference r
+         JOIN ducklake_data_file df ON df.data_file_id = r.data_file_id
+         WHERE df.table_id = $1",
+    )
+    .bind(b1.table_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        copied,
+        Some(cat_a),
+        "the bootstrap copies the v0.8.0 reference"
+    );
+    let column_kept: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'ducklake_data_file'
+                          AND column_name = 'owner_catalog_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        column_kept,
+        "the column stays until a later release drops it"
+    );
+
+    // B lets go: the owner reclaims f1.
+    mgr.drop_catalog("cat_b").await.unwrap();
+    let deleted = cleanup_old_files_in_catalog(&mgr, "cat_a", os, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, vec![f1_abs]);
+    let dangling: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_catalog_data_file_reference")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        dangling, 0,
+        "drop_catalog removes the dropped catalog's references"
+    );
+}
+
+/// `table_file_owners` reports the owning catalog of every file row, and
+/// `has_live_references` sees a live reference, on a store without the v0.8.0
+/// ownership column.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn table_file_owners_reports_owned_and_referenced_files() {
+    use datafusion_ducklake::metadata_writer::{DataFileInfo, DeleteFileInfo};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let source = mgr.create_catalog("source").await.unwrap();
+    let fork = mgr.create_catalog("fork").await.unwrap();
+    let w = PostgresMetadataWriter::with_pool(pool.clone(), fork)
+        .await
+        .unwrap();
+    w.set_data_path("/data").unwrap();
+    let ids = vec![1_i64, 2_i64];
+    assert!(!mgr.has_live_references().await.unwrap(), "empty store");
+
+    let own = w
+        .register_existing_data_file(
+            "public",
+            "t",
+            &cols(),
+            &ids,
+            &DataFileInfo::new("own.parquet", 8, 1),
+            WriteMode::Append,
+        )
+        .unwrap();
+    assert!(
+        !mgr.has_live_references().await.unwrap(),
+        "an owned file is not a reference"
+    );
+    w.register_existing_data_file_with_delete(
+        "public",
+        "t",
+        &cols(),
+        &ids,
+        &DataFileInfo::new("/src/f.parquet", 8, 1)
+            .with_absolute_path()
+            .with_owner_catalog(source),
+        Some(
+            &DeleteFileInfo::new("/src/d.parquet", 4, 1)
+                .with_absolute_path()
+                .with_owner_catalog(source),
+        ),
+        WriteMode::Append,
+    )
+    .unwrap();
+    assert!(mgr.has_live_references().await.unwrap());
+
+    let owners = mgr.table_file_owners(fork, own.table_id).await.unwrap();
+    let mut data: Vec<i64> = owners.data_files.values().copied().collect();
+    data.sort();
+    let mut expected = vec![fork, source];
+    expected.sort();
+    assert_eq!(
+        data, expected,
+        "one owned file, one reference to the source"
+    );
+    assert_eq!(
+        owners.delete_files.values().copied().collect::<Vec<_>>(),
+        vec![source]
+    );
+    assert!(
+        mgr.table_file_owners(source, own.table_id)
+            .await
+            .unwrap()
+            .data_files
+            .is_empty(),
+        "scoped to the catalog that holds the rows"
+    );
+}
+
 /// The same guard honours an absolute-path *delete-file* row: a referenced
 /// positional delete file is kept while any catalog still points at it.
 #[tokio::test(flavor = "multi_thread")]
@@ -8015,49 +8287,106 @@ async fn register_existing_data_file_with_delete_attaches_an_absolute_reference_
     assert_eq!(delete_rows, 1);
 }
 
-/// The partial indexes behind `all_reference_paths` are part of the schema
-/// bootstrap, so an existing deployment gains them on its next boot — and the
-/// predecessors they replace, which indexed path relativity, are dropped.
+/// File ownership stays out of the file tables. A fresh bootstrap gives
+/// `ducklake_data_file` and `ducklake_delete_file` only their DuckLake columns, and
+/// records references in this layout's own tables instead.
+///
+/// The allow-lists are the DuckLake column sets for these tables. The multicatalog
+/// layout may omit one of them but must not add a column of its own.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn initialize_multicatalog_schema_creates_reference_indexes() {
+async fn initialize_multicatalog_schema_keeps_ownership_off_the_file_tables() {
     let (pool, _c) = spin_up_postgres().await.unwrap();
-    let names = ["idx_data_file_owner_catalog", "idx_delete_file_owner_catalog"];
-    let index_defs = |names: Vec<&'static str>| {
+    let ducklake_columns: [(&str, &[&str]); 2] = [
+        (
+            "ducklake_data_file",
+            &[
+                "data_file_id",
+                "table_id",
+                "begin_snapshot",
+                "end_snapshot",
+                "file_order",
+                "path",
+                "path_is_relative",
+                "file_format",
+                "record_count",
+                "file_size_bytes",
+                "footer_size",
+                "row_id_start",
+                "partition_id",
+                "encryption_key",
+                "mapping_id",
+                "partial_max",
+            ],
+        ),
+        (
+            "ducklake_delete_file",
+            &[
+                "delete_file_id",
+                "table_id",
+                "begin_snapshot",
+                "end_snapshot",
+                "data_file_id",
+                "path",
+                "path_is_relative",
+                "format",
+                "delete_count",
+                "file_size_bytes",
+                "footer_size",
+                "encryption_key",
+                "partial_max",
+            ],
+        ),
+    ];
+    let columns = |table: &'static str| {
         let pool = pool.clone();
         async move {
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT indexname::text, indexdef::text FROM pg_indexes
-                 WHERE indexname = ANY($1) ORDER BY indexname",
+            sqlx::query_scalar::<_, String>(
+                "SELECT column_name::text FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = $1",
             )
-            .bind(&names[..])
+            .bind(table)
             .fetch_all(&pool)
             .await
             .unwrap()
         }
     };
-    let defs = index_defs(names.to_vec()).await;
-    assert_eq!(
-        defs.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-        names.to_vec()
-    );
-    for (name, def) in &defs {
+    for (table, allowed) in ducklake_columns {
+        let extra: Vec<String> = columns(table)
+            .await
+            .into_iter()
+            .filter(|c| !allowed.contains(&c.as_str()))
+            .collect();
         assert!(
-            def.contains("WHERE (owner_catalog_id IS NOT NULL)"),
-            "{name} must be partial over reference rows: {def}"
+            extra.is_empty(),
+            "{table} carries columns DuckLake does not define: {extra:?}"
         );
     }
-    assert!(
-        index_defs(vec![
-            "idx_data_file_absolute_path",
-            "idx_delete_file_absolute_path"
-        ])
-        .await
-        .is_empty(),
-        "the relativity-keyed indexes are dropped, not left answering a question \
-         nothing asks"
+    for table in ["ducklake_catalog_data_file_reference", "ducklake_catalog_delete_file_reference"]
+    {
+        assert!(
+            !columns(table).await.is_empty(),
+            "{table} must be created by the bootstrap"
+        );
+    }
+    let stale_indexes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pg_indexes WHERE indexname = ANY($1)")
+            .bind(
+                &[
+                    "idx_data_file_absolute_path",
+                    "idx_delete_file_absolute_path",
+                    "idx_data_file_owner_catalog",
+                    "idx_delete_file_owner_catalog",
+                ][..],
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stale_indexes, 0,
+        "a fresh store has no ownership index on the file tables"
     );
-    // Idempotent: a second bootstrap is a no-op, not a duplicate-index error.
+    // Idempotent: a second bootstrap is a no-op.
     initialize_multicatalog_schema(&pool).await.unwrap();
 }
 
@@ -8065,7 +8394,7 @@ async fn initialize_multicatalog_schema_creates_reference_indexes() {
 /// the cleaning catalog's own `cat_{id}/` layout is never deleted, however unreferenced
 /// it looks.
 ///
-/// Such a row carries no `owner_catalog_id`, which is what marks it as predating the
+/// Such a row has no `scheduled_by_owner`, which is what marks it as predating the
 /// ownership rule and so unverifiable.
 ///
 /// This is the mixed-version case. A build without the ownership rule scheduled every
@@ -8568,14 +8897,14 @@ async fn cleanup_reclaims_an_owned_absolute_file_written_outside_data_path() {
     );
 }
 
-/// Bootstrapping a store written before file ownership was recorded adds the column
-/// to all three file tables, leaves every existing row owned, and swaps the indexes.
+/// Bootstrapping a store written before file ownership was recorded leaves every
+/// existing file row owned, adds `scheduled_by_owner`, and drops the old indexes.
 ///
 /// The upgrade has to read the old rows correctly, not merely survive them. Before
-/// the column existed, an absolute path meant one thing — "my file, spelled
-/// absolutely" — so NULL, which is what `ADD COLUMN` gives every existing row, is
+/// ownership was recorded, an absolute path meant one thing — "my file, spelled
+/// absolutely" — so no reference record, which is what every existing row gets, is
 /// exactly that meaning carried forward. A row that came back as a *reference*
-/// instead would lose its reclaim path, which is the defect this column fixes.
+/// instead would lose its reclaim path, which is the defect the record fixes.
 ///
 /// The fixture here can only produce owned rows, so this asserts one direction only.
 /// The other direction — a row written while #309 was on `main`, where absolute DID
@@ -8644,20 +8973,17 @@ async fn bootstrapping_a_pre_ownership_store_leaves_every_file_owned() {
     )
     .unwrap();
 
-    // Rewind the store to the pre-ownership shape: no column anywhere, and the
-    // relativity-keyed indexes the reference lookup used to be served by. Dropping
-    // the column takes the partial indexes over it with it, so the explicit DROPs
-    // below are belt-and-braces.
+    // Rewind the store to the pre-ownership shape: no reference records, no
+    // `scheduled_by_owner`, and the relativity-keyed indexes the reference lookup
+    // used to be served by.
     for stmt in [
-        "ALTER TABLE ducklake_data_file DROP COLUMN owner_catalog_id",
-        "ALTER TABLE ducklake_delete_file DROP COLUMN owner_catalog_id",
+        "DROP TABLE ducklake_catalog_data_file_reference",
+        "DROP TABLE ducklake_catalog_delete_file_reference",
         "ALTER TABLE ducklake_files_scheduled_for_deletion DROP COLUMN scheduled_by_owner",
         "CREATE INDEX idx_data_file_absolute_path
          ON ducklake_data_file(path) WHERE NOT path_is_relative",
         "CREATE INDEX idx_delete_file_absolute_path
          ON ducklake_delete_file(path) WHERE NOT path_is_relative",
-        "DROP INDEX IF EXISTS idx_data_file_owner_catalog",
-        "DROP INDEX IF EXISTS idx_delete_file_owner_catalog",
     ] {
         sqlx::query(AssertSqlSafe(stmt))
             .execute(&pool)
@@ -8670,14 +8996,15 @@ async fn bootstrapping_a_pre_ownership_store_leaves_every_file_owned() {
     initialize_multicatalog_schema(&pool).await.unwrap();
 
     let unowned: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM ducklake_data_file WHERE owner_catalog_id IS NOT NULL",
+        "SELECT (SELECT COUNT(*) FROM ducklake_catalog_data_file_reference)
+              + (SELECT COUNT(*) FROM ducklake_catalog_delete_file_reference)",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
         unowned, 0,
-        "a row that predates the column is this catalog's own, not a reference"
+        "a row that predates the record is this catalog's own, not a reference"
     );
     let index_names: Vec<String> = sqlx::query_scalar(
         "SELECT indexname::text FROM pg_indexes
@@ -8686,11 +9013,6 @@ async fn bootstrapping_a_pre_ownership_store_leaves_every_file_owned() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert!(
-        index_names.contains(&"idx_data_file_owner_catalog".to_string())
-            && index_names.contains(&"idx_delete_file_owner_catalog".to_string()),
-        "the reference indexes are created on upgrade: {index_names:?}"
-    );
     assert!(
         !index_names.contains(&"idx_data_file_absolute_path".to_string())
             && !index_names.contains(&"idx_delete_file_absolute_path".to_string()),
@@ -8797,7 +9119,7 @@ async fn register_existing_data_file_rejects_malformed_ownership() {
 /// A reference row written before the ownership column existed must not let the
 /// referring catalog reclaim the owner's live file.
 ///
-/// The migration gives every pre-existing row `owner_catalog_id = NULL`, i.e. owned.
+/// The migration gives every pre-existing row no reference record, i.e. owned.
 /// That is the right reading for a row written before #309, when an absolute path
 /// meant only "spelled absolutely" — and the WRONG one for a row written while #309
 /// was on `main`, where absolute genuinely meant reference. Such a row now reads as
@@ -8871,12 +9193,15 @@ async fn cleanup_refuses_an_object_in_another_catalogs_layout_however_it_was_sch
             WriteMode::Replace,
         )
         .unwrap();
-    let owner: Option<i64> =
-        sqlx::query_scalar("SELECT owner_catalog_id FROM ducklake_data_file WHERE table_id = $1")
-            .bind(b1.table_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let owner: Option<i64> = sqlx::query_scalar(
+        "SELECT r.owner_catalog_id FROM ducklake_data_file df
+         LEFT JOIN ducklake_catalog_data_file_reference r ON r.data_file_id = df.data_file_id
+         WHERE df.table_id = $1",
+    )
+    .bind(b1.table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         owner, None,
         "the fixture must be the post-migration shape, or this test proves nothing"
@@ -8964,10 +9289,13 @@ async fn orphan_sweep_keeps_a_catalogs_own_absolute_file_under_its_own_root() {
         &setup.column_ids,
     )
     .unwrap();
-    let owner: Option<i64> = sqlx::query_scalar("SELECT owner_catalog_id FROM ducklake_data_file")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let owner: Option<i64> = sqlx::query_scalar(
+        "SELECT r.owner_catalog_id FROM ducklake_data_file df
+         LEFT JOIN ducklake_catalog_data_file_reference r ON r.data_file_id = df.data_file_id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(owner, None, "A's own file, absolute but owned");
 
     let os: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());

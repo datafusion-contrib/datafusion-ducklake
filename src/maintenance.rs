@@ -99,7 +99,7 @@ pub struct ScheduledFile {
     /// [`cleanup_old_files_in_catalog`] therefore treats as unverified.
     ///
     /// Deliberately NOT called `owner_catalog_id` like the column on
-    /// `ducklake_data_file`: there, a set value names ANOTHER catalog, and one name
+    /// `ducklake_catalog_data_file_reference`: there, a value names ANOTHER catalog, and one name
     /// carrying opposite meanings in two tables is what a later query copies across
     /// and gets backwards.
     pub scheduled_by_owner: Option<bool>,
@@ -286,8 +286,8 @@ pub async fn cleanup_old_files_in_catalog(
 /// produced it. The check cannot be waived by the row's own claim of ownership,
 /// because the case that most needs catching is a row whose claim is the thing that is
 /// wrong: a reference registered while `path_is_relative = false` still meant
-/// "reference" reads as owned after the ownership column is added (every pre-existing
-/// row migrates to NULL), so this catalog's expire schedules the owner's live object
+/// "reference" reads as owned once ownership is recorded explicitly (such a row got no
+/// reference record), so this catalog's expire schedules the owner's live object
 /// and stamps it as its own to reclaim. Trusting that stamp deletes another catalog's
 /// data. A legacy pre-`cat_{id}` layout is unaffected: its files sit under no
 /// `cat_{id}/` prefix at all, so nothing matches.
