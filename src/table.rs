@@ -2547,9 +2547,24 @@ impl DuckLakeTable {
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
+        // The predicate is evaluated on its data columns alone, never on the
+        // position column. Batch width is semantic here: the predicate was
+        // planned against the N catalog columns, a `LambdaVariable`'s index is
+        // its slot after those N, and a higher-order function takes any index
+        // below the batch width for a captured outer column. A full-width scan
+        // evaluates on exactly N columns; a narrowed one on M <= N, so every
+        // lambda index (>= N >= M) falls past the batch either way. With the
+        // position column appended, the full-width batch would be N + 1 wide and
+        // the first lambda parameter — or a `Column` at index N — would bind to
+        // the positions. `project` preserves the row count, which the
+        // column-free (literal) case relies on.
+        let data_columns: Vec<usize> = (0..pos_idx).collect();
         let mut positions = HashSet::new();
         for batch in &batches {
-            let mask = evaluated.evaluate(batch)?.into_array(batch.num_rows())?;
+            let evaluated_batch = batch.project(&data_columns)?;
+            let mask = evaluated
+                .evaluate(&evaluated_batch)?
+                .into_array(batch.num_rows())?;
             let mask = mask
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -3181,7 +3196,8 @@ impl DuckLakeTable {
     /// column:
     ///
     /// - its index is inside the catalog schema. One outside it cannot be
-    ///   rebound; the full scan leaves it to fail exactly as it always has.
+    ///   rebound; the full scan evaluates it on the data columns alone, where
+    ///   it fails to bind.
     /// - the presenting [`ColumnRenameExec`] finds it in the scan under the
     ///   file's own name for that position (or synthesizes it). That node binds
     ///   by name while this scan projects by position, and the two agree for

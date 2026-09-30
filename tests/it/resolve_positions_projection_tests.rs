@@ -23,7 +23,7 @@
 //! columns that swapped names, a name-mapped file with a Hive constant, a file
 //! that embeds row ids, a partitioned table, and files already carrying a
 //! delete file — plus predicates whose shape matters to the rebinding: NULL and
-//! NaN float keys, struct-field keys and a CASE.
+//! NaN float keys, struct-field keys, a CASE, and a lambda.
 //!
 //! The DuckDB-built cases also check the resolved count against official
 //! DuckLake's own answer to the same predicate over the same catalog.
@@ -1236,6 +1236,106 @@ async fn name_mapped_file() {
     // Guard against an oracle that could agree by accident.
     let unique: HashSet<_> = rows.iter().map(|(id, _)| *id).collect();
     assert_eq!(unique.len(), ROWS as usize);
+}
+
+/// A lambda's parameter is a `LambdaVariable` whose index is its slot AFTER the
+/// outer columns, and a higher-order function treats every index below the
+/// batch width as a captured outer column. The predicate must therefore be
+/// evaluated on a batch exactly as wide as the schema it was planned against:
+/// with the position column still appended, a predicate referencing every
+/// column would resolve its first lambda parameter to the positions.
+///
+/// Built by hand because the SQL planner does not produce lambdas.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn lambda_parameter_is_not_bound_to_the_position_column() {
+    use arrow::array::ListArray;
+    use arrow::datatypes::Int32Type;
+    use datafusion::functions_nested::expr_fn::array_any_match;
+    use datafusion::logical_expr::expr::LambdaVariable;
+    use datafusion::logical_expr::lambda;
+
+    let list_of = |id: i64| vec![Some((id % 13) as i32), Some((id % 17) as i32)];
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("payload", DataType::Binary, false),
+        Field::new("note", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            "l",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        ),
+    ]));
+    let ids: Vec<i64> = (0..ROWS).collect();
+    let batches: Vec<RecordBatch> = ids
+        .chunks(ROWS_PER_ROW_GROUP)
+        .map(|chunk| {
+            let payloads: Vec<Vec<u8>> = chunk.iter().map(|&id| payload(id)).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(BinaryArray::from_iter_values(payloads.iter())),
+                    Arc::new(StringArray::from_iter_values(
+                        chunk.iter().map(|&id| note(id)),
+                    )),
+                    Arc::new(Int64Array::from(chunk.to_vec())),
+                    Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                        chunk.iter().map(|&id| Some(list_of(id))),
+                    )),
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let temp = TempDir::new().unwrap();
+    table_writer(new_writer(&temp).await)
+        .write_table("main", "t", &batches)
+        .await
+        .unwrap();
+
+    let h = open(&temp).await;
+    let table = h.table().await;
+    let file = &table.files().unwrap()[0];
+    let path = file_path(&temp, file);
+    let physical_ids = physical_i64(&path, "id");
+    let any_seven = |id: &Option<i64>| {
+        let id = id.unwrap();
+        list_of(id).contains(&Some(7)) && id < 2_000
+    };
+    let lambda_predicate = || {
+        let x = Expr::LambdaVariable(LambdaVariable::new(
+            "x".to_string(),
+            Some(Arc::new(Field::new("x", DataType::Int32, true))),
+        ));
+        array_any_match(col("l"), lambda(["x"], x.eq(lit(7i32))))
+    };
+
+    // Narrow: only `l` and `id` are read.
+    let (positions, bytes) = h
+        .resolve(
+            &table,
+            file,
+            lambda_predicate().and(col("id").lt(lit(2_000i64))),
+        )
+        .await;
+    assert_eq!(positions, oracle(&physical_ids, any_seven));
+    assert!(!positions.is_empty());
+    assert_narrow(bytes, file_bytes(file), "lambda over a list key");
+
+    // Every column referenced: the batch is as wide as the catalog schema,
+    // which is exactly where a trailing position column would collide with the
+    // lambda parameter's slot.
+    let (positions, _) = h
+        .resolve(
+            &table,
+            file,
+            col("payload")
+                .is_not_null()
+                .and(col("note").is_not_null())
+                .and(col("id").lt(lit(2_000i64)))
+                .and(lambda_predicate()),
+        )
+        .await;
+    assert_eq!(positions, oracle(&physical_ids, any_seven));
 }
 
 /// Catalogs built by official DuckLake (through DuckDB), so the metadata —

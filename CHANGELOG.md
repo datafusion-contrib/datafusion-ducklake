@@ -109,6 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `DuckLakeTable::resolve_positions` evaluates its predicate on the table's data columns
+  alone, without the row-position column. A lambda's parameters (in a higher-order function
+  such as `array_any_match`) take the slots after the table's columns, so on a scan of every
+  column the trailing position column took the first parameter's slot and the predicate
+  failed; a scan narrowed to fewer columns was unaffected, since its batch ends before those
+  slots. SQL does not produce lambdas, so only a predicate built by hand could reach this.
+- A hand-built predicate passed to `DuckLakeTable::resolve_positions` with a column index one
+  past the table's columns now fails to bind instead of silently reading row positions, which
+  could have deleted rows by position: `ghost < 3` matched the first three rows of every file.
+  SQL `DELETE` cannot produce such a predicate.
+
 - Reading a past snapshot no longer applies deletions made after it that official DuckLake
   recorded, with their snapshots, in the same delete file (#306).
 - A scan binds each file's columns, row ids and deletes at open, as official does: planning
