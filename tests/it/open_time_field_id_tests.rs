@@ -14,7 +14,9 @@
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::{Array, StringArray};
 use arrow::record_batch::RecordBatch;
@@ -53,7 +55,20 @@ struct ReadRecordingStore {
     reads: Mutex<Vec<ObjectPath>>,
     /// File names whose next read fails, once each.
     fail_once: Mutex<HashSet<String>>,
+    /// Set once an injected failure has been returned.
+    failed: tokio::sync::watch::Sender<bool>,
+    /// A file name whose reads wait until an injected failure has been returned.
+    gated: Mutex<Option<String>>,
+    /// Whether a gated read gave up waiting, the failure never having come.
+    gate_timed_out: AtomicBool,
 }
+
+/// Error text of an injected read failure.
+const INJECTED_FAILURE: &str = "injected transient failure";
+
+/// How long a gated read waits for the injected failure before giving up. Only
+/// a guard against a hang: the wait ends as soon as the failure is returned.
+const GATE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl ReadRecordingStore {
     fn new() -> Arc<Self> {
@@ -61,17 +76,32 @@ impl ReadRecordingStore {
             inner: Arc::new(LocalFileSystem::new()),
             reads: Mutex::new(Vec::new()),
             fail_once: Mutex::new(HashSet::new()),
+            failed: tokio::sync::watch::Sender::new(false),
+            gated: Mutex::new(None),
+            gate_timed_out: AtomicBool::new(false),
         })
     }
 
-    /// Records the read, and fails it if `location` was set to fail once.
-    fn record(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.reads.lock().unwrap().push(location.clone());
+    /// Waits out the gate on `location`, records the read, and fails it if
+    /// `location` was set to fail once.
+    async fn record(&self, location: &ObjectPath) -> object_store::Result<()> {
         let name = location.filename().unwrap_or_default();
+        let gated = self.gated.lock().unwrap().as_deref() == Some(name);
+        if gated {
+            let mut failed = self.failed.subscribe();
+            if tokio::time::timeout(GATE_TIMEOUT, failed.wait_for(|failed| *failed))
+                .await
+                .is_err()
+            {
+                self.gate_timed_out.store(true, Ordering::SeqCst);
+            }
+        }
+        self.reads.lock().unwrap().push(location.clone());
         if self.fail_once.lock().unwrap().remove(name) {
+            self.failed.send_replace(true);
             return Err(object_store::Error::Generic {
                 store: "ReadRecordingStore",
-                source: format!("injected transient failure reading {location}").into(),
+                source: format!("{INJECTED_FAILURE} reading {location}").into(),
             });
         }
         Ok(())
@@ -80,6 +110,12 @@ impl ReadRecordingStore {
     /// Make the next read of the file named `name` fail.
     fn fail_next_read(&self, name: &str) {
         self.fail_once.lock().unwrap().insert(name.to_string());
+    }
+
+    /// Hold every read of the file named `name` until an injected failure has
+    /// been returned.
+    fn gate_reads_until_failure(&self, name: &str) {
+        *self.gated.lock().unwrap() = Some(name.to_string());
     }
 
     /// Whether every injected failure has been hit.
@@ -124,7 +160,7 @@ impl ObjectStore for ReadRecordingStore {
         location: &ObjectPath,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.record(location)?;
+        self.record(location).await?;
         self.inner.get_opts(location, options).await
     }
 
@@ -133,7 +169,7 @@ impl ObjectStore for ReadRecordingStore {
         location: &ObjectPath,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        self.record(location)?;
+        self.record(location).await?;
         self.inner.get_ranges(location, ranges).await
     }
 
@@ -1782,9 +1818,17 @@ async fn limit_one_under_default_partitioning_reads_few_files() -> anyhow::Resul
     Ok(())
 }
 
+/// The second data file of [`create_three_files_with_deletes`].
+struct SecondFile {
+    /// The data file's name.
+    data: String,
+    /// Its delete file, on disk.
+    delete: std::path::PathBuf,
+}
+
 /// Three data files of 1000 rows (ids `0..3000`), each with one row deleted
-/// through its own delete file. Returns the delete file of the second data file.
-async fn create_three_files_with_deletes(temp: &TempDir) -> anyhow::Result<std::path::PathBuf> {
+/// through its own delete file.
+async fn create_three_files_with_deletes(temp: &TempDir) -> anyhow::Result<SecondFile> {
     let conn = duckdb_lake(temp)?;
     conn.execute("CREATE TABLE lake.t (id BIGINT, v VARCHAR)", [])?;
     for file in 0..3_i64 {
@@ -1802,8 +1846,8 @@ async fn create_three_files_with_deletes(temp: &TempDir) -> anyhow::Result<std::
     drop(conn);
 
     let pool = SqlitePool::connect(&format!("sqlite:{}", catalog_path(temp).display())).await?;
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT del.path FROM ducklake_delete_file del \
+    let names: Vec<(String, String)> = sqlx::query_as(
+        "SELECT data.path, del.path FROM ducklake_delete_file del \
          JOIN ducklake_data_file data USING (data_file_id) \
          WHERE del.end_snapshot IS NULL ORDER BY data.row_id_start",
     )
@@ -1811,12 +1855,16 @@ async fn create_three_files_with_deletes(temp: &TempDir) -> anyhow::Result<std::
     .await?;
     pool.close().await;
     assert_eq!(names.len(), 3, "one delete file per data file");
-    let second = Path::new(&names[1])
+    let (data, delete) = &names[1];
+    let delete = Path::new(delete)
         .file_name()
         .expect("a delete file path names a file")
         .to_owned();
-    find_file(&temp.path().join("data"), &second)
-        .ok_or_else(|| anyhow::anyhow!("delete file {second:?} is not under the data path"))
+    Ok(SecondFile {
+        data: file_name(Path::new(data)),
+        delete: find_file(&temp.path().join("data"), &delete)
+            .ok_or_else(|| anyhow::anyhow!("delete file {delete:?} is not under the data path"))?,
+    })
 }
 
 fn find_file(dir: &Path, name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
@@ -1872,7 +1920,7 @@ async fn assert_missing_delete_file_fails(ctx: &SessionContext, label: &str) -> 
 #[tokio::test]
 async fn a_missing_delete_file_after_the_first_fails_the_query() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let missing = create_three_files_with_deletes(&temp).await?;
+    let missing = create_three_files_with_deletes(&temp).await?.delete;
     std::fs::remove_file(&missing)?;
     for config in partitioning_configs() {
         let label = format!("{} partitions", config.target_partitions());
@@ -1886,7 +1934,7 @@ async fn a_missing_delete_file_after_the_first_fails_the_query() -> anyhow::Resu
 fn file_name(path: &Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
-        .expect("a delete file has a UTF-8 name")
+        .expect("a file name is UTF-8")
         .to_string()
 }
 
@@ -1906,45 +1954,85 @@ const FLAKY_READ_COUNTS: [(&str, &str); 3] = [
     ),
 ];
 
-/// Asserts that `sql` returns `expected` when the next read of `flaky` fails,
-/// and that the failure was hit. The session must have one partition, so the
-/// second file's delete set is read ahead while the first file is read, and that
-/// read is the one that fails.
-async fn assert_flaky_read_is_retried(
-    ctx: &SessionContext,
-    store: &ReadRecordingStore,
-    flaky: &str,
-    sql: &str,
-    expected: &str,
-) -> anyhow::Result<()> {
-    store.fail_next_read(flaky);
-    let batches = ctx.sql(sql).await?.collect().await?;
-    assert!(
-        store.failures_spent(),
-        "{sql}: the injected failure was hit"
-    );
-    assert_eq!(
-        text_rows(&batches),
-        vec![vec![Some(expected.to_string())]],
-        "{sql}"
-    );
+/// Runs each of [`FLAKY_READ_COUNTS`] in a one-partition session, with row
+/// lineage when `lineage`, the first read of the second data file's delete file
+/// failing.
+///
+/// Ungated, the read that fails may be the one ahead of the scan or the one when
+/// the scan reaches the file, whichever comes first on the runtime. Either
+/// outcome is correct — the right count, or the query failing with the injected
+/// error — and a wrong count never is.
+///
+/// Gated, every read of the second data file waits until the failure has been
+/// returned. The read when the scan reaches the file needs that file's rows, so
+/// the read that fails is the one ahead of the scan, and the query must read the
+/// delete file again and return the right count.
+async fn run_flaky_delete_file_reads(lineage: bool, gated: bool) -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let second = create_three_files_with_deletes(&temp).await?;
+    let flaky = file_name(&second.delete);
+    for (sql, expected) in FLAKY_READ_COUNTS {
+        let label = format!("{sql} (lineage {lineage}, gated {gated})");
+        let store = ReadRecordingStore::new();
+        let config = SessionConfig::new().with_target_partitions(1);
+        let ctx = if lineage {
+            lineage_session(&temp, &store, config).await?
+        } else {
+            session(&temp, &store, config).await?
+        };
+        store.fail_next_read(&flaky);
+        if gated {
+            store.gate_reads_until_failure(&second.data);
+        }
+        let result = ctx.sql(sql).await?.collect().await;
+        assert!(
+            !store.gate_timed_out.load(Ordering::SeqCst),
+            "{label}: the read ahead of the scan never reached the delete file"
+        );
+        assert!(
+            store.failures_spent(),
+            "{label}: the injected failure was hit"
+        );
+        match result {
+            Ok(batches) => assert_eq!(
+                text_rows(&batches),
+                vec![vec![Some(expected.to_string())]],
+                "{label}"
+            ),
+            Err(error) if !gated && error.to_string().contains(INJECTED_FAILURE) => {},
+            Err(error) => panic!("{label}: {error}"),
+        }
+    }
     Ok(())
 }
 
-/// A read of a delete file that fails once and then succeeds gives the right
-/// rows: the read ahead of the scan fails, and the read when the scan reaches the
-/// data file reads the delete file afresh.
+/// A read of a delete file that fails once never yields a wrong count: the query
+/// returns the right one or fails with the read's error.
+#[tokio::test]
+async fn a_delete_file_read_that_fails_once_never_gives_a_wrong_count() -> anyhow::Result<()> {
+    run_flaky_delete_file_reads(false, false).await
+}
+
+/// [`a_delete_file_read_that_fails_once_never_gives_a_wrong_count`], on a
+/// multi-threaded runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_file_read_that_fails_once_never_gives_a_wrong_count_on_many_threads()
+-> anyhow::Result<()> {
+    run_flaky_delete_file_reads(false, false).await
+}
+
+/// A read ahead of the scan that fails is repeated, afresh, when the scan
+/// reaches the file, and the query returns the right count.
 #[tokio::test]
 async fn a_delete_file_read_that_fails_once_is_read_again() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let flaky = file_name(&create_three_files_with_deletes(&temp).await?);
-    for (sql, expected) in FLAKY_READ_COUNTS {
-        let store = ReadRecordingStore::new();
-        let config = SessionConfig::new().with_target_partitions(1);
-        let ctx = session(&temp, &store, config).await?;
-        assert_flaky_read_is_retried(&ctx, &store, &flaky, sql, expected).await?;
-    }
-    Ok(())
+    run_flaky_delete_file_reads(false, true).await
+}
+
+/// [`a_delete_file_read_that_fails_once_is_read_again`], on a multi-threaded
+/// runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_file_read_that_fails_once_is_read_again_on_many_threads() -> anyhow::Result<()> {
+    run_flaky_delete_file_reads(false, true).await
 }
 
 /// Under the session's default partitioning, `LIMIT 1` over `rowid` reads only a
@@ -1962,7 +2050,7 @@ async fn limit_one_over_rowid_under_default_partitioning_reads_few_files() -> an
 #[tokio::test]
 async fn a_missing_delete_file_after_the_first_fails_a_rowid_query() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
-    let missing = create_three_files_with_deletes(&temp).await?;
+    let missing = create_three_files_with_deletes(&temp).await?.delete;
     std::fs::remove_file(&missing)?;
     for config in partitioning_configs() {
         let label = format!("lineage, {} partitions", config.target_partitions());
@@ -1972,17 +2060,25 @@ async fn a_missing_delete_file_after_the_first_fails_a_rowid_query() -> anyhow::
     Ok(())
 }
 
+/// [`a_delete_file_read_that_fails_once_never_gives_a_wrong_count`], with row
+/// lineage.
+#[tokio::test]
+async fn a_delete_file_read_that_fails_once_never_gives_a_wrong_count_under_row_lineage()
+-> anyhow::Result<()> {
+    run_flaky_delete_file_reads(true, false).await
+}
+
 /// [`a_delete_file_read_that_fails_once_is_read_again`], with row lineage.
 #[tokio::test]
 async fn a_delete_file_read_that_fails_once_is_read_again_under_row_lineage() -> anyhow::Result<()>
 {
-    let temp = TempDir::new()?;
-    let flaky = file_name(&create_three_files_with_deletes(&temp).await?);
-    for (sql, expected) in FLAKY_READ_COUNTS {
-        let store = ReadRecordingStore::new();
-        let config = SessionConfig::new().with_target_partitions(1);
-        let ctx = lineage_session(&temp, &store, config).await?;
-        assert_flaky_read_is_retried(&ctx, &store, &flaky, sql, expected).await?;
-    }
-    Ok(())
+    run_flaky_delete_file_reads(true, true).await
+}
+
+/// [`a_delete_file_read_that_fails_once_is_read_again`], with row lineage, on a
+/// multi-threaded runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_file_read_that_fails_once_is_read_again_under_row_lineage_on_many_threads()
+-> anyhow::Result<()> {
+    run_flaky_delete_file_reads(true, true).await
 }
