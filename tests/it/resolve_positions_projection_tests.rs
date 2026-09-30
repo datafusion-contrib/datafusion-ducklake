@@ -18,9 +18,15 @@
 //! column's index in the narrowed batch differs from its catalog index.
 //!
 //! The shapes are the ones where a column's physical identity differs from its
-//! catalog one: a renamed key, a widened key, a key the file predates, a
-//! name-mapped file with a Hive constant, a file that embeds row ids, a
-//! partitioned table, and files already carrying a delete file.
+//! catalog one: a renamed key, a widened key, a key the file predates (with and
+//! without a default), a dropped column re-added under its old name, two
+//! columns that swapped names, a name-mapped file with a Hive constant, a file
+//! that embeds row ids, a partitioned table, and files already carrying a
+//! delete file — plus predicates whose shape matters to the rebinding: NULL and
+//! NaN float keys, struct-field keys and a CASE.
+//!
+//! The DuckDB-built cases also check the resolved count against official
+//! DuckLake's own answer to the same predicate over the same catalog.
 
 #![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
@@ -321,7 +327,9 @@ struct Harness {
     store: Arc<ByteCountingStore>,
 }
 
-async fn open(temp: &TempDir) -> Harness {
+/// A session that splits each file across partitions, reading local files
+/// through a fresh [`ByteCountingStore`].
+fn split_session() -> (SessionContext, Arc<ByteCountingStore>) {
     let mut config = ConfigOptions::new();
     config.execution.target_partitions = 8;
     config.optimizer.repartition_file_scans = true;
@@ -333,6 +341,11 @@ async fn open(temp: &TempDir) -> Harness {
         &url::Url::parse("file:///").unwrap(),
         Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
     );
+    (ctx, store)
+}
+
+async fn open(temp: &TempDir) -> Harness {
+    let (ctx, store) = split_session();
 
     let writer = SqliteMetadataWriter::new(&db_url(temp)).await.unwrap();
     let provider = SqliteMetadataProvider::new(&db_url(temp)).await.unwrap();
@@ -396,6 +409,19 @@ impl Harness {
         let mut positions: Vec<i64> = positions.into_iter().collect();
         positions.sort_unstable();
         (positions, bytes)
+    }
+
+    /// [`Self::resolve`] for a SQL predicate, parsed and type-coerced against
+    /// the table's catalog schema as a `DELETE ... WHERE` is.
+    async fn resolve_sql(
+        &self,
+        table: &DuckLakeTable,
+        file: &DuckLakeTableFile,
+        sql: &str,
+    ) -> (Vec<i64>, u64) {
+        let schema = DFSchema::try_from(table.schema().as_ref().clone()).unwrap();
+        let expr = self.ctx.state().create_logical_expr(sql, &schema).unwrap();
+        self.resolve(table, file, expr).await
     }
 
     /// Run a DML statement, returning its row count and the bytes it read.
@@ -483,26 +509,59 @@ fn file_path(temp: &TempDir, file: &DuckLakeTableFile) -> PathBuf {
     }
 }
 
-/// One column of a parquet file in physical order, read by its PHYSICAL name
-/// with the plain parquet reader and cast to Int64. This is the oracle's view
-/// of the file: nothing in it goes through this crate.
-fn physical_i64(path: &Path, column: &str) -> Vec<Option<i64>> {
+/// One leaf column of a parquet file in physical order, read by its PHYSICAL
+/// dotted path (`id`, or `s.a` for a struct field) with the plain parquet
+/// reader and cast to `to`. This is the oracle's view of the file: nothing in
+/// it goes through this crate.
+fn physical_leaf(path: &Path, column: &str, to: &DataType) -> Vec<ArrayRef> {
     let builder =
         ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
     let index = builder
         .parquet_schema()
         .columns()
         .iter()
-        .position(|c| c.name() == column)
+        .position(|c| c.path().string() == column)
         .unwrap_or_else(|| panic!("{} has no physical column {column}", path.display()));
     let mask = ProjectionMask::leaves(builder.parquet_schema(), [index]);
-    let mut out = Vec::new();
-    for batch in builder.with_projection(mask).build().unwrap() {
-        let column = arrow::compute::cast(batch.unwrap().column(0), &DataType::Int64).unwrap();
-        let column = column.as_any().downcast_ref::<Int64Array>().unwrap();
-        out.extend(column.iter());
-    }
-    out
+    builder
+        .with_projection(mask)
+        .build()
+        .unwrap()
+        .map(|batch| {
+            // A struct leaf comes back wrapped in its (single-child) parents.
+            let mut column = Arc::clone(batch.unwrap().column(0));
+            while let Some(parent) = column.as_any().downcast_ref::<arrow::array::StructArray>() {
+                column = Arc::clone(parent.column(0));
+            }
+            arrow::compute::cast(&column, to).unwrap()
+        })
+        .collect()
+}
+
+fn physical_i64(path: &Path, column: &str) -> Vec<Option<i64>> {
+    physical_leaf(path, column, &DataType::Int64)
+        .iter()
+        .flat_map(|a| {
+            a.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn physical_f64(path: &Path, column: &str) -> Vec<Option<f64>> {
+    physical_leaf(path, column, &DataType::Float64)
+        .iter()
+        .flat_map(|a| {
+            a.as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// The physical column names of a parquet file.
@@ -1086,16 +1145,7 @@ async fn name_mapped_file() {
     .unwrap();
     drop(conn);
 
-    let mut config = ConfigOptions::new();
-    config.execution.target_partitions = 8;
-    config.optimizer.repartition_file_scans = true;
-    config.optimizer.repartition_file_min_size = 1;
-    let ctx = SessionContext::new_with_config(SessionConfig::from(config));
-    let store = Arc::new(ByteCountingStore::new());
-    ctx.runtime_env().register_object_store(
-        &url::Url::parse("file:///").unwrap(),
-        Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
-    );
+    let (ctx, store) = split_session();
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy()).unwrap();
     ctx.register_catalog(
         "ducklake",
@@ -1186,4 +1236,289 @@ async fn name_mapped_file() {
     // Guard against an oracle that could agree by accident.
     let unique: HashSet<_> = rows.iter().map(|(id, _)| *id).collect();
     assert_eq!(unique.len(), ROWS as usize);
+}
+
+/// Catalogs built by official DuckLake (through DuckDB), so the metadata —
+/// defaults, dropped and re-added columns, renames — is exactly what official
+/// writes, and each resolved count is checked against official's own count for
+/// the same predicate over the same single-file table.
+#[cfg(feature = "metadata-duckdb")]
+mod official {
+    use super::*;
+    use datafusion_ducklake::DuckdbMetadataProvider;
+
+    const OFFICIAL_ROWS: i64 = 4_000;
+
+    struct Official {
+        h: Harness,
+        table: DuckLakeTable,
+        file: DuckLakeTableFile,
+        path: PathBuf,
+        size: u64,
+        /// Official's `count(*)` for each predicate, in order.
+        counts: Vec<usize>,
+        _temp: TempDir,
+    }
+
+    /// `t(wide, id, a, b, k2, f, s)` as ONE data file of `OFFICIAL_ROWS` rows
+    /// in 1000-row row groups, then `alter`, then official's count of each
+    /// predicate.
+    ///
+    /// `f` is NULL on every fifth row and NaN on every other seventh; `s` is
+    /// `{a: id % 100, b: 'x' || id}`.
+    async fn build(alter: &str, predicates: &[&str]) -> Official {
+        let temp = TempDir::new().unwrap();
+        let catalog_path = temp.path().join("official.ducklake");
+        let data_path = temp.path().join("data");
+        std::fs::create_dir_all(&data_path).unwrap();
+
+        crate::common::ensure_extension_installed("ducklake");
+        crate::common::ensure_extension_installed("parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch("LOAD ducklake; LOAD parquet;").unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 0);
+             CALL lake.set_option('parquet_row_group_size', 1000);
+             CREATE TABLE lake.t(
+                 wide VARCHAR, id BIGINT, a INTEGER, b INTEGER, k2 INTEGER,
+                 f DOUBLE, s STRUCT(a INTEGER, b VARCHAR));
+             INSERT INTO lake.t
+             SELECT (SELECT string_agg(md5(i::VARCHAR || '-' || j::VARCHAR), '')
+                     FROM range(48) r(j)),
+                    i, (i % 7)::INTEGER, (i % 11)::INTEGER, (i % 10)::INTEGER,
+                    CASE WHEN i % 5 = 0 THEN NULL
+                         WHEN i % 7 = 0 THEN 'NaN'::DOUBLE
+                         ELSE i * 0.5 END,
+                    {{'a': (i % 100)::INTEGER, 'b': 'x' || i::VARCHAR}}
+             FROM range({OFFICIAL_ROWS}) t(i);
+             {alter}",
+            catalog_path.display(),
+            data_path.display(),
+        ))
+        .unwrap();
+        let counts = predicates
+            .iter()
+            .map(|predicate| {
+                conn.query_row(
+                    &format!("SELECT count(*) FROM lake.t WHERE {predicate}"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or_else(|e| panic!("official rejected `{predicate}`: {e}"))
+                    as usize
+            })
+            .collect();
+        drop(conn);
+
+        let (ctx, store) = split_session();
+        let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy()).unwrap();
+        ctx.register_catalog(
+            "ducklake",
+            Arc::new(DuckLakeCatalog::new(provider).unwrap()),
+        );
+        let h = Harness {
+            ctx,
+            store,
+        };
+        let table = h.table().await;
+        let files = table.files().unwrap();
+        assert_eq!(files.len(), 1, "the fixture is one data file");
+        let file = files.into_iter().next().unwrap();
+        let path = file_path(&temp, &file);
+        let size = std::fs::metadata(&path).unwrap().len();
+        Official {
+            h,
+            table,
+            file,
+            path,
+            size,
+            counts,
+            _temp: temp,
+        }
+    }
+
+    impl Official {
+        async fn resolve(&self, sql: &str) -> (Vec<i64>, u64) {
+            self.h.resolve_sql(&self.table, &self.file, sql).await
+        }
+
+        fn i64s(&self, column: &str) -> Vec<Option<i64>> {
+            physical_i64(&self.path, column)
+        }
+
+        fn has_physical(&self, column: &str) -> bool {
+            physical_columns(&self.path).iter().any(|c| c == column)
+        }
+    }
+
+    /// Reading nothing is allowed here (a predicate that folds to a constant
+    /// reads no column), reading much is not.
+    fn assert_at_most_narrow(bytes: u64, size: u64, what: &str) {
+        assert!(
+            bytes * NARROW_FRACTION < size,
+            "{what}: read {bytes} bytes of a {size}-byte file"
+        );
+    }
+
+    /// `ADD COLUMN ... DEFAULT` after the file was written: the file has no
+    /// such column, and every one of its rows reads the default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn defaulted_column_the_file_predates() {
+        let predicates = ["tag = 7 AND id < 100", "tag = 8", "tag IS NULL"];
+        let o = build(
+            "ALTER TABLE lake.t ADD COLUMN tag INTEGER DEFAULT 7;",
+            &predicates,
+        )
+        .await;
+        assert!(!o.has_physical("tag"));
+        let ids = o.i64s("id");
+
+        let (positions, bytes) = o.resolve(predicates[0]).await;
+        assert_eq!(positions, oracle(&ids, |id| id.unwrap() < 100));
+        assert_eq!(positions.len(), 100);
+        assert_eq!(positions.len(), o.counts[0], "official agrees");
+        assert_narrow(bytes, o.size, "defaulted column AND key");
+
+        for (predicate, official) in predicates[1..].iter().zip(&o.counts[1..]) {
+            let (positions, bytes) = o.resolve(predicate).await;
+            assert!(positions.is_empty(), "`{predicate}` matched {positions:?}");
+            assert_eq!(*official, 0, "official agrees on `{predicate}`");
+            assert_at_most_narrow(bytes, o.size, predicate);
+        }
+    }
+
+    /// `DROP COLUMN k2` then `ADD COLUMN k2 ... DEFAULT 5`: the file still
+    /// holds the OLD `k2` under the old column's field id. The new column must
+    /// read the default for every row of the file, never the old values.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn dropped_and_readded_column_with_a_default() {
+        let predicates = ["k2 = 5", "k2 = 3"];
+        let o = build(
+            "ALTER TABLE lake.t DROP COLUMN k2;
+             ALTER TABLE lake.t ADD COLUMN k2 INTEGER DEFAULT 5;",
+            &predicates,
+        )
+        .await;
+        assert!(o.has_physical("k2"), "the file still carries the old k2");
+        let old_k2 = o.i64s("k2");
+        assert_eq!(
+            oracle(&old_k2, |k2| *k2 == Some(3)).len(),
+            OFFICIAL_ROWS as usize / 10,
+            "the old values are there to be (wrongly) bound"
+        );
+
+        let (positions, bytes) = o.resolve(predicates[0]).await;
+        assert_eq!(positions, (0..OFFICIAL_ROWS).collect::<Vec<_>>());
+        assert_eq!(positions.len(), o.counts[0], "official agrees");
+        assert_at_most_narrow(bytes, o.size, "re-added k2 = default");
+
+        let (positions, bytes) = o.resolve(predicates[1]).await;
+        assert!(
+            positions.is_empty(),
+            "k2 = 3 bound the dropped column's values: {} rows",
+            positions.len()
+        );
+        assert_eq!(o.counts[1], 0, "official agrees");
+        assert_at_most_narrow(bytes, o.size, "re-added k2 = old value");
+    }
+
+    /// `a` and `b` swap names: the catalog's `a` is the file's `b` and vice
+    /// versa, both INTEGER, so a mis-bound column would still type-check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn columns_that_swapped_names() {
+        let predicates = ["a = 3", "a = 3 AND b = 2"];
+        let o = build(
+            "ALTER TABLE lake.t RENAME COLUMN a TO swap_tmp;
+             ALTER TABLE lake.t RENAME COLUMN b TO a;
+             ALTER TABLE lake.t RENAME COLUMN swap_tmp TO b;",
+            &predicates,
+        )
+        .await;
+        let rows = zip2(o.i64s("a"), o.i64s("b"));
+
+        let (positions, bytes) = o.resolve(predicates[0]).await;
+        let expected = oracle(&rows, |(_, physical_b)| *physical_b == Some(3));
+        assert_ne!(
+            expected,
+            oracle(&rows, |(physical_a, _)| *physical_a == Some(3)),
+            "the two columns must disagree, or a swap would go unnoticed"
+        );
+        assert_eq!(positions, expected);
+        assert_eq!(positions.len(), o.counts[0], "official agrees");
+        assert_narrow(bytes, o.size, "swapped a");
+
+        let (positions, bytes) = o.resolve(predicates[1]).await;
+        assert_eq!(
+            positions,
+            oracle(&rows, |(physical_a, physical_b)| *physical_b == Some(3)
+                && *physical_a == Some(2))
+        );
+        assert!(!positions.is_empty());
+        assert_eq!(positions.len(), o.counts[1], "official agrees");
+        assert_narrow(bytes, o.size, "swapped a AND b");
+    }
+
+    /// Float keys are never pushed into the reader (NaN is not in the footer
+    /// bounds), so projection is the whole saving. NULL and NaN rows must both
+    /// resolve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn null_and_nan_float_keys() {
+        let predicates = ["f IS NULL", "isnan(f)", "f = 'NaN'::double AND id < 1000"];
+        let o = build("", &predicates).await;
+        let rows: Vec<(Option<i64>, Option<f64>)> = o
+            .i64s("id")
+            .into_iter()
+            .zip(physical_f64(&o.path, "f"))
+            .collect();
+
+        let expected: [Vec<i64>; 3] = [
+            oracle(&rows, |(_, f)| f.is_none()),
+            oracle(&rows, |(_, f)| f.is_some_and(f64::is_nan)),
+            oracle(&rows, |(id, f)| {
+                f.is_some_and(f64::is_nan) && id.unwrap() < 1000
+            }),
+        ];
+        for ((predicate, expected), official) in predicates.iter().zip(expected).zip(&o.counts) {
+            let (positions, bytes) = o.resolve(predicate).await;
+            assert!(
+                !expected.is_empty(),
+                "`{predicate}`: the fixture must match rows"
+            );
+            assert_eq!(positions, expected, "`{predicate}`");
+            assert_eq!(
+                positions.len(),
+                *official,
+                "official agrees on `{predicate}`"
+            );
+            assert_narrow(bytes, o.size, predicate);
+        }
+    }
+
+    /// A key inside a struct, alone and under a CASE: the rebinding has to
+    /// reach a column referenced only inside a field access and a conditional.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn struct_field_keys() {
+        let predicates = ["s['a'] = 7", "CASE WHEN s['a'] > 40 THEN id % 2 = 0 ELSE false END"];
+        let o = build("", &predicates).await;
+        let rows = zip2(o.i64s("id"), o.i64s("s.a"));
+
+        let expected: [Vec<i64>; 2] = [
+            oracle(&rows, |(_, a)| *a == Some(7)),
+            oracle(&rows, |(id, a)| a.unwrap() > 40 && id.unwrap() % 2 == 0),
+        ];
+        for ((predicate, expected), official) in predicates.iter().zip(expected).zip(&o.counts) {
+            let (positions, bytes) = o.resolve(predicate).await;
+            assert!(
+                !expected.is_empty(),
+                "`{predicate}`: the fixture must match rows"
+            );
+            assert_eq!(positions, expected, "`{predicate}`");
+            assert_eq!(
+                positions.len(),
+                *official,
+                "official agrees on `{predicate}`"
+            );
+            assert_narrow(bytes, o.size, predicate);
+        }
+    }
 }
