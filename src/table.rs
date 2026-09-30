@@ -1,6 +1,6 @@
 //! DuckLake table provider implementation
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -2439,15 +2439,22 @@ impl DuckLakeTable {
         Ok(())
     }
 
+    /// Present a positional scan of one file under catalog names and types.
+    ///
+    /// `columns` are the catalog column indices `plan` reads, in the order it
+    /// reads them; they become the leading output fields, and every field of
+    /// `plan` after them (the position column) passes through as it is.
     fn present_file_read_config(
         &self,
         plan: Arc<dyn ExecutionPlan>,
         file_cfg: &FileReadConfig,
-        physical_len: usize,
+        columns: &[usize],
     ) -> Arc<dyn ExecutionPlan> {
-        let mut output_fields: Vec<Arc<Field>> =
-            self.physical_schema.fields().iter().cloned().collect();
-        output_fields.extend(plan.schema().fields().iter().skip(physical_len).cloned());
+        let mut output_fields: Vec<Arc<Field>> = columns
+            .iter()
+            .map(|&index| Arc::clone(&self.physical_schema.fields()[index]))
+            .collect();
+        output_fields.extend(plan.schema().fields().iter().skip(columns.len()).cloned());
         Arc::new(ColumnRenameExec::new_with_constants(
             plan,
             Arc::new(Schema::new(output_fields)),
@@ -2482,11 +2489,11 @@ impl DuckLakeTable {
         data_file: &DuckLakeFileData,
         predicate: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     ) -> DataFusionResult<HashSet<i64>> {
-        // Positional scan of the data file: read the physical data columns and the
-        // reader-produced physical row position, WITHOUT applying any delete
-        // files. Then evaluate `predicate` per batch and collect the physical
-        // positions of matching rows — exactly the `pos` values a positional
-        // delete file records.
+        // Positional scan of the data file: read the data columns `predicate`
+        // needs and the reader-produced physical row position, WITHOUT applying
+        // any delete files. Then evaluate `predicate` per batch and collect the
+        // physical positions of matching rows — exactly the `pos` values a
+        // positional delete file records.
         //
         // `predicate` is expressed against the table's logical column order
         // (column index i = the i-th logical/data field); `Column::evaluate` is
@@ -2494,15 +2501,12 @@ impl DuckLakeTable {
         // physical rename. `ROW_POS_COLUMN_NAME` is appended last and is never
         // referenced by the predicate.
         //
-        // The projection is the physical data columns only. On a file that
-        // embeds a rowid column that column sits last in `read_schema`, so
-        // `0..physical_len` excludes it and the predicate's column indices still
-        // line up with the table's logical order.
+        // The projection is only the data columns the predicate references —
+        // see `positional_read_columns` — then the position column. On a file
+        // that embeds a rowid column that column sits last in `read_schema`,
+        // past every data column, so it is never projected.
         let file_cfg = self.build_file_read_config(state, data_file).await?;
 
-        // Physical data columns only (logical order), then the reader-produced
-        // position column. Embedded/rowid columns are not needed to evaluate the
-        // predicate or read positions.
         let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
             file_cfg.read_schema.clone(),
             self.physical_schema
@@ -2510,7 +2514,8 @@ impl DuckLakeTable {
                 .iter()
                 .map(|field| field.name().as_str()),
         );
-        let mut proj: Vec<usize> = (0..self.physical_schema.fields().len()).collect();
+        let (columns, evaluated) = self.positional_read_columns(&predicate, &file_cfg)?;
+        let mut proj = columns.clone();
         proj.push(pos_table_idx);
         let pos_idx = proj.len() - 1;
 
@@ -2519,6 +2524,12 @@ impl DuckLakeTable {
         // instead of every row of the file. Positions stay true under pruning
         // because the reader derives them from row-group offsets, and a row the
         // reader drops could not have matched anyway.
+        //
+        // The reader takes the ORIGINAL predicate, not `evaluated`: a pushed
+        // predicate is bound against `table_schema` — every data column in
+        // catalog order, whatever the projection — so its indices are the
+        // catalog's. `evaluated` is bound against the narrower batch this plan
+        // emits.
         let mut source = self.create_parquet_source(state, table_schema)?;
         if self.predicate_is_prunable(&predicate, &file_cfg) {
             source = source.with_predicate(Arc::clone(&predicate));
@@ -2532,14 +2543,13 @@ impl DuckLakeTable {
         );
         let plan = self.split_across_partitions(plan, state, &file_cfg)?;
 
-        let plan =
-            self.present_file_read_config(plan, &file_cfg, self.physical_schema.fields().len());
+        let plan = self.present_file_read_config(plan, &file_cfg, &columns);
 
         let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
 
         let mut positions = HashSet::new();
         for batch in &batches {
-            let mask = predicate.evaluate(batch)?.into_array(batch.num_rows())?;
+            let mask = evaluated.evaluate(batch)?.into_array(batch.num_rows())?;
             let mask = mask
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -3146,6 +3156,113 @@ impl DuckLakeTable {
             return Ok(plan);
         }
         Ok(plan.repartitioned(target, options)?.unwrap_or(plan))
+    }
+
+    /// The data columns a [`Self::resolve_positions`] scan of a file described
+    /// by `file_cfg` must read to evaluate `predicate`, and `predicate` rebound
+    /// against the batch that scan emits.
+    ///
+    /// The columns are the catalog indices `predicate` references, ascending,
+    /// and the scan emits them in that order followed by the position column,
+    /// so each `Column` is rewritten to its column's rank in the list. Every
+    /// other column — a wide payload beside a narrow key is the common case —
+    /// is never fetched or decoded. Official DuckLake reads only the columns a
+    /// delete's filter needs, too.
+    ///
+    /// A predicate with no column reference (a literal) reads no data column:
+    /// the scan emits only positions, one per row.
+    ///
+    /// Relies on `PhysicalExpr::children` reaching every column reference —
+    /// the contract DataFusion's own projection pushdown relies on, and the
+    /// one [`Self::predicate_is_prunable`] already walks by.
+    ///
+    /// Falls back to every data column, with `predicate` unchanged — the scan
+    /// this path always did — when either check fails for any referenced
+    /// column:
+    ///
+    /// - its index is inside the catalog schema. One outside it cannot be
+    ///   rebound; the full scan leaves it to fail exactly as it always has.
+    /// - the presenting [`ColumnRenameExec`] finds it in the scan under the
+    ///   file's own name for that position (or synthesizes it). That node binds
+    ///   by name while this scan projects by position, and the two agree for
+    ///   every file this crate knows how to lay out — but where they did not,
+    ///   the full scan would bind some other column in the file and a narrow
+    ///   one would not find it at all. Keeping the full scan keeps such a file's
+    ///   behaviour exactly what it was.
+    fn positional_read_columns(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+        file_cfg: &FileReadConfig,
+    ) -> DataFusionResult<(Vec<usize>, Arc<dyn PhysicalExpr>)> {
+        use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+        use datafusion::physical_expr::expressions::Column;
+
+        let catalog_fields = self.physical_schema.fields();
+        let every_column = || ((0..catalog_fields.len()).collect(), Arc::clone(predicate));
+
+        let mut referenced = BTreeSet::new();
+        let mut narrowable = true;
+        predicate.apply(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let index = column.index();
+            if index >= catalog_fields.len() || !self.presented_by_read_name(index, file_cfg) {
+                narrowable = false;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            referenced.insert(index);
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        if !narrowable {
+            return Ok(every_column());
+        }
+
+        let columns: Vec<usize> = referenced.into_iter().collect();
+        let rebound = Arc::clone(predicate)
+            .transform_down(|expr| {
+                let Some(column) = expr.downcast_ref::<Column>() else {
+                    return Ok(Transformed::no(expr));
+                };
+                let rank = columns.binary_search(&column.index()).map_err(|_| {
+                    DataFusionError::Internal(format!(
+                        "resolve_positions: column {} was not collected from the predicate",
+                        column.index()
+                    ))
+                })?;
+                Ok(Transformed::yes(
+                    Arc::new(Column::new(column.name(), rank)) as Arc<dyn PhysicalExpr>
+                ))
+            })?
+            .data;
+        Ok((columns, rebound))
+    }
+
+    /// Whether the [`ColumnRenameExec`] over a positional scan of this file
+    /// presents catalog column `index` from the scan's field at that same
+    /// position, or synthesizes it: the name it looks the column up under is
+    /// the one the file's read schema gives that position, and no earlier
+    /// position.
+    fn presented_by_read_name(&self, index: usize, file_cfg: &FileReadConfig) -> bool {
+        let catalog_name = self.physical_schema.field(index).name();
+        if file_cfg.constants.contains_key(catalog_name) {
+            return true;
+        }
+        let mut sources = file_cfg
+            .name_mapping
+            .iter()
+            .filter(|(_, to)| *to == catalog_name)
+            .map(|(from, _)| from.as_str());
+        let looked_up = match (sources.next(), sources.next()) {
+            (None, _) => catalog_name.as_str(),
+            (Some(from), None) => from,
+            // Two sources for one output name: which one the node picks is up
+            // to its map, so no position can be said to be the one it reads.
+            (Some(_), Some(_)) => return false,
+        };
+        // `index_of` is the first field of that name — the one the node's own
+        // by-name lookup would find in a scan of every column.
+        file_cfg.read_schema.index_of(looked_up).ok() == Some(index)
     }
 
     /// Whether `predicate` may be pushed into the parquet reader for a
@@ -4438,7 +4555,8 @@ impl DuckLakeTable {
             )?);
         }
 
-        plan = self.present_file_read_config(plan, &file_cfg, physical_len);
+        let every_column: Vec<usize> = (0..physical_len).collect();
+        plan = self.present_file_read_config(plan, &file_cfg, &every_column);
 
         Ok(UpdateSourceScan {
             scan: plan,

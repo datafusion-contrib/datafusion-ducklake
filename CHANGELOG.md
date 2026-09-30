@@ -100,6 +100,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard. Row groups and pages whose statistics rule the predicate out are no
   longer decoded, so updating one row reads one row group instead of every row
   of every candidate file.
+- `DuckLakeTable::resolve_positions`, and so a keyed `DELETE`, reads only the columns its
+  predicate references plus the row position, as official DuckLake's delete scan does. Before,
+  it read and decoded every column of every candidate file, so a delete keyed on a narrow
+  column of a table with wide columns beside it read nearly the whole table. On a test fixture
+  with a 1536-byte binary column and a 256-character text column, resolving one key read
+  about 10 KB of a 14 MB file instead of all of it. Resolved positions are unchanged.
 
 ### Fixed
 
