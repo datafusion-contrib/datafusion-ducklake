@@ -6,8 +6,6 @@
 //! Usage: cargo run --example dump_sort --features write-sqlite,metadata-sqlite \
 //!            -- <sqlite-conn-str> <schema> <table> <filter-sql>
 
-use std::sync::Arc;
-
 use datafusion::prelude::*;
 use datafusion_ducklake::metadata_provider::MetadataProvider;
 use datafusion_ducklake::{DuckLakeCatalog, SqliteMetadataProvider};
@@ -50,7 +48,7 @@ async fn main() {
 
     let catalog = DuckLakeCatalog::new(provider).unwrap();
     let ctx = SessionContext::new();
-    ctx.register_catalog("lake", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "lake", catalog);
 
     let total = ctx
         .sql(&format!("SELECT count(*) FROM lake.{schema}.{table}"))

@@ -7,8 +7,10 @@ use crate::information_schema::InformationSchemaProvider;
 use crate::metadata_provider::{MetadataProvider, resolve_snapshot_at_or_before};
 use crate::path_resolver::{parse_object_store_url, resolve_path};
 use crate::schema::DuckLakeSchema;
+use crate::snapshot_consistency::{ViewGuard, register_snapshot_consistency};
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 use datafusion::datasource::object_store::ObjectStoreUrl;
+use datafusion::prelude::SessionContext;
 
 #[cfg(feature = "write")]
 use crate::metadata_writer::MetadataWriter;
@@ -24,17 +26,38 @@ struct WriteConfig {
     options: crate::table_writer::DuckLakeWriteOptions,
 }
 
+/// Snapshot that lookups read: one fixed ID, or the latest at each lookup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SnapshotSelection {
+    Fixed(i64),
+    Latest,
+}
+
+impl SnapshotSelection {
+    pub(crate) fn resolve(self, provider: &dyn MetadataProvider) -> Result<i64> {
+        match self {
+            Self::Fixed(snapshot_id) => Ok(snapshot_id),
+            Self::Latest => provider.get_current_snapshot(),
+        }
+    }
+}
+
 /// DuckLake catalog provider
 ///
 /// Connects to a DuckLake catalog database and provides access to schemas and tables.
 /// Uses dynamic metadata lookup - schemas are queried on-demand from the catalog database.
-/// Bound to a specific snapshot ID for query consistency.
+/// Catalogs from [`DuckLakeCatalog::new`] and [`DuckLakeCatalog::with_writer`] read the latest
+/// snapshot at each lookup, as a new DuckDB transaction does, so commits from any writer are
+/// visible to the next statement. [`DuckLakeCatalog::with_snapshot`] and
+/// [`DuckLakeCatalog::with_snapshot_at`] stay bound to one snapshot ID.
 #[derive(Debug)]
 pub struct DuckLakeCatalog {
     /// Metadata provider for querying catalog
     provider: Arc<dyn MetadataProvider>,
-    /// Snapshot ID this catalog is bound to (for query consistency)
-    snapshot_id: i64,
+    /// Snapshot that schema and table lookups read
+    snapshot: SnapshotSelection,
+    /// Set when tables can be rebuilt at another snapshot: the views they were planned through.
+    view_guards: Option<Arc<Vec<ViewGuard>>>,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     /// Catalog base path component for resolving relative schema paths (e.g., /prefix/)
@@ -51,17 +74,17 @@ pub struct DuckLakeCatalog {
 impl DuckLakeCatalog {
     /// Create a new DuckLake catalog with a metadata provider
     ///
-    /// Gets the current snapshot ID at creation time and binds the catalog to it.
-    /// For backward compatibility. For explicit snapshot control, use `with_snapshot()`.
+    /// Reads the latest snapshot at each lookup. For a fixed view, use `with_snapshot()`.
     pub fn new(provider: impl MetadataProvider + 'static) -> Result<Self> {
         let provider = Arc::new(provider) as Arc<dyn MetadataProvider>;
-        let snapshot_id = provider.get_current_snapshot()?;
+        provider.get_current_snapshot()?;
         let data_path = provider.get_data_path()?;
         let (object_store_url, catalog_path) = parse_object_store_url(&data_path)?;
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: SnapshotSelection::Latest,
+            view_guards: Some(Arc::new(Vec::new())),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -81,7 +104,8 @@ impl DuckLakeCatalog {
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: SnapshotSelection::Fixed(snapshot_id),
+            view_guards: None,
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -133,13 +157,14 @@ impl DuckLakeCatalog {
         provider: Arc<dyn MetadataProvider>,
         writer: Arc<dyn MetadataWriter>,
     ) -> Result<Self> {
-        let snapshot_id = provider.get_current_snapshot()?;
+        provider.get_current_snapshot()?;
         let data_path_str = provider.get_data_path()?;
         let (object_store_url, catalog_path) = parse_object_store_url(&data_path_str)?;
 
         Ok(Self {
             provider,
-            snapshot_id,
+            snapshot: SnapshotSelection::Latest,
+            view_guards: Some(Arc::new(Vec::new())),
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
@@ -163,6 +188,25 @@ impl DuckLakeCatalog {
         if let Some(config) = self.write_config.as_mut() {
             config.options = options;
         }
+        self
+    }
+
+    /// Register a catalog on a session under `name`.
+    ///
+    /// A catalog from [`DuckLakeCatalog::new`] or [`DuckLakeCatalog::with_writer`] reads the
+    /// latest snapshot at each lookup, so this also calls [`register_snapshot_consistency`]
+    /// to keep a statement over several tables on one snapshot. A catalog bound to a snapshot
+    /// is registered as it is.
+    pub fn register(ctx: &SessionContext, name: &str, catalog: DuckLakeCatalog) {
+        if catalog.view_guards.is_some() {
+            register_snapshot_consistency(ctx);
+        }
+        ctx.register_catalog(name, Arc::new(catalog));
+    }
+
+    /// Make this catalog's tables rebuildable at another snapshot, under `view_guards`.
+    pub(crate) fn with_view_guards(mut self, view_guards: Option<Arc<Vec<ViewGuard>>>) -> Self {
+        self.view_guards = view_guards;
         self
     }
 
@@ -203,17 +247,11 @@ impl CatalogProvider for DuckLakeCatalog {
         // Start with information_schema
         let mut names = vec!["information_schema".to_string()];
 
-        // Add data schemas from catalog using the pinned snapshot_id
         let data_schemas = self
-            .provider
-            .list_schemas(self.snapshot_id)
-            .inspect_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    snapshot_id = %self.snapshot_id,
-                    "Failed to list schemas from catalog"
-                )
-            })
+            .snapshot
+            .resolve(self.provider.as_ref())
+            .and_then(|snapshot_id| self.provider.list_schemas(snapshot_id))
+            .inspect_err(|e| tracing::error!(error = %e, "Failed to list schemas from catalog"))
             .unwrap_or_default()
             .into_iter()
             .map(|s| s.schema_name);
@@ -235,8 +273,14 @@ impl CatalogProvider for DuckLakeCatalog {
             ))));
         }
 
-        // Query database with the pinned snapshot_id for data schemas
-        match self.provider.get_schema_by_name(name, self.snapshot_id) {
+        let snapshot_id = match self.snapshot.resolve(self.provider.as_ref()) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(e) => {
+                tracing::error!(error = %e, schema_name = %name, "Failed to resolve snapshot");
+                return None;
+            },
+        };
+        match self.provider.get_schema_by_name(name, snapshot_id) {
             Ok(Some(meta)) => {
                 // Resolve schema path hierarchically using path_resolver utility
                 let schema_path =
@@ -252,15 +296,15 @@ impl CatalogProvider for DuckLakeCatalog {
                         },
                     };
 
-                // Pass the pinned snapshot_id to schema
                 let schema = DuckLakeSchema::new(
                     meta.schema_id,
                     meta.schema_name,
                     Arc::clone(&self.provider),
-                    self.snapshot_id, // Propagate pinned snapshot_id
+                    snapshot_id,
                     self.object_store_url.clone(),
                     schema_path,
                 )
+                .with_snapshot_selection(self.snapshot, self.view_guards.clone())
                 .with_row_lineage(self.row_lineage);
 
                 // Configure writer if this catalog is writable
@@ -275,7 +319,11 @@ impl CatalogProvider for DuckLakeCatalog {
 
                 Some(Arc::new(schema) as Arc<dyn SchemaProvider>)
             },
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(error = %e, schema_name = %name, "Failed to look up schema");
+                None
+            },
         }
     }
 }

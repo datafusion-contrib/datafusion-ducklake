@@ -172,7 +172,7 @@ The `DuckLakeTable` provider handles URL resolution by:
 
 ### Snapshot Isolation
 - DuckLake uses snapshot IDs for temporal consistency
-- Current implementation queries latest snapshot on catalog creation
+- `new()` and `with_writer()` catalogs read the latest snapshot at each lookup; `with_snapshot()` and `with_snapshot_at()` stay fixed
 - Tables and schemas are filtered by snapshot validity ranges
 
 ### Parquet File Scanning

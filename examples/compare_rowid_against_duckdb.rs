@@ -166,7 +166,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let catalog = DuckLakeCatalog::new(provider)?.with_row_lineage(true);
     let cfg = SessionConfig::new().with_default_catalog_and_schema("dl", "main");
     let ctx = SessionContext::new_with_config_rt(cfg, runtime);
-    ctx.register_catalog("dl", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "dl", catalog);
     println!("✓ DataFusion catalog registered with row lineage enabled");
 
     // ----- 3. Compare table by table -----

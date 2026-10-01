@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeCatalog::register` and `register_snapshot_consistency` put every table of one statement,
+  including tables behind a view, on a single snapshot per catalog.
 - `MulticatalogManager::table_file_owners` and `has_live_references` report file ownership, so
   callers need not query the crate's tables for it (#310).
 - A `data_path` may use any object store URL scheme, for example `gs://`, `gcs://`, `az://` or
@@ -46,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: a catalog from `DuckLakeCatalog::new` or `with_writer` reads the latest snapshot at
+  each lookup instead of the one at creation, so a session sees its own and other writers' commits
+  on its next statement. Register it with `DuckLakeCatalog::register` to keep each statement on
+  one snapshot, or use `with_snapshot` for a frozen view.
 - `count(*)` on a table with delete files is answered from catalog counts, as official does,
   without reading any delete file (#306).
 - Multicatalog Postgres records file references in dedicated `ducklake_catalog_*_file_reference`

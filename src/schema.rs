@@ -8,8 +8,10 @@ use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableType;
 
-use crate::metadata_provider::MetadataProvider;
+use crate::catalog::SnapshotSelection;
+use crate::metadata_provider::{MetadataProvider, TableMetadata, ViewMetadata};
 use crate::path_resolver::resolve_path;
+use crate::snapshot_consistency::{SnapshotRebind, ViewGuard};
 use crate::table::DuckLakeTable;
 use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 
@@ -17,7 +19,6 @@ use crate::view::{UnplannableViewTable, plan_view, resolve_view_definition};
 use crate::metadata_writer::{ColumnDef, MetadataWriter, WriteMode, validate_name};
 #[cfg(feature = "write")]
 use datafusion::datasource::MemTable;
-#[cfg(feature = "write")]
 use datafusion::error::DataFusionError;
 
 /// Validate table name to prevent path traversal attacks and reject
@@ -49,16 +50,18 @@ fn validate_table_name(name: &str) -> DataFusionResult<()> {
 ///
 /// Represents a schema within a DuckLake catalog and provides access to tables.
 /// Uses dynamic metadata lookup - tables are queried on-demand from the catalog database.
-/// Caches snapshot_id received from catalog.schema() call for query consistency.
-#[derive(Debug)]
+/// Each lookup resolves its snapshot once, so the metadata it reads is from one snapshot.
+#[derive(Debug, Clone)]
 pub struct DuckLakeSchema {
     schema_id: i64,
     schema_name: String,
     /// Object store URL for resolving file paths (e.g., s3://bucket/ or file:///)
     object_store_url: Arc<ObjectStoreUrl>,
     provider: Arc<dyn MetadataProvider>,
-    /// Cached snapshot_id from catalog.schema() call
-    snapshot_id: i64,
+    /// Snapshot that table lookups read
+    snapshot: SnapshotSelection,
+    /// Set when tables can be rebuilt at another snapshot: the views they were planned through.
+    view_guards: Option<Arc<Vec<ViewGuard>>>,
     /// Schema path for resolving relative table paths
     schema_path: String,
     /// Propagated from the catalog: when true, tables expose a `rowid` column.
@@ -85,7 +88,8 @@ impl DuckLakeSchema {
             schema_id,
             schema_name: schema_name.into(),
             provider,
-            snapshot_id,
+            snapshot: SnapshotSelection::Fixed(snapshot_id),
+            view_guards: None,
             object_store_url,
             schema_path,
             row_lineage: false,
@@ -94,6 +98,20 @@ impl DuckLakeSchema {
             #[cfg(feature = "write")]
             write_options: crate::table_writer::DuckLakeWriteOptions::default(),
         }
+    }
+
+    pub(crate) fn with_snapshot_selection(
+        mut self,
+        snapshot: SnapshotSelection,
+        view_guards: Option<Arc<Vec<ViewGuard>>>,
+    ) -> Self {
+        self.snapshot = snapshot;
+        self.view_guards = view_guards;
+        self
+    }
+
+    pub(crate) fn provider_key(&self) -> usize {
+        Arc::as_ptr(&self.provider) as *const () as usize
     }
 
     /// Enable the row-lineage virtual `rowid` column for all tables in this
@@ -127,17 +145,105 @@ impl DuckLakeSchema {
     }
 }
 
+impl DuckLakeSchema {
+    fn resolve_snapshot(&self) -> DataFusionResult<i64> {
+        self.snapshot
+            .resolve(self.provider.as_ref())
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    fn build_table(
+        &self,
+        meta: &TableMetadata,
+        snapshot_id: i64,
+    ) -> DataFusionResult<DuckLakeTable> {
+        // Resolve table path hierarchically using path_resolver utility
+        let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative)
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+        // Pass snapshot_id to table
+        let table = DuckLakeTable::new(
+            meta.table_id,
+            meta.table_name.clone(),
+            self.provider.clone(),
+            snapshot_id, // Propagate snapshot_id
+            self.object_store_url.clone(),
+            table_path,
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
+        .with_row_lineage(self.row_lineage);
+
+        // Configure writer if this schema is writable
+        #[cfg(feature = "write")]
+        let table = if let Some(writer) = self.writer.as_ref() {
+            let settings = self
+                .provider
+                .get_metadata_settings(Some(self.schema_id), Some(meta.table_id))
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let options =
+                crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(
+                    &settings,
+                )
+                .with_overrides(&self.write_options);
+            table
+                .with_writer(self.schema_name.clone(), Arc::clone(writer))
+                .with_write_options(options)
+        } else {
+            table
+        };
+
+        Ok(match &self.view_guards {
+            Some(guards) => table.with_snapshot_rebind(SnapshotRebind::new(
+                self.clone(),
+                meta.table_name.clone(),
+                Arc::clone(guards),
+            )),
+            None => table,
+        })
+    }
+
+    pub(crate) fn view_at(
+        &self,
+        name: &str,
+        snapshot_id: i64,
+    ) -> DataFusionResult<Option<ViewMetadata>> {
+        self.provider
+            .get_view_by_name(self.schema_id, name, snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    /// Rebuild a table at another snapshot, for [`SnapshotRebind`].
+    pub(crate) fn table_at(
+        &self,
+        name: &str,
+        snapshot_id: i64,
+    ) -> DataFusionResult<Option<DuckLakeTable>> {
+        self.provider
+            .get_table_by_name(self.schema_id, name, snapshot_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+            .map(|meta| self.build_table(&meta, snapshot_id))
+            .transpose()
+    }
+}
+
 #[async_trait]
 impl SchemaProvider for DuckLakeSchema {
     fn table_names(&self) -> Vec<String> {
+        let snapshot_id = match self.snapshot.resolve(self.provider.as_ref()) {
+            Ok(snapshot_id) => snapshot_id,
+            Err(e) => {
+                tracing::error!(error = %e, schema_name = %self.schema_name, "Failed to resolve snapshot");
+                return Vec::new();
+            },
+        };
         let mut names = self
             .provider
-            .list_tables(self.schema_id, self.snapshot_id)
+            .list_tables(self.schema_id, snapshot_id)
             .inspect_err(|e| {
                 tracing::error!(
                     error = %e,
                     schema_id = %self.schema_id,
-                    snapshot_id = %self.snapshot_id,
+                    snapshot_id,
                     schema_name = %self.schema_name,
                     "Failed to list tables from catalog"
                 )
@@ -148,12 +254,12 @@ impl SchemaProvider for DuckLakeSchema {
             .collect::<Vec<_>>();
         names.extend(
             self.provider
-                .list_views(self.schema_id, self.snapshot_id)
+                .list_views(self.schema_id, snapshot_id)
                 .inspect_err(|e| {
                     tracing::error!(
                         error = %e,
                         schema_id = %self.schema_id,
-                        snapshot_id = %self.snapshot_id,
+                        snapshot_id,
                         schema_name = %self.schema_name,
                         "Failed to list views from catalog"
                     )
@@ -168,58 +274,23 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table(&self, name: &str) -> DataFusionResult<Option<Arc<dyn TableProvider>>> {
-        // Use cached snapshot_id
+        let snapshot_id = self.resolve_snapshot()?;
         match self
             .provider
-            .get_table_by_name(self.schema_id, name, self.snapshot_id)
+            .get_table_by_name(self.schema_id, name, snapshot_id)
         {
-            Ok(Some(meta)) => {
-                // Resolve table path hierarchically using path_resolver utility
-                let table_path = resolve_path(&self.schema_path, &meta.path, meta.path_is_relative)
-                    .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-
-                // Pass snapshot_id to table
-                let table = DuckLakeTable::new(
-                    meta.table_id,
-                    meta.table_name.clone(),
-                    self.provider.clone(),
-                    self.snapshot_id, // Propagate snapshot_id
-                    self.object_store_url.clone(),
-                    table_path,
-                )
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-                .with_row_lineage(self.row_lineage);
-
-                // Configure writer if this schema is writable
-                #[cfg(feature = "write")]
-                let table = if let Some(writer) = self.writer.as_ref() {
-                    let settings = self
-                        .provider
-                        .get_metadata_settings(Some(self.schema_id), Some(meta.table_id))
-                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                    let options =
-                        crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(
-                            &settings,
-                        )
-                        .with_overrides(&self.write_options);
-                    table
-                        .with_writer(self.schema_name.clone(), Arc::clone(writer))
-                        .with_write_options(options)
-                } else {
-                    table
-                };
-
-                Ok(Some(Arc::new(table) as Arc<dyn TableProvider>))
-            },
+            Ok(Some(meta)) => self
+                .build_table(&meta, snapshot_id)
+                .map(|table| Some(Arc::new(table) as Arc<dyn TableProvider>)),
             Ok(None) => match self
                 .provider
-                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+                .get_view_by_name(self.schema_id, name, snapshot_id)
             {
                 Ok(Some(view)) => {
                     let (definition, planned) = match resolve_view_definition(
                         &view,
                         self.provider.as_ref(),
-                        self.snapshot_id,
+                        snapshot_id,
                         &self.schema_name,
                     ) {
                         Ok(definition) => {
@@ -227,9 +298,14 @@ impl SchemaProvider for DuckLakeSchema {
                                 &view,
                                 &definition,
                                 Arc::clone(&self.provider),
-                                self.snapshot_id,
+                                snapshot_id,
                                 &self.schema_name,
                                 self.row_lineage,
+                                self.view_guards.as_ref().map(|guards| {
+                                    let mut chain = guards.to_vec();
+                                    chain.push(ViewGuard::new(view.clone()));
+                                    Arc::new(chain)
+                                }),
                             )
                             .await;
                             (definition, planned)
@@ -250,26 +326,30 @@ impl SchemaProvider for DuckLakeSchema {
     }
 
     async fn table_type(&self, name: &str) -> DataFusionResult<Option<TableType>> {
+        let snapshot_id = self.resolve_snapshot()?;
         if self
             .provider
-            .table_exists(self.schema_id, name, self.snapshot_id)
+            .table_exists(self.schema_id, name, snapshot_id)
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
         {
             return Ok(Some(TableType::Base));
         }
         self.provider
-            .get_view_by_name(self.schema_id, name, self.snapshot_id)
+            .get_view_by_name(self.schema_id, name, snapshot_id)
             .map(|view| view.map(|_| TableType::View))
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
     }
 
     fn table_exist(&self, name: &str) -> bool {
+        let Ok(snapshot_id) = self.snapshot.resolve(self.provider.as_ref()) else {
+            return false;
+        };
         self.provider
-            .table_exists(self.schema_id, name, self.snapshot_id)
+            .table_exists(self.schema_id, name, snapshot_id)
             .unwrap_or(false)
             || self
                 .provider
-                .get_view_by_name(self.schema_id, name, self.snapshot_id)
+                .get_view_by_name(self.schema_id, name, snapshot_id)
                 .map(|view| view.is_some())
                 .unwrap_or(false)
     }
@@ -287,9 +367,10 @@ impl SchemaProvider for DuckLakeSchema {
         // Validate table name to prevent path traversal attacks
         validate_table_name(&name)?;
 
+        let snapshot_id = self.resolve_snapshot()?;
         if self
             .provider
-            .get_view_by_name(self.schema_id, &name, self.snapshot_id)
+            .get_view_by_name(self.schema_id, &name, snapshot_id)
             .map_err(|e| DataFusionError::External(Box::new(e)))?
             .is_some()
         {

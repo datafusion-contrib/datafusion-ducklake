@@ -29,6 +29,7 @@ use crate::row_id::{
     unique_row_pos_name,
 };
 use crate::row_lineage::{LineageColumns, RowLineageExec};
+use crate::snapshot_consistency::SnapshotRebind;
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::stats_filter::{self, StatsFilter};
 use crate::types::{
@@ -1287,6 +1288,9 @@ pub struct DuckLakeTable {
     object_store_url: Arc<ObjectStoreUrl>,
     /// Table path for resolving relative file paths
     table_path: String,
+    /// Set when the table was looked up in a latest-snapshot catalog, so a statement can
+    /// rebuild it at a common snapshot.
+    snapshot_rebind: Option<Arc<SnapshotRebind>>,
     /// User-facing schema. Equals `physical_schema` when row lineage is off, or
     /// `physical_schema` with a `rowid` BIGINT appended at the end when on.
     schema: SchemaRef,
@@ -1458,6 +1462,7 @@ impl DuckLakeTable {
             snapshot_id,
             object_store_url,
             table_path,
+            snapshot_rebind: None,
             schema,
             physical_schema,
             row_lineage: false,
@@ -4267,6 +4272,7 @@ impl DuckLakeTable {
             snapshot_id: self.snapshot_id,
             object_store_url: self.object_store_url.clone(),
             table_path: self.table_path.clone(),
+            snapshot_rebind: None,
             schema: self.physical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
             row_lineage: false,
@@ -4323,8 +4329,21 @@ impl DuckLakeTable {
         &self.table_name
     }
 
-    /// This table's catalog `table_id`. Used by the compaction commit.
-    #[cfg(feature = "write")]
+    pub(crate) fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub(crate) fn snapshot_rebind(&self) -> Option<&Arc<SnapshotRebind>> {
+        self.snapshot_rebind.as_ref()
+    }
+
+    pub(crate) fn with_snapshot_rebind(mut self, rebind: Arc<SnapshotRebind>) -> Self {
+        self.snapshot_rebind = Some(rebind);
+        self
+    }
+
+    /// This table's catalog `table_id`. Used by the compaction commit and the snapshot
+    /// consistency rule.
     pub(crate) fn table_id(&self) -> i64 {
         self.table_id
     }
@@ -5417,10 +5436,9 @@ impl TableProvider for DuckLakeTable {
     /// mutation happens at execute time, so planning (e.g. `EXPLAIN`) is
     /// side-effect free.
     ///
-    /// The catalog pins its snapshot at creation, so a session sees one
-    /// generation for its lifetime: re-open the catalog between mutating
-    /// statements. See the [`delete_exec`](crate::delete_exec) module docs
-    /// ("Session lifecycle") for why a second in-session `DELETE` can conflict.
+    /// A writable catalog reads the latest snapshot for each statement, so later
+    /// statements in the session see this delete. See the
+    /// [`delete_exec`](crate::delete_exec) module docs ("Session lifecycle").
     #[cfg(feature = "write")]
     async fn delete_from(
         &self,

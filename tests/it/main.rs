@@ -78,6 +78,7 @@ mod rowid_physical_position_tests;
 mod scan_statistics_tests;
 mod scoped_settings_tests;
 mod session_parquet_options_tests;
+mod session_refresh_tests;
 mod snapshot_readback_tests;
 mod sorted_write_duckdb_tests;
 mod sorted_write_tests;

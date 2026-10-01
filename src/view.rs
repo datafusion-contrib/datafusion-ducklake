@@ -19,6 +19,7 @@ use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::catalog::DuckLakeCatalog;
 use crate::metadata_provider::{MetadataProvider, SchemaMetadata, ViewMetadata};
+use crate::snapshot_consistency::ViewGuard;
 
 const VIEW_CATALOG: &str = "__ducklake_view";
 
@@ -75,6 +76,7 @@ pub(crate) async fn plan_view(
     snapshot_id: i64,
     schema_name: &str,
     row_lineage: bool,
+    view_guards: Option<Arc<Vec<ViewGuard>>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let cycle = VIEW_PLAN_STACK
         .try_with(|stack| stack.borrow().contains(&view.view_id))
@@ -87,8 +89,16 @@ pub(crate) async fn plan_view(
         .try_with(|stack| stack.borrow_mut().push(view.view_id))
         .is_ok()
     {
-        let result =
-            plan_view_inner(view, sql, provider, snapshot_id, schema_name, row_lineage).await;
+        let result = plan_view_inner(
+            view,
+            sql,
+            provider,
+            snapshot_id,
+            schema_name,
+            row_lineage,
+            view_guards,
+        )
+        .await;
         VIEW_PLAN_STACK.with(|stack| {
             stack.borrow_mut().pop();
         });
@@ -97,7 +107,15 @@ pub(crate) async fn plan_view(
         VIEW_PLAN_STACK
             .scope(
                 RefCell::new(vec![view.view_id]),
-                plan_view_inner(view, sql, provider, snapshot_id, schema_name, row_lineage),
+                plan_view_inner(
+                    view,
+                    sql,
+                    provider,
+                    snapshot_id,
+                    schema_name,
+                    row_lineage,
+                    view_guards,
+                ),
             )
             .await
     }
@@ -110,6 +128,7 @@ async fn plan_view_inner(
     snapshot_id: i64,
     schema_name: &str,
     row_lineage: bool,
+    view_guards: Option<Arc<Vec<ViewGuard>>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let dialect = Dialect::from_str(&view.dialect).map_err(|e| view_error(view, e))?;
     let mut config = SessionConfig::new()
@@ -120,7 +139,8 @@ async fn plan_view_inner(
     let context = SessionContext::new_with_config(config);
     let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot_id)
         .map_err(|e| view_error(view, e))?
-        .with_row_lineage(row_lineage);
+        .with_row_lineage(row_lineage)
+        .with_view_guards(view_guards);
     context.register_catalog(VIEW_CATALOG, Arc::new(catalog));
 
     let options = SQLOptions::new()

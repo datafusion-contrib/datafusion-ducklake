@@ -212,7 +212,7 @@ async fn read_via_multicatalog(
     let runtime = Arc::new(RuntimeEnv::default());
     let config = SessionConfig::new().with_default_catalog_and_schema(catalog_name, "public");
     let ctx = SessionContext::new_with_config_rt(config, runtime);
-    ctx.register_catalog(catalog_name, Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, catalog_name, catalog);
 
     // List what this catalog can see — should be exactly the one table.
     if let Some(cat) = ctx.catalog(catalog_name) {
@@ -241,7 +241,7 @@ async fn pg_prod_sees_orders(pool: &sqlx::PgPool) -> Result<bool, Box<dyn std::e
     let sn = provider.get_current_snapshot()?;
     let catalog = DuckLakeCatalog::with_snapshot(Arc::new(provider), sn)?;
     let ctx = SessionContext::new();
-    ctx.register_catalog("pg_prod", Arc::new(catalog));
+    DuckLakeCatalog::register(&ctx, "pg_prod", catalog);
     let cat = ctx.catalog("pg_prod").unwrap();
     let schema = match cat.schema("public") {
         Some(s) => s,

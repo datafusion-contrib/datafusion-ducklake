@@ -123,7 +123,7 @@ let ctx = SessionContext::new_with_config_rt(
     SessionConfig::new().with_default_catalog_and_schema("ducklake", "main"),
     runtime,
 );
-ctx.register_catalog("ducklake", Arc::new(catalog));
+DuckLakeCatalog::register(&ctx, "ducklake", catalog);
 
 let df = ctx.sql("SELECT * FROM ducklake.main.my_table").await?;
 df.show().await?;
@@ -168,7 +168,7 @@ writer.get_or_create_schema("main", None, snapshot)?;
 let provider = PostgresMetadataProvider::new("postgresql://user:pass@localhost:5432/db").await?;
 let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))?;
 let ctx = SessionContext::new();
-ctx.register_catalog("ducklake", Arc::new(catalog));
+DuckLakeCatalog::register(&ctx, "ducklake", catalog);
 ctx.sql("CREATE TABLE ducklake.main.events (id BIGINT)").await?.collect().await?;
 ```
 
@@ -207,7 +207,7 @@ table_writer.write_table("public", "events", &[batch]).await?; // `batch` is you
 let provider = MulticatalogProvider::with_pool(pool.clone(), "my_catalog").await?;
 let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), writer)?;
 let ctx = SessionContext::new();
-ctx.register_catalog("ducklake", Arc::new(catalog));
+DuckLakeCatalog::register(&ctx, "ducklake", catalog);
 ctx.sql("INSERT INTO ducklake.public.events VALUES (1, 'a')").await?.collect().await?;
 ctx.sql("SELECT count(*) FROM ducklake.public.events").await?.show().await?;
 ```
