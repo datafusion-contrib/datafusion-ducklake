@@ -570,6 +570,26 @@ impl MulticatalogManager {
         .bind(format!("dropped_table:{table_id}"))
         .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
+        )
+        .bind(drop_snapshot)
+        .bind(catalog_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE ducklake_catalog_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND object_type = 'table' AND object_id = $3
+               AND end_snapshot IS NULL",
+        )
+        .bind(drop_snapshot)
+        .bind(catalog_id)
+        .bind(table_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(true)
     }
@@ -936,10 +956,11 @@ impl MulticatalogManager {
         // 6. Reclaim per-table metadata for fully-expired tables. This is official's
         //    twelve-table list from DeleteSnapshots.
         //    Official's list is twelve (ducklake_metadata_manager.cpp, DeleteSnapshots).
-        //    ducklake_column_tag, ducklake_inlined_data_tables and
-        //    ducklake_column_mapping are omitted because this schema does not have
-        //    them. IF ANY OF THE THREE IS EVER ADDED, ADD IT HERE TOO — official
-        //    reclaims it, and a table-scoped table this loop misses orphans forever.
+        //    ducklake_inlined_data_tables and ducklake_column_mapping are omitted
+        //    because this schema does not have them. IF EITHER IS EVER ADDED, ADD IT
+        //    HERE TOO — official reclaims it, and a table-scoped table this loop
+        //    misses orphans forever. Official's `ducklake_column_tag` is the catalog-scoped
+        //    `ducklake_catalog_column_tag` here; object tags are reclaimed below.
         //    ducklake_table_stats is in it because this writer
         //    creates and maintains it — the comment that used to say otherwise was
         //    wrong — and the SQLite expire path already reclaimed it.
@@ -953,6 +974,7 @@ impl MulticatalogManager {
             "ducklake_sort_info",
             "ducklake_sort_expression",
             "ducklake_schema_versions",
+            "ducklake_catalog_column_tag",
         ] {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE table_id = ANY($1)"
@@ -961,6 +983,22 @@ impl MulticatalogManager {
             .execute(&mut *tx)
             .await?;
         }
+
+        // Object tags ended before every surviving snapshot of this catalog can no longer be
+        // read. Column tags follow their table instead, as in official: they go with a dead
+        // table in the loop above, and an ended tag of a live table is kept.
+        sqlx::query(
+            "DELETE FROM ducklake_catalog_tag
+             WHERE catalog_id = $1 AND end_snapshot IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM ducklake_snapshot ss
+                 JOIN ducklake_catalog_snapshot_map m
+                   ON m.snapshot_id = ss.snapshot_id AND m.catalog_id = $1
+                 WHERE ss.snapshot_id >= ducklake_catalog_tag.begin_snapshot
+                   AND ss.snapshot_id < ducklake_catalog_tag.end_snapshot)",
+        )
+        .bind(catalog_id)
+        .execute(&mut *tx)
+        .await?;
 
         // 7. Reclaim schemas no longer covered by a surviving snapshot of this catalog,
         //    along with their catalog_schema_map rows (no orphan maps).

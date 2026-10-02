@@ -113,15 +113,8 @@ fn assert_duckdb_extension_reads_depths(catalog_path: &std::path::Path) {
          ALTER TABLE raw.ducklake_table ADD COLUMN table_uuid VARCHAR; \
          UPDATE raw.ducklake_table SET \
              table_uuid = '00000000-0000-0000-0000-000000000002', path = path || '/'; \
-         CREATE TABLE raw.ducklake_tag( \
-             object_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, key VARCHAR, value VARCHAR \
-         ); \
          CREATE TABLE IF NOT EXISTS raw.ducklake_inlined_data_tables( \
              table_id BIGINT, table_name VARCHAR, schema_version BIGINT \
-         ); \
-         CREATE TABLE raw.ducklake_column_tag( \
-             table_id BIGINT, column_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \
-             key VARCHAR, value VARCHAR \
          ); \
          CREATE TABLE raw.ducklake_column_mapping( \
              mapping_id BIGINT, table_id BIGINT, type VARCHAR \

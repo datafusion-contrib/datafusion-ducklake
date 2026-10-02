@@ -217,6 +217,12 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Partitioned `UPDATE` / upsert — the append+delete commit registers every appended file (one per output partition) together with the positional deletes, in one snapshot. A row whose partition-key value changed moves to its NEW partition and keeps its `rowid` lineage                                                        | ✅        |
 | Multi-catalog (PostgreSQL, **experimental** — library-specific, not in the DuckLake spec)                                                                                                                                                                                                                                        | ✅        |
 
+Comments and tags are readable on every metadata backend and writable on SQLite and on both
+PostgreSQL layouts. `execute_ducklake_sql` handles `COMMENT ON TABLE`, `VIEW`, and `COLUMN`.
+As in official DuckLake, schemas take no comments and a column takes only the `comment` key.
+A comment bumps `schema_version` and records `altered_table` or `altered_view`, so attached
+DuckDB sessions see it.
+
 Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
 `MetadataWriter`), not SQL DDL.
 

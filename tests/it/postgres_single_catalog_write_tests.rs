@@ -22,7 +22,8 @@ use datafusion_ducklake::MetadataProvider;
 use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, MetadataWriter, WriteMode};
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTableWriter, NullOrder, PartitionTransform, PostgresMetadataProvider,
-    PostgresSingleCatalogMetadataWriter, SortDirection, SortField,
+    PostgresSingleCatalogMetadataWriter, SortDirection, SortField, TagObjectType, TagTarget,
+    execute_ducklake_sql,
 };
 
 /// Returns everything the caller must keep alive — dropping the container tears
@@ -408,6 +409,173 @@ async fn sql_create_then_insert_then_select() {
         .unwrap()
         .value(0);
     assert_eq!(n, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn comment_on_versions_tags_and_bumps_schema_version() {
+    let (writer, pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let writer = Arc::new(writer);
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let provider = Arc::new(PostgresMetadataProvider::new(&conn_str).await.unwrap());
+    let catalog = Arc::new(DuckLakeCatalog::with_writer(provider, writer.clone()).unwrap());
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", catalog.clone());
+    ctx.sql("CREATE TABLE lake.main.nums (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let table_id: i64 =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_table WHERE table_name = 'nums'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let column_id: i64 = sqlx::query_scalar(
+        "SELECT column_id FROM ducklake_column WHERE table_id = $1 AND column_name = 'name'",
+    )
+    .bind(table_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let version_before: i64 =
+        sqlx::query_scalar("SELECT MAX(schema_version) FROM ducklake_snapshot")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let head_before: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    for sql in [
+        "COMMENT ON TABLE lake.main.nums IS 'first'",
+        "COMMENT ON TABLE lake.main.nums IS 'second'",
+        "COMMENT ON COLUMN lake.main.nums.name IS 'the name'",
+    ] {
+        execute_ducklake_sql(&ctx, catalog.as_ref(), sql)
+            .await
+            .unwrap();
+    }
+
+    let snapshots: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT s.snapshot_id, s.schema_version, c.changes_made FROM ducklake_snapshot s
+         JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
+         WHERE s.snapshot_id > $1 ORDER BY s.snapshot_id",
+    )
+    .bind(head_before)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let altered = Some(format!("altered_table:{table_id}"));
+    assert_eq!(
+        snapshots,
+        vec![
+            (head_before + 1, version_before + 1, altered.clone()),
+            (head_before + 2, version_before + 2, altered.clone()),
+            (head_before + 3, version_before + 3, altered),
+        ]
+    );
+    let ledger_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM ducklake_schema_versions WHERE begin_snapshot > $1",
+    )
+    .bind(head_before)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger_rows, 0);
+    let object_tags: Vec<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT begin_snapshot, end_snapshot, value FROM ducklake_tag
+         WHERE object_id = $1 AND key = 'comment' ORDER BY begin_snapshot",
+    )
+    .bind(table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        object_tags,
+        vec![
+            (
+                head_before + 1,
+                Some(head_before + 2),
+                Some("first".to_string())
+            ),
+            (head_before + 2, None, Some("second".to_string())),
+        ]
+    );
+
+    let comments = read_context(&conn_str)
+        .await
+        .sql(
+            "SELECT
+                 (SELECT comment FROM lake.information_schema.tables
+                  WHERE table_name = 'nums') AS table_comment,
+                 (SELECT comment FROM lake.information_schema.columns
+                  WHERE table_name = 'nums' AND column_name = 'name') AS column_comment",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let text = |index: usize| {
+        comments[0]
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    };
+    assert_eq!(
+        (text(0), text(1)),
+        ("second".to_string(), "the name".to_string())
+    );
+
+    let head_after: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    execute_ducklake_sql(&ctx, catalog.as_ref(), "COMMENT ON SCHEMA lake.main IS 'x'")
+        .await
+        .unwrap_err();
+    writer
+        .set_tag(
+            TagTarget::Object {
+                object_type: TagObjectType::Schema,
+                object_id: 1,
+            },
+            "comment",
+            Some("x"),
+        )
+        .unwrap_err();
+    writer
+        .set_tag(
+            TagTarget::Column {
+                table_id,
+                column_id,
+            },
+            "classification",
+            Some("x"),
+        )
+        .unwrap_err();
+    writer
+        .set_tag(
+            TagTarget::Object {
+                object_type: TagObjectType::Table,
+                object_id: table_id + 1000,
+            },
+            "comment",
+            Some("x"),
+        )
+        .unwrap_err();
+    let head_final: i64 = sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(head_final, head_after);
 }
 
 // ---------------------------------------------------------------------------
