@@ -199,7 +199,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | `SELECT` against DuckLake tables                                                                                                                                                                                                                                                                                                 | ✅        |
 | `INSERT INTO` (table must already exist on the PostgreSQL path)                                                                                                                                                                                                                                                                  | ✅        |
 | Non-empty `CREATE TABLE AS SELECT`                                                                                                                                                                                                                                                                                               | Rejected |
-| `DROP TABLE` (via `MetadataWriter`)                                                                                                                                                                                                                                                                                              | ✅        |
+| Catalog SQL DDL: `CREATE SCHEMA`, `DROP SCHEMA` (empty only), `DROP TABLE`, versioned `ALTER TABLE ... RENAME TO` (SQLite and PostgreSQL multicatalog)                                                                                                                                                                           | ✅        |
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends)                                                                                                                                                                              | ✅        |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations)                                                                                                                                    | ✅        |
@@ -226,8 +226,9 @@ As in official DuckLake, schemas take no comments and a column takes only the `c
 A comment bumps `schema_version` and records `altered_table` or `altered_view`, so attached
 DuckDB sessions see it.
 
-Maintenance and `DROP TABLE` are driven through the Rust API (`maintenance` module and
-`MetadataWriter`), not SQL DDL.
+Maintenance is driven through the Rust API. Catalog DDL supports `CREATE SCHEMA`,
+`DROP SCHEMA`, `DROP TABLE`, and versioned `RENAME TABLE`. It is available
+through both `MetadataWriter` and `execute_ducklake_sql`.
 
 ### Parquet writer defaults
 

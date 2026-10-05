@@ -25,6 +25,9 @@ pub(crate) fn directory_path(path: &str) -> String {
     }
 }
 
+pub(crate) const SCHEMA_DEPENDENT_TABLES: [&str; 3] =
+    ["ducklake_table", "ducklake_view", "ducklake_macro"];
+
 /// Validate a catalog entity name (schema, table, or column).
 ///
 /// Rejects names that are:
@@ -1710,6 +1713,51 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         columns: &[ColumnDef],
         snapshot_id: i64,
     ) -> Result<Vec<i64>>;
+
+    /// Create a schema as one metadata-only DDL commit.
+    ///
+    /// Returns the new snapshot, or `None` when `if_not_exists` turns an
+    /// already-live schema into a no-op.
+    fn create_schema(&self, _name: &str, _if_not_exists: bool) -> Result<Option<i64>> {
+        Err(DuckLakeError::InvalidConfig(
+            "CREATE SCHEMA is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Drop an empty schema as one metadata-only DDL commit.
+    ///
+    /// Returns the new snapshot, or `None` when `if_exists` turns a missing
+    /// schema into a no-op. Implementations must reject non-empty schemas.
+    fn drop_schema(&self, _name: &str, _if_exists: bool) -> Result<Option<i64>> {
+        Err(DuckLakeError::InvalidConfig(
+            "DROP SCHEMA is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Drop a table and its live child metadata as one DDL commit.
+    ///
+    /// Returns the new snapshot, or `None` when `if_exists` turns a missing
+    /// table into a no-op.
+    fn drop_table(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+        _if_exists: bool,
+    ) -> Result<Option<i64>> {
+        Err(DuckLakeError::InvalidConfig(
+            "DROP TABLE is not supported on this metadata backend".to_string(),
+        ))
+    }
+
+    /// Rename a live table by versioning its `ducklake_table` row.
+    ///
+    /// The replacement row keeps the stable `table_id`, path, and schema while
+    /// the previous name remains visible at snapshots before the returned one.
+    fn rename_table(&self, _schema_name: &str, _table_name: &str, _new_name: &str) -> Result<i64> {
+        Err(DuckLakeError::InvalidConfig(
+            "RENAME TABLE is not supported on this metadata backend".to_string(),
+        ))
+    }
 
     /// Promote (widen) an existing column's type in place — DuckLake schema
     /// evolution, distinct from a data write (which *rejects* type changes; see

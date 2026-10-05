@@ -49,6 +49,7 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     // Idempotent; MUST run here for the same reason as the migration above — this
     // is the bootstrap path callers actually use.
     crate::metadata_writer_postgres::migrate_file_ownership(pool).await?;
+    crate::metadata_writer_postgres::migrate_ducklake_table_drop_pk(pool).await?;
     Ok(())
 }
 
