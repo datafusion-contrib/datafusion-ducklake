@@ -64,10 +64,11 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)
    - `scan_memo.rs`: `DuckLakeReadOptions` (off by default) lets a table keep its first scan's catalog reads
      (listing, inlined rows and deletes, current-snapshot answer; all or nothing, and only from a fill
-     during which the head did not move) and each data file's delete positions. Only `scan()` uses them;
-     `files()`, `files_matching()` and the write paths read the catalog. A memoized table lists files that
-     a later DELETE, merge, rewrite or flush can replace, so it must be dropped before cleanup's grace
-     period passes
+     during which the head did not move) and each data file's delete positions. Each later scan reads the
+     catalog head and fills the memo again when it moved, because every commit that replaces a file (a
+     DELETE, merge, rewrite or flush) moves it. `skip_head_check` drops that read; such a table must be
+     dropped before cleanup's grace period passes. Only `scan()` uses the memos; `files()`,
+     `files_matching()` and the write paths read the catalog
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
    - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)

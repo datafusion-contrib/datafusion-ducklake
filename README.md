@@ -142,11 +142,13 @@ let catalog = DuckLakeCatalog::new(provider)?
     .with_read_options(DuckLakeReadOptions::memoized());
 ```
 
-The first scan of a table fills its memos, and later scans of that table read nothing from the
-catalog. A catalog lookup builds a new table for each statement, so the memos help only a caller
-that keeps the table. Drop a memoized table before the cleanup grace period passes: a later commit
-can replace the files that the memo lists, and cleanup deletes replaced files after that period.
-See `DuckLakeReadOptions` for the budgets.
+The first scan of a table fills its memos. Each later scan of that table reads only the catalog
+head. If a commit moved the head, the scan fills the memos again, so it never reads a file that a
+later commit replaced. A catalog lookup builds a new table for each statement, so the memos help
+only a caller that keeps the table. `skip_head_check()` drops the head read too, for a caller that keeps
+a table only while its snapshot is current. Drop such a table before the cleanup grace period
+passes: cleanup deletes replaced files after that period. See `DuckLakeReadOptions` for the
+budgets.
 
 ---
 

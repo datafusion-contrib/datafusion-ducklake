@@ -14,7 +14,10 @@
 //!   merge, a rewrite or a flush of inlined data changes how a past snapshot is
 //!   stored, so a memoized listing used beside a fresh inlined read (or the
 //!   reverse) could count a flushed row twice, or not at all. For the same
-//!   reason the fill is kept only if no commit landed while it read.
+//!   reason the fill is kept only if no commit landed while it read. The fill
+//!   records the catalog head, and each later scan reads the head and fills the
+//!   memo again when a commit moved it, as official DuckLake keys its caches on
+//!   the snapshot it reads.
 //! - The **delete memo** keeps the positions each data file's delete file
 //!   removes. A delete file is never rewritten in place: new deletions from a
 //!   data file are written to a new file under a new path. So a path always
@@ -24,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::record_batch::RecordBatch;
 
@@ -47,12 +50,10 @@ use crate::metadata_provider::{
 /// example one that caches tables by catalog, name and snapshot. A table that a
 /// catalog lookup builds for one statement is seldom scanned twice.
 ///
-/// # How long to keep a table
+/// # The head check
 ///
-/// A table with a catalog memo keeps reading the data files and delete files
-/// that its first scan listed. The rows those files hold at the table's
-/// snapshot never change, but the files that hold them can. A commit can replace
-/// a file that an older snapshot still reads:
+/// The rows at a table's snapshot never change, but the files that hold them
+/// can. A commit can replace a file that an older snapshot still reads:
 ///
 /// - a `DELETE` or `UPDATE` of rows in a data file that already has deletions
 ///   writes a new delete file in place of the old one;
@@ -65,10 +66,26 @@ use crate::metadata_provider::{
 /// official DuckLake (`delete_older_than`), or at once with
 /// `ducklake_cleanup_old_files(.., cleanup_all => true)` or this crate's
 /// `CleanupCriteria::All`.
-/// **Drop a memoized table before that grace period passes**, or a scan of it
-/// can fail on a file that is gone. A table without a catalog memo lists the
-/// files again on each scan and reads the new ones. A delete memo alone keeps no
-/// file names: it only spares reads.
+///
+/// Each of these replacements is a commit, and every commit moves the catalog
+/// head. So a memoized table reads the head on each scan, one catalog query,
+/// and fills the memo again when the head moved since the fill. A scan thus
+/// never plans over a replaced file, and cleanup cannot delete a file that a
+/// scan is about to read, except one that is already running, which is the
+/// case cleanup's grace period exists for. A commit to any table of the
+/// catalog moves the head, so on a busy catalog the memo fills again often.
+///
+/// [`Self::skip_head_check`] turns the check off, so a warm scan reads nothing
+/// from the catalog. The memo then keeps the files of its first listing for
+/// the table's life: **drop such a table before cleanup's grace period
+/// passes**, or a scan of it can fail on a file that is gone. That suits a
+/// caller that keeps a table only while its snapshot is current, for example
+/// one that caches tables by catalog, name and snapshot. A delete memo keeps no
+/// file names, so it needs no check.
+///
+/// Expiring snapshots commits nothing, so the head check does not notice that
+/// the table's own snapshot expired. A table at an expired snapshot cannot be
+/// read without a memo either, as in official DuckLake.
 ///
 /// # Budgets
 ///
@@ -76,14 +93,14 @@ use crate::metadata_provider::{
 /// keeps up to that many budgets. Byte counts are estimates of the heap memory
 /// held.
 ///
-/// The catalog memo keeps the first scan's reads only if they fit in
+/// The catalog memo keeps a scan's reads only if they fit in
 /// [`Self::catalog_memo_bytes`]; otherwise the table reads the catalog on every
-/// scan, as without a memo, and does not try to fill it again. The first scan of
-/// a memoized table reads without the scan's filters, so that the memo can serve
-/// any later scan: it lists every file without the catalog-side statistics
-/// filter, and reads every visible inlined row, as an unfiltered scan does.
-/// Later scans prune the listing in memory, and apply their filters to the
-/// inlined rows above the scan.
+/// scan, as without a memo, and does not try to fill it again. The scan that
+/// fills the memo reads without its filters, so that the memo can serve any
+/// later scan: it lists every file without the catalog-side statistics filter,
+/// and reads every visible inlined row, as an unfiltered scan does. Later scans
+/// prune the listing in memory, and apply their filters to the inlined rows
+/// above the scan.
 ///
 /// The delete memo keeps positions until they fill [`Self::delete_memo_bytes`].
 /// It never evicts: once full, it keeps what it has, and other delete files are
@@ -99,6 +116,10 @@ pub struct DuckLakeReadOptions {
     /// Bytes of delete-file positions a table can keep across scans. Zero, the
     /// default, turns the delete memo off.
     pub delete_memo_bytes: usize,
+    /// Use the catalog memo without reading the catalog head first, so a warm
+    /// scan reads nothing from the catalog. Off by default; see the head check
+    /// above for what a table that skips it must do.
+    pub skip_head_check: bool,
 }
 
 impl DuckLakeReadOptions {
@@ -130,6 +151,15 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_delete_memo(mut self, max_bytes: usize) -> Self {
         self.delete_memo_bytes = max_bytes;
+        self
+    }
+
+    /// Use the catalog memo without reading the catalog head first. A table
+    /// with these options must be dropped before cleanup's grace period passes;
+    /// see the head check above.
+    #[must_use]
+    pub fn skip_head_check(mut self) -> Self {
+        self.skip_head_check = true;
         self
     }
 
@@ -169,10 +199,13 @@ impl From<Vec<DuckLakeFileMetadata>> for ListingPage {
     }
 }
 
-/// The catalog reads of a table's first scan, which its later scans use in
-/// place of reading the catalog.
+/// The catalog reads of one scan, which later scans of the table use in place
+/// of reading the catalog.
 #[derive(Debug)]
 pub(crate) struct CatalogMemo {
+    /// The catalog head when the reads ran: a later scan uses the memo only
+    /// while the head has not moved.
+    pub(crate) head: i64,
     /// The complete file listing, in the pages the catalog returned it in.
     pub(crate) pages: Vec<ListingPage>,
     /// Inlined deletions: data file id to deleted row positions.
@@ -188,11 +221,23 @@ pub(crate) struct CatalogMemo {
     pub(crate) at_current_snapshot: bool,
 }
 
-/// A table's catalog memo: unset until a scan fills it, then the memo, or
-/// `None` when the reads did not fit the budget. Reads that did not fit are not
-/// tried again: the table's snapshot holds the same rows on every scan, and
-/// trying again would repeat an unfiltered listing on every scan.
-pub(crate) type CatalogMemoCell = OnceLock<Option<Arc<CatalogMemo>>>;
+/// A table's catalog memo.
+#[derive(Debug, Default)]
+pub(crate) enum MemoState {
+    /// No scan has filled the memo yet, or the last fill was not kept.
+    #[default]
+    Unset,
+    /// The reads of a scan, used by later scans while the head stays at
+    /// [`CatalogMemo::head`].
+    Filled(Arc<CatalogMemo>),
+    /// A scan's reads did not fit the budget. They are not tried again: the
+    /// table's snapshot holds the same rows on every scan, and trying again
+    /// would repeat an unfiltered listing on every scan.
+    TooLarge,
+}
+
+/// A table's catalog memo, shared with every clone of the table.
+pub(crate) type CatalogMemoCell = Mutex<MemoState>;
 
 /// The running size of a catalog memo being filled, against its budget.
 #[derive(Debug)]
@@ -396,6 +441,9 @@ mod tests {
         let memoized = DuckLakeReadOptions::memoized();
         assert!(memoized.catalog_memo_budget().is_some());
         assert!(DeletePositionMemo::new(memoized.delete_memo_bytes).is_some());
+        // The head check is on unless a caller turns it off.
+        assert!(!memoized.skip_head_check);
+        assert!(memoized.skip_head_check().skip_head_check);
 
         // Setting the field alone is enough: no second knob to forget. Outside
         // this crate `#[non_exhaustive]` rules out a struct literal, so this

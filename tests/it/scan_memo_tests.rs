@@ -521,7 +521,7 @@ fn run_duckdb(
         [],
     )?;
     for statement in statements {
-        conn.execute(statement, [])?;
+        conn.execute_batch(statement)?;
     }
     Ok(())
 }
@@ -576,8 +576,8 @@ fn table_at_head(provider: &dyn MetadataProvider) -> anyhow::Result<(i64, i64)> 
     Ok((table.table_id, snapshot))
 }
 
-/// The calls the first scan of a memoized table makes: the catalog head before
-/// and after its reads, and each read once.
+/// The calls a scan makes to fill a table's memo: the catalog head before and
+/// after its reads, and each read once.
 fn fill_calls() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
         ("get_current_snapshot", 2),
@@ -586,6 +586,13 @@ fn fill_calls() -> BTreeMap<&'static str, usize> {
         ("scan_inlined_data", 1),
     ])
 }
+
+/// The one call a scan makes when the memo is filled at the current head.
+fn head_check_calls() -> BTreeMap<&'static str, usize> {
+    BTreeMap::from([("get_current_snapshot", 1)])
+}
+
+const CLEANUP_ALL: &str = "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)";
 
 /// Five rows in one data file, two of them deleted by a delete file.
 const WITH_DELETES: &[&str] = &[
@@ -641,7 +648,7 @@ async fn without_a_memo_each_scan_reads_the_catalog_again() -> anyhow::Result<()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_memoized_table_reads_the_catalog_on_its_first_scan_only() -> anyhow::Result<()> {
+async fn a_memoized_table_reads_only_the_catalog_head_after_its_first_scan() -> anyhow::Result<()> {
     let lake = Lake::new(0, WITH_DELETES)?;
     let plain = lake.provider().await?;
     let (plain_ctx, _) = cached_table(&plain, DuckLakeReadOptions::default(), false).await?;
@@ -667,10 +674,7 @@ async fn a_memoized_table_reads_the_catalog_on_its_first_scan_only() -> anyhow::
         if scan == 0 {
             assert_eq!(calls, fill_calls());
         } else {
-            assert!(
-                calls.is_empty(),
-                "scan {scan} ({sql}) read the catalog: {calls:?}"
-            );
+            assert_eq!(calls, head_check_calls(), "scan {scan} ({sql})");
         }
     }
     Ok(())
@@ -701,7 +705,7 @@ async fn a_filtered_first_scan_memoizes_the_whole_listing() -> anyhow::Result<()
 
     // So the memo serves an unfiltered scan too.
     assert_eq!(query(&ctx, all).await?, query(&plain_ctx, all).await?);
-    assert!(counting.take().is_empty());
+    assert_eq!(counting.take(), head_check_calls());
     Ok(())
 }
 
@@ -717,8 +721,9 @@ async fn a_table_over_the_memo_budget_reads_the_catalog_on_every_scan() -> anyho
     let options = DuckLakeReadOptions::memoized().with_catalog_memo(1);
     let (ctx, _) = cached_table(&counting, options, false).await?;
     // The first scan lists the files for the memo, finds they do not fit, and
-    // lists them again for itself. Later scans do not try again.
-    for listings in [2, 1] {
+    // lists them again for itself. Later scans do not try again, and read no
+    // head either: there is no memo to check.
+    for (listings, heads) in [(2, Some(&1)), (1, None)] {
         assert_eq!(query(&ctx, all).await?, expected);
         let calls = counting.take();
         assert_eq!(
@@ -727,6 +732,7 @@ async fn a_table_over_the_memo_budget_reads_the_catalog_on_every_scan() -> anyho
             "{calls:?}"
         );
         assert_eq!(calls.get("scan_inlined_data"), Some(&1), "{calls:?}");
+        assert_eq!(calls.get("get_current_snapshot"), heads, "{calls:?}");
     }
     Ok(())
 }
@@ -760,8 +766,12 @@ async fn inlined_rows_and_deletions_come_from_the_memo() -> anyhow::Result<()> {
             query(&plain_ctx, sql).await?,
             "{sql}"
         );
-        let calls = counting.take();
-        assert_eq!(calls.is_empty(), scan > 0, "scan {scan} ({sql}): {calls:?}");
+        let expected = if scan == 0 {
+            fill_calls()
+        } else {
+            head_check_calls()
+        };
+        assert_eq!(counting.take(), expected, "scan {scan} ({sql})");
         // The fill reads every visible inlined row, unfiltered, and a scan the
         // memo serves reads none, so the count stays the fill's.
         assert_eq!(table.inlined_materialized_row_count(), 2, "scan {scan}");
@@ -780,8 +790,12 @@ async fn a_row_lineage_scan_uses_the_memo() -> anyhow::Result<()> {
     let sql = "SELECT rowid, id, name FROM t ORDER BY rowid";
     for scan in 0..3 {
         assert_eq!(query(&ctx, sql).await?, query(&plain_ctx, sql).await?);
-        let calls = counting.take();
-        assert_eq!(calls.is_empty(), scan > 0, "scan {scan}: {calls:?}");
+        let expected = if scan == 0 {
+            fill_calls()
+        } else {
+            head_check_calls()
+        };
+        assert_eq!(counting.take(), expected, "scan {scan}");
     }
     Ok(())
 }
@@ -841,10 +855,12 @@ async fn concurrent_first_scans_agree_and_keep_one_memo() -> anyhow::Result<()> 
     assert_eq!(second?, expected);
     counting.take();
     assert_eq!(query(&ctx, all).await?, expected);
-    assert!(counting.take().is_empty());
+    assert_eq!(counting.take(), head_check_calls());
     Ok(())
 }
 
+/// A commit moves the catalog head, so the next scan fills the memo again. The
+/// table stays bound to its snapshot either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_memoized_table_keeps_reading_its_snapshot() -> anyhow::Result<()> {
     let lake = Lake::new(0, THREE_FILES)?;
@@ -855,62 +871,70 @@ async fn a_memoized_table_keeps_reading_its_snapshot() -> anyhow::Result<()> {
 
     lake.run(0, &["INSERT INTO lake.t VALUES (30)"])?;
 
-    // The table is bound to its snapshot, memo or not.
     counting.take();
     assert_eq!(query(&ctx, all).await?, before);
-    assert!(counting.take().is_empty());
+    assert_eq!(counting.take(), fill_calls());
+    assert_eq!(query(&ctx, all).await?, before);
+    assert_eq!(counting.take(), head_check_calls());
     // A new lookup reads the new snapshot.
     let (fresh, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
     assert!(query(&fresh, all).await?.contains("| 30 |"));
     Ok(())
 }
 
+/// The head is the whole catalog's, so a commit to another table also makes
+/// the next scan fill the memo again: once, after which the head is still.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_merge_after_the_first_scan_leaves_the_memoized_rows_unchanged() -> anyhow::Result<()> {
+async fn a_commit_to_another_table_fills_the_memo_again() -> anyhow::Result<()> {
     let lake = Lake::new(0, THREE_FILES)?;
     let all = "SELECT id FROM t ORDER BY id";
     let counting = lake.provider().await?;
-    let (table_id, snapshot) = table_at_head(&counting)?;
     let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
     let before = query(&ctx, all).await?;
-    assert_eq!(
-        counting
-            .get_table_files_for_select(table_id, snapshot)?
-            .len(),
-        3
-    );
 
-    lake.run(0, &["CALL ducklake_merge_adjacent_files('lake')"])?;
-
-    // The merge changed how the table's snapshot is stored: one merged file
-    // now stands for the three.
-    assert_eq!(
-        counting
-            .get_table_files_for_select(table_id, snapshot)?
-            .len(),
-        1
-    );
-    counting.take();
-    // The memo still lists the three, which are scheduled for deletion but not
-    // yet deleted, and they hold the same rows.
-    assert_eq!(query(&ctx, all).await?, before);
-    assert!(counting.take().is_empty());
-    // A table built at the same snapshot now reads the merged file.
-    let fixed = DuckLakeCatalog::with_snapshot(Arc::new(lake.provider().await?), snapshot)?;
-    let table = fixed.schema("main").unwrap().table("t").await?.unwrap();
-    let fixed_ctx = SessionContext::new();
-    fixed_ctx.register_table("t", table)?;
-    assert_eq!(query(&fixed_ctx, all).await?, before);
-
-    // Once cleanup deletes the replaced files, the memoized table can no
-    // longer read them: this is why `DuckLakeReadOptions` says to drop a
-    // memoized table before cleanup's grace period passes.
     lake.run(
         0,
-        &["CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"],
+        &["CREATE TABLE lake.u (id INT)", "INSERT INTO lake.u VALUES (1)"],
     )?;
-    assert!(query(&ctx, all).await.is_err());
-    assert_eq!(query(&fixed_ctx, all).await?, before);
+
+    counting.take();
+    assert_eq!(query(&ctx, all).await?, before);
+    assert_eq!(counting.take(), fill_calls());
+    assert_eq!(query(&ctx, all).await?, before);
+    assert_eq!(counting.take(), head_check_calls());
+    Ok(())
+}
+
+/// Every commit that replaces files a snapshot reads also moves the head, so
+/// the next scan fills the memo from the new layout. Cleanup then removes the
+/// replaced files at once, and the memoized table still reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacing_commit_fills_the_memo_again_before_cleanup() -> anyhow::Result<()> {
+    for (fixture, inlining_rows, replace) in [
+        (THREE_FILES, 0, "CALL ducklake_merge_adjacent_files('lake')"),
+        (WITH_DELETES, 0, "DELETE FROM lake.t WHERE id = 5"),
+        (
+            WITH_DELETES,
+            0,
+            "CALL ducklake_rewrite_data_files('lake', delete_threshold => 0.0)",
+        ),
+        (INLINED, 10, "CALL ducklake_flush_inlined_data('lake')"),
+    ] {
+        let lake = Lake::new(inlining_rows, fixture)?;
+        let all = "SELECT * FROM t ORDER BY 1";
+        let counting = lake.provider().await?;
+        let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
+        let before = query(&ctx, all).await?;
+
+        lake.run(inlining_rows, &[replace])?;
+
+        counting.take();
+        assert_eq!(query(&ctx, all).await?, before, "{replace}");
+        assert_eq!(counting.take(), fill_calls(), "{replace}");
+        lake.run(inlining_rows, &[CLEANUP_ALL])?;
+        assert_eq!(query(&ctx, all).await?, before, "{replace}");
+        assert_eq!(counting.take(), head_check_calls(), "{replace}");
+    }
     Ok(())
 }
 
@@ -936,14 +960,51 @@ async fn a_commit_during_the_fill_is_not_kept() -> anyhow::Result<()> {
     assert_eq!(query(&ctx, all).await?, before);
     assert_eq!(counting.take(), fill_calls());
     assert_eq!(query(&ctx, all).await?, before);
-    assert!(counting.take().is_empty());
+    assert_eq!(counting.take(), head_check_calls());
 
     // The memo holds the merged layout, so cleanup takes nothing it reads.
-    lake.run(
-        0,
-        &["CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"],
-    )?;
+    lake.run(0, &[CLEANUP_ALL])?;
     assert_eq!(query(&ctx, all).await?, before);
+    Ok(())
+}
+
+/// Without the head check a warm scan reads nothing from the catalog, and the
+/// memo keeps its first layout for the table's life. Once cleanup removes the
+/// files a later commit replaced, the table can no longer be read: this is why
+/// a table that skips the check must be dropped before cleanup's grace period.
+#[tokio::test(flavor = "multi_thread")]
+async fn skipping_the_head_check_keeps_the_first_layout() -> anyhow::Result<()> {
+    let lake = Lake::new(0, THREE_FILES)?;
+    let all = "SELECT id FROM t ORDER BY id";
+    let counting = lake.provider().await?;
+    let (table_id, snapshot) = table_at_head(&counting)?;
+    let options = DuckLakeReadOptions::memoized().skip_head_check();
+    let (ctx, _) = cached_table(&counting, options, false).await?;
+    let before = query(&ctx, all).await?;
+    assert_eq!(counting.take(), fill_calls());
+    assert_eq!(query(&ctx, all).await?, before);
+    assert!(counting.take().is_empty());
+
+    lake.run(0, &["CALL ducklake_merge_adjacent_files('lake')"])?;
+    // The merge changed how the table's snapshot is stored: one merged file
+    // now stands for the three.
+    assert_eq!(
+        counting
+            .get_table_files_for_select(table_id, snapshot)?
+            .len(),
+        1
+    );
+    counting.take();
+    // The memo still lists the three, which are scheduled for deletion but
+    // not yet deleted, and they hold the same rows.
+    assert_eq!(query(&ctx, all).await?, before);
+    assert!(counting.take().is_empty());
+
+    lake.run(0, &[CLEANUP_ALL])?;
+    assert!(query(&ctx, all).await.is_err());
+    // A table at the same snapshot that checks the head reads the merged file.
+    let (checked, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
+    assert_eq!(query(&checked, all).await?, before);
     Ok(())
 }
 
@@ -961,7 +1022,7 @@ async fn a_table_behind_a_view_keeps_the_memo() -> anyhow::Result<()> {
     assert!(expected.contains("| 5  |"), "{expected}");
     counting.take();
     assert_eq!(query(&ctx, sql).await?, expected);
-    assert!(counting.take().is_empty());
+    assert_eq!(counting.take(), head_check_calls());
     Ok(())
 }
 
@@ -1005,7 +1066,11 @@ async fn a_memoized_table_at_an_older_snapshot_counts_its_own_rows() -> anyhow::
     let (_, snapshot) = table_at_head(&lake.provider().await?)?;
     lake.run(0, &["DELETE FROM lake.t WHERE id = 5"])?;
 
-    for options in [DuckLakeReadOptions::default(), DuckLakeReadOptions::memoized()] {
+    for options in [
+        DuckLakeReadOptions::default(),
+        DuckLakeReadOptions::memoized(),
+        DuckLakeReadOptions::memoized().skip_head_check(),
+    ] {
         let fixed = DuckLakeCatalog::with_snapshot(Arc::new(lake.provider().await?), snapshot)?
             .with_read_options(options.clone());
         let table = fixed.schema("main").unwrap().table("t").await?.unwrap();

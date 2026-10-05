@@ -31,7 +31,7 @@ use crate::row_id::{
 use crate::row_lineage::{LineageColumns, RowLineageExec};
 use crate::scan_memo::{
     CatalogMemo, CatalogMemoCell, DeletePositionMemo, DuckLakeReadOptions, ListingPage, MemoBudget,
-    inlined_deletes_bytes, listing_page_bytes,
+    MemoState, inlined_deletes_bytes, listing_page_bytes,
 };
 use crate::snapshot_consistency::SnapshotRebind;
 use crate::snapshot_filter::SnapshotFilterExec;
@@ -1518,7 +1518,7 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             read_options: DuckLakeReadOptions::default(),
-            catalog_memo: Arc::new(CatalogMemoCell::new()),
+            catalog_memo: Arc::new(CatalogMemoCell::default()),
             delete_memo: None,
             #[cfg(feature = "write")]
             schema_name: None,
@@ -1550,7 +1550,7 @@ impl DuckLakeTable {
     /// which also says how long a table that keeps its reads can be kept. The
     /// table starts with empty memos.
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
-        self.catalog_memo = Arc::new(CatalogMemoCell::new());
+        self.catalog_memo = Arc::new(CatalogMemoCell::default());
         self.delete_memo = DeletePositionMemo::new(options.delete_memo_bytes);
         self.read_options = options;
         self
@@ -1769,45 +1769,74 @@ impl DuckLakeTable {
 
     /// What one scan reads in place of the catalog, when the read options keep a
     /// catalog memo: the memo, and the inlined rows this call materialized from
-    /// the catalog to fill it (`None` when the memo was already filled, so the
-    /// scan reads nothing from the catalog). `None` when the options keep no
-    /// catalog memo or this table's reads did not fit it: the scan then reads the
-    /// catalog itself.
+    /// the catalog to fill it (`None` when the scan uses a memo that an earlier
+    /// scan filled, and so reads no inlined rows). `None` when the options keep
+    /// no catalog memo, or this table's reads did not fit it: the scan then reads
+    /// the catalog itself.
     ///
-    /// The first scan to find the memo unset fills it. A failed catalog read
-    /// leaves it unset, and so does a fill during which the catalog moved; a
-    /// later scan tries again. Scans that start together can each fill it; the
-    /// first fill kept is the one every later scan uses.
+    /// Unless the options skip it, the scan first reads the catalog head, and
+    /// uses the memo only if the head has not moved since the memo was filled.
+    /// Every commit that replaces a file moves the head, so a memo kept at the
+    /// current head lists exactly the files a fresh read lists. When the head
+    /// moved, the scan fills the memo again. A failed catalog read leaves the
+    /// memo as it was. A fill during which the head moved serves its own scan,
+    /// but is not kept. Of the fills that scans keep at the same time, the one
+    /// read at the newest head stays.
     fn catalog_memo(&self) -> DataFusionResult<Option<(Arc<CatalogMemo>, Option<usize>)>> {
         let Some(budget) = self.read_options.catalog_memo_budget() else {
             return Ok(None);
         };
-        if let Some(kept) = self.catalog_memo.get() {
-            return Ok(kept.as_ref().map(|memo| (Arc::clone(memo), None)));
+        let kept = match &*self.memo_state() {
+            MemoState::TooLarge => return Ok(None),
+            MemoState::Filled(memo) => Some(Arc::clone(memo)),
+            MemoState::Unset => None,
+        };
+        if let Some(memo) = &kept
+            && self.read_options.skip_head_check
+        {
+            return Ok(Some((Arc::clone(memo), None)));
         }
-        Ok(match self.fill_catalog_memo(budget)? {
+        // A head that cannot be read counts as moved.
+        let head = self.provider.get_current_snapshot().ok();
+        if let Some(memo) = kept
+            && head == Some(memo.head)
+        {
+            return Ok(Some((memo, None)));
+        }
+        Ok(match self.fill_catalog_memo(budget, head)? {
             MemoFill::Consistent(memo) => {
                 let materialized = memo.inlined_materialized;
                 let memo = Arc::new(memo);
-                let kept = self.catalog_memo.get_or_init(|| Some(Arc::clone(&memo)));
-                // A scan beside this one may have kept its own fill first, or
-                // found its reads too large; this fill still serves this scan.
-                Some((kept.clone().unwrap_or(memo), Some(materialized)))
+                let mut state = self.memo_state();
+                if !matches!(&*state, MemoState::Filled(kept) if kept.head > memo.head) {
+                    *state = MemoState::Filled(Arc::clone(&memo));
+                }
+                Some((memo, Some(materialized)))
             },
             MemoFill::Moved(memo) => {
                 let materialized = memo.inlined_materialized;
                 Some((Arc::new(memo), Some(materialized)))
             },
-            MemoFill::TooLarge => self
-                .catalog_memo
-                .get_or_init(|| None)
-                .as_ref()
-                .map(|memo| (Arc::clone(memo), None)),
+            MemoFill::TooLarge => {
+                let mut state = self.memo_state();
+                if !matches!(&*state, MemoState::Filled(kept) if Some(kept.head) >= head) {
+                    *state = MemoState::TooLarge;
+                }
+                None
+            },
         })
     }
 
+    /// This table's catalog memo, locked. It is held only to read or replace the
+    /// state, never across a catalog read.
+    fn memo_state(&self) -> std::sync::MutexGuard<'_, MemoState> {
+        self.catalog_memo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Read from the catalog everything a scan of this table reads there, for
-    /// the catalog memo.
+    /// the catalog memo. `head_before` is the catalog head, read just before.
     ///
     /// Everything is read without the scan's filters, so that the memo can
     /// serve any later scan: the listing without the catalog-side statistics
@@ -1822,11 +1851,11 @@ impl DuckLakeTable {
     /// that lands between two of them can split them the same way. Such a fill
     /// is used for this scan alone, which a scan without a memo risks too, and
     /// is not kept.
-    fn fill_catalog_memo(&self, mut budget: MemoBudget) -> DataFusionResult<MemoFill> {
-        // Every commit adds a snapshot, so a head that has not moved between the
-        // first read and the last means no commit landed between them. A head
-        // that cannot be read counts as moved.
-        let head_before = self.provider.get_current_snapshot().ok();
+    fn fill_catalog_memo(
+        &self,
+        mut budget: MemoBudget,
+        head_before: Option<i64>,
+    ) -> DataFusionResult<MemoFill> {
         let mut pages = Vec::new();
         for metadata in self.file_metadata_pages("memo", None) {
             let page = ListingPage::from(metadata?);
@@ -1853,17 +1882,22 @@ impl DuckLakeTable {
         if !budget.add(inlined_bytes) {
             return Ok(MemoFill::TooLarge);
         }
+        // Every commit adds a snapshot, so a head that has not moved between the
+        // first read and the last means no commit landed between them. A head
+        // that cannot be read counts as moved.
         let head_after = self.provider.get_current_snapshot().ok();
         let consistent = head_before.is_some() && head_before == head_after;
         let memo = CatalogMemo {
+            head: head_before.unwrap_or_default(),
             pages,
             inlined_deletes,
             inlined_rows: inlined.batches,
             inlined_materialized: inlined.materialized_row_count,
             // The catalog's delete counts are exact for this snapshot when it was
             // the current one while the listing was read (see
-            // `build_exec_for_files_with_deletes`), and they stay exact for the
-            // later scans that use this listing, however far the catalog moves.
+            // `build_exec_for_files_with_deletes`). They stay exact while the
+            // memo is used: a later commit moves the head, and the next scan
+            // reads afresh.
             at_current_snapshot: consistent && head_before == Some(self.snapshot_id),
         };
         Ok(if consistent {
