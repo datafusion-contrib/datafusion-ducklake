@@ -286,6 +286,39 @@ writer options.
 
 ---
 
+## Catalog DDL
+
+Route catalog metadata statements through `execute_ducklake_sql`:
+
+```rust
+execute_ducklake_sql(&ctx, &catalog, "CREATE SCHEMA analytics").await?;
+execute_ducklake_sql(
+    &ctx,
+    &catalog,
+    "ALTER TABLE analytics.events RENAME TO archived_events",
+)
+.await?;
+execute_ducklake_sql(
+    &ctx,
+    &catalog,
+    "DROP TABLE analytics.archived_events",
+)
+.await?;
+execute_ducklake_sql(&ctx, &catalog, "DROP SCHEMA analytics").await?;
+```
+
+`DROP SCHEMA` rejects a non‑empty schema. Table rename preserves the stable
+table ID, path, and history by writing a new `ducklake_table` version.
+`IF EXISTS` and `IF NOT EXISTS` no‑ops create no snapshot. SQLite catalogs
+remain readable by DuckDB after each operation. A legacy SQLite catalog with a
+primary key on `ducklake_table.table_id` needs
+`SqliteMetadataWriter::migrate_to_official_layout` before its first rename.
+The PostgreSQL multicatalog writer supports the same metadata transactions
+after `migrate_multicatalog_schema` upgrades an existing store to layout version 3.
+Stop older processes before upgrading the PostgreSQL store.
+
+---
+
 ## Partitioning
 
 Partition a table by one or more columns (optionally through a transform) so that queries

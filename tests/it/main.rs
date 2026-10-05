@@ -17,6 +17,7 @@
 
 mod append_with_deletes_postgres_tests;
 mod append_with_deletes_tests;
+mod catalog_ddl_sql_tests;
 mod catalog_read_memo_tests;
 mod catalog_version_tests;
 mod cdc_cumulative_delete_tests;

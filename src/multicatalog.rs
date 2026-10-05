@@ -28,7 +28,7 @@ END";
 const PG_REL_FLAG: &str = "(df.path_is_relative AND t.path_is_relative AND s.path_is_relative)";
 
 /// Tombstone the live table `schema_name.table_name` of catalog `catalog_id` at a
-/// new snapshot, inside `tx`; `Ok(false)` when there is no such table, having
+/// new snapshot, inside `tx`; `Ok(None)` when there is no such table, having
 /// written nothing. The caller holds the catalog row `FOR UPDATE` and commits.
 /// See [`MulticatalogManager::drop_table_in_catalog`].
 pub(crate) async fn drop_live_table(
@@ -36,7 +36,7 @@ pub(crate) async fn drop_live_table(
     catalog_id: i64,
     schema_name: &str,
     table_name: &str,
-) -> Result<bool> {
+) -> Result<Option<i64>> {
     // Resolve the live table_id by `(catalog, schema, table)`.
     // Filters on `end_snapshot IS NULL` on both schema and table so
     // an already-tombstoned table is treated as not-found and the
@@ -58,7 +58,7 @@ pub(crate) async fn drop_live_table(
     .await?
     {
         Some(r) => r.try_get(0)?,
-        None => return Ok(false),
+        None => return Ok(None),
     };
 
     // Allocate the drop snapshot and register it under this catalog.
@@ -127,9 +127,14 @@ pub(crate) async fn drop_live_table(
     // after the table is fully expired; future vacuum reclaims
     // them. This mirrors the official DuckLake's `DropTables`
     // (which leaves `ducklake_schema_versions` to vacuum likewise).
-    for child_table in
-        ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
-    {
+    for child_table in [
+        "ducklake_table",
+        "ducklake_partition_info",
+        "ducklake_sort_info",
+        "ducklake_column",
+        "ducklake_data_file",
+        "ducklake_delete_file",
+    ] {
         sqlx::query(AssertSqlSafe(format!(
             "UPDATE {} SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
@@ -170,7 +175,7 @@ pub(crate) async fn drop_live_table(
     .execute(&mut **tx)
     .await?;
 
-    Ok(true)
+    Ok(Some(drop_snapshot))
 }
 
 /// Create the standard and multicatalog tables in a database without a
@@ -677,7 +682,7 @@ impl MulticatalogManager {
 
         let dropped = drop_live_table(&mut tx, catalog_id, schema_name, table_name).await?;
         tx.commit().await?;
-        Ok(dropped)
+        Ok(dropped.is_some())
     }
 
     /// Read the legacy global `data_path` fallback.
@@ -926,7 +931,7 @@ impl MulticatalogManager {
         // 3. Tables in this catalog no longer covered by any surviving snapshot and with
         //    no surviving live version.
         let dead_tables: Vec<i64> = sqlx::query(
-            "SELECT t.table_id FROM ducklake_table t
+            "SELECT DISTINCT t.table_id FROM ducklake_table t
              JOIN ducklake_catalog_schema_map csm
                ON csm.schema_id = t.schema_id AND csm.catalog_id = $1
              WHERE t.end_snapshot IS NOT NULL AND NOT EXISTS (
@@ -956,7 +961,7 @@ impl MulticatalogManager {
         let legacy = crate::metadata_writer_postgres::legacy_owner_columns(&mut tx).await?;
         let data_owned = crate::metadata_writer_postgres::data_file_owned_sql(legacy);
         let dead_data_files = sqlx::query(AssertSqlSafe(format!(
-            "SELECT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
+            "SELECT DISTINCT df.data_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
                     {data_owned} AS owned
              FROM ducklake_data_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
@@ -1014,7 +1019,7 @@ impl MulticatalogManager {
         //    snapshot.
         let delete_owned = crate::metadata_writer_postgres::delete_file_owned_sql(legacy);
         let dead_delete_files = sqlx::query(AssertSqlSafe(format!(
-            "SELECT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
+            "SELECT DISTINCT df.delete_file_id, {PG_RESOLVED_PATH} AS resolved_path, {PG_REL_FLAG} AS rel,
                     {delete_owned} AS owned
              FROM ducklake_delete_file df
              JOIN ducklake_table t ON t.table_id = df.table_id
