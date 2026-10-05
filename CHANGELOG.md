@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DuckLakeReadOptions` lets a table keep its first scan's catalog reads and its delete-file
+  positions for later scans. It is off by default (#338).
 - Comments and tags: `MetadataWriter::set_tag`, `COMMENT ON TABLE`, `VIEW` and `COLUMN`, and the
   `object_tags` and `column_tags` views; writable on SQLite and both PostgreSQL layouts.
 - `information_schema.tables` and `columns` gain a `comment` column, which widens `SELECT *`.

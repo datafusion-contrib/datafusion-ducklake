@@ -12,6 +12,7 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::*;
 use parquet::arrow::ArrowWriter;
 use parquet::encryption::encrypt::FileEncryptionProperties;
@@ -526,5 +527,63 @@ async fn test_rowid_on_pme_encrypted_parquet() -> anyhow::Result<()> {
     // Rows were written in id order, so physical position is 0,1,2 and
     // row_id_start is 0.
     assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3)]);
+    Ok(())
+}
+
+/// A table that keeps its first scan's catalog reads installs the decryption
+/// keys of the files in its memo on every scan, and so does a clone of it,
+/// which shares the memo and reads nothing from the catalog.
+#[tokio::test]
+async fn test_memoized_scans_of_pme_encrypted_parquet() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let parquet_path = temp_dir.path().join("encrypted_data.parquet");
+    let catalog_path = temp_dir.path().join("catalog.duckdb");
+
+    let file_size = create_encrypted_parquet_file(&parquet_path, TEST_ENCRYPTION_KEY)?;
+    let key_str = std::str::from_utf8(TEST_ENCRYPTION_KEY)?;
+    create_catalog_with_encrypted_file(&catalog_path, &parquet_path, file_size, key_str)?;
+
+    let provider = DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?;
+    let catalog = DuckLakeCatalog::new(provider)?
+        .with_read_options(datafusion_ducklake::DuckLakeReadOptions::memoized());
+    let table = catalog
+        .schema("main")
+        .expect("schema main")
+        .table("encrypted_users")
+        .await?
+        .expect("table encrypted_users");
+    let clone = table
+        .downcast_ref::<datafusion_ducklake::DuckLakeTable>()
+        .expect("a DuckLake table")
+        .clone();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", table)?;
+    let clone_ctx = SessionContext::new();
+    clone_ctx.register_table("t", Arc::new(clone))?;
+
+    async fn ids(ctx: &SessionContext) -> anyhow::Result<Vec<i32>> {
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .values()
+                    .to_vec()
+            })
+            .collect())
+    }
+
+    assert_eq!(ids(&ctx).await?, vec![1, 2, 3]);
+    assert_eq!(ids(&ctx).await?, vec![1, 2, 3]);
+    assert_eq!(ids(&clone_ctx).await?, vec![1, 2, 3]);
     Ok(())
 }

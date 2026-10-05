@@ -86,6 +86,7 @@ pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
 pub(crate) mod row_lineage;
+mod scan_memo;
 pub mod schema;
 mod snapshot_changes;
 mod snapshot_consistency;
@@ -157,6 +158,7 @@ pub use metadata_provider::{
     SnapshotChangeMetadata, TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+pub use scan_memo::DuckLakeReadOptions;
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};

@@ -29,6 +29,10 @@ use crate::row_id::{
     unique_row_pos_name,
 };
 use crate::row_lineage::{LineageColumns, RowLineageExec};
+use crate::scan_memo::{
+    CatalogMemo, CatalogMemoCell, DeletePositionMemo, DuckLakeReadOptions, ListingPage, MemoBudget,
+    inlined_deletes_bytes, listing_page_bytes,
+};
 use crate::snapshot_consistency::SnapshotRebind;
 use crate::snapshot_filter::SnapshotFilterExec;
 use crate::stats_filter::{self, StatsFilter};
@@ -176,6 +180,39 @@ impl Iterator for FileMetadataPages<'_> {
         // full page's worth of matches is always returned when one exists.
         self.finished = metadata.len() < FILE_METADATA_BATCH_SIZE;
         Some(Ok(metadata))
+    }
+}
+
+/// What filling a table's catalog memo produced.
+enum MemoFill {
+    /// The reads fit the memo's budget, and no commit landed while they ran.
+    Consistent(CatalogMemo),
+    /// The reads fit, but the catalog moved while they ran: good for the scan
+    /// that read them, not for keeping.
+    Moved(CatalogMemo),
+    /// The reads did not fit the memo's budget.
+    TooLarge,
+}
+
+/// The listing pages a scan plans over: the catalog memo's, borrowed, or the
+/// catalog's.
+enum ScanPages<'a> {
+    Memo(std::slice::Iter<'a, ListingPage>),
+    Catalog(FileMetadataPages<'a>),
+}
+
+impl<'a> Iterator for ScanPages<'a> {
+    type Item = Result<std::borrow::Cow<'a, ListingPage>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memo(pages) => pages
+                .next()
+                .map(|page| Ok(std::borrow::Cow::Borrowed(page))),
+            Self::Catalog(pages) => pages.next().map(|metadata| {
+                metadata.map(|metadata| std::borrow::Cow::Owned(ListingPage::from(metadata)))
+            }),
+        }
     }
 }
 
@@ -402,7 +439,7 @@ fn scalar_precision(
 
 fn file_row_count(
     file: &DuckLakeTableFile,
-    file_columns: Option<&HashMap<i64, DuckLakeFileColumnStatistics>>,
+    file_columns: Option<&HashMap<i64, &DuckLakeFileColumnStatistics>>,
 ) -> Precision<usize> {
     let gross = file.max_row_count.or_else(|| {
         file_columns.and_then(|columns| columns.values().find_map(|stats| stats.value_count))
@@ -519,18 +556,18 @@ fn build_datafusion_statistics(
     schema: &Schema,
     columns: &[DuckLakeTableColumn],
     table_files: &[DuckLakeTableFile],
-    catalog: DuckLakeStatistics,
+    catalog: &DuckLakeStatistics,
     use_current_table_statistics: bool,
     file_metadata_complete: bool,
 ) -> (Statistics, HashMap<i64, Arc<Statistics>>) {
-    let table_column_rows: HashMap<i64, DuckLakeTableColumnStatistics> = catalog
+    let table_column_rows: HashMap<i64, &DuckLakeTableColumnStatistics> = catalog
         .columns
-        .into_iter()
+        .iter()
         .map(|stats| (stats.column_id, stats))
         .collect();
-    let mut file_column_rows: HashMap<i64, HashMap<i64, DuckLakeFileColumnStatistics>> =
+    let mut file_column_rows: HashMap<i64, HashMap<i64, &DuckLakeFileColumnStatistics>> =
         HashMap::new();
-    for stats in catalog.files {
+    for stats in &catalog.files {
         file_column_rows
             .entry(stats.data_file_id)
             .or_default()
@@ -841,15 +878,11 @@ fn delete_file_read_schema() -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// One catalog metadata page, resolved: its files, the per-file statistics that
-/// drive PRUNING (partition-derived bounds folded in), and the narrower per-file
-/// statistics that may be published as a scan SUMMARY. See
-/// [`DuckLakeTable::page_files_with_both_statistics`] for why the last two differ.
-type PagedFileStatistics = (
-    Vec<DuckLakeTableFile>,
-    HashMap<i64, Arc<Statistics>>,
-    HashMap<i64, Arc<Statistics>>,
-);
+/// One listing page's per-file statistics: those that drive PRUNING
+/// (partition-derived bounds folded in), and the narrower ones that may be
+/// published as a scan SUMMARY. See [`DuckLakeTable::page_statistics`] for why
+/// the two differ.
+type PageStatistics = (HashMap<i64, Arc<Statistics>>, HashMap<i64, Arc<Statistics>>);
 
 /// Cached schema mapping for renamed and path-derived columns.
 type SchemaMapping = (
@@ -1323,6 +1356,14 @@ pub struct DuckLakeTable {
     file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
     /// Rows materialized by the most recent inlined scan before residual filters.
     inlined_materialized_row_count: Arc<AtomicUsize>,
+    /// How this table reuses what its scans read. Both memos are off by default.
+    read_options: DuckLakeReadOptions,
+    /// The catalog reads of this table's first scan, when `read_options` keeps
+    /// them. Shared with every clone, which reads the same snapshot.
+    catalog_memo: Arc<CatalogMemoCell>,
+    /// Delete-file positions this table's scans read, when `read_options` keeps
+    /// them. Shared with every clone.
+    delete_memo: Option<Arc<DeletePositionMemo>>,
     /// Decryption keys for the encrypted files this table has listed, and the
     /// factory built from them. Shared with every clone of the table, so a key
     /// one of them installs is available to all of them.
@@ -1445,7 +1486,7 @@ impl DuckLakeTable {
             physical_schema.as_ref(),
             &columns,
             &[],
-            catalog_statistics,
+            &catalog_statistics,
             use_current_table_statistics,
             false,
         );
@@ -1476,6 +1517,9 @@ impl DuckLakeTable {
             encryption_keys,
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
+            read_options: DuckLakeReadOptions::default(),
+            catalog_memo: Arc::new(CatalogMemoCell::new()),
+            delete_memo: None,
             #[cfg(feature = "write")]
             schema_name: None,
             #[cfg(feature = "write")]
@@ -1501,7 +1545,22 @@ impl DuckLakeTable {
         self
     }
 
+    /// Set how this table reuses what its scans read: by default every scan
+    /// reads the catalog and the delete files again. See [`DuckLakeReadOptions`],
+    /// which also says how long a table that keeps its reads can be kept. The
+    /// table starts with empty memos.
+    pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
+        self.catalog_memo = Arc::new(CatalogMemoCell::new());
+        self.delete_memo = DeletePositionMemo::new(options.delete_memo_bytes);
+        self.read_options = options;
+        self
+    }
+
     /// Rows materialized by the most recent metadata-catalog inlined scan.
+    ///
+    /// With a catalog memo (see [`DuckLakeReadOptions`]), the scan that fills it
+    /// materializes every visible inlined row, and a scan the memo serves runs
+    /// no catalog scan, so it leaves this count as it was.
     #[must_use]
     pub fn inlined_materialized_row_count(&self) -> usize {
         self.inlined_materialized_row_count.load(Ordering::Relaxed)
@@ -1707,6 +1766,145 @@ impl DuckLakeTable {
             finished: false,
         }
     }
+
+    /// What one scan reads in place of the catalog, when the read options keep a
+    /// catalog memo: the memo, and the inlined rows this call materialized from
+    /// the catalog to fill it (`None` when the memo was already filled, so the
+    /// scan reads nothing from the catalog). `None` when the options keep no
+    /// catalog memo or this table's reads did not fit it: the scan then reads the
+    /// catalog itself.
+    ///
+    /// The first scan to find the memo unset fills it. A failed catalog read
+    /// leaves it unset, and so does a fill during which the catalog moved; a
+    /// later scan tries again. Scans that start together can each fill it; the
+    /// first fill kept is the one every later scan uses.
+    fn catalog_memo(&self) -> DataFusionResult<Option<(Arc<CatalogMemo>, Option<usize>)>> {
+        let Some(budget) = self.read_options.catalog_memo_budget() else {
+            return Ok(None);
+        };
+        if let Some(kept) = self.catalog_memo.get() {
+            return Ok(kept.as_ref().map(|memo| (Arc::clone(memo), None)));
+        }
+        Ok(match self.fill_catalog_memo(budget)? {
+            MemoFill::Consistent(memo) => {
+                let materialized = memo.inlined_materialized;
+                let memo = Arc::new(memo);
+                let kept = self.catalog_memo.get_or_init(|| Some(Arc::clone(&memo)));
+                // A scan beside this one may have kept its own fill first, or
+                // found its reads too large; this fill still serves this scan.
+                Some((kept.clone().unwrap_or(memo), Some(materialized)))
+            },
+            MemoFill::Moved(memo) => {
+                let materialized = memo.inlined_materialized;
+                Some((Arc::new(memo), Some(materialized)))
+            },
+            MemoFill::TooLarge => self
+                .catalog_memo
+                .get_or_init(|| None)
+                .as_ref()
+                .map(|memo| (Arc::clone(memo), None)),
+        })
+    }
+
+    /// Read from the catalog everything a scan of this table reads there, for
+    /// the catalog memo.
+    ///
+    /// Everything is read without the scan's filters, so that the memo can
+    /// serve any later scan: the listing without the catalog-side statistics
+    /// filter, and the inlined rows without the inlined filter. A scan prunes
+    /// the listing in memory either way, and applies its filters above the
+    /// inlined rows (they are `Inexact`), so the rows it returns are the same.
+    ///
+    /// The reads are kept together or not at all. A merge, a rewrite or a
+    /// flush of inlined data changes how this snapshot is stored, so a memoized
+    /// listing beside a fresh inlined read, or the reverse, could see a flushed
+    /// row twice or not at all. The reads are separate statements, so a commit
+    /// that lands between two of them can split them the same way. Such a fill
+    /// is used for this scan alone, which a scan without a memo risks too, and
+    /// is not kept.
+    fn fill_catalog_memo(&self, mut budget: MemoBudget) -> DataFusionResult<MemoFill> {
+        // Every commit adds a snapshot, so a head that has not moved between the
+        // first read and the last means no commit landed between them. A head
+        // that cannot be read counts as moved.
+        let head_before = self.provider.get_current_snapshot().ok();
+        let mut pages = Vec::new();
+        for metadata in self.file_metadata_pages("memo", None) {
+            let page = ListingPage::from(metadata?);
+            if !budget.add(listing_page_bytes(&page)) {
+                return Ok(MemoFill::TooLarge);
+            }
+            pages.push(page);
+        }
+        let inlined_deletes = self.inlined_deletes_by_file()?;
+        if !budget.add(inlined_deletes_bytes(&inlined_deletes)) {
+            return Ok(MemoFill::TooLarge);
+        }
+        let inlined = self.provider.scan_inlined_data(
+            self.table_id,
+            self.snapshot_id,
+            &self.columns,
+            None,
+        )?;
+        let inlined_bytes = inlined
+            .batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .sum();
+        if !budget.add(inlined_bytes) {
+            return Ok(MemoFill::TooLarge);
+        }
+        let head_after = self.provider.get_current_snapshot().ok();
+        let consistent = head_before.is_some() && head_before == head_after;
+        let memo = CatalogMemo {
+            pages,
+            inlined_deletes,
+            inlined_rows: inlined.batches,
+            inlined_materialized: inlined.materialized_row_count,
+            // The catalog's delete counts are exact for this snapshot when it was
+            // the current one while the listing was read (see
+            // `build_exec_for_files_with_deletes`), and they stay exact for the
+            // later scans that use this listing, however far the catalog moves.
+            at_current_snapshot: consistent && head_before == Some(self.snapshot_id),
+        };
+        Ok(if consistent {
+            MemoFill::Consistent(memo)
+        } else {
+            MemoFill::Moved(memo)
+        })
+    }
+
+    /// Whether any row of `batches`, which hold the physical columns, can
+    /// satisfy every one of `filters`. A conjunct that cannot be evaluated here
+    /// counts as satisfied, so the answer errs towards yes.
+    fn any_row_can_match(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+        batches: &[RecordBatch],
+    ) -> bool {
+        let predicate = datafusion::physical_expr::conjunction_opt(
+            self.physical_conjuncts(state, filters).unwrap_or_default(),
+        );
+        batches
+            .iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .any(|batch| {
+                let Some(predicate) = &predicate else {
+                    return true;
+                };
+                match predicate
+                    .evaluate(batch)
+                    .and_then(|value| value.into_array(batch.num_rows()))
+                {
+                    Ok(mask) => mask
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .is_none_or(|mask| mask.true_count() > 0),
+                    Err(_) => true,
+                }
+            })
+    }
+
     /// Resolve a file path (data or delete file) to its absolute path
     fn resolve_file_path(&self, file: &DuckLakeFileData) -> DataFusionResult<String> {
         resolve_path(&self.table_path, &file.path, file.path_is_relative)
@@ -1981,12 +2179,15 @@ impl DuckLakeTable {
         // `ColumnStatistics` including each `ScalarValue` bound, so building a
         // map this caller drops immediately would cost one wasted clone per file
         // per mutation.
-        let (table_files, pruning, _) = self.page_files_resolved(metadata, false);
-        (table_files, pruning)
+        let page = ListingPage::from(metadata);
+        let (pruning, _) = self.page_statistics(&page, false);
+        (page.files, pruning)
     }
 
-    /// As [`Self::page_files_with_statistics`], and additionally the per-file
-    /// statistics that may be published as the SCAN SUMMARY.
+    /// The per-file statistics of one listing page that drive pruning, with
+    /// partition-derived bounds folded in, and, when `want_summary`, the per-file
+    /// statistics that may be published as the SCAN SUMMARY. It borrows the page,
+    /// so a page the catalog memo keeps serves every scan without being copied.
     ///
     /// Two maps rather than one because `Precision` carries two meanings here
     /// that do not coincide. For pruning, `Exact` means "act on this bound"; a
@@ -2010,57 +2211,32 @@ impl DuckLakeTable {
     /// - **`num_rows`** comes from [`file_summary_row_count`], which subtracts
     ///   deletes and refuses the `value_count` fallback, so it stays exact
     ///   through a DELETE exactly as official's `count(*)` does.
-    fn page_files_with_both_statistics(
-        &self,
-        metadata: Vec<DuckLakeFileMetadata>,
-    ) -> PagedFileStatistics {
-        self.page_files_resolved(metadata, true)
-    }
-
-    /// Shared body of the two page resolvers; `want_summary` decides whether the
-    /// (cloning) summary map is built at all.
-    fn page_files_resolved(
-        &self,
-        metadata: Vec<DuckLakeFileMetadata>,
-        want_summary: bool,
-    ) -> PagedFileStatistics {
-        let mut catalog_file_statistics = Vec::new();
-        let mut table_files = Vec::with_capacity(metadata.len());
-        for DuckLakeFileMetadata {
-            file,
-            column_statistics,
-        } in metadata
-        {
-            table_files.push(file);
-            catalog_file_statistics.extend(column_statistics);
-        }
+    ///
+    /// `want_summary` decides whether the (cloning) summary map is built at all.
+    fn page_statistics(&self, page: &ListingPage, want_summary: bool) -> PageStatistics {
         let (_, mut file_statistics) = build_datafusion_statistics(
             self.physical_schema.as_ref(),
             &self.columns,
-            &table_files,
-            DuckLakeStatistics {
-                files: catalog_file_statistics,
-                ..Default::default()
-            },
+            &page.files,
+            &page.statistics,
             false,
             true,
         );
         // Derived from the PRISTINE per-file statistics, before partition bounds
         // are folded in below.
         let summary_statistics = if want_summary {
-            self.summary_statistics_from(&table_files, &file_statistics)
+            self.summary_statistics_from(&page.files, &file_statistics)
         } else {
             HashMap::new()
         };
         // Synthesize per-file bounds from partition values so partition columns
         // prune even when a file carries no parquet-derived column statistics.
-        self.apply_partition_bounds(&table_files, &mut file_statistics);
-        (table_files, file_statistics, summary_statistics)
+        self.apply_partition_bounds(&page.files, &mut file_statistics);
+        (file_statistics, summary_statistics)
     }
 
     /// Narrow the pruning statistics of each file to what may be published as a
-    /// scan summary. See [`Self::page_files_with_both_statistics`] for why the
-    /// two differ.
+    /// scan summary. See [`Self::page_statistics`] for why the two differ.
     fn summary_statistics_from(
         &self,
         table_files: &[DuckLakeTableFile],
@@ -2773,8 +2949,8 @@ impl DuckLakeTable {
     /// bounds when no row has ever been deleted), so this converges on it rather
     /// than adding behaviour of our own.
     ///
-    /// The inputs are the SUMMARY statistics from
-    /// [`Self::page_files_with_both_statistics`], never the pruning ones. That
+    /// The inputs are the SUMMARY statistics from [`Self::page_statistics`],
+    /// never the pruning ones. That
     /// distinction is the whole safety argument: the summary map has already
     /// dropped partition-derived bounds, bounds on types a writer may widen, and
     /// every bound on a file carrying deletes, so whatever remains `Exact` here
@@ -3387,11 +3563,15 @@ impl DuckLakeTable {
     /// groups them: one scan resolved per file by field id, and one per distinct
     /// name-mapped layout. No scan takes a `LIMIT`, which would stop it before
     /// the rows that survive the deletes.
+    ///
+    /// `known_current` says whether the table's snapshot is the catalog's
+    /// current one, when the scan already knows; `None` asks the catalog.
     fn build_exec_for_files_with_deletes(
         &self,
         state: &dyn Session,
         files: &[&DuckLakeTableFile],
         inlined_deletes: &HashMap<i64, HashSet<i64>>,
+        known_current: Option<bool>,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -3439,10 +3619,11 @@ impl DuckLakeTable {
         // historical read snapshot. Official answers `count(*)` from catalog counts
         // only at the current snapshot; so does this.
         let at_current_snapshot = !files.iter().any(|file| file.delete_file.is_some())
-            || self
-                .provider
-                .get_current_snapshot()
-                .is_ok_and(|current| current == self.snapshot_id);
+            || known_current.unwrap_or_else(|| {
+                self.provider
+                    .get_current_snapshot()
+                    .is_ok_and(|current| current == self.snapshot_id)
+            });
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
         for ((read_schema, name_mapping, constants), group_files, resolved_by_field_id) in groups {
@@ -3537,7 +3718,8 @@ impl DuckLakeTable {
                     deletes,
                     self.object_store_url.as_ref().clone(),
                 )?
-                .with_read_order(read_order),
+                .with_read_order(read_order)
+                .with_position_memo(self.delete_memo.clone()),
             );
             if !name_mapping.is_empty() || !constants.is_empty() || exec.schema() != output_schema {
                 let defaults = if resolved_by_field_id {
@@ -3674,6 +3856,7 @@ impl DuckLakeTable {
         state: &dyn Session,
         files: &[&DuckLakeTableFile],
         inlined_deletes: &HashMap<i64, HashSet<i64>>,
+        known_current: Option<bool>,
         file_statistics: &HashMap<i64, Arc<Statistics>>,
         user_proj: &[usize],
         rowid_idx: usize,
@@ -3717,10 +3900,11 @@ impl DuckLakeTable {
             .collect();
         let collect_statistics = state.config_options().execution.collect_statistics;
         let at_current_snapshot = !files.iter().any(|file| file.delete_file.is_some())
-            || self
-                .provider
-                .get_current_snapshot()
-                .is_ok_and(|current| current == self.snapshot_id);
+            || known_current.unwrap_or_else(|| {
+                self.provider
+                    .get_current_snapshot()
+                    .is_ok_and(|current| current == self.snapshot_id)
+            });
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(groups.len());
         for ((read_schema, name_mapping, constants), group_files, resolved_by_field_id) in groups {
@@ -3872,7 +4056,8 @@ impl DuckLakeTable {
                     deletes,
                     self.object_store_url.as_ref().clone(),
                 )?
-                .with_read_order(read_order),
+                .with_read_order(read_order)
+                .with_position_memo(self.delete_memo.clone()),
             );
             if !name_mapping.is_empty() || !constants.is_empty() || exec.schema() != output_schema {
                 let defaults = if resolved_by_field_id {
@@ -4286,6 +4471,9 @@ impl DuckLakeTable {
             // pinned snapshot). A read-only clone starts with an empty cache.
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
+            read_options: self.read_options.clone(),
+            catalog_memo: Arc::clone(&self.catalog_memo),
+            delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
             encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,
@@ -4971,6 +5159,8 @@ impl TableProvider for DuckLakeTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // With a catalog memo, every catalog read below comes from it instead.
+        let memo = self.catalog_memo()?;
         let inlined_filter = translate_inlined_filters(filters);
 
         // Row-lineage detour: when the synthetic `rowid` column is projected,
@@ -4988,15 +5178,29 @@ impl TableProvider for DuckLakeTable {
         // rows would silently vanish from a row-lineage read. Refuse loudly
         // instead until inlined rowid scans are supported.
         if rowid_in_proj {
-            let inlined = self.provider.scan_inlined_data(
-                self.table_id,
-                self.snapshot_id,
-                &self.columns,
-                inlined_filter.as_ref(),
-            )?;
-            self.inlined_materialized_row_count
-                .store(inlined.materialized_row_count, Ordering::Relaxed);
-            if inlined.batches.iter().any(|batch| batch.num_rows() > 0) {
+            let has_inlined_rows = match &memo {
+                Some((memo, materialized)) => {
+                    if let Some(materialized) = materialized {
+                        self.inlined_materialized_row_count
+                            .store(*materialized, Ordering::Relaxed);
+                    }
+                    // The memo keeps every inlined row. Refuse only for one the
+                    // filters keep, as the filtered catalog read below does.
+                    self.any_row_can_match(state, filters, &memo.inlined_rows)
+                },
+                None => {
+                    let inlined = self.provider.scan_inlined_data(
+                        self.table_id,
+                        self.snapshot_id,
+                        &self.columns,
+                        inlined_filter.as_ref(),
+                    )?;
+                    self.inlined_materialized_row_count
+                        .store(inlined.materialized_row_count, Ordering::Relaxed);
+                    inlined.batches.iter().any(|batch| batch.num_rows() > 0)
+                },
+            };
+            if has_inlined_rows {
                 return Err(crate::DuckLakeError::Unsupported(format!(
                     "row-lineage (rowid) scan on a table with inlined rows is not supported; \
                      {INLINED_DATA_REMEDIATION}"
@@ -5006,7 +5210,15 @@ impl TableProvider for DuckLakeTable {
         }
 
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        let inlined_deletes = self.inlined_deletes_by_file()?;
+        let read_inlined_deletes;
+        let inlined_deletes = match &memo {
+            Some((memo, _)) => &memo.inlined_deletes,
+            None => {
+                read_inlined_deletes = self.inlined_deletes_by_file()?;
+                &read_inlined_deletes
+            },
+        };
+        let known_current = memo.as_ref().map(|(memo, _)| memo.at_current_snapshot);
         // One physical form of the filters feeds both pruning paths; see
         // `physical_conjuncts`, which leaves out any conjunct it cannot convert.
         // A failure to build the schema they convert against means "prune
@@ -5023,8 +5235,10 @@ impl TableProvider for DuckLakeTable {
         // statistics prove they cannot match, which is what stops planning cost
         // scaling with the table. Purely additive — `prune_table_files_iteratively`
         // still runs on every file that comes back, and a predicate that will
-        // not lower simply yields no filter.
+        // not lower simply yields no filter. A memoized listing is complete, and
+        // is pruned in memory alone.
         let stats_filter = datafusion::physical_expr::conjunction_opt(conjuncts.iter().cloned())
+            .filter(|_| memo.is_none())
             .and_then(|predicate| {
                 stats_filter::lower_predicate(&predicate, &self.physical_schema, &self.columns)
             })
@@ -5040,14 +5254,18 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
-        for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
-            let (table_files, file_statistics, summary_statistics) =
-                self.page_files_with_both_statistics(metadata?);
+        let pages = match &memo {
+            Some((memo, _)) => ScanPages::Memo(memo.pages.iter()),
+            None => ScanPages::Catalog(self.file_metadata_pages("planning", stats_filter.as_ref())),
+        };
+        for page in pages {
+            let page = page?;
+            let (file_statistics, summary_statistics) = self.page_statistics(&page, true);
             #[cfg(feature = "encryption")]
-            self.configure_encryption_factory(&table_files)?;
+            self.configure_encryption_factory(&page.files)?;
 
             let table_files =
-                self.prune_table_files_iteratively(&pruning, &table_files, &file_statistics);
+                self.prune_table_files_iteratively(&pruning, &page.files, &file_statistics);
 
             if rowid_in_proj {
                 let rowid_idx = rowid_idx.unwrap();
@@ -5061,7 +5279,8 @@ impl TableProvider for DuckLakeTable {
                     execs.push(self.build_exec_for_files_with_rowid(
                         state,
                         &rest,
-                        &inlined_deletes,
+                        inlined_deletes,
+                        known_current,
                         &file_statistics,
                         &user_proj,
                         rowid_idx,
@@ -5075,7 +5294,7 @@ impl TableProvider for DuckLakeTable {
                     execs.push(self.build_exec_for_partial_files(
                         state,
                         &field_id,
-                        &inlined_deletes,
+                        inlined_deletes,
                         &file_statistics,
                         &user_proj,
                         Some(rowid_idx),
@@ -5119,7 +5338,8 @@ impl TableProvider for DuckLakeTable {
                 execs.push(self.build_exec_for_files_with_deletes(
                     state,
                     &files_with_deletes,
-                    &inlined_deletes,
+                    inlined_deletes,
+                    known_current,
                     &file_statistics,
                     projection,
                 )?);
@@ -5134,7 +5354,7 @@ impl TableProvider for DuckLakeTable {
                 execs.push(self.build_exec_for_partial_files(
                     state,
                     &field_id,
-                    &inlined_deletes,
+                    inlined_deletes,
                     &file_statistics,
                     &user_proj,
                     None,
@@ -5174,17 +5394,30 @@ impl TableProvider for DuckLakeTable {
         // in the catalog (not in Parquet). Union them in so SELECT / COUNT(*)
         // include them. Providers without inlined data — or that don't implement
         // the read — return empty, so this is a no-op for ordinary catalogs.
-        let inlined = self.provider.scan_inlined_data(
-            self.table_id,
-            self.snapshot_id,
-            &self.columns,
-            inlined_filter.as_ref(),
-        )?;
-        self.inlined_materialized_row_count
-            .store(inlined.materialized_row_count, Ordering::Relaxed);
-        if inlined.batches.iter().any(|b| b.num_rows() > 0) {
+        // Memoized rows are unfiltered; the filters are reapplied above this scan.
+        let inlined_rows = match &memo {
+            Some((memo, materialized)) => {
+                if let Some(materialized) = materialized {
+                    self.inlined_materialized_row_count
+                        .store(*materialized, Ordering::Relaxed);
+                }
+                memo.inlined_rows.clone()
+            },
+            None => {
+                let inlined = self.provider.scan_inlined_data(
+                    self.table_id,
+                    self.snapshot_id,
+                    &self.columns,
+                    inlined_filter.as_ref(),
+                )?;
+                self.inlined_materialized_row_count
+                    .store(inlined.materialized_row_count, Ordering::Relaxed);
+                inlined.batches
+            },
+        };
+        if inlined_rows.iter().any(|b| b.num_rows() > 0) {
             let exec = MemorySourceConfig::try_new_exec(
-                &[inlined.batches],
+                &[inlined_rows],
                 self.physical_schema.clone(),
                 projection.cloned(),
             )?;
@@ -6096,7 +6329,7 @@ mod tests {
                 table.physical_schema.as_ref(),
                 &table.columns,
                 &files,
-                DuckLakeStatistics {
+                &DuckLakeStatistics {
                     files: catalog_statistics,
                     ..Default::default()
                 },
@@ -7258,7 +7491,7 @@ mod tests {
             &schema,
             &columns,
             &[],
-            DuckLakeStatistics {
+            &DuckLakeStatistics {
                 columns: vec![DuckLakeTableColumnStatistics {
                     column_id: 1,
                     contains_null: Some(false),
@@ -7302,7 +7535,7 @@ mod tests {
                 &schema,
                 &columns,
                 std::slice::from_ref(&file),
-                DuckLakeStatistics {
+                &DuckLakeStatistics {
                     files: vec![DuckLakeFileColumnStatistics {
                         data_file_id: 7,
                         column_id: 1,
@@ -7369,7 +7602,7 @@ mod tests {
                 &schema,
                 &columns,
                 &[],
-                DuckLakeStatistics {
+                &DuckLakeStatistics {
                     columns: vec![DuckLakeTableColumnStatistics {
                         column_id: 1,
                         contains_null: Some(false),
@@ -7440,7 +7673,7 @@ mod tests {
                 &schema,
                 &columns,
                 &table_files,
-                DuckLakeStatistics {
+                &DuckLakeStatistics {
                     files: vec![stat(1, "1.0", "2.0", Some(false)), stat(2, "0.5", "3.0", nan_b)],
                     ..Default::default()
                 },
