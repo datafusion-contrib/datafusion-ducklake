@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
   by every writer's schema bootstrap and by existing catalogs on their next
   initialization.
+- `MERGE INTO` through `execute_ducklake_sql` on SQLite and PostgreSQL: one matched `UPDATE` or
+  `DELETE` and one not-matched `INSERT` commit in one snapshot; updated rows keep their row IDs.
 
 ### Changed
 

@@ -203,6 +203,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Row-level deletes (Merge-On-Read delete files, read)                                                                                                                                                                                                                                                                             | ✅        |
 | SQL `DELETE FROM t [WHERE ...]` (positional + inlined-row deletes, mixed in one snapshot + inline-aware metadata-only truncate; all write backends)                                                                                                                                                                              | ✅        |
 | SQL `UPDATE t SET c = e [, ...] [WHERE p]` (rewrite + positional delete, one snapshot; all write backends; refuses on tables with visible inlined rows — see Data inlining under Limitations)                                                                                                                                    | ✅        |
+| SQL `MERGE INTO` upserts (one matched `UPDATE` or `DELETE`, one not-matched `INSERT`, one snapshot; SQLite and PostgreSQL; partitioned targets refused)                                                                                                                                                                          | ✅        |
 | Snapshot-based consistency (bound at catalog creation)                                                                                                                                                                                                                                                                           | ✅        |
 | Filter pushdown to Parquet (row-group / page pruning)                                                                                                                                                                                                                                                                            | ✅        |
 | Filter pushdown into the catalog file listing — per-column statistics narrow the metadata query, so planning a selective scan or keyed mutation does not list every live file                                                                                                                                                    | ✅        |
@@ -276,6 +277,12 @@ in DataFusion's `information_schema.columns` until its definition becomes planna
 View planning uses a private, snapshot-pinned `SessionContext`, rejects DDL, DML, and statement
 commands, and propagates the catalog's row-lineage option. Caller-registered UDFs and caller session
 settings, including `execution.time_zone`, are not inherited.
+
+`execute_ducklake_sql` supports DuckLake `MERGE INTO` upserts on SQLite and
+PostgreSQL: one matched `UPDATE` or `DELETE` action, an optional matched
+predicate, and one not‑matched `INSERT` action commit through one
+append‑plus‑delete snapshot. Updated rows keep their row IDs. Multiple matched
+actions and partitioned targets remain unsupported.
 
 ---
 

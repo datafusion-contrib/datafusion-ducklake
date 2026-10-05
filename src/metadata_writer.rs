@@ -1685,6 +1685,15 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Reserve a unique contiguous row-ID range and return its first ID.
+    /// Reservations may leave gaps when the later data commit fails, just like
+    /// sequence-backed object IDs, but IDs are never reused.
+    fn reserve_row_ids(&self, _table_id: i64, _count: i64) -> Result<i64> {
+        Err(DuckLakeError::Unsupported(
+            "row-ID reservation is not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Get or create a schema, returning `(schema_id, was_created)`.
     fn get_or_create_schema(
         &self,

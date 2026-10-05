@@ -118,6 +118,8 @@ pub mod insert_exec;
 #[cfg(feature = "write")]
 pub mod maintenance;
 #[cfg(feature = "write")]
+pub(crate) mod merge;
+#[cfg(feature = "write")]
 pub mod metadata_writer;
 #[cfg(feature = "write-duckdb")]
 pub mod metadata_writer_duckdb;
