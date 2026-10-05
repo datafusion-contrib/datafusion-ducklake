@@ -992,6 +992,40 @@ async fn file_listings_for_mutations_read_the_catalog() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `count(*)` of a table pinned at an older snapshot, with and without a memo.
+///
+/// The catalog's delete counts answer `count(*)` only at the current snapshot.
+/// A second DELETE from a data file replaces its delete file, for older
+/// snapshots too, with one that also holds the newer deletion, so its count
+/// over-states the deletions at the older snapshot. The memo records whether
+/// the snapshot was current when it was filled, and here it was not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memoized_table_at_an_older_snapshot_counts_its_own_rows() -> anyhow::Result<()> {
+    let lake = Lake::new(0, WITH_DELETES)?;
+    let (_, snapshot) = table_at_head(&lake.provider().await?)?;
+    lake.run(0, &["DELETE FROM lake.t WHERE id = 5"])?;
+
+    for options in [DuckLakeReadOptions::default(), DuckLakeReadOptions::memoized()] {
+        let fixed = DuckLakeCatalog::with_snapshot(Arc::new(lake.provider().await?), snapshot)?
+            .with_read_options(options.clone());
+        let table = fixed.schema("main").unwrap().table("t").await?.unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", table)?;
+        // Ids 1, 3 and 5 are live at the snapshot; the DELETE of 5 came later.
+        for scan in 0..2 {
+            let batches = ctx.sql("SELECT count(*) FROM t").await?.collect().await?;
+            let count = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("count(*) is Int64")
+                .value(0);
+            assert_eq!(count, 3, "{options:?}, scan {scan}");
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Delete memo
 // ---------------------------------------------------------------------------

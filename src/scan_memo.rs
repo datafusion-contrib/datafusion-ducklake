@@ -87,7 +87,9 @@ use crate::metadata_provider::{
 ///
 /// The delete memo keeps positions until they fill [`Self::delete_memo_bytes`].
 /// It never evicts: once full, it keeps what it has, and other delete files are
-/// read on each scan.
+/// read on each scan. Without a catalog memo, each scan lists the files again,
+/// so the entries of data files that a merge or a rewrite replaced stay in the
+/// memo, and count against its budget, until the table is dropped.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeReadOptions {
@@ -269,7 +271,9 @@ pub(crate) fn inlined_deletes_bytes(deletes: &HashMap<i64, HashSet<i64>>) -> usi
 /// file is never rewritten in place. A file that records each deletion's
 /// snapshot contributes only the deletions made at or before the read snapshot,
 /// so that snapshot is part of the entry too. When a later scan lists a new
-/// delete file for the data file, its positions replace the entry.
+/// delete file for the data file, its positions replace the entry. An entry
+/// whose data file no listing names any more, after a merge or a rewrite,
+/// stays until the memo is dropped.
 #[derive(Debug)]
 pub(crate) struct DeletePositionMemo {
     max_bytes: usize,
