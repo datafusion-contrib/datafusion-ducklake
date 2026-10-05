@@ -184,7 +184,7 @@ async fn paths_are_unscoped_and_relative() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(schema_path, "main", "schema path must not be cat_-scoped");
+    assert_eq!(schema_path, "main/", "schema path must not be cat_-scoped");
     assert!(schema_rel);
 
     let (table_path, table_rel): (String, bool) = sqlx::query_as(
@@ -193,7 +193,7 @@ async fn paths_are_unscoped_and_relative() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(table_path, "users");
+    assert_eq!(table_path, "users/");
     assert!(table_rel);
 
     // The data file lands relative to the resolved table path.
@@ -1071,7 +1071,7 @@ async fn set_data_path_replaces_rather_than_duplicates() {
     .await
     .unwrap();
     assert_eq!(rows, 1);
-    assert_eq!(writer.get_data_path().unwrap(), "/tmp/two");
+    assert_eq!(writer.get_data_path().unwrap(), "/tmp/two/");
 }
 
 #[tokio::test(flavor = "multi_thread")]

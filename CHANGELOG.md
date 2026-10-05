@@ -166,6 +166,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plan-time file pruning takes the session's `max_in_list_size` too, so it and row-group
   pruning answer to one cap — visible where the statistics filter does not already narrow
   the listing.
+- Spec-layout writers store `data_path`, schema paths, and table paths with a trailing `/` and
+  migrate legacy rows on initialization, so DuckDB resolves crate-written data files.
+- `footer_size` stores the Parquet Thrift metadata length without the eight-byte trailer, so
+  DuckDB's footer prefetch accepts crate-written files.
 
 ## [0.8.0] - 2026-09-16
 

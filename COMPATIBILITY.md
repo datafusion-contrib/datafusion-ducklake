@@ -36,7 +36,10 @@ PostgreSQL has **two** writers, both behind `write-postgres`:
 Use `PostgresSingleCatalogMetadataWriter` unless you specifically need many
 catalogs in one database. It produces the same catalog shape as the SQLite and
 MySQL writers: no `catalog_id` columns, no `ducklake_catalog*` map tables, and
-unscoped relative paths (`{data_path}/{schema}/{table}/…`).
+unscoped relative paths (`{data_path}/{schema}/{table}/…`). The four spec-layout
+writers store `data_path`, schema paths, and table paths with a trailing `/`, as
+DuckDB does, and initialization appends it to legacy rows so DuckDB can resolve
+crate-written files. The multi-catalog layout keeps its paths as given.
 
 **Multi-catalog** (PostgreSQL only, **experimental**) lets a single metadata store hold
 multiple independent DuckLake catalogs. Reading multiple catalogs requires
