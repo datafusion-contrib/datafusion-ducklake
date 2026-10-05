@@ -26,7 +26,7 @@ use crate::metadata_writer::{
     table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
     validate_inlined_index_columns, validate_name, validate_table_setting,
 };
-use crate::metadata_writer::{is_inlined_system_column, tag_change};
+use crate::metadata_writer::{directory_path, is_inlined_system_column, tag_change};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -1080,8 +1080,8 @@ impl SqliteMetadataWriter {
 /// path. Assumes `/`-joined relative names (everything our writer produces).
 const RESOLVED_PATH: &str = "CASE
     WHEN NOT df.path_is_relative THEN df.path
-    WHEN NOT t.path_is_relative THEN t.path || '/' || df.path
-    ELSE s.path || '/' || t.path || '/' || df.path
+    WHEN NOT t.path_is_relative THEN RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
+    ELSE RTRIM(s.path, '/') || '/' || RTRIM(t.path, '/') || '/' || LTRIM(df.path, '/')
 END";
 
 /// Companion to [`RESOLVED_PATH`]: 1 only when the whole chain is relative (so the
@@ -1370,6 +1370,30 @@ async fn migrate_add_partition_id(pool: &SqlitePool) -> Result<()> {
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+/// Give legacy `data_path`, schema path, and table path values the trailing `/`
+/// DuckLake readers expect. Idempotent.
+async fn migrate_directory_paths(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE ducklake_metadata SET value = value || '/'
+         WHERE key = 'data_path' AND scope IS NULL AND value <> '' AND value NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2992,13 +3016,13 @@ impl MetadataWriter for SqliteMetadataWriter {
                 return Ok((schema_id, false));
             }
 
-            let schema_path = path.unwrap_or(name);
+            let schema_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, 1, ?) RETURNING schema_id",
             )
             .bind(name)
-            .bind(schema_path)
+            .bind(&schema_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -3049,14 +3073,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = path.unwrap_or(name);
+            let table_path = directory_path(path.unwrap_or(name));
             let row = sqlx::query(
                 "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                  VALUES (?, ?, ?, 1, ?) RETURNING table_id",
             )
             .bind(schema_id)
             .bind(name)
-            .bind(table_path)
+            .bind(&table_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?;
@@ -5702,13 +5726,14 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        let path = directory_path(path);
         block_on(async {
             let current: Option<String> = sqlx::query_scalar(
                 "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
             )
             .fetch_optional(&self.pool)
             .await?;
-            if current.as_deref() == Some(path) {
+            if current.as_deref() == Some(path.as_str()) {
                 return Ok(());
             }
 
@@ -5720,7 +5745,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "INSERT INTO ducklake_metadata (key, value, scope)
                  VALUES ('data_path', ?, NULL)",
             )
-            .bind(path)
+            .bind(&path)
             .execute(&self.pool)
             .await?;
 
@@ -5799,6 +5824,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             )
             .execute(&self.pool)
             .await?;
+            migrate_directory_paths(&self.pool).await?;
             Ok(())
         })
     }
@@ -5860,7 +5886,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                          VALUES (?, ?, 1, ?) RETURNING schema_id",
                     )
                     .bind(schema_name)
-                    .bind(schema_name)
+                    .bind(directory_path(schema_name))
                     .bind(snapshot_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -5887,7 +5913,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     )
                     .bind(schema_id)
                     .bind(table_name)
-                    .bind(table_name)
+                    .bind(directory_path(table_name))
                     .bind(snapshot_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -7784,6 +7810,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_schema_migrates_directory_paths_once() {
+        let (writer, _temp) = create_test_writer().await;
+        writer.set_data_path("/tmp/ducklake-data").unwrap();
+        let snapshot_id = writer.create_snapshot().unwrap();
+        let (schema_id, _) = writer
+            .get_or_create_schema("main", None, snapshot_id)
+            .unwrap();
+        writer
+            .get_or_create_table(schema_id, "users", None, snapshot_id)
+            .unwrap();
+        async fn paths(pool: &SqlitePool) -> (String, String, String) {
+            let data_path: String = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let schema_path: String = sqlx::query_scalar("SELECT path FROM ducklake_schema")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            let table_path: String = sqlx::query_scalar("SELECT path FROM ducklake_table")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            (data_path, schema_path, table_path)
+        }
+        assert_eq!(
+            paths(&writer.pool).await,
+            (
+                "/tmp/ducklake-data/".to_string(),
+                "main/".to_string(),
+                "users/".to_string()
+            )
+        );
+
+        sqlx::query(
+            "UPDATE ducklake_metadata SET value = '/tmp/ducklake-data' WHERE key = 'data_path'",
+        )
+        .execute(&writer.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE ducklake_schema SET path = 'main'")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ducklake_table SET path = 'users'")
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            writer.initialize_schema().unwrap();
+            assert_eq!(
+                paths(&writer.pool).await,
+                (
+                    "/tmp/ducklake-data/".to_string(),
+                    "main/".to_string(),
+                    "users/".to_string()
+                )
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_data_path() {
         let (writer, _temp) = create_test_writer().await;
 
@@ -7792,12 +7882,12 @@ mod tests {
 
         // Get data path
         let path = writer.get_data_path().unwrap();
-        assert_eq!(path, "/data/path");
+        assert_eq!(path, "/data/path/");
 
         // Update data path
         writer.set_data_path("/new/path").unwrap();
         let path2 = writer.get_data_path().unwrap();
-        assert_eq!(path2, "/new/path");
+        assert_eq!(path2, "/new/path/");
     }
 
     #[tokio::test(flavor = "multi_thread")]

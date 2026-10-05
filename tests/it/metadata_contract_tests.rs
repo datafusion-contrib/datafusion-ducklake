@@ -1092,12 +1092,35 @@ async fn sqlite_set_data_path_skips_an_unchanged_write() {
     let after_first = sqlite_change_counter(&db_path);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     assert_eq!(sqlite_change_counter(&db_path), after_first);
-    assert_eq!(writer.get_data_path().unwrap(), data_path.to_str().unwrap());
+    assert_eq!(
+        writer.get_data_path().unwrap(),
+        format!("{}/", data_path.to_str().unwrap())
+    );
 
     writer.set_data_path(other_path.to_str().unwrap()).unwrap();
     assert!(sqlite_change_counter(&db_path) > after_first);
     assert_eq!(
         writer.get_data_path().unwrap(),
-        other_path.to_str().unwrap()
+        format!("{}/", other_path.to_str().unwrap())
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_reopen_of_a_migrated_catalog_writes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("catalog.sqlite");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    drop(writer);
+    let after_first = sqlite_change_counter(&db_path);
+
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    drop(writer);
+
+    assert_eq!(sqlite_change_counter(&db_path), after_first);
 }

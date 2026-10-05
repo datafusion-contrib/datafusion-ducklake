@@ -22,6 +22,7 @@
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
+use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
     MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
@@ -867,9 +868,10 @@ async fn finalize_table_snapshot(
             Some(id) => id,
             None => sqlx::query_scalar(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
-                 VALUES ($1, $1, TRUE, $2) RETURNING schema_id",
+                 VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
             )
             .bind(schema_name)
+            .bind(directory_path(schema_name))
             .bind(snapshot_id)
             .fetch_one(&mut **tx)
             .await?,
@@ -893,11 +895,12 @@ async fn finalize_table_snapshot(
                 "INSERT INTO ducklake_table
                      (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
                  OVERRIDING SYSTEM VALUE
-                 VALUES ($1, $2, $3, $3, TRUE, $4)",
+                 VALUES ($1, $2, $3, $4, TRUE, $5)",
             )
             .bind(table_id_hint)
             .bind(schema_id)
             .bind(table_name)
+            .bind(directory_path(table_name))
             .bind(snapshot_id)
             .execute(&mut **tx)
             .await?;
@@ -1277,13 +1280,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // `{data_path}/{schema}/{table}/…`, matching every other
             // single-catalog backend (the multicatalog writer scopes to
             // `cat_{id}/{schema}` instead).
-            let schema_path = path.unwrap_or(name);
+            let schema_path = directory_path(path.unwrap_or(name));
             let schema_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                  VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
             )
             .bind(name)
-            .bind(schema_path)
+            .bind(&schema_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?
@@ -1332,14 +1335,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
 
-            let table_path = path.unwrap_or(name);
+            let table_path = directory_path(path.unwrap_or(name));
             let table_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                  VALUES ($1, $2, $3, TRUE, $4) RETURNING table_id",
             )
             .bind(schema_id)
             .bind(name)
-            .bind(table_path)
+            .bind(&table_path)
             .bind(snapshot_id)
             .fetch_one(&mut *tx)
             .await?
@@ -2286,13 +2289,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
+        let path = directory_path(path);
         block_on(async {
             let current: Option<String> = sqlx::query_scalar(
                 "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
             )
             .fetch_optional(&self.pool)
             .await?;
-            if current.as_deref() == Some(path) {
+            if current.as_deref() == Some(path.as_str()) {
                 return Ok(());
             }
 
@@ -2305,7 +2309,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "INSERT INTO ducklake_metadata (key, value, scope)
                  VALUES ('data_path', $1, NULL)",
             )
-            .bind(path)
+            .bind(&path)
             .execute(&mut *tx)
             .await?;
 
@@ -2377,6 +2381,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 "SELECT COALESCE(MAX(sort_id), 0) FROM ducklake_sort_info",
             )
             .await?;
+            crate::metadata_writer_postgres::migrate_directory_paths(&self.pool).await?;
             Ok(())
         })
     }
