@@ -18,8 +18,8 @@ use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
-    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    MultiTableCommit, SnapshotChanges, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
+    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
     inlined_delete_conflicts, inlined_delete_groups, live_inlined_index_columns,
     parse_inlined_index_columns, snapshot_has_change, staged_table_write_changes,
@@ -2843,6 +2843,29 @@ impl MetadataWriter for SqliteMetadataWriter {
             crate::DuckLakeError::Internal("SQLite commit lock is poisoned".to_string())
         })?;
         operation()
+    }
+
+    fn snapshot_changes_since(&self, snapshot_id: i64) -> Result<Vec<SnapshotChanges>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT s.snapshot_id, c.changes_made
+                 FROM ducklake_snapshot s
+                 LEFT JOIN ducklake_snapshot_changes c USING (snapshot_id)
+                 WHERE s.snapshot_id > ?
+                 ORDER BY s.snapshot_id",
+            )
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChanges {
+                        snapshot_id: row.try_get(0)?,
+                        changes_made: row.try_get(1)?,
+                    })
+                })
+                .collect()
+        })
     }
 
     fn create_snapshot(&self) -> Result<i64> {
@@ -6713,6 +6736,56 @@ mod tests {
 
         let snap2 = writer.create_snapshot().unwrap();
         assert_eq!(snap2, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_changes_since_returns_complete_ordered_history() {
+        let (writer, _temp) = create_test_writer().await;
+        let first = writer.create_snapshot().unwrap();
+        let second = writer.create_snapshot().unwrap();
+        let third = writer.create_snapshot().unwrap();
+        // A bare snapshot records an empty ledger row; give two of them real
+        // changes and remove the first, which a catalog may lack entirely.
+        for (snapshot_id, changes_made) in
+            [(second, "inserted_into_table:7"), (third, "altered_table:8")]
+        {
+            sqlx::query(
+                "UPDATE ducklake_snapshot_changes SET changes_made = ? WHERE snapshot_id = ?",
+            )
+            .bind(changes_made)
+            .bind(snapshot_id)
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("DELETE FROM ducklake_snapshot_changes WHERE snapshot_id = ?")
+            .bind(first)
+            .execute(&writer.pool)
+            .await
+            .unwrap();
+
+        let complete = writer.snapshot_changes_since(0).unwrap();
+        assert_eq!(complete.len(), 3);
+        assert_eq!(
+            complete[0],
+            SnapshotChanges {
+                snapshot_id: first,
+                changes_made: None,
+            }
+        );
+        assert_eq!(
+            writer.snapshot_changes_since(first).unwrap(),
+            vec![
+                SnapshotChanges {
+                    snapshot_id: second,
+                    changes_made: Some("inserted_into_table:7".to_string()),
+                },
+                SnapshotChanges {
+                    snapshot_id: third,
+                    changes_made: Some("altered_table:8".to_string()),
+                },
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

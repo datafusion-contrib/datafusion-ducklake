@@ -128,6 +128,15 @@ pub enum DuckLakeError {
     #[error("Write conflict: {0}")]
     Conflict(String),
 
+    /// An optimistic metadata transaction lost the sequential snapshot-id race.
+    /// The staged data files remain valid, so the caller may inspect intervening
+    /// snapshot changes and retry only the metadata commit.
+    #[error("Snapshot {snapshot_id} commit collision: {message}")]
+    SnapshotCollision {
+        snapshot_id: i64,
+        message: String,
+    },
+
     /// Generic error
     #[error("Internal error: {0}")]
     Internal(String),

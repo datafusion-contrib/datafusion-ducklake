@@ -40,14 +40,14 @@ use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
     DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING,
-    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
-    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    quote_snapshot_name, quote_snapshot_table, snapshot_has_change, staged_table_write_changes,
-    table_storage_changes, top_level_column_ids, validate_delete_entries,
-    validate_inlined_index_columns, validate_name, validate_table_setting,
+    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotChanges, SnapshotCommitMetadata,
+    SourceRetirement, StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult,
+    assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
+    inlined_delete_conflicts, inlined_delete_groups, live_inlined_index_columns,
+    parse_inlined_index_columns, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
+    staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_inlined_index_columns, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -2316,6 +2316,29 @@ impl MetadataWriter for MySqlMetadataWriter {
                 ensure_mysql_physical_indexes(&self.pool, table_id, &physical_table).await?;
             }
             Ok(())
+        })
+    }
+
+    fn snapshot_changes_since(&self, snapshot_id: i64) -> Result<Vec<SnapshotChanges>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT s.snapshot_id, c.changes_made
+                 FROM ducklake_snapshot s
+                 LEFT JOIN ducklake_snapshot_changes c USING (snapshot_id)
+                 WHERE s.snapshot_id > ?
+                 ORDER BY s.snapshot_id",
+            )
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChanges {
+                        snapshot_id: row.try_get(0)?,
+                        changes_made: row.try_get(1)?,
+                    })
+                })
+                .collect()
         })
     }
 

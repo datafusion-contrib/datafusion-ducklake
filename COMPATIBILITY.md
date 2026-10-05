@@ -353,6 +353,19 @@ cover the catalog file on SQLite and DuckDB, and the requested identity on
 PostgreSQL and MySQL. MySQL's pre-existing global-setting setter remains
 unsupported.
 
+An optimistic metadata backend can report a snapshot‑id collision after the
+Parquet files are already staged. The table writer then reads every intervening
+`changes_made` value, applies DuckLake's logical conflict table, and retries
+only the metadata registration when the changes commute. Inserts commute with
+inserts and deletes, but not with a drop or alter of their target. An
+append‑plus‑delete does not commute with a drop, alter, overlapping delete,
+or compaction. Missing or unknown changesets abort conservatively. Retry count,
+backoff, and initial wait are caller‑configurable through
+`ConflictRetryConfig`, with defaults of 10, 1.5, and 100 ms. The shipped SQLite,
+DuckDB, MySQL, and PostgreSQL writers serialize snapshot allocation, so they
+normally avoid this collision path while retaining their existing commit‑time
+fences.
+
 `WriteMode::Replace` (SQL `INSERT OVERWRITE`, and the first write of a table) is
 **abort-on-conflict** under concurrency, matching DuckLake's snapshot isolation:
 

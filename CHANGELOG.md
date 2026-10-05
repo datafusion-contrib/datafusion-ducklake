@@ -48,6 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
   by every writer's schema bootstrap and by existing catalogs on their next
   initialization.
+- Bounded metadata-only retry after a snapshot-id collision when the intervening changes commute,
+  with `ConflictRetryConfig` and `MetadataWriter::snapshot_changes_since` for optimistic backends;
+  the shipped writers are unchanged.
 
 ### Changed
 

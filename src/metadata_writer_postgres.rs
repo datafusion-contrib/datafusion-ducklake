@@ -16,14 +16,14 @@ use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata, StagedTableData,
-    StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    encode_inlined_index_columns, inlined_delete_conflicts, inlined_delete_groups,
-    live_inlined_index_columns, parse_inlined_index_columns, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, table_write_changes, tag_change,
-    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
-    validate_table_setting,
+    MultiTableCommit, PromoteLayout, PromotedFile, SnapshotChanges, SnapshotCommitMetadata,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
+    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
+    tag_change, top_level_column_ids, validate_delete_entries, validate_inlined_index_columns,
+    validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -2935,6 +2935,31 @@ impl MetadataWriter for PostgresMetadataWriter {
             &format!("{}:{identity}", self.catalog_id),
             operation,
         )
+    }
+
+    fn snapshot_changes_since(&self, snapshot_id: i64) -> Result<Vec<SnapshotChanges>> {
+        block_on(async {
+            let rows = sqlx::query(
+                "SELECT s.snapshot_id, c.changes_made
+                 FROM ducklake_snapshot s
+                 JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                 LEFT JOIN ducklake_snapshot_changes c ON c.snapshot_id = s.snapshot_id
+                 WHERE m.catalog_id = $1 AND s.snapshot_id > $2
+                 ORDER BY s.snapshot_id",
+            )
+            .bind(self.catalog_id)
+            .bind(snapshot_id)
+            .fetch_all(&self.pool)
+            .await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(SnapshotChanges {
+                        snapshot_id: row.try_get(0)?,
+                        changes_made: row.try_get(1)?,
+                    })
+                })
+                .collect()
+        })
     }
 
     fn create_snapshot(&self) -> Result<i64> {
