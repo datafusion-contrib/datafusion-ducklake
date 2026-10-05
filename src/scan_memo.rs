@@ -75,13 +75,7 @@ use crate::metadata_provider::{
 /// case cleanup's grace period exists for. A commit to any table of the
 /// catalog moves the head, so on a busy catalog the memo fills again often.
 ///
-/// [`Self::skip_head_check`] turns the check off, so a warm scan reads nothing
-/// from the catalog. The memo then keeps the files of its first listing for
-/// the table's life: **drop such a table before cleanup's grace period
-/// passes**, or a scan of it can fail on a file that is gone. That suits a
-/// caller that keeps a table only while its snapshot is current, for example
-/// one that caches tables by catalog, name and snapshot. A delete memo keeps no
-/// file names, so it needs no check.
+/// A delete memo keeps no file names, so it needs no check.
 ///
 /// Expiring snapshots commits nothing, so the head check does not notice that
 /// the table's own snapshot expired. A table at an expired snapshot cannot be
@@ -104,22 +98,19 @@ use crate::metadata_provider::{
 ///
 /// The delete memo keeps positions until they fill [`Self::delete_memo_bytes`].
 /// It never evicts: once full, it keeps what it has, and other delete files are
-/// read on each scan. Without a catalog memo, each scan lists the files again,
-/// so the entries of data files that a merge or a rewrite replaced stay in the
-/// memo, and count against its budget, until the table is dropped.
+/// read on each scan. A scan that lists the files again, without a catalog
+/// memo or after the head moved, can find that a merge or a rewrite replaced a
+/// data file. The old file's entry stays in the memo, and counts against its
+/// budget, until the table is dropped.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeReadOptions {
-    /// Bytes a table can keep of its first scan's catalog reads. Zero, the
-    /// default, turns the catalog memo off.
+    /// Bytes a table can keep of a scan's catalog reads. Zero, the default,
+    /// turns the catalog memo off.
     pub catalog_memo_bytes: usize,
     /// Bytes of delete-file positions a table can keep across scans. Zero, the
     /// default, turns the delete memo off.
     pub delete_memo_bytes: usize,
-    /// Use the catalog memo without reading the catalog head first, so a warm
-    /// scan reads nothing from the catalog. Off by default; see the head check
-    /// above for what a table that skips it must do.
-    pub skip_head_check: bool,
 }
 
 impl DuckLakeReadOptions {
@@ -151,15 +142,6 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_delete_memo(mut self, max_bytes: usize) -> Self {
         self.delete_memo_bytes = max_bytes;
-        self
-    }
-
-    /// Use the catalog memo without reading the catalog head first. A table
-    /// with these options must be dropped before cleanup's grace period passes;
-    /// see the head check above.
-    #[must_use]
-    pub fn skip_head_check(mut self) -> Self {
-        self.skip_head_check = true;
         self
     }
 
@@ -441,9 +423,6 @@ mod tests {
         let memoized = DuckLakeReadOptions::memoized();
         assert!(memoized.catalog_memo_budget().is_some());
         assert!(DeletePositionMemo::new(memoized.delete_memo_bytes).is_some());
-        // The head check is on unless a caller turns it off.
-        assert!(!memoized.skip_head_check);
-        assert!(memoized.skip_head_check().skip_head_check);
 
         // Setting the field alone is enough: no second knob to forget. Outside
         // this crate `#[non_exhaustive]` rules out a struct literal, so this

@@ -564,6 +564,17 @@ async fn query(ctx: &SessionContext, sql: &str) -> anyhow::Result<String> {
     Ok(pretty_format_batches(&batches)?.to_string())
 }
 
+/// `SELECT count(*)` of table `t`.
+async fn count(ctx: &SessionContext) -> anyhow::Result<i64> {
+    let batches = ctx.sql("SELECT count(*) FROM t").await?.collect().await?;
+    Ok(batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("count(*) is Int64")
+        .value(0))
+}
+
 /// `t`'s id and the snapshot the catalog is at.
 fn table_at_head(provider: &dyn MetadataProvider) -> anyhow::Result<(i64, i64)> {
     let snapshot = provider.get_current_snapshot()?;
@@ -968,43 +979,25 @@ async fn a_commit_during_the_fill_is_not_kept() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Without the head check a warm scan reads nothing from the catalog, and the
-/// memo keeps its first layout for the table's life. Once cleanup removes the
-/// files a later commit replaced, the table can no longer be read: this is why
-/// a table that skips the check must be dropped before cleanup's grace period.
+/// A commit that lands while a scan fills the memo can split the fill's reads.
+/// Here a DELETE replaces the delete file just before the listing, so the
+/// listing holds a delete count that includes a deletion made after the
+/// table's snapshot. The fill sees the head move, so even the scan that filled
+/// the memo does not answer `count(*)` from that count.
 #[tokio::test(flavor = "multi_thread")]
-async fn skipping_the_head_check_keeps_the_first_layout() -> anyhow::Result<()> {
-    let lake = Lake::new(0, THREE_FILES)?;
-    let all = "SELECT id FROM t ORDER BY id";
+async fn a_commit_during_the_fill_does_not_count_from_the_catalog() -> anyhow::Result<()> {
+    let lake = Lake::new(0, WITH_DELETES)?;
     let counting = lake.provider().await?;
-    let (table_id, snapshot) = table_at_head(&counting)?;
-    let options = DuckLakeReadOptions::memoized().skip_head_check();
-    let (ctx, _) = cached_table(&counting, options, false).await?;
-    let before = query(&ctx, all).await?;
-    assert_eq!(counting.take(), fill_calls());
-    assert_eq!(query(&ctx, all).await?, before);
-    assert!(counting.take().is_empty());
+    let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
 
-    lake.run(0, &["CALL ducklake_merge_adjacent_files('lake')"])?;
-    // The merge changed how the table's snapshot is stored: one merged file
-    // now stands for the three.
-    assert_eq!(
-        counting
-            .get_table_files_for_select(table_id, snapshot)?
-            .len(),
-        1
+    counting.before(
+        "get_table_file_metadata_page_filtered",
+        lake.runner(&["DELETE FROM lake.t WHERE id = 5"]),
     );
-    counting.take();
-    // The memo still lists the three, which are scheduled for deletion but
-    // not yet deleted, and they hold the same rows.
-    assert_eq!(query(&ctx, all).await?, before);
-    assert!(counting.take().is_empty());
-
-    lake.run(0, &[CLEANUP_ALL])?;
-    assert!(query(&ctx, all).await.is_err());
-    // A table at the same snapshot that checks the head reads the merged file.
-    let (checked, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
-    assert_eq!(query(&checked, all).await?, before);
+    // Ids 1, 3 and 5 are live at the table's snapshot; the DELETE of 5 came later.
+    for scan in 0..2 {
+        assert_eq!(count(&ctx).await?, 3, "scan {scan}");
+    }
     Ok(())
 }
 
@@ -1066,11 +1059,7 @@ async fn a_memoized_table_at_an_older_snapshot_counts_its_own_rows() -> anyhow::
     let (_, snapshot) = table_at_head(&lake.provider().await?)?;
     lake.run(0, &["DELETE FROM lake.t WHERE id = 5"])?;
 
-    for options in [
-        DuckLakeReadOptions::default(),
-        DuckLakeReadOptions::memoized(),
-        DuckLakeReadOptions::memoized().skip_head_check(),
-    ] {
+    for options in [DuckLakeReadOptions::default(), DuckLakeReadOptions::memoized()] {
         let fixed = DuckLakeCatalog::with_snapshot(Arc::new(lake.provider().await?), snapshot)?
             .with_read_options(options.clone());
         let table = fixed.schema("main").unwrap().table("t").await?.unwrap();
@@ -1078,14 +1067,7 @@ async fn a_memoized_table_at_an_older_snapshot_counts_its_own_rows() -> anyhow::
         ctx.register_table("t", table)?;
         // Ids 1, 3 and 5 are live at the snapshot; the DELETE of 5 came later.
         for scan in 0..2 {
-            let batches = ctx.sql("SELECT count(*) FROM t").await?.collect().await?;
-            let count = batches[0]
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::Int64Array>()
-                .expect("count(*) is Int64")
-                .value(0);
-            assert_eq!(count, 3, "{options:?}, scan {scan}");
+            assert_eq!(count(&ctx).await?, 3, "{options:?}, scan {scan}");
         }
     }
     Ok(())

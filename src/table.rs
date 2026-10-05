@@ -1774,8 +1774,8 @@ impl DuckLakeTable {
     /// no catalog memo, or this table's reads did not fit it: the scan then reads
     /// the catalog itself.
     ///
-    /// Unless the options skip it, the scan first reads the catalog head, and
-    /// uses the memo only if the head has not moved since the memo was filled.
+    /// The scan first reads the catalog head, and uses the memo only if the
+    /// head has not moved since the memo was filled.
     /// Every commit that replaces a file moves the head, so a memo kept at the
     /// current head lists exactly the files a fresh read lists. When the head
     /// moved, the scan fills the memo again. A failed catalog read leaves the
@@ -1791,11 +1791,6 @@ impl DuckLakeTable {
             MemoState::Filled(memo) => Some(Arc::clone(memo)),
             MemoState::Unset => None,
         };
-        if let Some(memo) = &kept
-            && self.read_options.skip_head_check
-        {
-            return Ok(Some((Arc::clone(memo), None)));
-        }
         // A head that cannot be read counts as moved.
         let head = self.provider.get_current_snapshot().ok();
         if let Some(memo) = kept
