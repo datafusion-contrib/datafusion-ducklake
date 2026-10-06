@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `MulticatalogProvider` reads each page of a table's file listing, with its files' column
+  statistics and partition values, in one statement instead of three (#338).
 - **BREAKING**: `ColumnWithTable` gains a required `table_id` field, and `SQL_LIST_ALL_COLUMNS`
   selects `t.table_id` as its third column; add the field to struct literals and shift positional
   reads.
