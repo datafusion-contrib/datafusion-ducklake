@@ -256,6 +256,13 @@ impl MulticatalogProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
+        self.probe_schema_capabilities().await
+    }
+
+    /// Probes the catalog's optional-schema capabilities, whatever the memo
+    /// holds, and memoizes an all-`true` answer as [`Self::schema_capabilities`]
+    /// does.
+    async fn probe_schema_capabilities(&self) -> Result<SchemaCapabilities> {
         let row: (bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
@@ -387,12 +394,12 @@ impl MulticatalogProvider {
             };
             // The page, its files' column statistics and their partition
             // values, in one statement. A catalog without one of the two
-            // tables reads NULL in its place, as the probe found it.
-            let page_sql = |stats_sql: Option<&StatsFilterSql>, enrich: bool| {
+            // tables reads NULL in its place, as `caps` found it.
+            let page_sql = |caps: SchemaCapabilities, stats_sql: Option<&StatsFilterSql>| {
                 fused_page_sql(
                     &listing_sql(stats_sql),
-                    enrich && caps.file_column_stats,
-                    enrich && caps.file_partition_values,
+                    caps.file_column_stats,
+                    caps.file_partition_values,
                 )
             };
 
@@ -401,12 +408,18 @@ impl MulticatalogProvider {
             let fetch = |sql: String| async move {
                 fetch_data_file_page(pool, &sql, table_id, snapshot_id, after, limit).await
             };
-            // A table the probe saw can be gone by the time the page is read,
-            // for example when the probe's answer is memoized. The files are
-            // then listed without statistics or partition values, rather than
-            // the scan failing: both only narrow what a scan reads.
-            let unenriched = || fetch(page_sql(None, false));
-            let rows = match fetch(page_sql(stats_sql.as_ref(), true)).await {
+            let first = fetch(page_sql(caps, stats_sql.as_ref())).await;
+            // A table the memoized probe saw can be gone by now. Probe again,
+            // past the memo, and read the page from the tables there are, so a
+            // missing table costs only what it held, as the separate reads did.
+            let (caps, first) = match first {
+                Err(error) if is_missing_statistics_table(&error) => {
+                    let current = self.probe_schema_capabilities().await?;
+                    (current, fetch(page_sql(current, stats_sql.as_ref())).await)
+                },
+                first => (caps, first),
+            };
+            let rows = match first {
                 Ok(rows) => rows,
                 // The filter is advisory, so a catalog the narrowed query
                 // cannot run — one predating `ducklake_file_column_stats`,
@@ -419,13 +432,8 @@ impl MulticatalogProvider {
                 // surfaces from it.
                 Err(error) if stats_sql.is_some() => {
                     crate::metadata_provider::log_stats_filter_fallback(&error, table_id);
-                    match fetch(page_sql(None, true)).await {
-                        Ok(rows) => rows,
-                        Err(error) if is_missing_statistics_table(&error) => unenriched().await?,
-                        Err(error) => return Err(error.into()),
-                    }
+                    fetch(page_sql(caps, None)).await?
                 },
-                Err(error) if is_missing_statistics_table(&error) => unenriched().await?,
                 Err(error) => return Err(error.into()),
             };
             rows.iter()
@@ -443,14 +451,6 @@ impl MulticatalogProvider {
     }
 }
 
-/// Column of a listing page row at which [`fused_page_sql`] puts the file's
-/// column statistics: seven arrays, one per statistics column, after the 20
-/// columns [`decode_table_file`] reads.
-const PAGE_STATISTICS_COLUMN: usize = 20;
-/// Column at which [`fused_page_sql`] puts the file's partition values: the key
-/// indexes, then the values, after the seven statistics arrays.
-const PAGE_PARTITION_VALUES_COLUMN: usize = PAGE_STATISTICS_COLUMN + 7;
-
 /// One listing page in one statement: `listing` (the page's own query, ending
 /// in its `LIMIT`), then each listed file's column statistics and partition
 /// values.
@@ -463,7 +463,8 @@ const PAGE_PARTITION_VALUES_COLUMN: usize = PAGE_STATISTICS_COLUMN + 7;
 /// every file on the page. Each array is sorted on every column of the row, not
 /// on its key alone, so the arrays of one file stay aligned even if two rows
 /// share a key. `statistics` or `partition_values` false selects NULL in place
-/// of that table, for a catalog that does not have it.
+/// of that table, for a catalog that does not have it. Either way the arrays
+/// carry the same column names, which the decoders read them by.
 ///
 /// The parameters are the listing's own (`$4` is the table id, `$7` the cursor),
 /// so the statement binds exactly what [`fetch_data_file_page`] binds.
@@ -504,8 +505,10 @@ fn fused_page_sql(listing: &str, statistics: bool, partition_values: bool) -> St
          page_statistics.min_values, page_statistics.max_values,
          page_statistics.contains_nans"
     } else {
-        "NULL::bigint[], NULL::bigint[], NULL::bigint[], NULL::bigint[],
-         NULL::text[], NULL::text[], NULL::boolean[]"
+        "NULL::bigint[] AS column_ids, NULL::bigint[] AS column_sizes,
+         NULL::bigint[] AS value_counts, NULL::bigint[] AS null_counts,
+         NULL::text[] AS min_values, NULL::text[] AS max_values,
+         NULL::boolean[] AS contains_nans"
     };
     let partition_columns = if partition_values {
         sql.push_str(&format!(
@@ -530,7 +533,7 @@ fn fused_page_sql(listing: &str, statistics: bool, partition_values: bool) -> St
         );
         "page_partition_values.key_indexes, page_partition_values.key_values"
     } else {
-        "NULL::bigint[], NULL::text[]"
+        "NULL::bigint[] AS key_indexes, NULL::text[] AS key_values"
     };
     sql.push_str(&format!(
         "
@@ -546,17 +549,16 @@ fn decode_page_statistics(
     row: &PgRow,
     data_file_id: i64,
 ) -> Result<Vec<DuckLakeFileColumnStatistics>> {
-    let at = PAGE_STATISTICS_COLUMN;
     // NULL when the file has no statistics, or the catalog no statistics table.
-    let Some(column_ids) = row.try_get::<Option<Vec<i64>>, _>(at)? else {
+    let Some(column_ids) = row.try_get::<Option<Vec<i64>>, _>("column_ids")? else {
         return Ok(Vec::new());
     };
-    let column_sizes: Vec<Option<i64>> = row.try_get(at + 1)?;
-    let value_counts: Vec<Option<i64>> = row.try_get(at + 2)?;
-    let null_counts: Vec<Option<i64>> = row.try_get(at + 3)?;
-    let min_values: Vec<Option<String>> = row.try_get(at + 4)?;
-    let max_values: Vec<Option<String>> = row.try_get(at + 5)?;
-    let contains_nans: Vec<Option<bool>> = row.try_get(at + 6)?;
+    let column_sizes: Vec<Option<i64>> = row.try_get("column_sizes")?;
+    let value_counts: Vec<Option<i64>> = row.try_get("value_counts")?;
+    let null_counts: Vec<Option<i64>> = row.try_get("null_counts")?;
+    let min_values: Vec<Option<String>> = row.try_get("min_values")?;
+    let max_values: Vec<Option<String>> = row.try_get("max_values")?;
+    let contains_nans: Vec<Option<bool>> = row.try_get("contains_nans")?;
     let rows = column_ids.len();
     if [
         column_sizes.len(),
@@ -598,12 +600,11 @@ fn decode_page_statistics(
 /// The partition values [`fused_page_sql`] put on a page row for its file, as
 /// `(partition_key_index, value)` in key order.
 fn decode_page_partition_values(row: &PgRow) -> Result<Vec<(i32, Option<String>)>> {
-    let at = PAGE_PARTITION_VALUES_COLUMN;
     // NULL when the file has no partition values, or the catalog no such table.
-    let Some(key_indexes) = row.try_get::<Option<Vec<i64>>, _>(at)? else {
+    let Some(key_indexes) = row.try_get::<Option<Vec<i64>>, _>("key_indexes")? else {
         return Ok(Vec::new());
     };
-    let values: Vec<Option<String>> = row.try_get(at + 1)?;
+    let values: Vec<Option<String>> = row.try_get("key_values")?;
     if values.len() != key_indexes.len() {
         return Err(crate::DuckLakeError::Internal(
             "the partition value arrays of a listing page differ in length".to_string(),

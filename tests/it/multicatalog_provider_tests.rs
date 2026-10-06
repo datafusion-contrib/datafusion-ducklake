@@ -842,6 +842,80 @@ async fn a_listing_page_carries_each_files_statistics_and_partition_values() {
     }
 }
 
+/// A table the memoized capability probe saw can be gone by the time a page is
+/// read. The page then reads from the tables there are: it keeps what the
+/// other table holds, and a filter that needs only the remaining table still
+/// prunes.
+#[rstest]
+#[case::without_partition_values("ducklake_file_partition_value")]
+#[case::without_column_statistics("ducklake_file_column_stats")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_table_dropped_after_the_probe_costs_only_what_it_held(#[case] dropped: &str) {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let column_id = provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id;
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value
+             (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES ($1, $2, 0, 'a')",
+    )
+    .bind(ids[1])
+    .bind(table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Memoize the probe while both tables exist.
+    provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .unwrap();
+    assert!(provider.schema_capabilities_cached());
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {dropped}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let unfiltered = provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .unwrap();
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(
+            table_id,
+            snapshot_id,
+            None,
+            4096,
+            Some(&seeded_filter(column_id)),
+        )
+        .unwrap();
+    assert_eq!(listed_ids(&unfiltered), ids);
+    let partition_value = vec![(0, Some("a".to_string()))];
+    if dropped == "ducklake_file_partition_value" {
+        // The statistics stay, so the filter, which needs only them, still
+        // prunes file 2.
+        assert_eq!(
+            unfiltered[2].column_statistics[0].min_value.as_deref(),
+            Some("100")
+        );
+        assert_eq!(listed_ids(&filtered), vec![ids[0], ids[1], ids[3], ids[4]]);
+        assert!(
+            filtered
+                .iter()
+                .all(|file| file.file.partition_values.is_empty())
+        );
+    } else {
+        // The partition values stay. Without statistics the filter cannot run,
+        // so every file is listed.
+        assert_eq!(unfiltered[1].file.partition_values, partition_value);
+        assert!(
+            unfiltered
+                .iter()
+                .all(|file| file.column_statistics.is_empty())
+        );
+        assert_eq!(listed_ids(&filtered), ids);
+        assert_eq!(filtered[1].file.partition_values, partition_value);
+    }
+}
+
 /// A catalog without `ducklake_file_partition_value` still lists its files,
 /// with their column statistics.
 #[tokio::test(flavor = "multi_thread")]
