@@ -224,6 +224,30 @@ writer options.
 
 ---
 
+## Schema evolution
+
+Route metadata‑only column changes through `execute_ducklake_sql`. Existing
+top‑level and nested fields keep their DuckLake field IDs across renames and
+lossless type widening:
+
+```rust
+execute_ducklake_sql(&ctx, &catalog, "ALTER TABLE events ADD COLUMN source VARCHAR").await?;
+execute_ducklake_sql(&ctx, &catalog, "ALTER TABLE events RENAME COLUMN id TO event_id").await?;
+execute_ducklake_sql(
+    &ctx,
+    &catalog,
+    "ALTER TABLE events ALTER COLUMN event_id SET TYPE BIGINT",
+)
+.await?;
+execute_ducklake_sql(&ctx, &catalog, "ALTER TABLE events DROP COLUMN source").await?;
+```
+
+Nested struct paths use dot notation, such as `ADD COLUMN profile.zip BIGINT`.
+Type changes accept only lossless widening. SQLite and PostgreSQL writers
+support these operations.
+
+---
+
 ## Partitioning
 
 Partition a table by one or more columns (optionally through a transform) so that queries

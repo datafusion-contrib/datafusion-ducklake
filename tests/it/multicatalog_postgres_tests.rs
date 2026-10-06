@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 use datafusion_ducklake::metadata_writer::{
-    ColumnDef, ColumnStat, DataFileInfo, MetadataWriter, SnapshotCommitMetadata, WriteMode,
+    ColumnChange, ColumnDef, ColumnStat, DataFileInfo, MetadataWriter, SnapshotCommitMetadata,
+    WriteMode,
 };
 use datafusion_ducklake::{
     DuckLakeError, DuckLakeTableWriter, MetadataProvider, MulticatalogManager,
@@ -9510,4 +9511,105 @@ async fn orphan_sweep_keeps_a_catalogs_own_absolute_file_under_its_own_root() {
         "the sweep deleted a live file this catalog owns: {deleted:?}"
     );
     assert!(!dir.join("stray.parquet").exists(), "the orphan is gone");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_column_ddl_preserves_recursive_field_ids() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("column_ddl")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let profile =
+        DataType::Struct(vec![Arc::new(Field::new("city", DataType::Int32, true))].into());
+    let columns = vec![ColumnDef::from_arrow("profile", &profile, true).unwrap()];
+    let setup = writer
+        .begin_write_transaction("public", "nested", &columns, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            setup.table_id,
+            "public",
+            "nested",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+        .unwrap();
+
+    let profile_id = setup.field_ids[0];
+    let city_id = setup.field_ids[1];
+    writer
+        .change_column(
+            setup.table_id,
+            &ColumnChange::Add {
+                path: vec!["profile".into(), "zip".into()],
+                column: ColumnDef::new("zip", "int32", true).unwrap(),
+                if_not_exists: false,
+            },
+        )
+        .unwrap();
+    writer
+        .change_column(
+            setup.table_id,
+            &ColumnChange::Promote {
+                path: vec!["profile".into(), "zip".into()],
+                ducklake_type: "int64".into(),
+            },
+        )
+        .unwrap();
+    writer
+        .change_column(
+            setup.table_id,
+            &ColumnChange::Rename {
+                path: vec!["profile".into(), "zip".into()],
+                new_name: "postal_code".into(),
+            },
+        )
+        .unwrap();
+    writer
+        .change_column(
+            setup.table_id,
+            &ColumnChange::Drop {
+                path: vec!["profile".into(), "city".into()],
+                if_exists: false,
+            },
+        )
+        .unwrap();
+
+    let rows = sqlx::query(
+        "SELECT column_id, column_name, column_type, parent_column
+         FROM ducklake_column WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(setup.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<i64, _>("column_id").unwrap(), profile_id);
+    assert_eq!(
+        rows[0].try_get::<String, _>("column_name").unwrap(),
+        "profile"
+    );
+    assert_eq!(
+        rows[1].try_get::<String, _>("column_name").unwrap(),
+        "postal_code"
+    );
+    assert_eq!(
+        rows[1].try_get::<Option<i64>, _>("parent_column").unwrap(),
+        Some(profile_id)
+    );
+    assert_eq!(
+        rows[1].try_get::<String, _>("column_type").unwrap(),
+        "int64"
+    );
+    assert_ne!(rows[1].try_get::<i64, _>("column_id").unwrap(), city_id);
+    assert_eq!(current_head(&pool, catalog_id).await, 5);
 }
