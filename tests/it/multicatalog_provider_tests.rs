@@ -686,6 +686,263 @@ fn listed_ids(files: &[DuckLakeFileMetadata]) -> Vec<i64> {
     files.iter().map(|file| file.file.data_file_id).collect()
 }
 
+/// One column-statistics row as a listing page reports it: column id, size,
+/// value count, null count, min, max, contains NaN.
+type StatisticRow = (
+    i64,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+);
+
+/// What a listed file carries besides its own row: its column statistics and
+/// partition values, each sorted so a comparison does not depend on order.
+fn enrichment(file: &DuckLakeFileMetadata) -> (Vec<StatisticRow>, Vec<(i32, Option<String>)>) {
+    let mut statistics: Vec<StatisticRow> = file
+        .column_statistics
+        .iter()
+        .map(|statistic| {
+            assert_eq!(statistic.data_file_id, file.file.data_file_id);
+            (
+                statistic.column_id,
+                statistic.column_size_bytes,
+                statistic.value_count,
+                statistic.null_count,
+                statistic.min_value.clone(),
+                statistic.max_value.clone(),
+                statistic.contains_nan,
+            )
+        })
+        .collect();
+    statistics.sort_by_key(|row| row.0);
+    let mut partition_values = file.file.partition_values.clone();
+    partition_values.sort();
+    (statistics, partition_values)
+}
+
+/// Every listed file carries its own column statistics and partition values,
+/// across page boundaries and with or without a filter: one file with
+/// statistics on two columns and partition values on two keys, one whose only
+/// partition value is NULL, and one with neither.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_listing_page_carries_each_files_statistics_and_partition_values() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let column_id = provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id;
+    // A second statistics row for file 1, on a lower column id than the first.
+    let other_column = column_id - 1;
+    sqlx::query(
+        "INSERT INTO ducklake_file_column_stats
+             (data_file_id, table_id, column_id, column_size_bytes, value_count,
+              null_count, min_value, max_value, contains_nan)
+         VALUES ($1, $2, $3, 16, 50, 5, 'a', 'z', true)",
+    )
+    .bind(ids[1])
+    .bind(table_id)
+    .bind(other_column)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (file_index, key_index, value) in
+        [(1usize, 1i64, Some("b")), (1, 0, Some("a")), (3, 0, None::<&str>)]
+    {
+        sqlx::query(
+            "INSERT INTO ducklake_file_partition_value
+                 (data_file_id, table_id, partition_key_index, partition_value)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(ids[file_index])
+        .bind(table_id)
+        .bind(key_index)
+        .bind(value)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let statistic = |column: i64, min: Option<&str>, max: Option<&str>| -> StatisticRow {
+        (
+            column,
+            Some(8),
+            Some(100),
+            Some(0),
+            min.map(str::to_string),
+            max.map(str::to_string),
+            None,
+        )
+    };
+    let expected = |file_index: usize| -> (Vec<StatisticRow>, Vec<(i32, Option<String>)>) {
+        match file_index {
+            0 => (Vec::new(), Vec::new()),
+            1 => (
+                vec![
+                    (
+                        other_column,
+                        Some(16),
+                        Some(50),
+                        Some(5),
+                        Some("a".to_string()),
+                        Some("z".to_string()),
+                        Some(true),
+                    ),
+                    statistic(column_id, Some("0"), Some("10")),
+                ],
+                vec![(0, Some("a".to_string())), (1, Some("b".to_string()))],
+            ),
+            2 => (
+                vec![statistic(column_id, Some("100"), Some("200"))],
+                Vec::new(),
+            ),
+            3 => (
+                vec![statistic(column_id, Some("not-a-number"), Some("also-not-a-number"))],
+                vec![(0, None)],
+            ),
+            _ => (vec![statistic(column_id, None, None)], Vec::new()),
+        }
+    };
+
+    // Two files a page, so the files of one page are not those of the next.
+    let mut listed = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = provider
+            .get_table_file_metadata_page(table_id, snapshot_id, cursor, 2)
+            .unwrap();
+        let Some(last) = page.last() else {
+            break;
+        };
+        cursor = Some(last.file.data_file_id);
+        listed.extend(page);
+    }
+    assert_eq!(listed_ids(&listed), ids);
+    for (file_index, file) in listed.iter().enumerate() {
+        assert_eq!(enrichment(file), expected(file_index), "file {file_index}");
+    }
+
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(
+            table_id,
+            snapshot_id,
+            None,
+            4096,
+            Some(&seeded_filter(column_id)),
+        )
+        .unwrap();
+    assert_eq!(listed_ids(&filtered), vec![ids[0], ids[1], ids[3], ids[4]]);
+    for file in &filtered {
+        let file_index = ids
+            .iter()
+            .position(|id| *id == file.file.data_file_id)
+            .unwrap();
+        assert_eq!(enrichment(file), expected(file_index), "file {file_index}");
+    }
+}
+
+/// A table the memoized capability probe saw can be gone by the time a page is
+/// read. The page then reads from the tables there are: it keeps what the
+/// other table holds, and a filter that needs only the remaining table still
+/// prunes.
+#[rstest]
+#[case::without_partition_values("ducklake_file_partition_value")]
+#[case::without_column_statistics("ducklake_file_column_stats")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_table_dropped_after_the_probe_costs_only_what_it_held(#[case] dropped: &str) {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let column_id = provider.get_table_structure(table_id, snapshot_id).unwrap()[0].column_id;
+    sqlx::query(
+        "INSERT INTO ducklake_file_partition_value
+             (data_file_id, table_id, partition_key_index, partition_value)
+         VALUES ($1, $2, 0, 'a')",
+    )
+    .bind(ids[1])
+    .bind(table_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Memoize the probe while both tables exist.
+    provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .unwrap();
+    assert!(provider.schema_capabilities_cached());
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {dropped}")))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let unfiltered = provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .unwrap();
+    let filtered = provider
+        .get_table_file_metadata_page_filtered(
+            table_id,
+            snapshot_id,
+            None,
+            4096,
+            Some(&seeded_filter(column_id)),
+        )
+        .unwrap();
+    assert_eq!(listed_ids(&unfiltered), ids);
+    let partition_value = vec![(0, Some("a".to_string()))];
+    if dropped == "ducklake_file_partition_value" {
+        // The statistics stay, so the filter, which needs only them, still
+        // prunes file 2.
+        assert_eq!(
+            unfiltered[2].column_statistics[0].min_value.as_deref(),
+            Some("100")
+        );
+        assert_eq!(listed_ids(&filtered), vec![ids[0], ids[1], ids[3], ids[4]]);
+        assert!(
+            filtered
+                .iter()
+                .all(|file| file.file.partition_values.is_empty())
+        );
+    } else {
+        // The partition values stay. Without statistics the filter cannot run,
+        // so every file is listed.
+        assert_eq!(unfiltered[1].file.partition_values, partition_value);
+        assert!(
+            unfiltered
+                .iter()
+                .all(|file| file.column_statistics.is_empty())
+        );
+        assert_eq!(listed_ids(&filtered), ids);
+        assert_eq!(filtered[1].file.partition_values, partition_value);
+    }
+}
+
+/// A catalog without `ducklake_file_partition_value` still lists its files,
+/// with their column statistics.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_listing_page_keeps_statistics_on_a_catalog_without_partition_values() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot_id, ids) = seed_filter_catalog(&pool).await.unwrap();
+    sqlx::query("DROP TABLE ducklake_file_partition_value")
+        .execute(&pool)
+        .await
+        .expect("drop the partition value table");
+
+    let listed = provider
+        .get_table_file_metadata_page(table_id, snapshot_id, None, 4096)
+        .expect("a catalog without partition values must still list its files");
+    assert_eq!(listed_ids(&listed), ids);
+    assert_eq!(
+        listed[2].column_statistics[0].min_value.as_deref(),
+        Some("100")
+    );
+    assert!(
+        listed
+            .iter()
+            .all(|file| file.file.partition_values.is_empty())
+    );
+}
+
 #[rstest]
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
