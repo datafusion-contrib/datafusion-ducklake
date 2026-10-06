@@ -318,6 +318,9 @@ impl MulticatalogProvider {
             crate::DuckLakeError::InvalidConfig("file metadata page limit exceeds i64".to_string())
         })?;
         block_on(async {
+            // A probe that finds a table missing is not memoized, so an answer the
+            // memo did not give is current, and probing again would repeat it.
+            let memoized = self.schema_capabilities.get().is_some();
             let caps = self.schema_capabilities().await?;
             let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max::bigint"
@@ -413,7 +416,7 @@ impl MulticatalogProvider {
             // past the memo, and read the page from the tables there are, so a
             // missing table costs only what it held, as the separate reads did.
             let (caps, first) = match first {
-                Err(error) if is_missing_statistics_table(&error) => {
+                Err(error) if memoized && is_missing_statistics_table(&error) => {
                     let current = self.probe_schema_capabilities().await?;
                     (current, fetch(page_sql(current, stats_sql.as_ref())).await)
                 },
