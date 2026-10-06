@@ -152,8 +152,14 @@ impl SchemaCapabilities {
 /// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
 /// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Nothing drops the table
 /// once it exists, so "exists" holds for good. "Absent" holds for reads at or
-/// below the snapshot it was seen at: a deletion committed later has a later
-/// snapshot, which such a read does not see.
+/// below the catalog's head at the time of the check: a deletion committed
+/// later takes a snapshot above that head, which such a read does not see.
+///
+/// Official reads only committed snapshots, so its check is always at or below
+/// the head. This crate also accepts a snapshot above the head (for example
+/// from `DuckLakeCatalog::with_snapshot`), and a later commit can still create
+/// that snapshot. So absence is recorded up to the lower of the snapshot read
+/// and the head, never above the head.
 #[derive(Debug, Clone, Copy)]
 enum InlinedDeletionTable {
     Exists,
@@ -283,19 +289,31 @@ impl MulticatalogProvider {
             },
             _ => {},
         }
-        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
-            .bind(table)
-            .fetch_one(&self.pool)
-            .await?;
+        // The head is read in the same statement as the check, so both describe
+        // one state of the catalog.
+        let (exists, head): (bool, i64) = sqlx::query_as(
+            "SELECT to_regclass($1) IS NOT NULL,
+                    (SELECT COALESCE(MAX(snapshot_id), 0)
+                     FROM ducklake_catalog_snapshot_map
+                     WHERE catalog_id = $2)",
+        )
+        .bind(table)
+        .bind(self.catalog_id)
+        .fetch_one(&self.pool)
+        .await?;
+        // Commits to one catalog take their snapshots in commit order, each
+        // above the last, so any deletion committed after this check has a
+        // snapshot above `head`.
+        let absent_through = snapshot_id.min(head);
         let mut tables = self.inlined_deletion_tables();
         let entry = tables
             .entry(table_id)
-            .or_insert(InlinedDeletionTable::AbsentThrough(snapshot_id));
+            .or_insert(InlinedDeletionTable::AbsentThrough(absent_through));
         *entry = match (*entry, exists) {
             // A read beside this one may already have seen the table.
             (_, true) | (InlinedDeletionTable::Exists, false) => InlinedDeletionTable::Exists,
             (InlinedDeletionTable::AbsentThrough(seen), false) => {
-                InlinedDeletionTable::AbsentThrough(seen.max(snapshot_id))
+                InlinedDeletionTable::AbsentThrough(seen.max(absent_through))
             },
         };
         Ok(exists)

@@ -844,3 +844,50 @@ async fn inlined_deletions_are_read_at_the_snapshot_asked_for() {
             .is_empty()
     );
 }
+
+/// A read pinned above the catalog's head must not make the provider remember
+/// absence past that head. Here a clone reads one snapshot ahead, then another
+/// client commits that snapshot with the table's first inlined deletion. A read
+/// at the new head must see the deletion. Remembering absence through the
+/// snapshot read would hide it: then a merge would fold the file without its
+/// deletion, and the deleted row would come back for every reader.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_read_above_the_head_does_not_hide_a_later_inlined_deletion() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, _, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    assert!(
+        provider
+            .clone()
+            .get_inlined_deletes(table_id, head + 1)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Another client commits the next snapshot, with the first inlined
+    // deletion from the table.
+    let committed: i64 =
+        sqlx::query_scalar("INSERT INTO ducklake_snapshot DEFAULT VALUES RETURNING snapshot_id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)",
+    )
+    .bind(provider.catalog_id())
+    .bind(committed)
+    .execute(&pool)
+    .await
+    .unwrap();
+    create_inlined_deletion_table(&pool, table_id, &[(ids[1], 0, committed)])
+        .await
+        .unwrap();
+
+    let latest = provider.get_current_snapshot().unwrap();
+    assert_eq!(latest, committed);
+    assert_eq!(
+        deleted(&provider.get_inlined_deletes(table_id, latest).unwrap()),
+        vec![(ids[1], 0)]
+    );
+}
