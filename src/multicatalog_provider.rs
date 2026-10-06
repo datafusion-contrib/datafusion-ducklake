@@ -35,7 +35,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -153,6 +153,27 @@ impl SchemaCapabilities {
     }
 }
 
+/// What a provider knows about one table's inlined-deletion table,
+/// `ducklake_inlined_delete_<table_id>`, which the table's first inlined
+/// deletion creates.
+///
+/// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
+/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Nothing drops the table
+/// once it exists, so "exists" holds for good. "Absent" holds for reads at or
+/// below the catalog's head at the time of the check: a deletion committed
+/// later takes a snapshot above that head, which such a read does not see.
+///
+/// Official reads only committed snapshots, so its check is always at or below
+/// the head. This crate also accepts a snapshot above the head (for example
+/// from `DuckLakeCatalog::with_snapshot`), and a later commit can still create
+/// that snapshot. So absence is recorded up to the lower of the snapshot read
+/// and the head, never above the head.
+#[derive(Debug, Clone, Copy)]
+enum InlinedDeletionTable {
+    Exists,
+    AbsentThrough(i64),
+}
+
 /// Catalog-scoped Postgres metadata reader.
 ///
 /// Construct with [`Self::with_pool`] (name-keyed; resolves to `catalog_id` once
@@ -165,6 +186,9 @@ pub struct MulticatalogProvider {
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
     schema_capabilities: Arc<OnceLock<SchemaCapabilities>>,
+    // Each table's inlined-deletion table, by table id, as far as this provider
+    // has looked (see `InlinedDeletionTable`). Shared across clones.
+    inlined_deletion_tables: Arc<Mutex<HashMap<i64, InlinedDeletionTable>>>,
 }
 
 impl MulticatalogProvider {
@@ -208,6 +232,7 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
+            inlined_deletion_tables: Arc::default(),
         })
     }
 
@@ -229,6 +254,7 @@ impl MulticatalogProvider {
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
+            inlined_deletion_tables: Arc::default(),
         })
     }
 
@@ -240,6 +266,65 @@ impl MulticatalogProvider {
     #[doc(hidden)]
     pub fn schema_capabilities_cached(&self) -> bool {
         self.schema_capabilities.get().is_some()
+    }
+
+    /// This provider's memo of inlined-deletion tables, locked. It is never
+    /// held across a catalog read.
+    fn inlined_deletion_tables(&self) -> MutexGuard<'_, HashMap<i64, InlinedDeletionTable>> {
+        self.inlined_deletion_tables
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `table_id`'s inlined-deletion table, named `table`, exists for a
+    /// read at `snapshot_id`.
+    ///
+    /// The memo answers when it can (see [`InlinedDeletionTable`]). Otherwise
+    /// `to_regclass` is asked. Unlike a read of a missing table, it raises no
+    /// error, so reading a table without inlined deletions never issues a
+    /// failing statement.
+    async fn inlined_deletion_table_exists(
+        &self,
+        table_id: i64,
+        table: &str,
+        snapshot_id: i64,
+    ) -> Result<bool> {
+        let known = self.inlined_deletion_tables().get(&table_id).copied();
+        match known {
+            Some(InlinedDeletionTable::Exists) => return Ok(true),
+            Some(InlinedDeletionTable::AbsentThrough(seen)) if snapshot_id <= seen => {
+                return Ok(false);
+            },
+            _ => {},
+        }
+        // The head is read in the same statement as the check, so both describe
+        // one state of the catalog.
+        let (exists, head): (bool, i64) = sqlx::query_as(
+            "SELECT to_regclass($1) IS NOT NULL,
+                    (SELECT COALESCE(MAX(snapshot_id), 0)
+                     FROM ducklake_catalog_snapshot_map
+                     WHERE catalog_id = $2)",
+        )
+        .bind(table)
+        .bind(self.catalog_id)
+        .fetch_one(&self.pool)
+        .await?;
+        // Commits to one catalog take their snapshots in commit order, each
+        // above the last, so any deletion committed after this check has a
+        // snapshot above `head`.
+        let absent_through = snapshot_id.min(head);
+        let mut tables = self.inlined_deletion_tables();
+        let entry = tables
+            .entry(table_id)
+            .or_insert(InlinedDeletionTable::AbsentThrough(absent_through));
+        *entry = match (*entry, exists) {
+            // A read beside this one may already have seen the table.
+            (_, true) | (InlinedDeletionTable::Exists, false) => InlinedDeletionTable::Exists,
+            (InlinedDeletionTable::AbsentThrough(seen), false) => {
+                InlinedDeletionTable::AbsentThrough(seen.max(absent_through))
+            },
+        };
+        Ok(exists)
     }
 
     /// Returns the catalog's optional-schema capabilities, probing at most
@@ -1509,8 +1594,44 @@ impl MetadataProvider for MulticatalogProvider {
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedDelete>> {
-        self.inlined_provider
-            .get_inlined_deletes(table_id, snapshot_id)
+        let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+        block_on(async {
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, snapshot_id)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            // The name is built from the table id alone.
+            let sql = format!(
+                "SELECT file_id, row_id FROM \"{table}\"
+                 WHERE begin_snapshot <= $1
+                 ORDER BY file_id, row_id"
+            );
+            match sqlx::query(AssertSqlSafe(sql))
+                .bind(snapshot_id)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| {
+                        Ok(DuckLakeInlinedDelete {
+                            data_file_id: row.try_get(0)?,
+                            row_id: row.try_get(1)?,
+                        })
+                    })
+                    .collect(),
+                // The table was seen, and is gone. Nothing in this crate drops
+                // one, but a missing table holds no deletions to apply, which is
+                // what a read of it has always returned.
+                Err(error) if is_missing_statistics_table(&error) => {
+                    self.inlined_deletion_tables().remove(&table_id);
+                    Ok(Vec::new())
+                },
+                Err(error) => Err(error.into()),
+            }
+        })
     }
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {

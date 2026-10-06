@@ -968,3 +968,183 @@ async fn catalog_setting_deterministically_overrides_shared_global_setting() -> 
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Inlined deletions
+// ---------------------------------------------------------------------------
+
+/// Create table `table_id`'s inlined-deletion table, as the first inlined
+/// deletion from it does, holding `rows` of `(file_id, row_id, begin_snapshot)`.
+async fn create_inlined_deletion_table(
+    pool: &PgPool,
+    table_id: i64,
+    rows: &[(i64, i64, i64)],
+) -> anyhow::Result<()> {
+    let table = format!("ducklake_inlined_delete_{table_id}");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE \"{table}\" (file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)"
+    )))
+    .execute(pool)
+    .await?;
+    for (file_id, row_id, begin_snapshot) in rows {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO \"{table}\" (file_id, row_id, begin_snapshot) VALUES ($1, $2, $3)"
+        )))
+        .bind(file_id)
+        .bind(row_id)
+        .bind(begin_snapshot)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+fn deleted(
+    deletes: &[datafusion_ducklake::metadata_provider::DuckLakeInlinedDelete],
+) -> Vec<(i64, i64)> {
+    deletes
+        .iter()
+        .map(|delete| (delete.data_file_id, delete.row_id))
+        .collect()
+}
+
+/// A table without an inlined-deletion table has no inlined deletions, and the
+/// provider remembers that for reads at or below the snapshot it looked at, as
+/// official DuckLake does. A read at a later snapshot looks again, and once the
+/// table exists, every read uses it.
+///
+/// The deletion at `snapshot` below is back-dated: a real one would carry the
+/// later snapshot of the commit that made it. It is what lets the test see that
+/// the read at `snapshot` takes the remembered answer instead of looking again.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_missing_inlined_deletion_table_is_remembered_up_to_the_snapshot_read() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot, ids) = seed_filter_catalog(&pool).await.unwrap();
+
+    assert!(
+        provider
+            .get_inlined_deletes(table_id, snapshot)
+            .unwrap()
+            .is_empty()
+    );
+
+    create_inlined_deletion_table(
+        &pool,
+        table_id,
+        &[(ids[0], 1, snapshot), (ids[1], 2, snapshot + 1)],
+    )
+    .await
+    .unwrap();
+
+    // Remembered as absent through `snapshot`: not looked at again.
+    assert!(
+        provider
+            .get_inlined_deletes(table_id, snapshot)
+            .unwrap()
+            .is_empty()
+    );
+    // A later snapshot looks again and finds the table.
+    assert_eq!(
+        deleted(
+            &provider
+                .get_inlined_deletes(table_id, snapshot + 1)
+                .unwrap()
+        ),
+        vec![(ids[0], 1), (ids[1], 2)]
+    );
+    // Now known to exist, so a read at `snapshot` reads it too.
+    assert_eq!(
+        deleted(&provider.get_inlined_deletes(table_id, snapshot).unwrap()),
+        vec![(ids[0], 1)]
+    );
+}
+
+/// Inlined deletions are read at the snapshot asked for, and a table dropped
+/// after the provider saw it reads as no deletions rather than an error.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn inlined_deletions_are_read_at_the_snapshot_asked_for() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, snapshot, ids) = seed_filter_catalog(&pool).await.unwrap();
+    create_inlined_deletion_table(
+        &pool,
+        table_id,
+        &[(ids[2], 7, snapshot), (ids[0], 3, snapshot), (ids[1], 1, snapshot + 1)],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        deleted(&provider.get_inlined_deletes(table_id, snapshot).unwrap()),
+        vec![(ids[0], 3), (ids[2], 7)]
+    );
+    assert_eq!(
+        deleted(
+            &provider
+                .get_inlined_deletes(table_id, snapshot + 1)
+                .unwrap()
+        ),
+        vec![(ids[0], 3), (ids[1], 1), (ids[2], 7)]
+    );
+
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE \"ducklake_inlined_delete_{table_id}\""
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        provider
+            .get_inlined_deletes(table_id, snapshot)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A read pinned above the catalog's head must not make the provider remember
+/// absence past that head. Here a clone reads one snapshot ahead, then another
+/// client commits that snapshot with the table's first inlined deletion. A read
+/// at the new head must see the deletion. Remembering absence through the
+/// snapshot read would hide it: then a merge would fold the file without its
+/// deletion, and the deleted row would come back for every reader.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_read_above_the_head_does_not_hide_a_later_inlined_deletion() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (provider, table_id, _, ids) = seed_filter_catalog(&pool).await.unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    assert!(
+        provider
+            .clone()
+            .get_inlined_deletes(table_id, head + 1)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Another client commits the next snapshot, with the first inlined
+    // deletion from the table.
+    let committed: i64 =
+        sqlx::query_scalar("INSERT INTO ducklake_snapshot DEFAULT VALUES RETURNING snapshot_id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id) VALUES ($1, $2)",
+    )
+    .bind(provider.catalog_id())
+    .bind(committed)
+    .execute(&pool)
+    .await
+    .unwrap();
+    create_inlined_deletion_table(&pool, table_id, &[(ids[1], 0, committed)])
+        .await
+        .unwrap();
+
+    let latest = provider.get_current_snapshot().unwrap();
+    assert_eq!(latest, committed);
+    assert_eq!(
+        deleted(&provider.get_inlined_deletes(table_id, latest).unwrap()),
+        vec![(ids[1], 0)]
+    );
+}
