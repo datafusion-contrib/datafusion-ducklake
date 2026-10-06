@@ -118,6 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column of a table with wide columns beside it read nearly the whole table. On a test fixture
   with a 1536-byte binary column and a 256-character text column, resolving one key read
   about 10 KB of a 14 MB file instead of all of it. Resolved positions are unchanged.
+- `MulticatalogProvider` checks that a table's inlined-deletion table exists before reading it,
+  and remembers the answer as official DuckLake does, instead of catching a failed read (#338).
 
 ### Fixed
 
