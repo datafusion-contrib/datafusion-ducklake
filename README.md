@@ -145,7 +145,9 @@ let catalog = DuckLakeCatalog::new(provider)?
 The first scan of a table fills its memos. Each later scan of that table reads only the catalog
 head. If a commit moved the head, the scan fills the memos again, so it never reads a file that a
 later commit replaced. A catalog lookup builds a new table for each statement, so the memos help
-only a caller that keeps the table. See `DuckLakeReadOptions` for the budgets.
+only a caller that keeps the table. A refill makes one catalog call more than a scan without a
+memo. On a catalog that commits between most scans, the memos cost more than they save. See
+`DuckLakeReadOptions` for the budgets.
 
 ---
 

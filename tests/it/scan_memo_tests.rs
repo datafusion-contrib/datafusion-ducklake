@@ -3,7 +3,8 @@
 //! memos of `DuckLakeReadOptions` (#338).
 //!
 //! The catalogs are written by official DuckLake through DuckDB, with their
-//! metadata in SQLite so a test can commit while a table is open. A
+//! metadata in SQLite, or in PostgreSQL for the tests in [`postgres`], so a
+//! test can commit while a table is open. A
 //! [`CountingProvider`] counts the catalog calls each scan makes, and a
 //! [`ReadCountingStore`] counts the reads of each file.
 
@@ -450,18 +451,42 @@ impl object_store::ObjectStore for ReadCountingStore {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-/// A DuckLake catalog in a temporary directory, its metadata in SQLite and its
-/// data in Parquet, written by official DuckLake.
+/// A DuckLake catalog in a temporary directory, its data in Parquet and its
+/// metadata in SQLite or PostgreSQL, written by official DuckLake.
 struct Lake {
     dir: TempDir,
+    metadata: Metadata,
+}
+
+/// Where a [`Lake`] keeps its metadata.
+#[derive(Clone)]
+enum Metadata {
+    /// A SQLite file in the lake's directory.
+    Sqlite,
+    /// A database on a PostgreSQL server, by its sqlx URL and its libpq string.
+    #[cfg(feature = "metadata-postgres")]
+    Postgres {
+        url: String,
+        libpq: String,
+    },
 }
 
 impl Lake {
-    /// A catalog that `statements` set up, with inserts of at most
-    /// `inlining_rows` rows inlined into the catalog.
+    /// A catalog with SQLite metadata that `statements` set up, with inserts of
+    /// at most `inlining_rows` rows inlined into the catalog.
     fn new(inlining_rows: usize, statements: &[&str]) -> anyhow::Result<Self> {
+        Self::with_metadata(Metadata::Sqlite, inlining_rows, statements)
+    }
+
+    /// [`Self::new`], with its metadata in `metadata`.
+    fn with_metadata(
+        metadata: Metadata,
+        inlining_rows: usize,
+        statements: &[&str],
+    ) -> anyhow::Result<Self> {
         let lake = Self {
             dir: TempDir::new()?,
+            metadata,
         };
         std::fs::create_dir_all(lake.data_path())?;
         lake.run(inlining_rows, statements)?;
@@ -476,10 +501,28 @@ impl Lake {
         self.dir.path().join("data")
     }
 
+    /// The DuckDB extension that reads the metadata, and the catalog's
+    /// `ATTACH` path.
+    fn attach(&self) -> (&'static str, String) {
+        match &self.metadata {
+            Metadata::Sqlite => (
+                "sqlite",
+                format!("ducklake:sqlite:{}", self.catalog_path().display()),
+            ),
+            #[cfg(feature = "metadata-postgres")]
+            Metadata::Postgres {
+                libpq,
+                ..
+            } => ("postgres", format!("ducklake:postgres:{libpq}")),
+        }
+    }
+
     /// Run `statements` through DuckDB with the catalog attached as `lake`.
     fn run(&self, inlining_rows: usize, statements: &[&str]) -> anyhow::Result<()> {
+        let (extension, attach) = self.attach();
         run_duckdb(
-            &self.catalog_path(),
+            extension,
+            &attach,
             &self.data_path(),
             inlining_rows,
             statements,
@@ -488,34 +531,62 @@ impl Lake {
 
     /// [`Self::run`], as a closure to hand a [`CountingProvider`] hook.
     fn runner(&self, statements: &'static [&'static str]) -> impl FnOnce() + Send + 'static {
-        let (catalog, data) = (self.catalog_path(), self.data_path());
-        move || run_duckdb(&catalog, &data, 0, statements).expect("DuckDB statements")
+        let ((extension, attach), data) = (self.attach(), self.data_path());
+        move || run_duckdb(extension, &attach, &data, 0, statements).expect("DuckDB statements")
     }
 
     async fn provider(&self) -> anyhow::Result<CountingProvider> {
-        let url = format!("sqlite:{}", self.catalog_path().display());
-        Ok(CountingProvider::new(Arc::new(
-            SqliteMetadataProvider::new(&url).await?,
-        )))
+        let inner: Arc<dyn MetadataProvider> = match &self.metadata {
+            Metadata::Sqlite => {
+                let url = format!("sqlite:{}", self.catalog_path().display());
+                Arc::new(SqliteMetadataProvider::new(&url).await?)
+            },
+            #[cfg(feature = "metadata-postgres")]
+            Metadata::Postgres {
+                url,
+                ..
+            } => Arc::new(datafusion_ducklake::PostgresMetadataProvider::new(url).await?),
+        };
+        Ok(CountingProvider::new(inner))
+    }
+}
+
+/// Makes the catalogs of one test: SQLite files, or databases on one
+/// PostgreSQL server.
+enum Backend {
+    Sqlite,
+    #[cfg(feature = "metadata-postgres")]
+    Postgres(Box<postgres::Server>),
+}
+
+impl Backend {
+    /// A new catalog that `statements` set up; see [`Lake::new`].
+    async fn lake(&self, inlining_rows: usize, statements: &[&str]) -> anyhow::Result<Lake> {
+        let metadata = match self {
+            Self::Sqlite => Metadata::Sqlite,
+            #[cfg(feature = "metadata-postgres")]
+            Self::Postgres(server) => server.database().await?,
+        };
+        Lake::with_metadata(metadata, inlining_rows, statements)
     }
 }
 
 fn run_duckdb(
-    catalog: &std::path::Path,
+    extension: &str,
+    attach: &str,
     data: &std::path::Path,
     inlining_rows: usize,
     statements: &[&str],
 ) -> anyhow::Result<()> {
     common::ensure_ducklake_installed();
-    common::ensure_extension_installed("sqlite");
+    common::ensure_extension_installed(extension);
     let conn = duckdb::Connection::open_in_memory()?;
-    conn.execute("LOAD sqlite", [])?;
+    conn.execute(&format!("LOAD {extension}"), [])?;
     conn.execute("LOAD ducklake", [])?;
     conn.execute(
         &format!(
-            "ATTACH 'ducklake:sqlite:{}' AS lake \
+            "ATTACH '{attach}' AS lake \
              (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {inlining_rows})",
-            catalog.display(),
             data.display()
         ),
         [],
@@ -660,7 +731,11 @@ async fn without_a_memo_each_scan_reads_the_catalog_again() -> anyhow::Result<()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_memoized_table_reads_only_the_catalog_head_after_its_first_scan() -> anyhow::Result<()> {
-    let lake = Lake::new(0, WITH_DELETES)?;
+    reads_only_the_catalog_head_after_its_first_scan(&Backend::Sqlite).await
+}
+
+async fn reads_only_the_catalog_head_after_its_first_scan(backend: &Backend) -> anyhow::Result<()> {
+    let lake = backend.lake(0, WITH_DELETES).await?;
     let plain = lake.provider().await?;
     let (plain_ctx, _) = cached_table(&plain, DuckLakeReadOptions::default(), false).await?;
     let counting = lake.provider().await?;
@@ -897,7 +972,11 @@ async fn a_memoized_table_keeps_reading_its_snapshot() -> anyhow::Result<()> {
 /// the next scan fill the memo again: once, after which the head is still.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_to_another_table_fills_the_memo_again() -> anyhow::Result<()> {
-    let lake = Lake::new(0, THREE_FILES)?;
+    commit_to_another_table_fills_the_memo_again(&Backend::Sqlite).await
+}
+
+async fn commit_to_another_table_fills_the_memo_again(backend: &Backend) -> anyhow::Result<()> {
+    let lake = backend.lake(0, THREE_FILES).await?;
     let all = "SELECT id FROM t ORDER BY id";
     let counting = lake.provider().await?;
     let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
@@ -921,6 +1000,12 @@ async fn a_commit_to_another_table_fills_the_memo_again() -> anyhow::Result<()> 
 /// replaced files at once, and the memoized table still reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replacing_commit_fills_the_memo_again_before_cleanup() -> anyhow::Result<()> {
+    replacing_commit_fills_the_memo_again_before_cleanup(&Backend::Sqlite).await
+}
+
+async fn replacing_commit_fills_the_memo_again_before_cleanup(
+    backend: &Backend,
+) -> anyhow::Result<()> {
     for (fixture, inlining_rows, replace) in [
         (THREE_FILES, 0, "CALL ducklake_merge_adjacent_files('lake')"),
         (WITH_DELETES, 0, "DELETE FROM lake.t WHERE id = 5"),
@@ -931,7 +1016,7 @@ async fn a_replacing_commit_fills_the_memo_again_before_cleanup() -> anyhow::Res
         ),
         (INLINED, 10, "CALL ducklake_flush_inlined_data('lake')"),
     ] {
-        let lake = Lake::new(inlining_rows, fixture)?;
+        let lake = backend.lake(inlining_rows, fixture).await?;
         let all = "SELECT * FROM t ORDER BY 1";
         let counting = lake.provider().await?;
         let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
@@ -986,7 +1071,13 @@ async fn a_commit_during_the_fill_is_not_kept() -> anyhow::Result<()> {
 /// the memo does not answer `count(*)` from that count.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_commit_during_the_fill_does_not_count_from_the_catalog() -> anyhow::Result<()> {
-    let lake = Lake::new(0, WITH_DELETES)?;
+    commit_during_the_fill_does_not_count_from_the_catalog(&Backend::Sqlite).await
+}
+
+async fn commit_during_the_fill_does_not_count_from_the_catalog(
+    backend: &Backend,
+) -> anyhow::Result<()> {
+    let lake = backend.lake(0, WITH_DELETES).await?;
     let counting = lake.provider().await?;
     let (ctx, _) = cached_table(&counting, DuckLakeReadOptions::memoized(), false).await?;
 
@@ -1148,4 +1239,95 @@ async fn the_delete_memo_follows_a_replaced_delete_file() -> anyhow::Result<()> 
     assert_eq!(query(&ctx, all).await?, before);
     assert_eq!(store.take_reads_of("-delete.parquet"), 0);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL metadata
+// ---------------------------------------------------------------------------
+
+/// The catalog memo on PostgreSQL metadata: the same head check and fill guards
+/// as the SQLite tests above, through the PostgreSQL provider, whose head is
+/// the newest snapshot of the catalog.
+#[cfg(feature = "metadata-postgres")]
+mod postgres {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use testcontainers::ContainerAsync;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    use super::*;
+
+    /// A PostgreSQL server in a container, for the catalogs of one test.
+    pub(super) struct Server {
+        _container: ContainerAsync<Postgres>,
+        port: u16,
+        databases: AtomicUsize,
+    }
+
+    impl Server {
+        async fn start() -> anyhow::Result<Self> {
+            let container = Postgres::default().start().await?;
+            let port = container.get_host_port_ipv4(5432).await?;
+            Ok(Self {
+                _container: container,
+                port,
+                databases: AtomicUsize::new(0),
+            })
+        }
+
+        fn url(&self, database: &str) -> String {
+            format!(
+                "postgresql://postgres:postgres@127.0.0.1:{}/{database}",
+                self.port
+            )
+        }
+
+        /// A new, empty database on this server, so that each catalog of a
+        /// test starts empty.
+        pub(super) async fn database(&self) -> anyhow::Result<Metadata> {
+            let name = format!("lake_{}", self.databases.fetch_add(1, Ordering::Relaxed));
+            let admin = sqlx::PgPool::connect(&self.url("postgres")).await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+                .execute(&admin)
+                .await?;
+            admin.close().await;
+            Ok(Metadata::Postgres {
+                url: self.url(&name),
+                libpq: format!(
+                    "host=127.0.0.1 port={} dbname={name} user=postgres password=postgres",
+                    self.port
+                ),
+            })
+        }
+    }
+
+    async fn backend() -> anyhow::Result<Backend> {
+        Ok(Backend::Postgres(Box::new(Server::start().await?)))
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memoized_table_reads_only_the_catalog_head_after_its_first_scan()
+    -> anyhow::Result<()> {
+        reads_only_the_catalog_head_after_its_first_scan(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_to_another_table_fills_the_memo_again() -> anyhow::Result<()> {
+        commit_to_another_table_fills_the_memo_again(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacing_commit_fills_the_memo_again_before_cleanup() -> anyhow::Result<()> {
+        replacing_commit_fills_the_memo_again_before_cleanup(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_during_the_fill_does_not_count_from_the_catalog() -> anyhow::Result<()> {
+        commit_during_the_fill_does_not_count_from_the_catalog(&backend().await?).await
+    }
 }

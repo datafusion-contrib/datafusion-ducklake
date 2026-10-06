@@ -72,14 +72,21 @@ use crate::metadata_provider::{
 /// and fills the memo again when the head moved since the fill. A scan thus
 /// never plans over a replaced file, and cleanup cannot delete a file that a
 /// scan is about to read, except one that is already running, which is the
-/// case cleanup's grace period exists for. A commit to any table of the
-/// catalog moves the head, so on a busy catalog the memo fills again often.
+/// case cleanup's grace period exists for.
+///
+/// A commit to any table of the catalog moves the head. A scan that then fills
+/// the memo again makes one more catalog call than a scan without a memo, 5
+/// against 4, and lists the files without the scan's filters. So the memo pays
+/// off only when most scans find the head where the fill left it. On a catalog
+/// that commits between most scans, it costs more than no memo.
 ///
 /// A delete memo keeps no file names, so it needs no check.
 ///
 /// Expiring snapshots commits nothing, so the head check does not notice that
-/// the table's own snapshot expired. A table at an expired snapshot cannot be
-/// read without a memo either, as in official DuckLake.
+/// the table's own snapshot expired. Official DuckLake refuses to read an
+/// expired snapshot. This crate does not check for one: a table at an expired
+/// snapshot lists only the files that a remaining snapshot still uses, and a
+/// memoized table reads the files of its fill until cleanup deletes them.
 ///
 /// # Budgets
 ///
