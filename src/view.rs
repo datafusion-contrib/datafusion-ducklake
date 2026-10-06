@@ -19,6 +19,7 @@ use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::catalog::DuckLakeCatalog;
 use crate::metadata_provider::{MetadataProvider, SchemaMetadata, ViewMetadata};
+use crate::scan_memo::DuckLakeReadOptions;
 use crate::snapshot_consistency::ViewGuard;
 
 const VIEW_CATALOG: &str = "__ducklake_view";
@@ -69,6 +70,7 @@ tokio::task_local! {
     static VIEW_PLAN_STACK: RefCell<Vec<i64>>;
 }
 
+#[allow(clippy::too_many_arguments, reason = "the view's catalog settings stay explicit")]
 pub(crate) async fn plan_view(
     view: &ViewMetadata,
     sql: &str,
@@ -76,6 +78,7 @@ pub(crate) async fn plan_view(
     snapshot_id: i64,
     schema_name: &str,
     row_lineage: bool,
+    read_options: DuckLakeReadOptions,
     view_guards: Option<Arc<Vec<ViewGuard>>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let cycle = VIEW_PLAN_STACK
@@ -96,6 +99,7 @@ pub(crate) async fn plan_view(
             snapshot_id,
             schema_name,
             row_lineage,
+            read_options,
             view_guards,
         )
         .await;
@@ -114,6 +118,7 @@ pub(crate) async fn plan_view(
                     snapshot_id,
                     schema_name,
                     row_lineage,
+                    read_options,
                     view_guards,
                 ),
             )
@@ -121,6 +126,7 @@ pub(crate) async fn plan_view(
     }
 }
 
+#[allow(clippy::too_many_arguments, reason = "the view's catalog settings stay explicit")]
 async fn plan_view_inner(
     view: &ViewMetadata,
     sql: &str,
@@ -128,6 +134,7 @@ async fn plan_view_inner(
     snapshot_id: i64,
     schema_name: &str,
     row_lineage: bool,
+    read_options: DuckLakeReadOptions,
     view_guards: Option<Arc<Vec<ViewGuard>>>,
 ) -> Result<Arc<dyn TableProvider>> {
     let dialect = Dialect::from_str(&view.dialect).map_err(|e| view_error(view, e))?;
@@ -140,6 +147,7 @@ async fn plan_view_inner(
     let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot_id)
         .map_err(|e| view_error(view, e))?
         .with_row_lineage(row_lineage)
+        .with_read_options(read_options)
         .with_view_guards(view_guards);
     context.register_catalog(VIEW_CATALOG, Arc::new(catalog));
 

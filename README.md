@@ -129,6 +129,26 @@ let df = ctx.sql("SELECT * FROM ducklake.main.my_table").await?;
 df.show().await?;
 ```
 
+### Keeping a table's reads across queries
+
+By default, every scan of a table reads the catalog again: the file list, the inlined rows and
+deletions, and each delete file that the scan reaches. A caller that keeps built tables across
+queries, for example in a cache keyed by table and snapshot, can keep these reads instead:
+
+```rust,ignore
+use datafusion_ducklake::DuckLakeReadOptions;
+
+let catalog = DuckLakeCatalog::new(provider)?
+    .with_read_options(DuckLakeReadOptions::memoized());
+```
+
+The first scan of a table fills its memos. Each later scan of that table reads only the catalog
+head. If a commit moved the head, the scan fills the memos again, so it never reads a file that a
+later commit replaced. A catalog lookup builds a new table for each statement, so the memos help
+only a caller that keeps the table. A refill makes one catalog call more than a scan without a
+memo. On a catalog that commits between most scans, the memos cost more than they save. See
+`DuckLakeReadOptions` for the budgets.
+
 ---
 
 ## Writing a catalog

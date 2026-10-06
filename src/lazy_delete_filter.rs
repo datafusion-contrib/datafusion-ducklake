@@ -46,6 +46,7 @@ use object_store::path::Path as ObjectPath;
 use tokio::sync::OnceCell;
 
 use crate::row_lineage::references_only_prefix;
+use crate::scan_memo::DeletePositionMemo;
 use crate::table::{DELETE_POS_COL, DELETE_SNAPSHOT_COL, is_object_store_not_found};
 
 /// One data file's deletes, as the catalog lists them.
@@ -71,7 +72,9 @@ pub(crate) struct FileDeletes {
 /// can be split into byte ranges read by different partitions, and nothing here
 /// learns when the last of them is done. The sets are not reserved against the
 /// session's memory pool; they hold one `i64` per deleted row of each data file
-/// the scan has reached.
+/// the scan has reached. A table whose read options keep a delete memo also
+/// keeps the sets it reads after the plan is dropped, within the memo's budget;
+/// see [`crate::DuckLakeReadOptions`].
 ///
 /// The input carries, at `file_id_index`, the data file's catalog id — the same
 /// on every row of a file — and at `pos_index` the row's physical position in the
@@ -95,6 +98,9 @@ pub(crate) struct LazyDeleteFilterExec {
     /// only warms the per-file cache; a file whose delete set is not ready when
     /// its rows arrive has it read then, so any order gives the same rows.
     read_order: Arc<Vec<Vec<i64>>>,
+    /// The table's delete memo, when its read options keep one: positions read
+    /// by an earlier scan of the table are taken from it instead of the file.
+    position_memo: Option<Arc<DeletePositionMemo>>,
     properties: Arc<PlanProperties>,
 }
 
@@ -126,6 +132,7 @@ impl LazyDeleteFilterExec {
             Arc::new(loaded),
             object_store_url,
             Arc::new(Vec::new()),
+            None,
         ))
     }
 
@@ -134,6 +141,12 @@ impl LazyDeleteFilterExec {
     /// hint; see the field's docs.
     pub(crate) fn with_read_order(mut self, read_order: Vec<Vec<i64>>) -> Self {
         self.read_order = Arc::new(read_order);
+        self
+    }
+
+    /// Take delete sets from, and keep them in, the table's delete memo.
+    pub(crate) fn with_position_memo(mut self, memo: Option<Arc<DeletePositionMemo>>) -> Self {
+        self.position_memo = memo;
         self
     }
 
@@ -148,6 +161,7 @@ impl LazyDeleteFilterExec {
         loaded: Arc<HashMap<i64, OnceCell<Arc<HashSet<i64>>>>>,
         object_store_url: ObjectStoreUrl,
         read_order: Arc<Vec<Vec<i64>>>,
+        position_memo: Option<Arc<DeletePositionMemo>>,
     ) -> Self {
         // Rows are dropped, never reordered, and the dropped columns trail the
         // kept ones, so the input's orderings over the kept columns hold.
@@ -184,6 +198,7 @@ impl LazyDeleteFilterExec {
             loaded,
             object_store_url,
             read_order,
+            position_memo,
             properties,
         }
     }
@@ -261,6 +276,7 @@ impl ExecutionPlan for LazyDeleteFilterExec {
             Arc::clone(&self.loaded),
             self.object_store_url.clone(),
             Arc::clone(&self.read_order),
+            self.position_memo.clone(),
         )))
     }
 
@@ -305,6 +321,7 @@ impl ExecutionPlan for LazyDeleteFilterExec {
                     Arc::clone(&self.loaded),
                     self.object_store_url.clone(),
                     Arc::clone(&self.read_order),
+                    self.position_memo.clone(),
                 )))
             },
         )
@@ -325,6 +342,7 @@ impl ExecutionPlan for LazyDeleteFilterExec {
             loaded: Arc::clone(&self.loaded),
             object_store_url: self.object_store_url.clone(),
             read_order: self.read_order.get(partition).cloned().unwrap_or_default(),
+            position_memo: self.position_memo.clone(),
         });
         // Owned by the stream alone, so dropping the stream — a `LIMIT` above
         // having what it needs — aborts the reads started ahead.
@@ -387,6 +405,7 @@ struct BatchFilter {
     object_store_url: ObjectStoreUrl,
     /// This partition's data files with deletes, in the scan's read order.
     read_order: Vec<i64>,
+    position_memo: Option<Arc<DeletePositionMemo>>,
 }
 
 /// Delete-set reads a partition's stream has started ahead of the scan.
@@ -469,23 +488,51 @@ impl BatchFilter {
             return Ok(Arc::new(HashSet::new()));
         };
         cell.get_or_try_init(|| async {
-            let mut deleted = file.inlined.clone();
-            if let Some((scan, path)) = &file.delete_file {
-                deleted.extend(
-                    read_delete_positions(
-                        scan,
-                        context,
-                        &self.object_store_url,
-                        path,
-                        file.read_snapshot,
-                    )
-                    .await?,
-                );
+            let Some((scan, path)) = &file.delete_file else {
+                return Ok(Arc::new(file.inlined.clone()));
+            };
+            let from_file = self
+                .delete_file_positions(file_id, scan, path, file.read_snapshot, context)
+                .await?;
+            if file.inlined.is_empty() {
+                return Ok(from_file);
             }
+            let mut deleted = file.inlined.clone();
+            deleted.extend(from_file.iter());
             Ok::<_, DataFusionError>(Arc::new(deleted))
         })
         .await
         .cloned()
+    }
+
+    /// The positions data file `file_id`'s delete file at `path` removes, from
+    /// the table's delete memo when an earlier scan kept them, else read from
+    /// the file and kept.
+    async fn delete_file_positions(
+        &self,
+        file_id: i64,
+        scan: &Arc<dyn ExecutionPlan>,
+        path: &str,
+        read_snapshot: Option<i64>,
+        context: &Arc<TaskContext>,
+    ) -> DataFusionResult<Arc<HashSet<i64>>> {
+        let Some(memo) = &self.position_memo else {
+            return Ok(Arc::new(
+                read_delete_positions(scan, context, &self.object_store_url, path, read_snapshot)
+                    .await?,
+            ));
+        };
+        if let Some(positions) = memo.get(file_id, path, read_snapshot) {
+            return Ok(positions);
+        }
+        let mut positions =
+            read_delete_positions(scan, context, &self.object_store_url, path, read_snapshot)
+                .await?;
+        // Kept past this scan, so give back the slack the reads left.
+        positions.shrink_to_fit();
+        let positions = Arc::new(positions);
+        memo.insert(file_id, path, read_snapshot, &positions);
+        Ok(positions)
     }
 }
 

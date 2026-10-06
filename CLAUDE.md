@@ -48,7 +48,8 @@ The codebase follows a layered architecture with clear separation of concerns:
    - Bridges DuckLake concepts to DataFusion's catalog system
    - `DuckLakeCatalog`: Implements `CatalogProvider`, uses dynamic metadata lookup (queries on every call to `schema()` and `schema_names()`)
    - `DuckLakeSchema`: Implements `SchemaProvider`, uses dynamic metadata lookup (queries on every call to `table()` and `table_names()`)
-   - `DuckLakeTable`: Implements `TableProvider`, caches table structure and file lists at creation time
+   - `DuckLakeTable`: Implements `TableProvider`, caches table structure at creation time and reads the
+     file list at each scan, unless `DuckLakeReadOptions` keeps the first scan's reads (see below)
    - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching
 
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
@@ -61,6 +62,12 @@ The codebase follows a layered architecture with clear separation of concerns:
 
 4. **Additional capabilities**
    - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)
+   - `scan_memo.rs`: `DuckLakeReadOptions` (off by default) lets a table keep its first scan's catalog reads
+     (listing, inlined rows and deletes, current-snapshot answer; all or nothing, and only from a fill
+     during which the head did not move) and each data file's delete positions. Each later scan reads the
+     catalog head and fills the memo again when it moved, because every commit that replaces a file (a
+     DELETE, merge, rewrite or flush) moves it. Only `scan()` uses the memos; `files()`,
+     `files_matching()` and the write paths read the catalog
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
    - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
@@ -108,8 +115,8 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
   - `new()`: O(1) - just stores IDs and paths
 
 - **DuckLakeTable** (`table.rs`):
-  - Still caches table structure and file lists at creation time
-  - This is necessary for query planning and execution
+  - Caches table structure at creation time, which query planning needs
+  - Reads the file list at each scan, or once with `DuckLakeReadOptions` (`scan_memo.rs`)
 
 **Benefits**:
 - O(1) memory usage regardless of catalog size
@@ -119,7 +126,8 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
 
 **Trade-offs**:
 - Small query overhead per metadata lookup (acceptable for typical catalog sizes)
-- Future optimization: Add optional caching layer via wrapper implementation
+- A table's own scans can reuse their catalog reads through `DuckLakeReadOptions`; catalog and schema
+  lookups have no caching layer
 
 ### Data Flow
 
@@ -265,7 +273,8 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - DuckDB-encrypted (non-PME) Parquet files are not supported
 - Inlined rows participate in scans and `COUNT(*)`; see `COMPATIBILITY.md` for
   mutation and CDC limits.
-- No optional metadata caching layer (all lookups are dynamic)
+- Catalog and schema lookups are dynamic. Only a table's own scans can reuse their reads, through the
+  opt-in `DuckLakeReadOptions`
 
 ### Testing
 The project includes comprehensive tests (`tests/it/`, ~50 integration modules plus unit
@@ -286,7 +295,7 @@ Representative groups:
 - **Writes**: `write_tests.rs`, `sql_write_tests.rs`, `concurrent_write_tests.rs`, `insert_partitioning_tests.rs`, `postgres_single_catalog_write_tests.rs`
 - **Backends**: `sqlite_metadata_provider_test.rs`, `postgres_metadata_provider_test.rs`, `mysql_metadata_provider_test.rs`, `hybrid_asyncdb.rs`
 - **Multicatalog**: `multicatalog_provider_tests.rs`, `multicatalog_postgres_tests.rs`, `multicatalog_hardening_tests.rs`
-- **Capabilities**: `information_schema_test.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
+- **Capabilities**: `information_schema_test.rs`, `scan_memo_tests.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
 - **Concurrency & object store**: `concurrent_tests.rs`, `object_store_integration_test.rs`
 - **SQL logic tests**: `sqllogictest_runner.rs` driving `tests/sqllogictests/`
 - **Test data generation**: helpers in `tests/it/common/mod.rs` — each test builds its own

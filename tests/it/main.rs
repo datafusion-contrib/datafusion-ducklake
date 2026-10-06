@@ -77,6 +77,7 @@ mod resolve_positions_projection_tests;
 mod row_count_tests;
 mod row_id_tests;
 mod rowid_physical_position_tests;
+mod scan_memo_tests;
 mod scan_statistics_tests;
 mod scoped_settings_tests;
 mod session_parquet_options_tests;
