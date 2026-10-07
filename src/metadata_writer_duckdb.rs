@@ -40,6 +40,7 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
+use crate::metadata_writer::PENDING_BEGIN_SNAPSHOT;
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
@@ -1257,8 +1258,13 @@ fn record_table_changes(
         params![table_id, snapshot_id],
         |row| row.get(0),
     )?;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id)?;
     let mut changes = Vec::new();
-    if schema_begin_snapshot == snapshot_id {
+    if schema_was_created {
         let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
         let recorded: Option<String> = tx
             .query_row(
@@ -1272,7 +1278,7 @@ fn record_table_changes(
             changes.push(entry);
         }
     }
-    if table_begin_snapshot == snapshot_id {
+    if table_was_created {
         changes.push(format!(
             "created_table:{}",
             quote_snapshot_table(schema_name, table_name)
@@ -1282,6 +1288,23 @@ fn record_table_changes(
     }
     changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata)
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+fn publish_pending_rows(tx: &Transaction<'_>, table_id: i64, snapshot_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+        params![snapshot_id, PENDING_BEGIN_SNAPSHOT, table_id],
+    )?;
+    tx.execute(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+        params![snapshot_id, table_id, PENDING_BEGIN_SNAPSHOT],
+    )?;
+    Ok(())
 }
 
 /// Bump the per-catalog monotonic `schema_version` on a DDL snapshot to
@@ -4478,7 +4501,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_schema (schema_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, true, ?) RETURNING schema_id",
-                    params![schema_name, directory_path(schema_name), snapshot_id],
+                    params![schema_name, directory_path(schema_name), PENDING_BEGIN_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }
@@ -4498,7 +4521,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 None => tx.query_row(
                     "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
                      VALUES (?, ?, ?, true, ?) RETURNING table_id",
-                    params![schema_id, table_name, directory_path(table_name), snapshot_id],
+                    params![schema_id, table_name, directory_path(table_name), PENDING_BEGIN_SNAPSHOT],
                     |row| row.get(0),
                 )?,
             }

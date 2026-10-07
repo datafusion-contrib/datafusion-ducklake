@@ -35,6 +35,7 @@ use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::maintenance::{ExpireCriteria, ExpiredSnapshot, format_sql_timestamp};
 use crate::metadata_provider::block_on;
+use crate::metadata_writer::PENDING_BEGIN_SNAPSHOT;
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
@@ -1126,8 +1127,13 @@ async fn record_table_changes(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
+    let schema_was_created =
+        schema_begin_snapshot == PENDING_BEGIN_SNAPSHOT || schema_begin_snapshot == snapshot_id;
+    let table_was_created =
+        table_begin_snapshot == PENDING_BEGIN_SNAPSHOT || table_begin_snapshot == snapshot_id;
+    publish_pending_rows(tx, table_id, snapshot_id).await?;
     let mut changes = Vec::new();
-    if schema_begin_snapshot == snapshot_id {
+    if schema_was_created {
         let entry = format!("created_schema:{}", quote_snapshot_name(schema_name));
         let recorded: Option<String> = sqlx::query_scalar(
             "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = ?",
@@ -1140,7 +1146,7 @@ async fn record_table_changes(
             changes.push(entry);
         }
     }
-    if table_begin_snapshot == snapshot_id {
+    if table_was_created {
         changes.push(format!(
             "created_table:{}",
             quote_snapshot_table(schema_name, table_name)
@@ -1150,6 +1156,35 @@ async fn record_table_changes(
     }
     changes.push(write_changes.to_string());
     record_snapshot_changes(tx, snapshot_id, &changes.join(","), commit_metadata).await
+}
+
+/// Stamp `snapshot_id` on the table row, and on its schema row, that this write
+/// inserted at begin with [`PENDING_BEGIN_SNAPSHOT`].
+async fn publish_pending_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    table_id: i64,
+    snapshot_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE ducklake_schema SET begin_snapshot = ?
+         WHERE begin_snapshot = ?
+           AND schema_id = (SELECT schema_id FROM ducklake_table WHERE table_id = ?)",
+    )
+    .bind(snapshot_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_table SET begin_snapshot = ?
+         WHERE table_id = ? AND begin_snapshot = ?",
+    )
+    .bind(snapshot_id)
+    .bind(table_id)
+    .bind(PENDING_BEGIN_SNAPSHOT)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Give legacy `data_path`, schema path, and table path values the trailing `/`
@@ -4739,7 +4774,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     )
                     .bind(schema_name)
                     .bind(directory_path(schema_name))
-                    .bind(snapshot_id)
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64
@@ -4766,7 +4801,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(schema_id)
                     .bind(table_name)
                     .bind(directory_path(table_name))
-                    .bind(snapshot_id)
+                    .bind(PENDING_BEGIN_SNAPSHOT)
                     .execute(&mut *tx)
                     .await?;
                     result.last_insert_id() as i64
