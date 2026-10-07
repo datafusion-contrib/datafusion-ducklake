@@ -35,15 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `finish`, so an orphan-file sweep's `older_than` cutoff must be earlier than the start of
   the longest write that may still be running.
 - The `ducklake.upload_staged_files` span times only the uploads still running at `finish`.
+- **BREAKING** for `MetadataWriter` implementors: a write session or multi-table transaction
+  now removes the files it uploaded when a commit returns any error other than
+  `CommitOutcomeUnknown`. An implementation must return any other error only when nothing
+  was committed, and `CommitOutcomeUnknown` when its `COMMIT` failed with an unknown outcome.
 
 ### Fixed
 
 - A write session whose commit fails with nothing committed removes the data and delete
   files it uploaded, on every session path — rolling, partitioned, single-file, and
   `finish_with_deletes` — as official DuckLake does; so does a multi-table transaction whose
-  commit fails with nothing committed. Before, only a conflict or validation failure did. A
+  commit fails with nothing committed. Before, a session removed nothing on a failed commit,
+  and a multi-table transaction removed its files only on a conflict or validation failure. A
   `COMMIT` that fails on PostgreSQL or MySQL keeps them, since it may have applied; official
-  removes them there too.
+  removes them there too. A multi-table transaction whose cleanup fails now returns the commit
+  error and logs the cleanup failure.
 
 ## [0.9.0] - 2026-10-07
 

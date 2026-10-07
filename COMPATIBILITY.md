@@ -293,9 +293,21 @@ publishing schema or table rows.
 
 `DuckLakeWriteTransaction` finalizes new or existing tables on DuckDB, SQLite,
 MySQL, and both PostgreSQL layouts. Every stage must retain its schema and field
-IDs. A conflict rejects the whole commit. Definite rejections remove staged
-objects; ambiguous database or transport failures retain them for guarded vacuum.
-Snapshot-column staging validates its inputs before uploading any objects.
+IDs. A conflict rejects the whole commit. Snapshot-column staging validates its
+inputs before uploading any objects.
+
+A commit that fails with nothing committed removes the data and delete files it
+uploaded, as official DuckLake does; this covers `DuckLakeWriteTransaction` and
+every `TableWriteSession` path, but not yet the buffered `write_table` /
+`append_table` paths, which leave their files to the orphan sweep on any commit
+failure. A failure is classified by phase: anything raised
+before `COMMIT`, and a `COMMIT` failure on DuckDB or SQLite, means nothing was
+committed. One deliberate divergence: when the `COMMIT` statement itself fails on
+PostgreSQL or MySQL (`DuckLakeError::CommitOutcomeUnknown`), the server may have
+applied it, so the files are kept and left to the orphan sweep. Official removes
+them there too, which can leave a committed snapshot naming deleted objects and
+every later read of the table failing. Keeping them costs at most unreferenced
+objects until the next orphan sweep past its `older_than` cutoff.
 
 Ordinary append stages commute. Callers can explicitly require an unchanged
 base snapshot with `expected_base_snapshot_id`, including for append stages.

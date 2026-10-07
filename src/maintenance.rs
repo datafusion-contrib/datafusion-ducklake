@@ -515,6 +515,10 @@ pub async fn delete_orphaned_files_sqlite(
 
 /// List the DuckDB catalog's `data_path` and delete every unreferenced Parquet
 /// file.
+///
+/// An `OlderThan` cutoff must be earlier than the start of the longest write that may still
+/// be running: a streaming write puts each file in the data path as soon as it is finished
+/// and commits them all at the end.
 #[cfg(feature = "write-duckdb")]
 pub async fn delete_orphaned_files_duckdb(
     writer: &crate::metadata_writer_duckdb::DuckdbMetadataWriter,
@@ -532,6 +536,10 @@ pub async fn delete_orphaned_files_duckdb(
 /// All roots must resolve to the same object-store authority because this API
 /// accepts one object store. Use [`delete_orphaned_files_in_data_path`] with the
 /// matching store when one metadata database spans multiple authorities.
+///
+/// An `OlderThan` cutoff must be earlier than the start of the longest write that may still
+/// be running: a streaming write puts each file in the data path as soon as it is finished
+/// and commits them all at the end.
 #[cfg(feature = "write-postgres")]
 pub async fn delete_orphaned_files_multicatalog(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -581,6 +589,10 @@ pub async fn delete_orphaned_files_multicatalog(
 ///
 /// The sweep includes every catalog root nested under that path because object-store listing is
 /// recursive. References from every included root are retained.
+///
+/// An `OlderThan` cutoff must be earlier than the start of the longest write that may still
+/// be running: a streaming write puts each file in the data path as soon as it is finished
+/// and commits them all at the end.
 #[cfg(feature = "write-postgres")]
 pub async fn delete_orphaned_files_in_catalog(
     mgr: &crate::multicatalog::MulticatalogManager,
@@ -598,6 +610,10 @@ pub async fn delete_orphaned_files_in_catalog(
 ///
 /// `object_store` must serve the authority parsed from `data_path`. The object-store trait does not
 /// expose its authority for runtime validation.
+///
+/// An `OlderThan` cutoff must be earlier than the start of the longest write that may still
+/// be running: a streaming write puts each file in the data path as soon as it is finished
+/// and commits them all at the end.
 #[cfg(feature = "write-postgres")]
 pub async fn delete_orphaned_files_in_data_path(
     mgr: &crate::multicatalog::MulticatalogManager,

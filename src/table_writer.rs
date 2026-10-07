@@ -2251,7 +2251,7 @@ impl DuckLakeWriteTransaction<'_> {
     /// Stages inserted rows and deletes for one table.
     ///
     /// The transaction takes ownership of the positional delete objects and removes them if the
-    /// transaction aborts or its metadata commit fails.
+    /// transaction aborts or its metadata commit fails with nothing committed.
     #[allow(clippy::too_many_arguments)]
     pub async fn stage_write_with_deletes(
         &mut self,
@@ -2303,7 +2303,7 @@ impl DuckLakeWriteTransaction<'_> {
     /// Stages deletes for a table without inserting replacement rows.
     ///
     /// The transaction takes ownership of the positional delete objects and removes them if the
-    /// transaction aborts or its metadata commit fails.
+    /// transaction aborts or its metadata commit fails with nothing committed.
     pub fn stage_deletes(
         &mut self,
         schema_name: &str,
@@ -2381,12 +2381,12 @@ impl DuckLakeWriteTransaction<'_> {
                 // networked COMMIT that failed may still have applied, and
                 // deleting the objects then would leave a committed snapshot
                 // pointing at missing files. See `commit_definitely_rolled_back`.
+                // A cleanup failure is logged rather than returned, so the caller still
+                // sees the commit error it decides a retry on.
                 if commit_definitely_rolled_back(&e)
                     && let Err(cleanup) = self.cleanup().await
                 {
-                    return Err(crate::error::DuckLakeError::Internal(format!(
-                        "multi-table commit failed: {e}; staged-file cleanup failed: {cleanup}"
-                    )));
+                    tracing::warn!(error = %cleanup, "failed to remove a file of a rejected commit");
                 }
                 return Err(e);
             },
