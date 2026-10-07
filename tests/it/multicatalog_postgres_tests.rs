@@ -9511,3 +9511,198 @@ async fn orphan_sweep_keeps_a_catalogs_own_absolute_file_under_its_own_root() {
     );
     assert!(!dir.join("stray.parquet").exists(), "the orphan is gone");
 }
+
+// ---------------------------------------------------------------------------
+// Read sessions
+// ---------------------------------------------------------------------------
+
+/// A catalog `session` holding table `public.t`, written as two Parquet files
+/// with ids 1 to 5, and a second pool on the same database: `connections`
+/// connections, giving up on a wait after two seconds. Returns the catalog id,
+/// the second pool and the directory the files are in.
+async fn session_fixture(pool: &PgPool, connections: u32) -> (i64, PgPool, tempfile::TempDir) {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("session")
+        .await
+        .unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let table_writer = DuckLakeTableWriter::new(Arc::new(writer), store).unwrap();
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+        "id",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = |ids: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::clone(&schema) as Arc<Schema>,
+            vec![Arc::new(Int64Array::from(ids))],
+        )
+        .unwrap()
+    };
+    table_writer
+        .write_table("public", "t", &[batch(vec![1, 2, 3])])
+        .await
+        .unwrap();
+    table_writer
+        .append_table("public", "t", &[batch(vec![4, 5])])
+        .await
+        .unwrap();
+
+    let small = PgPoolOptions::new()
+        .max_connections(connections)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    (catalog_id, small, temp)
+}
+
+/// One query's scans read the catalog on its read session alone. The test holds
+/// the only other connection of a two-connection pool while the query plans and
+/// runs, so a catalog read that went to the pool would wait out the pool's
+/// two-second timeout and fail the query.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_query_reads_the_catalog_on_its_read_session_alone() {
+    use arrow::array::Int64Array;
+    use datafusion::catalog::CatalogProvider;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, DuckLakeTable};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (catalog_id, small, _data) = session_fixture(&pool, 2).await;
+    let provider = MulticatalogProvider::with_pool_and_id(small.clone(), catalog_id)
+        .await
+        .unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::new(provider.clone()), head).unwrap();
+    let table = catalog
+        .schema("public")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = table
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLake table");
+
+    let session = provider.begin_read_session().await.unwrap();
+    let per_query = table.with_metadata_provider(Arc::new(provider.with_read_session(&session)));
+    let held = small.acquire().await.unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(per_query)).unwrap();
+    let batches = ctx
+        .sql("SELECT id FROM t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    drop(held);
+    session.end().await;
+    // Both connections are back in the pool.
+    let _first = small.acquire().await.unwrap();
+    let _second = small.acquire().await.unwrap();
+}
+
+/// Each read a scan makes runs on the session's connection: on a one-connection
+/// pool whose only connection the session holds, every one of them still
+/// answers. Once the session ends, the same provider reads through the pool.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn every_read_a_scan_makes_runs_on_the_read_session() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (catalog_id, small, _data) = session_fixture(&pool, 1).await;
+    let provider = MulticatalogProvider::with_pool_and_id(small.clone(), catalog_id)
+        .await
+        .unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let schema = provider
+        .get_schema_by_name("public", head)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", head)
+        .unwrap()
+        .unwrap();
+    let columns = provider.get_table_structure(table.table_id, head).unwrap();
+
+    let session = provider.begin_read_session().await.unwrap();
+    let bound = provider.with_read_session(&session);
+    assert_eq!(bound.get_current_snapshot().unwrap(), head);
+    assert_eq!(
+        bound
+            .get_table_file_metadata_page(table.table_id, head, None, 4096)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        bound
+            .get_inlined_deletes(table.table_id, head)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        bound
+            .scan_inlined_data(table.table_id, head, &columns, None)
+            .unwrap()
+            .batches
+            .is_empty()
+    );
+    // Not a pool timeout: the lookup ran, on the session, and found nothing.
+    let missing = bound.get_name_mapping(i64::MAX).unwrap_err().to_string();
+    assert!(missing.contains("does not exist"), "{missing}");
+
+    session.end().await;
+    assert_eq!(bound.get_current_snapshot().unwrap(), head);
+}
+
+/// Dropping the last handle to a session that was never ended gives its
+/// connection back to the pool.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn dropping_an_open_read_session_returns_its_connection() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let (catalog_id, small, _data) = session_fixture(&pool, 1).await;
+    let provider = MulticatalogProvider::with_pool_and_id(small.clone(), catalog_id)
+        .await
+        .unwrap();
+    let session = provider.begin_read_session().await.unwrap();
+    let bound = provider.with_read_session(&session);
+    drop(session);
+    drop(bound);
+    small
+        .acquire()
+        .await
+        .expect("the dropped session gives its connection back");
+}

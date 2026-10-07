@@ -25,14 +25,17 @@ use crate::metadata_provider::{
     reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::metadata_provider_postgres::{
-    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, stats_filter_sql,
+    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, scan_inlined_data_on,
+    stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_filter::StatsFilter;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::{PgArguments, PgPool, PgPoolOptions, PgRow, Postgres};
+use sqlx::query::Query;
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -124,6 +127,9 @@ struct SchemaCapabilities {
     /// The `ducklake_file_partition_value` table exists. A listing page carries
     /// each file's partition values only when it does.
     file_partition_values: bool,
+    /// The `ducklake_inlined_data_tables` registry exists, which a scan reads to
+    /// find a table's inlined rows.
+    inlined_data_tables: bool,
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
@@ -150,6 +156,7 @@ impl SchemaCapabilities {
             && self.views
             && self.file_column_stats
             && self.file_partition_values
+            && self.inlined_data_tables
     }
 }
 
@@ -174,6 +181,51 @@ enum InlinedDeletionTable {
     AbsentThrough(i64),
 }
 
+/// One pooled connection for the catalog reads of one query.
+///
+/// Take one with [`MulticatalogProvider::begin_read_session`], and bind a
+/// provider's scan reads to it with [`MulticatalogProvider::with_read_session`].
+/// The scans of the query then read the catalog on this connection alone,
+/// instead of taking one from the pool for every statement.
+///
+/// [`Self::end`] gives the connection back to the pool. A provider still bound
+/// to an ended session reads through the pool again, so a read that comes late
+/// still works. Dropping the last handle to an open session gives the
+/// connection back as well.
+#[derive(Debug, Clone)]
+pub struct MetadataReadSession {
+    inner: Arc<ReadSessionInner>,
+}
+
+#[derive(Debug)]
+struct ReadSessionInner {
+    // `None` once the session ends. A lock rather than a plain cell because
+    // DataFusion can plan several scans of one query at once: their statements
+    // take turns on the connection.
+    connection: tokio::sync::Mutex<Option<PoolConnection<Postgres>>>,
+}
+
+impl MetadataReadSession {
+    /// Give the connection back to the pool. Reads through a provider bound to
+    /// this session use the pool from now on. Ending an ended session does
+    /// nothing.
+    pub async fn end(&self) {
+        let connection = self.inner.connection.lock().await.take();
+        drop(connection);
+    }
+}
+
+impl Drop for ReadSessionInner {
+    fn drop(&mut self) {
+        // sqlx returns a connection to its pool from a task it spawns, which
+        // needs a runtime. The catalog runtime always has one; the thread that
+        // drops the last handle might not.
+        if let Some(connection) = self.connection.get_mut().take() {
+            crate::metadata_provider::catalog_runtime().spawn(async move { drop(connection) });
+        }
+    }
+}
+
 /// Catalog-scoped Postgres metadata reader.
 ///
 /// Construct with [`Self::with_pool`] (name-keyed; resolves to `catalog_id` once
@@ -189,6 +241,9 @@ pub struct MulticatalogProvider {
     // Each table's inlined-deletion table, by table id, as far as this provider
     // has looked (see `InlinedDeletionTable`). Shared across clones.
     inlined_deletion_tables: Arc<Mutex<HashMap<i64, InlinedDeletionTable>>>,
+    // The read session a scan's reads run on, when this provider is bound to
+    // one (see `MetadataReadSession`).
+    read_session: Option<Arc<ReadSessionInner>>,
 }
 
 impl MulticatalogProvider {
@@ -233,6 +288,7 @@ impl MulticatalogProvider {
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
+            read_session: None,
         })
     }
 
@@ -255,11 +311,110 @@ impl MulticatalogProvider {
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
+            read_session: None,
         })
     }
 
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Take one connection from this provider's pool for the catalog reads of
+    /// one query. See [`MetadataReadSession`].
+    ///
+    /// The connection is taken on the runtime this crate drives catalog I/O on,
+    /// as [`Self::new`] opens its pool, so a connection the pool opens for it
+    /// registers there.
+    pub async fn begin_read_session(&self) -> Result<MetadataReadSession> {
+        let pool = self.pool.clone();
+        let connection =
+            crate::metadata_provider::connect_on_catalog_runtime(
+                async move { pool.acquire().await },
+            )
+            .await?;
+        Ok(MetadataReadSession {
+            inner: Arc::new(ReadSessionInner {
+                connection: tokio::sync::Mutex::new(Some(connection)),
+            }),
+        })
+    }
+
+    /// This provider with the reads a scan makes running on `session`: the file
+    /// listing, inlined rows and deletions, name mappings, the catalog head and
+    /// the schema-capability probe. Every other call keeps using the pool. The
+    /// provider shares its memos with `self`.
+    ///
+    /// `session` must come from a provider of the same pool, through
+    /// [`Self::begin_read_session`].
+    #[must_use]
+    pub fn with_read_session(&self, session: &MetadataReadSession) -> Self {
+        Self {
+            read_session: Some(Arc::clone(&session.inner)),
+            ..self.clone()
+        }
+    }
+
+    /// Every row `query` returns, read on the open read session when this
+    /// provider has one, else through the pool.
+    async fn read_all(
+        &self,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+        if let Some(session) = &self.read_session {
+            let mut connection = session.connection.lock().await;
+            if let Some(connection) = connection.as_mut() {
+                return query.fetch_all(&mut **connection).await;
+            }
+        }
+        query.fetch_all(&self.pool).await
+    }
+
+    /// The one row `query` returns, read as [`Self::read_all`] reads.
+    async fn read_one(
+        &self,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> std::result::Result<PgRow, sqlx::Error> {
+        if let Some(session) = &self.read_session {
+            let mut connection = session.connection.lock().await;
+            if let Some(connection) = connection.as_mut() {
+                return query.fetch_one(&mut **connection).await;
+            }
+        }
+        query.fetch_one(&self.pool).await
+    }
+
+    /// One page of the file listing, read as [`Self::read_all`] reads.
+    async fn read_page(
+        &self,
+        sql: &str,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: i64,
+        limit: i64,
+    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+        if let Some(session) = &self.read_session {
+            let mut connection = session.connection.lock().await;
+            if let Some(connection) = connection.as_mut() {
+                return fetch_data_file_page(
+                    &mut **connection,
+                    sql,
+                    table_id,
+                    snapshot_id,
+                    after_data_file_id,
+                    limit,
+                )
+                .await;
+            }
+        }
+        fetch_data_file_page(
+            &self.pool,
+            sql,
+            table_id,
+            snapshot_id,
+            after_data_file_id,
+            limit,
+        )
+        .await
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -299,16 +454,19 @@ impl MulticatalogProvider {
         }
         // The head is read in the same statement as the check, so both describe
         // one state of the catalog.
-        let (exists, head): (bool, i64) = sqlx::query_as(
-            "SELECT to_regclass($1) IS NOT NULL,
-                    (SELECT COALESCE(MAX(snapshot_id), 0)
-                     FROM ducklake_catalog_snapshot_map
-                     WHERE catalog_id = $2)",
-        )
-        .bind(table)
-        .bind(self.catalog_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = self
+            .read_one(
+                sqlx::query(
+                    "SELECT to_regclass($1) IS NOT NULL,
+                            (SELECT COALESCE(MAX(snapshot_id), 0)
+                             FROM ducklake_catalog_snapshot_map
+                             WHERE catalog_id = $2)",
+                )
+                .bind(table)
+                .bind(self.catalog_id),
+            )
+            .await?;
+        let (exists, head): (bool, i64) = (row.try_get(0)?, row.try_get(1)?);
         // Commits to one catalog take their snapshots in commit order, each
         // above the last, so any deletion committed after this check has a
         // snapshot above `head`.
@@ -348,8 +506,9 @@ impl MulticatalogProvider {
     /// holds, and memoizes an all-`true` answer as [`Self::schema_capabilities`]
     /// does.
     async fn probe_schema_capabilities(&self) -> Result<SchemaCapabilities> {
-        let row: (bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
-            "SELECT
+        let row = self
+            .read_one(sqlx::query(
+                "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
                EXISTS (SELECT 1 FROM information_schema.columns
@@ -360,21 +519,22 @@ impl MulticatalogProvider {
                to_regclass('ducklake_view') IS NOT NULL,
                to_regclass('ducklake_file_column_stats') IS NOT NULL,
                to_regclass('ducklake_file_partition_value') IS NOT NULL,
+               to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
                current_setting('server_version_num')::int >= 120000",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+            ))
+            .await?;
         let caps = SchemaCapabilities {
-            data_file_partial_max: row.0,
-            delete_file_partial_max: row.1,
-            schema_versions: row.2,
-            data_file_partition_id: row.3,
-            views: row.4,
-            file_column_stats: row.5,
-            file_partition_values: row.6,
-            soft_input_validation: row.7,
-            materialized_cte: row.8,
+            data_file_partial_max: row.try_get(0)?,
+            delete_file_partial_max: row.try_get(1)?,
+            schema_versions: row.try_get(2)?,
+            data_file_partition_id: row.try_get(3)?,
+            views: row.try_get(4)?,
+            file_column_stats: row.try_get(5)?,
+            file_partition_values: row.try_get(6)?,
+            inlined_data_tables: row.try_get(7)?,
+            soft_input_validation: row.try_get(8)?,
+            materialized_cte: row.try_get(9)?,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -492,9 +652,9 @@ impl MulticatalogProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let pool = &self.pool;
             let fetch = |sql: String| async move {
-                fetch_data_file_page(pool, &sql, table_id, snapshot_id, after, limit).await
+                self.read_page(&sql, table_id, snapshot_id, after, limit)
+                    .await
             };
             let first = fetch(page_sql(caps, stats_sql.as_ref())).await;
             // A table the memoized probe saw can be gone by now. Probe again,
@@ -708,14 +868,16 @@ fn decode_page_partition_values(row: &PgRow) -> Result<Vec<(i32, Option<String>)
 impl MetadataProvider for MulticatalogProvider {
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
-            let row = sqlx::query(
-                "SELECT COALESCE(MAX(snapshot_id), 0)
-                 FROM ducklake_catalog_snapshot_map
-                 WHERE catalog_id = $1",
-            )
-            .bind(self.catalog_id)
-            .fetch_one(&self.pool)
-            .await?;
+            let row = self
+                .read_one(
+                    sqlx::query(
+                        "SELECT COALESCE(MAX(snapshot_id), 0)
+                         FROM ducklake_catalog_snapshot_map
+                         WHERE catalog_id = $1",
+                    )
+                    .bind(self.catalog_id),
+                )
+                .await?;
             Ok(row.try_get(0)?)
         })
     }
@@ -1066,7 +1228,7 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
         block_on(async {
-            let rows = sqlx::query(
+            let query = sqlx::query(
                 "SELECT mapping.mapping_id, mapping.table_id, mapping.type,
                         name.column_id, name.source_name, name.target_field_id,
                         name.parent_column, name.is_partition
@@ -1076,9 +1238,8 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE mapping.mapping_id = $1
                  ORDER BY name.parent_column NULLS FIRST, name.column_id",
             )
-            .bind(mapping_id)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(mapping_id);
+            let rows = self.read_all(query).await?;
             let first = rows.first().ok_or_else(|| {
                 crate::DuckLakeError::InvalidConfig(format!(
                     "DuckLake name mapping {mapping_id} does not exist"
@@ -1564,8 +1725,9 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
-        self.inlined_provider
-            .get_inlined_data(table_id, snapshot_id, columns)
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
     }
 
     fn scan_inlined_data(
@@ -1575,8 +1737,29 @@ impl MetadataProvider for MulticatalogProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&crate::inlined_filter::InlinedFilter>,
     ) -> Result<crate::inlined_filter::InlinedDataScan> {
-        self.inlined_provider
-            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(crate::inlined_filter::InlinedDataScan::default());
+            }
+            // The registry, then each inlined table's columns and rows, all on
+            // one connection: the read session's while it is open, else one
+            // from the pool for the length of the read.
+            if let Some(session) = &self.read_session {
+                let mut connection = session.connection.lock().await;
+                if let Some(connection) = connection.as_mut() {
+                    return scan_inlined_data_on(
+                        connection,
+                        table_id,
+                        snapshot_id,
+                        columns,
+                        filter,
+                    )
+                    .await;
+                }
+            }
+            let mut connection = self.pool.acquire().await?;
+            scan_inlined_data_on(&mut connection, table_id, snapshot_id, columns, filter).await
+        })
     }
 
     fn get_inlined_data_with_row_ids(
@@ -1608,9 +1791,8 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE begin_snapshot <= $1
                  ORDER BY file_id, row_id"
             );
-            match sqlx::query(AssertSqlSafe(sql))
-                .bind(snapshot_id)
-                .fetch_all(&self.pool)
+            match self
+                .read_all(sqlx::query(AssertSqlSafe(sql)).bind(snapshot_id))
                 .await
             {
                 Ok(rows) => rows

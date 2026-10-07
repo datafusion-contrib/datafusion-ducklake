@@ -200,7 +200,7 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 #[cfg(feature = "write-postgres")]
 pub use multicatalog::{FileOwners, MulticatalogManager, initialize_multicatalog_schema};
 #[cfg(feature = "multicatalog-postgres")]
-pub use multicatalog_provider::MulticatalogProvider;
+pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
 #[cfg(feature = "write")]
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]

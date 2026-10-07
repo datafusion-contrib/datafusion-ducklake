@@ -1485,6 +1485,21 @@ impl DuckLakeTable {
         })
     }
 
+    /// This table with its catalog reads going through `provider`, for one
+    /// query.
+    ///
+    /// Only the provider changes. The clone shares every cache of this table:
+    /// its schema, statistics, name mappings, file read configuration and
+    /// decryption keys. `provider` must read the same catalog as the table's
+    /// own, for example the table's provider bound to one query's read session
+    /// with `MulticatalogProvider::with_read_session`.
+    #[must_use]
+    pub fn with_metadata_provider(&self, provider: Arc<dyn MetadataProvider>) -> Self {
+        let mut table = self.clone();
+        table.provider = provider;
+        table
+    }
+
     /// Enable / disable the row-lineage feature. When enabled, the table's
     /// public schema includes a trailing `rowid` BIGINT column synthesized
     /// from each row's catalog-recorded `row_id_start + position_in_file`.
