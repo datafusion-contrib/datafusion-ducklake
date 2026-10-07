@@ -355,6 +355,105 @@ pub(crate) async fn scan_inlined_data_on(
     Ok(InlinedDataScan::from_batches(batches))
 }
 
+/// Every inlined row of table `table_id` visible at `snapshot_id`, with its row
+/// id and begin snapshot, read on one connection: the table's inlined-data
+/// tables from the registry, then each one's columns and rows.
+///
+/// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
+/// session. The caller checks first that the catalog has
+/// `ducklake_inlined_data_tables`.
+pub(crate) async fn inlined_data_with_row_ids_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    snapshot_id: i64,
+    columns: &[DuckLakeTableColumn],
+) -> Result<Vec<DuckLakeInlinedData>> {
+    let entries =
+        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
+            .bind(table_id)
+            .fetch_all(&mut *connection)
+            .await?;
+    let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
+    let mut batches = Vec::new();
+
+    for entry in entries {
+        let table: String = entry.try_get("table_name")?;
+        if !is_inlined_data_table(&table) {
+            continue;
+        }
+        let present = sqlx::query(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(&table)
+        .fetch_all(&mut *connection)
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<String, _>(0))
+        .collect::<std::result::Result<HashSet<_>, _>>()?;
+        let projected = columns
+            .iter()
+            .zip(schema.fields())
+            .map(|(column, field)| {
+                if !present.contains(&column.column_name) {
+                    "NULL::text".to_string()
+                } else {
+                    let ident = quote_ident(&column.column_name);
+                    inlined_text_projection(
+                        InlinedDataBackend::Postgres,
+                        column,
+                        field.data_type(),
+                        &ident,
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT row_id, begin_snapshot, {projected} FROM {}
+             WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL)
+             ORDER BY begin_snapshot, row_id",
+            quote_ident(&table)
+        );
+        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(snapshot_id)
+            .bind(snapshot_id)
+            .fetch_all(&mut *connection)
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let row_ids = rows
+            .iter()
+            .map(|row| row.try_get("row_id"))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let begin_snapshots = rows
+            .iter()
+            .map(|row| row.try_get("begin_snapshot"))
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        let decoded_rows = rows
+            .into_iter()
+            .map(|row| {
+                (0..columns.len())
+                    .map(|index| row.try_get::<Option<String>, _>(index + 2))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        batches.push(DuckLakeInlinedData {
+            table_name: table,
+            row_ids,
+            begin_snapshots,
+            batch: parse_inlined_rows_with_present(
+                schema.clone(),
+                columns,
+                decoded_rows,
+                Some(&present),
+            )?,
+        });
+    }
+    Ok(batches)
+}
+
 /// Statistics SQL for a catalog queried natively as PostgreSQL.
 ///
 /// Shared with [`crate::multicatalog_provider`], which speaks the same dialect
@@ -1882,91 +1981,8 @@ impl MetadataProvider for PostgresMetadataProvider {
             if !self.schema_capabilities().await?.inlined_data_tables {
                 return Ok(Vec::new());
             }
-            let entries = sqlx::query(
-                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_all(&self.pool)
-            .await?;
-            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
-            let mut batches = Vec::new();
-
-            for entry in entries {
-                let table: String = entry.try_get("table_name")?;
-                if !is_inlined_data_table(&table) {
-                    continue;
-                }
-                let present = sqlx::query(
-                    "SELECT column_name FROM information_schema.columns
-                     WHERE table_schema = current_schema() AND table_name = $1",
-                )
-                .bind(&table)
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| row.try_get::<String, _>(0))
-                .collect::<std::result::Result<HashSet<_>, _>>()?;
-                let projected = columns
-                    .iter()
-                    .zip(schema.fields())
-                    .map(|(column, field)| {
-                        if !present.contains(&column.column_name) {
-                            "NULL::text".to_string()
-                        } else {
-                            let ident = quote_ident(&column.column_name);
-                            inlined_text_projection(
-                                InlinedDataBackend::Postgres,
-                                column,
-                                field.data_type(),
-                                &ident,
-                            )
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!(
-                    "SELECT row_id, begin_snapshot, {projected} FROM {}
-                     WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL)
-                     ORDER BY begin_snapshot, row_id",
-                    quote_ident(&table)
-                );
-                let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                    .bind(snapshot_id)
-                    .bind(snapshot_id)
-                    .fetch_all(&self.pool)
-                    .await?;
-                if rows.is_empty() {
-                    continue;
-                }
-                let row_ids = rows
-                    .iter()
-                    .map(|row| row.try_get("row_id"))
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                let begin_snapshots = rows
-                    .iter()
-                    .map(|row| row.try_get("begin_snapshot"))
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                let decoded_rows = rows
-                    .into_iter()
-                    .map(|row| {
-                        (0..columns.len())
-                            .map(|index| row.try_get::<Option<String>, _>(index + 2))
-                            .collect::<std::result::Result<Vec<_>, _>>()
-                    })
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                batches.push(DuckLakeInlinedData {
-                    table_name: table,
-                    row_ids,
-                    begin_snapshots,
-                    batch: parse_inlined_rows_with_present(
-                        schema.clone(),
-                        columns,
-                        decoded_rows,
-                        Some(&present),
-                    )?,
-                });
-            }
-            Ok(batches)
+            let mut connection = self.pool.acquire().await?;
+            inlined_data_with_row_ids_on(&mut connection, table_id, snapshot_id, columns).await
         })
     }
 

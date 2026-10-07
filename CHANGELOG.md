@@ -7,12 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `MulticatalogProvider::begin_read_session` takes one pooled connection for a query, and
+  `with_read_session` runs every catalog read of the provider on it.
+  `DuckLakeTable::with_metadata_provider` binds a cached table to it per query (#338).
+
 ## [0.9.0] - 2026-10-07
 
 ### Added
 
-- `MulticatalogProvider::with_read_session` runs a query's scan reads on one pooled connection,
-  and `DuckLakeTable::with_metadata_provider` binds a cached table to it per query (#338).
 - Comments and tags: `MetadataWriter::set_tag`, `COMMENT ON TABLE`, `VIEW` and `COLUMN`, and the
   `object_tags` and `column_tags` views; writable on SQLite and both PostgreSQL layouts.
 - `information_schema.tables` and `columns` gain a `comment` column, which widens `SELECT *`.
