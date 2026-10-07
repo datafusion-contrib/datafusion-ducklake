@@ -2079,7 +2079,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
 /// Process-wide and never shut down: an embedder can hold one provider per
 /// catalog, and a runtime apiece would cost threads per catalog for work that
 /// shares a driver perfectly well.
-fn catalog_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn catalog_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()

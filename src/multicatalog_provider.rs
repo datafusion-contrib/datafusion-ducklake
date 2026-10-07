@@ -7,12 +7,12 @@
 //! extra scoping because the caller already obtained the id through a
 //! catalog-scoped lookup.
 //!
-//! Catalog-scoped queries are implemented here. Reads keyed by globally unique table IDs reuse the
-//! single-catalog provider's storage-level implementation.
+//! Catalog-scoped queries are implemented here. Reads of inlined data share the
+//! single-catalog provider's storage-level implementation, run on this
+//! provider's connection.
 
 use arrow::record_batch::RecordBatch;
 
-use crate::PostgresMetadataProvider;
 use crate::Result;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
@@ -25,14 +25,17 @@ use crate::metadata_provider::{
     reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::metadata_provider_postgres::{
-    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, stats_filter_sql,
+    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, inlined_data_with_row_ids_on,
+    scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
 use crate::stats_filter::StatsFilter;
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::{PgArguments, PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
+use sqlx::query::Query;
 use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -124,6 +127,9 @@ struct SchemaCapabilities {
     /// The `ducklake_file_partition_value` table exists. A listing page carries
     /// each file's partition values only when it does.
     file_partition_values: bool,
+    /// The `ducklake_inlined_data_tables` registry exists, which a scan reads to
+    /// find a table's inlined rows.
+    inlined_data_tables: bool,
     /// The server has `pg_input_is_valid` (PostgreSQL 16+), which
     /// [`PostgresStatsDialect`] needs for its exact `TRY_CAST` stand-in.
     ///
@@ -150,6 +156,7 @@ impl SchemaCapabilities {
             && self.views
             && self.file_column_stats
             && self.file_partition_values
+            && self.inlined_data_tables
     }
 }
 
@@ -174,6 +181,91 @@ enum InlinedDeletionTable {
     AbsentThrough(i64),
 }
 
+/// One pooled connection for the catalog reads of one query.
+///
+/// Take one with [`MulticatalogProvider::begin_read_session`], and bind a
+/// provider's catalog reads to it with [`MulticatalogProvider::with_read_session`].
+/// The query then reads the catalog on this connection alone, instead of taking
+/// one from the pool for every statement. One session serves every catalog in
+/// its database.
+///
+/// [`Self::end`] gives the connection back to the pool. A provider still bound
+/// to an ended session reads through the pool again, so a read that comes late
+/// still works. Dropping the last handle to an open session gives the
+/// connection back as well.
+#[derive(Debug, Clone)]
+pub struct MetadataReadSession {
+    inner: Arc<ReadSessionInner>,
+}
+
+#[derive(Debug)]
+struct ReadSessionInner {
+    // The database the connection reads, which a provider bound to the session
+    // must read as well.
+    database: DatabaseIdentity,
+    // `None` once the session ends. A lock rather than a plain cell because
+    // DataFusion can plan several scans of one query at once: their statements
+    // take turns on the connection.
+    connection: tokio::sync::Mutex<Option<PoolConnection<Postgres>>>,
+}
+
+impl MetadataReadSession {
+    /// End the session and give its connection back to the pool. Reads through
+    /// a provider bound to this session use the pool from now on. Ending an
+    /// ended session does nothing.
+    pub async fn end(&self) -> Result<()> {
+        // Fallible so that a session that also holds a transaction can report
+        // a failed commit here without a change to this signature.
+        let connection = self.inner.connection.lock().await.take();
+        drop(connection);
+        Ok(())
+    }
+}
+
+/// The database a pool connects to, as its connect options name it: the
+/// server, the user, the database and the server options, which can set the
+/// search path. Two pools with one identity read the same catalog tables.
+#[derive(Debug, PartialEq, Eq)]
+struct DatabaseIdentity {
+    server: String,
+    port: u16,
+    username: String,
+    database: String,
+    options: Option<String>,
+}
+
+impl DatabaseIdentity {
+    fn of(pool: &PgPool) -> Self {
+        let options = pool.connect_options();
+        Self {
+            server: match options.get_socket() {
+                Some(socket) => socket.display().to_string(),
+                None => options.get_host().to_string(),
+            },
+            port: options.get_port(),
+            username: options.get_username().to_string(),
+            // Postgres connects to the database named after the user when the
+            // options name none.
+            database: options
+                .get_database()
+                .unwrap_or(options.get_username())
+                .to_string(),
+            options: options.get_options().map(str::to_string),
+        }
+    }
+}
+
+impl Drop for ReadSessionInner {
+    fn drop(&mut self) {
+        // sqlx returns a connection to its pool from a task it spawns, which
+        // needs a runtime. The catalog runtime always has one; the thread that
+        // drops the last handle might not.
+        if let Some(connection) = self.connection.get_mut().take() {
+            crate::metadata_provider::catalog_runtime().spawn(async move { drop(connection) });
+        }
+    }
+}
+
 /// Catalog-scoped Postgres metadata reader.
 ///
 /// Construct with [`Self::with_pool`] (name-keyed; resolves to `catalog_id` once
@@ -181,7 +273,6 @@ enum InlinedDeletionTable {
 #[derive(Debug, Clone)]
 pub struct MulticatalogProvider {
     pool: PgPool,
-    inlined_provider: PostgresMetadataProvider,
     catalog_id: i64,
     // Positive-only memo of the optional-schema capability probes. `Arc` so
     // derived `Clone` shares the cache across provider clones.
@@ -189,6 +280,9 @@ pub struct MulticatalogProvider {
     // Each table's inlined-deletion table, by table id, as far as this provider
     // has looked (see `InlinedDeletionTable`). Shared across clones.
     inlined_deletion_tables: Arc<Mutex<HashMap<i64, InlinedDeletionTable>>>,
+    // The read session every catalog read runs on, when this provider is bound
+    // to one (see `MetadataReadSession`).
+    read_session: Option<Arc<ReadSessionInner>>,
 }
 
 impl MulticatalogProvider {
@@ -228,11 +322,11 @@ impl MulticatalogProvider {
             .ok_or_else(|| crate::DuckLakeError::CatalogNotFound(catalog_name.to_string()))?
             .try_get(0)?;
         Ok(Self {
-            inlined_provider: PostgresMetadataProvider::from_pool(pool.clone()),
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
+            read_session: None,
         })
     }
 
@@ -250,16 +344,123 @@ impl MulticatalogProvider {
     /// arrange, opening the whole pool on the catalog runtime.
     pub async fn with_pool_and_id(pool: PgPool, catalog_id: i64) -> Result<Self> {
         Ok(Self {
-            inlined_provider: PostgresMetadataProvider::from_pool(pool.clone()),
             pool,
             catalog_id,
             schema_capabilities: Arc::new(OnceLock::new()),
             inlined_deletion_tables: Arc::default(),
+            read_session: None,
         })
     }
 
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Take one connection from this provider's pool for the catalog reads of
+    /// one query. See [`MetadataReadSession`].
+    ///
+    /// The connection is taken on the runtime this crate drives catalog I/O on,
+    /// as [`Self::new`] opens its pool, so a connection the pool opens for it
+    /// registers there.
+    pub async fn begin_read_session(&self) -> Result<MetadataReadSession> {
+        let pool = self.pool.clone();
+        let connection =
+            crate::metadata_provider::connect_on_catalog_runtime(
+                async move { pool.acquire().await },
+            )
+            .await?;
+        Ok(MetadataReadSession {
+            inner: Arc::new(ReadSessionInner {
+                database: DatabaseIdentity::of(&self.pool),
+                connection: tokio::sync::Mutex::new(Some(connection)),
+            }),
+        })
+    }
+
+    /// This provider with every catalog read running on `session`. The provider
+    /// shares its memos with `self`.
+    ///
+    /// `session` can come from the provider of any catalog in the same
+    /// database. Returns [`crate::DuckLakeError::InvalidConfig`] when its pool
+    /// connects to another server, port, user, database or set of server
+    /// options than this provider's pool.
+    pub fn with_read_session(&self, session: &MetadataReadSession) -> Result<Self> {
+        if session.inner.database != DatabaseIdentity::of(&self.pool) {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "a read session must connect to the same database as the provider's pool"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            read_session: Some(Arc::clone(&session.inner)),
+            ..self.clone()
+        })
+    }
+
+    /// Run `read` on the read session's connection while the session is open,
+    /// else on one connection from the pool.
+    async fn on_connection<T, E: From<sqlx::Error>>(
+        &self,
+        read: impl AsyncFnOnce(&mut PgConnection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        if let Some(session) = &self.read_session {
+            let mut connection = session.connection.lock().await;
+            if let Some(connection) = connection.as_mut() {
+                return read(connection).await;
+            }
+        }
+        let mut connection = self.pool.acquire().await?;
+        read(&mut connection).await
+    }
+
+    /// Every row `query` returns, read as [`Self::on_connection`] reads.
+    async fn read_all(
+        &self,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+        self.on_connection(async |connection| query.fetch_all(connection).await)
+            .await
+    }
+
+    /// The one row `query` returns, read as [`Self::on_connection`] reads.
+    async fn read_one(
+        &self,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> std::result::Result<PgRow, sqlx::Error> {
+        self.on_connection(async |connection| query.fetch_one(connection).await)
+            .await
+    }
+
+    /// The row `query` returns, if any, read as [`Self::on_connection`] reads.
+    async fn read_optional(
+        &self,
+        query: Query<'_, Postgres, PgArguments>,
+    ) -> std::result::Result<Option<PgRow>, sqlx::Error> {
+        self.on_connection(async |connection| query.fetch_optional(connection).await)
+            .await
+    }
+
+    /// One page of the file listing, read as [`Self::on_connection`] reads.
+    async fn read_page(
+        &self,
+        sql: &str,
+        table_id: i64,
+        snapshot_id: i64,
+        after_data_file_id: i64,
+        limit: i64,
+    ) -> std::result::Result<Vec<PgRow>, sqlx::Error> {
+        self.on_connection(async |connection| {
+            fetch_data_file_page(
+                connection,
+                sql,
+                table_id,
+                snapshot_id,
+                after_data_file_id,
+                limit,
+            )
+            .await
+        })
+        .await
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -299,16 +500,19 @@ impl MulticatalogProvider {
         }
         // The head is read in the same statement as the check, so both describe
         // one state of the catalog.
-        let (exists, head): (bool, i64) = sqlx::query_as(
-            "SELECT to_regclass($1) IS NOT NULL,
-                    (SELECT COALESCE(MAX(snapshot_id), 0)
-                     FROM ducklake_catalog_snapshot_map
-                     WHERE catalog_id = $2)",
-        )
-        .bind(table)
-        .bind(self.catalog_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = self
+            .read_one(
+                sqlx::query(
+                    "SELECT to_regclass($1) IS NOT NULL,
+                            (SELECT COALESCE(MAX(snapshot_id), 0)
+                             FROM ducklake_catalog_snapshot_map
+                             WHERE catalog_id = $2)",
+                )
+                .bind(table)
+                .bind(self.catalog_id),
+            )
+            .await?;
+        let (exists, head): (bool, i64) = (row.try_get(0)?, row.try_get(1)?);
         // Commits to one catalog take their snapshots in commit order, each
         // above the last, so any deletion committed after this check has a
         // snapshot above `head`.
@@ -348,8 +552,9 @@ impl MulticatalogProvider {
     /// holds, and memoizes an all-`true` answer as [`Self::schema_capabilities`]
     /// does.
     async fn probe_schema_capabilities(&self) -> Result<SchemaCapabilities> {
-        let row: (bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
-            "SELECT
+        let row = self
+            .read_one(sqlx::query(
+                "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
                EXISTS (SELECT 1 FROM information_schema.columns
@@ -360,21 +565,22 @@ impl MulticatalogProvider {
                to_regclass('ducklake_view') IS NOT NULL,
                to_regclass('ducklake_file_column_stats') IS NOT NULL,
                to_regclass('ducklake_file_partition_value') IS NOT NULL,
+               to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
                current_setting('server_version_num')::int >= 120000",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+            ))
+            .await?;
         let caps = SchemaCapabilities {
-            data_file_partial_max: row.0,
-            delete_file_partial_max: row.1,
-            schema_versions: row.2,
-            data_file_partition_id: row.3,
-            views: row.4,
-            file_column_stats: row.5,
-            file_partition_values: row.6,
-            soft_input_validation: row.7,
-            materialized_cte: row.8,
+            data_file_partial_max: row.try_get(0)?,
+            delete_file_partial_max: row.try_get(1)?,
+            schema_versions: row.try_get(2)?,
+            data_file_partition_id: row.try_get(3)?,
+            views: row.try_get(4)?,
+            file_column_stats: row.try_get(5)?,
+            file_partition_values: row.try_get(6)?,
+            inlined_data_tables: row.try_get(7)?,
+            soft_input_validation: row.try_get(8)?,
+            materialized_cte: row.try_get(9)?,
         };
         if caps.all() {
             let _ = self.schema_capabilities.set(caps);
@@ -492,9 +698,9 @@ impl MulticatalogProvider {
             };
 
             let after = after_data_file_id.unwrap_or(i64::MIN);
-            let pool = &self.pool;
             let fetch = |sql: String| async move {
-                fetch_data_file_page(pool, &sql, table_id, snapshot_id, after, limit).await
+                self.read_page(&sql, table_id, snapshot_id, after, limit)
+                    .await
             };
             let first = fetch(page_sql(caps, stats_sql.as_ref())).await;
             // A table the memoized probe saw can be gone by now. Probe again,
@@ -708,32 +914,41 @@ fn decode_page_partition_values(row: &PgRow) -> Result<Vec<(i32, Option<String>)
 impl MetadataProvider for MulticatalogProvider {
     fn get_current_snapshot(&self) -> Result<i64> {
         block_on(async {
-            let row = sqlx::query(
-                "SELECT COALESCE(MAX(snapshot_id), 0)
-                 FROM ducklake_catalog_snapshot_map
-                 WHERE catalog_id = $1",
-            )
-            .bind(self.catalog_id)
-            .fetch_one(&self.pool)
-            .await?;
+            let row = self
+                .read_one(
+                    sqlx::query(
+                        "SELECT COALESCE(MAX(snapshot_id), 0)
+                         FROM ducklake_catalog_snapshot_map
+                         WHERE catalog_id = $1",
+                    )
+                    .bind(self.catalog_id),
+                )
+                .await?;
             Ok(row.try_get(0)?)
         })
     }
 
     fn get_data_path(&self) -> Result<String> {
         block_on(async {
-            let path: Option<String> = if catalog_has_data_path(&self.pool).await? {
-                sqlx::query_scalar("SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1")
-                    .bind(self.catalog_id)
-                    .fetch_one(&self.pool)
-                    .await?
+            let has_data_path: bool = self
+                .read_one(sqlx::query(CATALOG_HAS_DATA_PATH))
+                .await?
+                .try_get(0)?;
+            let path: Option<String> = if has_data_path {
+                self.read_one(
+                    sqlx::query("SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1")
+                        .bind(self.catalog_id),
+                )
+                .await?
+                .try_get(0)?
             } else {
-                sqlx::query_scalar(
+                self.read_optional(sqlx::query(
                     "SELECT value FROM ducklake_metadata
                      WHERE key = 'data_path' AND scope IS NULL LIMIT 1",
-                )
-                .fetch_optional(&self.pool)
+                ))
                 .await?
+                .map(|row| row.try_get(0))
+                .transpose()?
             };
 
             path.ok_or_else(|| {
@@ -752,23 +967,25 @@ impl MetadataProvider for MulticatalogProvider {
         table_id: Option<i64>,
     ) -> Result<HashMap<String, String>> {
         block_on(async {
-            let has_scope_columns: bool = sqlx::query_scalar(
-                "SELECT COUNT(*) = 2 FROM information_schema.columns \
-                 WHERE table_schema = current_schema() \
-                 AND table_name = 'ducklake_metadata' \
-                 AND column_name IN ('scope', 'scope_id')",
-            )
-            .fetch_one(&self.pool)
-            .await?;
+            let has_scope_columns: bool = self
+                .read_one(sqlx::query(
+                    "SELECT COUNT(*) = 2 FROM information_schema.columns \
+                     WHERE table_schema = current_schema() \
+                     AND table_name = 'ducklake_metadata' \
+                     AND column_name IN ('scope', 'scope_id')",
+                ))
+                .await?
+                .try_get(0)?;
             let rows = if has_scope_columns {
-                sqlx::query(
-                    "SELECT key, value, scope, scope_id
+                self.read_all(
+                    sqlx::query(
+                        "SELECT key, value, scope, scope_id
                      FROM ducklake_metadata
                      WHERE scope IS DISTINCT FROM 'catalog' OR scope_id = $1
                      ORDER BY CASE WHEN scope = 'catalog' THEN 1 ELSE 0 END, key",
+                    )
+                    .bind(self.catalog_id),
                 )
-                .bind(self.catalog_id)
-                .fetch_all(&self.pool)
                 .await?
                 .into_iter()
                 .map(|row| {
@@ -787,8 +1004,7 @@ impl MetadataProvider for MulticatalogProvider {
                 })
                 .collect::<Result<Vec<_>>>()?
             } else {
-                sqlx::query("SELECT key, value FROM ducklake_metadata")
-                    .fetch_all(&self.pool)
+                self.read_all(sqlx::query("SELECT key, value FROM ducklake_metadata"))
                     .await?
                     .into_iter()
                     .map(|row| {
@@ -807,16 +1023,18 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT s.snapshot_id, s.snapshot_time, s.schema_version
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT s.snapshot_id, s.snapshot_time, s.schema_version
                  FROM ducklake_snapshot s
                  JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
                  WHERE m.catalog_id = $1
                  ORDER BY s.snapshot_id",
-            )
-            .bind(self.catalog_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -836,8 +1054,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_snapshot_changes(&self) -> Result<Vec<SnapshotChangeMetadata>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT snapshot.snapshot_id,
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT snapshot.snapshot_id,
                         snapshot.snapshot_time::text AS snapshot_time,
                         changes.changes_made,
                         changes.author,
@@ -850,10 +1070,10 @@ impl MetadataProvider for MulticatalogProvider {
                    ON changes.snapshot_id = snapshot.snapshot_id
                  WHERE catalog.catalog_id = $1
                  ORDER BY snapshot.snapshot_id",
-            )
-            .bind(self.catalog_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -872,8 +1092,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn find_snapshot_by_commit_extra_info(&self, needle: &str) -> Result<Option<i64>> {
         block_on(async {
-            let row = sqlx::query(
-                "SELECT changes.snapshot_id
+            let row = self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT changes.snapshot_id
                  FROM ducklake_snapshot_changes AS changes
                  JOIN ducklake_catalog_snapshot_map AS snapshots
                    ON snapshots.snapshot_id = changes.snapshot_id
@@ -891,12 +1113,12 @@ impl MetadataProvider for MulticatalogProvider {
                    )
                  ORDER BY changes.snapshot_id
                  LIMIT 1",
-            )
-            .bind(self.catalog_id)
-            .bind(needle)
-            .bind(needle)
-            .fetch_optional(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(needle)
+                    .bind(needle),
+                )
+                .await?;
 
             Ok(row.map(|row| row.try_get("snapshot_id")).transpose()?)
         })
@@ -904,19 +1126,21 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_schemas(&self, snapshot_id: i64) -> Result<Vec<SchemaMetadata>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT s.schema_id, s.schema_name, s.path, s.path_is_relative
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT s.schema_id, s.schema_name, s.path, s.path_is_relative
                  FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
                  WHERE m.catalog_id = $1
                    AND $2 >= s.begin_snapshot
                    AND ($3 < s.end_snapshot OR s.end_snapshot IS NULL)",
-            )
-            .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -935,18 +1159,20 @@ impl MetadataProvider for MulticatalogProvider {
         // schema_id is globally unique; caller has already resolved it via
         // get_schema_by_name (catalog-scoped). No additional scoping needed.
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT table_id, table_name, path, path_is_relative
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT table_id, table_name, path, path_is_relative
                  FROM ducklake_table
                  WHERE schema_id = $1
                    AND $2 >= begin_snapshot
                    AND ($3 < end_snapshot OR end_snapshot IS NULL)",
-            )
-            .bind(schema_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(schema_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -966,7 +1192,7 @@ impl MetadataProvider for MulticatalogProvider {
             if !self.schema_capabilities().await?.views {
                 return Ok(Vec::new());
             }
-            let rows = sqlx::query(
+            let rows = self.read_all(sqlx::query(
                 "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
                  FROM ducklake_view
                  WHERE schema_id = $1
@@ -975,8 +1201,7 @@ impl MetadataProvider for MulticatalogProvider {
             )
             .bind(schema_id)
             .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .bind(snapshot_id))
             .await?;
 
             rows.into_iter().map(|row| decode_view(&row)).collect()
@@ -994,20 +1219,22 @@ impl MetadataProvider for MulticatalogProvider {
         // concurrent or aborted writer's begin-time column generation (which
         // commits before the head advances). Match the catalog head window.
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column,
                         initial_default, default_value, default_value_type, default_value_dialect
                  FROM ducklake_column
                  WHERE table_id = $1
                    AND $2 >= begin_snapshot
                    AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY column_order",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             let raw: Result<Vec<(DuckLakeTableColumn, Option<i64>)>> = rows
                 .into_iter()
@@ -1037,19 +1264,21 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_table_fields(&self, table_id: i64, snapshot_id: i64) -> Result<Vec<DuckLakeTableField>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
                  FROM ducklake_column
                  WHERE table_id = $1
                    AND $2 >= begin_snapshot
                    AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY column_order",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
             rows.into_iter()
                 .map(|row| {
                     Ok(DuckLakeTableField {
@@ -1066,7 +1295,7 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_name_mapping(&self, mapping_id: i64) -> Result<DuckLakeNameMapping> {
         block_on(async {
-            let rows = sqlx::query(
+            let query = sqlx::query(
                 "SELECT mapping.mapping_id, mapping.table_id, mapping.type,
                         name.column_id, name.source_name, name.target_field_id,
                         name.parent_column, name.is_partition
@@ -1076,9 +1305,8 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE mapping.mapping_id = $1
                  ORDER BY name.parent_column NULLS FIRST, name.column_id",
             )
-            .bind(mapping_id)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(mapping_id);
+            let rows = self.read_all(query).await?;
             let first = rows.first().ok_or_else(|| {
                 crate::DuckLakeError::InvalidConfig(format!(
                     "DuckLake name mapping {mapping_id} does not exist"
@@ -1173,14 +1401,16 @@ impl MetadataProvider for MulticatalogProvider {
                   AND $5 >= data.begin_snapshot
                   AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)"
             );
-            let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .bind(table_id)
-                .bind(snapshot_id)
-                .bind(snapshot_id)
-                .fetch_all(&self.pool)
+            let rows = self
+                .read_all(
+                    sqlx::query(AssertSqlSafe(sql.as_str()))
+                        .bind(table_id)
+                        .bind(snapshot_id)
+                        .bind(snapshot_id)
+                        .bind(table_id)
+                        .bind(snapshot_id)
+                        .bind(snapshot_id),
+                )
                 .await?;
 
             let mut files: Vec<DuckLakeTableFile> = rows
@@ -1198,16 +1428,18 @@ impl MetadataProvider for MulticatalogProvider {
                 files.iter().map(|f| f.data_file_id).max(),
             ) {
                 let mut values_by_file: HashMap<i64, Vec<(i32, Option<String>)>> = HashMap::new();
-                match sqlx::query(
-                    "SELECT data_file_id, partition_key_index, partition_value
+                match self
+                    .read_all(
+                        sqlx::query(
+                            "SELECT data_file_id, partition_key_index, partition_value
                      FROM ducklake_file_partition_value
                      WHERE table_id = $1 AND data_file_id >= $2 AND data_file_id <= $3",
-                )
-                .bind(table_id)
-                .bind(min)
-                .bind(max)
-                .fetch_all(&self.pool)
-                .await
+                        )
+                        .bind(table_id)
+                        .bind(min)
+                        .bind(max),
+                    )
+                    .await
                 {
                     Ok(rows) => {
                         for row in rows {
@@ -1237,20 +1469,22 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_partition_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<PartitionSpec>> {
         // Keyed by the globally-unique table_id, so no catalog scoping is needed.
         block_on(async {
-            let generation_count: i64 = match sqlx::query_scalar(
-                "SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_one(&self.pool)
-            .await
+            let generation_count: i64 = match self
+                .read_one(
+                    sqlx::query("SELECT COUNT(*) FROM ducklake_partition_info WHERE table_id = $1")
+                        .bind(table_id),
+                )
+                .await
             {
-                Ok(count) => count,
+                Ok(row) => row.try_get(0)?,
                 Err(error) if is_missing_statistics_table(&error) => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
             let prune_safe = generation_count == 1;
-            let rows = match sqlx::query(
-                "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
+            let rows = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
                  JOIN ducklake_partition_column AS pc
                    ON pc.partition_id = pi.partition_id AND pc.table_id = pi.table_id
@@ -1258,12 +1492,12 @@ impl MetadataProvider for MulticatalogProvider {
                    AND $2 >= pi.begin_snapshot
                    AND ($3 < pi.end_snapshot OR pi.end_snapshot IS NULL)
                  ORDER BY pc.partition_key_index",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await
             {
                 Ok(rows) => rows,
                 Err(error) if is_missing_statistics_table(&error) => return Ok(None),
@@ -1287,8 +1521,10 @@ impl MetadataProvider for MulticatalogProvider {
     fn get_sort_spec(&self, table_id: i64, snapshot_id: i64) -> Result<Option<SortSpec>> {
         // Keyed by the globally unique table_id, so no catalog scoping is needed.
         block_on(async {
-            let rows = match sqlx::query(
-                "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
+            let rows = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
                         se.sort_direction, se.null_order
                  FROM ducklake_sort_info AS si
                  JOIN ducklake_sort_expression AS se
@@ -1297,12 +1533,12 @@ impl MetadataProvider for MulticatalogProvider {
                    AND $2 >= si.begin_snapshot
                    AND ($3 < si.end_snapshot OR si.end_snapshot IS NULL)
                  ORDER BY se.sort_key_index",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await
             {
                 Ok(rows) => rows,
                 Err(error) if is_missing_statistics_table(&error) => return Ok(None),
@@ -1352,13 +1588,15 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
     ) -> Result<DuckLakeStatistics> {
         block_on(async {
-            let table = match sqlx::query(
-                "SELECT record_count, file_size_bytes
+            let table = match self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_optional(&self.pool)
-            .await
+                    )
+                    .bind(table_id),
+                )
+                .await
             {
                 Ok(row) => row
                     .map(|row| {
@@ -1371,8 +1609,10 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) if is_missing_statistics_table(&error) => None,
                 Err(error) => return Err(error.into()),
             };
-            let column_sizes = match sqlx::query(
-                "SELECT stats.column_id,
+            let column_sizes = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT stats.column_id,
                         CASE
                           WHEN COUNT(*) = COUNT(stats.column_size_bytes)
                            AND COUNT(*) = (
@@ -1391,15 +1631,15 @@ impl MetadataProvider for MulticatalogProvider {
                    AND $5 >= data.begin_snapshot
                    AND ($6 < data.end_snapshot OR data.end_snapshot IS NULL)
                  GROUP BY stats.column_id",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await
             {
                 Ok(rows) => rows
                     .into_iter()
@@ -1412,26 +1652,31 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) if is_missing_statistics_table(&error) => HashMap::new(),
                 Err(error) => return Err(error.into()),
             };
-            let bounds_are_exact: bool = sqlx::query_scalar(
-                "SELECT NOT EXISTS (
-                     SELECT 1 FROM ducklake_delete_file
-                     WHERE table_id = $1
-                       AND $2 >= begin_snapshot
-                       AND ($3 < end_snapshot OR end_snapshot IS NULL)
-                 )",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_one(&self.pool)
-            .await?;
-            let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+            let bounds_are_exact: bool = self
+                .read_one(
+                    sqlx::query(
+                        "SELECT NOT EXISTS (
+                             SELECT 1 FROM ducklake_delete_file
+                             WHERE table_id = $1
+                               AND $2 >= begin_snapshot
+                               AND ($3 < end_snapshot OR end_snapshot IS NULL)
+                         )",
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?
+                .try_get(0)?;
+            let columns = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id),
+                )
+                .await
             {
                 Ok(rows) => rows
                     .into_iter()
@@ -1461,13 +1706,15 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         block_on(async {
-            let table = match sqlx::query(
-                "SELECT record_count, file_size_bytes
+            let table = match self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT record_count, file_size_bytes
                  FROM ducklake_table_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_optional(&self.pool)
-            .await
+                    )
+                    .bind(table_id),
+                )
+                .await
             {
                 Ok(row) => row
                     .map(|row| {
@@ -1481,13 +1728,15 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) => return Err(error.into()),
             };
 
-            let columns = match sqlx::query(
-                "SELECT column_id, contains_null, min_value, max_value, contains_nan
+            let columns = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT column_id, contains_null, min_value, max_value, contains_nan
                  FROM ducklake_table_column_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id),
+                )
+                .await
             {
                 Ok(rows) => rows
                     .into_iter()
@@ -1507,8 +1756,10 @@ impl MetadataProvider for MulticatalogProvider {
                 Err(error) => return Err(error.into()),
             };
 
-            let files = match sqlx::query(
-                "SELECT
+            let files = match self
+                .read_all(
+                    sqlx::query(
+                        "SELECT
                     stats.data_file_id,
                     stats.column_id,
                     stats.column_size_bytes,
@@ -1524,12 +1775,12 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE stats.table_id = $1
                    AND $2 >= data.begin_snapshot
                    AND ($3 < data.end_snapshot OR data.end_snapshot IS NULL)",
-            )
-            .bind(table_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await
+                    )
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await
             {
                 Ok(rows) => rows
                     .into_iter()
@@ -1564,8 +1815,9 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<RecordBatch>> {
-        self.inlined_provider
-            .get_inlined_data(table_id, snapshot_id, columns)
+        Ok(self
+            .scan_inlined_data(table_id, snapshot_id, columns, None)?
+            .batches)
     }
 
     fn scan_inlined_data(
@@ -1575,8 +1827,17 @@ impl MetadataProvider for MulticatalogProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&crate::inlined_filter::InlinedFilter>,
     ) -> Result<crate::inlined_filter::InlinedDataScan> {
-        self.inlined_provider
-            .scan_inlined_data(table_id, snapshot_id, columns, filter)
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(crate::inlined_filter::InlinedDataScan::default());
+            }
+            // The registry, then each inlined table's columns and rows, all on
+            // one connection.
+            self.on_connection(async |connection| {
+                scan_inlined_data_on(connection, table_id, snapshot_id, columns, filter).await
+            })
+            .await
+        })
     }
 
     fn get_inlined_data_with_row_ids(
@@ -1585,8 +1846,15 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        self.inlined_provider
-            .get_inlined_data_with_row_ids(table_id, snapshot_id, columns)
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            self.on_connection(async |connection| {
+                inlined_data_with_row_ids_on(connection, table_id, snapshot_id, columns).await
+            })
+            .await
+        })
     }
 
     fn get_inlined_deletes(
@@ -1608,9 +1876,8 @@ impl MetadataProvider for MulticatalogProvider {
                  WHERE begin_snapshot <= $1
                  ORDER BY file_id, row_id"
             );
-            match sqlx::query(AssertSqlSafe(sql))
-                .bind(snapshot_id)
-                .fetch_all(&self.pool)
+            match self
+                .read_all(sqlx::query(AssertSqlSafe(sql)).bind(snapshot_id))
                 .await
             {
                 Ok(rows) => rows
@@ -1636,21 +1903,23 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn get_schema_by_name(&self, name: &str, snapshot_id: i64) -> Result<Option<SchemaMetadata>> {
         block_on(async {
-            let row = sqlx::query(
-                "SELECT s.schema_id, s.schema_name, s.path, s.path_is_relative
+            let row = self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT s.schema_id, s.schema_name, s.path, s.path_is_relative
                  FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
                  WHERE m.catalog_id = $1
                    AND s.schema_name = $2
                    AND $3 >= s.begin_snapshot
                    AND ($4 < s.end_snapshot OR s.end_snapshot IS NULL)",
-            )
-            .bind(self.catalog_id)
-            .bind(name)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_optional(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(name)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             match row {
                 Some(r) => Ok(Some(SchemaMetadata {
@@ -1672,20 +1941,22 @@ impl MetadataProvider for MulticatalogProvider {
     ) -> Result<Option<TableMetadata>> {
         // schema_id catalog-scoped by caller.
         block_on(async {
-            let row = sqlx::query(
-                "SELECT table_id, table_name, path, path_is_relative
+            let row = self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT table_id, table_name, path, path_is_relative
                  FROM ducklake_table
                  WHERE schema_id = $1
                    AND table_name = $2
                    AND $3 >= begin_snapshot
                    AND ($4 < end_snapshot OR end_snapshot IS NULL)",
-            )
-            .bind(schema_id)
-            .bind(name)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_optional(&self.pool)
-            .await?;
+                    )
+                    .bind(schema_id)
+                    .bind(name)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             match row {
                 Some(r) => Ok(Some(TableMetadata {
@@ -1709,7 +1980,7 @@ impl MetadataProvider for MulticatalogProvider {
             if !self.schema_capabilities().await?.views {
                 return Ok(None);
             }
-            let row = sqlx::query(
+            let row = self.read_optional(sqlx::query(
                 "SELECT view_id, schema_id, begin_snapshot, view_name, dialect, sql, column_aliases
                  FROM ducklake_view
                  WHERE schema_id = $1
@@ -1720,8 +1991,7 @@ impl MetadataProvider for MulticatalogProvider {
             .bind(schema_id)
             .bind(name)
             .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_optional(&self.pool)
+            .bind(snapshot_id))
             .await?;
 
             row.map(|row| decode_view(&row)).transpose()
@@ -1730,21 +2000,23 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn table_exists(&self, schema_id: i64, name: &str, snapshot_id: i64) -> Result<bool> {
         block_on(async {
-            let row = sqlx::query(
-                "SELECT EXISTS(
+            let row = self
+                .read_one(
+                    sqlx::query(
+                        "SELECT EXISTS(
                     SELECT 1 FROM ducklake_table
                     WHERE schema_id = $1
                       AND table_name = $2
                       AND $3 >= begin_snapshot
                       AND ($4 < end_snapshot OR end_snapshot IS NULL)
                  )",
-            )
-            .bind(schema_id)
-            .bind(name)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_one(&self.pool)
-            .await?;
+                    )
+                    .bind(schema_id)
+                    .bind(name)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
             Ok(row.try_get(0)?)
         })
     }
@@ -1755,7 +2027,7 @@ impl MetadataProvider for MulticatalogProvider {
                 TagTarget::Object {
                     object_type,
                     object_id,
-                } => sqlx::query(
+                } => self.read_all(sqlx::query(
                     "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_catalog_tag
                      WHERE catalog_id = $1 AND object_type = $2 AND object_id = $3
                        AND $4 >= begin_snapshot
@@ -1766,13 +2038,12 @@ impl MetadataProvider for MulticatalogProvider {
                 .bind(object_type.as_str())
                 .bind(object_id)
                 .bind(snapshot_id)
-                .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .bind(snapshot_id))
                 .await,
                 TagTarget::Column {
                     table_id,
                     column_id,
-                } => sqlx::query(
+                } => self.read_all(sqlx::query(
                     "SELECT begin_snapshot, end_snapshot, key, value FROM ducklake_catalog_column_tag
                      WHERE catalog_id = $1 AND table_id = $2 AND column_id = $3
                        AND $4 >= begin_snapshot
@@ -1783,8 +2054,7 @@ impl MetadataProvider for MulticatalogProvider {
                 .bind(table_id)
                 .bind(column_id)
                 .bind(snapshot_id)
-                .bind(snapshot_id)
-                .fetch_all(&self.pool)
+                .bind(snapshot_id))
                 .await,
             };
             let rows = match result {
@@ -1812,20 +2082,22 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
     ) -> Result<Option<i64>> {
         block_on(async {
-            let result = sqlx::query(
-                "SELECT v.view_id FROM ducklake_view v
+            let result = self
+                .read_optional(
+                    sqlx::query(
+                        "SELECT v.view_id FROM ducklake_view v
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = v.schema_id
                  WHERE m.catalog_id = $1 AND v.schema_id = $2 AND v.view_name = $3
                    AND $4 >= v.begin_snapshot
                    AND ($5 < v.end_snapshot OR v.end_snapshot IS NULL)",
-            )
-            .bind(self.catalog_id)
-            .bind(schema_id)
-            .bind(name)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_optional(&self.pool)
-            .await;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(schema_id)
+                    .bind(name)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await;
             match result {
                 Ok(Some(row)) => Ok(Some(row.try_get(0)?)),
                 Ok(None) => Ok(None),
@@ -1837,8 +2109,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_tables(&self, snapshot_id: i64) -> Result<Vec<TableWithSchema>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT s.schema_name, t.table_id, t.table_name, t.path, t.path_is_relative
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT s.schema_name, t.table_id, t.table_name, t.path, t.path_is_relative
                  FROM ducklake_schema s
                  JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
                  JOIN ducklake_table t ON s.schema_id = t.schema_id
@@ -1848,14 +2122,14 @@ impl MetadataProvider for MulticatalogProvider {
                    AND $4 >= t.begin_snapshot
                    AND ($5 < t.end_snapshot OR t.end_snapshot IS NULL)
                  ORDER BY s.schema_name, t.table_name",
-            )
-            .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -1880,7 +2154,7 @@ impl MetadataProvider for MulticatalogProvider {
             if !self.schema_capabilities().await?.views {
                 return Ok(Vec::new());
             }
-            let rows = sqlx::query(
+            let rows = self.read_all(sqlx::query(
                 "SELECT s.schema_name, v.view_id, v.schema_id, v.begin_snapshot, v.view_name,
                         v.dialect, v.sql, v.column_aliases
                  FROM ducklake_schema s
@@ -1894,8 +2168,7 @@ impl MetadataProvider for MulticatalogProvider {
                  ORDER BY s.schema_name, v.view_name",
             )
             .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .bind(snapshot_id))
             .await?;
             rows.into_iter()
                 .map(|row| {
@@ -1922,7 +2195,7 @@ impl MetadataProvider for MulticatalogProvider {
         // accumulate column history across catalogs and would otherwise return
         // ended columns alongside current ones.
         block_on(async {
-            let rows = sqlx::query(
+            let rows = self.read_all(sqlx::query(
                 "SELECT s.schema_name, t.table_name, t.table_id, c.column_id, c.column_name, c.column_type,
                         c.nulls_allowed, c.parent_column, c.initial_default, c.default_value,
                         c.default_value_type, c.default_value_dialect
@@ -1945,8 +2218,7 @@ impl MetadataProvider for MulticatalogProvider {
             .bind(snapshot_id)
             .bind(snapshot_id)
             .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
+            .bind(snapshot_id))
             .await?;
 
             let raw: Result<Vec<(ColumnWithTable, Option<i64>)>> = rows
@@ -1986,18 +2258,20 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_object_tags(&self, snapshot_id: i64) -> Result<Vec<ObjectTag>> {
         block_on(async {
-            let result = sqlx::query(
-                "SELECT object_type, object_id, begin_snapshot, end_snapshot, key, value
+            let result = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT object_type, object_id, begin_snapshot, end_snapshot, key, value
                  FROM ducklake_catalog_tag
                  WHERE catalog_id = $1 AND $2 >= begin_snapshot
                    AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY object_type, object_id, key",
-            )
-            .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await;
             let rows = match result {
                 Ok(rows) => rows,
                 Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
@@ -2032,18 +2306,20 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_column_tags(&self, snapshot_id: i64) -> Result<Vec<ColumnTag>> {
         block_on(async {
-            let result = sqlx::query(
-                "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
+            let result = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT table_id, column_id, begin_snapshot, end_snapshot, key, value
                  FROM ducklake_catalog_column_tag
                  WHERE catalog_id = $1 AND $2 >= begin_snapshot
                    AND ($3 < end_snapshot OR end_snapshot IS NULL)
                  ORDER BY table_id, column_id, key",
-            )
-            .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await;
+                    )
+                    .bind(self.catalog_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await;
             let rows = match result {
                 Ok(rows) => rows,
                 Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
@@ -2068,8 +2344,10 @@ impl MetadataProvider for MulticatalogProvider {
 
     fn list_all_files(&self, snapshot_id: i64) -> Result<Vec<FileWithTable>> {
         block_on(async {
-            let rows = sqlx::query(
-                "SELECT
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT
                     s.schema_name,
                     t.table_name,
                     data.data_file_id,
@@ -2102,18 +2380,18 @@ impl MetadataProvider for MulticatalogProvider {
                   AND $8 >= data.begin_snapshot
                   AND ($9 < data.end_snapshot OR data.end_snapshot IS NULL)
                 ORDER BY s.schema_name, t.table_name, data.path",
-            )
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(self.catalog_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&self.pool)
-            .await?;
+                    )
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(self.catalog_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id)
+                    .bind(snapshot_id),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -2177,8 +2455,10 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
-            let rows = sqlx::query(AssertSqlSafe(format!(
-                "SELECT
+            let rows = self
+                .read_all(
+                    sqlx::query(AssertSqlSafe(format!(
+                        "SELECT
                     data.begin_snapshot,
                     data.path,
                     data.path_is_relative,
@@ -2194,12 +2474,12 @@ impl MetadataProvider for MulticatalogProvider {
                   AND (data.begin_snapshot >= $2
                        OR ({pm} IS NOT NULL AND {pm} >= $2))
                 ORDER BY data.begin_snapshot"
-            )))
-            .bind(table_id)
-            .bind(start_snapshot)
-            .bind(end_snapshot)
-            .fetch_all(&self.pool)
-            .await?;
+                    )))
+                    .bind(table_id)
+                    .bind(start_snapshot)
+                    .bind(end_snapshot),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -2237,8 +2517,10 @@ impl MetadataProvider for MulticatalogProvider {
             } else {
                 "NULL::bigint"
             };
-            let rows = sqlx::query(AssertSqlSafe(format!(
-                r#"
+            let rows = self
+                .read_all(
+                    sqlx::query(AssertSqlSafe(format!(
+                        r#"
 WITH current_delete AS (
     SELECT
         ddf.data_file_id,
@@ -2298,12 +2580,12 @@ WHERE data.table_id = $1
   AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
 "#
-            )))
-            .bind(table_id)
-            .bind(start_snapshot)
-            .bind(end_snapshot)
-            .fetch_all(&self.pool)
-            .await?;
+                    )))
+                    .bind(table_id)
+                    .bind(start_snapshot)
+                    .bind(end_snapshot),
+                )
+                .await?;
 
             rows.into_iter()
                 .map(|row| {
@@ -2331,15 +2613,16 @@ WHERE data.table_id = $1
     }
 }
 
+/// Whether `ducklake_catalog` has the `data_path` column.
+const CATALOG_HAS_DATA_PATH: &str = "SELECT EXISTS (
+     SELECT 1 FROM pg_attribute
+     WHERE attrelid = 'ducklake_catalog'::regclass
+       AND attname = 'data_path'
+       AND NOT attisdropped
+ )";
+
 pub(crate) async fn catalog_has_data_path(pool: &PgPool) -> Result<bool> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM pg_attribute
-             WHERE attrelid = 'ducklake_catalog'::regclass
-               AND attname = 'data_path'
-               AND NOT attisdropped
-         )",
-    )
-    .fetch_one(pool)
-    .await?)
+    Ok(sqlx::query_scalar(CATALOG_HAS_DATA_PATH)
+        .fetch_one(pool)
+        .await?)
 }
