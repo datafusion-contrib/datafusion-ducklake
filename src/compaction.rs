@@ -5,12 +5,15 @@
 //!
 //! 1. [`DuckLakeTable::merge_adjacent_files`] coalesces several small data files
 //!    of one table (of the SAME schema version — never across a DDL boundary)
-//!    into fewer larger ones. A merged file that spans more than one origin
-//!    snapshot is written as a DuckLake **partial data file**: it embeds each
-//!    row's original rowid AND a per-row `_ducklake_internal_snapshot_id` column,
-//!    and its catalog row records `partial_max` (the maximum origin snapshot id
-//!    among its rows), so time travel / change feeds can still attribute every
-//!    merged row to its origin snapshot. A partial file is itself a merge
+//!    into fewer larger ones. A merged file keeps each row's original rowid:
+//!    when the sources' rowid ranges are adjacent it writes the rows in rowid
+//!    order and keeps the first source's `row_id_start`, otherwise it embeds
+//!    each rowid as a column. A merged file that spans more than one origin
+//!    snapshot is written as a DuckLake **partial data file**: it embeds a
+//!    per-row `_ducklake_internal_snapshot_id` column, and its catalog row
+//!    records `partial_max` (the maximum origin snapshot id among its rows), so
+//!    time travel / change feeds can still attribute every merged row to its
+//!    origin snapshot. A partial file is itself a merge
 //!    candidate: its scan projects that embedded column, so each row keeps its
 //!    own origin through a re-merge and a partition never accumulates a floor of
 //!    files it can no longer reduce.
@@ -56,13 +59,15 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    sorts::sort::SortExec,
+    sorts::sort::SortExec, sorts::sort_preserving_merge::SortPreservingMergeExec,
 };
 use futures::{StreamExt, TryStreamExt};
 
 use crate::column_rename::ColumnRenameExec;
 use crate::metadata_provider::DuckLakeTableFile;
-use crate::metadata_writer::{CompactionOutputFile, CompactionSourceFile, SourceRetirement};
+use crate::metadata_writer::{
+    CompactionOutputFile, CompactionSourceFile, RowIdStart, SourceRetirement,
+};
 use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
 use crate::sort::{SortDirection, SortSpec};
@@ -578,12 +583,14 @@ pub(crate) fn sorted_rewrite_batches(
 /// That coalesce emits partitions interleaved by arrival, so an unsorted merge's
 /// physical row order depends on which object-store request returned first. The
 /// same now applies to a single-file `rewrite_data_files`, whose scan is split
-/// across byte ranges: its output order is no longer the source order. This
-/// matches official DuckLake, which sets `DONT_PRESERVE_ORDER` on exactly this
-/// copy (`ducklake_compaction_functions.cpp`), and costs nothing that is load
-/// bearing: a compaction output carries each row's rowid and origin snapshot as
-/// columns and records no `row_id_start`, so nothing downstream derives lineage
-/// from where a row sits. Delete files ARE written in position space, but a
+/// across byte ranges: its output order is no longer the source order. Official
+/// DuckLake preserves order on this copy (`PRESERVE_ORDER` in
+/// `ducklake_compaction_functions.cpp`), but here the order costs nothing that
+/// is load bearing: an output written through here carries each row's rowid and origin
+/// snapshot as columns and records no `row_id_start`, so nothing downstream
+/// derives lineage from where a row sits. (A rowid-adjacent merge, whose rowids
+/// ARE positions, is written through [`rowid_ordered_output`] instead.) Delete
+/// files ARE written in position space, but a
 /// mutation resolves those positions by rescanning the file it is targeting, so
 /// they describe that file's actual layout whatever it turned out to be.
 ///
@@ -619,6 +626,102 @@ pub(crate) fn sorted_rewrite_output(
     let sorted: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ordering.clone(), input));
     let output = Arc::new(ColumnRenameExec::new(sorted, schema, HashMap::new()));
     Ok(output.execute(0, context)?)
+}
+
+/// The `row_id_start` a merge of `bin` keeps, when its sources are
+/// rowid-adjacent in the order their rows are written.
+///
+/// Official DuckLake's rule (`GenerateCompactionCommand` in
+/// `ducklake_compaction_functions.cpp`): every source has a `row_id_start`,
+/// and each one's equals the previous source's `row_id_start + row_count`.
+/// The merged file then holds exactly the range `[first start, first start +
+/// total rows)` in position order, so it embeds no rowid column and keeps the
+/// first source's `row_id_start`. Any other bin returns `None` and embeds.
+///
+/// Merge sources have no deletes, so `row_count` is the catalog
+/// `record_count` (`max_row_count`); a source without one cannot be shown
+/// adjacent.
+fn adjacent_row_id_start(bin: &[&DuckLakeTableFile]) -> Option<i64> {
+    let mut next: Option<i64> = None;
+    for tf in bin {
+        let start = tf.row_id_start?;
+        if next.is_some_and(|next| next != start) {
+            return None;
+        }
+        next = Some(start.checked_add(tf.max_row_count?)?);
+    }
+    bin.first()?.row_id_start
+}
+
+/// Stream a rowid-adjacent merge's rows in rowid order, without the rowid
+/// column, for a file whose rowids are `start` plus each row's position.
+///
+/// `input` carries `[data columns..., rowid, (snapshot id)]` with the rowid at
+/// `rowid_index`. Each partition of it reads one byte range of one source in
+/// file order, so each is already in rowid order and a sort-preserving merge
+/// on the rowid restores the sources' order across partitions. Official
+/// DuckLake gets the same order from `PRESERVE_ORDER` on the merge's copy.
+///
+/// The position a row lands at IS its rowid in such a file, so the stream
+/// checks that the rowids it passes on are exactly `start, start + 1, ...`
+/// and fails the merge on the first one that is not, rather than write a file
+/// that would renumber rows. The caller checks the total row count.
+fn rowid_ordered_output(
+    context: Arc<TaskContext>,
+    input: Arc<dyn ExecutionPlan>,
+    rowid_index: usize,
+    start: i64,
+) -> Result<SendableRecordBatchStream> {
+    let schema = input.schema();
+    let input: Arc<dyn ExecutionPlan> = if input.output_partitioning().partition_count() > 1 {
+        let rowid = schema.field(rowid_index).name();
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            Arc::new(Column::new(rowid, rowid_index)),
+            SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )])
+        .ok_or_else(|| DuckLakeError::Internal("rowid ordering is empty".to_string()))?;
+        Arc::new(SortPreservingMergeExec::new(ordering, input))
+    } else {
+        input
+    };
+    let kept: Vec<usize> = (0..schema.fields().len())
+        .filter(|&index| index != rowid_index)
+        .collect();
+    let output_schema = Arc::new(schema.project(&kept)?);
+    let mut next = start;
+    let stream = input
+        .execute(0, context)?
+        .map(move |batch| -> DataFusionResult<RecordBatch> {
+            let batch = batch?;
+            let rowids = batch
+                .column(rowid_index)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal("merge rowid column is not Int64".to_string())
+                })?;
+            for index in 0..rowids.len() {
+                if rowids.is_null(index) || rowids.value(index) != next {
+                    return Err(DataFusionError::Internal(format!(
+                        "rowid-adjacent merge expected rowid {next} at this position, found {}",
+                        if rowids.is_null(index) {
+                            "NULL".to_string()
+                        } else {
+                            rowids.value(index).to_string()
+                        }
+                    )));
+                }
+                next += 1;
+            }
+            Ok(batch.project(&kept)?)
+        });
+    Ok(Box::pin(RecordBatchStreamAdapter::new(
+        output_schema,
+        stream,
+    )))
 }
 
 impl DuckLakeTable {
@@ -672,7 +775,12 @@ impl DuckLakeTable {
     /// preserving it keeps them prunable exactly as before.
     ///
     /// Each source file's live rows are read with their original rowids
-    /// preserved; a merged file whose rows span more than one origin snapshot is
+    /// preserved. When the bin's sources are rowid-adjacent (each one's
+    /// `row_id_start` is the previous one's `row_id_start + record_count`) and
+    /// the table has no sort order, the merged file is written in rowid order
+    /// with no rowid column and keeps the first source's `row_id_start`, as
+    /// official DuckLake's merge does; otherwise it embeds each row's rowid. A
+    /// merged file whose rows span more than one origin snapshot is
     /// written as a partial file (embedding the per-row
     /// `_ducklake_internal_snapshot_id` column and recording `partial_max`). The
     /// sources are retired and scheduled for deletion in the same commit.
@@ -928,6 +1036,30 @@ impl DuckLakeTable {
                     .is_some_and(|facts| facts.has_embedded_snapshot)
             };
             let partial = min_origin != max_origin || bin.iter().any(|tf| embeds_origins(tf));
+
+            // Rowid-adjacent sources keep their rowids as positions: the output
+            // embeds no rowid column and keeps the first source's
+            // `row_id_start`, as official DuckLake's merge does
+            // (`adjacent_row_id_start`). Two cases embed regardless:
+            //
+            // - A sorted output. Official sorts an adjacent merge too and still
+            //   writes no rowids, which renumbers the rows it moves; this crate
+            //   keeps every row's rowid through a merge, so a reordered output
+            //   carries them as a column.
+            // - A source that physically embeds rowids. The read path takes
+            //   such a file's rowids from that column, so its catalog range
+            //   says nothing about them. Official records no range on such a
+            //   file, so its adjacency check rejects it the same way.
+            let carried_row_id_start = if ordering.is_none()
+                && bin.iter().all(|tf| {
+                    source_facts
+                        .get(&tf.data_file_id)
+                        .is_some_and(|facts| !facts.has_embedded_rowid)
+                }) {
+                adjacent_row_id_start(bin)
+            } else {
+                None
+            };
             // Seeded from the catalog so a bin that embeds nothing still reports
             // its range; every leaf raises it to what it actually emitted.
             let observed_max_origin = Arc::new(AtomicI64::new(max_origin.unwrap_or(i64::MIN)));
@@ -974,11 +1106,19 @@ impl DuckLakeTable {
                 files_processed += 1;
             }
 
-            let merged = sorted_rewrite_output(
-                state.task_ctx(),
-                UnionExec::try_new(leaves)?,
-                ordering.as_ref(),
-            )?;
+            let merged = match carried_row_id_start {
+                Some(start) => rowid_ordered_output(
+                    state.task_ctx(),
+                    UnionExec::try_new(leaves)?,
+                    physical_schema.fields().len(),
+                    start,
+                )?,
+                None => sorted_rewrite_output(
+                    state.task_ctx(),
+                    UnionExec::try_new(leaves)?,
+                    ordering.as_ref(),
+                )?,
+            };
             // A bin whose sources hold no rows at all writes no file; its
             // sources are still retired by the commit below.
             let Some(merged) = first_nonempty(merged).await? else {
@@ -998,18 +1138,32 @@ impl DuckLakeTable {
                     );
                     crate::partition::hive_subpath(&names, &partition_values)
                 });
-            let file = table_writer
-                .write_compacted_file_stream(
+            let mut file = table_writer
+                .write_compacted_file_stream_with_lineage(
                     schema_name,
                     self.table_name(),
                     physical_schema.as_ref(),
                     &column_ids,
                     &top_level_column_ids,
                     merged,
+                    carried_row_id_start.is_none(),
                     partial,
                     subpath.as_deref(),
                 )
                 .await?;
+            if let Some(start) = carried_row_id_start {
+                // The stream checked the rowids were contiguous from `start`;
+                // the count closes the range, so the file holds exactly the
+                // sources' rowids.
+                let expected: i64 = bin.iter().filter_map(|tf| tf.max_row_count).sum();
+                if file.record_count != expected {
+                    return Err(DuckLakeError::Internal(format!(
+                        "rowid-adjacent merge wrote {} rows, its sources hold {expected}",
+                        file.record_count
+                    )));
+                }
+                file.row_id_start = RowIdStart::Preserved(start);
+            }
             rows_written += file.record_count;
             let file = match partition_id {
                 Some(pid) => file.with_partition(pid, partition_value_pairs(&partition_values)),

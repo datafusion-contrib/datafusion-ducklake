@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now removes the files it uploaded when a commit returns any error other than
   `CommitOutcomeUnknown`. An implementation must return any other error only when nothing
   was committed, and `CommitOutcomeUnknown` when its `COMMIT` failed with an unknown outcome.
+- `merge_adjacent_files` writes no rowid column when the merged files' rowid ranges are
+  adjacent and the table has no sort order, keeping the first file's `row_id_start`, as
+  official DuckLake does.
+- **BREAKING** for `MetadataWriter` implementors: `commit_compaction` must store an output's
+  `row_id_start` when it is `RowIdStart::Preserved`, and NULL otherwise.
 
 ### Fixed
 

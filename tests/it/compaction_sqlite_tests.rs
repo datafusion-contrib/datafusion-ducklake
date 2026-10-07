@@ -211,8 +211,9 @@ struct MergedFile {
 /// The embedded lineage columns of a compaction output — `(rowid, origin
 /// snapshot)` per row, in the file's PHYSICAL order. Read from the parquet
 /// itself, so it shows the layout on disk rather than what the read path
-/// reconstructs. The snapshot column is absent unless the file is partial.
-fn file_lineage(temp: &TempDir, path: &str) -> Vec<(i64, Option<i64>)> {
+/// reconstructs. The rowid column is absent from a merge of rowid-adjacent
+/// files, and the snapshot column unless the file is partial.
+fn file_lineage(temp: &TempDir, path: &str) -> Vec<(Option<i64>, Option<i64>)> {
     let file =
         std::fs::File::open(temp.path().join("data").join("main").join("t").join(path)).unwrap();
     let mut out = Vec::new();
@@ -224,11 +225,13 @@ fn file_lineage(temp: &TempDir, path: &str) -> Vec<(i64, Option<i64>)> {
         let batch = batch.unwrap();
         let rowids = batch
             .column_by_name("_ducklake_internal_row_id")
-            .expect("a compaction output embeds its rowids")
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .clone();
+            .map(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone()
+            });
         let snapshots = batch
             .column_by_name("_ducklake_internal_snapshot_id")
             .map(|column| {
@@ -240,7 +243,7 @@ fn file_lineage(temp: &TempDir, path: &str) -> Vec<(i64, Option<i64>)> {
             });
         for i in 0..batch.num_rows() {
             out.push((
-                rowids.value(i),
+                rowids.as_ref().map(|column| column.value(i)),
                 snapshots.as_ref().map(|column| column.value(i)),
             ));
         }
@@ -851,10 +854,10 @@ async fn merge_reads_a_whole_bin_in_one_pass() {
         // pairing, which is the part that must hold.
         let mut lineage = file_lineage(&temp, &file.path);
         lineage.sort_unstable();
-        let mut expected: Vec<(i64, Option<i64>)> = (0..APPENDS)
+        let mut expected: Vec<(Option<i64>, Option<i64>)> = (0..APPENDS)
             .map(|append_index| {
                 (
-                    i64::from(append_index) * 2 + index as i64,
+                    Some(i64::from(append_index) * 2 + index as i64),
                     Some(first_snapshot + i64::from(append_index)),
                 )
             })
@@ -1474,14 +1477,17 @@ async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel()
         Some(pre_snapshot),
         "partial_max = max origin snapshot among merged rows"
     );
+    // The three sources' rowids are adjacent (0..2, 2..4, 4..6), so the merged
+    // file keeps the first source's range and embeds no rowid column.
     let merged_row_id_start = opt_i64(
         &p,
         "SELECT row_id_start FROM ducklake_data_file WHERE end_snapshot IS NULL",
     )
     .await;
     assert_eq!(
-        merged_row_id_start, None,
-        "merged file serves rowids inline"
+        merged_row_id_start,
+        Some(0),
+        "an adjacent merge keeps the first source's row_id_start"
     );
     let merged_begin = scalar_i64(
         &p,
@@ -2735,4 +2741,366 @@ async fn merge_preserves_lineage_when_sources_are_split_across_partitions() {
         id_rowid.len(),
         "every merged row must keep a distinct rowid"
     );
+    // The two sources are rowid-adjacent, so the merged file keeps their range
+    // and each row's position is its rowid: the split partitions must have been
+    // put back in rowid order, which makes every id's rowid exactly its insert
+    // order.
+    let p = pool(&temp).await;
+    assert_eq!(live_file(&p).await.1, Some(0));
+    assert_eq!(
+        id_rowid,
+        (0..PER_FILE * 2)
+            .map(|id| (id, i64::from(id)))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// `(id, rowid)` of `main.t` as of `snapshot`, via a row-lineage catalog.
+async fn read_id_rowid_at(temp: &TempDir, snapshot: i64) -> Vec<(i32, i64)> {
+    let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(temp)).await.unwrap());
+    let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot)
+        .unwrap()
+        .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id, rowid FROM ducklake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let rids = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((ids.value(i), rids.value(i)));
+        }
+    }
+    out
+}
+
+/// Whether the parquet at `path` (relative to `main.t`) physically carries the
+/// embedded rowid column.
+fn embeds_rowids(temp: &TempDir, path: &str) -> bool {
+    let file =
+        std::fs::File::open(temp.path().join("data").join("main").join("t").join(path)).unwrap();
+    ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .schema()
+        .column_with_name("_ducklake_internal_row_id")
+        .is_some()
+}
+
+/// Every `(snapshot_id, rowid, change_type, id)` of `main.t` from
+/// `ducklake_table_changes` over the whole history.
+async fn all_changes(temp: &TempDir) -> Vec<(i64, i64, String, i32)> {
+    let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(temp)).await.unwrap());
+    let catalog =
+        DuckLakeCatalog::new(SqliteMetadataProvider::new(&ro_url(temp)).await.unwrap()).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    datafusion_ducklake::register_ducklake_functions(&ctx, provider);
+    let batches = ctx
+        .sql(
+            "SELECT snapshot_id, rowid, change_type, id \
+             FROM ducklake_table_changes('main.t', 0, 1000) \
+             ORDER BY snapshot_id, rowid",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let snaps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let rowids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let kinds = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let ids = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        for r in 0..batch.num_rows() {
+            rows.push((
+                snaps.value(r),
+                rowids.value(r),
+                kinds.value(r).to_string(),
+                ids.value(r),
+            ));
+        }
+    }
+    rows
+}
+
+/// The single live data file's `(path, row_id_start, record_count)`.
+async fn live_file(p: &SqlitePool) -> (String, Option<i64>, i64) {
+    let row = sqlx::query(
+        "SELECT path, row_id_start, record_count FROM ducklake_data_file \
+         WHERE end_snapshot IS NULL",
+    )
+    .fetch_one(p)
+    .await
+    .unwrap();
+    (
+        row.try_get(0).unwrap(),
+        row.try_get(1).unwrap(),
+        row.try_get(2).unwrap(),
+    )
+}
+
+/// Official DuckLake's merge writes no rowid column when its sources are
+/// rowid-adjacent: the merged file keeps the first source's `row_id_start`,
+/// and each row's rowid is that start plus its position
+/// (`GenerateCompactionCommand`, `ducklake_compaction_functions.cpp`). The
+/// re-merge below is upstream's `merge_adjacent_partial_file_info.test`: a
+/// merged partial file is itself an adjacent source, so merging it with later
+/// appends still keeps the range.
+#[tokio::test(flavor = "multi_thread")]
+async fn adjacent_merge_keeps_row_id_start_and_writes_no_rowid_column() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    let p = pool(&temp).await;
+    let rowids_before = read_id_rowid(&temp).await;
+    assert_eq!(rowids_before, vec![(1, 0), (2, 1), (3, 2), (4, 3)]);
+
+    let result = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!((result.files_processed, result.files_created), (2, 1));
+
+    let (path, row_id_start, record_count) = live_file(&p).await;
+    assert_eq!(
+        row_id_start,
+        Some(0),
+        "keeps the first source's row_id_start"
+    );
+    assert_eq!(record_count, 4);
+    assert!(
+        !embeds_rowids(&temp, &path),
+        "an adjacent merge writes no rowid column"
+    );
+    // Rows are written in rowid order, since position now IS the rowid.
+    assert_eq!(file_values(&temp, &path), vec![10, 20, 30, 40]);
+    // Still a partial file: the snapshot-id column is written as before.
+    assert_eq!(
+        file_lineage(&temp, &path)
+            .into_iter()
+            .map(|(rowid, origin)| (rowid, origin.is_some()))
+            .collect::<Vec<_>>(),
+        vec![(None, true); 4],
+    );
+    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+    // The range was issued to the sources already; nothing new is minted.
+    assert_eq!(
+        scalar_i64(&p, "SELECT next_row_id FROM ducklake_table_stats").await,
+        4
+    );
+
+    // Re-merge the partial output with two later appends: AB (0..4) + C (4..6)
+    // + D (6..8) are adjacent, so the output still starts at 0.
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    append(&temp, vec![7, 8], vec![70, 80]).await;
+    let rowids_before = read_id_rowid(&temp).await;
+    let result = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!((result.files_processed, result.files_created), (3, 1));
+    let (path, row_id_start, record_count) = live_file(&p).await;
+    assert_eq!((row_id_start, record_count), (Some(0), 8));
+    assert!(!embeds_rowids(&temp, &path));
+    assert_eq!(
+        file_values(&temp, &path),
+        vec![10, 20, 30, 40, 50, 60, 70, 80]
+    );
+    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+    assert_eq!(
+        read_rows(&temp).await,
+        (1..=8).map(|id| (id, id * 10)).collect::<Vec<_>>()
+    );
+}
+
+/// A merged file with a `row_id_start` and no rowid column, read at snapshots
+/// before the merge once its sources are physically gone: time travel and the
+/// change feed must serve the same rows with the same rowids as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn adjacent_merge_serves_history_and_changes_after_sources_are_deleted() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    let p = pool(&temp).await;
+    let snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT begin_snapshot FROM ducklake_data_file ORDER BY begin_snapshot",
+    )
+    .fetch_all(&p)
+    .await
+    .unwrap();
+    assert_eq!(snapshots.len(), 3);
+    let mut history = Vec::new();
+    for snapshot in &snapshots {
+        history.push(read_id_rowid_at(&temp, *snapshot).await);
+    }
+    let changes_before = all_changes(&temp).await;
+    assert_eq!(changes_before.len(), 6);
+
+    run_merge(&temp, MergeOptions::default()).await;
+    let (path, row_id_start, _) = live_file(&p).await;
+    assert_eq!(row_id_start, Some(0));
+    assert!(!embeds_rowids(&temp, &path));
+
+    let deleted = {
+        let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+        cleanup_old_files_sqlite(&writer, object_store(), CleanupCriteria::All, false)
+            .await
+            .unwrap()
+    };
+    assert_eq!(deleted.len(), 3, "the three sources are gone from disk");
+
+    for (snapshot, expected) in snapshots.iter().zip(&history) {
+        assert_eq!(
+            &read_id_rowid_at(&temp, *snapshot).await,
+            expected,
+            "rows and rowids as of snapshot {snapshot}"
+        );
+    }
+    assert_eq!(
+        all_changes(&temp).await,
+        changes_before,
+        "the change feed reports the same rowids at the same snapshots"
+    );
+}
+
+/// Adjacency is decided per bin, in the order the bin's rows are written, and
+/// only an unsorted merge of files whose rowids are their ranges keeps one.
+/// The partitioned case is upstream's `compaction_partitioned_non_adjacent.test`
+/// shape: files of one partition interleaved with another's are not adjacent.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_keeps_row_id_start_only_for_adjacent_bins() {
+    use datafusion_ducklake::partition::PartitionTransform;
+    use datafusion_ducklake::{ColumnDef, WriteMode};
+
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let cols = vec![
+        ColumnDef::from_arrow("id", &DataType::Int32, false).unwrap(),
+        ColumnDef::from_arrow("val", &DataType::Int32, false).unwrap(),
+    ];
+    let s = writer
+        .begin_write_transaction("main", "t", &cols, WriteMode::Replace)
+        .unwrap();
+    writer
+        .publish_snapshot(
+            s.table_id,
+            "main",
+            "t",
+            s.snapshot_id,
+            WriteMode::Replace,
+            s.base_snapshot_id,
+            &cols,
+            &s.column_ids,
+        )
+        .unwrap();
+    writer
+        .set_partition_spec(
+            s.table_id,
+            &[("val".to_string(), PartitionTransform::Identity)],
+        )
+        .unwrap();
+
+    // One row per append, so each file's rowid is its append order:
+    // val=1 gets rowids 0 and 1 (adjacent), val=2 gets 2 and 4 (not), and
+    // val=3's single file is not merged.
+    for (id, val) in [(1, 1), (2, 1), (3, 2), (4, 3), (5, 2)] {
+        append(&temp, vec![id], vec![val]).await;
+    }
+    let rowids_before = read_id_rowid(&temp).await;
+    assert_eq!(rowids_before, vec![(1, 0), (2, 1), (3, 2), (4, 3), (5, 4)]);
+
+    let result = run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!((result.files_processed, result.files_created), (4, 2));
+
+    let p = pool(&temp).await;
+    let files: Vec<(String, Option<i64>, i64)> = sqlx::query(
+        "SELECT path, row_id_start, record_count FROM ducklake_data_file \
+         WHERE end_snapshot IS NULL ORDER BY path",
+    )
+    .fetch_all(&p)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| {
+        (
+            row.try_get(0).unwrap(),
+            row.try_get(1).unwrap(),
+            row.try_get(2).unwrap(),
+        )
+    })
+    .collect();
+    let shape: Vec<(String, Option<i64>, i64, bool)> = files
+        .iter()
+        .map(|(path, start, count)| {
+            (
+                path.split('/').next().unwrap().to_string(),
+                *start,
+                *count,
+                embeds_rowids(&temp, path),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("val=1".to_string(), Some(0), 2, false),
+            ("val=2".to_string(), None, 2, true),
+            ("val=3".to_string(), Some(3), 1, false),
+        ],
+    );
+    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+}
+
+/// A table sort order reorders a merged file's rows, so position no longer
+/// follows rowid and the merge embeds rowids even for adjacent sources.
+/// Official DuckLake writes no rowids here and keeps the first source's
+/// `row_id_start`, which renumbers the rows the sort moved; this crate keeps
+/// each row's rowid through a merge instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn sorted_merge_of_adjacent_files_embeds_rowids() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    let p = pool(&temp).await;
+    // A first, unsorted merge keeps the range...
+    run_merge(&temp, MergeOptions::default()).await;
+    assert_eq!(live_file(&p).await.1, Some(0));
+
+    // ...and a sorted one over adjacent sources embeds.
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    let table_id = scalar_i64(&p, "SELECT table_id FROM ducklake_table LIMIT 1").await;
+    SqliteMetadataWriter::new(&db_url(&temp))
+        .await
+        .unwrap()
+        .set_sort_spec(
+            table_id,
+            &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    let rowids_before = read_id_rowid(&temp).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    let (path, row_id_start, _) = live_file(&p).await;
+    assert_eq!(row_id_start, None);
+    assert!(embeds_rowids(&temp, &path));
+    assert_eq!(file_values(&temp, &path), vec![60, 50, 40, 30, 20, 10]);
+    assert_eq!(read_id_rowid(&temp).await, rowids_before);
 }

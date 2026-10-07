@@ -877,3 +877,155 @@ async fn merge_of_absolute_reference_files_does_not_schedule_them() {
     assert_eq!(read_rows(&pool, "cat_a", None).await, rows);
     assert_eq!(read_rows(&pool, "cat_b", None).await, rows);
 }
+
+/// `(id, rowid)` from `<cat>.public.t`, optionally as of `snapshot`, through a
+/// row-lineage catalog.
+async fn read_id_rowid(pool: &PgPool, cat_name: &str, snapshot: Option<i64>) -> Vec<(i32, i64)> {
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let catalog = match snapshot {
+        Some(s) => DuckLakeCatalog::with_snapshot(Arc::new(provider), s).unwrap(),
+        None => DuckLakeCatalog::new(provider).unwrap(),
+    }
+    .with_row_lineage(true);
+    let ctx = SessionContext::new();
+    ctx.register_catalog(cat_name, Arc::new(catalog));
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id, rowid FROM {cat_name}.public.t ORDER BY id"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for b in &batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let rowids = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        for i in 0..b.num_rows() {
+            rows.push((ids.value(i), rowids.value(i)));
+        }
+    }
+    rows
+}
+
+/// A merge of rowid-adjacent files on the multicatalog Postgres backend keeps
+/// the first source's `row_id_start` and embeds no rowid column, as official
+/// DuckLake's merge does. Rowids read back identical at the head and at the
+/// pre-merge snapshots, and a DELETE afterwards lands on the right row.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn adjacent_merge_keeps_row_id_start_postgres() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let os: ObjStore = Arc::new(LocalFileSystem::new());
+    let cat_name = "cat";
+    let cat = MulticatalogManager::new(pool.clone())
+        .create_catalog(cat_name)
+        .await
+        .unwrap();
+
+    DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
+        .unwrap()
+        .write_table("public", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let mut snapshots = Vec::new();
+    for (ids, vals) in [(vec![3, 4], vec![30, 40]), (vec![5, 6], vec![50, 60])] {
+        snapshots.push(
+            MulticatalogProvider::with_pool(pool.clone(), cat_name)
+                .await
+                .unwrap()
+                .get_current_snapshot()
+                .unwrap(),
+        );
+        DuckLakeTableWriter::new(writer_for(&pool, cat, &data).await, os.clone())
+            .unwrap()
+            .append_table("public", "t", &[batch(ids, vals)])
+            .await
+            .unwrap();
+    }
+    snapshots.push(
+        MulticatalogProvider::with_pool(pool.clone(), cat_name)
+            .await
+            .unwrap()
+            .get_current_snapshot()
+            .unwrap(),
+    );
+    let mut history = Vec::new();
+    for snapshot in &snapshots {
+        history.push(read_id_rowid(&pool, cat_name, Some(*snapshot)).await);
+    }
+    assert_eq!(
+        history.last().unwrap(),
+        &vec![(1, 0), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5)]
+    );
+
+    let result = with_writable_table(&pool, cat, cat_name, &data, |t, s| async move {
+        t.merge_adjacent_files(&s, MergeOptions::default()).await
+    })
+    .await;
+    assert_eq!((result.files_processed, result.files_created), (3, 1));
+
+    let files = live_files(&pool, cat_name).await;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].row_id_start, Some(0));
+    let parquet = std::fs::File::open(
+        data.join(format!("cat_{cat}"))
+            .join("public")
+            .join("t")
+            .join(&files[0].file.path),
+    )
+    .unwrap();
+    assert!(
+        ParquetRecordBatchReaderBuilder::try_new(parquet)
+            .unwrap()
+            .schema()
+            .column_with_name("_ducklake_internal_row_id")
+            .is_none(),
+        "an adjacent merge writes no rowid column"
+    );
+    assert_eq!(
+        file_values(&data, cat, &files[0].file.path),
+        vec![10, 20, 30, 40, 50, 60]
+    );
+    for (snapshot, expected) in snapshots.iter().zip(&history) {
+        assert_eq!(
+            &read_id_rowid(&pool, cat_name, Some(*snapshot)).await,
+            expected,
+            "rows and rowids as of snapshot {snapshot}"
+        );
+    }
+    assert_eq!(
+        &read_id_rowid(&pool, cat_name, None).await,
+        history.last().unwrap()
+    );
+
+    // A DELETE against the merged file removes exactly the row it names.
+    let provider = MulticatalogProvider::with_pool(pool.clone(), cat_name)
+        .await
+        .unwrap();
+    let catalog =
+        DuckLakeCatalog::with_writer(Arc::new(provider), writer_for(&pool, cat, &data).await)
+            .unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog(cat_name, Arc::new(catalog));
+    ctx.sql(&format!("DELETE FROM {cat_name}.public.t WHERE id = 4"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        read_id_rowid(&pool, cat_name, None).await,
+        vec![(1, 0), (2, 1), (3, 2), (5, 4), (6, 5)]
+    );
+}

@@ -1295,7 +1295,42 @@ impl DuckLakeTableWriter {
         data_schema: &Schema,
         data_column_ids: &[i64],
         stats_column_ids: &[i64],
+        batches: SendableRecordBatchStream,
+        embed_snapshot_id: bool,
+        partition_subpath: Option<&str>,
+    ) -> Result<DataFileInfo> {
+        self.write_compacted_file_stream_with_lineage(
+            schema_name,
+            table_name,
+            data_schema,
+            data_column_ids,
+            stats_column_ids,
+            batches,
+            true,
+            embed_snapshot_id,
+            partition_subpath,
+        )
+        .await
+    }
+
+    /// [`Self::write_compacted_file_stream`], choosing whether the output
+    /// embeds the rowid column.
+    ///
+    /// With `embed_rowid` false the batches carry no rowid column (the data
+    /// columns, then the snapshot-id column when `embed_snapshot_id`), and the
+    /// file's rowids are its catalog `row_id_start` plus each row's position:
+    /// the caller must write the rows in rowid order and register the file
+    /// with that `row_id_start`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_compacted_file_stream_with_lineage(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_schema: &Schema,
+        data_column_ids: &[i64],
+        stats_column_ids: &[i64],
         mut batches: SendableRecordBatchStream,
+        embed_rowid: bool,
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
@@ -1317,12 +1352,15 @@ impl DuckLakeTableWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
         // Data columns carry their catalog field-ids; append the reserved-field-id
-        // embedded rowid column, and for a merged partial file the snapshot-id
-        // column. Neither embedded column is a catalog column.
+        // embedded rowid column unless the rows' position serves it, and for a
+        // merged partial file the snapshot-id column. Neither embedded column is
+        // a catalog column.
         let schema_with_ids = {
             let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
             let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
-            fields.push(embedded_rowid_field());
+            if embed_rowid {
+                fields.push(embedded_rowid_field());
+            }
             if embed_snapshot_id {
                 fields.push(embedded_snapshot_id_field());
             }

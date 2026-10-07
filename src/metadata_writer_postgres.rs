@@ -6170,15 +6170,16 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Register each rewritten output. begin_snapshot = the file's min
             // origin snapshot for a merged partial file (so historical reads see
-            // it), else this compaction snapshot; row_id_start NULL (rowids come
-            // from the embedded column); partial_max marks a merged partial file.
+            // it), else this compaction snapshot; row_id_start the carried range
+            // of a rowid-adjacent merge, else NULL (rowids come from the
+            // embedded column); partial_max marks a merged partial file.
             for out in outputs {
                 let begin = out.begin_snapshot.unwrap_or(snapshot_id);
                 let inserted = sqlx::query(
                     "INSERT INTO ducklake_data_file
                          (table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8) RETURNING data_file_id",
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
                 )
                 .bind(table_id)
                 .bind(&out.file.path)
@@ -6186,6 +6187,9 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .bind(out.file.file_size_bytes)
                 .bind(out.file.footer_size)
                 .bind(out.file.record_count)
+                .bind(crate::metadata_writer::compaction_output_row_id_start(
+                    &out.file,
+                ))
                 .bind(begin)
                 .bind(out.partial_max)
                 .fetch_one(&mut *tx)

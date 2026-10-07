@@ -4183,9 +4183,10 @@ impl DuckLakeTable {
         // reconstructable lineage. Gated on the output actually carrying `rowid`,
         // because this function serves two callers: the rowid-projected read and
         // an ordinary time-travel read, which projects the embedded column away
-        // and needs no lineage at all. A merged partial file always carries the
-        // embedded column, so this is a guard against a foreign catalog rather
-        // than a live case — but without it the rowid caller's failure is a
+        // and needs no lineage at all. A merged partial file carries either the
+        // embedded column or a `row_id_start` (a merge of rowid-adjacent files),
+        // so this is a guard against a foreign catalog rather than a live case —
+        // but without it the rowid caller's failure is a
         // confusing "no field named rowid" from the rename layer instead of a
         // statement of what is actually missing.
         if output_schema.field_with_name(ROWID_COLUMN_NAME).is_ok()
@@ -4428,6 +4429,7 @@ impl DuckLakeTable {
         Ok(MergeSourceFacts {
             drops_current_columns: cfg.drops_current_columns,
             has_embedded_snapshot: cfg.embedded_snapshot_parquet_name.is_some(),
+            has_embedded_rowid: cfg.embedded_rowid_parquet_name.is_some(),
         })
     }
 
@@ -4711,6 +4713,10 @@ pub(crate) struct MergeSourceFacts {
     /// that do not read the field, catalogs predating it), and keying off it
     /// would re-stamp every row with one origin and drop the column.
     pub(crate) has_embedded_snapshot: bool,
+    /// The file physically embeds the `_ducklake_internal_row_id` column. The
+    /// read path then takes its rowids from that column, whatever its catalog
+    /// `row_id_start` says, so a merge cannot treat its range as its rowids.
+    pub(crate) has_embedded_rowid: bool,
 }
 
 /// Output schema of a rewritten source file: the table's physical columns (in
