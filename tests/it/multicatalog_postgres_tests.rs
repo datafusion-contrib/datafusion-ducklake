@@ -9847,3 +9847,104 @@ async fn dropping_an_open_read_session_returns_its_connection() {
         .await
         .expect("the dropped session gives its connection back");
 }
+
+/// A rolling session whose commit a stale base snapshot rejects removes every file
+/// it uploaded while the write ran, and leaves the committed files alone.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn rejected_rolling_session_removes_its_uploaded_files() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+    use tempfile::TempDir;
+
+    fn parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(parquet_files(&path));
+            } else if path.extension().is_some_and(|e| e == "parquet") {
+                out.push(path);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("rejected_rolling")
+        .await
+        .unwrap();
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new());
+    let metadata: Arc<dyn MetadataWriter> = writer.clone();
+    let mut options = datafusion_ducklake::DuckLakeWriteOptions::default();
+    options.max_row_group_rows = Some(64);
+    options.parquet_version = Some(parquet::file::properties::WriterVersion::PARQUET_1_0);
+    let table_writer = DuckLakeTableWriter::new(metadata, store)
+        .unwrap()
+        .with_target_file_size(4 * 1024)
+        .with_options(&options)
+        .with_upload_concurrency(3);
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = |start: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(start..start + 300))],
+        )
+        .unwrap()
+    };
+    let initial = table_writer
+        .write_table("public", "events", &[batch(0)])
+        .await
+        .unwrap();
+    table_writer
+        .append_table("public", "events", &[batch(300)])
+        .await
+        .unwrap();
+    let committed = parquet_files(&data_path);
+    assert_eq!(committed.len(), 2);
+
+    let mut session = table_writer
+        .begin_write("public", "events", schema.as_ref(), WriteMode::Replace)
+        .unwrap()
+        .with_options(
+            &TableWriteOptions::new().with_expected_base_snapshot_id(initial.snapshot_id),
+        );
+    for b in 0..60 {
+        session
+            .write_batch_async(&batch(1000 + b * 300))
+            .await
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while parquet_files(&data_path).len() <= committed.len() + 5 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write must upload files before it commits"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let err = session
+        .finish()
+        .await
+        .expect_err("a stale base must conflict");
+    assert!(matches!(err, DuckLakeError::Conflict(_)), "got: {err}");
+    assert_eq!(
+        parquet_files(&data_path),
+        committed,
+        "the rejected write's files must be removed, and only those"
+    );
+}

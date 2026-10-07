@@ -3649,7 +3649,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -3811,7 +3811,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4156,7 +4156,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             }
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -5361,7 +5361,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5614,7 +5614,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,

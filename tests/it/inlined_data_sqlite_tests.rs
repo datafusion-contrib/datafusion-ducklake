@@ -749,8 +749,8 @@ async fn writer_inlines_at_limit_and_uses_parquet_outside_limit() {
 }
 
 /// A fence-rejected multi-table commit is a DEFINITE rollback: nothing is
-/// visible on either table and the staged Parquet objects are removed (only an
-/// ambiguous commit failure leaves them to the guarded vacuum).
+/// visible on either table and the staged Parquet objects are removed (only a
+/// `COMMIT` whose outcome is unknown keeps them).
 #[tokio::test(flavor = "multi_thread")]
 async fn conflicted_multi_table_commit_leaves_no_partial_state_and_no_staged_files() {
     let temp = TempDir::new().unwrap();

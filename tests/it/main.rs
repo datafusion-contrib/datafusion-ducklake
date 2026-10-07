@@ -32,6 +32,7 @@ mod concurrent_tests;
 mod concurrent_write_tests;
 mod delete_filter_tests;
 mod duckdb_attach_reads_written_files_tests;
+mod early_upload_tests;
 mod empty_data_file_tests;
 mod encryption_tests;
 mod files_matching_tests;

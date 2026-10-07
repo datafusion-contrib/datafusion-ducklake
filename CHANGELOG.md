@@ -12,6 +12,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MulticatalogProvider::begin_read_session` takes one pooled connection for a query, and
   `with_read_session` runs every catalog read of the provider on it.
   `DuckLakeTable::with_metadata_provider` binds a cached table to it per query (#338).
+- `TableWriteSession::write_batch_async` writes a batch and then waits until every finished
+  file has started uploading, which bounds the finished files a rolling or partitioned
+  session holds on local disk to `upload_concurrency`.
+- `TableWriteSession::abort` abandons a session without committing and removes every file it
+  uploaded, waiting for the uploads in flight first.
+
+### Changed
+
+- **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown`, with the `metadata-postgres` or
+  `metadata-mysql` feature; add an arm to exhaustive matches. A PostgreSQL or MySQL commit
+  that registers data files, or `commit_multi_table`, returns it in place of `Sqlx` when the
+  `COMMIT` statement itself fails, since the server may have applied it.
+- A rolling or partitioned session uploads each data file as soon as it is finished, instead
+  of all of them in `finish`, so upload buffers are held while later files are still being
+  encoded; `with_upload_concurrency` caps how many uploads run at once.
+- `TableWriteSession::write_batch` can return an upload failure, and once it has, every later
+  call fails too; drop or `abort` the session.
+- Dropping a session after its uploads started removes them in the background, on the tokio
+  runtime the uploads started on.
+- A streaming session puts its files in the data path for the whole write, not only at
+  `finish`, so an orphan-file sweep's `older_than` cutoff must be earlier than the start of
+  the longest write that may still be running.
+- The `ducklake.upload_staged_files` span times only the uploads still running at `finish`.
+
+### Fixed
+
+- A write session whose commit fails with nothing committed removes the data and delete
+  files it uploaded, on every session path — rolling, partitioned, single-file, and
+  `finish_with_deletes` — as official DuckLake does; so does a multi-table transaction whose
+  commit fails with nothing committed. Before, only a conflict or validation failure did. A
+  `COMMIT` that fails on PostgreSQL or MySQL keeps them, since it may have applied; official
+  removes them there too.
 
 ## [0.9.0] - 2026-10-07
 
