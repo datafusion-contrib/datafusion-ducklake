@@ -1606,9 +1606,35 @@ pub(crate) fn tag_change(target: TagTarget, key: &str) -> Result<String> {
     }
 }
 
+/// Commit `tx` on a networked catalog, reporting a failure as
+/// [`DuckLakeError::CommitOutcomeUnknown`]: the server may have applied the
+/// `COMMIT` before the error reached us, so the caller cannot tell whether it
+/// took effect.
+#[cfg(any(feature = "write-postgres", feature = "write-mysql"))]
+pub(crate) async fn commit_networked<DB: sqlx::Database>(
+    tx: sqlx::Transaction<'_, DB>,
+) -> Result<()> {
+    tx.commit()
+        .await
+        .map_err(DuckLakeError::CommitOutcomeUnknown)
+}
+
 /// Trait for writing metadata to DuckLake catalogs.
 ///
 /// Implementations must be thread-safe (`Send + Sync`).
+///
+/// A write session removes the data and delete files it wrote when the commit
+/// that would register them fails with nothing committed, and keeps them when the
+/// outcome is unknown. It tells the two apart by the error alone, so the commits
+/// it calls (`register_data_file`, `register_data_files`, their
+/// `_with_commit_metadata`, `_with_deletes` and `_with_deletes_and_commit_metadata`
+/// forms, and `commit_multi_table`) must keep this contract: return
+/// `DuckLakeError::CommitOutcomeUnknown` when the transaction's `COMMIT` itself
+/// fails and the catalog may have applied it, and any other error only when
+/// nothing was committed. In particular, an implementation must not return any
+/// other error once its transaction has committed, or the session removes files a
+/// committed snapshot names. An embedded catalog whose failed `COMMIT` is known to
+/// have rolled back returns that failure as an ordinary error.
 pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;

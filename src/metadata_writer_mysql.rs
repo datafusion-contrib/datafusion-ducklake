@@ -2740,7 +2740,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .await?
                     .try_get(0)?;
 
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -2904,7 +2904,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?
                     .try_get(0)?;
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -3076,7 +3076,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     .bind(table_id)
                     .fetch_one(&mut *tx)
                     .await?;
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -3918,7 +3918,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                 )
                 .await?;
             }
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,

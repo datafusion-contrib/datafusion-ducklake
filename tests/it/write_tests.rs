@@ -2570,8 +2570,11 @@ async fn abort_multi_table_write_removes_staged_files() {
     );
 }
 
+/// A database error raised before the metadata transaction's `COMMIT` means
+/// nothing was committed, so the staged files are removed, as official DuckLake
+/// removes a failed transaction's files.
 #[tokio::test(flavor = "multi_thread")]
-async fn failed_multi_table_database_commit_preserves_staged_files() {
+async fn failed_multi_table_database_commit_removes_staged_files() {
     let (metadata, temp) = create_test_env().await;
     let metadata = Arc::new(metadata);
     let store = create_object_store();
@@ -2589,6 +2592,11 @@ async fn failed_multi_table_database_commit_preserves_staged_files() {
     .unwrap();
     let base = writer
         .append_table("main", "events", from_ref(&batch))
+        .await
+        .unwrap();
+    let committed = store
+        .list(Some(&prefix))
+        .try_collect::<Vec<_>>()
         .await
         .unwrap();
     let mut transaction = writer.transaction();
@@ -2618,13 +2626,21 @@ async fn failed_multi_table_database_commit_preserves_staged_files() {
     let error = transaction.commit().await.unwrap_err();
     assert!(matches!(error, DuckLakeError::Sqlx(_)), "{error}");
     assert_eq!(before.len(), 2);
+    assert_eq!(committed.len(), 1);
     assert_eq!(
         store
             .list(Some(&prefix))
             .try_collect::<Vec<_>>()
             .await
-            .unwrap(),
-        before
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.location)
+            .collect::<Vec<_>>(),
+        committed
+            .into_iter()
+            .map(|meta| meta.location)
+            .collect::<Vec<_>>(),
+        "only the committed file may remain"
     );
     assert_eq!(
         SqliteMetadataProvider::new(&format!("sqlite:{}", temp.path().join("test.db").display()))

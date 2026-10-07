@@ -1,7 +1,7 @@
 //! Ordered-concurrent staged-file upload.
 //!
-//! `TableWriteSession::finish` uploads the files a rolling write produced with
-//! several in flight, but must register them in WRITE ORDER: the commit assigns
+//! A rolling `TableWriteSession` uploads the files it produces with several in
+//! flight, but `finish` must register them in WRITE ORDER: the commit assigns
 //! each file's `row_id_start` by walking the list and advancing a running counter
 //! (`register_data_files_with_commit_metadata`). Reordering the uploads would
 //! renumber rows silently — no error, no failed commit, just different lineage ids
@@ -376,23 +376,33 @@ async fn a_failed_upload_removes_the_files_that_already_landed() {
         .with_upload_concurrency(CONCURRENCY)
         .begin_write("main", "t", schema.as_ref(), WriteMode::Append)
         .unwrap();
+    // Files upload while the write goes on, so the failure can surface from
+    // `write_batch` as well as from `finish`. Either way the write must fail, and
+    // aborting it must leave nothing behind.
+    let mut early = None;
     for b in 0..TOTAL_BATCHES as i32 {
         let ids: Vec<i32> = (b * 100..(b + 1) * 100).collect();
         let vals: Vec<i32> = ids.iter().map(|id| id * 10).collect();
-        session
-            .write_batch(
-                &RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
-                )
-                .unwrap(),
-            )
-            .unwrap();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
+        )
+        .unwrap();
+        if let Err(e) = session.write_batch(&batch) {
+            early = Some(e);
+            break;
+        }
     }
-    let err = session
-        .finish()
-        .await
-        .expect_err("the injected upload failure must fail the write");
+    let err = match early {
+        Some(err) => {
+            session.abort().await.unwrap();
+            err
+        },
+        None => session
+            .finish()
+            .await
+            .expect_err("the injected upload failure must fail the write"),
+    };
     let msg = err.to_string();
     assert!(
         msg.contains("injected upload failure"),

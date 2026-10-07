@@ -69,6 +69,15 @@ pub enum DuckLakeError {
     #[error("Database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 
+    /// The `COMMIT` of a metadata transaction failed on a PostgreSQL or MySQL
+    /// catalog, so whether it took effect is unknown: the server may have
+    /// committed it before the connection failed. Raised by the commits that
+    /// register data files and by `commit_multi_table`; any other error from
+    /// those means nothing was committed. Read the catalog before retrying.
+    #[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql"))]
+    #[error("Commit outcome unknown: {0}")]
+    CommitOutcomeUnknown(#[source] sqlx::Error),
+
     /// Catalog not found
     #[error("Catalog not found: {0}")]
     CatalogNotFound(String),

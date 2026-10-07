@@ -1202,7 +1202,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 )
                 .await?;
             }
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -1583,7 +1583,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .await?;
 
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(ids)
         })
     }
@@ -1727,7 +1727,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 commit_metadata,
             )
             .await?;
-            tx.commit().await?;
+            crate::metadata_writer::commit_networked(tx).await?;
             Ok(ids)
         })
     }
