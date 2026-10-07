@@ -43,7 +43,7 @@ crate to build, so it is not a default:
 ```toml
 # Cargo.toml — read (and write) DuckDB-backed catalogs
 [dependencies.datafusion-ducklake]
-version = "0.8"
+version = "0.9"
 features = ["duckdb-bundled"]   # add "write-duckdb" to write them
 ```
 
@@ -51,7 +51,7 @@ features = ["duckdb-bundled"]   # add "write-duckdb" to write them
 # Cargo.toml — read PostgreSQL catalogs
 # (to write them too, use features = ["write-postgres"])
 [dependencies.datafusion-ducklake]
-version = "0.8"
+version = "0.9"
 default-features = false
 features = ["metadata-postgres", "tls-rustls-aws-lc-rs"]
 ```
@@ -337,8 +337,13 @@ A few highlights worth knowing up front:
   single-catalog layout, recommended by default, and an experimental multi-catalog layout.
 - Object stores: local filesystem, S3-compatible (S3, MinIO), and any other `object_store`
   backend registered in the `RuntimeEnv` under the `data_path` scheme (`gs://`, `az://`, ...).
+- A catalog from `DuckLakeCatalog::new` or `with_writer` reads the latest snapshot at each
+  lookup. Register it with `DuckLakeCatalog::register` to keep each statement on one snapshot.
 - Snapshots can be selected through `DuckLakeCatalog` (by id or timestamp) or per query with
   `ducklake_table_at`; DataFusion does not support `AS OF` syntax.
+- Comments and tags are readable on every backend through the `information_schema` views
+  `object_tags` and `column_tags`. SQLite and both PostgreSQL layouts can write them, for
+  example with `COMMENT ON` through `execute_ducklake_sql`.
 - Table partitioning: read + file pruning on all backends; partitioned writes on every
   writable backend.
 - Filter pushdown reaches the catalog: per-column statistics narrow the file-listing query
