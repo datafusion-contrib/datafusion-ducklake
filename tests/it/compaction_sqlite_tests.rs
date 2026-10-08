@@ -1208,7 +1208,6 @@ async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage()
             &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
         )
         .unwrap();
-    let rowids_before = read_id_rowid(&temp).await;
     assert_eq!(
         usize::try_from(TOTAL_ROWS).unwrap()
             * (2 * std::mem::size_of::<i32>() + std::mem::size_of::<i64>()),
@@ -1254,7 +1253,15 @@ async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage()
         file_values(&temp, &files[0].file.file.path),
         (0..TOTAL_ROWS).rev().collect::<Vec<_>>(),
     );
-    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+    // The sources are rowid-adjacent, so the merged file keeps their range and
+    // each row's rowid is its sorted position, as in official DuckLake.
+    assert_eq!(files[0].file.row_id_start, Some(0));
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        (0..TOTAL_ROWS)
+            .map(|id| (id, i64::from(TOTAL_ROWS - 1 - id)))
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(
         read_rows_at(&temp, first_snapshot).await,
         expected_first_snapshot,
@@ -1619,7 +1626,6 @@ async fn sorted_merge_with_limited_memory_preserves_row_and_snapshot_lineage() {
             &[SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast)],
         )
         .unwrap();
-    let rowids_before = read_id_rowid(&temp).await;
 
     let spill = TempDir::new().unwrap();
     let runtime = Arc::new(
@@ -1672,7 +1678,16 @@ async fn sorted_merge_with_limited_memory_preserves_row_and_snapshot_lineage() {
         file_values(&temp, &live_path),
         (0..ROW_COUNT).collect::<Vec<_>>(),
     );
-    assert_eq!(read_id_rowid(&temp).await, rowids_before);
+    // The sources are rowid-adjacent, so each row's rowid is its sorted
+    // position, as in official DuckLake: here, its `val`.
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        read_rows(&temp)
+            .await
+            .into_iter()
+            .map(|(id, val)| (id, i64::from(val)))
+            .collect::<Vec<_>>(),
+    );
     assert_eq!(
         read_rows_at(&temp, first_snapshot).await,
         (0..ROWS_PER_FILE)
@@ -3070,23 +3085,24 @@ async fn merge_keeps_row_id_start_only_for_adjacent_bins() {
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
 }
 
-/// A table sort order reorders a merged file's rows, so position no longer
-/// follows rowid and the merge embeds rowids even for adjacent sources.
-/// Official DuckLake writes no rowids here and keeps the first source's
-/// `row_id_start`, which renumbers the rows the sort moved; this crate keeps
-/// each row's rowid through a merge instead.
+/// A sorted merge of rowid-adjacent files keeps the first source's
+/// `row_id_start` and writes no rowid column, as official DuckLake's does
+/// (`GenerateCompactionCommand` sorts with no rowid tiebreaker and keeps the
+/// range). Each row's rowid is then its sorted position, at the head and at
+/// every snapshot the merged file serves.
 #[tokio::test(flavor = "multi_thread")]
-async fn sorted_merge_of_adjacent_files_embeds_rowids() {
+async fn sorted_merge_of_adjacent_files_takes_rowids_from_sorted_position() {
     let temp = TempDir::new().unwrap();
     seed(&temp, vec![1, 2], vec![10, 20]).await;
     append(&temp, vec![3, 4], vec![30, 40]).await;
     let p = pool(&temp).await;
-    // A first, unsorted merge keeps the range...
+    // A first, unsorted merge keeps every rowid...
     run_merge(&temp, MergeOptions::default()).await;
     assert_eq!(live_file(&p).await.1, Some(0));
 
-    // ...and a sorted one over adjacent sources embeds.
+    // ...and a sorted one keeps the range while the rows move.
     append(&temp, vec![5, 6], vec![50, 60]).await;
+    let first_snapshot = scalar_i64(&p, "SELECT MIN(begin_snapshot) FROM ducklake_data_file").await;
     let table_id = scalar_i64(&p, "SELECT table_id FROM ducklake_table LIMIT 1").await;
     SqliteMetadataWriter::new(&db_url(&temp))
         .await
@@ -3096,11 +3112,466 @@ async fn sorted_merge_of_adjacent_files_embeds_rowids() {
             &[SortField::column(0, "val", SortDirection::Desc, NullOrder::NullsLast)],
         )
         .unwrap();
-    let rowids_before = read_id_rowid(&temp).await;
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        (1..=6)
+            .map(|id| (id, i64::from(id) - 1))
+            .collect::<Vec<_>>()
+    );
     run_merge(&temp, MergeOptions::default()).await;
-    let (path, row_id_start, _) = live_file(&p).await;
-    assert_eq!(row_id_start, None);
-    assert!(embeds_rowids(&temp, &path));
+    let (path, row_id_start, record_count) = live_file(&p).await;
+    assert_eq!((row_id_start, record_count), (Some(0), 6));
+    assert!(!embeds_rowids(&temp, &path));
     assert_eq!(file_values(&temp, &path), vec![60, 50, 40, 30, 20, 10]);
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        (1..=6)
+            .map(|id| (id, 6 - i64::from(id)))
+            .collect::<Vec<_>>()
+    );
+    // History is served from the same file, so it reads the same rowids.
+    assert_eq!(
+        read_id_rowid_at(&temp, first_snapshot).await,
+        vec![(1, 5), (2, 4)]
+    );
+    assert_eq!(
+        read_rows(&temp).await,
+        (1..=6).map(|id| (id, id * 10)).collect::<Vec<_>>()
+    );
+}
+
+/// Merge candidates are taken in official DuckLake's order (`begin_snapshot`,
+/// `row_id_start`, `data_file_id`). An earlier merge's output takes a new,
+/// higher `data_file_id` but keeps its sources' `begin_snapshot` and range,
+/// so it precedes a file appended before that merge ran: the two are adjacent
+/// and the merge keeps the range.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_orders_an_earlier_merge_output_before_later_appends() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    let p = pool(&temp).await;
+    // Merge only the first two files: the output (rowids 0..4) gets the
+    // highest data_file_id, above the third file's (4..6).
+    let result = run_merge(
+        &temp,
+        MergeOptions {
+            max_merged_files: 2,
+            ..MergeOptions::default()
+        },
+    )
+    .await;
+    assert_eq!((result.files_processed, result.files_created), (2, 1));
+    let ids: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT data_file_id, row_id_start FROM ducklake_data_file \
+         WHERE end_snapshot IS NULL ORDER BY data_file_id",
+    )
+    .fetch_all(&p)
+    .await
+    .unwrap();
+    assert_eq!(
+        ids.iter().map(|(_, start)| *start).collect::<Vec<_>>(),
+        vec![Some(4), Some(0)],
+        "the merge output has the higher data_file_id"
+    );
+    let rowids_before = read_id_rowid(&temp).await;
+
+    run_merge(&temp, MergeOptions::default()).await;
+    let (path, row_id_start, record_count) = live_file(&p).await;
+    assert_eq!((row_id_start, record_count), (Some(0), 6));
+    assert!(!embeds_rowids(&temp, &path));
+    assert_eq!(file_values(&temp, &path), vec![10, 20, 30, 40, 50, 60]);
     assert_eq!(read_id_rowid(&temp).await, rowids_before);
+}
+
+/// Side-by-side parity with official DuckLake (the bundled DuckDB and its
+/// `ducklake` extension): the same statements build two identical catalogs,
+/// official merges one and this crate merges the other, and the merged files'
+/// catalog shape, physical row order and rowids (at the head and at every
+/// earlier snapshot) must agree.
+#[cfg(feature = "metadata-duckdb")]
+mod official_parity {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// One live data file of `main.t` after the merge.
+    #[derive(Debug, PartialEq)]
+    struct FileShape {
+        row_id_start: Option<i64>,
+        record_count: i64,
+        embeds_rowids: bool,
+        /// The `id` column in physical order.
+        ids: Vec<i32>,
+    }
+
+    /// `(snapshot, [(id, rowid)])`; a `None` snapshot is the head.
+    type RowidsAt = (Option<i64>, Vec<(i32, i64)>);
+
+    /// What one side's merge produced.
+    #[derive(Debug, PartialEq)]
+    struct Merged {
+        files: Vec<FileShape>,
+        /// `(snapshot, [(id, rowid)])` for every snapshot from the table's
+        /// creation up to the merge, then the head (`None`).
+        rowids: Vec<RowidsAt>,
+    }
+
+    fn open_official(temp: &TempDir, inlining_limit: usize) -> duckdb::Connection {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        crate::common::ensure_ducklake_installed();
+        conn.execute_batch("INSTALL sqlite; LOAD sqlite; LOAD ducklake;")
+            .unwrap();
+        let data_path = temp.path().join("data");
+        std::fs::create_dir_all(&data_path).unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH 'ducklake:sqlite:{}' AS lake \
+             (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT {inlining_limit})",
+            temp.path().join("test.db").display(),
+            data_path.display()
+        ))
+        .unwrap();
+        conn
+    }
+
+    fn official_id_rowid(conn: &duckdb::Connection, snapshot: Option<i64>) -> Vec<(i32, i64)> {
+        let at = snapshot.map_or(String::new(), |s| format!(" AT (VERSION => {s})"));
+        let mut stmt = conn
+            .prepare(&format!("SELECT id, rowid FROM lake.t{at} ORDER BY id"))
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The file named `name` anywhere under `dir`.
+    fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if let Some(found) = find_file(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|f| f == name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    async fn live_files(temp: &TempDir) -> Vec<FileShape> {
+        let p = pool(temp).await;
+        let rows: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
+            "SELECT f.path, f.row_id_start, f.record_count FROM ducklake_data_file f \
+             JOIN ducklake_table t ON t.table_id = f.table_id \
+             WHERE t.table_name = 't' AND t.end_snapshot IS NULL \
+               AND f.end_snapshot IS NULL \
+             ORDER BY f.row_id_start IS NULL, f.row_id_start, f.record_count",
+        )
+        .fetch_all(&p)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(path, row_id_start, record_count)| {
+                let name = Path::new(&path).file_name().unwrap().to_str().unwrap();
+                let file = std::fs::File::open(
+                    find_file(&temp.path().join("data"), name)
+                        .unwrap_or_else(|| panic!("no data file named {name}")),
+                )
+                .unwrap();
+                let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+                let embeds_rowids = reader
+                    .schema()
+                    .column_with_name("_ducklake_internal_row_id")
+                    .is_some();
+                let ids = reader
+                    .build()
+                    .unwrap()
+                    .flat_map(|batch| {
+                        let batch = batch.unwrap();
+                        batch
+                            .column_by_name("id")
+                            .unwrap()
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect();
+                FileShape {
+                    row_id_start,
+                    record_count,
+                    embeds_rowids,
+                    ids,
+                }
+            })
+            .collect()
+    }
+
+    /// The snapshots from `main.t`'s creation up to now.
+    async fn table_snapshots(temp: &TempDir) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT snapshot_id FROM ducklake_snapshot WHERE snapshot_id >= \
+             (SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_name = 't') \
+             ORDER BY snapshot_id",
+        )
+        .fetch_all(&pool(temp).await)
+        .await
+        .unwrap()
+    }
+
+    /// Build the catalog with `statements` twice, merge one copy with official
+    /// DuckLake and the other with this crate, and return both results as
+    /// `(official, crate)`.
+    async fn merge_both(inlining_limit: usize, statements: &[&str]) -> (Merged, Merged) {
+        let official = TempDir::new().unwrap();
+        let ours = TempDir::new().unwrap();
+        for temp in [&official, &ours] {
+            let conn = open_official(temp, inlining_limit);
+            for statement in statements {
+                conn.execute_batch(statement).unwrap();
+            }
+            conn.execute_batch("DETACH lake").unwrap();
+        }
+        let snapshots = table_snapshots(&official).await;
+        assert_eq!(snapshots, table_snapshots(&ours).await);
+
+        let conn = open_official(&official, inlining_limit);
+        conn.execute_batch("CALL ducklake_merge_adjacent_files('lake')")
+            .unwrap();
+        let mut official_rowids: Vec<RowidsAt> = snapshots
+            .iter()
+            .map(|s| (Some(*s), official_id_rowid(&conn, Some(*s))))
+            .collect();
+        official_rowids.push((None, official_id_rowid(&conn, None)));
+        conn.execute_batch("DETACH lake").unwrap();
+        let official_merged = Merged {
+            files: live_files(&official).await,
+            rowids: official_rowids,
+        };
+
+        normalize_official_data_file_ids(&ours).await.unwrap();
+        let result = run_merge(&ours, MergeOptions::default()).await;
+        assert!(result.did_work());
+        let mut our_rowids = Vec::new();
+        for s in &snapshots {
+            our_rowids.push((Some(*s), read_id_rowid_at(&ours, *s).await));
+        }
+        our_rowids.push((None, read_id_rowid(&ours).await));
+        let our_merged = Merged {
+            files: live_files(&ours).await,
+            rowids: our_rowids,
+        };
+        (official_merged, our_merged)
+    }
+
+    fn head(merged: &Merged) -> &[(i32, i64)] {
+        &merged.rowids.last().unwrap().1
+    }
+
+    /// Two inserts, then `SET SORTED BY`: official keeps the range and the
+    /// rows the sort moves take the rowids of their new positions, at the head
+    /// and in history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sorted_merge_matches_official() {
+        let (official, ours) = merge_both(
+            0,
+            &[
+                "CREATE TABLE lake.t(id INTEGER, val INTEGER)",
+                "INSERT INTO lake.t SELECT i, 9 - i FROM range(0, 5) r(i)",
+                "INSERT INTO lake.t SELECT i, 9 - i FROM range(5, 10) r(i)",
+                "ALTER TABLE lake.t SET SORTED BY (val ASC)",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        assert_eq!(
+            official.files,
+            vec![FileShape {
+                row_id_start: Some(0),
+                record_count: 10,
+                embeds_rowids: false,
+                ids: (0..10).rev().collect(),
+            }]
+        );
+        assert_eq!(
+            head(&official),
+            (0..10)
+                .map(|id| (id, 9 - i64::from(id)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Upstream `test/sql/sorted_table/merge_adjacent_sorted_basic.test`: two
+    /// flushed files (each embedding its rowids), a two-key sort order and an
+    /// unrelated `ADD COLUMN`, then a merge that writes the rows in sorted
+    /// order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sorted_merge_of_flushed_files_matches_official() {
+        let (official, ours) = merge_both(
+            10,
+            &[
+                "CREATE TABLE lake.t(id INTEGER, k INTEGER, s VARCHAR)",
+                "INSERT INTO lake.t FROM range(4) r(i) \
+                 SELECT i, i % 2, 'woot' || i ORDER BY i DESC",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t FROM range(4) r(i) \
+                 SELECT i + 4, (i + 4) % 2, 'woot' || (i + 4) ORDER BY i DESC",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "ALTER TABLE lake.t SET SORTED BY (k ASC NULLS LAST, s ASC NULLS LAST)",
+                "ALTER TABLE lake.t ADD COLUMN new_column INTEGER",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        assert_eq!(
+            official.files,
+            vec![FileShape {
+                row_id_start: Some(0),
+                record_count: 8,
+                embeds_rowids: false,
+                ids: vec![0, 2, 4, 6, 1, 3, 5, 7],
+            }]
+        );
+    }
+
+    /// An inlined-data flush writes the rowid column and records a range. The
+    /// merge treats it as adjacent by its range and writes no rowid column.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flushed_file_merge_matches_official() {
+        let (official, ours) = merge_both(
+            10,
+            &[
+                "CREATE TABLE lake.t(id INTEGER, k INTEGER)",
+                "INSERT INTO lake.t VALUES (0, 0), (1, 1), (2, 2)",
+                "INSERT INTO lake.t VALUES (3, 3), (4, 4), (5, 5)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t SELECT i, i FROM range(6, 30) r(i)",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        assert_eq!(
+            official.files,
+            vec![FileShape {
+                row_id_start: Some(0),
+                record_count: 30,
+                embeds_rowids: false,
+                ids: (0..30).collect(),
+            }]
+        );
+        assert_eq!(
+            head(&official),
+            (0..30).map(|id| (id, i64::from(id))).collect::<Vec<_>>()
+        );
+    }
+
+    /// A flush written under a sort order embeds rowids that are not in file
+    /// order. Once the sort is reset, official's merge writes the flushed
+    /// rows in file order and they take the rowids of their positions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sorted_flush_after_sort_reset_matches_official() {
+        let (official, ours) = merge_both(
+            10,
+            &[
+                "CREATE TABLE lake.t(id INTEGER, val INTEGER)",
+                "ALTER TABLE lake.t SET SORTED BY (val ASC)",
+                "INSERT INTO lake.t VALUES (0, 3), (1, 1), (2, 2)",
+                "INSERT INTO lake.t VALUES (3, 0), (4, 5)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "ALTER TABLE lake.t RESET SORTED BY",
+                "INSERT INTO lake.t SELECT 5 + i, 100 + i FROM range(20) r(i)",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        let file = &official.files[0];
+        assert_eq!(
+            (file.row_id_start, file.record_count, file.embeds_rowids),
+            (Some(0), 25, false)
+        );
+        assert_eq!(&file.ids[..5], &[3, 1, 2, 0, 4]);
+        assert_eq!(
+            &head(&official)[..5],
+            &[(0, 3), (1, 1), (2, 2), (3, 0), (4, 4)]
+        );
+    }
+
+    /// An earlier merge's output (new, higher id; old `begin_snapshot` and
+    /// range) followed by a file appended before that merge ran: official
+    /// orders them by `begin_snapshot`, finds them adjacent and keeps the
+    /// range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn earlier_merge_output_and_older_file_match_official() {
+        let (official, ours) = merge_both(
+            0,
+            &[
+                "CREATE TABLE lake.t(id INTEGER, val INTEGER)",
+                "INSERT INTO lake.t VALUES (1, 10), (2, 20)",
+                "INSERT INTO lake.t VALUES (3, 30), (4, 40)",
+                "INSERT INTO lake.t SELECT 4 + i, i FROM range(1, 2001) r(i)",
+                // Merge only the two small files: the third is above this cap.
+                "CALL ducklake_merge_adjacent_files('lake', 't', max_file_size => 2000)",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        let file = &official.files[0];
+        assert_eq!(
+            (
+                official.files.len(),
+                file.row_id_start,
+                file.record_count,
+                file.embeds_rowids
+            ),
+            (1, Some(0), 2004, false)
+        );
+        assert_eq!(file.ids, (1..=2004).collect::<Vec<_>>());
+    }
+
+    /// Upstream `test/sql/compaction/small_insert_compaction.test`: five
+    /// single-row inserts, each flushed to its own file (with an unrelated
+    /// table's insert in between), merge into one file that keeps rowids
+    /// 0..5 at the head and at every earlier snapshot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_insert_compaction_matches_official() {
+        let (official, ours) = merge_both(
+            10,
+            &[
+                "CREATE TABLE lake.t(id INTEGER)",
+                "CREATE TABLE lake.test2(i INTEGER)",
+                "INSERT INTO lake.t VALUES (1)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.test2 VALUES (42)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t VALUES (2)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t VALUES (3)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t VALUES (4)",
+                "CALL ducklake_flush_inlined_data('lake')",
+                "INSERT INTO lake.t VALUES (5)",
+                "CALL ducklake_flush_inlined_data('lake')",
+            ],
+        )
+        .await;
+        assert_eq!(ours, official);
+        assert_eq!(
+            official.files,
+            vec![FileShape {
+                row_id_start: Some(0),
+                record_count: 5,
+                embeds_rowids: false,
+                ids: (1..=5).collect(),
+            }]
+        );
+        assert_eq!(
+            head(&official),
+            (1..=5)
+                .map(|id| (id, i64::from(id) - 1))
+                .collect::<Vec<_>>()
+        );
+    }
 }

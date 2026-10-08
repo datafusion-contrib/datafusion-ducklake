@@ -40,10 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CommitOutcomeUnknown`. An implementation must return any other error only when nothing
   was committed, and `CommitOutcomeUnknown` when its `COMMIT` failed with an unknown outcome.
 - `merge_adjacent_files` writes no rowid column when the merged files' rowid ranges are
-  adjacent and the table has no sort order, keeping the first file's `row_id_start`, as
-  official DuckLake does.
+  adjacent, keeping the first file's `row_id_start`, as official DuckLake does. Each row's
+  rowid is then that start plus its position in the merged file. Without a sort order the
+  rows keep their rowids. With a sort order the rows are written in sorted order, so their
+  rowids follow the sorted position, at the head and at earlier snapshots. A file with an
+  embedded rowid column and a `row_id_start` (an inlined-data flush) is adjacent by its range,
+  and its rows are taken in file order.
+- `merge_adjacent_files` takes merge candidates in official DuckLake's order within a schema
+  version and partition: `begin_snapshot`, then `row_id_start`, then `data_file_id`. An
+  earlier merge's output, whose id is newer than files appended before that merge ran, now
+  precedes them.
 - **BREAKING** for `MetadataWriter` implementors: `commit_compaction` must store an output's
-  `row_id_start` when it is `RowIdStart::Preserved`, and NULL otherwise.
+  `row_id_start` when it is `RowIdStart::Preserved`, and NULL otherwise. An implementation
+  that keeps storing NULL registers a merged file that has neither a range nor a rowid
+  column: reading its rowids, or updating it, fails.
 
 ### Fixed
 

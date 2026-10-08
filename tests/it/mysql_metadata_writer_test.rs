@@ -1458,3 +1458,105 @@ async fn mysql_initialize_migrates_directory_paths_once() {
         assert_eq!(table_path, "users/");
     }
 }
+
+/// `commit_compaction` stores a `Preserved` output's `row_id_start` (a merge
+/// of rowid-adjacent files keeps the first source's range) and NULL for any
+/// other output, without moving `next_row_id`: the same contract the SQLite,
+/// DuckDB and PostgreSQL writers are held to.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_compaction_stores_a_preserved_row_id_start() {
+    let (_container, writer, pool) = start_writer().await;
+    let columns = int_column();
+    let mut last_snapshot = 0;
+    let mut table_id = 0;
+    for (path, rows) in [("a.parquet", 2), ("b.parquet", 3), ("c.parquet", 4)] {
+        let setup = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+            .unwrap();
+        last_snapshot = writer
+            .register_data_file(
+                setup.table_id,
+                "main",
+                "t",
+                setup.snapshot_id,
+                &DataFileInfo::new(path, 10 * rows, rows),
+                WriteMode::Append,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.column_ids,
+            )
+            .unwrap()
+            .snapshot_id;
+        table_id = setup.table_id;
+    }
+    let next_row_id = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(next_row_id().await, 9);
+
+    // a (rowids 0..2) + b (2..5) merge into one file that keeps start 0.
+    let (a_id, b_id, c_id) = (
+        file_id(&pool, "a.parquet").await,
+        file_id(&pool, "b.parquet").await,
+        file_id(&pool, "c.parquet").await,
+    );
+    let adjacent = writer
+        .commit_compaction(
+            table_id,
+            last_snapshot,
+            &[
+                CompactionSourceFile {
+                    data_file_id: a_id,
+                    delete_file_id: None,
+                },
+                CompactionSourceFile {
+                    data_file_id: b_id,
+                    delete_file_id: None,
+                },
+            ],
+            &[CompactionOutputFile {
+                file: DataFileInfo::new("ab.parquet", 50, 5).with_source_row_id_start(Some(0)),
+                begin_snapshot: None,
+                partial_max: None,
+            }],
+            SourceRetirement::Remove,
+        )
+        .unwrap();
+    // c alone, rewritten with embedded rowids, records no range.
+    writer
+        .commit_compaction(
+            table_id,
+            adjacent.snapshot_id,
+            &[CompactionSourceFile {
+                data_file_id: c_id,
+                delete_file_id: None,
+            }],
+            &[CompactionOutputFile {
+                file: DataFileInfo::new("c2.parquet", 40, 4),
+                begin_snapshot: None,
+                partial_max: None,
+            }],
+            SourceRetirement::Remove,
+        )
+        .unwrap();
+
+    let stored: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT path, row_id_start FROM ducklake_data_file
+         WHERE end_snapshot IS NULL ORDER BY path",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![("ab.parquet".to_string(), Some(0)), ("c2.parquet".to_string(), None),]
+    );
+    assert_eq!(next_row_id().await, 9, "a compaction mints no rowids");
+}

@@ -4429,7 +4429,6 @@ impl DuckLakeTable {
         Ok(MergeSourceFacts {
             drops_current_columns: cfg.drops_current_columns,
             has_embedded_snapshot: cfg.embedded_snapshot_parquet_name.is_some(),
-            has_embedded_rowid: cfg.embedded_rowid_parquet_name.is_some(),
         })
     }
 
@@ -4713,10 +4712,6 @@ pub(crate) struct MergeSourceFacts {
     /// that do not read the field, catalogs predating it), and keying off it
     /// would re-stamp every row with one origin and drop the column.
     pub(crate) has_embedded_snapshot: bool,
-    /// The file physically embeds the `_ducklake_internal_row_id` column. The
-    /// read path then takes its rowids from that column, whatever its catalog
-    /// `row_id_start` says, so a merge cannot treat its range as its rowids.
-    pub(crate) has_embedded_rowid: bool,
 }
 
 /// Output schema of a rewritten source file: the table's physical columns (in
