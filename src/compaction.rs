@@ -846,7 +846,9 @@ impl DuckLakeTable {
     /// position in the merged file. Without a sort order the rows are written
     /// in source order, so every rowid is unchanged. With one they are written
     /// in sorted order, so the rowids follow the sorted position, as in
-    /// official. Any other bin embeds each row's original rowid as a column. A
+    /// official. That breaks the row lineage guarantee that compaction
+    /// preserves rowids; it is an open upstream bug (duckdb/ducklake#1602) and
+    /// is matched here until official fixes it. Any other bin embeds each row's original rowid as a column. A
     /// merged file whose rows span more than one origin snapshot is
     /// written as a partial file (embedding the per-row
     /// `_ducklake_internal_snapshot_id` column and recording `partial_max`). The

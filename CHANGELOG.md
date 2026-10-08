@@ -43,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adjacent, keeping the first file's `row_id_start`, as official DuckLake does. Each row's
   rowid is then that start plus its position in the merged file. Without a sort order the
   rows keep their rowids. With a sort order the rows are written in sorted order, so their
-  rowids follow the sorted position, at the head and at earlier snapshots. A file with an
+  rowids follow the sorted position, at the head and at earlier snapshots, as in official DuckLake; this contradicts the row lineage guarantee and is tracked upstream as duckdb/ducklake#1602. A file with an
   embedded rowid column and a `row_id_start` (an inlined-data flush) is adjacent by its range,
   and its rows are taken in file order.
 - `merge_adjacent_files` takes merge candidates in official DuckLake's order within a schema
