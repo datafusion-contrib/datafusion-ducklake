@@ -3338,7 +3338,7 @@ impl MetadataWriter for MySqlMetadataWriter {
                     "INSERT INTO ducklake_data_file
                          (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(data_file_id)
                 .bind(table_id)
@@ -3347,6 +3347,9 @@ impl MetadataWriter for MySqlMetadataWriter {
                 .bind(output.file.file_size_bytes)
                 .bind(output.file.footer_size)
                 .bind(output.file.record_count)
+                .bind(crate::metadata_writer::compaction_output_row_id_start(
+                    &output.file,
+                ))
                 .bind(begin_snapshot)
                 .bind(output.partial_max)
                 .execute(&mut *tx)

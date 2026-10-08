@@ -112,6 +112,9 @@ async fn duckdb_compaction_retains_origin_metadata_and_rows() {
         ),
         (Some(snapshots[0]), Some(1), snapshots.last().copied()),
     );
+    // The three sources' rowid ranges are adjacent, so the merged file keeps
+    // the first one's start and serves rowids by position.
+    assert_eq!(files[0].row_id_start, Some(0));
     assert_eq!(
         read_rows(DuckLakeCatalog::with_snapshot(fresh.clone(), current).unwrap()).await,
         vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]

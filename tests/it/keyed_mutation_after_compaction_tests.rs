@@ -13,9 +13,9 @@
 //! silently: it asserts the exact surviving `(id, rowid)` rows, AND that the
 //! resolved/written `pos` values are physical indices rather than rowids.
 //!
-//! How the second assertion is made differs, because a merge reads its sources
-//! concurrently and does not fix which slot a row lands in. Where the physical
-//! order IS determined — `delete_on_rewritten_file_whose_physical_order_is_reversed`,
+//! How the second assertion is made differs, because a merge of files that are
+//! not rowid-adjacent reads its sources concurrently and does not fix which slot
+//! a row lands in. Where the physical order IS determined — `delete_on_rewritten_file_whose_physical_order_is_reversed`,
 //! under a sort order that runs position and rowid in opposite directions, and
 //! `keyed_mutation_after_rewrite_with_rowid_holes`, where the rowid run has
 //! gaps — the positions are asserted exactly, and those two are the decisive
@@ -376,12 +376,12 @@ async fn delete_after_merge_of_multi_origin_files() {
         "a merge spanning three origin snapshots writes a partial file",
     );
 
-    // Resolved rather than hardcoded: a merge reads its sources concurrently and
-    // hands them on as they arrive, so which physical slot id = 2 lands in is not
-    // fixed. What must hold is that the DELETE records the slot the resolver
-    // found — that the delete is keyed on physical position at all. Whether that
-    // position can be told apart from the rowid is settled by the sorted case
-    // below, where the two deliberately run opposite.
+    // Resolved rather than asserted: what must hold is that the DELETE records
+    // the slot the resolver found — that the delete is keyed on physical
+    // position at all. These sources are rowid-adjacent, so the merge writes
+    // them in rowid order (`delete_and_update_after_adjacent_merge` asserts the
+    // slots exactly). Whether a position can be told apart from the rowid is
+    // settled by the sorted case below, where the two deliberately run opposite.
     let position = resolve_in_only_live_file(&temp, id_equals(2)).await;
     assert_eq!(position.len(), 1, "id = 2 occurs once");
 
@@ -698,5 +698,65 @@ async fn keyed_mutation_after_rewrite_with_rowid_holes() {
         read_id_rowid(&temp).await,
         vec![(1, 0), (3, 2), (6, 5), (7, 6)],
         "rowid lineage preserved through an update on a hole-bearing file",
+    );
+}
+
+/// A merge of rowid-adjacent files keeps the first source's `row_id_start` and
+/// embeds no rowid column, so its rows sit in rowid order and a row's position
+/// is `rowid - row_id_start`. A keyed DELETE and an UPDATE against it must land
+/// on exactly those positions, and every surviving row (the updated one
+/// included) keeps its rowid.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_and_update_after_adjacent_merge() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2], vec![10, 20]).await;
+    append(&temp, vec![3, 4], vec![30, 40]).await;
+    append(&temp, vec![5, 6], vec![50, 60]).await;
+    assert_eq!(
+        run_merge(&temp, MergeOptions::default()).await,
+        CompactionResult {
+            files_processed: 3,
+            files_created: 1,
+            rows_written: 6,
+        },
+    );
+    let p = pool(&temp).await;
+    assert_eq!(
+        opt_i64(
+            &p,
+            "SELECT row_id_start FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await,
+        Some(0),
+        "the sources are adjacent, so the merged file keeps their range",
+    );
+
+    // Position is rowid here, so both are exact.
+    assert_eq!(
+        resolve_in_only_live_file(&temp, id_equals(3)).await,
+        vec![2]
+    );
+    assert_eq!(
+        resolve_in_only_live_file(&temp, id_equals(5)).await,
+        vec![4]
+    );
+
+    assert_eq!(
+        run_dml(&temp, "DELETE FROM ducklake.main.t WHERE id = 3").await,
+        1,
+    );
+    assert_eq!(live_delete_positions(&temp).await, vec![2]);
+    assert_eq!(
+        run_dml(&temp, "UPDATE ducklake.main.t SET val = 99 WHERE id = 5").await,
+        1,
+    );
+    assert_eq!(live_delete_positions(&temp).await, vec![2, 4]);
+    assert_eq!(
+        read_rows(&temp).await,
+        vec![(1, 10), (2, 20), (4, 40), (5, 99), (6, 60)],
+    );
+    assert_eq!(
+        read_id_rowid(&temp).await,
+        vec![(1, 0), (2, 1), (4, 3), (5, 4), (6, 5)],
     );
 }

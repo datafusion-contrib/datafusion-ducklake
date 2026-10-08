@@ -982,6 +982,20 @@ pub(crate) fn allocate_row_id_start(next_row_id: i64, file: &DataFileInfo) -> Ro
     }
 }
 
+/// The `row_id_start` a compaction output is registered with.
+///
+/// A merge of rowid-adjacent sources writes no rowid column and carries the
+/// first source's range over as [`RowIdStart::Preserved`]; every other output
+/// embeds its rowids and records `NULL`. The range was issued to the sources
+/// already, so nothing is minted and `next_row_id` does not move.
+#[cfg_attr(not(feature = "write"), allow(dead_code))]
+pub(crate) fn compaction_output_row_id_start(file: &DataFileInfo) -> Option<i64> {
+    match file.row_id_start {
+        RowIdStart::Preserved(start) => Some(start),
+        RowIdStart::Assign | RowIdStart::Embedded => None,
+    }
+}
+
 /// Enforce the partition-spec invariant for one file being committed, given the
 /// table's currently-live partition generation (`live_partition_id`, `None` when
 /// the table has no live spec). Every backend's `register_data_file` /
@@ -1314,11 +1328,13 @@ pub enum SourceRetirement {
 /// One new file to register in a compaction commit
 /// ([`MetadataWriter::commit_compaction`]).
 ///
-/// The parquet has already been written (embedding each row's original rowid,
-/// and for a merged partial file the per-row `_ducklake_internal_snapshot_id`
-/// column); this is the catalog registration. `row_id_start` is stored NULL
-/// because the file's rowids are served from its embedded rowid column, not
-/// synthesized from a start.
+/// The parquet has already been written (with each row's original rowid, and
+/// for a merged partial file the per-row `_ducklake_internal_snapshot_id`
+/// column); this is the catalog registration. A file that embeds its rowids is
+/// stored with `row_id_start` NULL. A merge of rowid-adjacent sources embeds
+/// none and sets [`DataFileInfo::row_id_start`] to
+/// [`RowIdStart::Preserved`] with the first source's start, so its rowids are
+/// that start plus each row's position.
 #[derive(Debug, Clone)]
 pub struct CompactionOutputFile {
     /// The written parquet's location / size / record count.
@@ -2427,8 +2443,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// forward (compaction is not DDL). `base_snapshot` is the catalog head the
     /// sources were read at, used only for the conflict diagnostic.
     ///
-    /// Each output is registered with `end_snapshot` NULL, `row_id_start` NULL
-    /// (rowids come from the embedded column), its
+    /// Each output is registered with `end_snapshot` NULL, `row_id_start` from
+    /// [`CompactionOutputFile::file`] when it is [`RowIdStart::Preserved`] (a
+    /// merge of rowid-adjacent files, which embeds no rowids) and NULL
+    /// otherwise (rowids come from the embedded column), its
     /// [`CompactionOutputFile::partial_max`], and `begin_snapshot` =
     /// [`CompactionOutputFile::begin_snapshot`] (or the new snapshot when that is
     /// `None`).
@@ -2896,6 +2914,18 @@ mod tests {
         assert_eq!(embedded.row_id_start, RowIdStart::Embedded);
         let carried = DataFileInfo::new("a.parquet", 100, 4).with_source_row_id_start(Some(40));
         assert_eq!(carried.row_id_start, RowIdStart::Preserved(40));
+    }
+
+    #[test]
+    fn compaction_output_stores_only_a_carried_range() {
+        let file = DataFileInfo::new("a.parquet", 100, 4);
+        assert_eq!(compaction_output_row_id_start(&file), None);
+        assert_eq!(
+            compaction_output_row_id_start(&file.clone().with_embedded_row_ids()),
+            None
+        );
+        let carried = file.with_source_row_id_start(Some(40));
+        assert_eq!(compaction_output_row_id_start(&carried), Some(40));
     }
 
     #[test]

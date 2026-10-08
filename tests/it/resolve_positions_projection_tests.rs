@@ -53,7 +53,7 @@ use tempfile::TempDir;
 use datafusion_ducklake::partition::PartitionTransform;
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableFile, DuckLakeTableWriter,
-    DuckLakeWriteOptions, MergeOptions, MetadataWriter, SqliteMetadataProvider,
+    DuckLakeWriteOptions, MergeOptions, MetadataWriter, RewriteOptions, SqliteMetadataProvider,
     SqliteMetadataWriter, WriteMode,
 };
 
@@ -1054,6 +1054,31 @@ async fn file_that_embeds_row_ids() {
         )
         .await;
     }
+    // Rewrite the first file before merging. A rewrite output embeds its
+    // rowids and records no `row_id_start`, so the merge's sources are not
+    // rowid-adjacent and the merged file embeds its rowids too; a merge of
+    // adjacent files would keep a `row_id_start` and embed none.
+    let h = open(&temp).await;
+    let table = h.table().await;
+    let first = table
+        .files()
+        .unwrap()
+        .iter()
+        .map(|file| file.data_file_id)
+        .min()
+        .unwrap();
+    let rewritten = table
+        .rewrite_data_files(
+            &h.ctx.state(),
+            RewriteOptions {
+                data_file_ids: Some(vec![first]),
+                ..RewriteOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(rewritten.files_created, 1);
+
     let h = open(&temp).await;
     let result = h
         .table()

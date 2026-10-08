@@ -4183,9 +4183,10 @@ impl DuckLakeTable {
         // reconstructable lineage. Gated on the output actually carrying `rowid`,
         // because this function serves two callers: the rowid-projected read and
         // an ordinary time-travel read, which projects the embedded column away
-        // and needs no lineage at all. A merged partial file always carries the
-        // embedded column, so this is a guard against a foreign catalog rather
-        // than a live case — but without it the rowid caller's failure is a
+        // and needs no lineage at all. A merged partial file carries either the
+        // embedded column or a `row_id_start` (a merge of rowid-adjacent files),
+        // so this is a guard against a foreign catalog rather than a live case —
+        // but without it the rowid caller's failure is a
         // confusing "no field named rowid" from the rename layer instead of a
         // statement of what is actually missing.
         if output_schema.field_with_name(ROWID_COLUMN_NAME).is_ok()

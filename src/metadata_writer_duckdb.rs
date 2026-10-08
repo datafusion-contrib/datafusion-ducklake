@@ -3754,7 +3754,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 "INSERT INTO ducklake_data_file
                      (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     data_file_id,
                     table_id,
@@ -3763,6 +3763,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     output.file.file_size_bytes,
                     output.file.footer_size,
                     output.file.record_count,
+                    crate::metadata_writer::compaction_output_row_id_start(&output.file),
                     begin_snapshot,
                     output.partial_max,
                 ],
