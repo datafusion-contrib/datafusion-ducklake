@@ -311,7 +311,10 @@ objects until the next orphan sweep past its `older_than` cutoff.
 
 Ordinary append stages commute. Callers can explicitly require an unchanged
 base snapshot with `expected_base_snapshot_id`, including for append stages.
-That optional precondition is stronger than ordinary append isolation.
+That optional precondition is stronger than ordinary append isolation. A deletion
+committed since that snapshot fails it too: a delete file written or ended, or an
+inlined delete. `flush_inlined_data` counts only inlined deletes: as in official
+DuckLake, a flush commits over a concurrent delete of a Parquet row.
 
 Empty transactions, zero-row staging calls, and empty delete sets are no-ops.
 They add no result entry or snapshot. Staged inline deletes group row IDs by
@@ -371,8 +374,12 @@ unsupported.
 - **Two concurrent `Replace`s of the same table never silently union.** The first to
   commit wins; the later one — whose base is now stale — aborts with
   `DuckLakeError::Conflict` (retryable by the caller). The check runs at the commit point
-  under the catalog lock: a `Replace` aborts if any data file **or** column of the table has
-  `begin_snapshot`/`end_snapshot` newer than the catalog head it began on.
+  under the catalog lock: a `Replace` aborts if any data file **or** delete file of the table
+  has `begin_snapshot`/`end_snapshot` newer than the catalog head it began on, or an inlined
+  delete of the table was committed after it. The PostgreSQL multi-catalog writer
+  (`PostgresMetadataWriter`) also aborts when a column of the table changed since that head;
+  the other writers do not check columns. A concurrent `DELETE` therefore aborts
+  it, as official DuckLake aborts an insert into a table another transaction deleted from.
 - **Column ids are stable** across writes: an unchanged column keeps its `column_id`
   (== parquet field-id); a same-schema `Replace` rewrites no column rows. Only added/removed
   columns are written.

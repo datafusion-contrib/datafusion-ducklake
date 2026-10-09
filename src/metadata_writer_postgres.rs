@@ -14,7 +14,7 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
+    ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
     MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata, StagedTableData,
     StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
@@ -1276,26 +1276,34 @@ async fn reserve_ids(
 /// files/columns and before `advance_catalog_head`. Because snapshot ids are
 /// assigned at commit (id order == commit order per catalog) and all metadata is
 /// written at commit (no dormant rows), this scalar check is exact: if any data
-/// file OR column of the table has `begin_snapshot` or `end_snapshot` > `base`
-/// (the catalog head observed at begin), another writer committed a generation
-/// of this table since this write began ⇒ [`DuckLakeError::Conflict`]. Catches a
-/// data Replace (new file begin), a fileless `CREATE`/Replace (new column begin),
-/// and a DROP (end-stamp). The writer's own rows are not written yet, so the
-/// check never self-conflicts. (`Append` does not call this: concurrent appends
-/// commute, matching upstream DuckLake.)
+/// file, delete file OR column of the table has `begin_snapshot` or
+/// `end_snapshot` > `base` (the catalog head observed at begin), or an inlined
+/// delete row has `begin_snapshot` > `base`, another writer changed this table
+/// since this write began ⇒ [`DuckLakeError::Conflict`]. Catches a data Replace
+/// (new file begin), a fileless `CREATE`/Replace (new column begin), a DROP
+/// (end-stamp), and a DELETE that wrote or retired only a delete file or an
+/// inlined delete. The writer's own rows are not written yet, so the check
+/// never self-conflicts. (`Append` does not call this unless the write set an
+/// expected base snapshot: concurrent appends commute, matching upstream DuckLake.)
+/// An inlined-data flush ([`ConflictScope::InlinedFlush`]) does not count delete
+/// files: official DuckLake commits a flush over a concurrent delete file.
 pub(crate) async fn detect_replace_conflict(
     table_id: i64,
     base_snapshot: i64,
+    scope: ConflictScope,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<()> {
     let conflict = sqlx::query(
         "SELECT 1 WHERE EXISTS (SELECT 1 FROM ducklake_data_file
              WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))
            OR EXISTS (SELECT 1 FROM ducklake_column
-             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))",
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))
+           OR ($3 AND EXISTS (SELECT 1 FROM ducklake_delete_file
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2)))",
     )
     .bind(table_id)
     .bind(base_snapshot)
+    .bind(scope.counts_delete_files())
     .fetch_optional(&mut **tx)
     .await?;
     if conflict.is_some() {
@@ -1326,6 +1334,38 @@ pub(crate) async fn detect_replace_conflict(
                  snapshot {base_snapshot}; aborting"
             )));
         }
+    }
+    detect_inlined_delete_since(table_id, base_snapshot, tx).await
+}
+
+/// Abort with [`crate::DuckLakeError::Conflict`] when the table's inlined
+/// delete table holds a row committed after `base_snapshot`: another writer
+/// deleted rows of the table's data files without writing a delete file.
+pub(crate) async fn detect_inlined_delete_since(
+    table_id: i64,
+    base_snapshot: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(&table)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !exists {
+        return Ok(());
+    }
+    let conflict = sqlx::query(AssertSqlSafe(format!(
+        "SELECT 1 FROM {} WHERE begin_snapshot > $1 LIMIT 1",
+        quote_ident(&table)
+    )))
+    .bind(base_snapshot)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if conflict.is_some() {
+        return Err(crate::DuckLakeError::Conflict(format!(
+            "Replace on table {table_id} conflicts with an inlined delete committed since \
+             snapshot {base_snapshot}; aborting"
+        )));
     }
     Ok(())
 }
@@ -2032,7 +2072,7 @@ async fn finalize_table_snapshot(
         .map(|r| r.try_get(0))
         .transpose()?;
         if let Some(tid) = existing_table_id {
-            detect_replace_conflict(tid, base_snapshot, tx).await?;
+            detect_replace_conflict(tid, base_snapshot, ConflictScope::Table, tx).await?;
         }
     }
 
@@ -3554,7 +3594,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+                detect_replace_conflict(
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
             }
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
@@ -3719,7 +3765,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+                detect_replace_conflict(
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
             }
             let (snapshot_id, schema_id, table_id) = finalize_snapshot(
                 self.catalog_id,
@@ -3892,7 +3944,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+                detect_replace_conflict(
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
             }
             let schema_version: i64 = sqlx::query_scalar(
                 "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = $1",
@@ -4055,7 +4113,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             }
             if let Some(expected) = expected_base_snapshot_id {
                 for write in writes {
-                    detect_replace_conflict(write.table_id, expected, &mut tx).await?;
+                    detect_replace_conflict(
+                        write.table_id,
+                        expected,
+                        ConflictScope::of(write),
+                        &mut tx,
+                    )
+                    .await?;
                 }
             }
             let mut had_live_data = Vec::with_capacity(writes.len());
@@ -5188,7 +5252,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+                detect_replace_conflict(
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
             }
             if !deletes.is_empty() {
                 let file_ids = deletes
@@ -5437,7 +5507,13 @@ impl MetadataWriter for PostgresMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(table_id, expected_base_snapshot_id, &mut tx).await?;
+                detect_replace_conflict(
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                    &mut tx,
+                )
+                .await?;
             }
             if !deletes.is_empty() {
                 let file_ids = deletes

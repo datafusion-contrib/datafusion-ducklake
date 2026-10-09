@@ -24,9 +24,9 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, DataFileInfo, ExistingCatalogColumn, MetadataWriter,
-    MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
-    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, ExistingCatalogColumn,
+    MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite,
+    WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, quote_snapshot_name,
     quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
     tag_change, top_level_column_ids, validate_name,
@@ -34,8 +34,8 @@ use crate::metadata_writer::{
 use crate::metadata_writer_postgres::{
     SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
     apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_inlined_at_snapshot,
-    detect_replace_conflict as detect_staged_conflict, quote_ident, set_postgres_table_setting,
-    validate_staged_table, with_postgres_commit_lock,
+    detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict, quote_ident,
+    set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -376,21 +376,27 @@ async fn seed_counter(pool: &PgPool, key: &str, max_sql: &'static str) -> Result
     Ok(())
 }
 
-/// Abort a `Replace` whose base is stale: any data file newer than `base_snapshot`
-/// means another writer published in the meantime. `Append` does not call this —
-/// concurrent appends commute.
+/// Abort a `Replace` whose base is stale: any data file or delete file begun or
+/// ended after `base_snapshot`, or an inlined delete committed after it, means
+/// another writer changed the table in the meantime. `Append` does not call this
+/// unless the write set an expected base snapshot — concurrent appends commute.
+/// An inlined-data flush ([`ConflictScope::InlinedFlush`]) does not count delete
+/// files: official DuckLake commits a flush over a concurrent delete file.
 async fn detect_replace_conflict(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
     base_snapshot: i64,
+    scope: ConflictScope,
 ) -> Result<()> {
     let conflict: Option<i32> = sqlx::query(
-        "SELECT 1 FROM ducklake_data_file
-         WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2)
-         LIMIT 1",
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM ducklake_data_file
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2))
+           OR ($3 AND EXISTS (SELECT 1 FROM ducklake_delete_file
+             WHERE table_id = $1 AND (begin_snapshot > $2 OR end_snapshot > $2)))",
     )
     .bind(table_id)
     .bind(base_snapshot)
+    .bind(scope.counts_delete_files())
     .fetch_optional(&mut **tx)
     .await?
     .map(|row| row.try_get(0))
@@ -401,7 +407,7 @@ async fn detect_replace_conflict(
              snapshot {base_snapshot}; aborting (retry the write against the new generation)"
         )));
     }
-    Ok(())
+    detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
 /// Retire the prior generation's still-visible data files at `snapshot_id` and
@@ -1074,7 +1080,7 @@ async fn finalize_table_snapshot(
     if mode == WriteMode::Replace {
         // Abort if a concurrent writer published a newer generation since this
         // write began.
-        detect_replace_conflict(tx, table_id, base_snapshot).await?;
+        detect_replace_conflict(tx, table_id, base_snapshot, ConflictScope::Table).await?;
         // Seed the stats row (first write to a brand-new table) so retire's
         // zero-update has a row, then retire the prior data generation.
         seed_table_stats(tx, table_id).await?;
@@ -1124,7 +1130,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             for write in writes {
                 validate_staged_table(&mut tx, write).await?;
                 if let Some(expected) = expected_base_snapshot_id {
-                    detect_staged_conflict(write.table_id, expected, &mut tx).await?;
+                    detect_staged_conflict(
+                        write.table_id,
+                        expected,
+                        ConflictScope::of(write),
+                        &mut tx,
+                    )
+                    .await?;
                 }
                 let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut *tx).await?;
                 let names: Vec<String> = sqlx::query_scalar(
@@ -1512,7 +1524,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+                detect_replace_conflict(
+                    &mut tx,
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                )
+                .await?;
             }
 
             // Partition-spec fence: this file must be consistent with the table's live
@@ -1653,7 +1671,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             if mode != WriteMode::Replace
                 && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
             {
-                detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+                detect_replace_conflict(
+                    &mut tx,
+                    table_id,
+                    expected_base_snapshot_id,
+                    ConflictScope::Table,
+                )
+                .await?;
             }
             // Partition-spec fence (both directions, every file): each file must be
             // consistent with the table's live partition generation at commit time.

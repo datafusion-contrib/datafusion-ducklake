@@ -1492,6 +1492,35 @@ impl StagedTableWrite {
     }
 }
 
+/// What a table-level conflict check counts as a change since its base snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConflictScope {
+    /// Any change to the table, including a commit that only wrote or ended a
+    /// delete file: official DuckLake fails an insert into a table another
+    /// transaction deleted from.
+    Table,
+    /// An inlined-data flush. Official DuckLake fails a flush on a dropped
+    /// table, an inlined delete or another flush, but not on a delete file:
+    /// the flush moves only inlined rows, which a delete file cannot name.
+    InlinedFlush,
+}
+
+impl ConflictScope {
+    /// The scope for one staged table write.
+    pub(crate) const fn of(write: &StagedTableWrite) -> Self {
+        if write.inlined_flush {
+            Self::InlinedFlush
+        } else {
+            Self::Table
+        }
+    }
+
+    /// Whether a delete file begun or ended after the base is a conflict.
+    pub(crate) const fn counts_delete_files(self) -> bool {
+        matches!(self, Self::Table)
+    }
+}
+
 /// Result of one atomic multi-table write.
 #[derive(Debug, Clone)]
 pub struct MultiTableCommit {

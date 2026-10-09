@@ -38,16 +38,16 @@ use crate::metadata_provider::block_on;
 use crate::metadata_writer::directory_path;
 use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
-    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
-    DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING,
-    InlinedRowRef, MetadataWriter, MultiTableCommit, SnapshotCommitMetadata, SourceRetirement,
-    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
-    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
-    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
-    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
-    quote_snapshot_name, quote_snapshot_table, snapshot_has_change, staged_table_write_changes,
-    table_storage_changes, top_level_column_ids, validate_delete_entries,
-    validate_inlined_index_columns, validate_name, validate_table_setting,
+    ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, ConflictScope,
+    DataFileInfo, DeleteFileEntry, DeleteFileInfo, ExistingCatalogColumn,
+    INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter, MultiTableCommit,
+    SnapshotCommitMetadata, SourceRetirement, StagedTableData, StagedTableWrite, WriteMode,
+    WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
+    catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
+    inlined_delete_conflicts, inlined_delete_groups, live_inlined_index_columns,
+    parse_inlined_index_columns, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
+    staged_table_write_changes, table_storage_changes, top_level_column_ids,
+    validate_delete_entries, validate_inlined_index_columns, validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -806,21 +806,31 @@ async fn seed_counter(pool: &MySqlPool, key: &str, max_sql: &'static str) -> Res
 
 /// Optimistic-concurrency check for a `Replace` commit (mirrors the SQLite /
 /// Postgres writers). Run before retiring the prior generation: if any data file
-/// of the table has `begin_snapshot` or `end_snapshot` newer than
-/// `base_snapshot` (the head observed when this write began), another writer
-/// published a newer generation in the meantime, so this `Replace` aborts with
+/// or delete file of the table has `begin_snapshot` or `end_snapshot` newer than
+/// `base_snapshot` (the head observed when this write began), or an inlined data
+/// or inlined delete row was committed after it, another writer changed the
+/// table in the meantime, so this `Replace` aborts with
 /// [`crate::DuckLakeError::Conflict`] rather than clobbering it. (`Append` does
-/// not call this: concurrent appends commute.)
+/// not call this unless the write set an expected base snapshot: concurrent
+/// appends commute.)
+/// An inlined-data flush ([`ConflictScope::InlinedFlush`]) does not count delete
+/// files: official DuckLake commits a flush over a concurrent delete file.
 async fn detect_replace_conflict(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     table_id: i64,
     base_snapshot: i64,
+    scope: ConflictScope,
 ) -> Result<()> {
     let conflict: Option<i64> = sqlx::query(
-        "SELECT 1 FROM ducklake_data_file
-         WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)
-         LIMIT 1",
+        "SELECT 1 FROM DUAL WHERE EXISTS (SELECT 1 FROM ducklake_data_file
+             WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?))
+           OR (? AND EXISTS (SELECT 1 FROM ducklake_delete_file
+             WHERE table_id = ? AND (begin_snapshot > ? OR end_snapshot > ?)))",
     )
+    .bind(table_id)
+    .bind(base_snapshot)
+    .bind(base_snapshot)
+    .bind(scope.counts_delete_files())
     .bind(table_id)
     .bind(base_snapshot)
     .bind(base_snapshot)
@@ -854,6 +864,31 @@ async fn detect_replace_conflict(
         {
             return Err(crate::DuckLakeError::Conflict(format!(
                 "Replace on table {table_id} conflicts with inlined data committed since \
+                 snapshot {base_snapshot}; aborting"
+            )));
+        }
+    }
+    let inlined_deletes = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = DATABASE() AND table_name = ?",
+    )
+    .bind(&inlined_deletes)
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists > 0 {
+        let sql = format!(
+            "SELECT 1 FROM {} WHERE begin_snapshot > ? LIMIT 1",
+            quote_ident(&inlined_deletes)
+        );
+        if sqlx::query(AssertSqlSafe(sql))
+            .bind(base_snapshot)
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some()
+        {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "Replace on table {table_id} conflicts with an inlined delete committed since \
                  snapshot {base_snapshot}; aborting"
             )));
         }
@@ -1771,7 +1806,7 @@ async fn finalize_table_snapshot(
     if mode == WriteMode::Replace {
         // Abort if a concurrent writer published a newer generation since this
         // write began.
-        detect_replace_conflict(tx, table_id, base_snapshot).await?;
+        detect_replace_conflict(tx, table_id, base_snapshot, ConflictScope::Table).await?;
         // Seed the stats row (first write to a brand-new table) so retire's
         // zero-update has a row, then retire the prior data generation.
         sqlx::query(
@@ -3653,7 +3688,13 @@ impl MetadataWriter for MySqlMetadataWriter {
                 if mode != WriteMode::Replace
                     && let Some(expected_base_snapshot_id) = expected_base_snapshot_id
                 {
-                    detect_replace_conflict(&mut tx, table_id, expected_base_snapshot_id).await?;
+                    detect_replace_conflict(
+                        &mut tx,
+                        table_id,
+                        expected_base_snapshot_id,
+                        ConflictScope::Table,
+                    )
+                    .await?;
                 }
                 let schema_version: i64 = sqlx::query_scalar(
                     "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
@@ -3818,7 +3859,13 @@ impl MetadataWriter for MySqlMetadataWriter {
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             if let Some(expected) = expected_base_snapshot_id {
                 for write in writes {
-                    detect_replace_conflict(&mut tx, write.table_id, expected).await?;
+                    detect_replace_conflict(
+                        &mut tx,
+                        write.table_id,
+                        expected,
+                        ConflictScope::of(write),
+                    )
+                    .await?;
                 }
             }
             let mut had_live_data = Vec::with_capacity(writes.len());
