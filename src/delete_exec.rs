@@ -378,16 +378,22 @@ async fn run_delete(
     // (atomic multi-file DELETE). No new data file is appended, so this uses the
     // dedicated delete-only commit rather than `register_data_file_with_deletes`
     // (which requires an appended file).
-    writer
-        .commit_deletes(
-            table_id,
-            schema_name,
-            table_name,
-            base_snapshot,
-            &entries,
-            &inlined_rows,
-        )
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    if let Err(error) = writer.commit_deletes(
+        table_id,
+        schema_name,
+        table_name,
+        base_snapshot,
+        &entries,
+        &inlined_rows,
+    ) {
+        let files = entries
+            .iter()
+            .map(|entry| (entry.delete.path.as_str(), entry.delete.path_is_relative));
+        let error = table_writer
+            .release_refused_files(schema_name, table_name, error, files)
+            .await;
+        return Err(DataFusionError::External(Box::new(error)));
+    }
 
     Ok(total_deleted)
 }

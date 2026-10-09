@@ -78,6 +78,14 @@ pub enum DuckLakeError {
     #[error("Commit outcome unknown: {0}")]
     CommitOutcomeUnknown(#[source] sqlx::Error),
 
+    /// A PostgreSQL metadata writer's commit guard refused a commit, so its
+    /// transaction was rolled back and nothing was committed. The source is the
+    /// error the guard returned; see
+    /// [`PostgresCommitGuard`](crate::metadata_writer_postgres::PostgresCommitGuard).
+    #[cfg(feature = "write-postgres")]
+    #[error("Commit refused: {0}")]
+    CommitRefused(#[source] crate::metadata_writer_postgres::CommitGuardError),
+
     /// Catalog not found
     #[error("Catalog not found: {0}")]
     CatalogNotFound(String),

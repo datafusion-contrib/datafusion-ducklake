@@ -1259,13 +1259,20 @@ impl DuckLakeTable {
         if sources.is_empty() {
             return Ok(CompactionResult::empty());
         }
-        writer.commit_compaction(
+        if let Err(error) = writer.commit_compaction(
             self.table_id(),
             self.base_snapshot(),
             &sources,
             &outputs,
             SourceRetirement::Remove,
-        )?;
+        ) {
+            let files = outputs
+                .iter()
+                .map(|output| (output.file.path.as_str(), output.file.path_is_relative));
+            return Err(table_writer
+                .release_refused_files(schema_name, self.table_name(), error, files)
+                .await);
+        }
         Ok(CompactionResult {
             files_processed,
             files_created: outputs.len(),
@@ -1453,13 +1460,20 @@ impl DuckLakeTable {
         }
         // Retire (do not remove) the sources: they still serve time travel to
         // pre-rewrite snapshots until their snapshots are expired.
-        writer.commit_compaction(
+        if let Err(error) = writer.commit_compaction(
             self.table_id(),
             self.base_snapshot(),
             &sources,
             &outputs,
             SourceRetirement::Retire,
-        )?;
+        ) {
+            let files = outputs
+                .iter()
+                .map(|output| (output.file.path.as_str(), output.file.path_is_relative));
+            return Err(table_writer
+                .release_refused_files(schema_name, self.table_name(), error, files)
+                .await);
+        }
         Ok(CompactionResult {
             files_processed,
             files_created: outputs.len(),

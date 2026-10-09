@@ -32,14 +32,16 @@ use crate::metadata_writer::{
     tag_change, top_level_column_ids, validate_name,
 };
 use crate::metadata_writer_postgres::{
-    SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
-    apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_inlined_at_snapshot,
-    detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict, quote_ident,
-    set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
+    PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
+    apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_guarded,
+    commit_inlined_at_snapshot, commit_networked_guarded, detect_inlined_delete_since,
+    detect_replace_conflict as detect_staged_conflict, quote_ident, set_postgres_table_setting,
+    validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{AssertSqlSafe, Row};
+use std::sync::Arc;
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
@@ -273,6 +275,7 @@ const SQL_CREATE_TABLES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct PostgresSingleCatalogMetadataWriter {
     pool: PgPool,
+    commit_guard: Option<Arc<dyn PostgresCommitGuard>>,
 }
 
 impl PostgresSingleCatalogMetadataWriter {
@@ -299,6 +302,7 @@ impl PostgresSingleCatalogMetadataWriter {
         .await?;
         Ok(Self {
             pool,
+            commit_guard: None,
         })
     }
 
@@ -307,6 +311,7 @@ impl PostgresSingleCatalogMetadataWriter {
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
+            commit_guard: None,
         }
     }
 
@@ -315,6 +320,20 @@ impl PostgresSingleCatalogMetadataWriter {
         let writer = Self::new(connection_string).await?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+    /// Runs `guard` inside every metadata transaction this writer commits, right
+    /// before `COMMIT`; see [`PostgresCommitGuard`].
+    pub fn with_commit_guard(mut self, guard: Arc<dyn PostgresCommitGuard>) -> Self {
+        self.commit_guard = Some(guard);
+        self
+    }
+
+    async fn commit(&self, tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+        commit_guarded(tx, self.commit_guard.as_deref()).await
+    }
+
+    async fn commit_networked(&self, tx: sqlx::Transaction<'_, sqlx::Postgres>) -> Result<()> {
+        commit_networked_guarded(tx, self.commit_guard.as_deref()).await
     }
 }
 
@@ -1214,7 +1233,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 )
                 .await?;
             }
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -1223,7 +1242,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     }
 
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
-        set_postgres_table_setting(&self.pool, None, table_id, key, value)
+        set_postgres_table_setting(
+            &self.pool,
+            self.commit_guard.as_deref(),
+            None,
+            table_id,
+            key,
+            value,
+        )
     }
 
     fn with_commit_lock(
@@ -1240,7 +1266,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // A bare snapshot carries no schema change of its own → carry
             // schema_version forward (no DDL bump, no ledger row).
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -1260,7 +1286,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .bind(value)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            self.commit(transaction).await?;
             Ok(())
         })
     }
@@ -1284,7 +1310,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?;
 
             if let Some(row) = existing {
-                tx.commit().await?;
+                self.commit(tx).await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -1311,7 +1337,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok((schema_id, true))
         })
     }
@@ -1336,7 +1362,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .await?;
 
             if let Some(row) = existing {
-                tx.commit().await?;
+                self.commit(tx).await?;
                 return Ok((row.try_get(0)?, false));
             }
 
@@ -1367,7 +1393,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok((table_id, true))
         })
     }
@@ -1449,7 +1475,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 .await?;
             }
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             top_level_column_ids(&catalog_columns, &field_ids)
         })
     }
@@ -1601,7 +1627,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             )
             .await?;
 
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(ids)
         })
     }
@@ -1751,7 +1777,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 commit_metadata,
             )
             .await?;
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(ids)
         })
     }
@@ -1834,7 +1860,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -1904,7 +1930,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2056,7 +2082,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -2144,7 +2170,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2179,7 +2205,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(new_snapshot)
         })
     }
@@ -2224,7 +2250,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(ids)
         })
     }
@@ -2255,7 +2281,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(result.rows_affected())
         })
     }
@@ -2337,7 +2363,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(())
         })
     }
@@ -2559,7 +2585,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // Inserts nothing: this commit only persists the counter advance for the
             // column ids (and the sequence advances, which are non-transactional
             // anyway). Every metadata row is written by finalize_snapshot.
-            tx.commit().await?;
+            self.commit(tx).await?;
 
             Ok(WriteSetupResult {
                 snapshot_id,

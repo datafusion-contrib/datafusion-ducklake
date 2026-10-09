@@ -1606,7 +1606,7 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let committed = self.metadata.register_data_files_with_commit_metadata(
+        let committed = match self.metadata.register_data_files_with_commit_metadata(
             setup.table_id,
             schema_name,
             table_name,
@@ -1620,7 +1620,14 @@ impl DuckLakeTableWriter {
             &setup.field_ids,
             &options.commit_metadata,
             options.expected_base_snapshot_id,
-        )?;
+        ) {
+            Ok(committed) => committed,
+            Err(e) => {
+                return Err(self
+                    .release_written_files(schema_name, table_name, e, &file_infos)
+                    .await);
+            },
+        };
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
@@ -1823,7 +1830,7 @@ impl DuckLakeTableWriter {
         }
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
 
-        let committed = self.metadata.register_data_files(
+        let committed = match self.metadata.register_data_files(
             setup.table_id,
             schema_name,
             table_name,
@@ -1833,7 +1840,14 @@ impl DuckLakeTableWriter {
             setup.base_snapshot_id,
             &columns,
             &setup.field_ids,
-        )?;
+        ) {
+            Ok(committed) => committed,
+            Err(e) => {
+                return Err(self
+                    .release_written_files(schema_name, table_name, e, &file_infos)
+                    .await);
+            },
+        };
 
         Ok(WriteResult {
             snapshot_id: committed.snapshot_id,
@@ -1979,6 +1993,75 @@ impl DuckLakeTableWriter {
             files_written,
             records_written,
         })
+    }
+
+    /// Remove `file_infos`, written under `schema_name.table_name` for a commit
+    /// that failed with `error`, when it definitely registered nothing (see
+    /// [`commit_definitely_rolled_back`]), and return `error`.
+    async fn release_written_files(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        error: crate::error::DuckLakeError,
+        file_infos: &[DataFileInfo],
+    ) -> crate::error::DuckLakeError {
+        let files = file_infos
+            .iter()
+            .map(|file| (file.path.as_str(), file.path_is_relative));
+        self.release_files_if(
+            schema_name,
+            table_name,
+            error,
+            files,
+            commit_definitely_rolled_back,
+        )
+        .await
+    }
+
+    /// Remove `files`, written under `schema_name.table_name` for a commit that
+    /// failed with `error`, when a commit guard refused it, and return `error`.
+    /// For the commits outside the [`MetadataWriter`] contract (see
+    /// [`commit_refused`]); `files` are catalog paths with their
+    /// `path_is_relative` flag.
+    pub(crate) async fn release_refused_files<'a>(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        error: crate::error::DuckLakeError,
+        files: impl IntoIterator<Item = (&'a str, bool)>,
+    ) -> crate::error::DuckLakeError {
+        self.release_files_if(schema_name, table_name, error, files, commit_refused)
+            .await
+    }
+
+    async fn release_files_if<'a>(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        error: crate::error::DuckLakeError,
+        files: impl IntoIterator<Item = (&'a str, bool)>,
+        rolled_back: fn(&crate::error::DuckLakeError) -> bool,
+    ) -> crate::error::DuckLakeError {
+        if !rolled_back(&error) {
+            return error;
+        }
+        let objects = files
+            .into_iter()
+            .map(|(path, is_relative)| {
+                self.staged_object_path(schema_name, table_name, path, is_relative)
+            })
+            .collect::<Result<Vec<_>>>();
+        match objects {
+            Ok(objects) => {
+                for failure in remove_objects(&self.object_store, objects).await {
+                    tracing::warn!(error = %failure, "failed to remove a file of a rejected commit");
+                }
+            },
+            Err(path_error) => {
+                tracing::warn!(error = %path_error, "failed to resolve a file of a rejected commit");
+            },
+        }
+        error
     }
 
     fn staged_object_path(
@@ -2507,6 +2590,19 @@ async fn release_after_failed_commit(
         }
     }
     error
+}
+
+/// Whether `error` is a commit guard's refusal, which rolled the transaction back
+/// before its `COMMIT` was sent. Unlike [`commit_definitely_rolled_back`], this
+/// holds for the commits outside the [`MetadataWriter`] contract too, which do
+/// not tell a failed `COMMIT` apart from their other errors.
+fn commit_refused(error: &crate::error::DuckLakeError) -> bool {
+    #[cfg(feature = "write-postgres")]
+    if let crate::error::DuckLakeError::CommitRefused(_) = error {
+        return true;
+    }
+    let _ = error;
+    false
 }
 
 /// Split `batches` back into slices of `lengths` rows, in order.
