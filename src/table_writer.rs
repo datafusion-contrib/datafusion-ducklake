@@ -385,8 +385,9 @@ pub struct TableWriteOptions {
     pub commit_metadata: SnapshotCommitMetadata,
     /// Catalog snapshot against which this write read its input.
     ///
-    /// The commit fails if the target table's data-file generation changed
-    /// after this snapshot. Commits to other tables do not cause a conflict.
+    /// The commit fails if the target table's data files, delete files or
+    /// inlined rows changed after this snapshot, including a commit that only
+    /// deleted rows. Commits to other tables do not cause a conflict.
     pub expected_base_snapshot_id: Option<i64>,
 }
 

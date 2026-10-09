@@ -70,6 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COMMIT` that fails on PostgreSQL or MySQL keeps them, since it may have applied; official
   removes them there too. A multi-table transaction whose cleanup fails now returns the commit
   error and logs the cleanup failure.
+- A `Replace`, and a write with `expected_base_snapshot_id`, fail with `Conflict` when a commit
+  since their base deleted rows of the table, as official DuckLake fails an insert. An
+  inlined-data flush still commits over a delete file, and now fails over an inlined deletion
+  of a Parquet row.
 
 ## [0.9.0] - 2026-10-07
 
