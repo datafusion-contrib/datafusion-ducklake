@@ -57,6 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `row_id_start` when it is `RowIdStart::Preserved`, and NULL otherwise. An implementation
   that keeps storing NULL registers a merged file that has neither a range nor a rowid
   column: reading its rowids, or updating it, fails.
+- Large row-ID scans use less CPU when no scanned file has file-based or inlined
+  deletes (#368).
 
 ### Fixed
 

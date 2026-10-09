@@ -431,6 +431,11 @@ impl BatchFilter {
     ) -> DataFusionResult<RecordBatch> {
         let file_ids = int64_column(&batch, self.file_id_index, "data file id")?;
         let positions = int64_column(&batch, self.pos_index, "row position")?;
+        if self.files.is_empty() {
+            // With no delete entries every row survives, so only drop the
+            // hidden file-id and position columns.
+            return project_kept_columns(batch, &self.kept, &self.schema);
+        }
         let mut keep = Vec::with_capacity(batch.num_rows());
         let mut current: Option<(i64, Arc<HashSet<i64>>)> = None;
         for row in 0..batch.num_rows() {
@@ -447,16 +452,7 @@ impl BatchFilter {
             keep.push(!deleted.contains(&positions.value(row)));
         }
         let filtered = filter_record_batch(&batch, &BooleanArray::from(keep))?;
-        let columns = self
-            .kept
-            .iter()
-            .map(|index| Arc::clone(filtered.column(*index)))
-            .collect();
-        Ok(RecordBatch::try_new_with_options(
-            Arc::clone(&self.schema),
-            columns,
-            &RecordBatchOptions::new().with_row_count(Some(filtered.num_rows())),
-        )?)
+        project_kept_columns(filtered, &self.kept, &self.schema)
     }
 
     /// The positions deleted from data file `file_id`, read once per scan.
@@ -487,6 +483,23 @@ impl BatchFilter {
         .await
         .cloned()
     }
+}
+
+fn project_kept_columns(
+    batch: RecordBatch,
+    kept: &[usize],
+    schema: &SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let row_count = batch.num_rows();
+    let columns = kept
+        .iter()
+        .map(|index| Arc::clone(batch.column(*index)))
+        .collect();
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )?)
 }
 
 fn int64_column<'a>(
