@@ -17,9 +17,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session holds on local disk to `upload_concurrency`.
 - `TableWriteSession::abort` abandons a session without committing and removes every file it
   uploaded, waiting for the uploads in flight first.
+- `PostgresCommitGuard`, with the `write-postgres` feature: `with_commit_guard` on
+  `PostgresMetadataWriter` and `PostgresSingleCatalogMetadataWriter` runs a caller's check on
+  the connection of each metadata transaction the writer commits, after its last write and
+  right before `COMMIT`. A refusal rolls the transaction back and the writer returns
+  `DuckLakeError::CommitRefused`; a write removes the files it uploaded for it. Without a
+  guard nothing changes.
+- `PostgresMetadataWriter::drop_table` drops a table as
+  `MulticatalogManager::drop_table_in_catalog` does, through the writer's commit guard. It
+  returns `CatalogNotFound` for a missing catalog where `drop_table_in_catalog` returns
+  `false`, and waits for the catalog lock up to the writer's `with_lock_timeout`.
 
 ### Changed
 
+- **BREAKING**: `DuckLakeError` gains `CommitRefused`, with the `write-postgres` feature; add
+  an arm to exhaustive matches. Its source is the error a `PostgresCommitGuard` refused a
+  commit with. Nothing was committed, so a caller may treat it like any other failure before
+  `COMMIT`; it is never `CommitOutcomeUnknown`.
 - **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown`, with the `metadata-postgres` or
   `metadata-mysql` feature; add an arm to exhaustive matches. A PostgreSQL or MySQL commit
   that registers data files, or `commit_multi_table`, returns it in place of `Sqlx` when the
@@ -70,6 +84,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COMMIT` that fails on PostgreSQL or MySQL keeps them, since it may have applied; official
   removes them there too. A multi-table transaction whose cleanup fails now returns the commit
   error and logs the cleanup failure.
+- `DuckLakeTableWriter::write_table`, `append_table`, `write_rows` and the `write_partitioned`
+  forms remove the files they uploaded when the commit fails with nothing committed, as a
+  write session does; before, those files were left for the orphan sweep.
 - A `Replace`, and a write with `expected_base_snapshot_id`, fail with `Conflict` when a commit
   since their base deleted rows of the table, as official DuckLake fails an insert. An
   inlined-data flush still commits over a delete file, and now fails over an inlined deletion

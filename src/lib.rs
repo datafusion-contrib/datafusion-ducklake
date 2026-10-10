@@ -192,7 +192,7 @@ pub use metadata_writer_duckdb::DuckdbMetadataWriter;
 #[cfg(feature = "write-mysql")]
 pub use metadata_writer_mysql::MySqlMetadataWriter;
 #[cfg(feature = "write-postgres")]
-pub use metadata_writer_postgres::PostgresMetadataWriter;
+pub use metadata_writer_postgres::{CommitGuardError, PostgresCommitGuard, PostgresMetadataWriter};
 #[cfg(feature = "write-postgres")]
 pub use metadata_writer_postgres_single::PostgresSingleCatalogMetadataWriter;
 #[cfg(feature = "write-sqlite")]

@@ -25,6 +25,151 @@ END";
 /// Companion to [`PG_RESOLVED_PATH`]: true only when the whole chain is relative.
 const PG_REL_FLAG: &str = "(df.path_is_relative AND t.path_is_relative AND s.path_is_relative)";
 
+/// Tombstone the live table `schema_name.table_name` of catalog `catalog_id` at a
+/// new snapshot, inside `tx`; `Ok(false)` when there is no such table, having
+/// written nothing. The caller holds the catalog row `FOR UPDATE` and commits.
+/// See [`MulticatalogManager::drop_table_in_catalog`].
+pub(crate) async fn drop_live_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    catalog_id: i64,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<bool> {
+    // Resolve the live table_id by `(catalog, schema, table)`.
+    // Filters on `end_snapshot IS NULL` on both schema and table so
+    // an already-tombstoned table is treated as not-found and the
+    // call becomes an idempotent no-op.
+    let table_id: i64 = match sqlx::query(
+        "SELECT t.table_id FROM ducklake_table t
+             JOIN ducklake_schema s ON s.schema_id = t.schema_id
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+             WHERE m.catalog_id = $1
+               AND s.schema_name = $2
+               AND s.end_snapshot IS NULL
+               AND t.table_name = $3
+               AND t.end_snapshot IS NULL",
+    )
+    .bind(catalog_id)
+    .bind(schema_name)
+    .bind(table_name)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        Some(r) => r.try_get(0)?,
+        None => return Ok(false),
+    };
+
+    // Allocate the drop snapshot and register it under this catalog.
+    // Every snapshot has a row in `ducklake_catalog_snapshot_map` —
+    // same discipline as `MetadataWriter::create_snapshot` and
+    // `begin_write_transaction`.
+    //
+    // DROP TABLE is a DDL change (the set of live tables in the
+    // catalog shrinks by one), so the drop snapshot bumps
+    // `schema_version` — `prev_max + 1` per the per-catalog dense
+    // contract that `begin_write_transaction` enforces for DDL
+    // commits. Computed AFTER the snapshot is inserted, filtered
+    // strictly less than its own id, so concurrent writers (which
+    // hold the same catalog FOR UPDATE lock we do) can't slip a
+    // row in to invalidate the dense allocation.
+    let drop_snapshot: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+             VALUES (CURRENT_TIMESTAMP, 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
+             VALUES ($1, $2)",
+    )
+    .bind(catalog_id)
+    .bind(drop_snapshot)
+    .execute(&mut **tx)
+    .await?;
+
+    // Bump per-catalog dense schema_version: prior MAX + 1 (DDL).
+    // Falls back to 1 when this is the catalog's first commit ever,
+    // mirroring `begin_write_transaction`'s "no prior snapshot ⇒ v1"
+    // guard so the schema_version stays monotone-from-1.
+    let prev_max: i64 = sqlx::query(
+        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+             JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+             WHERE m.catalog_id = $1 AND s.snapshot_id < $2",
+    )
+    .bind(catalog_id)
+    .bind(drop_snapshot)
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    let new_schema_version = if prev_max == 0 {
+        1
+    } else {
+        prev_max + 1
+    };
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+        .bind(new_schema_version)
+        .bind(drop_snapshot)
+        .execute(&mut **tx)
+        .await?;
+
+    // Tombstone the table row and every currently-live child row
+    // keyed by `table_id`. The `end_snapshot IS NULL` guard makes
+    // each UPDATE a no-op for rows already tombstoned at an earlier
+    // snapshot (e.g. data files superseded by a prior REPLACE).
+    //
+    // `ducklake_schema_versions` rows are not tombstoned — that
+    // table has no `end_snapshot` column. They become unreferenced
+    // after the table is fully expired; future vacuum reclaims
+    // them. This mirrors the official DuckLake's `DropTables`
+    // (which leaves `ducklake_schema_versions` to vacuum likewise).
+    for child_table in
+        ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
+    {
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE {} SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            child_table
+        )))
+        .bind(drop_snapshot)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO ducklake_snapshot_changes
+                 (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+             VALUES ($1, $2, NULL, NULL, NULL)",
+    )
+    .bind(drop_snapshot)
+    .bind(format!("dropped_table:{table_id}"))
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
+    )
+    .bind(drop_snapshot)
+    .bind(catalog_id)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE ducklake_catalog_tag SET end_snapshot = $1
+             WHERE catalog_id = $2 AND object_type = 'table' AND object_id = $3
+               AND end_snapshot IS NULL",
+    )
+    .bind(drop_snapshot)
+    .bind(catalog_id)
+    .bind(table_id)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(true)
+}
+
 /// Bootstrap standard + multicatalog tables. Idempotent.
 pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     execute_ddl_statements(
@@ -408,6 +553,9 @@ impl MulticatalogManager {
     /// should list the table's data file paths via
     /// [`crate::MetadataProvider::get_table_files_for_select`] BEFORE
     /// calling this and schedule their removal externally.
+    ///
+    /// [`crate::PostgresMetadataWriter::drop_table`] performs the same drop
+    /// through a writer, under its commit guard.
     pub async fn drop_table_in_catalog(
         &self,
         catalog_name: &str,
@@ -455,143 +603,9 @@ impl MulticatalogManager {
             },
         };
 
-        // Resolve the live table_id by `(catalog, schema, table)`.
-        // Filters on `end_snapshot IS NULL` on both schema and table so
-        // an already-tombstoned table is treated as not-found and the
-        // call becomes an idempotent no-op.
-        let table_id: i64 = match sqlx::query(
-            "SELECT t.table_id FROM ducklake_table t
-             JOIN ducklake_schema s ON s.schema_id = t.schema_id
-             JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
-             WHERE m.catalog_id = $1
-               AND s.schema_name = $2
-               AND s.end_snapshot IS NULL
-               AND t.table_name = $3
-               AND t.end_snapshot IS NULL",
-        )
-        .bind(catalog_id)
-        .bind(schema_name)
-        .bind(table_name)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            Some(r) => r.try_get(0)?,
-            None => {
-                tx.commit().await?;
-                return Ok(false);
-            },
-        };
-
-        // Allocate the drop snapshot and register it under this catalog.
-        // Every snapshot has a row in `ducklake_catalog_snapshot_map` —
-        // same discipline as `MetadataWriter::create_snapshot` and
-        // `begin_write_transaction`.
-        //
-        // DROP TABLE is a DDL change (the set of live tables in the
-        // catalog shrinks by one), so the drop snapshot bumps
-        // `schema_version` — `prev_max + 1` per the per-catalog dense
-        // contract that `begin_write_transaction` enforces for DDL
-        // commits. Computed AFTER the snapshot is inserted, filtered
-        // strictly less than its own id, so concurrent writers (which
-        // hold the same catalog FOR UPDATE lock we do) can't slip a
-        // row in to invalidate the dense allocation.
-        let drop_snapshot: i64 = sqlx::query(
-            "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
-             VALUES (CURRENT_TIMESTAMP, 0) RETURNING snapshot_id",
-        )
-        .fetch_one(&mut *tx)
-        .await?
-        .try_get(0)?;
-
-        sqlx::query(
-            "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
-             VALUES ($1, $2)",
-        )
-        .bind(catalog_id)
-        .bind(drop_snapshot)
-        .execute(&mut *tx)
-        .await?;
-
-        // Bump per-catalog dense schema_version: prior MAX + 1 (DDL).
-        // Falls back to 1 when this is the catalog's first commit ever,
-        // mirroring `begin_write_transaction`'s "no prior snapshot ⇒ v1"
-        // guard so the schema_version stays monotone-from-1.
-        let prev_max: i64 = sqlx::query(
-            "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
-             JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
-             WHERE m.catalog_id = $1 AND s.snapshot_id < $2",
-        )
-        .bind(catalog_id)
-        .bind(drop_snapshot)
-        .fetch_one(&mut *tx)
-        .await?
-        .try_get(0)?;
-        let new_schema_version = if prev_max == 0 {
-            1
-        } else {
-            prev_max + 1
-        };
-        sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
-            .bind(new_schema_version)
-            .bind(drop_snapshot)
-            .execute(&mut *tx)
-            .await?;
-
-        // Tombstone the table row and every currently-live child row
-        // keyed by `table_id`. The `end_snapshot IS NULL` guard makes
-        // each UPDATE a no-op for rows already tombstoned at an earlier
-        // snapshot (e.g. data files superseded by a prior REPLACE).
-        //
-        // `ducklake_schema_versions` rows are not tombstoned — that
-        // table has no `end_snapshot` column. They become unreferenced
-        // after the table is fully expired; future vacuum reclaims
-        // them. This mirrors the official DuckLake's `DropTables`
-        // (which leaves `ducklake_schema_versions` to vacuum likewise).
-        for child_table in
-            ["ducklake_table", "ducklake_column", "ducklake_data_file", "ducklake_delete_file"]
-        {
-            sqlx::query(AssertSqlSafe(format!(
-                "UPDATE {} SET end_snapshot = $1
-                 WHERE table_id = $2 AND end_snapshot IS NULL",
-                child_table
-            )))
-            .bind(drop_snapshot)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        sqlx::query(
-            "INSERT INTO ducklake_snapshot_changes
-                 (snapshot_id, changes_made, author, commit_message, commit_extra_info)
-             VALUES ($1, $2, NULL, NULL, NULL)",
-        )
-        .bind(drop_snapshot)
-        .bind(format!("dropped_table:{table_id}"))
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
-             WHERE catalog_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
-        )
-        .bind(drop_snapshot)
-        .bind(catalog_id)
-        .bind(table_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE ducklake_catalog_tag SET end_snapshot = $1
-             WHERE catalog_id = $2 AND object_type = 'table' AND object_id = $3
-               AND end_snapshot IS NULL",
-        )
-        .bind(drop_snapshot)
-        .bind(catalog_id)
-        .bind(table_id)
-        .execute(&mut *tx)
-        .await?;
-
+        let dropped = drop_live_table(&mut tx, catalog_id, schema_name, table_name).await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(dropped)
     }
 
     /// Read the legacy global `data_path` fallback.

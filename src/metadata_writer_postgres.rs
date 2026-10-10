@@ -36,6 +36,7 @@ use sqlx::AssertSqlSafe;
 use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions, Postgres};
+use std::sync::Arc;
 
 pub(crate) const SQL_CREATE_INLINED_DATA_TABLES: &str =
     "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables (
@@ -1012,6 +1013,95 @@ pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// The error a [`PostgresCommitGuard`] returns to refuse a commit.
+pub type CommitGuardError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A check a PostgreSQL metadata writer runs inside each metadata transaction it
+/// commits, after the transaction's last write and immediately before `COMMIT`.
+///
+/// It lets a caller tie a commit to a condition held in the same database, such
+/// as a lease row in a table of its own that it reads with `SELECT ... FOR SHARE`:
+/// the check and the commit are one transaction, so the condition cannot change
+/// between them.
+///
+/// `before_commit` receives the transaction's own connection and sees every row
+/// the transaction has written. It may read anything and write tables of its
+/// own, but must not write any `ducklake_*` table, and must neither commit nor
+/// roll back the transaction. Returning `Err` rolls the transaction back, so
+/// nothing it wrote is committed, and the writer returns
+/// [`DuckLakeError::CommitRefused`](crate::DuckLakeError::CommitRefused) carrying
+/// the error. A write session treats that like any commit that registered
+/// nothing, and removes the files it uploaded.
+///
+/// A guard must return `Err` if any statement it ran on `conn` failed. A failed
+/// statement aborts the transaction, and PostgreSQL then answers the writer's
+/// `COMMIT` with a rollback rather than an error, so a guard that swallows the
+/// failure makes the writer report a commit that never happened.
+///
+/// The guard runs with whatever locks the transaction already holds. On
+/// [`PostgresMetadataWriter`], a transaction that locks its catalog row
+/// `FOR UPDATE` runs the guard with that lock held and under the writer's
+/// `SET LOCAL lock_timeout`, so the guard's time is added to every such commit
+/// on the catalog; [`PostgresMetadataWriter::create_snapshot`] and table
+/// settings take no catalog lock and set no `lock_timeout`. The single-catalog
+/// writer has no catalog lock and sets no `lock_timeout`. A `SET` the guard
+/// issues without `LOCAL` outlives the transaction on the pooled connection.
+///
+/// The guard runs once per metadata transaction the writer commits, including
+/// the ones that write nothing: the id reservation at the start of a write, and
+/// a lookup that finds its schema or table already exists. Unguarded are
+/// [`MetadataWriter::initialize_schema`], which creates and upgrades the catalog
+/// tables, and the idempotent `CREATE TABLE IF NOT EXISTS` of
+/// `ducklake_inlined_data_tables` the writers run outside any transaction.
+#[async_trait::async_trait]
+pub trait PostgresCommitGuard: Send + Sync + std::fmt::Debug {
+    /// Approve or refuse the commit of the transaction `conn` is running.
+    async fn before_commit(
+        &self,
+        conn: &mut sqlx::PgConnection,
+    ) -> std::result::Result<(), CommitGuardError>;
+}
+
+/// Commit `tx` once `guard` approves it; with no guard this is `tx.commit()`.
+/// A refusal rolls `tx` back and returns
+/// [`DuckLakeError::CommitRefused`](crate::DuckLakeError::CommitRefused).
+pub(crate) async fn commit_guarded(
+    tx: sqlx::Transaction<'_, Postgres>,
+    guard: Option<&dyn PostgresCommitGuard>,
+) -> Result<()> {
+    approve_commit(tx, guard).await?.commit().await?;
+    Ok(())
+}
+
+/// [`commit_guarded`] for the commits that report a failed `COMMIT` as
+/// [`DuckLakeError::CommitOutcomeUnknown`](crate::DuckLakeError::CommitOutcomeUnknown).
+/// A refusal is never reported that way: the guard runs before `COMMIT` is sent.
+pub(crate) async fn commit_networked_guarded(
+    tx: sqlx::Transaction<'_, Postgres>,
+    guard: Option<&dyn PostgresCommitGuard>,
+) -> Result<()> {
+    crate::metadata_writer::commit_networked(approve_commit(tx, guard).await?).await
+}
+
+/// Hand `tx` back once `guard` approves it, or roll it back on a refusal.
+async fn approve_commit<'c>(
+    mut tx: sqlx::Transaction<'c, Postgres>,
+    guard: Option<&dyn PostgresCommitGuard>,
+) -> Result<sqlx::Transaction<'c, Postgres>> {
+    let Some(guard) = guard else {
+        return Ok(tx);
+    };
+    let Err(refusal) = guard.before_commit(&mut tx).await else {
+        return Ok(tx);
+    };
+    // A failed rollback leaves the transaction to the server, which aborts it
+    // when the connection closes; either way nothing was committed.
+    if let Err(error) = tx.rollback().await {
+        tracing::warn!(%error, "failed to roll back a transaction its commit guard refused");
+    }
+    Err(crate::DuckLakeError::CommitRefused(refusal))
+}
+
 /// PostgreSQL-based metadata writer for DuckLake catalogs.
 ///
 /// Bound to a single `catalog_id` at construction. To write to a different
@@ -1021,6 +1111,7 @@ pub struct PostgresMetadataWriter {
     pool: PgPool,
     catalog_id: i64,
     lock_timeout_ms: u32,
+    commit_guard: Option<Arc<dyn PostgresCommitGuard>>,
 }
 
 impl PostgresMetadataWriter {
@@ -1036,6 +1127,7 @@ impl PostgresMetadataWriter {
             pool,
             catalog_id,
             lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
+            commit_guard: None,
         })
     }
 
@@ -1066,8 +1158,51 @@ impl PostgresMetadataWriter {
         self
     }
 
+    /// Runs `guard` inside every metadata transaction this writer commits, right
+    /// before `COMMIT`; see [`PostgresCommitGuard`].
+    pub fn with_commit_guard(mut self, guard: Arc<dyn PostgresCommitGuard>) -> Self {
+        self.commit_guard = Some(guard);
+        self
+    }
+
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
+    }
+
+    /// Tombstone the live table `schema_name.table_name` of this writer's catalog
+    /// at a new snapshot, as
+    /// [`MulticatalogManager::drop_table_in_catalog`](crate::MulticatalogManager::drop_table_in_catalog)
+    /// does, in one transaction committed through this writer's commit guard.
+    /// Returns `Ok(false)`, having written nothing, when no such table is live.
+    pub fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        for (name, what) in [(schema_name, "Schema"), (table_name, "Table")] {
+            if name.trim().is_empty() {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "{what} name cannot be empty"
+                )));
+            }
+        }
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let dropped = crate::multicatalog::drop_live_table(
+                &mut tx,
+                self.catalog_id,
+                schema_name,
+                table_name,
+            )
+            .await?;
+            self.commit(tx).await?;
+            Ok(dropped)
+        })
+    }
+
+    async fn commit(&self, tx: sqlx::Transaction<'_, Postgres>) -> Result<()> {
+        commit_guarded(tx, self.commit_guard.as_deref()).await
+    }
+
+    async fn commit_networked(&self, tx: sqlx::Transaction<'_, Postgres>) -> Result<()> {
+        commit_networked_guarded(tx, self.commit_guard.as_deref()).await
     }
 }
 
@@ -2838,6 +2973,7 @@ pub(crate) async fn apply_inlined_deletes_at_snapshot(
 
 pub(crate) fn set_postgres_table_setting(
     pool: &PgPool,
+    guard: Option<&dyn PostgresCommitGuard>,
     catalog_id: Option<i64>,
     table_id: i64,
     key: &str,
@@ -2861,7 +2997,7 @@ pub(crate) fn set_postgres_table_setting(
         .execute(&mut *tx)
         .await?;
         sqlx::query("INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES ($1, $2, 'table', $3)").bind(&key).bind(value).bind(table_id).execute(&mut *tx).await?;
-        tx.commit().await?;
+        commit_guarded(tx, guard).await?;
         Ok(())
     })
 }
@@ -2889,7 +3025,14 @@ pub(crate) fn with_postgres_commit_lock(
 
 impl MetadataWriter for PostgresMetadataWriter {
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
-        set_postgres_table_setting(&self.pool, Some(self.catalog_id), table_id, key, value)
+        set_postgres_table_setting(
+            &self.pool,
+            self.commit_guard.as_deref(),
+            Some(self.catalog_id),
+            table_id,
+            key,
+            value,
+        )
     }
 
     fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
@@ -2939,7 +3082,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(table_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            self.commit(transaction).await?;
             Ok(())
         })
     }
@@ -2960,7 +3103,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 ensure_postgres_physical_indexes(&mut transaction, table_id, &physical_table)
                     .await?;
             }
-            transaction.commit().await?;
+            self.commit(transaction).await?;
             Ok(())
         })
     }
@@ -3000,7 +3143,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             record_snapshot_changes(&mut tx, snapshot_id, "", &SnapshotCommitMetadata::default())
                 .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -3152,7 +3295,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -3307,7 +3450,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -3333,7 +3476,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .bind(self.catalog_id)
             .execute(&mut *transaction)
             .await?;
-            transaction.commit().await?;
+            self.commit(transaction).await?;
             Ok(())
         })
     }
@@ -3361,7 +3504,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             if let Some(row) = existing {
                 let id: i64 = row.try_get(0)?;
-                tx.commit().await?;
+                self.commit(tx).await?;
                 return Ok((id, false));
             }
 
@@ -3396,7 +3539,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok((schema_id, true))
         })
     }
@@ -3425,7 +3568,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             if let Some(row) = existing {
                 let id: i64 = row.try_get(0)?;
-                tx.commit().await?;
+                self.commit(tx).await?;
                 return Ok((id, false));
             }
 
@@ -3458,7 +3601,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok((id, true))
         })
     }
@@ -3530,7 +3673,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 )
                 .await?;
             }
-            tx.commit().await?;
+            self.commit(tx).await?;
             top_level_column_ids(&catalog_columns, &column_ids)
         })
     }
@@ -3695,7 +3838,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -3863,7 +4006,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4074,7 +4217,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             );
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, commit_metadata).await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -4220,7 +4363,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .await?;
             }
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(MultiTableCommit {
                 snapshot_id,
                 tables,
@@ -4272,7 +4415,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -4389,7 +4532,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -4447,7 +4590,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -4493,7 +4636,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &SnapshotCommitMetadata::default(),
             )
             .await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(snapshot_id)
         })
     }
@@ -5038,7 +5181,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
             }
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5182,7 +5325,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5431,7 +5574,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5690,7 +5833,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            crate::metadata_writer::commit_networked(tx).await?;
+            self.commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5835,7 +5978,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -5897,7 +6040,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6043,7 +6186,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .fetch_one(&mut *tx)
                     .await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6326,7 +6469,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6496,7 +6639,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(live_rows)
         })
     }
@@ -6633,7 +6776,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // advance_catalog_head MUST be the last write before commit.
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(Some(snapshot_id))
         })
     }
@@ -6681,7 +6824,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .await?;
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -6720,7 +6863,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(n)
         })
     }
@@ -6794,7 +6937,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             match existing {
                 Some(cur) if cur == path => {
-                    tx.commit().await?;
+                    self.commit(tx).await?;
                     return Ok(());
                 },
                 Some(cur) => {
@@ -6812,7 +6955,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
 
-            tx.commit().await?;
+            self.commit(tx).await?;
             Ok(())
         })
     }
@@ -7029,7 +7172,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             .try_get(0)?;
 
             // Commit the (sequence-only) reservation transaction.
-            tx.commit().await?;
+            self.commit(tx).await?;
 
             Ok(WriteSetupResult {
                 // snapshot_id is vestigial here (like SQLite's): the real id is
