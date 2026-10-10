@@ -1,6 +1,8 @@
 //! SQL entry point for DuckLake metadata and data-layout DDL.
 //!
-//! DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
+//! Catalog DDL uses sqlparser's DuckDB dialect and dispatches `CREATE/DROP
+//! SCHEMA`, `DROP TABLE`, and `ALTER TABLE … RENAME TO` directly to the metadata
+//! writer. DataFusion's SQL parser (sqlparser) does not accept `ALTER TABLE … SET
 //! PARTITIONED BY (…)` / `… SET SORTED BY (…)` — it errors at parse time, before
 //! any `LogicalPlan` exists, so a custom `QueryPlanner`/analyzer can never
 //! intercept it. Instead, [`execute_ducklake_sql`] is a transparent wrapper the
@@ -22,6 +24,9 @@
 //!     "ALTER TABLE lake.main.events SET SORTED BY (device_id, ts DESC NULLS LAST)").await?;
 //! execute_ducklake_sql(ctx, catalog,
 //!     "ALTER TABLE lake.main.events RESET SORTED BY").await?;
+//! execute_ducklake_sql(ctx, catalog,
+//!     "ALTER TABLE lake.main.events RENAME TO archived_events").await?;
+//! execute_ducklake_sql(ctx, catalog, "DROP TABLE lake.main.archived_events").await?;
 //! # Ok(()) }
 //! ```
 //!
@@ -34,10 +39,10 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
-    CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectName, Statement,
+    AlterTableOperation, CommentObject, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, ObjectName, ObjectType, RenameTableNameKind, SchemaName, Statement,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
@@ -62,7 +67,7 @@ pub async fn execute_ducklake_sql(
     catalog: &DuckLakeCatalog,
     sql: &str,
 ) -> DataFusionResult<DataFrame> {
-    match parse_ducklake_ddl(sql)? {
+    match parse_catalog_ddl(sql)?.or(parse_ducklake_ddl(sql)?) {
         Some(ddl) => apply_ducklake_ddl(ctx, catalog, ddl).await,
         None => ctx.sql(sql).await,
     }
@@ -76,6 +81,22 @@ enum DuckLakeDdl {
         object_name: Vec<(String, bool)>,
         comment: Option<String>,
         if_exists: bool,
+    },
+    CreateSchema {
+        schema: Vec<(String, bool)>,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        schema: Vec<(String, bool)>,
+        if_exists: bool,
+    },
+    DropTable {
+        table: Vec<(String, bool)>,
+        if_exists: bool,
+    },
+    RenameTable {
+        table: Vec<(String, bool)>,
+        new_name: Vec<(String, bool)>,
     },
     SetPartition {
         table: Vec<(String, bool)>,
@@ -91,6 +112,95 @@ enum DuckLakeDdl {
     ResetSort {
         table: Vec<(String, bool)>,
     },
+}
+
+fn parse_catalog_ddl(sql: &str) -> DataFusionResult<Option<DuckLakeDdl>> {
+    let statements = match Parser::parse_sql(&DuckDbDialect {}, sql) {
+        Ok(statements) => statements,
+        Err(_) => return Ok(None),
+    };
+    let [statement] = statements.as_slice() else {
+        return Ok(None);
+    };
+    match statement {
+        Statement::CreateSchema {
+            schema_name: SchemaName::Simple(name),
+            if_not_exists,
+            ..
+        } => Ok(Some(DuckLakeDdl::CreateSchema {
+            schema: object_name_parts(name),
+            if_not_exists: *if_not_exists,
+        })),
+        Statement::Drop {
+            object_type: ObjectType::Schema,
+            if_exists,
+            names,
+            cascade,
+            ..
+        } => {
+            if *cascade {
+                return Err(DataFusionError::Plan(
+                    "DROP SCHEMA CASCADE is not supported; drop all tables first".to_string(),
+                ));
+            }
+            let [name] = names.as_slice() else {
+                return Err(DataFusionError::Plan(
+                    "DuckLake DROP SCHEMA accepts exactly one schema".to_string(),
+                ));
+            };
+            Ok(Some(DuckLakeDdl::DropSchema {
+                schema: object_name_parts(name),
+                if_exists: *if_exists,
+            }))
+        },
+        Statement::Drop {
+            object_type: ObjectType::Table,
+            if_exists,
+            names,
+            cascade,
+            ..
+        } => {
+            if *cascade {
+                return Err(DataFusionError::Plan(
+                    "DROP TABLE CASCADE is not supported".to_string(),
+                ));
+            }
+            let [name] = names.as_slice() else {
+                return Err(DataFusionError::Plan(
+                    "DuckLake DROP TABLE accepts exactly one table".to_string(),
+                ));
+            };
+            Ok(Some(DuckLakeDdl::DropTable {
+                table: object_name_parts(name),
+                if_exists: *if_exists,
+            }))
+        },
+        Statement::AlterTable(alter)
+            if matches!(
+                alter.operations.as_slice(),
+                [AlterTableOperation::RenameTable { .. }]
+            ) =>
+        {
+            let [
+                AlterTableOperation::RenameTable {
+                    table_name,
+                },
+            ] = alter.operations.as_slice()
+            else {
+                unreachable!()
+            };
+            let new_name = match table_name {
+                RenameTableNameKind::As(name) | RenameTableNameKind::To(name) => {
+                    object_name_parts(name)
+                },
+            };
+            Ok(Some(DuckLakeDdl::RenameTable {
+                table: object_name_parts(&alter.name),
+                new_name,
+            }))
+        },
+        _ => Ok(None),
+    }
 }
 
 fn parse_err(error: ParserError) -> DataFusionError {
@@ -377,7 +487,24 @@ fn resolve_schema_table(parts: &[(String, bool)]) -> DataFusionResult<(String, S
         [schema, table] => Ok((norm(schema), norm(table))),
         [_catalog, schema, table] => Ok((norm(schema), norm(table))),
         _ => Err(DataFusionError::Plan(
-            "partition DDL target must be a table name of 1–3 parts".to_string(),
+            "DuckLake DDL target must be a table name of 1–3 parts".to_string(),
+        )),
+    }
+}
+
+fn resolve_schema(parts: &[(String, bool)]) -> DataFusionResult<String> {
+    let norm = |(value, quoted): &(String, bool)| {
+        if *quoted {
+            value.clone()
+        } else {
+            value.to_ascii_lowercase()
+        }
+    };
+    match parts {
+        [schema] => Ok(norm(schema)),
+        [_catalog, schema] => Ok(norm(schema)),
+        _ => Err(DataFusionError::Plan(
+            "DuckLake DDL target must be a schema name of 1–2 parts".to_string(),
         )),
     }
 }
@@ -518,10 +645,67 @@ async fn apply_ducklake_ddl(
         return empty_dataframe(ctx);
     }
 
-    let parts = match &ddl {
-        DuckLakeDdl::Comment {
-            ..
-        } => unreachable!("comments return above"),
+    match &ddl {
+        DuckLakeDdl::CreateSchema {
+            schema,
+            if_not_exists,
+        } => {
+            writer
+                .create_schema(&resolve_schema(schema)?, *if_not_exists)
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::DropSchema {
+            schema,
+            if_exists,
+        } => {
+            writer
+                .drop_schema(&resolve_schema(schema)?, *if_exists)
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::DropTable {
+            table,
+            if_exists,
+        } => {
+            let (schema_name, table_name) = resolve_schema_table(table)?;
+            writer
+                .drop_table(&schema_name, &table_name, *if_exists)
+                .map_err(DataFusionError::from)?;
+        },
+        DuckLakeDdl::RenameTable {
+            table,
+            new_name,
+        } => {
+            let (schema_name, table_name) = resolve_schema_table(table)?;
+            let [(new_name, quoted)] = new_name.as_slice() else {
+                return Err(DataFusionError::Plan(
+                    "ALTER TABLE RENAME TO requires an unqualified new table name".to_string(),
+                ));
+            };
+            let new_name = if *quoted {
+                new_name.clone()
+            } else {
+                new_name.to_ascii_lowercase()
+            };
+            writer
+                .rename_table(&schema_name, &table_name, &new_name)
+                .map_err(DataFusionError::from)?;
+        },
+        _ => {
+            apply_data_layout_ddl(writer.as_ref(), provider.as_ref(), snapshot, &ddl)?;
+        },
+    }
+
+    // DDL returns an empty (0-row) result, matching DataFusion's own DDL.
+    empty_dataframe(ctx)
+}
+
+fn apply_data_layout_ddl(
+    writer: &dyn crate::metadata_writer::MetadataWriter,
+    provider: &dyn crate::metadata_provider::MetadataProvider,
+    snapshot: i64,
+    ddl: &DuckLakeDdl,
+) -> DataFusionResult<()> {
+    let parts = match ddl {
         DuckLakeDdl::SetPartition {
             table,
             ..
@@ -536,6 +720,7 @@ async fn apply_ducklake_ddl(
         | DuckLakeDdl::ResetSort {
             table,
         } => table,
+        _ => unreachable!("catalog DDL is handled before data-layout DDL"),
     };
     let (schema_name, table_name) = resolve_schema_table(parts)?;
 
@@ -557,7 +742,7 @@ async fn apply_ducklake_ddl(
             ..
         } => {
             writer
-                .set_partition_spec(table.table_id, &transforms)
+                .set_partition_spec(table.table_id, transforms)
                 .map_err(DataFusionError::from)?;
         },
         DuckLakeDdl::ResetPartition {
@@ -572,7 +757,7 @@ async fn apply_ducklake_ddl(
             ..
         } => {
             writer
-                .set_sort_spec(table.table_id, &fields)
+                .set_sort_spec(table.table_id, fields)
                 .map_err(DataFusionError::from)?;
         },
         DuckLakeDdl::ResetSort {
@@ -582,8 +767,8 @@ async fn apply_ducklake_ddl(
                 .reset_sort_spec(table.table_id)
                 .map_err(DataFusionError::from)?;
         },
+        _ => unreachable!("catalog DDL is handled before data-layout DDL"),
     }
 
-    // DDL returns an empty (0-row) result, matching DataFusion's own DDL.
-    empty_dataframe(ctx)
+    Ok(())
 }

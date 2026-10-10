@@ -118,6 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `idx_file_partition_value_table_key (table_id, partition_key_index)`, created
   by every writer's schema bootstrap and by existing catalogs on their next
   initialization.
+- `CREATE SCHEMA`, `DROP SCHEMA` (empty only), `DROP TABLE`, and `ALTER TABLE ... RENAME TO` through
+  `execute_ducklake_sql` on SQLite and the PostgreSQL multicatalog writer.
 
 ### Changed
 

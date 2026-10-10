@@ -371,6 +371,98 @@ async fn snapshot_changes(pool: &PgPool, snapshot_id: i64) -> Option<String> {
         .unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn postgres_catalog_ddl_versions_table_names() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let catalog_id = manager.create_catalog("catalog_ddl").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    writer.set_data_path("/data").unwrap();
+
+    let schema_snapshot = writer.create_schema("analytics", false).unwrap().unwrap();
+    assert_eq!(writer.create_schema("analytics", true).unwrap(), None);
+    assert_eq!(current_head(&pool, catalog_id).await, schema_snapshot);
+
+    let columns = cols();
+    let setup = writer
+        .begin_write_transaction("analytics", "events", &columns, WriteMode::Replace)
+        .unwrap();
+    let committed = writer
+        .publish_snapshot(
+            setup.table_id,
+            "analytics",
+            "events",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+        )
+        .unwrap();
+    assert!(writer.drop_schema("analytics", false).is_err());
+    assert_eq!(current_head(&pool, catalog_id).await, committed.snapshot_id);
+
+    let rename_snapshot = writer
+        .rename_table("analytics", "events", "archived_events")
+        .unwrap();
+    let rows = sqlx::query(
+        "SELECT table_id, table_name, begin_snapshot, end_snapshot
+         FROM ducklake_table WHERE table_id = $1 ORDER BY begin_snapshot",
+    )
+    .bind(committed.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].try_get::<i64, _>("table_id").unwrap(),
+        committed.table_id
+    );
+    assert_eq!(
+        rows[0].try_get::<String, _>("table_name").unwrap(),
+        "events"
+    );
+    assert_eq!(
+        rows[0].try_get::<Option<i64>, _>("end_snapshot").unwrap(),
+        Some(rename_snapshot)
+    );
+    assert_eq!(
+        rows[1].try_get::<i64, _>("table_id").unwrap(),
+        committed.table_id
+    );
+    assert_eq!(
+        rows[1].try_get::<String, _>("table_name").unwrap(),
+        "archived_events"
+    );
+    assert_eq!(
+        rows[1].try_get::<i64, _>("begin_snapshot").unwrap(),
+        rename_snapshot
+    );
+    assert_eq!(
+        rows[1].try_get::<Option<i64>, _>("end_snapshot").unwrap(),
+        None
+    );
+
+    let drop_snapshot = writer
+        .drop_table("analytics", "archived_events", false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        writer
+            .drop_table("analytics", "archived_events", true)
+            .unwrap(),
+        None
+    );
+    assert_eq!(current_head(&pool, catalog_id).await, drop_snapshot);
+    let schema_drop = writer.drop_schema("analytics", false).unwrap().unwrap();
+    assert_eq!(current_head(&pool, catalog_id).await, schema_drop);
+    assert_eq!(writer.drop_schema("analytics", true).unwrap(), None);
+    assert_eq!(current_head(&pool, catalog_id).await, schema_drop);
+}
+
 /// Total record_count of the files visible to a reader at the current head —
 /// the same window predicate the read path applies.
 async fn visible_records_at_head(pool: &PgPool, catalog_id: i64, table_id: i64) -> i64 {

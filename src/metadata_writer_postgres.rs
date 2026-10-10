@@ -16,14 +16,14 @@ use crate::metadata_writer::is_inlined_system_column;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
-    MultiTableCommit, PromoteLayout, PromotedFile, SnapshotCommitMetadata, StagedTableData,
-    StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids, catalog_column_defs,
-    catalog_column_type_equal, catalog_column_type_requires_migration, catalog_columns_differ,
-    encode_inlined_index_columns, inlined_delete_conflicts, inlined_delete_groups,
-    live_inlined_index_columns, parse_inlined_index_columns, snapshot_has_change,
-    staged_table_write_changes, table_storage_changes, table_write_changes, tag_change,
-    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
-    validate_table_setting,
+    MultiTableCommit, PromoteLayout, PromotedFile, SCHEMA_DEPENDENT_TABLES, SnapshotCommitMetadata,
+    StagedTableData, StagedTableWrite, WriteMode, WriteSetupResult, assign_column_ids,
+    catalog_column_defs, catalog_column_type_equal, catalog_column_type_requires_migration,
+    catalog_columns_differ, encode_inlined_index_columns, inlined_delete_conflicts,
+    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
+    tag_change, top_level_column_ids, validate_delete_entries, validate_inlined_index_columns,
+    validate_name, validate_table_setting,
 };
 use crate::partition::PartitionTransform;
 use arrow::array::{
@@ -254,7 +254,7 @@ pub(crate) const SQL_CREATE_STANDARD_TABLES: &[&str] = &[
         end_snapshot BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_table (
-        table_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        table_id BIGINT GENERATED ALWAYS AS IDENTITY,
         schema_id BIGINT NOT NULL,
         table_name VARCHAR NOT NULL,
         path VARCHAR NOT NULL DEFAULT '',
@@ -616,6 +616,8 @@ pub(crate) const SQL_CREATE_MULTICATALOG_TABLES: &[&str] = &[
     // writer (manual SQL, external migrations).
     r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_active_table_per_schema
         ON ducklake_table(schema_id, table_name) WHERE end_snapshot IS NULL"#,
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_ducklake_table_live_id
+        ON ducklake_table(table_id) WHERE end_snapshot IS NULL"#,
     // At most one *live* version per field-id (design §4.1, reviews #2/#3). The
     // promote's retire-then-insert (end the old row, then insert the new live row,
     // in one txn) keeps this satisfied at every commit boundary.
@@ -1012,6 +1014,31 @@ pub async fn purge_orphaned_metadata(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn migrate_ducklake_table_drop_pk(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"DO $$
+        DECLARE pk_name text;
+        BEGIN
+            SELECT conname INTO pk_name
+            FROM pg_constraint
+            WHERE conrelid = 'ducklake_table'::regclass
+              AND contype = 'p';
+            IF pk_name IS NOT NULL THEN
+                EXECUTE 'ALTER TABLE ducklake_table DROP CONSTRAINT ' || quote_ident(pk_name);
+            END IF;
+        END $$;"#,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ducklake_table_live_id
+         ON ducklake_table(table_id) WHERE end_snapshot IS NULL",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// PostgreSQL-based metadata writer for DuckLake catalogs.
 ///
 /// Bound to a single `catalog_id` at construction. To write to a different
@@ -1213,6 +1240,43 @@ async fn assert_table_live(
             "table_id {table_id} is not live"
         )))
     }
+}
+
+async fn insert_schema_snapshot(
+    catalog_id: i64,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(i64, i64)> {
+    let snapshot_id: i64 = sqlx::query(
+        "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
+         VALUES (NOW(), 0) RETURNING snapshot_id",
+    )
+    .fetch_one(&mut **tx)
+    .await?
+    .try_get(0)?;
+    sqlx::query(
+        "INSERT INTO ducklake_catalog_snapshot_map (catalog_id, snapshot_id)
+         VALUES ($1, $2)",
+    )
+    .bind(catalog_id)
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    let previous: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
+         JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+         WHERE m.catalog_id = $1 AND s.snapshot_id <> $2",
+    )
+    .bind(catalog_id)
+    .bind(snapshot_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let schema_version = previous + 1;
+    sqlx::query("UPDATE ducklake_snapshot SET schema_version = $1 WHERE snapshot_id = $2")
+        .bind(schema_version)
+        .bind(snapshot_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok((snapshot_id, schema_version))
 }
 
 /// Reject only a `table_id` hint that exists and belongs to ANOTHER catalog. A
@@ -3151,6 +3215,316 @@ impl MetadataWriter for PostgresMetadataWriter {
                 &change,
                 &SnapshotCommitMetadata::default(),
             )
+            .await?;
+            tx.commit().await?;
+            Ok(snapshot_id)
+        })
+    }
+
+    fn create_schema(&self, name: &str, if_not_exists: bool) -> Result<Option<i64>> {
+        validate_name(name, "Schema")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ducklake_schema s
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                 WHERE m.catalog_id = $1 AND s.schema_name = $2
+                   AND s.end_snapshot IS NULL",
+            )
+            .bind(self.catalog_id)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?
+                != 0;
+            if exists {
+                if if_not_exists {
+                    tx.commit().await?;
+                    return Ok(None);
+                }
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "schema '{name}' already exists"
+                )));
+            }
+
+            let (snapshot_id, _schema_version) =
+                insert_schema_snapshot(self.catalog_id, &mut tx).await?;
+            let schema_id: i64 = sqlx::query_scalar(
+                "INSERT INTO ducklake_schema
+                     (schema_name, path, path_is_relative, begin_snapshot)
+                 VALUES ($1, $2, TRUE, $3) RETURNING schema_id",
+            )
+            .bind(name)
+            .bind(format!("cat_{}/{name}", self.catalog_id))
+            .bind(snapshot_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_catalog_schema_map (catalog_id, schema_id)
+                 VALUES ($1, $2)",
+            )
+            .bind(self.catalog_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(snapshot_id))
+        })
+    }
+
+    fn drop_schema(&self, name: &str, if_exists: bool) -> Result<Option<i64>> {
+        validate_name(name, "Schema")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let schema_id = sqlx::query_scalar::<_, i64>(
+                "SELECT s.schema_id FROM ducklake_schema s
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                 WHERE m.catalog_id = $1 AND s.schema_name = $2
+                   AND s.end_snapshot IS NULL",
+            )
+            .bind(self.catalog_id)
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(schema_id) = schema_id else {
+                if if_exists {
+                    tx.commit().await?;
+                    return Ok(None);
+                }
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "schema '{name}' does not exist"
+                )));
+            };
+            for relation in SCHEMA_DEPENDENT_TABLES {
+                let exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(relation)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if !exists {
+                    continue;
+                }
+                let entry_count = sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {relation}
+                     WHERE schema_id = $1 AND end_snapshot IS NULL"
+                )))
+                .bind(schema_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                if entry_count != 0 {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "schema '{name}' is not empty"
+                    )));
+                }
+            }
+
+            let (snapshot_id, _schema_version) =
+                insert_schema_snapshot(self.catalog_id, &mut tx).await?;
+            sqlx::query(
+                "UPDATE ducklake_schema SET end_snapshot = $1
+                 WHERE schema_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(schema_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(snapshot_id))
+        })
+    }
+
+    fn drop_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        if_exists: bool,
+    ) -> Result<Option<i64>> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(table_name, "Table")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let table_id = sqlx::query_scalar::<_, i64>(
+                "SELECT t.table_id FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                 WHERE m.catalog_id = $1 AND s.schema_name = $2
+                   AND s.end_snapshot IS NULL AND t.table_name = $3
+                   AND t.end_snapshot IS NULL",
+            )
+            .bind(self.catalog_id)
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(table_id) = table_id else {
+                if if_exists {
+                    tx.commit().await?;
+                    return Ok(None);
+                }
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "table '{schema_name}.{table_name}' does not exist"
+                )));
+            };
+            let (snapshot_id, _schema_version) =
+                insert_schema_snapshot(self.catalog_id, &mut tx).await?;
+            for child in [
+                "ducklake_table",
+                "ducklake_partition_info",
+                "ducklake_sort_info",
+                "ducklake_column",
+                "ducklake_data_file",
+                "ducklake_delete_file",
+            ] {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {child} SET end_snapshot = $1
+                     WHERE table_id = $2 AND end_snapshot IS NULL"
+                )))
+                .bind(snapshot_id)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            for (child, id_column) in
+                [("ducklake_column_tag", "table_id"), ("ducklake_tag", "object_id")]
+            {
+                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(child)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if exists {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "UPDATE {child} SET end_snapshot = $1
+                         WHERE {id_column} = $2 AND end_snapshot IS NULL"
+                    )))
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+            tx.commit().await?;
+            Ok(Some(snapshot_id))
+        })
+    }
+
+    fn rename_table(&self, schema_name: &str, table_name: &str, new_name: &str) -> Result<i64> {
+        validate_name(schema_name, "Schema")?;
+        validate_name(table_name, "Table")?;
+        validate_name(new_name, "Table")?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let row = sqlx::query(
+                "SELECT t.table_id, t.schema_id, t.path, t.path_is_relative
+                 FROM ducklake_table t
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                 WHERE m.catalog_id = $1 AND s.schema_name = $2
+                   AND s.end_snapshot IS NULL AND t.table_name = $3
+                   AND t.end_snapshot IS NULL",
+            )
+            .bind(self.catalog_id)
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "table '{schema_name}.{table_name}' does not exist"
+                ))
+            })?;
+            let table_id: i64 = row.try_get("table_id")?;
+            let schema_id: i64 = row.try_get("schema_id")?;
+            let path: String = row.try_get("path")?;
+            let path_is_relative: bool = row.try_get("path_is_relative")?;
+            let has_table_uuid: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM information_schema.columns
+                     WHERE table_schema = current_schema()
+                       AND table_name = 'ducklake_table'
+                       AND column_name = 'table_uuid'
+                 )",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            let table_uuid = if has_table_uuid {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT table_uuid::text FROM ducklake_table
+                     WHERE table_id = $1 AND end_snapshot IS NULL",
+                )
+                .bind(table_id)
+                .fetch_one(&mut *tx)
+                .await?
+            } else {
+                None
+            };
+            let target_exists = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ducklake_table
+                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(new_name)
+            .fetch_one(&mut *tx)
+            .await?
+                != 0;
+            if target_exists {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "table '{schema_name}.{new_name}' already exists"
+                )));
+            }
+
+            let (snapshot_id, schema_version) =
+                insert_schema_snapshot(self.catalog_id, &mut tx).await?;
+            sqlx::query(
+                "UPDATE ducklake_table SET end_snapshot = $1
+                 WHERE table_id = $2 AND end_snapshot IS NULL",
+            )
+            .bind(snapshot_id)
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            if has_table_uuid {
+                sqlx::query(
+                    "INSERT INTO ducklake_table
+                         (table_id, table_uuid, schema_id, table_name, path,
+                          path_is_relative, begin_snapshot)
+                     OVERRIDING SYSTEM VALUE
+                     VALUES ($1, $2::uuid, $3, $4, $5, $6, $7)",
+                )
+                .bind(table_id)
+                .bind(table_uuid)
+                .bind(schema_id)
+                .bind(new_name)
+                .bind(path)
+                .bind(path_is_relative)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO ducklake_table
+                         (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+                     OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(table_id)
+                .bind(schema_id)
+                .bind(new_name)
+                .bind(path)
+                .bind(path_is_relative)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO ducklake_schema_versions
+                     (begin_snapshot, schema_version, table_id)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(snapshot_id)
+            .bind(schema_version)
+            .bind(table_id)
+            .execute(&mut *tx)
             .await?;
             tx.commit().await?;
             Ok(snapshot_id)
@@ -6834,6 +7208,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // Carry a v0.8.0 store's ownership column into the reference tables.
             // Idempotent.
             migrate_file_ownership(&self.pool).await?;
+            migrate_ducklake_table_drop_pk(&self.pool).await?;
             Ok(())
         })
     }

@@ -617,8 +617,9 @@ async fn delete_orphaned_files_handles_empty_schema_path() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO ducklake_table (schema_id, table_name, path, path_is_relative, begin_snapshot)
-         VALUES (1, 't', 't', 1, 1)",
+        "INSERT INTO ducklake_table
+             (table_id, schema_id, table_name, path, path_is_relative, begin_snapshot)
+         VALUES (1, 1, 't', 't', 1, 1)",
     )
     .execute(&p)
     .await
