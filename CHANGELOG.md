@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MetadataProvider::scan_inlined_data_noting_absence` also reports that the catalog registers
+  no inlined-data table for a table. The PostgreSQL and multicatalog providers implement it.
 - `MulticatalogProvider::begin_read_session` takes one pooled connection for a query, and
   `with_read_session` runs every catalog read of the provider on it.
   `DuckLakeTable::with_metadata_provider` binds a cached table to it per query (#338).
@@ -30,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A `DuckLakeTable` whose catalog registers no inlined-data table for it reads that registry
+  once per snapshot, not on every scan.
 - **BREAKING**: `DuckLakeError` gains `CommitRefused`, with the `write-postgres` feature; add
   an arm to exhaustive matches. Its source is the error a `PostgresCommitGuard` refused a
   commit with. Nothing was committed, so a caller may treat it like any other failure before

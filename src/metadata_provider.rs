@@ -1874,6 +1874,35 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         )?))
     }
 
+    /// [`Self::scan_inlined_data`], and whether the catalog registered no
+    /// inlined-data table for `table_id` when the read ran.
+    ///
+    /// `true` means `ducklake_inlined_data_tables` named no table for
+    /// `table_id`, or the catalog has no such registry. A writer registers an
+    /// inlined-data table in the transaction that commits its first rows. So a
+    /// table registered after this read holds only rows of a later commit, and
+    /// no read at `snapshot_id` or an earlier snapshot can find inlined rows.
+    /// [`crate::DuckLakeTable`] then skips the read on its later scans at those
+    /// snapshots. Official DuckLake likewise keeps the registry with the
+    /// catalog it loads once per `schema_version`.
+    ///
+    /// `false` means the registry named at least one table, or the provider
+    /// cannot tell. The default delegates to [`Self::scan_inlined_data`] and
+    /// answers `false`, so a provider that does not override this one reads on
+    /// every scan, as before.
+    fn scan_inlined_data_noting_absence(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<(InlinedDataScan, bool)> {
+        Ok((
+            self.scan_inlined_data(table_id, snapshot_id, columns, filter)?,
+            false,
+        ))
+    }
+
     /// Read positional deletions stored in `ducklake_inlined_delete_<table_id>`
     /// that are visible at `snapshot_id`.
     ///

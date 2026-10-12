@@ -9948,3 +9948,102 @@ async fn rejected_rolling_session_removes_its_uploaded_files() {
         "the rejected write's files must be removed, and only those"
     );
 }
+
+/// A table that saw no inlined-data table keeps that answer for its own
+/// snapshot only. Its later scans skip the registry and still read every row.
+/// Rows a later commit inlines stay invisible to it, as they must at its
+/// snapshot, and a lookup at the later snapshot reads them.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_cached_absence_of_inlined_data_covers_only_its_snapshot() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::catalog::{CatalogProvider, TableProvider};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, DuckLakeWriteOptions};
+    use object_store::local::LocalFileSystem;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("inline_absence")
+        .await
+        .unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let rows = |ids: Vec<i64>| {
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    };
+    let table_writer = |inline_limit: usize| {
+        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .with_options(
+                &DuckLakeWriteOptions::default().with_data_inlining_row_limit(inline_limit),
+            )
+    };
+    async fn row_count(table: &Arc<dyn TableProvider>) -> usize {
+        let ctx = SessionContext::new();
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        collect(plan, ctx.task_ctx())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+    let lookup = || async {
+        let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+            .await
+            .unwrap();
+        DuckLakeCatalog::new(provider)
+            .unwrap()
+            .schema("main")
+            .unwrap()
+            .table("t")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    // Three rows in a Parquet file, nothing inlined.
+    table_writer(0)
+        .write_table("main", "t", &[rows(vec![1, 2, 3])])
+        .await
+        .unwrap();
+    let before = lookup().await;
+    assert_eq!(row_count(&before).await, 3);
+    assert_eq!(
+        row_count(&before).await,
+        3,
+        "a scan that skips the registry still reads every row"
+    );
+
+    // Two more rows, inlined by a later commit.
+    table_writer(10)
+        .append_table("main", "t", &[rows(vec![4, 5])])
+        .await
+        .unwrap();
+    let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_inlined_data_tables")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(registered, 1, "the append is inlined");
+
+    assert_eq!(
+        row_count(&before).await,
+        3,
+        "the table's own snapshot cannot see rows committed after it"
+    );
+    assert_eq!(
+        row_count(&lookup().await).await,
+        5,
+        "a lookup at the new snapshot reads the inlined rows"
+    );
+}

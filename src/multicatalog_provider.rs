@@ -1855,9 +1855,22 @@ impl MetadataProvider for MulticatalogProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&crate::inlined_filter::InlinedFilter>,
     ) -> Result<crate::inlined_filter::InlinedDataScan> {
+        Ok(self
+            .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
+            .0)
+    }
+
+    fn scan_inlined_data_noting_absence(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+    ) -> Result<(crate::inlined_filter::InlinedDataScan, bool)> {
         block_on(async {
+            // No registry: no inlined-data table can exist yet.
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(crate::inlined_filter::InlinedDataScan::default());
+                return Ok((crate::inlined_filter::InlinedDataScan::default(), true));
             }
             // The registry, then each inlined table's columns and rows, all on
             // one connection.

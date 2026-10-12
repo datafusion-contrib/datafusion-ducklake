@@ -241,7 +241,9 @@ where
 
 /// Every inlined row of table `table_id` visible at `snapshot_id`, read on one
 /// connection: the table's inlined-data tables from the registry, then each
-/// one's columns and rows. `filter`, when given, narrows the rows in SQL.
+/// one's columns and rows. `filter`, when given, narrows the rows in SQL. Also
+/// returns whether the registry named no table for `table_id` (see
+/// [`MetadataProvider::scan_inlined_data_noting_absence`]).
 ///
 /// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
 /// session. The caller checks first that the catalog has
@@ -252,12 +254,13 @@ pub(crate) async fn scan_inlined_data_on(
     snapshot_id: i64,
     columns: &[DuckLakeTableColumn],
     filter: Option<&InlinedFilter>,
-) -> Result<InlinedDataScan> {
+) -> Result<(InlinedDataScan, bool)> {
     let registry =
         sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
             .bind(table_id)
             .fetch_all(&mut *connection)
             .await?;
+    let absent = registry.is_empty();
     let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let mut batches = Vec::new();
 
@@ -352,7 +355,7 @@ pub(crate) async fn scan_inlined_data_on(
             Some(&present),
         )?);
     }
-    Ok(InlinedDataScan::from_batches(batches))
+    Ok((InlinedDataScan::from_batches(batches), absent))
 }
 
 /// Every inlined row of table `table_id` visible at `snapshot_id`, with its row
@@ -1962,9 +1965,22 @@ impl MetadataProvider for PostgresMetadataProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
     ) -> Result<InlinedDataScan> {
+        Ok(self
+            .scan_inlined_data_noting_absence(table_id, snapshot_id, columns, filter)?
+            .0)
+    }
+
+    fn scan_inlined_data_noting_absence(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+        columns: &[DuckLakeTableColumn],
+        filter: Option<&InlinedFilter>,
+    ) -> Result<(InlinedDataScan, bool)> {
         block_on(async {
+            // No registry: no inlined-data table can exist yet.
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(InlinedDataScan::default());
+                return Ok((InlinedDataScan::default(), true));
             }
             let mut connection = self.pool.acquire().await?;
             scan_inlined_data_on(&mut connection, table_id, snapshot_id, columns, filter).await
