@@ -1323,13 +1323,13 @@ pub struct DuckLakeTable {
     file_read_config_cache: Arc<std::sync::Mutex<HashMap<String, Arc<FileReadConfig>>>>,
     /// Rows materialized by the most recent inlined scan before residual filters.
     inlined_materialized_row_count: Arc<AtomicUsize>,
-    /// The latest snapshot at which the catalog was seen to register no
-    /// inlined-data table for this table, `i64::MIN` until a scan sees that. A
-    /// scan at that snapshot or an earlier one skips the inlined-data read: a
-    /// table registered later holds only rows of later commits (see
-    /// [`MetadataProvider::scan_inlined_data_noting_absence`]). Shared with every
-    /// clone, as the other caches are, and keyed by snapshot so that a clone at
-    /// a later snapshot reads again.
+    /// The latest snapshot through which the catalog was seen to hold no
+    /// inlined rows for this table, `i64::MIN` until a scan sees that. The
+    /// provider bounds it by the catalog's head (see
+    /// [`MetadataProvider::scan_inlined_data_noting_absence`]). A scan at that
+    /// snapshot or an earlier one skips the inlined-data read. Shared with
+    /// every clone, as the other caches are, and keyed by snapshot so that a
+    /// clone at a later snapshot reads again.
     inlined_absent_through: Arc<AtomicI64>,
     /// Decryption keys for the encrypted files this table has listed, and the
     /// factory built from them. Shared with every clone of the table, so a key
@@ -1527,23 +1527,23 @@ impl DuckLakeTable {
 
     /// The inlined rows a scan reads, `filter` narrowing them in the catalog.
     ///
-    /// Reads nothing when an earlier scan, at this snapshot or a later one, saw
-    /// that the catalog registers no inlined-data table for this table
+    /// Reads nothing when an earlier scan saw that the catalog holds no inlined
+    /// rows for this table through this snapshot
     /// ([`Self::inlined_absent_through`]). That spares a warm table without
     /// inlined rows one catalog statement per scan.
     fn scan_inlined_rows(&self, filter: Option<&InlinedFilter>) -> Result<InlinedDataScan> {
         if self.snapshot_id <= self.inlined_absent_through.load(Ordering::Acquire) {
             return Ok(InlinedDataScan::default());
         }
-        let (scan, absent) = self.provider.scan_inlined_data_noting_absence(
+        let (scan, absent_through) = self.provider.scan_inlined_data_noting_absence(
             self.table_id,
             self.snapshot_id,
             &self.columns,
             filter,
         )?;
-        if absent {
+        if let Some(absent_through) = absent_through {
             self.inlined_absent_through
-                .fetch_max(self.snapshot_id, Ordering::AcqRel);
+                .fetch_max(absent_through, Ordering::AcqRel);
         }
         Ok(scan)
     }
@@ -6309,10 +6309,11 @@ mod tests {
         visible_when_filtered: Option<Vec<i64>>,
         /// Inlined-data reads that reached this catalog.
         inlined_reads: Arc<AtomicUsize>,
-        /// What a read says about the registry: `Some(true)` registers no
-        /// inlined-data table, `Some(false)` registers one, and `None` answers
-        /// as the trait's default does, as a provider that cannot tell.
-        inlined_absent: Option<bool>,
+        /// What a read says about the registry: `Some(head)` registers no
+        /// inlined-data table, at a catalog whose head is `head`. `None`
+        /// registers one, which a read answers as the trait's default does,
+        /// for a provider that cannot tell.
+        inlined_head: Option<i64>,
     }
 
     impl MetadataProvider for FixedFileProvider {
@@ -6337,9 +6338,9 @@ mod tests {
             snapshot_id: i64,
             columns: &[DuckLakeTableColumn],
             filter: Option<&InlinedFilter>,
-        ) -> Result<(InlinedDataScan, bool)> {
+        ) -> Result<(InlinedDataScan, Option<i64>)> {
             let scan = self.scan_inlined_data(table_id, snapshot_id, columns, filter)?;
-            Ok((scan, self.inlined_absent.unwrap_or(false)))
+            Ok((scan, self.inlined_head.map(|head| snapshot_id.min(head))))
         }
 
         fn get_data_path(&self) -> Result<String> {
@@ -6582,7 +6583,7 @@ mod tests {
                 partition_spec,
                 visible_when_filtered: None,
                 inlined_reads: Arc::default(),
-                inlined_absent: None,
+                inlined_head: None,
             }),
             1,
             Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
@@ -6590,9 +6591,10 @@ mod tests {
         )
     }
 
-    /// A table with no files over a catalog that answers inlined-data reads with
-    /// `inlined_absent`, and the count of reads that reached the catalog.
-    fn inlined_table(inlined_absent: Option<bool>) -> Result<(DuckLakeTable, Arc<AtomicUsize>)> {
+    /// A table at snapshot 1 with no files, over a catalog that answers
+    /// inlined-data reads with `inlined_head`, and the count of reads that
+    /// reached the catalog.
+    fn inlined_table(inlined_head: Option<i64>) -> Result<(DuckLakeTable, Arc<AtomicUsize>)> {
         let inlined_reads = Arc::new(AtomicUsize::new(0));
         let table = DuckLakeTable::new(
             1,
@@ -6602,7 +6604,7 @@ mod tests {
                 partition_spec: None,
                 visible_when_filtered: None,
                 inlined_reads: Arc::clone(&inlined_reads),
-                inlined_absent,
+                inlined_head,
             }),
             1,
             Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),
@@ -6620,7 +6622,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_table_without_inlined_data_tables_reads_the_registry_once() -> Result<()> {
-        let (table, reads) = inlined_table(Some(true))?;
+        let (table, reads) = inlined_table(Some(1))?;
         scan_times(&table, 3).await;
         assert_eq!(reads.load(Ordering::SeqCst), 1, "only the first scan reads");
 
@@ -6632,16 +6634,10 @@ mod tests {
         Ok(())
     }
 
+    /// A registry that names a table and a provider that cannot tell give the
+    /// same answer, `None`.
     #[tokio::test]
     async fn a_table_with_an_inlined_data_table_reads_on_every_scan() -> Result<()> {
-        let (table, reads) = inlined_table(Some(false))?;
-        scan_times(&table, 3).await;
-        assert_eq!(reads.load(Ordering::SeqCst), 3);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_provider_that_cannot_tell_reads_on_every_scan() -> Result<()> {
         let (table, reads) = inlined_table(None)?;
         scan_times(&table, 3).await;
         assert_eq!(reads.load(Ordering::SeqCst), 3);
@@ -6650,7 +6646,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_absence_holds_only_through_the_snapshot_it_was_seen_at() -> Result<()> {
-        let (table, reads) = inlined_table(Some(true))?;
+        let (table, reads) = inlined_table(Some(2))?;
         scan_times(&table, 1).await;
         assert_eq!(reads.load(Ordering::SeqCst), 1);
 
@@ -6670,6 +6666,24 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_table_pinned_above_the_head_reads_on_every_scan() -> Result<()> {
+        // `DuckLakeCatalog::with_snapshot` accepts a snapshot the catalog has
+        // not reached. A later commit can inline rows at a snapshot at or
+        // below it, so an empty registry says nothing about it.
+        let (mut table, reads) = inlined_table(Some(1))?;
+        table.snapshot_id = 5;
+        scan_times(&table, 2).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // The answer still covers the snapshots up to the head.
+        let mut at_head = table.clone();
+        at_head.snapshot_id = 1;
+        scan_times(&at_head, 1).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+
     /// A table whose catalog honours a pushed-down filter, listing only
     /// `visible_when_filtered` for a page that carries one. An unfiltered
     /// listing — [`DuckLakeTable::files`] among them — still sees every file.
@@ -6685,7 +6699,7 @@ mod tests {
                 partition_spec: None,
                 visible_when_filtered: Some(visible_when_filtered),
                 inlined_reads: Arc::default(),
-                inlined_absent: None,
+                inlined_head: None,
             }),
             1,
             Arc::new(ObjectStoreUrl::parse("memory://").unwrap()),

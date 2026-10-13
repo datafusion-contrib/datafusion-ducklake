@@ -10047,3 +10047,104 @@ async fn a_cached_absence_of_inlined_data_covers_only_its_snapshot() {
         "a lookup at the new snapshot reads the inlined rows"
     );
 }
+
+/// A table pinned above the catalog's head (`DuckLakeCatalog::with_snapshot`
+/// accepts that) keeps no answer for its own snapshot. Later commits can inline
+/// rows at or below it, and a rescan of the same table must read them, as a
+/// fresh lookup at that snapshot does.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn a_cached_absence_of_inlined_data_stops_at_the_head() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion::catalog::{CatalogProvider, TableProvider};
+    use datafusion::physical_plan::collect;
+    use datafusion::prelude::SessionContext;
+    use datafusion_ducklake::{DuckLakeCatalog, DuckLakeWriteOptions};
+    use object_store::local::LocalFileSystem;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("inline_absence_pinned")
+        .await
+        .unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let rows = |ids: Vec<i64>| {
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    };
+    let table_writer = |inline_limit: usize| {
+        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .with_options(
+                &DuckLakeWriteOptions::default().with_data_inlining_row_limit(inline_limit),
+            )
+    };
+    async fn row_count(table: &Arc<dyn TableProvider>) -> usize {
+        let ctx = SessionContext::new();
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        collect(plan, ctx.task_ctx())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+    let head = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+             WHERE catalog_id = $1",
+        )
+        .bind(catalog_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    // Three rows in a Parquet file, nothing inlined.
+    table_writer(0)
+        .write_table("main", "t", &[rows(vec![1, 2, 3])])
+        .await
+        .unwrap();
+    let pin = head().await + 100;
+    let lookup_at_pin = || async {
+        let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+            .await
+            .unwrap();
+        DuckLakeCatalog::with_snapshot(Arc::new(provider), pin)
+            .unwrap()
+            .schema("main")
+            .unwrap()
+            .table("t")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let pinned = lookup_at_pin().await;
+    assert_eq!(row_count(&pinned).await, 3);
+
+    // Two rows in a Parquet file, then two inlined, both at or below the pin.
+    table_writer(0)
+        .append_table("main", "t", &[rows(vec![4, 5])])
+        .await
+        .unwrap();
+    table_writer(10)
+        .append_table("main", "t", &[rows(vec![6, 7])])
+        .await
+        .unwrap();
+    assert!(head().await <= pin, "both commits land at or below the pin");
+
+    assert_eq!(
+        row_count(&pinned).await,
+        7,
+        "the pinned table reads the rows inlined at or below its snapshot"
+    );
+    assert_eq!(row_count(&lookup_at_pin().await).await, 7);
+}

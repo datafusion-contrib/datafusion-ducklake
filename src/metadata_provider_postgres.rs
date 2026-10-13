@@ -242,30 +242,54 @@ where
 /// Every inlined row of table `table_id` visible at `snapshot_id`, read on one
 /// connection: the table's inlined-data tables from the registry, then each
 /// one's columns and rows. `filter`, when given, narrows the rows in SQL. Also
-/// returns whether the registry named no table for `table_id` (see
+/// returns the snapshot through which the registry names no table for
+/// `table_id`, if it names none (see
 /// [`MetadataProvider::scan_inlined_data_noting_absence`]).
+///
+/// `catalog_id` names the multicatalog catalog whose head bounds that
+/// snapshot. `None` takes the head of a single-catalog store.
 ///
 /// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
 /// session. The caller checks first that the catalog has
 /// `ducklake_inlined_data_tables`.
 pub(crate) async fn scan_inlined_data_on(
     connection: &mut PgConnection,
+    catalog_id: Option<i64>,
     table_id: i64,
     snapshot_id: i64,
     columns: &[DuckLakeTableColumn],
     filter: Option<&InlinedFilter>,
-) -> Result<(InlinedDataScan, bool)> {
-    let registry =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
-            .bind(table_id)
-            .fetch_all(&mut *connection)
-            .await?;
-    let absent = registry.is_empty();
+) -> Result<(InlinedDataScan, Option<i64>)> {
+    // The head is read in the same statement as the registry, so both describe
+    // one state of the catalog.
+    let row = match catalog_id {
+        None => sqlx::query(
+            "SELECT ARRAY(SELECT table_name::text FROM ducklake_inlined_data_tables
+                          WHERE table_id = $1),
+                    (SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot)",
+        )
+        .bind(table_id),
+        Some(catalog_id) => sqlx::query(
+            "SELECT ARRAY(SELECT table_name::text FROM ducklake_inlined_data_tables
+                          WHERE table_id = $1),
+                    (SELECT COALESCE(MAX(snapshot_id), 0)
+                     FROM ducklake_catalog_snapshot_map
+                     WHERE catalog_id = $2)",
+        )
+        .bind(table_id)
+        .bind(catalog_id),
+    }
+    .fetch_one(&mut *connection)
+    .await?;
+    let (registry, head): (Vec<String>, i64) = (row.try_get(0)?, row.try_get(1)?);
+    // Commits to one catalog take their snapshots in commit order, each above
+    // the last, so a table registered after this read holds only rows above
+    // `head`.
+    let absent_through = registry.is_empty().then(|| snapshot_id.min(head));
     let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let mut batches = Vec::new();
 
-    for entry in registry {
-        let table: String = entry.try_get("table_name")?;
+    for table in registry {
         if !is_inlined_data_table(&table) {
             continue;
         }
@@ -355,7 +379,7 @@ pub(crate) async fn scan_inlined_data_on(
             Some(&present),
         )?);
     }
-    Ok((InlinedDataScan::from_batches(batches), absent))
+    Ok((InlinedDataScan::from_batches(batches), absent_through))
 }
 
 /// Every inlined row of table `table_id` visible at `snapshot_id`, with its row
@@ -1976,14 +2000,23 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, bool)> {
+    ) -> Result<(InlinedDataScan, Option<i64>)> {
         block_on(async {
-            // No registry: no inlined-data table can exist yet.
+            // No registry yet, so no inlined rows. Not an answer to keep: a
+            // migration can add the registry, and a later commit inline rows.
             if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok((InlinedDataScan::default(), true));
+                return Ok((InlinedDataScan::default(), None));
             }
             let mut connection = self.pool.acquire().await?;
-            scan_inlined_data_on(&mut connection, table_id, snapshot_id, columns, filter).await
+            scan_inlined_data_on(
+                &mut connection,
+                None,
+                table_id,
+                snapshot_id,
+                columns,
+                filter,
+            )
+            .await
         })
     }
 

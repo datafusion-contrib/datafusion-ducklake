@@ -1874,32 +1874,37 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         )?))
     }
 
-    /// [`Self::scan_inlined_data`], and whether the catalog registered no
-    /// inlined-data table for `table_id` when the read ran.
+    /// [`Self::scan_inlined_data`], and the latest snapshot through which the
+    /// catalog holds no inlined rows for `table_id`, if the read can tell.
     ///
-    /// `true` means `ducklake_inlined_data_tables` named no table for
-    /// `table_id`, or the catalog has no such registry. A writer registers an
-    /// inlined-data table in the transaction that commits its first rows. So a
-    /// table registered after this read holds only rows of a later commit, and
-    /// no read at `snapshot_id` or an earlier snapshot can find inlined rows.
-    /// [`crate::DuckLakeTable`] then skips the read on its later scans at those
-    /// snapshots. Official DuckLake likewise keeps the registry with the
-    /// catalog it loads once per `schema_version`.
+    /// `Some(through)` means `ducklake_inlined_data_tables` named no table for
+    /// `table_id`, and `through` is the lower of `snapshot_id` and the
+    /// catalog's head, read in the same statement. A writer registers an
+    /// inlined-data table in the transaction that commits its first rows, and
+    /// that commit takes a snapshot above the head. So no read at `through` or
+    /// an earlier snapshot can find inlined rows, and [`crate::DuckLakeTable`]
+    /// skips the read on its later scans at those snapshots. Official DuckLake
+    /// likewise keeps the registry with the catalog it loads once per
+    /// `schema_version`.
     ///
-    /// `false` means the registry named at least one table, or the provider
-    /// cannot tell. The default delegates to [`Self::scan_inlined_data`] and
-    /// answers `false`, so a provider that does not override this one reads on
-    /// every scan, as before.
+    /// `through` never exceeds the head: `snapshot_id` can lie above it (for
+    /// example from [`crate::DuckLakeCatalog::with_snapshot`]), and a later
+    /// commit can then inline rows at a snapshot that such a read sees.
+    ///
+    /// `None` means the registry named at least one table, the catalog has no
+    /// registry yet, or the provider cannot tell. The default delegates to
+    /// [`Self::scan_inlined_data`] and answers `None`, so a provider that does
+    /// not override this one reads on every scan, as before.
     fn scan_inlined_data_noting_absence(
         &self,
         table_id: i64,
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
-    ) -> Result<(InlinedDataScan, bool)> {
+    ) -> Result<(InlinedDataScan, Option<i64>)> {
         Ok((
             self.scan_inlined_data(table_id, snapshot_id, columns, filter)?,
-            false,
+            None,
         ))
     }
 

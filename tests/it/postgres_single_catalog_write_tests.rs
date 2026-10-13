@@ -1624,3 +1624,34 @@ async fn empty_delete_finish_commits_a_partitioned_append() {
         4
     );
 }
+
+/// An empty inlined-data registry answers for the snapshots up to the
+/// catalog's head, never above it. `DuckLakeCatalog::with_snapshot` accepts a
+/// snapshot the catalog has not reached, and a later commit can inline rows
+/// that a read at that snapshot sees.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_empty_inlined_registry_answers_up_to_the_head() {
+    let (writer, _pool, conn_str, _tmp, _container) = setup().await.unwrap();
+    let written = DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .write_table("main", "t", &[batch(vec![1, 2, 3], vec![None, None, None])])
+        .await
+        .unwrap();
+    let (table_id, head) = (written.table_id, written.snapshot_id);
+    let provider = PostgresMetadataProvider::new(&conn_str).await.unwrap();
+    let absent_through = |snapshot_id: i64| {
+        provider
+            .scan_inlined_data_noting_absence(table_id, snapshot_id, &[], None)
+            .unwrap()
+            .1
+    };
+
+    assert_eq!(absent_through(head - 1), Some(head - 1));
+    assert_eq!(absent_through(head), Some(head));
+    assert_eq!(
+        absent_through(head + 100),
+        Some(head),
+        "never above the head"
+    );
+}
