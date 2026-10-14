@@ -12,7 +12,8 @@ use crate::metadata_writer_postgres::{execute_ddl_statements, quote_ident};
 use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
-use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow};
+use std::sync::{Arc, OnceLock};
 
 /// SQL expression yielding a file path resolved relative to the catalog `data_path`
 /// root (file → table → schema → data_path). An absolute path anywhere in the chain
@@ -210,21 +211,34 @@ pub struct FileOwners {
 
 /// Manages DuckLake catalogs within a shared metadata database.
 ///
-/// `MulticatalogManager` is stateless: it just executes SQL against the pool.
-/// Multiple managers against the same pool are safe.
+/// `MulticatalogManager` executes SQL against the pool, keeping only a memo of
+/// the inlined-data registry's existence. Multiple managers against the same
+/// pool are safe.
 #[derive(Debug, Clone)]
 pub struct MulticatalogManager {
     pool: PgPool,
+    /// Set once the store is seen to have the `ducklake_inlined_data_tables`
+    /// registry, which is never dropped.
+    has_inlined_registry: Arc<OnceLock<()>>,
 }
 
 impl MulticatalogManager {
-    /// Whether the store has the `ducklake_inlined_data_tables` registry, from the
-    /// capability probe every inlined read uses. A store bootstrapped before staged
-    /// commits lacks it until a writer first binds to it.
-    async fn has_inlined_data_registry(&self) -> Result<bool> {
-        crate::PostgresMetadataProvider::from_pool(self.pool.clone())
-            .has_inlined_data_registry()
-            .await
+    /// Whether the store has the `ducklake_inlined_data_tables` registry, probed
+    /// on `connection` — the caller's open transaction — so the probe takes no
+    /// second pooled connection. A store bootstrapped before staged commits lacks
+    /// it until a writer first binds to it.
+    async fn has_inlined_data_registry(&self, connection: &mut PgConnection) -> Result<bool> {
+        if self.has_inlined_registry.get().is_some() {
+            return Ok(true);
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT to_regclass('ducklake_inlined_data_tables') IS NOT NULL")
+                .fetch_one(&mut *connection)
+                .await?;
+        if exists {
+            let _ = self.has_inlined_registry.set(());
+        }
+        Ok(exists)
     }
 
     /// Connect to PostgreSQL and initialize the multicatalog schema.
@@ -245,6 +259,7 @@ impl MulticatalogManager {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            has_inlined_registry: Arc::new(OnceLock::new()),
         }
     }
 
@@ -427,31 +442,7 @@ impl MulticatalogManager {
             .execute(&mut *tx)
             .await?;
         }
-        // The catalog's inlined storage: every registered inlined data table of its
-        // tables and their inlined delete tables, listed while the table and registry
-        // rows that name them exist and dropped in this transaction after them.
-        let table_ids = sqlx::query_scalar::<_, i64>(
-            "SELECT DISTINCT t.table_id FROM ducklake_table t
-             JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
-             WHERE m.catalog_id = $1",
-        )
-        .bind(catalog_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        // A store bootstrapped before staged commits has no registry.
-        let has_registry = self.has_inlined_data_registry().await?;
-        let registered = if has_registry {
-            sqlx::query_scalar::<_, String>(
-                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)",
-            )
-            .bind(&table_ids)
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            Vec::new()
-        };
-        let inlined_storage = dead_table_inlined_storage(registered, &table_ids)?;
-        let mut child_tables = vec![
+        let child_tables = [
             "ducklake_data_file",
             "ducklake_delete_file",
             "ducklake_file_column_stats",
@@ -465,9 +456,6 @@ impl MulticatalogManager {
             "ducklake_sort_info",
             "ducklake_sort_expression",
         ];
-        if has_registry {
-            child_tables.push("ducklake_inlined_data_tables");
-        }
         for child_table in child_tables {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {} WHERE table_id IN (
@@ -483,14 +471,34 @@ impl MulticatalogManager {
         }
 
         // Tables and schemas owned by this catalog.
-        sqlx::query(
+        let mut table_ids = sqlx::query_scalar::<_, i64>(
             "DELETE FROM ducklake_table WHERE schema_id IN (
                 SELECT schema_id FROM ducklake_catalog_schema_map WHERE catalog_id = $1
-            )",
+            ) RETURNING table_id",
         )
         .bind(catalog_id)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        table_ids.sort_unstable();
+        table_ids.dedup();
+        // The catalog's inlined storage: every registered inlined data table of its
+        // tables and their inlined delete tables, listed as their table and registry
+        // rows are deleted and dropped in this transaction after them. A catalog
+        // without tables has none, and a store bootstrapped before staged commits
+        // has no registry.
+        let registered = if !table_ids.is_empty() && self.has_inlined_data_registry(&mut tx).await?
+        {
+            sqlx::query_scalar::<_, String>(
+                "DELETE FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)
+                 RETURNING table_name",
+            )
+            .bind(&table_ids)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
+        let inlined_storage = dead_table_inlined_storage(registered, &table_ids)?;
         drop_existing_tables(&mut tx, inlined_storage).await?;
 
         sqlx::query(
@@ -1022,22 +1030,24 @@ impl MulticatalogManager {
         //    because this writer creates and maintains it, and the SQLite expire path
         //    reclaims it too.
         //    The table's inlined storage goes with it: its registered inlined data
-        //    tables and its inlined delete table, listed before the registry rows are
+        //    tables and its inlined delete table, listed as the registry rows are
         //    deleted and dropped after them, as official does.
-        //    A store bootstrapped before staged commits has no registry.
-        let has_registry = self.has_inlined_data_registry().await?;
-        let registered = if has_registry {
-            sqlx::query_scalar::<_, String>(
-                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)",
-            )
-            .bind(&dead_tables)
-            .fetch_all(&mut *tx)
-            .await?
-        } else {
-            Vec::new()
-        };
+        //    With no dead table there is none; a store bootstrapped before staged
+        //    commits has no registry.
+        let registered =
+            if !dead_tables.is_empty() && self.has_inlined_data_registry(&mut tx).await? {
+                sqlx::query_scalar::<_, String>(
+                    "DELETE FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)
+                     RETURNING table_name",
+                )
+                .bind(&dead_tables)
+                .fetch_all(&mut *tx)
+                .await?
+            } else {
+                Vec::new()
+            };
         let inlined_storage = dead_table_inlined_storage(registered, &dead_tables)?;
-        let mut per_table = vec![
+        let per_table = [
             "ducklake_table",
             "ducklake_table_stats",
             "ducklake_table_column_stats",
@@ -1049,9 +1059,6 @@ impl MulticatalogManager {
             "ducklake_schema_versions",
             "ducklake_catalog_column_tag",
         ];
-        if has_registry {
-            per_table.push("ducklake_inlined_data_tables");
-        }
         for table in per_table {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE table_id = ANY($1)"

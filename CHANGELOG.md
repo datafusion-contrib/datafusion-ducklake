@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `drop_empty_superseded_inlined_tables`, and the `inlined_flush` module's flush types.
 - `stats_collect::WrittenLeafStats` and `collect_written_column_stats` keep DuckDB's string
   bounds.
+- `stats_collect::compute_column_stats_with_leaf_ids` records nested leaf statistics under
+  caller-supplied column ids.
 - `register_ducklake_maintenance_functions` registers the `ducklake_flush_inlined_data`
   table function, which `register_ducklake_functions` leaves out.
 - `DuckLakeCatalog::checkpoint` runs official's `CHECKPOINT`, and `MetadataWriter::maintenance`
@@ -112,9 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column: reading its rowids, or updating it, fails.
 - Large row-ID scans use less CPU when no scanned file has file-based or inlined
   deletes (#368).
-- **BREAKING**: `data_inlining_row_limit` defaults to official's `10`, not `0`, and above `0` a
-  column named like an inlined system column (`row_id`, ...) is refused (#270). To write only
-  Parquet, set the `data_inlining_row_limit` option to `0` (catalog, schema or table scope).
+- **BREAKING**: SQL and direct `MetadataWriter` writes default `data_inlining_row_limit` to
+  `10`, as official; above `0` a table refuses `row_id` and other inlined system names (#270).
+  Set the option to `0` to opt out.
 - **BREAKING**: a Parquet write to a catalog with `encrypted` set fails with `Unsupported`
   instead of writing unencrypted; inlined writes succeed. To write Parquet, set `encrypted` to
   `false`; no data migration is needed.
@@ -128,8 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the data file, as official DuckLake does; one of the same rows still aborts it.
 - A `DELETE` or `UPDATE` recording inlined deletions commits beside a delete file the data file
   got since it read the table, as official DuckLake does; one of the same rows aborts it.
-- The `with_write_options` `data_inlining_row_limit` applies where the catalog stores none, as
-  official's attach option does, also to inlined table creation and reserved column names.
+- `DuckLakeTableWriter`'s limit (`0` unless set) and `with_write_options`' act as official's
+  `DATA_INLINING_ROW_LIMIT`: where none is stored, they gate inlined tables and reserved names.
 - **BREAKING**: appends, inlined inserts and `set_delete_file` fail on the concurrent changes
   official's conflict check refuses since an `Append`'s `base_snapshot`; concurrent appends
   still commit. Pass `WriteSetupResult::base_snapshot_id`.
@@ -138,8 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DuckLakeTable::statistics()` reports the table-wide row count and bounds as inexact.
 - SQLite catalogs store inlined floats as text and declare inlined `UBIGINT` columns `VARCHAR`,
   as official does.
-- File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and `TIME` bounds as text,
-  and cover each nested leaf field and a float column's non-NaN values, as official's do.
+- File statistics spell `BOOLEAN` bounds `0`/`1`, blob in hex and `TIME` as text, and cover a
+  written file's nested leaf fields and a float column's non-NaN values, as official's do.
 - File string and blob bounds over 256 bytes are truncated as DuckDB's Parquet writer truncates
   them, instead of at 64 bytes.
 - `CREATE TABLE` and column changes create the table's inlined data table, inlined inserts go
@@ -155,6 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `inlined_insert` before `inlined_delete`, as official DuckLake does.
 - **BREAKING**: `stats_collect::collect_column_stats` and `compute_column_stats` take
   `contains_nan_flags` per Parquet leaf, not per column; pass one flag per nested leaf.
+- **BREAKING**: registering a data file whose statistics name one column more than once fails
+  with `InvalidConfig` instead of storing both rows; pass one `ColumnStat` per column per file.
 - A flush that moves inlined deletions of Parquet rows into delete files conflicts with a
   concurrent insert, alter or compaction of the table, as official's flush does.
 - Writer initialization adds the columns this release writes to SQLite catalogs from 0.5 and

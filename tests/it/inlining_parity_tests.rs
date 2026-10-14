@@ -730,12 +730,13 @@ async fn inlined_data_tables_follow_column_changes_as_official_creates_them() {
         ]));
         let values = Arc::new(Int32Array::from((0..20).collect::<Vec<_>>()));
         let batch = RecordBatch::try_new(schema, vec![values.clone(), values]).unwrap();
+        // Official's default limit of 10: the 20 rows go to Parquet.
         DuckLakeTableWriter::new(
             writer,
             Arc::new(object_store::local::LocalFileSystem::new()),
         )
         .unwrap()
-        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
         .append_table("main", "t", &[batch])
         .await
         .unwrap();
@@ -787,12 +788,13 @@ async fn flush_with_nothing_to_write_drops_empty_superseded_inlined_tables() {
         ]));
         let values = Arc::new(Int32Array::from((0..20).collect::<Vec<_>>()));
         let batch = RecordBatch::try_new(schema, vec![values.clone(), values]).unwrap();
+        // Official's default limit of 10: the 20 rows go to Parquet.
         DuckLakeTableWriter::new(
             writer,
             Arc::new(object_store::local::LocalFileSystem::new()),
         )
         .unwrap()
-        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
         .append_table("main", "t", &[batch])
         .await
         .unwrap();

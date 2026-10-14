@@ -8,10 +8,15 @@ use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, StringViewArray};
 use arrow::record_batch::RecordBatch;
+#[cfg(feature = "metadata-postgres")]
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_ducklake::inlined_filter::{InlinedComparison, InlinedFilter, InlinedValue};
+#[cfg(any(
+    feature = "metadata-postgres",
+    all(feature = "metadata-mysql", feature = "write-mysql")
+))]
 use datafusion_ducklake::metadata_provider::DuckLakeTableColumn;
 use datafusion_ducklake::{
     DuckLakeCatalog, DuckLakeTable, DuckdbMetadataProvider, MetadataProvider,
@@ -656,6 +661,7 @@ async fn mysql_sqlite_style_inlined_rows_are_visible() {
 }
 
 /// Render one cell of a DuckDB or DataFusion result for a cross-engine diff.
+#[cfg(feature = "metadata-postgres")]
 fn duckdb_text(value: duckdb::types::Value) -> String {
     use duckdb::types::Value;
     match value {

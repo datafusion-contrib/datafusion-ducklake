@@ -427,14 +427,28 @@ fn arrow_leaves(field: &Field) -> Vec<&Field> {
     }
 }
 
+/// How a nested column's leaves are labelled with catalog column ids.
+#[derive(Debug, Clone, Copy)]
+enum NestedLeafIds<'a> {
+    /// A nested column's leaves get no statistics.
+    Skip,
+    /// Each leaf takes the field id the file tags it with: a file this crate
+    /// writes tags every field with its catalog column id.
+    FileFieldIds,
+    /// `ids[leaf]` is the catalog column id of Parquet leaf `leaf`; a leaf
+    /// without one gets no statistics.
+    Mapped(&'a [Option<i64>]),
+}
+
 /// Harvest per-column statistics for the Parquet file at `path`.
 ///
 /// `column_ids` are the catalog `column_id`s for the file's columns, in physical
 /// (written) order; `row_count` is the total rows in the file. Returns one
-/// [`ColumnStat`] per scalar column and per scalar field of a nested column
-/// whose stats could be read. String and blob bounds come from the footer,
-/// truncated as [`StringBounds`] truncates them; a writer that saw the values
-/// passes them through [`collect_written_column_stats`] instead.
+/// [`ColumnStat`] per scalar column whose stats could be read; a nested column
+/// gets none, as the file's field ids need not be catalog column ids. String
+/// and blob bounds come from the footer, truncated as [`StringBounds`]
+/// truncates them; a writer that saw the values passes them through
+/// [`collect_written_column_stats`] instead.
 ///
 /// Best-effort and never fatal: any failure to open the file or read a column's
 /// statistics is logged and that column is simply omitted (or its bound left
@@ -447,7 +461,14 @@ pub fn collect_column_stats(
     row_count: i64,
     contains_nan_flags: &[Option<bool>],
 ) -> Vec<ColumnStat> {
-    collect(path, column_ids, row_count, contains_nan_flags, None)
+    collect(
+        path,
+        column_ids,
+        row_count,
+        contains_nan_flags,
+        None,
+        NestedLeafIds::Skip,
+    )
 }
 
 /// [`collect_column_stats`] for a file whose values `leaves` saw as they were
@@ -465,6 +486,27 @@ pub fn collect_written_column_stats(
         row_count,
         &leaves.nan_flags,
         Some(&leaves.bounds),
+        NestedLeafIds::Skip,
+    )
+}
+
+/// [`collect_written_column_stats`] for a file this crate wrote, whose field
+/// ids are the catalog column ids: a nested column also gets one
+/// [`ColumnStat`] per scalar field below it, keyed by that field's id, as
+/// official records them.
+pub(crate) fn collect_own_written_column_stats(
+    path: &Path,
+    column_ids: &[i64],
+    row_count: i64,
+    leaves: &WrittenLeafStats,
+) -> Vec<ColumnStat> {
+    collect(
+        path,
+        column_ids,
+        row_count,
+        &leaves.nan_flags,
+        Some(&leaves.bounds),
+        NestedLeafIds::FileFieldIds,
     )
 }
 
@@ -474,8 +516,16 @@ fn collect(
     row_count: i64,
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
+    nested: NestedLeafIds<'_>,
 ) -> Vec<ColumnStat> {
-    match try_collect(path, column_ids, row_count, contains_nan_flags, bounds) {
+    match try_collect(
+        path,
+        column_ids,
+        row_count,
+        contains_nan_flags,
+        bounds,
+        nested,
+    ) {
         Ok(stats) => stats,
         Err(e) => {
             tracing::warn!(
@@ -494,6 +544,7 @@ fn try_collect(
     row_count: i64,
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
+    nested: NestedLeafIds<'_>,
 ) -> crate::Result<Vec<ColumnStat>> {
     let file = std::fs::File::open(path)?;
     // Parses only the footer (no data pages are read).
@@ -511,6 +562,7 @@ fn try_collect(
         row_count,
         contains_nan_flags,
         bounds,
+        nested,
     ))
 }
 
@@ -524,11 +576,13 @@ fn try_collect(
 ///
 /// `arrow_schema` must be the schema reconstructed from `metadata` (as a parquet
 /// reader builder produces), so `StatisticsConverter`'s name/type match agrees.
-/// `column_ids[i]` labels file column `i`; a nested column's leaves are labelled
-/// by the field ids the file tags them with. `contains_nan_flags`, indexed by
-/// Parquet leaf, is empty when the caller could not scan the data for NaN
-/// (footer-only paths): `contains_nan` is then unknown. String and blob
-/// bounds are truncated as [`StringBounds`] truncates them.
+/// `column_ids[i]` labels file column `i`, and a nested column gets no
+/// statistics: the file's field ids need not be catalog column ids
+/// ([`compute_column_stats_with_leaf_ids`] labels its leaves).
+/// `contains_nan_flags`, indexed by Parquet leaf, is empty when the caller could
+/// not scan the data for NaN (footer-only paths): `contains_nan` is then
+/// unknown. String and blob bounds are truncated as [`StringBounds`] truncates
+/// them.
 pub fn compute_column_stats(
     arrow_schema: &SchemaRef,
     metadata: &ParquetMetaData,
@@ -543,6 +597,32 @@ pub fn compute_column_stats(
         row_count,
         contains_nan_flags,
         None,
+        NestedLeafIds::Skip,
+    )
+}
+
+/// [`compute_column_stats`] that also records one [`ColumnStat`] per scalar
+/// field of a nested column, as official does, keyed by `leaf_column_ids`:
+/// `leaf_column_ids[leaf]` is the catalog column id of Parquet leaf `leaf`
+/// (the file's leaf order, which [`ParquetMetaData`]'s schema descriptor
+/// numbers). A leaf of a nested column with no entry, or `None`, gets no
+/// statistics; a scalar column is still labelled by `column_ids`.
+pub fn compute_column_stats_with_leaf_ids(
+    arrow_schema: &SchemaRef,
+    metadata: &ParquetMetaData,
+    column_ids: &[i64],
+    leaf_column_ids: &[Option<i64>],
+    row_count: i64,
+    contains_nan_flags: &[Option<bool>],
+) -> Vec<ColumnStat> {
+    compute(
+        arrow_schema,
+        metadata,
+        column_ids,
+        row_count,
+        contains_nan_flags,
+        None,
+        NestedLeafIds::Mapped(leaf_column_ids),
     )
 }
 
@@ -553,6 +633,7 @@ fn compute(
     row_count: i64,
     contains_nan_flags: &[Option<bool>],
     bounds: Option<&[Option<LeafBounds>]>,
+    nested_ids: NestedLeafIds<'_>,
 ) -> Vec<ColumnStat> {
     let parquet_schema = metadata.file_metadata().schema_descr();
     let row_groups = metadata.row_groups();
@@ -562,7 +643,8 @@ fn compute(
     let mut out = Vec::with_capacity(n);
 
     // Official records a row per Parquet leaf column: a scalar column's own,
-    // and one per scalar field of a nested column, keyed by that field's id.
+    // and one per scalar field of a nested column, keyed by that field's
+    // catalog id when `nested_ids` supplies one.
     let mut first_leaf_of_root: Vec<Option<usize>> = vec![None; fields.len()];
     for leaf in 0..parquet_schema.num_columns() {
         let root = parquet_schema.get_column_root_idx(leaf);
@@ -580,17 +662,24 @@ fn compute(
                 | DataType::Map(_, _)
         );
         let (column_id, converter) = if nested {
-            let descriptor = parquet_schema.column(leaf);
-            let info = descriptor.self_type().get_basic_info();
+            let column_id = match nested_ids {
+                NestedLeafIds::Skip => None,
+                NestedLeafIds::FileFieldIds => {
+                    let descriptor = parquet_schema.column(leaf);
+                    let info = descriptor.self_type().get_basic_info();
+                    info.has_id().then(|| i64::from(info.id()))
+                },
+                NestedLeafIds::Mapped(ids) => ids.get(leaf).copied().flatten(),
+            };
+            let Some(column_id) = column_id else {
+                continue;
+            };
             let leaves = arrow_leaves(root_field);
             let Some(leaf_field) = leaves.get(leaf - first_leaf) else {
                 continue;
             };
-            if !info.has_id() {
-                continue;
-            }
             match StatisticsConverter::from_column_index(leaf, leaf_field, parquet_schema) {
-                Ok(converter) => (i64::from(info.id()), converter),
+                Ok(converter) => (column_id, converter),
                 Err(e) => {
                     tracing::debug!(leaf, error = %e, "no statistics converter for leaf column");
                     continue;

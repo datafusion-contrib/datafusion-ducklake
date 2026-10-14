@@ -925,3 +925,255 @@ async fn negative_nan_rows_survive_min_based_file_pruning() {
         "-NaN does not match a greater-than bound"
     );
 }
+
+/// A Parquet file written outside the crate, with its own field ids: `s
+/// STRUCT(x)` as field 1 with `x` as field 2, then `a` = 3 and `b` = 4.
+fn foreign_nested_file(path: &std::path::Path) {
+    use arrow::array::StructArray;
+    use arrow::datatypes::Fields;
+    use std::collections::HashMap;
+    let id = |id: &str| HashMap::from([("PARQUET:field_id".to_string(), id.to_string())]);
+    let x = Field::new("x", DataType::Int64, true).with_metadata(id("2"));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("s", DataType::Struct(Fields::from(vec![x.clone()])), true)
+            .with_metadata(id("1")),
+        Field::new("a", DataType::Int64, true).with_metadata(id("3")),
+        Field::new("b", DataType::Int64, true).with_metadata(id("4")),
+    ]));
+    let xs: arrow::array::ArrayRef = Arc::new(Int64Array::from(vec![1000, 1001, 1002]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StructArray::from(vec![(Arc::new(x), xs)])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(Int64Array::from(vec![10, 11, 12])),
+        ],
+    )
+    .unwrap();
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, None)
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// `compute_column_stats` labels a file's columns by the caller's
+/// `column_ids` alone: the field ids a foreign file embeds name no catalog
+/// column, so a nested column's leaves get no statistics.
+#[test]
+fn compute_column_stats_ignores_a_foreign_files_field_ids() {
+    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("foreign.parquet");
+    foreign_nested_file(&path);
+    let metadata =
+        ArrowReaderMetadata::load(&std::fs::File::open(&path).unwrap(), Default::default())
+            .unwrap();
+    let stats = datafusion_ducklake::stats_collect::compute_column_stats(
+        metadata.schema(),
+        metadata.metadata(),
+        &[10, 11, 12],
+        3,
+        &[],
+    );
+    let got = stats
+        .iter()
+        .map(|stat| {
+            (
+                stat.column_id,
+                stat.min_value.clone(),
+                stat.max_value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            (11, Some("1".to_string()), Some("3".to_string())),
+            (12, Some("10".to_string()), Some("12".to_string())),
+        ]
+    );
+
+    // With the caller's id for the nested leaf, it gets its row too.
+    let stats = datafusion_ducklake::stats_collect::compute_column_stats_with_leaf_ids(
+        metadata.schema(),
+        metadata.metadata(),
+        &[10, 11, 12],
+        &[Some(20)],
+        3,
+        &[],
+    );
+    let got = stats
+        .iter()
+        .map(|stat| {
+            (
+                stat.column_id,
+                stat.min_value.clone(),
+                stat.max_value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            (20, Some("1000".to_string()), Some("1002".to_string())),
+            (11, Some("1".to_string()), Some("3".to_string())),
+            (12, Some("10".to_string()), Some("12".to_string())),
+        ]
+    );
+}
+
+/// A caller registering a foreign file labels its columns by file index and
+/// maps them to the table's column ids, as the stats' contract says: the
+/// registered statistics describe the right columns and a filtered query finds
+/// the row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_nested_file_registers_with_correct_stats() {
+    use datafusion_ducklake::metadata_writer::{ColumnDef, DataFileInfo, WriteMode};
+    use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+    let temp = TempDir::new().unwrap();
+    let db_path = temp.path().join("c.db");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+
+    let file_path = temp.path().join("foreign.parquet");
+    foreign_nested_file(&file_path);
+    let metadata = ArrowReaderMetadata::load(
+        &std::fs::File::open(&file_path).unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    let columns = metadata
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| ColumnDef::from_arrow(f.name(), f.data_type(), f.is_nullable()).unwrap())
+        .collect::<Vec<_>>();
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    // Statistics labelled by file column index, then mapped to the table's ids.
+    let by_index = datafusion_ducklake::stats_collect::compute_column_stats(
+        metadata.schema(),
+        metadata.metadata(),
+        &[0, 1, 2],
+        3,
+        &[],
+    );
+    let stats = by_index
+        .into_iter()
+        .map(|mut stat| {
+            stat.column_id = setup.column_ids[stat.column_id as usize];
+            stat
+        })
+        .collect::<Vec<_>>();
+    let size = std::fs::metadata(&file_path).unwrap().len() as i64;
+    writer
+        .register_data_file(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            &DataFileInfo::new(file_path.to_str().unwrap(), size, 3)
+                .with_absolute_path()
+                .with_column_stats(stats),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+        .unwrap();
+
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT c.column_name, s.min_value, s.max_value
+         FROM ducklake_file_column_stats s
+         JOIN ducklake_column c ON c.column_id = s.column_id AND c.table_id = s.table_id
+         ORDER BY s.column_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "a".to_string(),
+                Some("1".to_string()),
+                Some("3".to_string())
+            ),
+            (
+                "b".to_string(),
+                Some("10".to_string()),
+                Some("12".to_string())
+            ),
+        ]
+    );
+
+    let provider = SqliteMetadataProvider::new(&url).await.unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(DuckLakeCatalog::new(provider).unwrap()));
+    let batches = ctx
+        .sql("SELECT a, s.x FROM lake.main.t WHERE b = 11")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 1);
+}
+
+/// A register refuses statistics that describe one column twice in one file.
+#[tokio::test(flavor = "multi_thread")]
+async fn register_refuses_duplicate_column_stats() {
+    use datafusion_ducklake::metadata_writer::{ColumnDef, ColumnStat, DataFileInfo, WriteMode};
+    let temp = TempDir::new().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", temp.path().join("c.db").display());
+    let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let snapshot = writer.create_snapshot().unwrap();
+    writer.get_or_create_schema("main", None, snapshot).unwrap();
+    let columns = vec![ColumnDef::from_arrow("a", &DataType::Int64, true).unwrap()];
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    let stat = |min: &str, max: &str| ColumnStat {
+        column_id: setup.column_ids[0],
+        min_value: Some(min.to_string()),
+        max_value: Some(max.to_string()),
+        null_count: Some(0),
+        value_count: Some(3),
+        contains_nan: None,
+        column_size_bytes: None,
+    };
+    let error = writer
+        .register_data_file(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            &DataFileInfo::new("f.parquet", 100, 3)
+                .with_column_stats(vec![stat("1", "3"), stat("1000", "1002")]),
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, datafusion_ducklake::DuckLakeError::InvalidConfig(_)),
+        "{error}"
+    );
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_file_column_stats")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}

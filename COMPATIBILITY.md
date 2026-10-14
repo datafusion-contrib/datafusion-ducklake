@@ -282,6 +282,15 @@ arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
 Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
 multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 
+A stored table, schema or catalog‑wide `data_inlining_row_limit` decides whether a table gets an
+inlined data table and refuses inlined system column names (`row_id`, ...). Where none is stored,
+the writer's own limit does, as official's `DATA_INLINING_ROW_LIMIT` attach option does: the
+`DuckLakeCatalog::with_write_options` limit for SQL (`10` when unset), a `DuckLakeTableWriter`'s
+own limit for its writes (`0` unless set), and official's default `10` for a direct
+`MetadataWriter` call. A SQL `INSERT` inlines under the stored limit, else that writer limit, as
+official's insert does. A direct `DuckLakeTableWriter` write is this crate's own: it inlines under
+the writer's limit alone, whatever the catalog stores.
+
 ### Views
 
 Every metadata backend reads snapshot-visible rows from `ducklake_view`. Catalogs without that

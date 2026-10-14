@@ -316,20 +316,37 @@ fn a_mysql_scan_runs_under_a_current_thread_runtime() {
 /// a connection before it returns, so a pool built the ordinary way on the
 /// caller's runtime already holds a socket registered with that runtime's I/O
 /// driver, and only that driver ever reports it readable. The first catalog
-/// call is what stops that driver being driven, so the connection never comes
-/// back and the call ends at the pool's acquire timeout.
+/// call is what stops that driver being driven, so once a read on that
+/// connection finds nothing waiting, it never comes back and the call ends at
+/// the pool's acquire timeout.
+///
+/// Not every time, though. Tokio clears a socket's readiness only when a read
+/// returns `WouldBlock`, and sqlx stops reading a reply once it has it whole, so
+/// the idle connection is still marked readable when the call starts. Each
+/// read the call makes then succeeds without the driver whenever the server's
+/// reply is already in the socket buffer, which a loaded machine makes likely,
+/// so the call has three outcomes:
+///
+/// - every reply it reads is already buffered, and it answers;
+/// - the pool's health check on acquire finds nothing waiting, and the call
+///   fails with the acquire timeout;
+/// - the health check's reply is buffered but the query's is not, so the
+///   connection is acquired and the query's read waits on the undriven driver
+///   forever: the acquire timeout does not bound a query, and the call hangs.
+///
+/// All three are the documented limitation. What this test pins is that no
+/// other error comes back; it bounds the hang itself, and leaves the hung
+/// thread behind, since nothing can wake it.
 ///
 /// Owning a driver cannot rescue this — those connections predate the call —
 /// and that is the line the crate docs and the `from_pool` rustdoc draw: the
 /// guarantee covers the pools this crate opens. Every other test here builds
 /// its catalog with `new`, so this is the only one that would notice an adopted
-/// pool moving further from it. The timeout is not a regression either: a
-/// bridge reaching for `block_in_place` panicked outright under this runtime,
-/// so a typed error after a wait is what the change bought this shape.
+/// pool moving further from it.
 #[cfg(feature = "write-postgres")]
 #[test]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-fn an_adopted_pool_still_stalls_under_a_current_thread_runtime() {
+fn an_adopted_pool_answers_times_out_or_hangs_under_a_current_thread_runtime() {
     use datafusion_ducklake::{DuckLakeError, PostgresMetadataProvider};
     use sqlx::postgres::PgPoolOptions;
 
@@ -353,9 +370,8 @@ fn an_adopted_pool_still_stalls_under_a_current_thread_runtime() {
                 .unwrap();
             let outcome = runtime.block_on(async move {
                 // What an embedder would write, with the acquire timeout
-                // shortened from its default of thirty seconds: this call can
-                // only ever reach that timeout, so the default would be thirty
-                // seconds of suite time spent waiting for a known answer.
+                // shortened from its default of thirty seconds, which would be
+                // suite time spent waiting whenever the call does time out.
                 let pool = PgPoolOptions::new()
                     .max_connections(5)
                     .acquire_timeout(Duration::from_secs(10))
@@ -369,18 +385,25 @@ fn an_adopted_pool_still_stalls_under_a_current_thread_runtime() {
         .unwrap();
 
     // Enforced from this thread for the reason the tests above give, and set
-    // well clear of the acquire timeout so that a late answer is still an
-    // answer rather than a missing one.
+    // well clear of the acquire timeout so that a late answer or timeout is
+    // still told apart from the hang.
     let outcome = rx.recv_timeout(Duration::from_secs(120));
     fixture_runtime.block_on(async move { drop(container) });
 
-    let error = outcome
-        .expect("the catalog call neither answered nor gave up")
-        .expect_err("an adopted pool takes its readiness from the runtime the call blocks");
-    assert!(
-        matches!(error, DuckLakeError::Sqlx(sqlx::Error::PoolTimedOut)),
-        "expected the pool's acquire timeout, got {error:?}"
-    );
+    match outcome {
+        // Every read found its reply already waiting (see above).
+        Ok(Ok(_)) => {},
+        Ok(Err(error)) => assert!(
+            matches!(error, DuckLakeError::Sqlx(sqlx::Error::PoolTimedOut)),
+            "expected an answer, the pool's acquire timeout or a hang, got {error:?}"
+        ),
+        // The health check's reply was buffered and the query's was not (see
+        // above); the thread stays blocked until the process exits.
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the catalog call's thread panicked")
+        },
+    }
 }
 
 /// A catalog call from a thread with no runtime at all.

@@ -263,6 +263,7 @@ async fn fill_snapshot_counters(metadata: &Metadata) {
             sqlx::query(statement).execute(&pool).await.unwrap();
             pool.close().await;
         },
+        #[cfg(feature = "metadata-postgres")]
         Metadata::Postgres(dsn) => {
             let pool = sqlx::PgPool::connect(&postgres_url(dsn)).await.unwrap();
             sqlx::query(statement).execute(&pool).await.unwrap();
@@ -273,6 +274,7 @@ async fn fill_snapshot_counters(metadata: &Metadata) {
 }
 
 /// The URL of the PostgreSQL database a `key=value` DSN names.
+#[cfg(feature = "metadata-postgres")]
 fn postgres_url(dsn: &str) -> String {
     let value = |key: &str| {
         dsn.split_whitespace()
@@ -357,6 +359,7 @@ async fn postgres_single_catalog_creates_no_inlined_table_for_geometry() {
 }
 
 /// Create `main.g` with one row in Parquet.
+#[cfg(any(feature = "write-duckdb", feature = "write-mysql", feature = "multicatalog-postgres"))]
 async fn create_g(side: &Side) {
     DuckLakeTableWriter::new(Arc::clone(&side.writer), Arc::new(LocalFileSystem::new()))
         .unwrap()
@@ -368,6 +371,7 @@ async fn create_g(side: &Side) {
 
 /// Record `main.g`'s `shape` column as GEOMETRY and unregister its inlined
 /// data table.
+#[cfg(any(feature = "write-duckdb", feature = "write-mysql", feature = "multicatalog-postgres"))]
 const RETYPE: [&str; 2] = [
     "UPDATE ducklake_column SET column_type = 'geometry' WHERE column_name = 'shape'",
     "DELETE FROM ducklake_inlined_data_tables",
@@ -380,6 +384,7 @@ const RETYPE: [&str; 2] = [
 /// ([`RETYPE`]). Rows of the table are written to
 /// Parquet by `INSERT` and `UPDATE`, and a partitioning change creates no
 /// inlined data table for it.
+#[cfg(any(feature = "write-duckdb", feature = "write-mysql", feature = "multicatalog-postgres"))]
 async fn crate_side_never_inlines_geometry(side: &Side) {
     let snapshot = side.provider.get_current_snapshot().unwrap();
     let schema = side
@@ -541,10 +546,9 @@ async fn multicatalog_never_inlines_geometry() {
 /// Through a catalog whose write options set the inlining limit to `0`,
 /// `CREATE TABLE` and a partitioning change create no inlined data table, and
 /// a column named like an inlined system column is allowed, as official with
-/// `DATA_INLINING_ROW_LIMIT 0` behaves. A table writer's own limit is the
-/// limit its inserts apply, like official's
-/// `ducklake_default_data_inlining_row_limit`: its first write creates the
-/// inlined data table the catalog's default limit calls for. Each step opens
+/// `DATA_INLINING_ROW_LIMIT 0` behaves. A table writer's own limit of `0`
+/// applies where the catalog stores none, as that attach option does: its
+/// first write creates no inlined data table either. Each step opens
 /// the catalog with `open`; `registered` counts its registered inlined data
 /// tables with the catalog closed.
 async fn zero_limit_creates_no_inlined_table(
@@ -566,7 +570,7 @@ async fn zero_limit_creates_no_inlined_table(
             .await
             .unwrap();
     }
-    assert_eq!(registered().await, 1, "a table writer's first write");
+    assert_eq!(registered().await, 0, "a table writer's first write");
     {
         let side = open().await;
         let ctx = SessionContext::new();
@@ -578,7 +582,7 @@ async fn zero_limit_creates_no_inlined_table(
             .await
             .unwrap();
     }
-    assert_eq!(registered().await, 1, "CREATE TABLE");
+    assert_eq!(registered().await, 0, "CREATE TABLE");
     {
         let side = open().await;
         let ctx = SessionContext::new();
@@ -594,7 +598,7 @@ async fn zero_limit_creates_no_inlined_table(
         .await
         .unwrap();
     }
-    assert_eq!(registered().await, 1, "SET PARTITIONED BY");
+    assert_eq!(registered().await, 0, "SET PARTITIONED BY");
 }
 
 /// A stored table, schema or catalog-wide `data_inlining_row_limit` outranks

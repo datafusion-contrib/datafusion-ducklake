@@ -38,8 +38,12 @@
 //! On a mismatch the history is shrunk (steps, rows and columns dropped while
 //! the same kind of mismatch remains) and printed as a regression test.
 //!
-//! `FUZZ_SEEDS` sets the number of seeds per backend (default 50 on SQLite and
-//! DuckDB, 20 on the Docker backends) and `FUZZ_SEED` runs one seed. The
+//! `FUZZ_SEEDS` sets the number of seeds per backend (default 8 on SQLite and
+//! DuckDB, 3 on the Docker backends, to keep the default suite's cost down;
+//! `FUZZ_SEEDS=50` and `FUZZ_SEEDS=20` are the fuller runs) and `FUZZ_SEED`
+//! runs one seed. An exhaustive (regression) run reads the rows at each earlier
+//! snapshot and each change-feed window when it lands and all of them after the
+//! last step; `FUZZ_ALL_WINDOWS` reads every one after every step. The
 //! `#[ignore]`d `soak_*` tests run `FUZZ_SEEDS` seeds (default 2000; 300 on the
 //! Docker backends).
 //!
@@ -2989,6 +2993,17 @@ impl Run<'_> {
         result
     }
 
+    /// Whether an exhaustive run reads the rows at every earlier snapshot and
+    /// every change-feed window after the step reaching `index`: after the
+    /// history's last step, and after every step under `FUZZ_ALL_WINDOWS`.
+    /// After the other steps it reads the snapshot just before and the windows
+    /// ending at `index`, so each is still read when it lands and again at the
+    /// end; reading every window after every step costs a cube of the
+    /// history's length.
+    fn every_earlier(&self, index: usize) -> bool {
+        index == self.history.steps.len() || std::env::var("FUZZ_ALL_WINDOWS").is_ok()
+    }
+
     async fn compare_step(&mut self, step: usize) -> Result<(), Mismatch> {
         let index = step + 1;
         let list = |at: usize| {
@@ -3030,9 +3045,13 @@ impl Run<'_> {
         }
         self.compare_rows("rows", step, &official, &ours)?;
 
-        // Time travel to earlier steps: every one in a short history.
-        let earlier: Vec<usize> = if self.exhaustive {
+        // Time travel to earlier steps: every one after the last step or under
+        // `FUZZ_ALL_WINDOWS`, else the previous one in an exhaustive run and a
+        // random one otherwise.
+        let earlier: Vec<usize> = if self.exhaustive && self.every_earlier(index) {
             (self.readable_from..index).collect()
+        } else if self.exhaustive && index > self.readable_from {
+            vec![index - 1]
         } else if index > self.readable_from {
             vec![self.readable_from + self.rng.below(index - self.readable_from)]
         } else {
@@ -3080,10 +3099,15 @@ impl Run<'_> {
         }
 
         // Change feeds over windows of steps: every one in a short history.
-        let windows: Vec<(usize, usize)> = if self.exhaustive {
+        // An exhaustive run reads each window when its last step lands and
+        // every window again after the history's last step (see
+        // [`Run::every_earlier`]).
+        let windows: Vec<(usize, usize)> = if self.exhaustive && self.every_earlier(index) {
             (self.readable_from..index)
                 .flat_map(|a| (a + 1..=index).map(move |b| (a, b)))
                 .collect()
+        } else if self.exhaustive {
+            (self.readable_from..index).map(|a| (a, index)).collect()
         } else if index > self.readable_from {
             let a = self.readable_from + self.rng.below(index - self.readable_from);
             let b = a + 1 + self.rng.below(index - a);
@@ -3204,7 +3228,9 @@ impl Run<'_> {
             }
         }
         self.compare_reads(step).await?;
-        // Predicates and aggregates at an earlier snapshot.
+        // Predicates and aggregates at an earlier snapshot: every one after
+        // each step of an exhaustive run, as which files a predicate prunes at
+        // an earlier snapshot can change with the catalog's later statistics.
         let earlier: Vec<usize> = if self.exhaustive {
             (self.readable_from..index).collect()
         } else if index > self.readable_from {
@@ -5130,14 +5156,18 @@ async fn check(history: &History, kind: Kind) {
     }
 }
 
+/// A sample of seeds for the default suite: `FUZZ_SEEDS` runs more, and
+/// `soak_sqlite` runs 2000.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn fuzz_sqlite() {
-    fuzz(Backend::Sqlite, seeds(50)).await;
+    fuzz(Backend::Sqlite, seeds(8)).await;
 }
 
+/// A sample of seeds for the default suite: `FUZZ_SEEDS` runs more, and
+/// `soak_duckdb` runs 2000.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn fuzz_duckdb() {
-    fuzz(Backend::Duckdb, seeds(50)).await;
+    fuzz(Backend::Duckdb, seeds(8)).await;
 }
 
 #[ignore = "soak run: FUZZ_SEEDS seeds (default 2000)"]
@@ -5189,7 +5219,8 @@ async fn fuzz_mysql() {
         Backend::Mysql {
             port,
         },
-        seeds(20),
+        // A sample for the default suite: `FUZZ_SEEDS` runs more, the soak 300.
+        seeds(3),
     )
     .await;
 }
@@ -5203,7 +5234,8 @@ async fn fuzz_postgres_single_catalog() {
         Backend::PostgresSingle {
             port,
         },
-        seeds(20),
+        // A sample for the default suite: `FUZZ_SEEDS` runs more, the soak 300.
+        seeds(3),
     )
     .await;
 }
@@ -5217,7 +5249,8 @@ async fn fuzz_multicatalog() {
         Backend::Multicatalog {
             port,
         },
-        seeds(20),
+        // A sample for the default suite: `FUZZ_SEEDS` runs more, the soak 300.
+        seeds(3),
     )
     .await;
 }

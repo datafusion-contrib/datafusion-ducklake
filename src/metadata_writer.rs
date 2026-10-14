@@ -94,7 +94,8 @@ pub(crate) fn enables_inlining(key: &str, value: &str) -> bool {
 /// table's, else its schema's, else the catalog-wide one, else the limit
 /// [`with_inlining_limit`] set for this call, as official's stored settings
 /// outrank its `DATA_INLINING_ROW_LIMIT` attach option; else official's
-/// default.
+/// default (`10`), which a direct `MetadataWriter` call outside a table writer
+/// gets.
 pub(crate) fn effective_inlining_limit(
     rows: &[(Option<String>, Option<i64>, String)],
     schema_id: i64,
@@ -130,10 +131,11 @@ thread_local! {
 /// table or schema version or checks reserved column names, where the catalog
 /// stores no setting of it, as official's `DATA_INLINING_ROW_LIMIT` attach
 /// option applies: a stored table, schema or catalog-wide setting outranks it
-/// ([`effective_inlining_limit`]). `None` reads the settings alone. The limit is the one `DuckLakeCatalog::with_write_options` set,
-/// as its inserts apply it; a `DuckLakeTableWriter`'s own limit, like
-/// official's `ducklake_default_data_inlining_row_limit` setting, applies to
-/// its inserts only.
+/// ([`effective_inlining_limit`]). `None` falls back to official's default.
+/// SQL `CREATE TABLE` and partitioning changes pass the limit
+/// `DuckLakeCatalog::with_write_options` set, `None` when unset; a
+/// `DuckLakeTableWriter` passes its own limit, `0` unless configured, so a SQL
+/// `INSERT`, which writes through one, passes the limit its table resolved.
 pub(crate) fn with_inlining_limit<T>(limit: Option<usize>, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<usize>);
     impl Drop for Restore {
@@ -773,6 +775,24 @@ pub(crate) fn catalog_fields(
         .copied()
         .zip(defs.into_iter().map(|def| def.ducklake_type))
         .collect())
+}
+
+/// Refuse `column_stats` of one data file that describe a column more than
+/// once: the catalog keeps one statistics row per column per file, as
+/// official's per-file statistics hold one entry per column, and the
+/// table-wide roll-up would otherwise merge rows that disagree.
+pub(crate) fn reject_duplicate_column_stats(column_stats: &[ColumnStat]) -> Result<()> {
+    let mut seen = std::collections::HashSet::with_capacity(column_stats.len());
+    for stat in column_stats {
+        if !seen.insert(stat.column_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "a data file carries statistics for column_id {} more than once; \
+                 one statistics row per column per file is allowed",
+                stat.column_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The `ducklake_file_column_stats` rows of each of `files`, in commit order,

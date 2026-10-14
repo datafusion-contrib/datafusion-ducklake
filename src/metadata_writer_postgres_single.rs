@@ -685,6 +685,7 @@ async fn insert_file_column_stats(
     data_file_id: i64,
     column_stats: &[ColumnStat],
 ) -> Result<()> {
+    crate::metadata_writer::reject_duplicate_column_stats(column_stats)?;
     for stat in column_stats {
         sqlx::query(
             "INSERT INTO ducklake_file_column_stats

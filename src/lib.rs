@@ -63,7 +63,10 @@
 //! connections, and a sqlx connection is only ever reported readable by that
 //! driver, so a catalog call through an adopted pool must not block the
 //! runtime the pool came from — under a `current_thread` runtime it blocks
-//! exactly that, and the call fails when the pool's acquire timeout expires.
+//! exactly that. The call fails when the pool's acquire timeout expires,
+//! answers when every reply it reads has already reached the socket, or hangs
+//! indefinitely when the pool's health check finds its reply waiting but the
+//! query does not: the acquire timeout does not bound the query.
 //! Those constructors say what they do and do not move.
 //!
 //! The cost is the threads this library starts without being asked, which is

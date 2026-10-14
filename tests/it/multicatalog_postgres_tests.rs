@@ -10368,3 +10368,62 @@ async fn append_racing_a_drop_conflicts_and_leaves_no_file() {
     }
     assert_eq!(count_files(), before, "the refused append removed its file");
 }
+
+/// Expire and drop run in one transaction on one pooled connection: on a pool
+/// of one connection they complete rather than wait for a second.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn expire_and_drop_catalog_complete_on_a_single_connection_pool() {
+    use datafusion_ducklake::maintenance::ExpireCriteria;
+    use std::time::Duration;
+
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&url)
+        .await
+        .unwrap();
+    initialize_multicatalog_schema(&pool).await.unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("one").await.unwrap();
+    {
+        let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+            .await
+            .unwrap();
+        writer.set_data_path("/data").unwrap();
+        three_generations(&writer, "public", "t");
+        three_generations(&writer, "public", "u");
+    }
+    // A dropped table whose snapshots all expire is dead: expire reclaims it and
+    // its inlined storage.
+    assert!(
+        mgr.drop_table_in_catalog("one", "public", "t")
+            .await
+            .unwrap()
+    );
+    let expired = tokio::time::timeout(
+        Duration::from_secs(5),
+        mgr.expire_snapshots_in_catalog(
+            "one",
+            ExpireCriteria::OlderThan(chrono::Utc::now() + chrono::Duration::hours(1)),
+        ),
+    )
+    .await
+    .expect("expire waited for a second connection")
+    .unwrap();
+    assert!(!expired.is_empty());
+    let dead: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ducklake_table WHERE table_name = 't'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dead, 0, "the dropped table was reclaimed");
+    let dropped = tokio::time::timeout(Duration::from_secs(5), mgr.drop_catalog("one"))
+        .await
+        .expect("drop_catalog waited for a second connection")
+        .unwrap();
+    assert!(dropped);
+}

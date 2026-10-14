@@ -2588,18 +2588,13 @@ async fn reserved_inline_columns_fall_back_to_parquet(#[case] name: &str) {
             .unwrap()
             .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(limit))
     };
-    // Creating the table while the catalog's inlining is enabled is refused,
-    // as in official, whatever limit the writer inlines under.
-    for limit in [10, 0] {
-        let error = table_writer(limit)
-            .write_table("main", "reserved", std::slice::from_ref(&input))
-            .await
-            .unwrap_err();
-        assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
-    }
-    writer
-        .set_global_setting("data_inlining_row_limit", "0")
-        .unwrap();
+    // Creating the table while inlining is in effect is refused, as in
+    // official: the catalog stores no limit, so the writer's own applies.
+    let error = table_writer(10)
+        .write_table("main", "reserved", std::slice::from_ref(&input))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
     table_writer(0)
         .write_table("main", "reserved", std::slice::from_ref(&input))
         .await

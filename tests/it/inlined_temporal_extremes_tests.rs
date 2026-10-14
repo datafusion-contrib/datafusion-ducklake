@@ -450,6 +450,11 @@ async fn sqlite_refuses_values_duckdb_cannot_hold() {
     }
 }
 
+#[cfg(any(
+    feature = "write-duckdb",
+    feature = "write-postgres",
+    feature = "multicatalog-postgres"
+))]
 async fn write_with(
     writer: Arc<dyn MetadataWriter>,
     batch: RecordBatch,

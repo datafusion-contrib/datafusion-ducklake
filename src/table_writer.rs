@@ -176,7 +176,13 @@ impl DuckLakeWriteOptions {
         })
     }
 
-    /// Sets the maximum row count for catalog-backed inlining.
+    /// Sets the maximum row count for catalog-backed inlining. Where the
+    /// catalog stores no limit, a [`DuckLakeTableWriter`] given it applies it
+    /// to reserved column names and to creating inlined data tables, as
+    /// official applies its `DATA_INLINING_ROW_LIMIT` attach option. Whether
+    /// the writer's own inserts are inlined is decided by this limit alone,
+    /// whatever the catalog stores; a SQL `INSERT` resolves the stored limit
+    /// first. A writer without it uses `0`.
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
@@ -792,9 +798,10 @@ impl DuckLakeTableWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
-        let mut setup =
+        let mut setup = self.with_inlining_limit(|| {
             self.metadata
-                .begin_write_transaction(schema_name, table_name, columns, mode)?;
+                .begin_write_transaction(schema_name, table_name, columns, mode)
+        })?;
         if let Some(planned) = self.planned_base_snapshot {
             setup.base_snapshot_id = setup.base_snapshot_id.min(planned);
         }
@@ -1076,6 +1083,7 @@ impl DuckLakeTableWriter {
         );
         Ok(TableWriteSession {
             metadata: Arc::clone(&self.metadata),
+            data_inlining_row_limit: self.data_inlining_row_limit(),
             object_store: Arc::clone(&self.object_store),
             object_path,
             table_key,
@@ -1805,7 +1813,7 @@ impl DuckLakeTableWriter {
         // Collect stats for catalog columns only. NaN presence and string
         // bounds were tracked while consuming the stream: the footer records
         // neither as official does.
-        let column_stats = crate::stats_collect::collect_written_column_stats(
+        let column_stats = crate::stats_collect::collect_own_written_column_stats(
             temp.path(),
             stats_column_ids,
             row_count,
@@ -1987,19 +1995,21 @@ impl DuckLakeTableWriter {
 
         let batches = in_order.unwrap_or(all_batches);
         if inline {
-            let committed = self.metadata.register_inlined_data(
-                setup.table_id,
-                schema_name,
-                table_name,
-                setup.snapshot_id,
-                &batches,
-                mode,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.field_ids,
-                &options.commit_metadata,
-                options.expected_base_snapshot_id,
-            )?;
+            let committed = self.with_inlining_limit(|| {
+                self.metadata.register_inlined_data(
+                    setup.table_id,
+                    schema_name,
+                    table_name,
+                    setup.snapshot_id,
+                    &batches,
+                    mode,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.field_ids,
+                    &options.commit_metadata,
+                    options.expected_base_snapshot_id,
+                )
+            })?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -2035,21 +2045,23 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let committed = match self.metadata.register_data_files_with_commit_metadata(
-            setup.table_id,
-            schema_name,
-            table_name,
-            setup.snapshot_id,
-            &file_infos,
-            mode,
-            options
-                .expected_base_snapshot_id
-                .unwrap_or(setup.base_snapshot_id),
-            &columns,
-            &setup.field_ids,
-            &options.commit_metadata,
-            options.expected_base_snapshot_id,
-        ) {
+        let committed = match self.with_inlining_limit(|| {
+            self.metadata.register_data_files_with_commit_metadata(
+                setup.table_id,
+                schema_name,
+                table_name,
+                setup.snapshot_id,
+                &file_infos,
+                mode,
+                options
+                    .expected_base_snapshot_id
+                    .unwrap_or(setup.base_snapshot_id),
+                &columns,
+                &setup.field_ids,
+                &options.commit_metadata,
+                options.expected_base_snapshot_id,
+            )
+        }) {
             Ok(committed) => committed,
             Err(e) => {
                 return Err(self
@@ -2167,19 +2179,21 @@ impl DuckLakeTableWriter {
             ));
         }
         if inline {
-            let committed = self.metadata.register_inlined_data(
-                setup.table_id,
-                schema_name,
-                table_name,
-                setup.snapshot_id,
-                batches,
-                mode,
-                setup.base_snapshot_id,
-                &columns,
-                &setup.field_ids,
-                &SnapshotCommitMetadata::new(),
-                None,
-            )?;
+            let committed = self.with_inlining_limit(|| {
+                self.metadata.register_inlined_data(
+                    setup.table_id,
+                    schema_name,
+                    table_name,
+                    setup.snapshot_id,
+                    batches,
+                    mode,
+                    setup.base_snapshot_id,
+                    &columns,
+                    &setup.field_ids,
+                    &SnapshotCommitMetadata::new(),
+                    None,
+                )
+            })?;
             return Ok(WriteResult {
                 snapshot_id: committed.snapshot_id,
                 table_id: committed.table_id,
@@ -2268,17 +2282,19 @@ impl DuckLakeTableWriter {
         }
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
 
-        let committed = match self.metadata.register_data_files(
-            setup.table_id,
-            schema_name,
-            table_name,
-            setup.snapshot_id,
-            &file_infos,
-            mode,
-            setup.base_snapshot_id,
-            &columns,
-            &setup.field_ids,
-        ) {
+        let committed = match self.with_inlining_limit(|| {
+            self.metadata.register_data_files(
+                setup.table_id,
+                schema_name,
+                table_name,
+                setup.snapshot_id,
+                &file_infos,
+                mode,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.field_ids,
+            )
+        }) {
             Ok(committed) => committed,
             Err(e) => {
                 return Err(self
@@ -2555,6 +2571,13 @@ impl DuckLakeTableWriter {
     /// inlining is off.
     pub(crate) fn data_inlining_row_limit(&self) -> usize {
         self.data_inlining_row_limit.unwrap_or(0)
+    }
+
+    /// Run `f`, a commit through this writer's metadata writer, with this
+    /// writer's limit as the one it applies where the catalog stores none
+    /// ([`crate::metadata_writer::with_inlining_limit`]).
+    fn with_inlining_limit<T>(&self, f: impl FnOnce() -> T) -> T {
+        crate::metadata_writer::with_inlining_limit(Some(self.data_inlining_row_limit()), f)
     }
 
     /// Whether `rows` rows of `schema_name.table_name` go to inlined storage:
@@ -3182,11 +3205,13 @@ impl DuckLakeWriteTransaction<'_> {
                 .iter()
                 .map(|prepared| prepared.write.clone())
                 .collect::<Vec<_>>();
-            let committed = self.writer.metadata.commit_multi_table(
-                &writes,
-                &self.commit_metadata,
-                self.expected_base_snapshot_id,
-            );
+            let committed = self.writer.with_inlining_limit(|| {
+                self.writer.metadata.commit_multi_table(
+                    &writes,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )
+            });
             let e = match committed {
                 Ok(committed) => break committed,
                 Err(e) => e,
@@ -3693,7 +3718,7 @@ async fn upload_staged_file(
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
 
-    let column_stats = crate::stats_collect::collect_written_column_stats(
+    let column_stats = crate::stats_collect::collect_own_written_column_stats(
         &staged.temp,
         column_ids,
         staged.row_count,
@@ -4243,6 +4268,9 @@ async fn remove_objects(
 #[derive(Debug)]
 pub struct TableWriteSession {
     metadata: Arc<dyn MetadataWriter>,
+    /// The `data_inlining_row_limit` of the writer that began this session,
+    /// applied by its commit where the catalog stores none.
+    data_inlining_row_limit: usize,
     object_store: Arc<dyn ObjectStore>,
     object_path: ObjectPath,
     /// Object-store key of the table directory, which a relative delete-file path
@@ -4287,7 +4315,7 @@ pub struct TableWriteSession {
     row_count: i64,
     /// What the written batches showed of each Parquet leaf that the footer
     /// does not record exactly: NaN presence and DuckDB's string and blob
-    /// bounds. Fed into `collect_written_column_stats` at finish.
+    /// bounds. Fed into `collect_own_written_column_stats` at finish.
     leaf_stats: crate::stats_collect::WrittenLeafStats,
     /// Set when the target table is partitioned: batches are routed here, one file
     /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
@@ -4305,6 +4333,13 @@ pub struct TableWriteSession {
 }
 
 impl TableWriteSession {
+    /// Run `f`, this session's commit, with the limit of the writer that began
+    /// it as the one it applies where the catalog stores none
+    /// ([`crate::metadata_writer::with_inlining_limit`]).
+    fn with_inlining_limit<T>(&self, f: impl FnOnce() -> T) -> T {
+        crate::metadata_writer::with_inlining_limit(Some(self.data_inlining_row_limit), f)
+    }
+
     // Keep the read plan's snapshot for source-scoped conflict checks without
     // enabling the broader table-generation precondition.
     pub(crate) const fn with_base_snapshot_id(mut self, snapshot_id: i64) -> Self {
@@ -4543,19 +4578,21 @@ impl TableWriteSession {
             }
             let file_infos = uploaded.infos;
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = match self.metadata.register_data_files_with_commit_metadata(
-                self.table_id,
-                &self.schema_name,
-                &self.table_name,
-                self.snapshot_id,
-                &file_infos,
-                self.mode,
-                self.base_snapshot_id,
-                &self.columns,
-                &self.field_ids,
-                &self.commit_metadata,
-                self.expected_base_snapshot_id,
-            ) {
+            let committed = match self.with_inlining_limit(|| {
+                self.metadata.register_data_files_with_commit_metadata(
+                    self.table_id,
+                    &self.schema_name,
+                    &self.table_name,
+                    self.snapshot_id,
+                    &file_infos,
+                    self.mode,
+                    self.base_snapshot_id,
+                    &self.columns,
+                    &self.field_ids,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )
+            }) {
                 Ok(committed) => committed,
                 Err(e) => {
                     return Err(release_after_failed_commit(
@@ -4586,19 +4623,21 @@ impl TableWriteSession {
             }
             let file_infos = uploaded.infos;
             let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
-            let committed = match self.metadata.register_data_files_with_commit_metadata(
-                self.table_id,
-                &self.schema_name,
-                &self.table_name,
-                self.snapshot_id,
-                &file_infos,
-                self.mode,
-                self.base_snapshot_id,
-                &self.columns,
-                &self.field_ids,
-                &self.commit_metadata,
-                self.expected_base_snapshot_id,
-            ) {
+            let committed = match self.with_inlining_limit(|| {
+                self.metadata.register_data_files_with_commit_metadata(
+                    self.table_id,
+                    &self.schema_name,
+                    &self.table_name,
+                    self.snapshot_id,
+                    &file_infos,
+                    self.mode,
+                    self.base_snapshot_id,
+                    &self.columns,
+                    &self.field_ids,
+                    &self.commit_metadata,
+                    self.expected_base_snapshot_id,
+                )
+            }) {
                 Ok(committed) => committed,
                 Err(e) => {
                     return Err(release_after_failed_commit(
@@ -4627,19 +4666,21 @@ impl TableWriteSession {
         // register_data_file returns the ids actually committed (snapshot id
         // assigned at commit; real schema/table ids, which may differ from the
         // begin-time reservations under a concurrent create). Report those.
-        let committed = match self.metadata.register_data_file_with_commit_metadata(
-            self.table_id,
-            &self.schema_name,
-            &self.table_name,
-            self.snapshot_id,
-            &file_info,
-            self.mode,
-            self.base_snapshot_id,
-            &self.columns,
-            &self.field_ids,
-            &self.commit_metadata,
-            self.expected_base_snapshot_id,
-        ) {
+        let committed = match self.with_inlining_limit(|| {
+            self.metadata.register_data_file_with_commit_metadata(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &file_info,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.field_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )
+        }) {
             Ok(committed) => committed,
             Err(e) => {
                 return Err(release_after_failed_commit(&self.object_store, e, vec![object]).await);
@@ -4722,7 +4763,7 @@ impl TableWriteSession {
         let records_written: i64 = file_infos.iter().map(|f| f.record_count).sum();
         // One appended file goes through the single-file commit, so a backend that
         // implements only that form keeps working; N>1 needs the multi-file commit.
-        let committed = match file_infos.as_slice() {
+        let committed = self.with_inlining_limit(|| match file_infos.as_slice() {
             [file_info] => self
                 .metadata
                 .register_data_file_with_deletes_and_commit_metadata(
@@ -4755,7 +4796,7 @@ impl TableWriteSession {
                     &self.commit_metadata,
                     self.expected_base_snapshot_id,
                 ),
-        };
+        });
         let committed = match committed {
             Ok(committed) => committed,
             Err(e) => return Err(release_after_failed_commit(&self.object_store, e, objects).await),
@@ -4857,7 +4898,7 @@ impl TableWriteSession {
         // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
         // attach them for the catalog commit. Best-effort: on failure the file
         // is registered without stats, which is spec-safe.
-        let column_stats = crate::stats_collect::collect_written_column_stats(
+        let column_stats = crate::stats_collect::collect_own_written_column_stats(
             temp.path(),
             &self.column_ids,
             self.row_count,

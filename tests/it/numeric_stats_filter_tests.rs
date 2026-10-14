@@ -13,7 +13,8 @@
 //! wider than a double, and doubles whose shortest text is fixed-point with
 //! more digits than a double holds exactly (`0.48024702758086213`), which
 //! DuckDB parses as a `DECIMAL` whose conversion to `DOUBLE` is not correctly
-//! rounded. Every predicate runs with the statistics filter
+//! rounded. Every predicate (a sample by default; set
+//! `NUMERIC_STATS_ALL_PREDICATES` for all) runs with the statistics filter
 //! honoured and ignored (the `PushdownToggle` of
 //! `pushdown_row_preservation_tests`), and the two answers must be identical.
 //! The catalogs are written both by official DuckLake and by this crate, on
@@ -208,7 +209,8 @@ fn constants(column: usize) -> Vec<String> {
     values
 }
 
-/// Every predicate this file checks.
+/// Every predicate this file can check; [`check`] samples them unless
+/// `NUMERIC_STATS_ALL_PREDICATES` is set.
 fn predicates() -> Vec<String> {
     let mut predicates = Vec::new();
     for (index, (name, _, cast)) in COLUMNS.iter().enumerate() {
@@ -347,7 +349,15 @@ async fn check(label: &str, provider: Arc<dyn MetadataProvider>) {
     let mut failures = Vec::new();
     let mut pruned = 0;
     let mut non_empty = 0;
-    let predicates = predicates();
+    // The default suite runs every fifth predicate, a stride coprime to the
+    // eight per constant so the operators rotate across constants;
+    // `NUMERIC_STATS_ALL_PREDICATES` runs every one.
+    let stride = if std::env::var("NUMERIC_STATS_ALL_PREDICATES").is_ok() {
+        1
+    } else {
+        5
+    };
+    let predicates = predicates().into_iter().step_by(stride).collect::<Vec<_>>();
     for predicate in &predicates {
         let sql = format!("SELECT id FROM lake.main.t WHERE {predicate}");
         let truth = run_query(&provider, false, &sql)

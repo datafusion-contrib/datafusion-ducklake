@@ -384,6 +384,7 @@ impl Lake {
         rows
     }
 
+    #[cfg(feature = "write-postgres")]
     async fn sql(&self, statement: &str) {
         let catalog =
             DuckLakeCatalog::with_writer(self.provider().await, self.writer.clone()).unwrap();
