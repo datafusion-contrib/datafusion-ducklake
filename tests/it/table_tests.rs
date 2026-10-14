@@ -297,8 +297,10 @@ async fn test_catalog_statistics_are_exposed_to_datafusion() -> DataFusionResult
     assert_eq!(file_a.min_value.as_deref(), Some("0"));
     assert_eq!(file_a.max_value.as_deref(), Some("999"));
 
+    // Table-wide statistics are upper bounds: `record_count` counts every row
+    // ever inserted and the bounds only widen.
     let table_stats = table.statistics().expect("table statistics");
-    assert_eq!(table_stats.num_rows, Precision::Exact(1000));
+    assert_eq!(table_stats.num_rows, Precision::Inexact(1000));
     assert!(matches!(
         table_stats.total_byte_size,
         Precision::Inexact(bytes) if bytes > 0
@@ -306,8 +308,11 @@ async fn test_catalog_statistics_are_exposed_to_datafusion() -> DataFusionResult
     assert_eq!(table_stats.column_statistics.len(), 2);
     let a = &table_stats.column_statistics[0];
     assert_eq!(a.null_count, Precision::Exact(0));
-    assert_eq!(a.min_value, Precision::Exact(ScalarValue::Int32(Some(0))));
-    assert_eq!(a.max_value, Precision::Exact(ScalarValue::Int32(Some(999))));
+    assert_eq!(a.min_value, Precision::Inexact(ScalarValue::Int32(Some(0))));
+    assert_eq!(
+        a.max_value,
+        Precision::Inexact(ScalarValue::Int32(Some(999)))
+    );
     assert!(matches!(a.byte_size, Precision::Inexact(bytes) if bytes > 0));
 
     let state = SessionContext::new().state();

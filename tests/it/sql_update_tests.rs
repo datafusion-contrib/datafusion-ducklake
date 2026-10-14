@@ -289,6 +289,10 @@ async fn update_applies_sort_order() {
     let temp_dir = TempDir::new().unwrap();
     seed_table(&temp_dir, vec![1, 1, 1], vec![30, 10, 20]).await;
     let writer = Arc::new(make_writer(&temp_dir).await);
+    // The new versions go to a sorted Parquet file rather than being inlined.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let provider = SqliteMetadataProvider::new(&format!(
         "sqlite:{}",
         temp_dir.path().join("test.db").display()
@@ -351,7 +355,9 @@ async fn update_applies_sort_order() {
         .downcast_ref::<Int32Array>()
         .unwrap();
 
-    assert_eq!(files.len(), 2);
+    // The UPDATE rewrote every row of the seeded file, so it is ended, as
+    // official ends a file a statement empties; only its output is live.
+    assert_eq!(files.len(), 1);
     assert_eq!(
         values.values().iter().copied().collect::<Vec<_>>(),
         vec![11, 21, 31],

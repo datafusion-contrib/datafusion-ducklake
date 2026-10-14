@@ -7,14 +7,13 @@
 //!
 //! Note: Ordering across files is undefined unless explicitly requested via ORDER BY.
 
-use crate::metadata_provider::reject_inlined_changes;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, StringArray, UInt32Array};
+use arrow::array::{Array, ArrayRef, Int64Array, StringArray, UInt32Array};
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
@@ -23,6 +22,7 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder, ParquetSource};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -39,7 +39,10 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 use crate::column_rename::ColumnRenameExec;
-use crate::metadata_provider::{DataFileChange, DuckLakeTableColumn, MetadataProvider};
+use crate::metadata_provider::{
+    DataFileChange, DuckLakeInlinedRows, DuckLakeTableColumn, InlinedFileDeleteChange,
+    InlinedRowSelection, MetadataProvider,
+};
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
 use crate::table::{
@@ -48,6 +51,7 @@ use crate::table::{
     session_parquet_source, validated_file_size, validated_record_count,
 };
 use crate::types::ABSENT_FIELD_PREFIX;
+use crate::types::DuckLakeDefaultExprAdapterFactory;
 
 #[cfg(feature = "encryption")]
 use crate::encryption::EncryptionFactoryBuilder;
@@ -767,6 +771,7 @@ impl TableChangesTable {
             self.object_store_url.as_ref().clone(),
             Arc::new(parquet_source),
         )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]));
 
         if let Some(proj) = parquet_projection {
@@ -942,6 +947,7 @@ impl TableChangesTable {
                         .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
                 ),
             )
+            .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
             .with_file_group(FileGroup::new(vec![pf]));
             DataSourceExec::from_data_source(builder.build())
         };
@@ -967,6 +973,7 @@ impl TableChangesTable {
                             .with_parquet_file_reader_factory(Arc::clone(&reader_factory)),
                     ),
                 )
+                .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
                 .with_file_group(FileGroup::new(vec![pf]));
                 DataSourceExec::from_data_source(builder.build())
             },
@@ -1016,6 +1023,7 @@ impl TableChangesTable {
                     .with_parquet_file_reader_factory(reader_factory),
             ),
         )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
         Ok(present_catalog_schema(
@@ -1065,6 +1073,7 @@ impl TableChangesTable {
                     .with_parquet_file_reader_factory(reader_factory),
             ),
         )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]));
         Ok(DataSourceExec::from_data_source(builder.build()))
     }
@@ -1158,12 +1167,14 @@ impl TableChangesTable {
     /// (new); surface unmatched inserts as `insert` and unmatched deletes as
     /// `delete` (carrying the deleted rows' old values), matching official
     /// DuckLake's `ducklake_table_changes`.
+    #[allow(clippy::too_many_arguments)]
     async fn build_correlated_changes(
         &self,
         state: &dyn Session,
         columns: &[DuckLakeTableColumn],
         data_files: &[DataFileChange],
         delete_files: &[crate::metadata_provider::DeleteFileChange],
+        inlined: InlinedChanges,
         layouts: &[Arc<ParquetFileLayout>],
         projection: Option<&Vec<usize>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -1243,6 +1254,8 @@ impl TableChangesTable {
         // Every delete in range is read: unmatched ones surface as `delete`
         // rows, and those sharing a (snapshot_id, rowid) with an embedded-rowid
         // insert pair into update preimages.
+        let mut inlined_file_deletes =
+            InlinedFileDeletes::group(&self.table_path, &inlined.file_deletes)?;
         let delete_units = {
             let mut delete_units = Vec::with_capacity(delete_files.len());
             for dfc in delete_files {
@@ -1253,6 +1266,8 @@ impl TableChangesTable {
                     dfc.data_file_path_is_relative,
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let (inlined_positions, full_file) =
+                    inlined_file_deletes.claim(&resolved, dfc.current_delete_path.is_none());
                 // The source data file can predate the window (and any rename in
                 // it), so its columns need resolving by field id too.
                 let source_layout = self
@@ -1292,19 +1307,15 @@ impl TableChangesTable {
                     },
                     None => None,
                 };
-                if snapshot_name.is_none() && dfc.snapshot_id < self.start_snapshot {
-                    return Err(DataFusionError::External(
-                        format!(
-                            "delete file {:?} begins before the query window but carries no \
-                             embedded per-row snapshot column; its deletions cannot be attributed",
-                            dfc.current_delete_path
-                        )
-                        .into(),
-                    ));
-                }
                 let cumulative = snapshot_name.is_some();
+                // A delete file without per-row snapshots dates every deletion
+                // it adds at its own begin_snapshot, so one beginning before the
+                // window adds none in it (official subtracts the latest delete
+                // file before the window, which holds them all); only the data
+                // file's in-window inlined deletions remain.
+                let before_window = !cumulative && dfc.snapshot_id < self.start_snapshot;
                 let current_delete_scan = match &dfc.current_delete_path {
-                    Some(p) => Some(self.build_delete_file_scan(
+                    Some(p) if !before_window => Some(self.build_delete_file_scan(
                         state,
                         p,
                         dfc.current_delete_path_is_relative.unwrap_or(true),
@@ -1312,10 +1323,10 @@ impl TableChangesTable {
                         dfc.current_delete_footer_size.unwrap_or(0),
                         &snapshot_name,
                     )?),
-                    None => None,
+                    _ => None,
                 };
                 let previous_delete_scan = match &dfc.previous_delete_path {
-                    Some(p) if !cumulative => Some(self.build_delete_file_scan(
+                    Some(p) if !cumulative && !before_window => Some(self.build_delete_file_scan(
                         state,
                         p,
                         dfc.previous_delete_path_is_relative.unwrap_or(true),
@@ -1348,16 +1359,59 @@ impl TableChangesTable {
                     current_delete_scan,
                     previous_delete_scan,
                     cumulative,
+                    full_file,
+                    inlined_positions,
                     record_count: dfc.data_record_count,
                     row_id_start: dfc.data_row_id_start,
+                });
+            }
+            // Data files whose only deletions in the window are inlined.
+            for (resolved, file) in inlined_file_deletes.unclaimed() {
+                validated_record_count(file.change.data_record_count, &file.change.data_file_path)?;
+                let source_layout = self
+                    .file_layout(
+                        state,
+                        columns,
+                        &file.change.data_file_path,
+                        file.change.data_file_path_is_relative,
+                        file.change.data_file_size_bytes,
+                        file.change.data_file_footer_size,
+                        file.change.data_mapping_id,
+                    )
+                    .await?;
+                let old_embedded = source_layout.embedded_rowid_parquet_name.clone();
+                let data_scan = self.build_delete_data_scan(
+                    state,
+                    &resolved,
+                    file.change.data_file_size_bytes,
+                    file.change.data_file_footer_size.unwrap_or(0),
+                    &source_layout,
+                    &old_embedded,
+                )?;
+                delete_units.push(DeleteUnit {
+                    snapshot_id: file.change.snapshot_id,
+                    data_scan,
+                    embedded_col_idx: old_embedded.as_ref().map(|_| table_len),
+                    pos_col_idx: table_len + usize::from(old_embedded.is_some()),
+                    current_delete_scan: None,
+                    previous_delete_scan: None,
+                    cumulative: false,
+                    full_file: false,
+                    inlined_positions: file.positions,
+                    record_count: file.change.data_record_count,
+                    row_id_start: file.change.data_row_id_start,
                 });
             }
             delete_units
         };
 
+        let inlined_inserts = keyed_inlined_rows(&inlined.inserts, &self.table_schema)?;
+        let inlined_deletes = keyed_inlined_rows(&inlined.deletes, &self.table_schema)?;
         let full: Arc<dyn ExecutionPlan> = Arc::new(TableChangesExec::new(
             insert_units,
             delete_units,
+            Arc::new(inlined_inserts),
+            Arc::new(inlined_deletes),
             self.table_schema.clone(),
             self.output_schema.clone(),
             table_len,
@@ -1412,18 +1466,6 @@ impl TableProvider for TableChangesTable {
         // change feed against exactly that generation of the schema.
         let columns = self.resolve_columns()?;
 
-        reject_inlined_changes(
-            self.provider.as_ref(),
-            self.table_id,
-            self.start_snapshot,
-            self.end_snapshot,
-            if self.insertions_only {
-                &["inlined_insert"]
-            } else {
-                &["inlined_insert", "inlined_delete"]
-            },
-        )?;
-
         // Get data files added between snapshots (INSERT changes)
         let data_files = self
             .provider
@@ -1437,9 +1479,7 @@ impl TableProvider for TableChangesTable {
         // Deletes applied in the window surface as `delete` rows (and pair into
         // update preimages), so they participate in both the empty check and
         // the path decision — a delete-only window is NOT empty. The insertions
-        // feed never reads the delete side. Inlined deletes
-        // (ducklake_inlined_delete_<table_id>) are not read here: a window whose
-        // only change is an inlined delete emits no rows (see COMPATIBILITY.md).
+        // feed never reads the delete side.
         let delete_files = if self.insertions_only {
             Vec::new()
         } else {
@@ -1452,8 +1492,20 @@ impl TableProvider for TableChangesTable {
                 .map_err(|e| DataFusionError::External(Box::new(e)))?
         };
 
+        // Row versions stored in the catalog rather than in Parquet: inlined
+        // inserts, inlined rows deleted or superseded in the window, and inlined
+        // deletions of Parquet-resident rows. Each carries its own row id and
+        // snapshot, so none of them depends on scan order.
+        let inlined = InlinedChanges::read(
+            self.provider.as_ref(),
+            self.table_id,
+            &columns,
+            (self.start_snapshot, self.end_snapshot),
+            !self.insertions_only,
+        )?;
+
         // Handle empty case
-        if data_files.is_empty() && delete_files.is_empty() {
+        if data_files.is_empty() && delete_files.is_empty() && inlined.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
         }
@@ -1473,10 +1525,10 @@ impl TableProvider for TableChangesTable {
         //     key). On a PME catalog we therefore stay on the insert-only path
         //     below — which IS encryption-aware — so CDC over inserts never
         //     fails; the tradeoff is that UPDATEs surface as plain inserts and
-        //     pure deletes are missing there. See COMPATIBILITY.md. (A
-        //     delete-only window carries no data file to detect encryption
-        //     from, so on an encrypted catalog it fails at read rather than
-        //     returning wrong results.)
+        //     pure deletes are missing there. See COMPATIBILITY.md. (A window
+        //     with no data file carries none to detect encryption from, so
+        //     where the table has delete files it fails at read on an
+        //     encrypted catalog rather than returning wrong results.)
         let any_encrypted = {
             #[cfg(feature = "encryption")]
             {
@@ -1498,7 +1550,7 @@ impl TableProvider for TableChangesTable {
         // documented-missing on encrypted catalogs), not a planning error.
         if any_encrypted {
             data_files.retain(|f| f.begin_snapshot >= self.start_snapshot);
-            if data_files.is_empty() {
+            if data_files.is_empty() && inlined.inserts.is_empty() {
                 use datafusion::physical_plan::empty::EmptyExec;
                 return Ok(Arc::new(EmptyExec::new(proj_info.output_schema)));
             }
@@ -1510,7 +1562,9 @@ impl TableProvider for TableChangesTable {
         }
         let any_partial = data_files.iter().any(|f| f.partial_max.is_some());
 
-        if (proj_info.need_rowid || !delete_files.is_empty() || any_partial) && !any_encrypted {
+        if (proj_info.need_rowid || !delete_files.is_empty() || any_partial || !inlined.is_empty())
+            && !any_encrypted
+        {
             let mut layouts: Vec<Arc<ParquetFileLayout>> = Vec::with_capacity(data_files.len());
             for data_file in &data_files {
                 layouts.push(
@@ -1532,6 +1586,7 @@ impl TableProvider for TableChangesTable {
                     &columns,
                     &data_files,
                     &delete_files,
+                    inlined,
                     &layouts,
                     projection,
                 )
@@ -1598,6 +1653,40 @@ impl TableProvider for TableChangesTable {
             execs.push(exec);
         }
 
+        // Inlined inserts carry their row ids and snapshots as data; on this
+        // insert-only path they surface as `insert` like every other row.
+        if !inlined.inserts.is_empty() {
+            let keyed = keyed_inlined_rows(&inlined.inserts, &self.table_schema)?;
+            let batches = keyed
+                .iter()
+                .map(|k| {
+                    prepend_cdc_columns(
+                        &k.table_batch,
+                        k.rowid.clone(),
+                        k.snapshot_id,
+                        ChangeType::Insert,
+                        &self.output_schema,
+                    )
+                })
+                .collect::<DataFusionResult<Vec<_>>>()?;
+            // The per-file branches lay their columns out as the requested CDC
+            // columns in feed order, then the requested table columns.
+            let layout: Vec<usize> = [
+                (proj_info.need_snapshot_id, SNAPSHOT_ID_IDX),
+                (proj_info.need_rowid, ROWID_IDX),
+                (proj_info.need_change_type, CHANGE_TYPE_IDX),
+            ]
+            .into_iter()
+            .filter_map(|(needed, idx)| needed.then_some(idx))
+            .chain(proj_info.table_indices.iter().map(|i| i + CDC_COLS))
+            .collect();
+            execs.push(MemorySourceConfig::try_new_exec(
+                &[batches],
+                self.output_schema.clone(),
+                Some(layout),
+            )?);
+        }
+
         // Combine with UnionExec if multiple files
         if execs.len() == 1 {
             Ok(execs.into_iter().next().unwrap())
@@ -1660,6 +1749,12 @@ struct DeleteUnit {
     /// per-row delete-snapshot column as its third column): positions are then
     /// windowed per row and each deleted row keys/emits at its own snapshot.
     cumulative: bool,
+    /// Whether the whole data file was retired at `snapshot_id` (no delete
+    /// file), so every position not deleted before is deleted now.
+    full_file: bool,
+    /// Inlined deletions of the data file's rows made in the window: position
+    /// to deleting snapshot.
+    inlined_positions: HashMap<i64, i64>,
     record_count: i64,
     /// First rowid of the source file (`None` if the catalog carries none).
     /// Required only when a deleted row has no embedded rowid.
@@ -1668,6 +1763,7 @@ struct DeleteUnit {
 
 /// Rows carrying their `(snapshot_id, rowid)` correlation key alongside the
 /// table columns, ready to be tagged once update pairs are known.
+#[derive(Debug, Clone)]
 struct KeyedRows {
     snapshot_id: i64,
     table_batch: RecordBatch,
@@ -1682,6 +1778,10 @@ struct KeyedRows {
 pub struct TableChangesExec {
     insert_units: Vec<InsertUnit>,
     delete_units: Vec<DeleteUnit>,
+    /// Inlined row versions written in the window, keyed by their own row ids.
+    inlined_inserts: Arc<Vec<KeyedRows>>,
+    /// Inlined row versions deleted or superseded in the window.
+    inlined_deletes: Arc<Vec<KeyedRows>>,
     #[allow(dead_code)]
     table_schema: SchemaRef,
     output_schema: SchemaRef,
@@ -1719,6 +1819,8 @@ impl TableChangesExec {
     fn new(
         insert_units: Vec<InsertUnit>,
         delete_units: Vec<DeleteUnit>,
+        inlined_inserts: Arc<Vec<KeyedRows>>,
+        inlined_deletes: Arc<Vec<KeyedRows>>,
         table_schema: SchemaRef,
         output_schema: SchemaRef,
         table_len: usize,
@@ -1734,6 +1836,8 @@ impl TableChangesExec {
         Self {
             insert_units,
             delete_units,
+            inlined_inserts,
+            inlined_deletes,
             table_schema,
             output_schema,
             table_len,
@@ -1752,9 +1856,12 @@ impl DisplayAs for TableChangesExec {
             | DisplayFormatType::TreeRender => {
                 write!(
                     f,
-                    "TableChangesExec: inserts={}, deletes={}",
+                    "TableChangesExec: inserts={}, deletes={}, inlined_inserts={}, \
+                     inlined_deletes={}",
                     self.insert_units.len(),
-                    self.delete_units.len()
+                    self.delete_units.len(),
+                    self.inlined_inserts.len(),
+                    self.inlined_deletes.len()
                 )
             },
         }
@@ -1812,6 +1919,8 @@ impl ExecutionPlan for TableChangesExec {
 
         let insert_units = self.insert_units.clone();
         let delete_units = self.delete_units.clone();
+        let inlined_inserts = Arc::clone(&self.inlined_inserts);
+        let inlined_deletes = Arc::clone(&self.inlined_deletes);
         let output_schema = self.output_schema.clone();
         let table_len = self.table_len;
         let need_rowid = self.need_rowid;
@@ -1821,6 +1930,8 @@ impl ExecutionPlan for TableChangesExec {
             correlate_changes(
                 insert_units,
                 delete_units,
+                inlined_inserts,
+                inlined_deletes,
                 output_schema,
                 table_len,
                 need_rowid,
@@ -1852,6 +1963,8 @@ impl ExecutionPlan for TableChangesExec {
 async fn correlate_changes(
     insert_units: Vec<InsertUnit>,
     delete_units: Vec<DeleteUnit>,
+    inlined_inserts: Arc<Vec<KeyedRows>>,
+    inlined_deletes: Arc<Vec<KeyedRows>>,
     output_schema: SchemaRef,
     table_len: usize,
     need_rowid: bool,
@@ -1967,6 +2080,10 @@ async fn correlate_changes(
         }
     }
 
+    // Inlined inserts carry their row ids; one written by an UPDATE keeps the
+    // row id of the version it supersedes, so every one of them may pair.
+    postimages.extend(inlined_inserts.iter().cloned());
+
     // Deleted rows: the positions newly masked at this snapshot, with each row's
     // rowid (embedded column when the source file has one, else row_id_start +
     // physical position). The rowid is required only when it is output
@@ -1977,7 +2094,7 @@ async fn correlate_changes(
     // (no embedded rowid and a NULL row_id_start), mirroring
     // `ducklake_table_deletions`.
     let preimage_rowids_required = need_rowid || !postimages.is_empty();
-    let mut preimages: Vec<KeyedRows> = Vec::new();
+    let mut preimages: Vec<KeyedRows> = inlined_deletes.iter().cloned().collect();
     for unit in &delete_units {
         // Cumulative delete files carry a per-row delete snapshot: only
         // in-window positions are collected, each remembering its snapshot;
@@ -1997,10 +2114,16 @@ async fn correlate_changes(
                     HashMap::new(),
                 )
             };
-        let current: HashSet<i64> = match current {
+        let mut current: HashSet<i64> = match current {
             Some(set) => set,
-            None => (0..unit.record_count).collect(),
+            None if unit.full_file => (0..unit.record_count).collect(),
+            None => HashSet::new(),
         };
+        let mut position_snapshots = position_snapshots;
+        for (&position, &snapshot) in &unit.inlined_positions {
+            current.insert(position);
+            position_snapshots.insert(position, snapshot);
+        }
         let previous = collect_delete_positions(&unit.previous_delete_scan, context.clone())
             .await?
             .unwrap_or_default();
@@ -2065,11 +2188,7 @@ async fn correlate_changes(
                         // a placeholder that update_keys can never contain.
                         (None, None) => 0,
                     };
-                    let snapshot = if unit.cumulative {
-                        *position_snapshots.get(&p).unwrap_or(&unit.snapshot_id)
-                    } else {
-                        unit.snapshot_id
-                    };
+                    let snapshot = *position_snapshots.get(&p).unwrap_or(&unit.snapshot_id);
                     let entry = by_snapshot.entry(snapshot).or_default();
                     entry.0.push(i as u32);
                     entry.1.push(rowid);
@@ -2104,15 +2223,14 @@ async fn correlate_changes(
     // rowid) also appears as a delete. Only postimages seed the key set — plain
     // inserts carry fresh rowids that never match a delete (and, when rowid is
     // projected away, only a placeholder), so they must not participate.
-    let post_keys: HashSet<(i64, i64)> = postimages
-        .iter()
-        .flat_map(|k| (0..k.rowid.len()).map(move |i| (k.snapshot_id, k.rowid.value(i))))
-        .collect();
-    let update_keys: HashSet<(i64, i64)> = preimages
-        .iter()
-        .flat_map(|k| (0..k.rowid.len()).map(move |i| (k.snapshot_id, k.rowid.value(i))))
-        .filter(|key| post_keys.contains(key))
-        .collect();
+    //
+    // Official defines the feed as each insertion left-joined to the window's
+    // deletions on `(snapshot_id, rowid)`, and each deletion to its insertions:
+    // a row that shares its key with several rows of the other side is
+    // reported once per such row. A key repeats where a retirement reports an
+    // earlier deletion again (see `InlinedFileDeletes`).
+    let post_counts = key_counts(&postimages);
+    let pre_counts = key_counts(&preimages);
 
     let mut out: Vec<RecordBatch> = Vec::new();
     // Plain inserts are always `insert` (they never pair with a delete).
@@ -2128,45 +2246,233 @@ async fn correlate_changes(
     for k in &postimages {
         // Rows whose key is an update pair become postimages; the rest are plain
         // inserts (embedded file with no matching delete, e.g. compaction).
-        if let Some(b) = filter_and_tag(
+        let (paired, unpaired) = pair_indices(k, &pre_counts);
+        out.extend(take_and_tag(
             k,
-            &key_mask(k, &update_keys, true),
+            paired,
             ChangeType::UpdatePostimage,
             &output_schema,
-        )? {
-            out.push(b);
-        }
-        if let Some(b) = filter_and_tag(
+        )?);
+        out.extend(take_and_tag(
             k,
-            &key_mask(k, &update_keys, false),
+            unpaired,
             ChangeType::Insert,
             &output_schema,
-        )? {
-            out.push(b);
-        }
+        )?);
     }
     for k in &preimages {
         // Rows paired with an insert surface as update preimages; the rest are
         // pure deletes, emitted as `delete` rows carrying the old values
         // (matching official DuckLake's table_changes).
-        if let Some(b) = filter_and_tag(
+        let (paired, unpaired) = pair_indices(k, &post_counts);
+        out.extend(take_and_tag(
             k,
-            &key_mask(k, &update_keys, true),
+            paired,
             ChangeType::UpdatePreimage,
             &output_schema,
-        )? {
-            out.push(b);
-        }
-        if let Some(b) = filter_and_tag(
+        )?);
+        out.extend(take_and_tag(
             k,
-            &key_mask(k, &update_keys, false),
+            unpaired,
             ChangeType::Delete,
             &output_schema,
-        )? {
-            out.push(b);
-        }
+        )?);
     }
     Ok(out)
+}
+
+/// The inlined row versions one change-feed window reads.
+pub(crate) struct InlinedChanges {
+    /// Inlined row versions written in the window.
+    pub(crate) inserts: Vec<DuckLakeInlinedRows>,
+    /// Inlined row versions deleted or superseded in the window.
+    pub(crate) deletes: Vec<DuckLakeInlinedRows>,
+    /// Inlined deletions of Parquet-resident rows made in the window.
+    pub(crate) file_deletes: Vec<InlinedFileDeleteChange>,
+}
+
+impl InlinedChanges {
+    /// Read the window's inlined changes; the delete side only when
+    /// `read_deletes`.
+    pub(crate) fn read(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        (start, end): (i64, i64),
+        read_deletes: bool,
+    ) -> DataFusionResult<Self> {
+        let external = |e| DataFusionError::External(Box::new(e));
+        let inserts = provider
+            .read_inlined_rows(
+                table_id,
+                columns,
+                InlinedRowSelection::InsertedBetween {
+                    start,
+                    end,
+                },
+                None,
+            )
+            .map_err(external)?;
+        let (deletes, file_deletes) = if read_deletes {
+            (
+                Self::read_deletes(provider, table_id, columns, (start, end))?,
+                provider
+                    .get_inlined_file_deletes_between(table_id, start, end)
+                    .map_err(external)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Self {
+            inserts,
+            deletes,
+            file_deletes,
+        })
+    }
+
+    /// Inlined row versions deleted or superseded in the window.
+    pub(crate) fn read_deletes(
+        provider: &dyn MetadataProvider,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        (start, end): (i64, i64),
+    ) -> DataFusionResult<Vec<DuckLakeInlinedRows>> {
+        provider
+            .read_inlined_rows(
+                table_id,
+                columns,
+                InlinedRowSelection::DeletedBetween {
+                    start,
+                    end,
+                },
+                None,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inserts.is_empty() && self.deletes.is_empty() && self.file_deletes.is_empty()
+    }
+}
+
+/// One data file's inlined deletions in a window.
+pub(crate) struct InlinedFileDeletesOfFile {
+    /// The first deletion read for the file; its data-file fields describe it.
+    pub(crate) change: InlinedFileDeleteChange,
+    /// Deleted position to deleting snapshot.
+    pub(crate) positions: HashMap<i64, i64>,
+}
+
+/// A window's inlined deletions of Parquet rows, grouped by data file and
+/// handed out to the delete records that read each file.
+///
+/// Official DuckLake attaches a file's inlined deletions to the delete records
+/// the window holds for it, and reads an inlined-only file on its own. A
+/// whole-file retirement of a file with inlined deletions in the window
+/// contributes only those deletions: official's delete filter treats the
+/// file's inlined deletions as replacing the retirement's every-row set.
+/// Upstream is wrong here, and this matches it deliberately until the fix:
+/// a rewrite deletes no row, yet the window then reports the rewritten file's
+/// rows as inserts, and a window holding only the retirement reports the
+/// earlier deletion again (see COMPATIBILITY.md). The same file reached by
+/// several delete records takes its inlined deletions once, with the first.
+pub(crate) struct InlinedFileDeletes {
+    files: HashMap<String, InlinedFileDeletesOfFile>,
+    order: Vec<String>,
+    claimed: HashSet<String>,
+}
+
+impl InlinedFileDeletes {
+    pub(crate) fn group(
+        table_path: &str,
+        changes: &[InlinedFileDeleteChange],
+    ) -> DataFusionResult<Self> {
+        let mut files: HashMap<String, InlinedFileDeletesOfFile> = HashMap::new();
+        let mut order = Vec::new();
+        for change in changes {
+            let resolved = resolve_path(
+                table_path,
+                &change.data_file_path,
+                change.data_file_path_is_relative,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let file = files.entry(resolved.clone()).or_insert_with(|| {
+                order.push(resolved);
+                InlinedFileDeletesOfFile {
+                    change: change.clone(),
+                    positions: HashMap::new(),
+                }
+            });
+            file.positions.insert(change.position, change.snapshot_id);
+            file.change.snapshot_id = file.change.snapshot_id.min(change.snapshot_id);
+        }
+        Ok(Self {
+            files,
+            order,
+            claimed: HashSet::new(),
+        })
+    }
+
+    /// The inlined deletions a delete record of the file at `resolved` reads,
+    /// and whether a whole-file retirement (`retires_file`) still deletes
+    /// every row.
+    pub(crate) fn claim(
+        &mut self,
+        resolved: &str,
+        retires_file: bool,
+    ) -> (HashMap<i64, i64>, bool) {
+        let Some(file) = self.files.get(resolved) else {
+            return (HashMap::new(), retires_file);
+        };
+        let positions = if self.claimed.insert(resolved.to_string()) {
+            file.positions.clone()
+        } else {
+            HashMap::new()
+        };
+        (positions, false)
+    }
+
+    /// The files no delete record claimed, in data-file order.
+    pub(crate) fn unclaimed(self) -> Vec<(String, InlinedFileDeletesOfFile)> {
+        let Self {
+            mut files,
+            order,
+            claimed,
+        } = self;
+        order
+            .into_iter()
+            .filter(|resolved| !claimed.contains(resolved))
+            .filter_map(|resolved| files.remove(&resolved).map(|file| (resolved, file)))
+            .collect()
+    }
+}
+
+/// Inlined row versions as [`KeyedRows`] under the feed's table schema, one per
+/// run of rows sharing a snapshot.
+fn keyed_inlined_rows(
+    rows: &[DuckLakeInlinedRows],
+    table_schema: &SchemaRef,
+) -> DataFusionResult<Vec<KeyedRows>> {
+    let mut keyed = Vec::new();
+    for rows in rows {
+        let batch = RecordBatch::try_new(Arc::clone(table_schema), rows.batch.columns().to_vec())?;
+        let rowids = Int64Array::from(rows.row_ids.clone());
+        let mut start = 0;
+        while start < rows.snapshots.len() {
+            let snapshot_id = rows.snapshots[start];
+            let mut end = start + 1;
+            while end < rows.snapshots.len() && rows.snapshots[end] == snapshot_id {
+                end += 1;
+            }
+            keyed.push(KeyedRows {
+                snapshot_id,
+                table_batch: batch.slice(start, end - start),
+                rowid: rowids.slice(start, end - start),
+            });
+            start = end;
+        }
+    }
+    Ok(keyed)
 }
 
 /// Downcast a batch column to `Int64Array` with a descriptive error.
@@ -2274,52 +2580,64 @@ fn prepend_cdc_columns(
         .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// A row-selection mask over `keyed`: `want_update` selects rows whose
-/// `(snapshot_id, rowid)` is (or is not) an update pair.
-fn key_mask(
-    keyed: &KeyedRows,
-    update_keys: &HashSet<(i64, i64)>,
-    want_update: bool,
-) -> BooleanArray {
-    BooleanArray::from(
-        (0..keyed.rowid.len())
-            .map(|i| {
-                let is_update = update_keys.contains(&(keyed.snapshot_id, keyed.rowid.value(i)));
-                is_update == want_update
-            })
-            .collect::<Vec<bool>>(),
-    )
+/// How many rows of `rows` carry each `(snapshot_id, rowid)` key.
+fn key_counts(rows: &[KeyedRows]) -> HashMap<(i64, i64), usize> {
+    let mut counts = HashMap::new();
+    for keyed in rows {
+        for i in 0..keyed.rowid.len() {
+            *counts
+                .entry((keyed.snapshot_id, keyed.rowid.value(i)))
+                .or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
-/// Filter `keyed`'s table columns by `mask`, tag with `change`, and append the
-/// CDC columns. Returns `None` when the mask selects no rows.
-fn filter_and_tag(
+/// The rows of `keyed` whose key the other side holds, each repeated once per
+/// row of the other side with that key (official's join), and the rest.
+fn pair_indices(keyed: &KeyedRows, other: &HashMap<(i64, i64), usize>) -> (Vec<u32>, Vec<u32>) {
+    let mut paired = Vec::new();
+    let mut unpaired = Vec::new();
+    for i in 0..keyed.rowid.len() {
+        let index = u32::try_from(i).expect("a batch holds fewer than 2^32 rows");
+        match other.get(&(keyed.snapshot_id, keyed.rowid.value(i))) {
+            Some(&count) => paired.extend(std::iter::repeat_n(index, count)),
+            None => unpaired.push(index),
+        }
+    }
+    (paired, unpaired)
+}
+
+/// The rows of `keyed` at `indices`, tagged with `change`, with the CDC
+/// columns appended. `None` when `indices` is empty.
+fn take_and_tag(
     keyed: &KeyedRows,
-    mask: &BooleanArray,
+    indices: Vec<u32>,
     change: ChangeType,
     output_schema: &SchemaRef,
 ) -> DataFusionResult<Option<RecordBatch>> {
-    if mask.true_count() == 0 {
+    if indices.is_empty() {
         return Ok(None);
     }
+    let indices = UInt32Array::from(indices);
+    let take = |array: &dyn Array| {
+        arrow::compute::take(array, &indices, None)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    };
     let cols: Vec<ArrayRef> = keyed
         .table_batch
         .columns()
         .iter()
-        .map(|c| {
-            arrow::compute::filter(c.as_ref(), mask)
-                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-        })
+        .map(|c| take(c.as_ref()))
         .collect::<DataFusionResult<_>>()?;
-    let filtered = RecordBatch::try_new(keyed.table_batch.schema(), cols)?;
-    let rowid = arrow::compute::filter(&keyed.rowid, mask)
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?
+    let taken = RecordBatch::try_new(keyed.table_batch.schema(), cols)?;
+    let rowid = take(&keyed.rowid)?
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| DataFusionError::Internal("filtered rowid is not Int64".to_string()))?
+        .ok_or_else(|| DataFusionError::Internal("taken rowid is not Int64".to_string()))?
         .clone();
     Ok(Some(prepend_cdc_columns(
-        &filtered,
+        &taken,
         rowid,
         keyed.snapshot_id,
         change,

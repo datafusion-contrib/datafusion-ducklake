@@ -9,11 +9,19 @@ use crate::metadata_provider::{
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
     DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, InlinedDataBackend, MetadataProvider, MetadataSetting, ObjectTag,
-    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
-    inlined_text_projection, is_inlined_data_table, parse_inlined_rows_with_present,
-    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
+    DuckLakeTag, FileWithTable, InlinedDataBackend, InlinedTableLayout, MetadataProvider,
+    MetadataSetting, ObjectTag, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata,
+    TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, block_on,
+    inlined_delete_table_name, inlined_text_projection, is_inlined_data_table,
+    parse_inlined_rows_with_present, reconstruct_columns, reconstruct_columns_with_table,
+    resolve_metadata_settings,
+};
+use crate::metadata_provider::{
+    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
+    INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange,
+    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, inlined_file_delete_change,
+    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
+    inlined_version_columns_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -27,8 +35,161 @@ use sqlx::AssertSqlSafe;
 use sqlx::Row;
 use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions, PgRow, Postgres};
 use sqlx::types::chrono::NaiveDateTime;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+
+/// Read `selection` of the inlined-data table `table` of `table_id` under
+/// `columns`, each resolved by column id against the schema version the table
+/// was written with. `None` when no row matches.
+async fn read_postgres_inlined_table(
+    connection: &mut PgConnection,
+    table_id: i64,
+    table: &str,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    shape: InlinedReadShape,
+) -> Result<Option<DuckLakeInlinedRows>> {
+    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let InlinedTableLayout {
+        system,
+        present,
+        physical_types,
+    } = inlined_table_layout(&mut *connection, table).await?;
+    let version_columns: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(
+        inlined_version_columns_sql(&quote_ident(table), &system, "$1"),
+    ))
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+
+    let mut select_list = selection
+        .system_select(&system)
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    // A string stored as `BYTEA` is read as its bytes: PostgreSQL text, which
+    // a conversion would produce, cannot hold the NUL bytes it may contain.
+    let raw_strings = columns
+        .iter()
+        .zip(schema.fields())
+        .enumerate()
+        .map(|(index, (_, field))| {
+            matches!(
+                field.data_type(),
+                arrow::datatypes::DataType::Utf8
+                    | arrow::datatypes::DataType::LargeUtf8
+                    | arrow::datatypes::DataType::Utf8View
+            ) && mapping.physical(index).is_some_and(|physical| {
+                physical_types
+                    .get(physical)
+                    .is_some_and(|ty| ty.trim().eq_ignore_ascii_case("bytea"))
+            })
+        })
+        .collect::<Vec<_>>();
+    select_list.extend(columns.iter().zip(schema.fields()).enumerate().map(
+        |(index, (column, field))| match mapping.physical(index) {
+            None => "NULL::text".to_string(),
+            Some(physical) if raw_strings[index] => quote_ident(physical),
+            Some(physical) => inlined_text_projection(
+                InlinedDataBackend::Postgres,
+                column,
+                field.data_type(),
+                &quote_ident(physical),
+                physical_types.get(physical).map(String::as_str),
+            ),
+        },
+    ));
+    let rendered = filter.and_then(|filter| {
+        let (filter, filter_schema) = mapping.physical_filter(columns, &schema, filter)?;
+        render_inlined_filter(
+            &filter,
+            InlinedSqlDialect::Postgres,
+            &filter_schema,
+            &physical_types,
+            2,
+        )
+    });
+    let pushed = rendered
+        .as_ref()
+        .map(|rendered| format!(" AND ({})", rendered.sql))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {}{pushed} ORDER BY {}",
+        select_list.join(", "),
+        quote_ident(table),
+        selection.predicate(&system, "$1", "$2"),
+        shape.order_by(&system, selection),
+    );
+    let (first, second) = selection.bounds();
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(first)
+        .bind(second);
+    if let Some(rendered) = rendered {
+        for bind in rendered.binds {
+            query = match bind {
+                InlinedSqlBind::Bool(value) => query.bind(value),
+                InlinedSqlBind::I64(value) => query.bind(value),
+                InlinedSqlBind::U64(value) => query.bind(value.to_string()),
+                InlinedSqlBind::F64(value) => query.bind(value),
+                InlinedSqlBind::Text(value) => query.bind(value),
+                InlinedSqlBind::Bytes(value) => query.bind(value),
+            };
+        }
+    }
+    let rows = query.fetch_all(&mut *connection).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.try_get(0))
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    let snapshots = rows
+        .iter()
+        .map(|row| row.try_get(1))
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    let end_snapshots = rows
+        .iter()
+        .map(|row| row.try_get(2))
+        .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
+    let values = rows
+        .iter()
+        .map(|row| {
+            (0..columns.len())
+                .map(|index| {
+                    let at = index + INLINED_SYSTEM_SELECT_WIDTH;
+                    if raw_strings[index] {
+                        row.try_get::<Option<Vec<u8>>, _>(at)?
+                            .map(|bytes| {
+                                String::from_utf8(bytes).map_err(|error| {
+                                    crate::DuckLakeError::Internal(format!(
+                                        "inlined string in {table} is not UTF-8: {error}"
+                                    ))
+                                })
+                            })
+                            .transpose()
+                    } else {
+                        Ok(row.try_get::<Option<String>, _>(at)?)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(DuckLakeInlinedRows {
+        table_name: table.to_string(),
+        row_ids,
+        snapshots,
+        end_snapshots,
+        batch: parse_inlined_rows_with_present(
+            schema,
+            columns,
+            values,
+            Some(&mapping.present(columns)),
+        )?,
+    }))
+}
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -37,6 +198,42 @@ fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
 
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The system column names DuckLake gives a new inlined data table in this
+/// catalog, from its `version` entry in `ducklake_metadata`.
+pub(crate) async fn catalog_inlined_system_columns<'e, E>(
+    executor: E,
+) -> Result<crate::metadata_provider::InlinedSystemColumns>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let version: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL",
+    )
+    .fetch_optional(executor)
+    .await?;
+    Ok(crate::metadata_provider::InlinedSystemColumns::for_catalog_version(version.as_deref()))
+}
+
+/// Read the physical columns of the inlined data table `table` in the current
+/// schema.
+pub(crate) async fn inlined_table_layout<'e, E>(
+    executor: E,
+    table: &str,
+) -> Result<InlinedTableLayout>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let columns = sqlx::query_as::<_, (String, String)>(
+        "SELECT column_name::text, data_type::text FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = $1
+         ORDER BY ordinal_position",
+    )
+    .bind(table)
+    .fetch_all(executor)
+    .await?;
+    InlinedTableLayout::from_columns(table, columns)
 }
 
 fn decode_view(row: &PgRow) -> Result<ViewMetadata> {
@@ -239,12 +436,32 @@ where
         .await
 }
 
+/// The registered inlined-data tables of `table_id`, read on `connection`.
+///
+/// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
+/// session. The caller checks first that the catalog has
+/// `ducklake_inlined_data_tables`.
+pub(crate) async fn registered_inlined_tables_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+) -> Result<Vec<String>> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
+    )
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(names
+        .into_iter()
+        .filter(|name| is_inlined_data_table(name))
+        .collect())
+}
+
 /// Every inlined row of table `table_id` visible at `snapshot_id`, read on one
 /// connection: the table's inlined-data tables from the registry, then each
-/// one's columns and rows. `filter`, when given, narrows the rows in SQL. Also
-/// returns the snapshot through which the registry names no table for
-/// `table_id`, if it names none (see
-/// [`MetadataProvider::scan_inlined_data_noting_absence`]).
+/// one's rows. `filter`, when given, narrows the rows in SQL. Also returns the
+/// snapshot through which the catalog holds no inlined row of `table_id`, if
+/// it holds none (see [`MetadataProvider::scan_inlined_data_noting_absence`]).
 ///
 /// `catalog_id` names the multicatalog catalog whose head bounds that
 /// snapshot. `None` takes the head of a single-catalog store.
@@ -282,203 +499,199 @@ pub(crate) async fn scan_inlined_data_on(
     .fetch_one(&mut *connection)
     .await?;
     let (registry, head): (Vec<String>, i64) = (row.try_get(0)?, row.try_get(1)?);
-    // Commits to one catalog take their snapshots in commit order, each above
-    // the last, so a table registered after this read holds only rows above
-    // `head`.
-    let absent_through = registry.is_empty().then(|| snapshot_id.min(head));
-    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
+    let through = snapshot_id.min(head);
     let mut batches = Vec::new();
-
-    for table in registry {
-        if !is_inlined_data_table(&table) {
-            continue;
-        }
-        let physical_columns = sqlx::query(
-            "SELECT column_name, data_type FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = $1",
-        )
-        .bind(&table)
-        .fetch_all(&mut *connection)
-        .await?;
-        let present = physical_columns
-            .iter()
-            .map(|row| row.try_get::<String, _>(0))
-            .collect::<std::result::Result<HashSet<_>, _>>()?;
-        let physical_types = physical_columns
-            .iter()
-            .map(|row| Ok((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
-            .collect::<std::result::Result<HashMap<_, _>, sqlx::Error>>()?;
-        let projected = columns
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                if !present.contains(&column.column_name) {
-                    "NULL::text".to_string()
-                } else {
-                    let ident = quote_ident(&column.column_name);
-                    inlined_text_projection(
-                        InlinedDataBackend::Postgres,
-                        column,
-                        field.data_type(),
-                        &ident,
-                    )
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let rendered = filter.and_then(|filter| {
-            render_inlined_filter(
-                filter,
-                InlinedSqlDialect::Postgres,
-                schema.as_ref(),
-                &physical_types,
-                2,
-            )
-        });
-        let pushed = rendered
-            .as_ref()
-            .map(|rendered| format!(" AND ({})", rendered.sql))
-            .unwrap_or_default();
-        let sql = format!(
-            "SELECT {projected} FROM {} \
-             WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL){pushed} \
-                 ORDER BY row_id",
-            quote_ident(&table)
-        );
-        let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(snapshot_id)
-            .bind(snapshot_id);
-        if let Some(rendered) = rendered {
-            for bind in rendered.binds {
-                query = match bind {
-                    InlinedSqlBind::Bool(value) => query.bind(value),
-                    InlinedSqlBind::I64(value) => query.bind(value),
-                    InlinedSqlBind::U64(value) => query.bind(value.to_string()),
-                    InlinedSqlBind::F64(value) => query.bind(value),
-                    InlinedSqlBind::Text(value) => query.bind(value),
-                    InlinedSqlBind::Bytes(value) => query.bind(value),
-                };
-            }
-        }
-        let rows = query.fetch_all(&mut *connection).await?;
-        if rows.is_empty() {
-            continue;
-        }
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                (0..columns.len())
-                    .map(|index| row.try_get::<Option<String>, _>(index))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        batches.push(parse_inlined_rows_with_present(
-            schema.clone(),
+    // `CREATE TABLE` and column changes register an inlined-data table before
+    // it holds a row, so an empty registry is not the only answer to keep: a
+    // registered table holding no row begun at or below `through` answers the
+    // same. Commits to one catalog take their snapshots in commit order, each
+    // above the last, so every row inserted after this read, into a registered
+    // table or a newly registered one, begins above `head`.
+    let mut absent = true;
+    for table in registry.iter().filter(|table| is_inlined_data_table(table)) {
+        if let Some(rows) = read_postgres_inlined_table(
+            connection,
+            table_id,
+            table,
             columns,
-            rows,
-            Some(&present),
-        )?);
+            InlinedRowSelection::VisibleAt(snapshot_id),
+            filter,
+            InlinedReadShape::Scan,
+        )
+        .await?
+        {
+            absent = false;
+            batches.push(rows.batch);
+        } else if absent {
+            // No row visible at `snapshot_id` under `filter`, but a row the
+            // filter excludes, or one ended by then, can still be seen at an
+            // earlier snapshot.
+            absent = first_inlined_snapshot_on(connection, table, through)
+                .await?
+                .is_none();
+        }
     }
-    Ok((InlinedDataScan::from_batches(batches), absent_through))
+    Ok((
+        InlinedDataScan::from_batches(batches),
+        absent.then_some(through),
+    ))
 }
 
-/// Every inlined row of table `table_id` visible at `snapshot_id`, with its row
-/// id and begin snapshot, read on one connection: the table's inlined-data
-/// tables from the registry, then each one's columns and rows.
+/// The inlined row versions of `table_id` that `selection` picks, one entry per
+/// registered inlined-data table with rows, all read on `connection`. See
+/// [`MetadataProvider::read_inlined_rows`].
 ///
 /// Shared with [`crate::multicatalog_provider`], which runs it on a query's read
 /// session. The caller checks first that the catalog has
 /// `ducklake_inlined_data_tables`.
-pub(crate) async fn inlined_data_with_row_ids_on(
+pub(crate) async fn read_inlined_rows_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    shape: InlinedReadShape,
+) -> Result<Vec<DuckLakeInlinedRows>> {
+    let mut out = Vec::new();
+    for table in registered_inlined_tables_on(connection, table_id).await? {
+        if let Some(rows) = read_postgres_inlined_table(
+            connection, table_id, &table, columns, selection, filter, shape,
+        )
+        .await?
+        {
+            out.push(rows);
+        }
+    }
+    Ok(out)
+}
+
+/// The earliest begin snapshot at or below `snapshot_id` in the inlined-data
+/// table `table`, read on `connection`; `None` when it holds no such row. A
+/// flush reads the table under the columns of that snapshot.
+pub(crate) async fn first_inlined_snapshot_on(
+    connection: &mut PgConnection,
+    table: &str,
+    snapshot_id: i64,
+) -> Result<Option<i64>> {
+    let system = inlined_table_layout(&mut *connection, table).await?.system;
+    let sql = format!(
+        "SELECT MIN({begin}) FROM {} WHERE {begin} <= $1",
+        quote_ident(table),
+        begin = system.begin_snapshot,
+    );
+    Ok(sqlx::query_scalar(AssertSqlSafe(sql))
+        .bind(snapshot_id)
+        .fetch_one(&mut *connection)
+        .await?)
+}
+
+/// The rows of `table`, an inlined-data table of `table_id`, written at or
+/// below `snapshot_id`, for a flush, read on `connection`.
+pub(crate) async fn inlined_table_for_flush_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    table: &str,
+    columns: &[DuckLakeTableColumn],
+    snapshot_id: i64,
+) -> Result<Option<DuckLakeInlinedRows>> {
+    read_postgres_inlined_table(
+        connection,
+        table_id,
+        table,
+        columns,
+        InlinedRowSelection::WrittenUpTo(snapshot_id),
+        None,
+        InlinedReadShape::Flush,
+    )
+    .await
+}
+
+/// The inlined deletions of Parquet rows of `table_id` a flush at `snapshot_id`
+/// writes out, with their data files and live delete files, read on
+/// `connection`. A table without an inlined-deletion table has none.
+pub(crate) async fn inlined_file_deletes_for_flush_on(
     connection: &mut PgConnection,
     table_id: i64,
     snapshot_id: i64,
-    columns: &[DuckLakeTableColumn],
-) -> Result<Vec<DuckLakeInlinedData>> {
-    let entries =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1")
-            .bind(table_id)
-            .fetch_all(&mut *connection)
-            .await?;
-    let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
-    let mut batches = Vec::new();
-
-    for entry in entries {
-        let table: String = entry.try_get("table_name")?;
-        if !is_inlined_data_table(&table) {
-            continue;
-        }
-        let present = sqlx::query(
-            "SELECT column_name FROM information_schema.columns
-             WHERE table_schema = current_schema() AND table_name = $1",
-        )
-        .bind(&table)
-        .fetch_all(&mut *connection)
-        .await?
-        .into_iter()
-        .map(|row| row.try_get::<String, _>(0))
-        .collect::<std::result::Result<HashSet<_>, _>>()?;
-        let projected = columns
-            .iter()
-            .zip(schema.fields())
-            .map(|(column, field)| {
-                if !present.contains(&column.column_name) {
-                    "NULL::text".to_string()
-                } else {
-                    let ident = quote_ident(&column.column_name);
-                    inlined_text_projection(
-                        InlinedDataBackend::Postgres,
-                        column,
-                        field.data_type(),
-                        &ident,
-                    )
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "SELECT row_id, begin_snapshot, {projected} FROM {}
-             WHERE $1 >= begin_snapshot AND ($2 < end_snapshot OR end_snapshot IS NULL)
-             ORDER BY begin_snapshot, row_id",
-            quote_ident(&table)
-        );
-        let rows = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(snapshot_id)
-            .bind(snapshot_id)
-            .fetch_all(&mut *connection)
-            .await?;
-        if rows.is_empty() {
-            continue;
-        }
-        let row_ids = rows
-            .iter()
-            .map(|row| row.try_get("row_id"))
-            .collect::<std::result::Result<Vec<i64>, _>>()?;
-        let begin_snapshots = rows
-            .iter()
-            .map(|row| row.try_get("begin_snapshot"))
-            .collect::<std::result::Result<Vec<i64>, _>>()?;
-        let decoded_rows = rows
-            .into_iter()
-            .map(|row| {
-                (0..columns.len())
-                    .map(|index| row.try_get::<Option<String>, _>(index + 2))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        batches.push(DuckLakeInlinedData {
-            table_name: table,
-            row_ids,
-            begin_snapshots,
-            batch: parse_inlined_rows_with_present(
-                schema.clone(),
-                columns,
-                decoded_rows,
-                Some(&present),
-            )?,
-        });
+) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+    let table = inlined_delete_table_name(table_id)?;
+    let sql = format!(
+        "{} ORDER BY del.file_id, del.row_id",
+        inlined_file_deletes_for_flush_sql(&quote_ident(&table), |n| format!("${n}"))
+    );
+    let mut query = sqlx::query(AssertSqlSafe(sql));
+    for _ in 0..crate::metadata_provider::INLINED_FILE_DELETES_FOR_FLUSH_PARAMS {
+        query = query.bind(snapshot_id);
     }
-    Ok(batches)
+    let rows = match query.fetch_all(&mut *connection).await {
+        Ok(rows) => rows,
+        Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    rows.iter()
+        .map(|row| {
+            let mut data_file =
+                DuckLakeFileData::new(row.try_get(3)?, row.try_get(4)?, row.try_get(5)?);
+            data_file.encryption_key = row.try_get(6)?;
+            let existing_delete = match row.try_get::<Option<i64>, _>(7)? {
+                Some(id) => {
+                    let mut file =
+                        DuckLakeFileData::new(row.try_get(8)?, row.try_get(9)?, row.try_get(10)?);
+                    file.footer_size = row.try_get(11)?;
+                    file.encryption_key = row.try_get(12)?;
+                    Some((id, file, row.try_get(13)?))
+                },
+                None => None,
+            };
+            Ok(DuckLakeInlinedFileDeleteForFlush {
+                data_file_id: row.try_get(0)?,
+                row_id: row.try_get(1)?,
+                begin_snapshot: row.try_get(2)?,
+                data_file,
+                existing_delete,
+                data_file_end: row.try_get(14)?,
+                existing_delete_end: row.try_get(15)?,
+                earlier_delete_end: row.try_get(16)?,
+            })
+        })
+        .collect()
+}
+
+/// The inlined deletions of Parquet rows of `table_id` committed after
+/// `start_snapshot` and at or below `end_snapshot`, read on `connection`. A
+/// table without an inlined-deletion table has none.
+pub(crate) async fn inlined_file_deletes_between_on(
+    connection: &mut PgConnection,
+    table_id: i64,
+    start_snapshot: i64,
+    end_snapshot: i64,
+) -> Result<Vec<InlinedFileDeleteChange>> {
+    let table = quote_ident(&inlined_delete_table_name(table_id)?);
+    let sql = inlined_file_deletes_between_sql(&table, ["$1", "$2", "$3"]);
+    match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+        .bind(table_id)
+        .bind(start_snapshot)
+        .bind(end_snapshot)
+        .fetch_all(&mut *connection)
+        .await
+    {
+        Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
+        Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The begin snapshot of delete file `delete_file_id`, read on `connection`.
+pub(crate) async fn delete_file_begin_snapshot_on(
+    connection: &mut PgConnection,
+    delete_file_id: i64,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(
+        "SELECT begin_snapshot FROM ducklake_delete_file WHERE delete_file_id = $1",
+    )
+    .bind(delete_file_id)
+    .fetch_optional(&mut *connection)
+    .await?)
 }
 
 /// Statistics SQL for a catalog queried natively as PostgreSQL.
@@ -661,9 +874,9 @@ impl StatsSqlDialect for PostgresStatsDialect {
 /// side, and it has no range a stat written by another engine could overflow —
 /// a narrower target would decline such a stat and lose the pruning, and the
 /// stats table is small enough that the arithmetic is not what this query
-/// costs. Floats map to `double precision` for the same reason: both sides are
-/// the shortest round-trip *text* of the value, so parsing them at higher
-/// precision than the column preserves both equality and order.
+/// costs. Floats map to `double precision`: a `DOUBLE` constant compares
+/// exactly, and a `FLOAT` one arrives as a cast to `Float64` compared against
+/// the edges of its rounding window (see `stats_filter`, divergence 11).
 ///
 /// Absent types are ones [`crate::stats_encode::encode_scalar`] has no
 /// canonical text for (`TIME`, `INTERVAL`, `Decimal256`, `UUID`, blobs, nested
@@ -714,7 +927,7 @@ pub(crate) fn postgres_cast_type(data_type: &DataType) -> Option<&'static str> {
 /// so on these servers a date or timestamp comparison pushes down nothing.
 pub(crate) fn postgres_castable_pattern(target: &str) -> Option<&'static str> {
     Some(match target {
-        "boolean" => r"^(true|false)$",
+        "boolean" => r"^(true|false|1|0)$",
         "numeric" => r"^-?[0-9]{1,255}(\.[0-9]{1,255})?$",
         // `inf` is a value this crate writes and PostgreSQL orders correctly.
         // `nan` is not: it parses, and comparing against it prunes a file whose
@@ -889,6 +1102,40 @@ impl PostgresMetadataProvider {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The registered inlined-data tables of `table_id`; none on a catalog
+    /// without the registry.
+    async fn registered_inlined_tables(&self, table_id: i64) -> Result<Vec<String>> {
+        if !self.schema_capabilities().await?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.pool.acquire().await?;
+        registered_inlined_tables_on(&mut connection, table_id).await
+    }
+
+    /// Read the inlined row versions `selection` picks, one entry per physical
+    /// inlined-data table with rows. See [`MetadataProvider::read_inlined_rows`].
+    async fn read_inlined_rows_postgres(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        shape: InlinedReadShape,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        if !self.schema_capabilities().await?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.pool.acquire().await?;
+        read_inlined_rows_on(&mut connection, table_id, columns, selection, filter, shape).await
+    }
+
+    /// Whether the catalog has the `ducklake_inlined_data_tables` registry, from
+    /// the capability probe every inlined read uses. A catalog created before data
+    /// inlining lacks it.
+    pub(crate) async fn has_inlined_data_registry(&self) -> Result<bool> {
+        Ok(self.schema_capabilities().await?.inlined_data_tables)
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -2026,12 +2273,92 @@ impl MetadataProvider for PostgresMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        block_on(async {
-            if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
+        let rows = block_on(self.read_inlined_rows_postgres(
+            table_id,
+            columns,
+            InlinedRowSelection::VisibleAt(snapshot_id),
+            None,
+            InlinedReadShape::Mutation,
+        ))?;
+        Ok(rows.into_iter().map(DuckLakeInlinedData::from).collect())
+    }
+
+    fn read_inlined_rows(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(self.read_inlined_rows_postgres(
+            table_id,
+            columns,
+            selection,
+            filter,
+            InlinedReadShape::Changes,
+        ))
+    }
+
+    fn get_inlined_data_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFlushData>> {
+        let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let mut flushed = Vec::new();
+        for table in tables {
+            let first = block_on(async {
+                let mut connection = self.pool.acquire().await?;
+                first_inlined_snapshot_on(&mut connection, &table, snapshot_id).await
+            })?;
+            let Some(first) = first else {
+                continue;
+            };
+            let columns = self.get_table_structure(table_id, first)?;
+            let rows = block_on(async {
+                let mut connection = self.pool.acquire().await?;
+                inlined_table_for_flush_on(&mut connection, table_id, &table, &columns, snapshot_id)
+                    .await
+            })?;
+            if let Some(rows) = rows {
+                flushed.push(DuckLakeInlinedFlushData {
+                    rows,
+                    columns,
+                    columns_snapshot: first,
+                });
             }
+        }
+        Ok(flushed)
+    }
+
+    fn get_inlined_file_deletes_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+        block_on(async {
             let mut connection = self.pool.acquire().await?;
-            inlined_data_with_row_ids_on(&mut connection, table_id, snapshot_id, columns).await
+            inlined_file_deletes_for_flush_on(&mut connection, table_id, snapshot_id).await
+        })
+    }
+
+    fn get_inlined_file_deletes_between(
+        &self,
+        table_id: i64,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        block_on(async {
+            let mut connection = self.pool.acquire().await?;
+            inlined_file_deletes_between_on(&mut connection, table_id, start_snapshot, end_snapshot)
+                .await
+        })
+    }
+
+    fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
+        block_on(async {
+            let mut connection = self.pool.acquire().await?;
+            delete_file_begin_snapshot_on(&mut connection, delete_file_id).await
         })
     }
 
@@ -2622,16 +2949,13 @@ impl MetadataProvider for PostgresMetadataProvider {
         block_on(async {
             // PostgreSQL equivalent of DuckDB's SQL_GET_DELETE_FILES_ADDED_BETWEEN_SNAPSHOTS
             // Uses LATERAL joins instead of MAX_BY/COLUMNS
-            // Cumulative (current-spec) delete files can hold in-window deletions
-            // even when their begin_snapshot predates the window; included via
-            // `ducklake_delete_file.partial_max`. Older catalogs lack the column
-            // (and cumulative delete files); degrade it to NULL there.
-            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
-                "ddf.partial_max::bigint"
-            } else {
-                "NULL::bigint"
-            };
-            let rows = sqlx::query(AssertSqlSafe(format!(
+            // `current_delete` takes every delete file that begins by the
+            // window's end, as official does: one that records each row's
+            // deleting snapshot (a flush's, dated at the earliest of them) can
+            // hold in-window deletions though it begins before the window. The
+            // feed windows its rows per row; a delete file without that column
+            // adds nothing before its own begin_snapshot.
+            let rows = sqlx::query(
                 r#"
 WITH current_delete AS (
     SELECT
@@ -2645,8 +2969,6 @@ WITH current_delete AS (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.begin_snapshot <= $3
-      AND (ddf.begin_snapshot >= $2
-           OR ({pm} IS NOT NULL AND {pm} >= $2))
 ),
 
 data_files AS (
@@ -2726,8 +3048,8 @@ LEFT JOIN LATERAL (
 WHERE data.table_id = $1
   AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
-"#
-            )))
+"#,
+            )
             .bind(table_id)
             .bind(start_snapshot)
             .bind(end_snapshot)
@@ -3105,8 +3427,9 @@ mod tests {
     /// An encoding whose bytes do not order chronologically is declined.
     ///
     /// Text comparison is only sound for the one shape `stats_encode` writes.
-    /// `chrono` renders a year past 9999 as `+12345` and one before the common
-    /// era as `-0044`, and both sort below every digit; `.50` sorts above `.5`
+    /// A year past 9999 has a fifth digit and one before the common era is
+    /// marked ` (BC)`, or, from other writers, `+12345` and `-0044`, which sort
+    /// below every digit; `.50` sorts above `.5`
     /// while naming the same instant; and `12:00:00+01` sorts above
     /// `12:00:00+00` while being earlier.
     #[test]
@@ -3118,8 +3441,8 @@ mod tests {
             splice(predicate, column("a", data_type, 2), 3, true).is_none()
         };
 
-        // 4_000_000 days after the epoch renders `+12921-08-18`; -800_000 gives
-        // `-0221-09-04`.
+        // 4_000_000 days after the epoch renders `12921-08-18`; -800_000 gives
+        // `0222-09-04 (BC)`.
         assert!(declines(
             ScalarValue::Date32(Some(4_000_000)),
             DataType::Date32
@@ -3129,8 +3452,8 @@ mod tests {
             DataType::Date32
         ));
 
-        // Year zero orders fine as text, so unlike the cast path this admits it.
-        assert!(!declines(
+        // Year zero is 1 BC, spelled `0001-01-01 (BC)` as DuckDB spells it.
+        assert!(declines(
             ScalarValue::Date32(Some(-719_528)),
             DataType::Date32
         ));

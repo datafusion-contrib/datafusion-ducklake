@@ -1376,17 +1376,35 @@ async fn merge_nested_table_uses_top_level_stats_ids() {
         .await,
         1,
     );
+    // The merged file records stats for `id` and for the list's element field,
+    // as official does per leaf, and none for the `items` container or under
+    // the embedded columns' ids.
     assert_eq!(
         scalar_i64(
             &p,
             "SELECT COUNT(*) FROM ducklake_file_column_stats s
              JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
              JOIN ducklake_column c ON c.column_id = s.column_id
-             WHERE d.end_snapshot IS NULL AND c.parent_column IS NOT NULL",
+             WHERE d.end_snapshot IS NULL AND c.parent_column IS NOT NULL
+               AND s.min_value = '10' AND s.max_value = '40'",
+        )
+        .await,
+        1,
+        "the element field's stats span both sources",
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            "SELECT COUNT(*) FROM ducklake_file_column_stats s
+             JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
+             WHERE d.end_snapshot IS NULL
+               AND s.column_id NOT IN (
+                   SELECT c.column_id FROM ducklake_column c
+                   WHERE c.column_name IN ('id', 'element'))",
         )
         .await,
         0,
-        "compaction stats must not label an embedded column with a nested field id",
+        "compaction stats must not label the container or an embedded column",
     );
 
     let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
@@ -1531,7 +1549,7 @@ async fn merge_coalesces_small_files_preserving_results_rowids_and_time_travel()
             .unwrap()
             .try_get(0)
             .unwrap();
-    assert_eq!(changes, format!("compacted_table:{tid}"));
+    assert_eq!(changes, format!("merge_adjacent:{tid}"));
 
     // Identical query results, and rowid lineage preserved across the rewrite.
     assert_eq!(
@@ -1710,9 +1728,13 @@ async fn rewrite_drops_deleted_rows_and_retires_data_and_delete_files() {
     let tid = scalar_i64(&p, "SELECT table_id FROM ducklake_table LIMIT 1").await;
     let create_snapshot = scalar_i64(&p, "SELECT MAX(snapshot_id) FROM ducklake_snapshot").await;
 
-    // Delete eight of the ten rows via SQL (a positional delete file).
+    // Delete eight of the ten rows via SQL (a positional delete file, so no
+    // deletion is inlined).
     {
         let writer = SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap();
+        writer
+            .set_global_setting("data_inlining_row_limit", "0")
+            .unwrap();
         let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
         let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
         let ctx = SessionContext::new();
@@ -1843,7 +1865,7 @@ async fn rewrite_drops_deleted_rows_and_retires_data_and_delete_files() {
             .unwrap()
             .try_get(0)
             .unwrap();
-    assert_eq!(changes, format!("compacted_table:{tid}"));
+    assert_eq!(changes, format!("rewrite_delete:{tid}"));
 
     // Rowid lineage of the surviving rows preserved (row 9 was position 8, row 10 position 9).
     assert_eq!(read_id_rowid(&temp).await, vec![(9, 8), (10, 9)]);

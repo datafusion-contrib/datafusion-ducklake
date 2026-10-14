@@ -117,13 +117,195 @@ pub(crate) fn parse_ducklake_scalar_leaf(value: &str, data_type: &DataType) -> O
             .parse::<i64>()
             .ok()
             .map(|value| ScalarValue::TimestampNanosecond(Some(value), timezone.clone()))
-            .or_else(|| ScalarValue::try_from_string(value.to_string(), data_type).ok()),
+            .or_else(|| ScalarValue::try_from_string(value.to_string(), data_type).ok())
+            .or_else(|| parse_duckdb_temporal(value, data_type)),
         DataType::List(_)
         | DataType::LargeList(_)
         | DataType::FixedSizeList(_, _)
         | DataType::Struct(_)
         | DataType::Map(_, _) => None,
+        DataType::Date32 | DataType::Timestamp(_, _) => {
+            ScalarValue::try_from_string(value.to_string(), data_type)
+                .ok()
+                .or_else(|| parse_duckdb_temporal(value, data_type))
+        },
+        DataType::Time32(_) | DataType::Time64(_) => {
+            ScalarValue::try_from_string(value.to_string(), data_type)
+                .ok()
+                .or_else(|| parse_end_of_day(value, data_type))
+        },
         _ => ScalarValue::try_from_string(value.to_string(), data_type).ok(),
+    }
+}
+
+/// DuckDB's `TIME` `24:00:00`, the end of the day, which Arrow's parser
+/// does not take.
+fn parse_end_of_day(text: &str, data_type: &DataType) -> Option<ScalarValue> {
+    let text = text.trim();
+    let fraction = text.strip_prefix("24:00:00")?;
+    if !(fraction.is_empty()
+        || fraction
+            .strip_prefix('.')
+            .is_some_and(|zeros| zeros.bytes().all(|b| b == b'0')))
+    {
+        return None;
+    }
+    Some(match data_type {
+        DataType::Time32(TimeUnit::Second) => ScalarValue::Time32Second(Some(86_400)),
+        DataType::Time32(TimeUnit::Millisecond) => ScalarValue::Time32Millisecond(Some(86_400_000)),
+        DataType::Time64(TimeUnit::Microsecond) => {
+            ScalarValue::Time64Microsecond(Some(86_400_000_000))
+        },
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            ScalarValue::Time64Nanosecond(Some(86_400_000_000_000))
+        },
+        _ => return None,
+    })
+}
+
+/// A date or timestamp in DuckDB's text, which Arrow's parser does not take
+/// for `infinity` and `-infinity`, years before 1 (`0044-03-15 (BC)`,
+/// `0101-01-01 (BC) 00:00:00.5`) or past 9999 (`12000-01-01`), up to the
+/// limits of DuckDB's types. A trailing UTC offset (`+00`, `+05:30`, `Z`) is
+/// applied; `T` may separate the date and the time.
+fn parse_duckdb_temporal(text: &str, data_type: &DataType) -> Option<ScalarValue> {
+    let text = text.trim();
+    let infinite = match text {
+        "infinity" => Some(false),
+        "-infinity" => Some(true),
+        _ => None,
+    };
+    if let Some(negative) = infinite {
+        // DuckDB's sentinels, which a DuckDB reader of the same Arrow value
+        // takes back as `infinity` and `-infinity`.
+        let sign = |max: i64| {
+            if negative {
+                -max
+            } else {
+                max
+            }
+        };
+        return Some(match data_type {
+            DataType::Date32 => ScalarValue::Date32(Some(sign(i64::from(i32::MAX)) as i32)),
+            DataType::Timestamp(unit, timezone) => {
+                timestamp_scalar(unit, sign(i64::MAX), timezone.clone())
+            },
+            _ => return None,
+        });
+    }
+    let bc = text.contains("(BC)");
+    let text = text.replace(" (BC)", "").replace("(BC)", "");
+    let text = text.trim();
+    // The date ends at the first space or `T` after its year.
+    let split = text
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| *c == ' ' || *c == 'T')
+        .map(|(index, _)| index);
+    let (date, time) = match split {
+        Some(index) => (&text[..index], Some(text[index + 1..].trim())),
+        None => (text, None),
+    };
+    let mut parts = date.rsplitn(3, '-');
+    let day: i64 = parse_field(parts.next()?)?;
+    let month: i64 = parse_field(parts.next()?)?;
+    let mut year: i64 = parse_field(parts.next()?)?;
+    if bc {
+        year = 1 - year;
+    }
+    let days = crate::stats_encode::days_from_civil(year, month, day)?;
+    if matches!(data_type, DataType::Date32) {
+        return Some(ScalarValue::Date32(Some(i32::try_from(days).ok()?)));
+    }
+    let DataType::Timestamp(unit, timezone) = data_type else {
+        return None;
+    };
+    let (clock, offset_seconds) = match time {
+        None => ("00:00:00", 0_i128),
+        Some(time) => {
+            let (clock, offset) = match time.find(['+', '-', 'Z']) {
+                Some(index) => (&time[..index], Some(&time[index..])),
+                None => (time, None),
+            };
+            let offset_seconds = match offset {
+                None | Some("Z") => 0,
+                Some(offset) => {
+                    let mut fields = offset[1..].split(':');
+                    let hours = parse_field(fields.next()?)?;
+                    let minutes = fields.next().map_or(Some(0), parse_field)?;
+                    let seconds = fields.next().map_or(Some(0), parse_field)?;
+                    let magnitude = clock_seconds(hours, minutes, seconds)?;
+                    if offset.starts_with('-') {
+                        -magnitude
+                    } else {
+                        magnitude
+                    }
+                },
+            };
+            (clock.trim(), offset_seconds)
+        },
+    };
+    let (whole, fraction) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut fields = whole.split(':');
+    let hours = parse_field(fields.next()?)?;
+    let minutes = parse_field(fields.next()?)?;
+    let seconds = parse_field(fields.next()?)?;
+    if fields.next().is_some()
+        || fraction.len() > 9
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let nanos: i128 = format!("{fraction:0<9}").parse().ok()?;
+    let total_seconds = i128::from(days)
+        .checked_mul(86_400)?
+        .checked_add(clock_seconds(hours, minutes, seconds)?)?
+        .checked_sub(offset_seconds)?;
+    let (per_second, nanos_per_unit) = match unit {
+        TimeUnit::Second => (1_i128, 1_000_000_000_i128),
+        TimeUnit::Millisecond => (1_000, 1_000_000),
+        TimeUnit::Microsecond => (1_000_000, 1_000),
+        TimeUnit::Nanosecond => (1_000_000_000, 1),
+    };
+    if nanos % nanos_per_unit != 0 {
+        return None;
+    }
+    let value = total_seconds
+        .checked_mul(per_second)?
+        .checked_add(nanos / nanos_per_unit)?;
+    Some(timestamp_scalar(
+        unit,
+        i64::try_from(value).ok()?,
+        timezone.clone(),
+    ))
+}
+
+/// A run of at most 18 ASCII digits as a number.
+fn parse_field(text: &str) -> Option<i64> {
+    if text.is_empty() || text.len() > 18 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// `hours:minutes:seconds` as seconds, `None` on overflow.
+fn clock_seconds(hours: i64, minutes: i64, seconds: i64) -> Option<i128> {
+    i128::from(hours)
+        .checked_mul(3_600)?
+        .checked_add(i128::from(minutes).checked_mul(60)?)?
+        .checked_add(i128::from(seconds))
+}
+
+fn timestamp_scalar(
+    unit: &TimeUnit,
+    value: i64,
+    timezone: Option<std::sync::Arc<str>>,
+) -> ScalarValue {
+    match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(Some(value), timezone),
+        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(Some(value), timezone),
+        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(Some(value), timezone),
+        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(Some(value), timezone),
     }
 }
 
@@ -177,6 +359,39 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
             u8::from_str_radix(pair, 16).ok()
         })
         .collect()
+}
+
+/// The DuckLake type names this crate reads as geometry (WKB), lower case.
+const GEOMETRY_TYPES: [&str; 9] = [
+    "geometry",
+    "point",
+    "linestring",
+    "polygon",
+    "multipoint",
+    "multilinestring",
+    "multipolygon",
+    "geometrycollection",
+    "linestring z",
+];
+
+/// Whether official DuckLake refuses to inline a column of DuckLake type
+/// `column_type`: a geometry (`SupportsInlining`). A column whose type holds
+/// one is recorded with a child column row of that type.
+pub(crate) fn refuses_inlining(column_type: &str) -> bool {
+    let column_type = column_type.trim();
+    GEOMETRY_TYPES
+        .iter()
+        .any(|geometry| geometry.eq_ignore_ascii_case(column_type))
+}
+
+/// The SQL list `'geometry', 'point', ...` of the lower-case type names
+/// [`refuses_inlining`] refuses, for `LOWER(column_type) IN (...)`.
+pub(crate) fn sql_uninlinable_types() -> String {
+    GEOMETRY_TYPES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Convert a DuckLake type string to an Arrow DataType
@@ -428,21 +643,30 @@ fn decimal_data_type(precision: u8, scale: i8) -> DataType {
 /// Returns `Ok(None)` if the type string is not a decimal type.
 /// Returns `Err` if it is a decimal type but has invalid precision/scale.
 fn parse_decimal(type_str: &str) -> Result<Option<DataType>> {
+    let type_str = type_str.trim();
     let normalized = type_str.to_ascii_lowercase();
-    if !normalized.starts_with("decimal") && !normalized.starts_with("numeric") {
+    let Some(rest) = ["decimal", "numeric"]
+        .iter()
+        .find_map(|name| normalized.strip_prefix(name))
+    else {
+        return Ok(None);
+    };
+    // Only `decimal(...)` / `numeric(...)`: a longer name is another type, and
+    // a bare `decimal` is not one this mapping knows.
+    let rest = rest.trim_start();
+    if !rest.starts_with('(') {
         return Ok(None);
     }
-
-    // Extract parameters from parentheses
-    let start = match type_str.find('(') {
-        Some(s) => s,
-        None => return Ok(None),
+    // The parameter list must close the type. Text after it is some other
+    // type (`decimal(18,3)[]`, a list) or no type at all, which the caller's
+    // remaining parsers accept or reject.
+    let start = type_str.len() - rest.len();
+    let Some(params) = type_str[start + 1..]
+        .strip_suffix(')')
+        .filter(|params| !params.contains(['(', ')']))
+    else {
+        return Ok(None);
     };
-    let end = match type_str.find(')') {
-        Some(e) => e,
-        None => return Ok(None),
-    };
-    let params = &type_str[start + 1..end];
 
     let parts: Vec<&str> = params.split(',').map(|s| s.trim()).collect();
 
@@ -2831,6 +3055,36 @@ mod tests {
         assert_eq!(
             ducklake_to_arrow_type("list<varchar>").unwrap(),
             DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true)))
+        );
+    }
+
+    #[test]
+    fn test_decimal_rejects_trailing_text() {
+        for hostile in [
+            "decimal(18,3); DROP TABLE ducklake_snapshot; --",
+            "decimal(18,3) x",
+            "decimal(18,3))",
+            "decimal(18,(3))",
+            "numeric(4)garbage",
+            "decimalx(18,3)",
+        ] {
+            assert!(
+                ducklake_to_arrow_type(hostile).is_err(),
+                "{hostile} parsed as {:?}",
+                ducklake_to_arrow_type(hostile)
+            );
+        }
+        assert_eq!(
+            ducklake_to_arrow_type(" decimal ( 18 , 3 ) ").unwrap(),
+            DataType::Decimal128(18, 3)
+        );
+        assert_eq!(
+            ducklake_to_arrow_type("decimal(18,3)[]").unwrap(),
+            DataType::List(Arc::new(Field::new(
+                LIST_ELEMENT_NAME,
+                DataType::Decimal128(18, 3),
+                true
+            )))
         );
     }
 

@@ -120,10 +120,10 @@
 //! all. The canonical encoding is chronologically ordered byte-wise, so
 //! comparing the two strings answers the same question exactly, at full
 //! precision, and parses nothing — an impossible date cannot raise. It is sound
-//! only for that one encoding: `chrono` renders a year past 9999 as `+12345` and
-//! one before the common era as `-0044`, both of which sort below every digit,
-//! and `.50` sorts above `.5` while naming the same instant. Anything else is
-//! declined.
+//! only for that one encoding with a four-digit year: a year past 9999 has five
+//! digits (`12345-01-01` sorts below `2024-01-01`), one before the common era
+//! is marked ` (BC)` after the date, and `.50` sorts above `.5` while naming the
+//! same instant. Anything else is declined.
 //!
 //! **7. A NaN or non-finite constant pushes down nothing.** Official prunes on
 //! `contains_nan` for `x = NaN`, and emits a real comparison for `x < inf`.
@@ -138,10 +138,13 @@
 //! from its entry point). It is the *column's* stored bounds that exclude NaN,
 //! and a `PhysicalExpr` handed to [`crate::DuckLakeTable::files_matching`]
 //! carries no guarantee the constant was coerced to the column's type, so the
-//! gate follows the column while the cast still follows the constant. The
-//! difference shows only for a non-float column compared against a float
-//! constant, where this prunes and official cannot; a non-float column holds no
-//! NaN, so its bounds are sound.
+//! gate follows the column while the cast still follows the constant. A
+//! constant whose type differs from a float column's, or a float constant on a
+//! column of another type, pushes down nothing: the cast would round a bound,
+//! and a rounded bound can land on the constant and fail a strict comparison
+//! its file satisfies (an `INTEGER` past 2^53 read as a `DOUBLE`). The same
+//! holds for a `DECIMAL` constant of smaller scale than its column. Official
+//! casts there and can prune a matching file; this keeps it.
 //!
 //! **9. A dialect's conversion of a bound is computed once per file, in the CTE
 //! body.** *A consequence of divergence 1, not an independent choice: this would
@@ -204,6 +207,42 @@
 //! this crate compares against the encoding its own write path stored
 //! (`split_batches_by_partition` calls `stats_encode::encode_scalar`, the same
 //! function that produces [`StatsLiteral::text`]).
+//!
+//! **11. A `FLOAT` constant is compared in the double domain, through the range
+//! of doubles that name it.** Official casts a `FLOAT` bound with
+//! `TRY_CAST(... AS FLOAT)` and splices the constant as its shortest text,
+//! which DuckDB reads as a `DOUBLE` whenever it carries an exponent: `1e+20` is
+//! 10^20 as a double, while the `FLOAT` closest to it, widened, is
+//! 1.0000000200408773e+20. The comparison then runs in `DOUBLE` and drops the
+//! file holding the very row `c = 1e20::FLOAT` asks for (duckdb/ducklake#1604).
+//! Reading both sides as text-to-double does not fix it in general: the
+//! shortest spelling of a float is one of many, and another writer's
+//! `1.00000002e+20` reads as a different double. Every correctly rounded
+//! spelling of a float does read as a double between the two midpoints to its
+//! neighbours, so the bound is cast to the dialect's double type and each
+//! comparison is made against a midpoint instead of the constant — `min < C`
+//! becomes `min <= lo(C)`, `max >= C` becomes `max >= lo(C)`, and so on, see
+//! `FloatWindow`. Every engine has a double type, so this is one rendering for
+//! all four dialects. A bound that lies exactly on a midpoint could name either
+//! neighbour, so every edge comparison is non-strict; a file is kept that a
+//! float-domain comparison would drop only when a bound sits exactly there.
+//! A zero constant, `FLOAT` or `DOUBLE`, gets the window around both zeros.
+//! DataFusion's `total_cmp` orders `-0.0` below `0.0`, so `c < 0.0` matches a
+//! `-0.0` row and `c <> 0.0` a `-0.0` one; the catalog engines compare the two
+//! zeros equal, and a bound need not carry the sign of the zero it stands for
+//! (a writer records a largest `-0.0` as `0.0`, as the Parquet specification
+//! has it). So `<` and `>` against a zero keep every file with a zero bound,
+//! and `<>` pushes down nothing. A `DOUBLE` constant other than zero is compared exactly, as
+//! official does, but spliced as its shortest digits with an exponent
+//! (`4.8024702758086213e-1`). Official splices its shortest text, which for a
+//! magnitude DuckDB prints without an exponent is fixed-point
+//! (`0.48024702758086213`); DuckDB parses that as a `DECIMAL`, and its
+//! `DECIMAL` to `DOUBLE` conversion is not correctly rounded past 15 digits,
+//! so the constant reads as a neighbouring double and official drops the file
+//! holding the very row `d = 0.48024702758086213` asks for. A literal with an
+//! exponent is a `DOUBLE` to DuckDB and MySQL, and a numeric that converts to
+//! the correctly rounded double on PostgreSQL; SQLite reads both spellings
+//! alike.
 //!
 //! # Why the statistics CTE is materialized
 //!
@@ -300,7 +339,8 @@ pub struct StatsLiteral {
     ///
     /// Official takes this from the constant's type and never the column's
     /// (`const auto &target_type = type ? *type : constant_expr->GetValue().type()`),
-    /// so a mixed-type comparison casts the way the constant asks.
+    /// so a mixed-type comparison casts the way the constant asks. A `Float32`
+    /// constant casts to `Float64`, where its window is compared (divergence 11).
     cast: Option<DataType>,
     /// Whether the literal renders unquoted. Official emits a bare number only
     /// for finite numerics and a quoted literal for everything else, including
@@ -309,6 +349,83 @@ pub struct StatsLiteral {
     /// How faithfully [`Self::text`] identifies this value when it is compared
     /// against a stored partition value as text, or `None` when it does not.
     partition_match: Option<PartitionTextMatch>,
+    /// For a float constant whose bounds cannot be compared against it exactly,
+    /// the doubles a bound naming it can read as; `None` compares exactly.
+    window: Option<FloatWindow>,
+    /// The SQL of a `DOUBLE` constant compared exactly, when it differs from
+    /// [`Self::text`]: the shortest round-trip digits with an exponent, which
+    /// every engine reads as a double. The fixed-point spelling `text` holds
+    /// (`0.48024702758086213`) is a `DECIMAL` to DuckDB and a numeric to
+    /// PostgreSQL, and DuckDB's `DECIMAL` to `DOUBLE` conversion is not
+    /// correctly rounded past 15 digits, so the constant would read as a
+    /// neighbouring double and miss the bound that names it.
+    number: Option<String>,
+}
+
+/// The doubles a stored bound can parse to while naming the float constant,
+/// for a constant a bound cannot be compared against exactly (see
+/// divergence 11).
+///
+/// Every comparison of a bound against the constant is rewritten into a
+/// comparison against an edge, made non-strict where a bound exactly on the
+/// edge could name either neighbour. The edges are exact doubles, rendered as
+/// their shortest round-trip text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FloatWindow {
+    /// The smallest double a correctly rounded spelling of the constant reads
+    /// as: halfway to the next float below it.
+    lo: String,
+    /// The largest such double: halfway to the next float above it.
+    hi: String,
+    /// The constant is a zero. `-0.0` and `0.0` compare equal in every catalog
+    /// engine and are distinct under DataFusion's `total_cmp`, so a strict
+    /// comparison against a zero is kept as the non-strict one and `<>` pushes
+    /// down nothing.
+    zero: bool,
+}
+
+impl FloatWindow {
+    /// The window of `value`, read at the column's own width: an `f32` names
+    /// every double that rounds to it, an `f64` only itself. `None` for an
+    /// `f64` other than zero, which a correctly rounding parser compares
+    /// exactly.
+    fn of(value: &ScalarValue) -> Option<Self> {
+        let (lo, hi, zero) = match value {
+            ScalarValue::Float32(Some(v)) if *v == 0.0 => {
+                let half = f64::from(f32::from_bits(1)) / 2.0;
+                (-half, half, true)
+            },
+            ScalarValue::Float32(Some(v)) if v.is_finite() => {
+                let here = f64::from(*v);
+                let below = f64::from(v.next_down());
+                let above = f64::from(v.next_up());
+                // At `±FLT_MAX` the neighbour is an infinity; the rounding
+                // boundary sits half an ulp past the value, as on the other
+                // side. Each sum is of two `f32`s, so it is exact in an `f64`.
+                let lo = if below.is_finite() {
+                    (here + below) / 2.0
+                } else {
+                    here - (above - here) / 2.0
+                };
+                let hi = if above.is_finite() {
+                    (here + above) / 2.0
+                } else {
+                    here + (here - below) / 2.0
+                };
+                (lo, hi, false)
+            },
+            ScalarValue::Float64(Some(v)) if *v == 0.0 => {
+                let tiny = f64::from_bits(1);
+                (-tiny, tiny, true)
+            },
+            _ => return None,
+        };
+        Some(Self {
+            lo: format!("{lo:e}"),
+            hi: format!("{hi:e}"),
+            zero,
+        })
+    }
 }
 
 /// How a value's canonical text relates to the other spellings of that value,
@@ -675,11 +792,10 @@ impl StatsLiteral {
     ///
     /// Refuses, matching official and this crate's own encoder: NULL constants;
     /// binary types, which official never pushes down (`LogicalTypeId::BLOB`);
-    /// and anything [`stats_encode::encode_scalar`] has no canonical text for —
-    /// `TIME`, `UUID`, `INTERVAL`, `Decimal256`, nested types, NaN, strings over
-    /// [`stats_encode::MAX_STRING_STAT_BYTES`], and strings containing a NUL
-    /// byte. A NUL is what official's own `'\0'` check rejects, and what the
-    /// write path stores as NULL, so there is nothing to compare against.
+    /// anything [`stats_encode::encode_scalar`] has no canonical text for —
+    /// `TIME`, `UUID`, `INTERVAL`, `Decimal256`, nested types, NaN, and strings
+    /// over [`stats_encode::MAX_STRING_STAT_BYTES`]; and strings containing a
+    /// NUL byte, which official's own `'\0'` check rejects.
     fn new(value: &ScalarValue) -> Option<Self> {
         if value.is_null() {
             return None;
@@ -711,13 +827,17 @@ impl StatsLiteral {
             return None;
         }
         let text = stats_encode::encode_scalar(value)?;
-        // `encode_scalar` already drops NUL-bearing strings; assert it rather
-        // than trusting it, because a NUL reaching the SQL text is a hazard in
-        // every dialect.
+        // A NUL reaching the SQL text is a hazard in every dialect, and
+        // official refuses such a constant.
         if text.contains('\0') {
             return None;
         }
-        let cast = requires_value_comparison(&data_type).then_some(data_type.clone());
+        // An `f32` constant is compared in the double domain through its
+        // window, so its bound is read as a double too (divergence 11).
+        let cast = requires_value_comparison(&data_type).then(|| match data_type {
+            DataType::Float32 => DataType::Float64,
+            ref other => other.clone(),
+        });
         // From the CONSTANT's type. The column's own answer is recorded
         // separately (`StatsColumnFilter::partition_text`) and both must agree
         // before a partition key is pre-filtered, because a mismatch means the
@@ -730,7 +850,42 @@ impl StatsLiteral {
             cast: cast.clone(),
             unquoted: renders_unquoted(value, &data_type),
             partition_match,
+            window: FloatWindow::of(value),
+            number: match value {
+                ScalarValue::Float64(Some(v)) if v.is_finite() && *v != 0.0 => {
+                    Some(format!("{v:e}"))
+                },
+                _ => None,
+            },
         })
+    }
+
+    /// The literal for comparing a column of `column_type` against `value`, or
+    /// `None` when the two types cannot be compared exactly in the stats SQL
+    /// (divergence 8).
+    ///
+    /// A bound is converted to the constant's type, so that conversion has to
+    /// be exact for every value the column holds. Between integer types and
+    /// into a `DECIMAL` of at least the column's scale it is, or overflows to
+    /// `NULL`, which keeps the file. Into or out of a float type it rounds:
+    /// an `INTEGER` past 2^53 read as a `DOUBLE` can round up onto the
+    /// constant and fail `min < C` for a file holding a smaller value, and a
+    /// `FLOAT` bound read as a `DECIMAL` loses the digits that place it above
+    /// or below the constant. Into a `DECIMAL` of smaller scale it rounds too.
+    fn for_column(value: &ScalarValue, column_type: &DataType) -> Option<Self> {
+        let constant_type = value.data_type();
+        if constant_type != *column_type {
+            if is_float(&constant_type) || is_float(column_type) {
+                return None;
+            }
+            if let (DataType::Decimal128(_, constant_scale), DataType::Decimal128(_, column_scale)) =
+                (&constant_type, column_type)
+                && constant_scale < column_scale
+            {
+                return None;
+            }
+        }
+        Self::new(value)
     }
 
     /// The constant's encoded text, exactly as [`stats_encode::encode_scalar`]
@@ -743,10 +898,10 @@ impl StatsLiteral {
 
     /// The literal as SQL.
     fn render(&self, dialect: &dyn StatsSqlDialect) -> String {
-        if self.unquoted {
-            self.text.clone()
-        } else {
-            dialect.quote_literal(&self.text)
+        match (&self.number, self.unquoted) {
+            (Some(number), _) => number.clone(),
+            (None, true) => self.text.clone(),
+            (None, false) => dialect.quote_literal(&self.text),
         }
     }
 
@@ -1150,16 +1305,25 @@ fn render_expr(expr: &StatsExpr, ctx: &RenderContext<'_>) -> Option<String> {
         StatsExpr::LiteralWithinBounds(literal) => {
             let min = literal.render_stat(StatKind::MinValue, ctx)?;
             let max = literal.render_stat(StatKind::MaxValue, ctx)?;
-            Some(format!(
-                "{} BETWEEN {min} AND {max}",
-                literal.render(ctx.dialect)
-            ))
+            Some(match &literal.window {
+                Some(window) => format!("({min} <= {} AND {max} >= {})", window.hi, window.lo),
+                None => format!("{} BETWEEN {min} AND {max}", literal.render(ctx.dialect)),
+            })
         },
         StatsExpr::NotEveryRowEqual(literal) => {
+            if literal.window.as_ref().is_some_and(|window| window.zero) {
+                return None;
+            }
             let min = literal.render_stat(StatKind::MinValue, ctx)?;
             let max = literal.render_stat(StatKind::MaxValue, ctx)?;
-            let value = literal.render(ctx.dialect);
-            Some(format!("NOT ({min} = {value} AND {max} = {value})"))
+            Some(match &literal.window {
+                // Both bounds strictly inside the window name the constant.
+                Some(window) => format!("NOT ({min} > {} AND {max} < {})", window.lo, window.hi),
+                None => {
+                    let value = literal.render(ctx.dialect);
+                    format!("NOT ({min} = {value} AND {max} = {value})")
+                },
+            })
         },
         StatsExpr::BoundCompare {
             stat,
@@ -1167,11 +1331,19 @@ fn render_expr(expr: &StatsExpr, ctx: &RenderContext<'_>) -> Option<String> {
             literal,
         } => {
             let bound = literal.render_stat(*stat, ctx)?;
-            Some(format!(
-                "{bound} {} {}",
-                op.sql(),
-                literal.render(ctx.dialect)
-            ))
+            Some(match &literal.window {
+                // `min < C` holds of the float bounds exactly when the bound
+                // names a float below C, whose spellings all read at or below
+                // the window's low edge; the other three follow the same way.
+                // Against a zero, a strict comparison keeps every zero.
+                Some(window) => match op {
+                    BoundOp::Lt if !window.zero => format!("{bound} <= {}", window.lo),
+                    BoundOp::Lt | BoundOp::LtEq => format!("{bound} <= {}", window.hi),
+                    BoundOp::Gt if !window.zero => format!("{bound} >= {}", window.hi),
+                    BoundOp::Gt | BoundOp::GtEq => format!("{bound} >= {}", window.lo),
+                },
+                None => format!("{bound} {} {}", op.sql(), literal.render(ctx.dialect)),
+            })
         },
         StatsExpr::CountPositive(stat) => Some(format!("{} > 0", ctx.qualify(*stat))),
         StatsExpr::FloatBoundsUnusable => Some(
@@ -1280,7 +1452,7 @@ fn lower_conjunct(
     let column = columns.get(index)?;
 
     let mut referenced_stats = BTreeSet::new();
-    let mut condition = lower_node(expr, index, &mut referenced_stats)?;
+    let mut condition = lower_node(expr, index, field.data_type(), &mut referenced_stats)?;
 
     // Float gate (see module docs). Applied once around the whole condition
     // rather than around each comparison: `gate OR (a AND b)` and
@@ -1397,6 +1569,7 @@ fn sole_column_index(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
 fn lower_node(
     expr: &Arc<dyn PhysicalExpr>,
     column_index: usize,
+    column_type: &DataType,
     referenced_stats: &mut BTreeSet<StatKind>,
 ) -> Option<StatsExpr> {
     if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
@@ -1407,7 +1580,9 @@ fn lower_node(
                 let mut stats = BTreeSet::new();
                 for child in [binary.left(), binary.right()] {
                     let mut child_stats = BTreeSet::new();
-                    if let Some(part) = lower_node(child, column_index, &mut child_stats) {
+                    if let Some(part) =
+                        lower_node(child, column_index, column_type, &mut child_stats)
+                    {
                         parts.push(part);
                         stats.extend(child_stats);
                     }
@@ -1429,13 +1604,24 @@ fn lower_node(
                 let mut stats = BTreeSet::new();
                 for child in [binary.left(), binary.right()] {
                     let mut child_stats = BTreeSet::new();
-                    parts.push(lower_node(child, column_index, &mut child_stats)?);
+                    parts.push(lower_node(
+                        child,
+                        column_index,
+                        column_type,
+                        &mut child_stats,
+                    )?);
                     stats.extend(child_stats);
                 }
                 referenced_stats.extend(stats);
                 Some(StatsExpr::Or(parts))
             },
-            operator => lower_comparison(binary, *operator, column_index, referenced_stats),
+            operator => lower_comparison(
+                binary,
+                *operator,
+                column_index,
+                column_type,
+                referenced_stats,
+            ),
         };
     }
 
@@ -1467,8 +1653,9 @@ fn lower_node(
             // no canonical encoding — abandons the whole list, for the same
             // reason as `OR`.
             let literal = element.downcast_ref::<Literal>()?;
-            parts.push(StatsExpr::LiteralWithinBounds(StatsLiteral::new(
+            parts.push(StatsExpr::LiteralWithinBounds(StatsLiteral::for_column(
                 literal.value(),
+                column_type,
             )?));
         }
         referenced_stats.insert(StatKind::MinValue);
@@ -1488,6 +1675,7 @@ fn lower_comparison(
     binary: &BinaryExpr,
     operator: Operator,
     column_index: usize,
+    column_type: &DataType,
     referenced_stats: &mut BTreeSet<StatKind>,
 ) -> Option<StatsExpr> {
     // The subject must be the bare column. Official accepts only a column
@@ -1505,7 +1693,7 @@ fn lower_comparison(
         return None;
     };
 
-    let literal = StatsLiteral::new(literal.value())?;
+    let literal = StatsLiteral::for_column(literal.value(), column_type)?;
 
     let (stats, condition): (&[StatKind], StatsExpr) = match operator {
         // A file can hold the value only if it lies within the recorded range.
@@ -2317,15 +2505,11 @@ mod tests {
             filter.partitions
         );
 
-        // A `Float64` constant against an integer column. The stored value is
-        // `7` and the probe would be `7.0`, which matches nothing — so the file
-        // holding exactly the wanted rows would be the one excluded.
+        // A `Float64` constant against an integer column lowers to nothing at
+        // all: pre-filtering by it would probe `7.0` where the stored value is
+        // `7`, excluding the file holding exactly the wanted rows.
         let float_constant = bin(ints.column("a"), Operator::Eq, lit(7.0f64));
-        assert!(
-            prefiltered(&ints, &float_constant, &key)
-                .partitions
-                .is_empty()
-        );
+        assert!(ints.lowers_to_nothing(&float_constant));
 
         // And an integer constant against a string column, the mirror image.
         let strings = Fixture::new(&[("s", DataType::Utf8, 1)]);
@@ -3220,7 +3404,7 @@ mod tests {
              ((col_3_stats.value_count IS NULL OR col_3_stats.value_count > 0) AND \
              (col_3_stats.min_value IS NULL OR col_3_stats.contains_nan IS NULL OR \
              (col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 5.0))))) IS NOT FALSE"
+             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 5e0))))) IS NOT FALSE"
         );
         assert_eq!(
             table.cte_stats(&predicate),
@@ -3238,7 +3422,7 @@ mod tests {
              ((col_3_stats.value_count IS NULL OR col_3_stats.value_count > 0) AND \
              (col_3_stats.max_value IS NULL OR col_3_stats.contains_nan IS NULL OR \
              (col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             (TRY_CAST(col_3_stats.max_value AS FLOAT) > 5.0))))) IS NOT FALSE"
+             (TRY_CAST(col_3_stats.max_value AS DOUBLE) >= 5.000000238418579e0))))) IS NOT FALSE"
         );
     }
 
@@ -3635,6 +3819,27 @@ mod tests {
         );
     }
 
+    /// A `DOUBLE` constant splices with an exponent: its fixed-point shortest
+    /// text would be a `DECIMAL` to DuckDB, which converts to a neighbouring
+    /// double.
+    #[test]
+    fn double_constant_renders_with_an_exponent() {
+        let table = Fixture::new(&[("f", DataType::Float64, 1)]);
+        for (value, rendered) in [
+            (0.48024702758086213, "4.8024702758086213e-1"),
+            (123456.78901234567, "1.2345678901234567e5"),
+            (-2.5, "-2.5e0"),
+            (1e20, "1e20"),
+        ] {
+            let predicate = bin(table.column("f"), Operator::Eq, lit(value));
+            let sql = table.sql(&predicate);
+            assert!(
+                sql.contains(&format!("{rendered} BETWEEN TRY_CAST(")),
+                "{value}: {sql}"
+            );
+        }
+    }
+
     #[test]
     fn date_constant_is_cast_and_quoted() {
         let table = Fixture::new(&[("d", DataType::Date32, 1)]);
@@ -3743,7 +3948,7 @@ mod tests {
             "((col_3_stats.data_file_id IS NULL OR \
              ((col_3_stats.value_count IS NULL OR col_3_stats.value_count > 0) AND \
              (col_3_stats.min_value IS NULL OR col_3_stats.max_value IS NULL OR \
-             1.5 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
+             1.5e0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
              TRY_CAST(col_3_stats.max_value AS DOUBLE))))) IS NOT FALSE"
         );
         assert_eq!(
@@ -3768,8 +3973,8 @@ mod tests {
              (col_3_stats.min_value IS NULL OR col_3_stats.max_value IS NULL OR \
              col_3_stats.contains_nan IS NULL OR \
              (col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             (NOT (TRY_CAST(col_3_stats.min_value AS DOUBLE) = 1.5 AND \
-             TRY_CAST(col_3_stats.max_value AS DOUBLE) = 1.5)))))) IS NOT FALSE"
+             (NOT (TRY_CAST(col_3_stats.min_value AS DOUBLE) = 1.5e0 AND \
+             TRY_CAST(col_3_stats.max_value AS DOUBLE) = 1.5e0)))))) IS NOT FALSE"
         );
         assert_eq!(
             table.cte_stats(&predicate),
@@ -3797,9 +4002,9 @@ mod tests {
             "((col_3_stats.data_file_id IS NULL OR \
              ((col_3_stats.value_count IS NULL OR col_3_stats.value_count > 0) AND \
              (col_3_stats.min_value IS NULL OR col_3_stats.max_value IS NULL OR \
-             (1.0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
+             (1e0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
              TRY_CAST(col_3_stats.max_value AS DOUBLE)) OR \
-             (2.0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
+             (2e0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
              TRY_CAST(col_3_stats.max_value AS DOUBLE)))))) IS NOT FALSE"
         );
         assert_eq!(
@@ -3809,33 +4014,143 @@ mod tests {
     }
 
     #[test]
-    fn float_column_casts_to_the_constant_type_and_is_still_gated() {
-        // G11 on a float column: the cast follows the INTEGER constant, but the
-        // gate follows the column, because it is the column's stored bounds that
-        // exclude NaN.
-        let table = Fixture::new(&[("f", DataType::Float64, 3)]);
-        let predicate = bin(table.column("f"), Operator::Gt, lit(5i32));
-        let sql = table.sql(&predicate);
-        assert!(
-            sql.contains("TRY_CAST(col_3_stats.max_value AS INTEGER) > 5"),
-            "{sql}"
-        );
-        assert!(sql.contains("contains_nan <> false"), "{sql}");
+    fn a_float_compared_across_types_pushes_down_nothing() {
+        // Divergence 8: a cast between a float and another numeric type rounds
+        // the bound, so neither direction is lowered.
+        let floats = Fixture::new(&[("f", DataType::Float64, 3)]);
+        assert!(floats.lowers_to_nothing(&bin(floats.column("f"), Operator::Gt, lit(5i32))));
+        assert!(floats.lowers_to_nothing(&bin(floats.column("f"), Operator::Eq, lit(5.0f32))));
+        let ints = ints();
+        assert!(ints.lowers_to_nothing(&bin(ints.column("a"), Operator::Gt, lit(5.0f64))));
+        let singles = Fixture::new(&[("g", DataType::Float32, 3)]);
+        assert!(singles.lowers_to_nothing(&bin(singles.column("g"), Operator::Eq, lit(5.0f64))));
+        let decimals = Fixture::new(&[("d", DataType::Decimal128(10, 2), 3)]);
+        assert!(decimals.lowers_to_nothing(&bin(decimals.column("d"), Operator::Eq, lit(5.0f64))));
     }
 
     #[test]
-    fn integer_column_with_a_float_constant_is_not_gated() {
-        // Documents a divergence. Official keys its NaN handling off the
-        // CONSTANT's type, so `a > 5.0` on an INTEGER column would get official's
-        // `OR contains_nan`. This crate keys the gate off the COLUMN's type and
-        // omits it. An integer column's `contains_nan` can never be true, so the
-        // two admit the same files; it is only the SQL text that differs.
-        let table = ints();
-        let predicate = bin(table.column("a"), Operator::Gt, lit(5.0f64));
-        let sql = table.sql(&predicate);
-        assert!(!sql.contains("contains_nan"), "{sql}");
+    fn a_decimal_constant_needs_at_least_the_columns_scale() {
+        let decimals = Fixture::new(&[("d", DataType::Decimal128(10, 2), 3)]);
+        let narrower = lit(ScalarValue::Decimal128(Some(125), 5, 1));
+        assert!(decimals.lowers_to_nothing(&bin(decimals.column("d"), Operator::Lt, narrower)));
+        let wider = lit(ScalarValue::Decimal128(Some(12_500), 12, 3));
+        let sql = decimals.sql(&bin(decimals.column("d"), Operator::Lt, wider));
         assert!(
-            sql.contains("TRY_CAST(col_1_stats.max_value AS DOUBLE) > 5.0"),
+            sql.contains("TRY_CAST(col_3_stats.min_value AS DECIMAL(12,3)) < 12.500"),
+            "{sql}"
+        );
+        // An integer column against a decimal constant converts exactly.
+        let ints = ints();
+        let constant = lit(ScalarValue::Decimal128(Some(125), 5, 1));
+        assert!(!ints.lowers_to_nothing(&bin(ints.column("a"), Operator::Lt, constant)));
+    }
+
+    /// The window edges of an `f32` constant, as the SQL spells them.
+    fn window_of(value: f32) -> (f64, f64) {
+        let window = FloatWindow::of(&ScalarValue::Float32(Some(value))).expect("a window");
+        (window.lo.parse().unwrap(), window.hi.parse().unwrap())
+    }
+
+    #[test]
+    fn a_float32_window_holds_exactly_the_doubles_that_round_to_it() {
+        for value in [
+            1e20f32,
+            -1e20,
+            1e-7,
+            0.1,
+            1.0,
+            f32::MAX,
+            f32::MIN,
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            -f32::from_bits(1),
+            1e-40,
+            16_777_216.0,
+        ] {
+            let (lo, hi) = window_of(value);
+            let here = f64::from(value);
+            assert!(lo < here && here < hi, "{value:?}: {lo} {hi}");
+            // Strictly inside the window rounds to the value; just outside
+            // it rounds away.
+            assert_eq!(lo.next_up() as f32, value, "{value:?}");
+            assert_eq!(hi.next_down() as f32, value, "{value:?}");
+            assert_ne!(lo.next_down() as f32, value, "{value:?}");
+            assert_ne!(hi.next_up() as f32, value, "{value:?}");
+            // The shortest spelling and a `%.9g` spelling both read inside.
+            for text in [format!("{value:e}"), format!("{value:.8e}")] {
+                let read: f64 = text.parse().unwrap();
+                assert!(lo <= read && read <= hi, "{value:?}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_float32_constant_compares_through_its_window() {
+        let table = Fixture::new(&[("f", DataType::Float32, 3)]);
+        let column = || table.column("f");
+        let FloatWindow {
+            lo,
+            hi,
+            ..
+        } = FloatWindow::of(&ScalarValue::Float32(Some(1e20))).unwrap();
+        let min = "TRY_CAST(col_3_stats.min_value AS DOUBLE)";
+        let max = "TRY_CAST(col_3_stats.max_value AS DOUBLE)";
+        for (op, expected) in [
+            (Operator::Eq, format!("({min} <= {hi} AND {max} >= {lo})")),
+            (Operator::Lt, format!("({min} <= {lo})")),
+            (Operator::LtEq, format!("({min} <= {hi})")),
+            (Operator::Gt, format!("({max} >= {hi})")),
+            (Operator::GtEq, format!("({max} >= {lo})")),
+            (
+                Operator::NotEq,
+                format!("(NOT ({min} > {lo} AND {max} < {hi}))"),
+            ),
+        ] {
+            let sql = table.sql(&bin(column(), op, lit(1e20f32)));
+            assert!(sql.contains(&expected), "{op}: {sql}");
+            assert!(!sql.contains("AS FLOAT"), "{op}: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_zero_constant_keeps_both_zeros() {
+        for (data_type, zero, lo, hi) in [
+            (
+                DataType::Float32,
+                lit(-0.0f32),
+                "-7.006492321624085e-46",
+                "7.006492321624085e-46",
+            ),
+            (DataType::Float64, lit(0.0f64), "-5e-324", "5e-324"),
+        ] {
+            let table = Fixture::new(&[("f", data_type.clone(), 3)]);
+            let min = "TRY_CAST(col_3_stats.min_value AS DOUBLE)";
+            let max = "TRY_CAST(col_3_stats.max_value AS DOUBLE)";
+            for (op, expected) in [
+                (Operator::Eq, format!("({min} <= {hi} AND {max} >= {lo})")),
+                (Operator::Lt, format!("({min} <= {hi})")),
+                (Operator::LtEq, format!("({min} <= {hi})")),
+                (Operator::Gt, format!("({max} >= {lo})")),
+                (Operator::GtEq, format!("({max} >= {lo})")),
+            ] {
+                let sql = table.sql(&bin(table.column("f"), op, zero.clone()));
+                assert!(sql.contains(&expected), "{data_type} {op}: {sql}");
+            }
+            assert!(
+                table
+                    .render_with(&bin(table.column("f"), Operator::NotEq, zero), &Duck)
+                    .is_none(),
+                "{data_type}: `<>` a zero must push down nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_float64_constant_other_than_zero_compares_exactly() {
+        let table = Fixture::new(&[("f", DataType::Float64, 3)]);
+        let sql = table.sql(&bin(table.column("f"), Operator::Lt, lit(1e20f64)));
+        assert!(
+            sql.contains("TRY_CAST(col_3_stats.min_value AS DOUBLE) < 1e20"),
             "{sql}"
         );
     }
@@ -4140,9 +4455,9 @@ mod tests {
              (col_3_stats.min_value IS NULL OR col_3_stats.max_value IS NULL OR \
              col_3_stats.contains_nan IS NULL OR \
              (col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             ((1.5 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
+             ((1.5e0 BETWEEN TRY_CAST(col_3_stats.min_value AS DOUBLE) AND \
              TRY_CAST(col_3_stats.max_value AS DOUBLE)) OR \
-             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 3.0)))))) IS NOT FALSE"
+             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 3e0)))))) IS NOT FALSE"
         );
         assert_eq!(
             table.cte_stats(&predicate),
@@ -4310,9 +4625,9 @@ mod tests {
              (col_3_stats.min_value IS NULL OR col_3_stats.max_value IS NULL OR \
              col_3_stats.contains_nan IS NULL OR \
              ((col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             (TRY_CAST(col_3_stats.max_value AS DOUBLE) > 5.0)) AND \
+             (TRY_CAST(col_3_stats.max_value AS DOUBLE) > 5e0)) AND \
              ((col_3_stats.contains_nan IS NULL OR col_3_stats.contains_nan <> false) OR \
-             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 10.0)))))) IS NOT FALSE"
+             (TRY_CAST(col_3_stats.min_value AS DOUBLE) < 1e1)))))) IS NOT FALSE"
         );
         assert_eq!(
             table.cte_stats(&predicate),

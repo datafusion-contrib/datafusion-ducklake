@@ -196,7 +196,7 @@ fn duckdb_records_snapshot_changes_and_commit_metadata() {
             (
                 second_commit.snapshot_id,
                 Some(format!(
-                    "deleted_from_table:{table_id},inserted_into_table:{table_id}"
+                    "inserted_into_table:{table_id},deleted_from_table:{table_id}"
                 )),
                 None,
                 None,

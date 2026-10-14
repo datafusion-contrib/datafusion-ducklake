@@ -557,9 +557,10 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
     // SQL DML through the catalog.
     for (case, approvals, sql) in [
         ("sql_insert", 1, "INSERT INTO {}.public.t VALUES (5, 50)"),
+        // Inlined under the default limit: no file ids are reserved first.
         (
             "sql_update",
-            1,
+            0,
             "UPDATE {}.public.t SET val = 11 WHERE id = 1",
         ),
         ("sql_delete", 0, "DELETE FROM {}.public.t WHERE id = 1"),
@@ -633,6 +634,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         .unwrap();
     let before = l.state().await;
     l.guard.refuse_after(1);
+    #[allow(deprecated)]
     let r = l
         .table_writer()
         .flush_inlined_data("public", "inl", &inlined_rows, inlined.snapshot_id)
@@ -658,6 +660,23 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         &rows,
     );
     l.assert_refused("commit_inlined_deletes", before, 0, r)
+        .await;
+
+    // The flush official runs (`ducklake_flush_inlined_data`).
+    let l = Lake::multi(&pool, &base, "official_flush").await;
+    let inlined = l
+        .inlining_writer()
+        .append_table("public", "inl", &[batch(&[1, 2], &[10, 20])])
+        .await
+        .unwrap();
+    let provider = l.provider().await;
+    let before = l.state().await;
+    l.guard.refuse_after(0);
+    let r = l
+        .table_writer()
+        .flush_table_inlined_data(provider, "public", "inl", inlined.snapshot_id)
+        .await;
+    l.assert_refused("flush_table_inlined_data", before, 0, r)
         .await;
 
     // Compaction.

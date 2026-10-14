@@ -1091,3 +1091,35 @@ async fn multicatalog_provider_lists_and_resolves_views() {
     assert_eq!(all_views[0].schema_name, "public");
     assert_eq!(all_views[0].view, views[0]);
 }
+
+/// Initializations racing on a store from v0.6.0 and earlier, which lacks
+/// `ducklake_delete_file.partial_max` and `ducklake_metadata.scope` /
+/// `scope_id`, all succeed: one that finds a column missing while another adds
+/// it waits for that one and leaves the column as it is.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn concurrent_initializations_upgrade_an_old_store() {
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    for round in 0..5 {
+        for statement in [
+            "ALTER TABLE ducklake_delete_file DROP COLUMN partial_max",
+            "ALTER TABLE ducklake_metadata DROP COLUMN scope_id, DROP COLUMN scope",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+        let results =
+            futures::future::join_all((0..12).map(|_| initialize_multicatalog_schema(&pool))).await;
+        for result in results {
+            result.unwrap_or_else(|e| panic!("round {round}: {e}"));
+        }
+        let columns: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns
+             WHERE (table_name = 'ducklake_delete_file' AND column_name = 'partial_max')
+                OR (table_name = 'ducklake_metadata' AND column_name IN ('scope', 'scope_id'))",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(columns, 3, "round {round}");
+    }
+}

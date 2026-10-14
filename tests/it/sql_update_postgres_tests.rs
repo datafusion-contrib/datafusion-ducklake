@@ -208,6 +208,10 @@ async fn update_applies_postgres_sort_order() {
             &[SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast)],
         )
         .unwrap();
+    // The new versions go to a sorted Parquet file rather than being inlined.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
 
     let ctx = writable_ctx(&pool, catalog_name, catalog_id, &data).await;
     let batches = ctx
@@ -253,7 +257,9 @@ async fn update_applies_postgres_sort_order() {
         .unwrap();
 
     assert_eq!(count, 3);
-    assert_eq!(files.len(), 2);
+    // The UPDATE rewrote every row of the seeded file, so it is ended, as
+    // official ends a file a statement empties; only its output is live.
+    assert_eq!(files.len(), 1);
     assert_eq!(
         values.values().iter().copied().collect::<Vec<_>>(),
         vec![11, 21, 31],
@@ -318,6 +324,11 @@ async fn partitioned_update_moves_rows_and_is_one_snapshot_postgres() {
         .await
         .unwrap();
 
+    // The moved rows are written to Parquet, not inlined.
+    writer_for(&pool, cat, &data)
+        .await
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     // Rows 1 and 3 move to two DIFFERENT new partitions (11 and 21).
     let ctx = writable_ctx(&pool, cat_name, cat, &data).await;
     let batches = ctx

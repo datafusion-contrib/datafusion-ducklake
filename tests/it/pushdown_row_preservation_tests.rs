@@ -412,7 +412,7 @@ const INSERTS: [&str; 7] = [
 /// than catalog-inlined rows; inlined data is a separate read path that this
 /// mechanism does not touch. `TimeZone` is pinned so the `TIMESTAMPTZ` bounds
 /// are written in UTC regardless of where the suite runs.
-fn with_official_ducklake(
+pub(crate) fn with_official_ducklake(
     attach_target: &str,
     extensions: &[&str],
     data_path: &Path,
@@ -1169,9 +1169,9 @@ fn poisons_for_column(
 
 /// The result of one query: the rows, and how many catalog rows the listing
 /// returned to produce them.
-struct Run {
-    rows: Vec<String>,
-    listed: usize,
+pub(crate) struct Run {
+    pub(crate) rows: Vec<String>,
+    pub(crate) listed: usize,
 }
 
 /// Every row of `batches` as a sorted `Vec<String>`, so two answers compare
@@ -1201,7 +1201,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<String> {
     out
 }
 
-async fn run_query(
+pub(crate) async fn run_query(
     inner: &Arc<dyn MetadataProvider>,
     enabled: bool,
     sql: &str,
@@ -1916,7 +1916,7 @@ async fn pushdown_row_preservation_postgres() {
 /// `max_value` in `utf8mb4_0900_ai_ci` `TEXT` columns — the case- and
 /// accent-insensitive collation the rendered SQL has to override.
 #[cfg(feature = "metadata-mysql")]
-fn transport_catalog_to_mysql(catalog_path: &Path, dsn: &str) -> anyhow::Result<()> {
+pub(crate) fn transport_catalog_to_mysql(catalog_path: &Path, dsn: &str) -> anyhow::Result<()> {
     common::ensure_ducklake_installed();
     common::ensure_extension_installed("mysql");
 
@@ -1973,4 +1973,90 @@ async fn pushdown_row_preservation_mysql() {
 
     let store = CatalogStore::MySql(url);
     sweep(&store, false).await;
+}
+
+/// A provider forwarding only the methods that predate the flush (the toggle
+/// above) refuses to flush a table holding inlined rows, or inlined deletions
+/// of Parquet rows, rather than report nothing to flush.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_without_flush_reads_refuses_to_flush() {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_ducklake::{
+        DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter,
+        SqliteMetadataProvider, SqliteMetadataWriter,
+    };
+    for file_deletion in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", dir.path().join("c.db").display());
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let writer = SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+        writer.set_data_path(data.to_str().unwrap()).unwrap();
+        let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+        let real: Arc<dyn MetadataProvider> =
+            Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let limit = if file_deletion {
+            0
+        } else {
+            10
+        };
+        DuckLakeTableWriter::new(
+            Arc::clone(&writer),
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        )
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(limit))
+        .append_table("main", "t", &[batch])
+        .await
+        .unwrap();
+        if file_deletion {
+            let ctx = SessionContext::new();
+            let catalog =
+                DuckLakeCatalog::with_writer(Arc::clone(&real), Arc::clone(&writer)).unwrap();
+            DuckLakeCatalog::register(&ctx, "lake", catalog);
+            let handle =
+                DuckLakeCatalog::with_writer(Arc::clone(&real), Arc::clone(&writer)).unwrap();
+            datafusion_ducklake::execute_ducklake_sql(
+                &ctx,
+                &handle,
+                "DELETE FROM lake.main.t WHERE id = 2",
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+            let head = real.get_current_snapshot().unwrap();
+            let table = real
+                .get_table_by_name(
+                    real.get_schema_by_name("main", head)
+                        .unwrap()
+                        .unwrap()
+                        .schema_id,
+                    "t",
+                    head,
+                )
+                .unwrap()
+                .unwrap()
+                .table_id;
+            assert_eq!(real.get_inlined_deletes(table, head).unwrap().len(), 1);
+        }
+        let toggle: Arc<dyn MetadataProvider> = Arc::new(PushdownToggle::new(real, true));
+        let catalog = DuckLakeCatalog::with_writer(toggle, writer).unwrap();
+        let error = catalog
+            .flush_inlined_data(&SessionContext::new().state(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, DuckLakeError::Unsupported(message) if message.contains("for a flush")),
+            "file deletion {file_deletion}: {error}"
+        );
+    }
 }

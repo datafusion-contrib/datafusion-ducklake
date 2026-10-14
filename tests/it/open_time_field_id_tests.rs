@@ -1586,6 +1586,9 @@ async fn a_stale_session_delete_keeps_deletions_made_after_its_snapshot() -> any
     for session_opened_after in [false, true] {
         let temp = TempDir::new()?;
         let conn = duckdb_lake(&temp)?;
+        // This crate's DELETE writes a delete file rather than an inlined
+        // deletion.
+        conn.execute("CALL lake.set_option('data_inlining_row_limit', 0)", [])?;
         conn.execute("CREATE TABLE lake.t (id INT)", [])?;
         conn.execute("INSERT INTO lake.t VALUES (1), (2), (3), (4), (5), (6)", [])?;
         conn.execute("DELETE FROM lake.t WHERE id = 1", [])?;

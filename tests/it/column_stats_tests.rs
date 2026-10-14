@@ -528,11 +528,11 @@ async fn emit_catalog_for_duckdb() {
     eprintln!("wrote crate catalog to {out}");
 }
 
-/// Finding-1 regression: a float file containing NaN must store NULL min/max
-/// (never a NaN-excluded finite bound) with contains_nan = true, so no reader
-/// can prune it — matching official DuckLake.
+/// A float file containing NaN stores the bounds of its other values with
+/// `contains_nan = true`, as official DuckLake does; a reader trusts a float
+/// bound only when `contains_nan` is false.
 #[tokio::test(flavor = "multi_thread")]
-async fn float_with_nan_suppresses_minmax() {
+async fn float_with_nan_records_bounds_without_nan() {
     let temp = TempDir::new().unwrap();
     let db_path = temp.path().join("stats.db");
     let data_path = temp.path().join("data");
@@ -569,8 +569,8 @@ async fn float_with_nan_suppresses_minmax() {
     let mx: Option<String> = row.try_get(1).unwrap();
     let nan: Option<bool> = row.try_get(2).unwrap();
     let vc: Option<i64> = row.try_get(3).unwrap();
-    assert_eq!(mn, None, "min must be NULL when NaN present");
-    assert_eq!(mx, None, "max must be NULL when NaN present");
+    assert_eq!(mn.as_deref(), Some("1.0"), "min leaves NaN out");
+    assert_eq!(mx.as_deref(), Some("2.0"), "max leaves NaN out");
     assert_eq!(nan, Some(true), "contains_nan must be true");
     assert_eq!(vc, Some(3), "NaN counts as a non-null value");
 }

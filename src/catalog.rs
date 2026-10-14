@@ -240,6 +240,15 @@ impl DuckLakeCatalog {
             .as_ref()
             .map(|config| Arc::clone(&config.writer))
     }
+
+    /// The `data_inlining_row_limit` set through
+    /// [`DuckLakeCatalog::with_write_options`], if any.
+    #[cfg(feature = "write")]
+    pub(crate) fn data_inlining_row_limit(&self) -> Option<usize> {
+        self.write_config
+            .as_ref()
+            .and_then(|config| config.options.data_inlining_row_limit)
+    }
 }
 
 impl CatalogProvider for DuckLakeCatalog {

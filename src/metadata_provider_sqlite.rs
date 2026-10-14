@@ -8,13 +8,18 @@ use crate::metadata_provider::SQL_FILE_SCHEMA_VERSION;
 use crate::metadata_provider::{
     ColumnTag, ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileColumnStatistics,
     DuckLakeFileData, DuckLakeFileMetadata, DuckLakeInlinedData, DuckLakeInlinedDelete,
+    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     DuckLakeNameMapping, DuckLakeNameMappingEntry, DuckLakeStatistics, DuckLakeTableColumn,
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
-    DuckLakeTag, FileWithTable, MetadataProvider, MetadataSetting, ObjectTag,
-    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
-    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
-    inlined_missing_scalar, reconstruct_columns, reconstruct_columns_with_table,
+    DuckLakeTag, FileWithTable, InlinedColumnMapping, InlinedFileDeleteChange,
+    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedTableLayout,
+    MetadataProvider, MetadataSetting, ObjectTag, SQL_GET_FILE_PARTITION_VALUES,
+    SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS,
+    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
+    TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
+    inlined_file_delete_change, inlined_file_deletes_between_sql,
+    inlined_file_deletes_for_flush_sql, inlined_missing_scalar, inlined_version_columns_sql,
+    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
     resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
@@ -98,6 +103,39 @@ fn decode_table_file(row: &SqliteRow, snapshot_id: i64) -> Result<DuckLakeTableF
     })
 }
 
+/// The system column names DuckLake gives a new inlined data table in this
+/// catalog, from its `version` entry in `ducklake_metadata`.
+pub(crate) async fn catalog_inlined_system_columns<'e, E>(
+    executor: E,
+) -> Result<crate::metadata_provider::InlinedSystemColumns>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let version: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM ducklake_metadata WHERE key = 'version' AND scope IS NULL",
+    )
+    .fetch_optional(executor)
+    .await?;
+    Ok(crate::metadata_provider::InlinedSystemColumns::for_catalog_version(version.as_deref()))
+}
+
+/// Read the physical columns of the inlined data table `table`.
+pub(crate) async fn inlined_table_layout<'e, E>(
+    executor: E,
+    table: &str,
+) -> Result<InlinedTableLayout>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let columns = sqlx::query_as::<_, (String, String)>(
+        "SELECT name, type FROM pragma_table_info(?) ORDER BY cid",
+    )
+    .bind(table)
+    .fetch_all(executor)
+    .await?;
+    InlinedTableLayout::from_columns(table, columns)
+}
+
 /// Build one Arrow [`RecordBatch`] (in `schema`, the table's physical schema)
 /// from inlined rows fetched out of a `ducklake_inlined_data_*` table. `present`
 /// is the set of the physical table's data-column names; a table column absent
@@ -162,14 +200,14 @@ fn build_inlined_batch(
             DataType::Float32 => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
-                    b.push(r.try_get::<Option<f64>, _>(name)?.map(|v| v as f32));
+                    b.push(inlined_float(r, name)?.map(|v| v as f32));
                 }
                 Arc::new(Float32Array::from(b)) as ArrayRef
             },
             DataType::Float64 => {
                 let mut b = Vec::with_capacity(n);
                 for r in rows {
-                    b.push(r.try_get::<Option<f64>, _>(name)?);
+                    b.push(inlined_float(r, name)?);
                 }
                 Arc::new(Float64Array::from(b)) as ArrayRef
             },
@@ -268,6 +306,31 @@ fn build_inlined_batch(
     Ok(RecordBatch::try_new(schema.clone(), arrays)?)
 }
 
+/// An inlined float: DuckDB's text of the value (`0.5`, `inf`, `-inf`, `nan`,
+/// `-0.0`) in a `VARCHAR` column, as official DuckLake's SQLite catalogs and
+/// this crate store it, or a `REAL` in the `DOUBLE` columns earlier releases
+/// of this crate created.
+fn inlined_float(row: &sqlx::sqlite::SqliteRow, name: &str) -> Result<Option<f64>> {
+    if let Ok(value) = row.try_get::<Option<f64>, _>(name) {
+        return Ok(value);
+    }
+    let Some(text) = row.try_get::<Option<String>, _>(name)? else {
+        return Ok(None);
+    };
+    let value = match text.trim().to_ascii_lowercase().as_str() {
+        "inf" | "infinity" | "+inf" | "+infinity" => f64::INFINITY,
+        "-inf" | "-infinity" => f64::NEG_INFINITY,
+        "nan" | "+nan" => f64::NAN,
+        "-nan" => -f64::NAN,
+        other => other.parse::<f64>().map_err(|e| {
+            crate::DuckLakeError::InvalidConfig(format!(
+                "invalid inlined float value '{text}' for column '{name}': {e}"
+            ))
+        })?,
+    };
+    Ok(Some(value))
+}
+
 fn build_inlined_temporal_array(
     rows: &[SqliteRow],
     column_name: &str,
@@ -320,6 +383,121 @@ fn build_inlined_temporal_array(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ScalarValue::iter_to_array(values)?)
+}
+
+/// Read `selection` of the inlined-data table `table` of `table_id` under
+/// `columns`, each resolved by column id against the schema version the table
+/// was written with. `None` when no row matches.
+async fn read_sqlite_inlined_table(
+    pool: &SqlitePool,
+    table_id: i64,
+    table: &str,
+    columns: &[DuckLakeTableColumn],
+    selection: InlinedRowSelection,
+    filter: Option<&InlinedFilter>,
+    shape: InlinedReadShape,
+) -> Result<Option<DuckLakeInlinedRows>> {
+    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let InlinedTableLayout {
+        system,
+        present,
+        physical_types,
+    } = inlined_table_layout(pool, table).await?;
+    let version_columns: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(
+        inlined_version_columns_sql(&quote_ident(table), &system, "?"),
+    ))
+    .bind(table_id)
+    .fetch_all(pool)
+    .await?;
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+
+    // Each physical column is selected under its catalog name, which is what
+    // `build_inlined_batch` reads it by.
+    let mut select_list = selection
+        .system_select(&system)
+        .iter()
+        .map(|column| (*column).to_string())
+        .collect::<Vec<_>>();
+    select_list.extend(columns.iter().enumerate().filter_map(|(index, column)| {
+        mapping.physical(index).map(|physical| {
+            format!(
+                "{} AS {}",
+                quote_ident(physical),
+                quote_ident(&column.column_name)
+            )
+        })
+    }));
+    let rendered = filter.and_then(|filter| {
+        let (filter, filter_schema) = mapping.physical_filter(columns, &schema, filter)?;
+        render_inlined_filter(
+            &filter,
+            InlinedSqlDialect::Sqlite,
+            &filter_schema,
+            &physical_types,
+            2,
+        )
+    });
+    let pushed = rendered
+        .as_ref()
+        .map(|rendered| format!(" AND ({})", rendered.sql))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {}{pushed} ORDER BY {}",
+        select_list.join(", "),
+        quote_ident(table),
+        selection.predicate(&system, "?", "?"),
+        shape.order_by(&system, selection),
+    );
+    let (first, second) = selection.bounds();
+    let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
+        .bind(first)
+        .bind(second);
+    if let Some(rendered) = rendered {
+        for bind in rendered.binds {
+            query = match bind {
+                InlinedSqlBind::Bool(value) => query.bind(value),
+                InlinedSqlBind::I64(value) => query.bind(value),
+                InlinedSqlBind::U64(value) => query.bind(i64::try_from(value).map_err(|_| {
+                    crate::DuckLakeError::Unsupported(format!(
+                        "SQLite inlined filter cannot represent unsigned value {value}"
+                    ))
+                })?),
+                InlinedSqlBind::F64(value) => query.bind(value),
+                InlinedSqlBind::Text(value) => query.bind(value),
+                InlinedSqlBind::Bytes(value) => query.bind(value),
+            };
+        }
+    }
+    let rows = query.fetch_all(pool).await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let row_ids = rows
+        .iter()
+        .map(|row| row.try_get(0))
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    let snapshots = rows
+        .iter()
+        .map(|row| row.try_get(1))
+        .collect::<std::result::Result<Vec<i64>, _>>()?;
+    let end_snapshots = rows
+        .iter()
+        .map(|row| row.try_get(2))
+        .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
+    let batch = build_inlined_batch(
+        &schema,
+        columns,
+        &mapping.present(columns),
+        &physical_types,
+        &rows,
+    )?;
+    Ok(Some(DuckLakeInlinedRows {
+        table_name: table.to_string(),
+        row_ids,
+        snapshots,
+        end_snapshots,
+        batch,
+    }))
 }
 
 fn is_missing_statistics_table(error: &sqlx::Error) -> bool {
@@ -382,11 +560,11 @@ impl StatsSqlDialect for SqliteStatsDialect {
     /// Temporal types are accepted only when *both* sides are canonically
     /// encoded, which is why the constant is inspected here. SQLite has no
     /// temporal type, so the comparison stays in the text domain, where order
-    /// matches chronology only for the fixed-width four-digit-year encoding:
-    /// `chrono` renders a year past 9999 as `+12345` and a negative one as
-    /// `-0044`, and `+` and `-` both sort below every digit, so one of those on
-    /// either side would invert the comparison. The stat is checked in SQL and
-    /// the constant right here.
+    /// matches chronology only for the fixed-width four-digit-year encoding: a
+    /// year past 9999 has a fifth digit, one before the common era is marked
+    /// ` (BC)`, and other writers' `+12345` and `-0044` sort below every digit,
+    /// so any of those on either side would invert the comparison. The stat is
+    /// checked in SQL and the constant right here.
     fn try_cast(&self, expr: &str, literal: &StatsLiteral, data_type: &DataType) -> Option<String> {
         match data_type {
             DataType::Int8
@@ -418,14 +596,18 @@ impl StatsSqlDialect for SqliteStatsDialect {
                 "CASE WHEN {} THEN CAST({expr} AS REAL) END",
                 sqlite_is_float_text(expr)
             )),
-            // A boolean stat is the text `true` / `false` and the constant is
-            // rendered quoted, so comparing them as text is both well-defined
-            // and correctly ordered ('false' < 'true'). Any other spelling is
-            // not this encoding, and reading it as a boolean would be a guess.
-            DataType::Boolean => Some(sqlite_guarded_text(
-                expr,
-                &format!("{} IN ('true', 'false')", self.collate_binary(expr)),
-            )),
+            // A boolean stat is `true` / `false`, or `1` / `0` as official's
+            // Parquet statistics spell it, and the constant is rendered quoted.
+            // Both spellings map to `true` / `false`, which compare correctly
+            // as text ('false' < 'true'). Any other spelling is not a DuckLake
+            // boolean, and reading it as one would be a guess.
+            DataType::Boolean => {
+                let text = self.collate_binary(expr);
+                Some(format!(
+                    "CASE WHEN {text} IN ('true', '1') THEN 'true' \
+                     WHEN {text} IN ('false', '0') THEN 'false' END COLLATE BINARY"
+                ))
+            },
             // `YYYY-MM-DD`: fixed width, so text order is date order.
             DataType::Date32 if is_canonical_date(literal.text()) => {
                 Some(sqlite_guarded_text(expr, &sqlite_is_canonical_date(expr)))
@@ -763,6 +945,47 @@ impl SqliteMetadataProvider {
             pool,
             schema_capabilities: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The registered inlined-data tables of `table_id`; none on a catalog
+    /// without the registry.
+    async fn registered_inlined_tables(&self, table_id: i64) -> Result<Vec<String>> {
+        if !self.schema_capabilities().await?.inlined_data_tables {
+            return Ok(Vec::new());
+        }
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+        )
+        .bind(table_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(names
+            .into_iter()
+            .filter(|name| is_inlined_data_table(name))
+            .collect())
+    }
+
+    /// Read the inlined row versions `selection` picks, one entry per physical
+    /// inlined-data table with rows. See [`MetadataProvider::read_inlined_rows`].
+    async fn read_inlined_rows_sqlite(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+        shape: InlinedReadShape,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        let mut out = Vec::new();
+        for table in self.registered_inlined_tables(table_id).await? {
+            if let Some(rows) = read_sqlite_inlined_table(
+                &self.pool, table_id, &table, columns, selection, filter, shape,
+            )
+            .await?
+            {
+                out.push(rows);
+            }
+        }
+        Ok(out)
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -1859,124 +2082,26 @@ impl MetadataProvider for SqliteMetadataProvider {
         columns: &[DuckLakeTableColumn],
         filter: Option<&InlinedFilter>,
     ) -> Result<InlinedDataScan> {
+        let rows = block_on(self.read_inlined_rows_sqlite(
+            table_id,
+            columns,
+            InlinedRowSelection::VisibleAt(snapshot_id),
+            filter,
+            InlinedReadShape::Scan,
+        ))?;
+        Ok(InlinedDataScan::from_batches(
+            rows.into_iter().map(|rows| rows.batch).collect(),
+        ))
+    }
+
+    fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
         block_on(async {
-            // Most catalogs have no inlined data — the registry table is absent.
-            // Detect and return empty so they (and older catalogs) are unaffected.
-            if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(InlinedDataScan::default());
-            }
-
-            // Every physical inlined table for this table (one per schema version).
-            let regs = sqlx::query(
-                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+            Ok(sqlx::query_scalar(
+                "SELECT begin_snapshot FROM ducklake_delete_file WHERE delete_file_id = ?",
             )
-            .bind(table_id)
-            .fetch_all(&self.pool)
-            .await?;
-            if regs.is_empty() {
-                return Ok(InlinedDataScan::default());
-            }
-
-            let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
-            let mut batches = Vec::new();
-            for reg in regs {
-                let phys: String = reg.try_get("table_name")?;
-                // Defensive: only touch tables that look like DuckLake inline tables.
-                if !phys.starts_with("ducklake_inlined_data_")
-                    || !phys.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-
-                // Which of the table's columns this inline table physically has
-                // (its layout matches the schema version it was created for).
-                let info = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT name, type FROM pragma_table_info({})",
-                    // pragma wants a string literal; single-quote-escape the name.
-                    format_args!("'{}'", phys.replace('\'', "''"))
-                )))
-                .fetch_all(&self.pool)
-                .await?;
-                let present: HashSet<String> = info
-                    .iter()
-                    .filter_map(|r| r.try_get::<String, _>("name").ok())
-                    .collect();
-                let physical_types = info
-                    .iter()
-                    .filter_map(|row| {
-                        Some((
-                            row.try_get::<String, _>("name").ok()?,
-                            row.try_get::<String, _>("type").ok()?,
-                        ))
-                    })
-                    .collect::<HashMap<_, _>>();
-
-                // Project the table columns this inline table actually has; rows
-                // visible at the snapshot (this predicate also hides inlined-row
-                // deletes, which set end_snapshot). ORDER BY row_id for stability.
-                let projected: Vec<String> = columns
-                    .iter()
-                    .filter(|c| present.contains(c.column_name.as_str()))
-                    .map(|c| quote_ident(&c.column_name))
-                    .collect();
-                let select_list = if projected.is_empty() {
-                    "1".to_string()
-                } else {
-                    projected.join(", ")
-                };
-                let rendered = filter.and_then(|filter| {
-                    render_inlined_filter(
-                        filter,
-                        InlinedSqlDialect::Sqlite,
-                        schema.as_ref(),
-                        &physical_types,
-                        2,
-                    )
-                });
-                let pushed = rendered
-                    .as_ref()
-                    .map(|rendered| format!(" AND ({})", rendered.sql))
-                    .unwrap_or_default();
-                let sql = format!(
-                    "SELECT {select_list} FROM {} \
-                 WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL){pushed} \
-                 ORDER BY row_id",
-                    quote_ident(&phys)
-                );
-                let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
-                    .bind(snapshot_id)
-                    .bind(snapshot_id);
-                if let Some(rendered) = rendered {
-                    for bind in rendered.binds {
-                        query = match bind {
-                        InlinedSqlBind::Bool(value) => query.bind(value),
-                        InlinedSqlBind::I64(value) => query.bind(value),
-                        InlinedSqlBind::U64(value) => query.bind(i64::try_from(value).map_err(
-                            |_| {
-                                crate::DuckLakeError::Unsupported(format!(
-                                    "SQLite inlined filter cannot represent unsigned value {value}"
-                                ))
-                            },
-                        )?),
-                        InlinedSqlBind::F64(value) => query.bind(value),
-                        InlinedSqlBind::Text(value) => query.bind(value),
-                        InlinedSqlBind::Bytes(value) => query.bind(value),
-                    };
-                    }
-                }
-                let rows = query.fetch_all(&self.pool).await?;
-                if rows.is_empty() {
-                    continue;
-                }
-                batches.push(build_inlined_batch(
-                    &schema,
-                    columns,
-                    &present,
-                    &physical_types,
-                    &rows,
-                )?);
-            }
-            Ok(InlinedDataScan::from_batches(batches))
+            .bind(delete_file_id)
+            .fetch_optional(&self.pool)
+            .await?)
         })
     }
 
@@ -2017,86 +2142,147 @@ impl MetadataProvider for SqliteMetadataProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
-        block_on(async {
-            if !self.schema_capabilities().await?.inlined_data_tables {
-                return Ok(Vec::new());
-            }
-            let regs = sqlx::query(
-                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
-            )
-            .bind(table_id)
-            .fetch_all(&self.pool)
-            .await?;
-            let schema: SchemaRef = Arc::new(crate::types::build_strict_arrow_schema(columns)?);
-            let mut batches = Vec::new();
-            for reg in regs {
-                let physical_name: String = reg.try_get("table_name")?;
-                if !physical_name.starts_with("ducklake_inlined_data_")
-                    || !physical_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-                let info = sqlx::query(AssertSqlSafe(format!(
-                    "SELECT name, type FROM pragma_table_info({})",
-                    format_args!("'{}'", physical_name.replace('\'', "''"))
-                )))
-                .fetch_all(&self.pool)
-                .await?;
-                let present: HashSet<String> = info
-                    .iter()
-                    .filter_map(|row| row.try_get::<String, _>("name").ok())
-                    .collect();
-                let physical_types = info
-                    .iter()
-                    .filter_map(|row| {
-                        Some((
-                            row.try_get::<String, _>("name").ok()?,
-                            row.try_get::<String, _>("type").ok()?,
-                        ))
-                    })
-                    .collect::<HashMap<_, _>>();
-                let projected = columns
-                    .iter()
-                    .filter(|column| present.contains(column.column_name.as_str()))
-                    .map(|column| quote_ident(&column.column_name))
-                    .collect::<Vec<_>>();
-                let select_list = if projected.is_empty() {
-                    "row_id, begin_snapshot".to_string()
-                } else {
-                    format!("row_id, begin_snapshot, {}", projected.join(", "))
-                };
-                let sql = format!(
-                    "SELECT {select_list} FROM {} \
-                     WHERE ? >= begin_snapshot AND (? < end_snapshot OR end_snapshot IS NULL) \
-                 ORDER BY begin_snapshot, row_id",
-                    quote_ident(&physical_name)
-                );
-                let rows = sqlx::query(AssertSqlSafe(sql))
+        let rows = block_on(self.read_inlined_rows_sqlite(
+            table_id,
+            columns,
+            InlinedRowSelection::VisibleAt(snapshot_id),
+            None,
+            InlinedReadShape::Mutation,
+        ))?;
+        Ok(rows.into_iter().map(DuckLakeInlinedData::from).collect())
+    }
+
+    fn read_inlined_rows(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&InlinedFilter>,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(self.read_inlined_rows_sqlite(
+            table_id,
+            columns,
+            selection,
+            filter,
+            InlinedReadShape::Changes,
+        ))
+    }
+
+    fn get_inlined_data_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFlushData>> {
+        let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let mut flushed = Vec::new();
+        for table in tables {
+            let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
+            let sql = format!(
+                "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
+                quote_ident(&table),
+                begin = system.begin_snapshot,
+            );
+            let first: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(sql))
                     .bind(snapshot_id)
-                    .bind(snapshot_id)
-                    .fetch_all(&self.pool)
-                    .await?;
-                if rows.is_empty() {
-                    continue;
-                }
-                let row_ids = rows
-                    .iter()
-                    .map(|row| row.try_get("row_id"))
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                let begin_snapshots = rows
-                    .iter()
-                    .map(|row| row.try_get("begin_snapshot"))
-                    .collect::<std::result::Result<Vec<i64>, _>>()?;
-                batches.push(DuckLakeInlinedData {
-                    table_name: physical_name,
-                    row_ids,
-                    begin_snapshots,
-                    batch: build_inlined_batch(&schema, columns, &present, &physical_types, &rows)?,
+                    .fetch_one(&self.pool),
+            )?;
+            let Some(first) = first else {
+                continue;
+            };
+            let columns = self.get_table_structure(table_id, first)?;
+            if let Some(rows) = block_on(read_sqlite_inlined_table(
+                &self.pool,
+                table_id,
+                &table,
+                &columns,
+                InlinedRowSelection::WrittenUpTo(snapshot_id),
+                None,
+                InlinedReadShape::Flush,
+            ))? {
+                flushed.push(DuckLakeInlinedFlushData {
+                    rows,
+                    columns,
+                    columns_snapshot: first,
                 });
             }
-            Ok(batches)
+        }
+        Ok(flushed)
+    }
+
+    fn get_inlined_file_deletes_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+        block_on(async {
+            let table = inlined_delete_table_name(table_id)?;
+            let sql = format!(
+                "{} ORDER BY del.file_id, del.row_id",
+                inlined_file_deletes_for_flush_sql(&quote_ident(&table), |_| "?".to_string())
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for _ in 0..crate::metadata_provider::INLINED_FILE_DELETES_FOR_FLUSH_PARAMS {
+                query = query.bind(snapshot_id);
+            }
+            let rows = match query.fetch_all(&self.pool).await {
+                Ok(rows) => rows,
+                Err(error) if is_missing_statistics_table(&error) => return Ok(Vec::new()),
+                Err(error) => return Err(error.into()),
+            };
+            rows.iter()
+                .map(|row| {
+                    let mut data_file =
+                        DuckLakeFileData::new(row.try_get(3)?, row.try_get(4)?, row.try_get(5)?);
+                    data_file.encryption_key = row.try_get(6)?;
+                    let existing_delete = match row.try_get::<Option<i64>, _>(7)? {
+                        Some(id) => {
+                            let mut file = DuckLakeFileData::new(
+                                row.try_get(8)?,
+                                row.try_get(9)?,
+                                row.try_get(10)?,
+                            );
+                            file.footer_size = row.try_get(11)?;
+                            file.encryption_key = row.try_get(12)?;
+                            Some((id, file, row.try_get(13)?))
+                        },
+                        None => None,
+                    };
+                    Ok(DuckLakeInlinedFileDeleteForFlush {
+                        data_file_id: row.try_get(0)?,
+                        row_id: row.try_get(1)?,
+                        begin_snapshot: row.try_get(2)?,
+                        data_file,
+                        existing_delete,
+                        data_file_end: row.try_get(14)?,
+                        existing_delete_end: row.try_get(15)?,
+                        earlier_delete_end: row.try_get(16)?,
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn get_inlined_file_deletes_between(
+        &self,
+        table_id: i64,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        block_on(async {
+            let table = quote_ident(&inlined_delete_table_name(table_id)?);
+            let sql = inlined_file_deletes_between_sql(&table, ["?", "?", "?"]);
+            match sqlx::query_as::<_, InlinedFileDeleteRow>(AssertSqlSafe(sql.as_str()))
+                .bind(table_id)
+                .bind(start_snapshot)
+                .bind(end_snapshot)
+                .fetch_all(&self.pool)
+                .await
+            {
+                Ok(rows) => Ok(rows.into_iter().map(inlined_file_delete_change).collect()),
+                Err(error) if is_missing_statistics_table(&error) => Ok(Vec::new()),
+                Err(error) => Err(error.into()),
+            }
         })
     }
 
@@ -2662,20 +2848,16 @@ impl MetadataProvider for SqliteMetadataProvider {
         block_on(async {
             // SQLite doesn't support LATERAL JOIN, so we use correlated subqueries instead
             // This query has two parts:
-            // 1. Incremental deletes: delete files added in the snapshot range
+            // 1. Partial deletes: delete files that begin by the window's end
             // 2. Full file deletes: data files that were completely removed in the snapshot range
             //
-            // Cumulative (current-spec) delete files can hold in-window deletions
-            // even when their begin_snapshot predates the window; they are
-            // included via `ducklake_delete_file.partial_max` (their max embedded
-            // snapshot). Older catalogs lack the column — and cumulative delete
-            // files — so it degrades to NULL there.
-            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
-                "cd.partial_max"
-            } else {
-                "NULL"
-            };
-            let rows = sqlx::query(AssertSqlSafe(format!(
+            // Part 1 takes every delete file that begins by the window's end, as
+            // official does: a delete file that records each row's deleting
+            // snapshot (a flush's, dated at the earliest of them) can hold
+            // in-window deletions though it begins before the window. The feed
+            // windows its rows per row; a delete file without that column adds
+            // nothing before its own begin_snapshot.
+            let rows = sqlx::query(
                 r#"
 -- Part 1: Incremental deletes (delete file added)
 SELECT
@@ -2719,8 +2901,6 @@ FROM ducklake_delete_file cd
 JOIN ducklake_data_file data ON data.data_file_id = cd.data_file_id
 WHERE cd.table_id = ?
   AND cd.begin_snapshot <= ?
-  AND (cd.begin_snapshot >= ?
-       OR ({pm} IS NOT NULL AND {pm} >= ?))
   AND data.table_id = ?
 
 UNION ALL
@@ -2767,18 +2947,16 @@ FROM ducklake_data_file data
 WHERE data.table_id = ?
   AND data.end_snapshot >= ?
   AND data.end_snapshot <= ?
-"#
-            )))
+"#,
+            )
             // Part 1 bindings: 4x table_id for prev subqueries, table_id for cd,
-            // end, start (window), start (partial_max), table_id for data
+            // end, table_id for data
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
             .bind(table_id)
             .bind(end_snapshot)
-            .bind(start_snapshot)
-            .bind(start_snapshot)
             .bind(table_id)
             // Part 2 bindings: 4x table_id for prev subqueries, table_id for data, start, end
             .bind(table_id)
@@ -2952,7 +3130,7 @@ mod tests {
             sql.cte
         );
         assert!(
-            sql.conditions.contains("col_2_stats.min_value_1 < 5.0"),
+            sql.conditions.contains("col_2_stats.min_value_1 < 5e0"),
             "{}",
             sql.conditions
         );
@@ -3064,10 +3242,9 @@ mod tests {
     }
 
     /// A constant outside the canonical four-digit-year encoding is declined:
-    /// `chrono` writes those years with a leading `+` or `-`, which sort below
-    /// every digit and would invert the text comparison. `stats_encode` renders
-    /// 4_000_000 days after the epoch as `+12921-08-18` and 800_000 before it as
-    /// `-0221-09-04`.
+    /// its text would not order with four-digit years. `stats_encode` renders
+    /// 4_000_000 days after the epoch as `12921-08-18` and 800_000 before it as
+    /// `0222-09-04 (BC)`.
     #[test]
     fn declines_a_date_constant_outside_the_canonical_encoding() {
         for days in [4_000_000, -800_000] {

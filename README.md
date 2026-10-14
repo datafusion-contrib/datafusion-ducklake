@@ -133,9 +133,10 @@ df.show().await?;
 
 ## Writing a catalog
 
-Data inlining is opt-in. The default `data_inlining_row_limit = 0` keeps writes
-in Parquet. A positive limit enables eligible small writes; see the
-[inlined storage limits](COMPATIBILITY.md#inlined-physical-storage) before enabling it.
+SQL writes of at most `data_inlining_row_limit` rows (default `10`, as in official
+DuckLake) are stored in the catalog rather than in Parquet; set the limit to `0` to
+write every insert to Parquet. See the
+[inlined storage limits](COMPATIBILITY.md#inlined-physical-storage).
 
 PostgreSQL has two writers, both behind the `write-postgres` feature:
 
@@ -350,9 +351,11 @@ A few highlights worth knowing up front:
   itself, so a selective scan no longer lists every file. A few type/backend combinations
   decline it and fall back to in-memory pruning — see COMPATIBILITY.md.
 - Data inlining: rows inlined by DuckDB's ducklake extension are read and counted by
-  `COUNT(*)` on every backend. Writing small batches inline is opt-in via the
-  `data_inlining_row_limit` setting; `UPDATE` and row-lineage scans still refuse a table with
-  visible inlined rows — see COMPATIBILITY.md.
+  `COUNT(*)` on every backend. SQL writes inline batches of at most `data_inlining_row_limit`
+  rows (default `10`, as in official DuckLake), and `UPDATE` and `DELETE` inline small changes
+  as official does. The single-catalog PostgreSQL writer does not inline: its SQL writes and
+  staged write transactions go to Parquet, and it supports neither `UPDATE` nor `DELETE`.
+  Row-lineage scans and change feeds include inlined rows — see COMPATIBILITY.md.
 - Schema evolution: recursive `list`/`struct`/`map` columns, literal column defaults, and
   per-file `map_by_name` name mappings are honoured across scans, writes, and change feeds.
 - Read-only DuckLake views are exposed across metadata backends.

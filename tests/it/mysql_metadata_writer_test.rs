@@ -330,10 +330,10 @@ async fn mysql_nested_inlined_rows_round_trip_flush_and_skip_text_indexes() {
 
     let flushed = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new()))
         .unwrap()
-        .flush_inlined_data(
+        .flush_table_inlined_data(
+            Arc::new(MySqlMetadataProvider::from_pool(pool.clone())),
             "main",
             "nested_flush",
-            &flush_inlined,
             flush_write.snapshot_id,
         )
         .await
@@ -352,15 +352,16 @@ async fn mysql_nested_inlined_rows_round_trip_flush_and_skip_text_indexes() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
+    // The flush deleted the rows it moved, as official's does.
+    assert!(
         provider
             .get_inlined_data(
                 flush_write.table_id,
                 flush_write.snapshot_id,
                 &flush_columns,
             )
-            .unwrap(),
-        vec![flush_expected.clone()]
+            .unwrap()
+            .is_empty()
     );
     assert_eq!(mysql_table_count(pool.clone(), "nested_flush").await, 2);
     assert_eq!(
@@ -814,7 +815,7 @@ async fn mysql_writer_completion_matches_sqlite_contracts() {
             1,
             2,
             Some(compact_second_commit.snapshot_id),
-            format!("compacted_table:{}", compact_first.table_id),
+            format!("merge_adjacent:{}", compact_first.table_id),
         )
     );
 
@@ -865,7 +866,8 @@ async fn mysql_writer_completion_matches_sqlite_contracts() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(restore_state, (Some(restore_snapshot), 2, 5));
+    // Retiring leaves the gross count of rows ever inserted.
+    assert_eq!(restore_state, (Some(restore_snapshot), 5, 5));
 
     let promote = writer
         .begin_write_transaction("main", "promote", &columns, WriteMode::Append)
@@ -967,10 +969,12 @@ async fn mysql_truncate_ends_inline_only_table() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(state, (truncate_snapshot, 0, 2, 0));
+    // A truncate leaves the gross count of rows ever inserted.
+    assert_eq!(state, (truncate_snapshot, 0, 2, 2));
+    // Official records the inlined rows it ended, and no Parquet deletion.
     assert_eq!(
         changes_made(&pool, truncate_snapshot).await,
-        Some(format!("deleted_from_table:{}", setup.table_id))
+        Some(format!("inlined_delete:{}", setup.table_id))
     );
     // Nothing left to truncate: idempotent no-op with no new snapshot.
     assert_eq!(
@@ -1006,10 +1010,14 @@ async fn mysql_truncate_retires_files_and_ends_inline_rows() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(state, (Some(truncate_snapshot), 0, 2, 0));
+    // A truncate leaves the gross count of rows ever inserted.
+    assert_eq!(state, (Some(truncate_snapshot), 0, 2, 5));
     assert_eq!(
         changes_made(&pool, truncate_snapshot).await,
-        Some(format!("deleted_from_table:{}", setup.table_id))
+        Some(format!(
+            "deleted_from_table:{0},inlined_delete:{0}",
+            setup.table_id
+        ))
     );
 }
 
@@ -1055,13 +1063,16 @@ async fn mysql_commit_deletes_mixes_positional_and_inlined_in_one_snapshot() {
     .unwrap();
     assert_eq!(
         state,
-        (commit.snapshot_id, Some(commit.snapshot_id), None, 4),
+        (commit.snapshot_id, Some(commit.snapshot_id), None, 5),
         "delete file begins at the commit, inline row 3 ends there, row 4 stays \
-         live, and only the inline delete adjusts the gross count"
+         live, and the gross count is left as it was"
     );
     assert_eq!(
         changes_made(&pool, commit.snapshot_id).await,
-        Some(format!("deleted_from_table:{}", setup.table_id))
+        Some(format!(
+            "deleted_from_table:{0},inlined_delete:{0}",
+            setup.table_id
+        ))
     );
 }
 
@@ -1173,7 +1184,7 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
     assert_eq!(
         changes_made(&pool, update_commit.snapshot_id).await,
         Some(format!(
-            "deleted_from_table:{0},inserted_into_table:{0}",
+            "inserted_into_table:{0},deleted_from_table:{0}",
             setup.table_id
         ))
     );
@@ -1222,7 +1233,7 @@ async fn mysql_unified_file_id_allocation_survives_mixed_paths() {
     );
     assert_eq!(
         changes_made(&pool, compact_commit.snapshot_id).await,
-        Some(format!("compacted_table:{}", setup.table_id))
+        Some(format!("rewrite_delete:{}", setup.table_id))
     );
 }
 
@@ -1559,4 +1570,100 @@ async fn mysql_compaction_stores_a_preserved_row_id_start() {
         vec![("ab.parquet".to_string(), Some(0)), ("c2.parquet".to_string(), None),]
     );
     assert_eq!(next_row_id().await, 9, "a compaction mints no rowids");
+}
+
+/// MySQL creates an inlined data table outside the commit's transaction, so a
+/// commit that fails afterwards leaves it behind, unregistered. Readers never
+/// see it, and the next commit to take its schema version replaces it with a
+/// table of that commit's columns instead of inserting into the stale one.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_orphan_inlined_table_is_ignored_and_replaced() {
+    let (_container, writer, pool) = start_writer().await;
+    let (setup, commit) = append_inlined(&writer, &[1, 2]);
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?")
+            .bind(commit.snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // What a rolled-back `ADD COLUMN other` leaves: the next version's table,
+    // with that commit's columns and no registry row.
+    let orphan = format!(
+        "ducklake_inlined_data_{}_{}",
+        setup.table_id,
+        schema_version + 1
+    );
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE TABLE `{orphan}` (row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT, \
+         id INT, other VARCHAR(10)) ENGINE = InnoDB"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(AssertSqlSafe(format!(
+        "INSERT INTO `{orphan}` VALUES (99, 0, NULL, 99, 'stale')"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mysql_table_count(pool.clone(), "t").await, 2);
+
+    let columns = vec![
+        ColumnDef::new("id", "int32", false).unwrap(),
+        ColumnDef::new("name", "varchar", true).unwrap(),
+    ];
+    let setup = writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Append)
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8View, true),
+        ])),
+        vec![Arc::new(Int32Array::from(vec![3])), Arc::new(StringViewArray::from(vec!["c"]))],
+    )
+    .unwrap();
+    writer
+        .register_inlined_data(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            &[batch],
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.column_ids,
+            &SnapshotCommitMetadata::default(),
+            None,
+        )
+        .unwrap();
+    let registered: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ? \
+         ORDER BY schema_version",
+    )
+    .bind(setup.table_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(registered.last(), Some(&orphan));
+    let physical: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position",
+    )
+    .bind(&orphan)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(physical[3..], ["id".to_string(), "name".to_string()]);
+    let batches = mysql_table_batches(pool.clone(), "t").await;
+    let text = arrow::util::pretty::pretty_format_batches(&batches)
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("| 3  | c    |") && !text.contains("stale"),
+        "{text}"
+    );
+    assert_eq!(mysql_table_count(pool, "t").await, 3);
 }

@@ -4,10 +4,11 @@
 //! that binds to a `catalog_id` produced here.
 
 use crate::Result;
+use crate::inlined_reclaim::dead_table_inlined_storage;
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_writer_postgres::execute_ddl_statements;
+use crate::metadata_writer_postgres::{execute_ddl_statements, quote_ident};
 use chrono::{DateTime, Utc};
 use sqlx::AssertSqlSafe;
 use sqlx::Row;
@@ -217,6 +218,15 @@ pub struct MulticatalogManager {
 }
 
 impl MulticatalogManager {
+    /// Whether the store has the `ducklake_inlined_data_tables` registry, from the
+    /// capability probe every inlined read uses. A store bootstrapped before staged
+    /// commits lacks it until a writer first binds to it.
+    async fn has_inlined_data_registry(&self) -> Result<bool> {
+        crate::PostgresMetadataProvider::from_pool(self.pool.clone())
+            .has_inlined_data_registry()
+            .await
+    }
+
     /// Connect to PostgreSQL and initialize the multicatalog schema.
     pub async fn connect(connection_string: &str, max_connections: u32) -> Result<Self> {
         let url = connection_string.to_string();
@@ -334,7 +344,9 @@ impl MulticatalogManager {
     /// the lock — matches
     /// [`crate::metadata_writer_postgres::DEFAULT_LOCK_TIMEOUT_MS`]. The
     /// entire teardown is one transaction; either everything is gone
-    /// or nothing changes.
+    /// or nothing changes. That includes the catalog's inlined storage:
+    /// the registered inlined data tables of its tables, their inlined
+    /// delete tables, and their registry rows.
     ///
     /// # What's NOT cleaned up
     ///
@@ -415,7 +427,31 @@ impl MulticatalogManager {
             .execute(&mut *tx)
             .await?;
         }
-        for child_table in [
+        // The catalog's inlined storage: every registered inlined data table of its
+        // tables and their inlined delete tables, listed while the table and registry
+        // rows that name them exist and dropped in this transaction after them.
+        let table_ids = sqlx::query_scalar::<_, i64>(
+            "SELECT DISTINCT t.table_id FROM ducklake_table t
+             JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+             WHERE m.catalog_id = $1",
+        )
+        .bind(catalog_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        // A store bootstrapped before staged commits has no registry.
+        let has_registry = self.has_inlined_data_registry().await?;
+        let registered = if has_registry {
+            sqlx::query_scalar::<_, String>(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)",
+            )
+            .bind(&table_ids)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
+        let inlined_storage = dead_table_inlined_storage(registered, &table_ids)?;
+        let mut child_tables = vec![
             "ducklake_data_file",
             "ducklake_delete_file",
             "ducklake_file_column_stats",
@@ -428,7 +464,11 @@ impl MulticatalogManager {
             "ducklake_partition_column",
             "ducklake_sort_info",
             "ducklake_sort_expression",
-        ] {
+        ];
+        if has_registry {
+            child_tables.push("ducklake_inlined_data_tables");
+        }
+        for child_table in child_tables {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {} WHERE table_id IN (
                     SELECT t.table_id FROM ducklake_table t
@@ -451,6 +491,7 @@ impl MulticatalogManager {
         .bind(catalog_id)
         .execute(&mut *tx)
         .await?;
+        drop_existing_tables(&mut tx, inlined_storage).await?;
 
         sqlx::query(
             "DELETE FROM ducklake_schema WHERE schema_id IN (
@@ -716,7 +757,10 @@ impl MulticatalogManager {
     /// data file / delete file no longer reachable by any surviving snapshot of this catalog
     /// is removed and its physical path recorded in `ducklake_files_scheduled_for_deletion`
     /// (tagged with `catalog_id`) for later deletion via
-    /// [`crate::maintenance::cleanup_old_files_in_catalog`]. Returns the expired snapshots.
+    /// [`crate::maintenance::cleanup_old_files_in_catalog`]. A fully expired table's
+    /// inlined data and inlined delete tables are dropped with its registry rows in the
+    /// same transaction; a live table's inlined rows are kept, also those no surviving
+    /// snapshot can read. Returns the expired snapshots.
     ///
     /// # Concurrency
     ///
@@ -970,15 +1014,30 @@ impl MulticatalogManager {
         // 6. Reclaim per-table metadata for fully-expired tables. This is official's
         //    twelve-table list from DeleteSnapshots.
         //    Official's list is twelve (ducklake_metadata_manager.cpp, DeleteSnapshots).
-        //    ducklake_inlined_data_tables and ducklake_column_mapping are omitted
-        //    because this schema does not have them. IF EITHER IS EVER ADDED, ADD IT
-        //    HERE TOO — official reclaims it, and a table-scoped table this loop
-        //    misses orphans forever. Official's `ducklake_column_tag` is the catalog-scoped
-        //    `ducklake_catalog_column_tag` here; object tags are reclaimed below.
-        //    ducklake_table_stats is in it because this writer
-        //    creates and maintains it — the comment that used to say otherwise was
-        //    wrong — and the SQLite expire path already reclaimed it.
-        for table in [
+        //    ducklake_column_mapping is omitted because this schema does not have it.
+        //    IF IT IS EVER ADDED, ADD IT HERE TOO — official reclaims it, and a
+        //    table-scoped table this loop misses orphans forever. Official's
+        //    `ducklake_column_tag` is the catalog-scoped `ducklake_catalog_column_tag`
+        //    here; object tags are reclaimed below. ducklake_table_stats is in it
+        //    because this writer creates and maintains it, and the SQLite expire path
+        //    reclaims it too.
+        //    The table's inlined storage goes with it: its registered inlined data
+        //    tables and its inlined delete table, listed before the registry rows are
+        //    deleted and dropped after them, as official does.
+        //    A store bootstrapped before staged commits has no registry.
+        let has_registry = self.has_inlined_data_registry().await?;
+        let registered = if has_registry {
+            sqlx::query_scalar::<_, String>(
+                "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ANY($1)",
+            )
+            .bind(&dead_tables)
+            .fetch_all(&mut *tx)
+            .await?
+        } else {
+            Vec::new()
+        };
+        let inlined_storage = dead_table_inlined_storage(registered, &dead_tables)?;
+        let mut per_table = vec![
             "ducklake_table",
             "ducklake_table_stats",
             "ducklake_table_column_stats",
@@ -989,7 +1048,11 @@ impl MulticatalogManager {
             "ducklake_sort_expression",
             "ducklake_schema_versions",
             "ducklake_catalog_column_tag",
-        ] {
+        ];
+        if has_registry {
+            per_table.push("ducklake_inlined_data_tables");
+        }
+        for table in per_table {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE table_id = ANY($1)"
             )))
@@ -997,6 +1060,7 @@ impl MulticatalogManager {
             .execute(&mut *tx)
             .await?;
         }
+        drop_existing_tables(&mut tx, inlined_storage).await?;
 
         // Object tags ended before every surviving snapshot of this catalog can no longer be
         // read. Column tags follow their table instead, as in official: they go with a dead
@@ -1358,6 +1422,36 @@ impl MulticatalogManager {
             .map(|r| Ok((r.try_get::<String, _>(0)?, r.try_get::<bool, _>(1)?)))
             .collect()
     }
+}
+
+/// Drop those of `tables` that exist. One existence query and one `DROP TABLE` per
+/// chunk instead of a statement per name: dropping a catalog lists an inlined delete
+/// table for every table it has, and most do not exist.
+async fn drop_existing_tables(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tables: Vec<String>,
+) -> Result<()> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM unnest($1::text[]) AS name
+         WHERE to_regclass(quote_ident(name)) IS NOT NULL",
+    )
+    .bind(&tables)
+    .fetch_all(&mut **tx)
+    .await?;
+    for chunk in existing.chunks(256) {
+        let names = chunk
+            .iter()
+            .map(|name| quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {names}")))
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Schedule the physical files behind dead `(id, resolved_path, rel, owned)` rows

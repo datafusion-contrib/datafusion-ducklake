@@ -11,9 +11,9 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{FutureExt, StreamExt};
-use object_store::ObjectStore;
 use object_store::buffered::BufWriter as ObjectBufWriter;
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
@@ -26,7 +26,7 @@ use crate::metadata_provider::DuckLakeInlinedData;
 use crate::metadata_writer::{
     ColumnDef, DataFileInfo, DeleteFileEntry, DeleteFileInfo, InlinedRowRef, MetadataWriter,
     SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode, WriteResult,
-    validate_delete_entries,
+    WriteSetupResult, validate_delete_entries,
 };
 use crate::path_resolver::join_paths;
 use crate::row_id::{embedded_rowid_field, embedded_snapshot_id_field};
@@ -73,12 +73,19 @@ pub const MINIMUM_TARGET_FILE_SIZE: usize = 4096;
 /// later compaction to reorganize (DuckLake compaction merges, never splits).
 pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 
+/// Default scoped `data_inlining_row_limit`, matching official DuckLake's
+/// (`DuckLakeCatalog::DataInliningRowLimit`): an insert of at most this many rows
+/// is stored in the catalog rather than in a Parquet file. Set the catalog,
+/// schema or table option to `0` to write every insert to Parquet.
+pub const DEFAULT_DATA_INLINING_ROW_LIMIT: usize = 10;
+
 /// Write and maintenance options carried from the catalog down to each table.
 /// A SQL `INSERT`, update rewrite, or compaction output uses the same compression,
 /// row-group caps, file-rollover target, sorting, and partition-path policy.
 /// A `None` field leaves the receiving writer's configured value unchanged.
 /// Catalog-derived options populate DuckDB's defaults: Snappy, 122,880 rows per
-/// row group, and [`DEFAULT_TARGET_FILE_SIZE`] rollover.
+/// row group, [`DEFAULT_TARGET_FILE_SIZE`] rollover, and inlining of inserts of at
+/// most [`DEFAULT_DATA_INLINING_ROW_LIMIT`] rows.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct DuckLakeWriteOptions {
@@ -128,9 +135,11 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            // Keep inlining opt-in until inline UPDATE, rowid, CDC, SQL flush, and
-            // automatic maintenance are supported. Explicit settings still apply (#270).
-            data_inlining_row_limit: setting_usize(settings, "data_inlining_row_limit", Some(0))?,
+            data_inlining_row_limit: setting_usize(
+                settings,
+                "data_inlining_row_limit",
+                Some(DEFAULT_DATA_INLINING_ROW_LIMIT),
+            )?,
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
@@ -144,7 +153,13 @@ impl DuckLakeWriteOptions {
             upload_concurrency: None,
             sort_on_insert: setting_bool(settings, "sort_on_insert", true)?,
             hive_file_pattern: setting_bool(settings, "hive_file_pattern", true)?,
-            auto_compact: setting_bool(settings, "auto_compact", true)?,
+            // Official compacts and flushes a table only while its option
+            // reads exactly `true`; any other value turns them off.
+            auto_compact: Some(
+                settings
+                    .get("auto_compact")
+                    .is_none_or(|value| value == "true"),
+            ),
             rewrite_delete_threshold: setting_f64(
                 settings,
                 "rewrite_delete_threshold",
@@ -423,6 +438,48 @@ struct PreparedTableWrite {
     object_paths: Vec<ObjectPath>,
     files_written: usize,
     records_written: i64,
+    /// What each of `write.rewritten_deletes` holds, in the same order.
+    rewrite_sources: Vec<RewrittenDeleteSource>,
+}
+
+/// What a statement's rewritten delete file holds, kept so the commit can
+/// write it again with the statement's deletions dated to a later snapshot.
+#[derive(Debug, Clone)]
+pub(crate) struct RewrittenDeleteSource {
+    /// The data file the deletions target, as its delete file records it.
+    pub(crate) data_file_path: String,
+    /// The replaced delete file's positions with the snapshot that deleted each.
+    pub(crate) existing: Vec<(i64, i64)>,
+    /// The statement's positions.
+    pub(crate) positions: Vec<i64>,
+}
+
+/// A delete file a statement rewrote, with what it holds.
+#[derive(Debug, Clone)]
+pub(crate) struct RewrittenDelete {
+    pub(crate) entry: crate::metadata_writer::InlinedFlushFileDelete,
+    pub(crate) source: RewrittenDeleteSource,
+}
+
+/// Attempts of a staged commit whose rewritten delete files must be re-dated
+/// because other snapshots landed first: official DuckLake's default
+/// `ducklake_max_retry_count`, which bounds its attempts, the first included.
+const MAX_COMMIT_ATTEMPTS: u32 = 10;
+
+/// Official DuckLake's default `ducklake_retry_wait_ms`.
+const RETRY_WAIT_MS: f64 = 100.0;
+
+/// Official DuckLake's default `ducklake_retry_backoff`.
+const RETRY_BACKOFF: f64 = 1.5;
+
+/// The wait before the attempt after failed attempt `attempt` (0-based), as
+/// official waits: `retry_wait_ms * [0.5, 1.0) * retry_backoff ^ attempt`.
+fn retry_wait(attempt: u32) -> std::time::Duration {
+    let random = (uuid::Uuid::new_v4().as_u128() >> 75) as f64 / (1u64 << 53) as f64;
+    let multiplier = (random + 1.0) / 2.0;
+    std::time::Duration::from_secs_f64(
+        RETRY_WAIT_MS * multiplier * RETRY_BACKOFF.powi(attempt as i32) / 1_000.0,
+    )
 }
 
 /// A set of table changes committed in one DuckLake snapshot.
@@ -439,12 +496,44 @@ pub struct DuckLakeWriteTransaction<'a> {
     writes: Vec<PreparedTableWrite>,
     commit_metadata: SnapshotCommitMetadata,
     expected_base_snapshot_id: Option<i64>,
+    delete_file_positions: Option<DeleteFilePositionsRef<'a>>,
+}
+
+/// A data file's live delete file: its id and every position it deletes.
+pub(crate) type LiveDeleteFile = (i64, std::collections::HashSet<i64>);
+
+/// Reads the live delete file of a data file at the catalog's latest
+/// snapshot, for a commit whose inlined deletions met a delete file their
+/// statement did not read ([`changed_delete_file_of`](crate::metadata_writer::changed_delete_file_of)).
+pub(crate) trait DeleteFilePositions: Send + Sync {
+    /// The live delete file of data file `data_file_id` of table `table_id`
+    /// and every position it deletes, or `None` when the data file is not
+    /// live or has no live delete file.
+    fn live_delete_file<'a>(
+        &'a self,
+        table_id: i64,
+        data_file_id: i64,
+    ) -> futures::future::BoxFuture<'a, Result<Option<LiveDeleteFile>>>;
+}
+
+/// A [`DeleteFilePositions`] a transaction holds.
+#[derive(Clone, Copy)]
+struct DeleteFilePositionsRef<'a>(&'a dyn DeleteFilePositions);
+
+impl std::fmt::Debug for DeleteFilePositionsRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeleteFilePositions")
+    }
 }
 
 /// High-level writer for DuckLake tables.
 #[derive(Debug, Clone)]
 pub struct DuckLakeTableWriter {
     metadata: Arc<dyn MetadataWriter>,
+    /// The snapshot a SQL statement planned against, when earlier than the
+    /// head its write begins at: changes committed since it conflict with
+    /// the write as they do with official's insert.
+    planned_base_snapshot: Option<i64>,
     object_store: Arc<dyn ObjectStore>,
     /// The key path portion of the data_path (e.g., "/prefix/data/")
     base_key_path: String,
@@ -482,6 +571,25 @@ pub struct DuckLakeTableWriter {
     hive_file_pattern: bool,
 }
 
+/// Whether an error came from the metadata database or the object store or
+/// file system, after which this crate leaves files it wrote in place rather
+/// than guess whether anything references them.
+pub(crate) fn is_transport_error(error: &crate::error::DuckLakeError) -> bool {
+    use crate::error::DuckLakeError;
+    match error {
+        DuckLakeError::ObjectStore(_) | DuckLakeError::Io(_) => true,
+        #[cfg(any(
+            feature = "metadata-postgres",
+            feature = "metadata-mysql",
+            feature = "metadata-sqlite"
+        ))]
+        DuckLakeError::Sqlx(_) => true,
+        #[cfg(feature = "metadata-duckdb")]
+        DuckLakeError::DuckDb(_) => true,
+        _ => false,
+    }
+}
+
 impl DuckLakeTableWriter {
     pub fn new(
         metadata: Arc<dyn MetadataWriter>,
@@ -492,6 +600,7 @@ impl DuckLakeTableWriter {
 
         Ok(Self {
             metadata,
+            planned_base_snapshot: None,
             object_store,
             base_key_path: key_path,
             compression: Compression::UNCOMPRESSED,
@@ -515,6 +624,7 @@ impl DuckLakeTableWriter {
             writes: Vec::new(),
             commit_metadata: SnapshotCommitMetadata::default(),
             expected_base_snapshot_id: None,
+            delete_file_positions: None,
         }
     }
 
@@ -665,6 +775,32 @@ impl DuckLakeTableWriter {
     /// This is also the right default for a session finished with
     /// [`TableWriteSession::finish_with_deletes`]: that commit registers every
     /// appended file, however many the session rolled or partitioned into, in the
+    /// Check the write against the changes committed since `snapshot_id`, the
+    /// snapshot its rows were planned at, rather than since the head it begins
+    /// at. SQL `INSERT` passes the snapshot its source and target were read at.
+    pub(crate) fn with_planned_base_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.planned_base_snapshot = Some(snapshot_id);
+        self
+    }
+
+    /// [`MetadataWriter::begin_write_transaction`], based at the planned
+    /// snapshot when one was set and is earlier.
+    fn begin_write_transaction(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+    ) -> Result<WriteSetupResult> {
+        let mut setup =
+            self.metadata
+                .begin_write_transaction(schema_name, table_name, columns, mode)?;
+        if let Some(planned) = self.planned_base_snapshot {
+            setup.base_snapshot_id = setup.base_snapshot_id.min(planned);
+        }
+        Ok(setup)
+    }
+
     /// same snapshot as the deletes.
     pub fn begin_write(
         &self,
@@ -831,12 +967,11 @@ impl DuckLakeTableWriter {
         partition_mode: StreamPartitionMode,
         roll: bool,
     ) -> Result<TableWriteSession> {
+        self.refuse_encrypted_parquet("write a data file")?;
         let validation_schema =
             Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
-        let setup =
-            self.metadata
-                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
         // Data columns carry their catalog field-ids. When embedding row lineage,
         // append the reserved-field-id rowid column AFTER them; it is a parquet-only
         // column (not a catalog column), so it is absent from `columns`/`column_ids`
@@ -961,7 +1096,7 @@ impl DuckLakeTableWriter {
             path_is_relative,
             mode,
             row_count: 0,
-            nan_flags: Vec::new(),
+            leaf_stats: Default::default(),
             partition_sink,
             roller,
             rolled,
@@ -999,17 +1134,80 @@ impl DuckLakeTableWriter {
             .await
     }
 
-    /// Shared body of [`Self::write_table`] / [`Self::append_table`].
+    /// Flush the catalog-inlined rows of one table to Parquet: the same flush as
+    /// [`DuckLakeCatalog::flush_inlined_data`](crate::DuckLakeCatalog::flush_inlined_data)
+    /// restricted to `schema_name.table_name`, writing through this writer's
+    /// object store and reading through `provider`.
     ///
-    /// A row-bearing input goes through the layout-aware [`Self::write_rows`]. An
-    /// input of only empty batches keeps the single-file session path: `write_rows`
-    /// produces no file at all, which for `Replace` would skip the truncation of the
-    /// prior generation, whereas the session registers the 0-row file that carries it.
+    /// The flush reads the inlined rows at `expected_base_snapshot_id` and commits
+    /// against it: a concurrent drop, inlined delete or flush of the table since
+    /// then aborts the commit with [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict)
+    /// and removes the files this call wrote. The files take the table's own write
+    /// settings (compression, row groups, `target_file_size`), as every flush does;
+    /// this writer's own settings do not apply. Flushed rows are deleted from the
+    /// inlined tables, and empty superseded inlined tables are dropped after the
+    /// commit. An error from that drop is returned although the flush
+    /// committed. Returns `None` when the table has nothing inlined, or has
+    /// `auto_compact` set to `false`; a flush that only moved inlined deletions
+    /// of Parquet rows into delete files reports no files or rows written.
+    pub async fn flush_table_inlined_data(
+        &self,
+        provider: Arc<dyn crate::metadata_provider::MetadataProvider>,
+        schema_name: &str,
+        table_name: &str,
+        expected_base_snapshot_id: i64,
+    ) -> Result<Option<WriteResult>> {
+        let catalog =
+            crate::DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&self.metadata))?;
+        let outcome = catalog
+            .flush_inlined_data_with(
+                crate::inlined_flush::FlushObjectStores::Fixed(Arc::clone(&self.object_store)),
+                Some(schema_name),
+                Some(table_name),
+                Some(expected_base_snapshot_id),
+            )
+            .await?;
+        let Some(snapshot_id) = outcome.snapshot_id else {
+            return Ok(None);
+        };
+        if let Some(table) = outcome.tables.into_iter().next() {
+            return Ok(Some(WriteResult {
+                snapshot_id,
+                table_id: table.table_id,
+                schema_id: table.schema_id,
+                files_written: table.files_written,
+                records_written: table.flushed.rows_flushed,
+            }));
+        }
+        // The commit moved only inlined deletions of Parquet rows into delete
+        // files: no row was flushed.
+        let schema = provider
+            .get_schema_by_name(schema_name, snapshot_id)?
+            .ok_or_else(|| crate::DuckLakeError::SchemaNotFound(schema_name.to_string()))?;
+        let table = provider
+            .get_table_by_name(schema.schema_id, table_name, snapshot_id)?
+            .ok_or_else(|| {
+                crate::DuckLakeError::TableNotFound(format!("{schema_name}.{table_name}"))
+            })?;
+        Ok(Some(WriteResult {
+            snapshot_id,
+            table_id: table.table_id,
+            schema_id: schema.schema_id,
+            files_written: 0,
+            records_written: 0,
+        }))
+    }
+
     /// Materialize visible inlined rows as Parquet in one fenced snapshot.
     ///
     /// The caller reads `inlined_data` at `expected_base_snapshot_id`. The
     /// commit registers the resulting data files and ends those exact inlined
     /// row identities atomically. Empty input is a no-op.
+    ///
+    /// Unlike official DuckLake's flush, the rows get new row ids and the
+    /// files begin at the flush snapshot, and the ended inlined rows stay in
+    /// their tables; [`Self::flush_table_inlined_data`] flushes as official does.
+    #[deprecated(note = "use DuckLakeCatalog::flush_inlined_data, which matches DuckLake's flush")]
     pub async fn flush_inlined_data(
         &self,
         schema_name: &str,
@@ -1088,6 +1286,12 @@ impl DuckLakeTableWriter {
         Ok(results.pop())
     }
 
+    /// Shared body of [`Self::write_table`] / [`Self::append_table`].
+    ///
+    /// A row-bearing input goes through the layout-aware [`Self::write_rows`]. An
+    /// input of only empty batches keeps the single-file session path: `write_rows`
+    /// produces no file at all, which for `Replace` would skip the truncation of the
+    /// prior generation, whereas the session registers the 0-row file that carries it.
     async fn write_all(
         &self,
         schema_name: &str,
@@ -1116,16 +1320,25 @@ impl DuckLakeTableWriter {
         session.finish().await
     }
 
+    /// Refuse to write a Parquet file for `operation` into an encrypted catalog
+    /// (see [`MetadataWriter::catalog_encrypted`]).
+    pub(crate) fn refuse_encrypted_parquet(&self, operation: &str) -> Result<()> {
+        if self.metadata.catalog_encrypted()? {
+            return Err(crate::inlined_flush::encrypted_catalog_error(operation));
+        }
+        Ok(())
+    }
+
     fn validation_schema(
         &self,
         schema_name: &str,
         table_name: &str,
         incoming_schema: &Schema,
     ) -> Result<Schema> {
-        let Some(columns) = self
+        let existing = self
             .metadata
-            .get_table_column_nullability(schema_name, table_name)?
-        else {
+            .get_table_column_nullability(schema_name, table_name)?;
+        let Some(columns) = existing else {
             return Ok(incoming_schema.clone());
         };
         let nullability: HashMap<String, bool> = columns
@@ -1148,6 +1361,30 @@ impl DuckLakeTableWriter {
         ))
     }
 
+    /// Remove the delete files of `deletes`, written under
+    /// `schema_name.table_name` for a commit that failed with `error`, when it
+    /// definitely registered nothing (see [`commit_definitely_rolled_back`]), and
+    /// return `error`.
+    pub(crate) async fn release_written_delete_files(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        error: crate::error::DuckLakeError,
+        deletes: &[DeleteFileEntry],
+    ) -> crate::error::DuckLakeError {
+        let files = deletes
+            .iter()
+            .map(|entry| (entry.delete.path.as_str(), entry.delete.path_is_relative));
+        self.release_files_if(
+            schema_name,
+            table_name,
+            error,
+            files,
+            commit_definitely_rolled_back,
+        )
+        .await
+    }
+
     /// Write a positional `(file_path, pos)` delete parquet, upload it, and
     /// return the [`DeleteFileInfo`] to register via
     /// [`MetadataWriter::set_delete_file`].
@@ -1167,6 +1404,83 @@ impl DuckLakeTableWriter {
         data_file_path: &str,
         positions: &[i64],
     ) -> Result<DeleteFileInfo> {
+        self.write_delete_file_inner(schema_name, table_name, data_file_path, positions, None)
+            .await
+    }
+
+    /// Write the delete file a statement rewrites: `source`'s existing
+    /// positions with their snapshots and its new positions dated `date`.
+    /// Returns the file with its `begin_snapshot` (the earliest deletion) and
+    /// `partial_max` (the latest).
+    pub(crate) async fn write_rewritten_delete_file(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        source: &RewrittenDeleteSource,
+        date: i64,
+    ) -> Result<(DeleteFileInfo, i64, i64)> {
+        let mut deletions = source
+            .existing
+            .iter()
+            .copied()
+            .chain(source.positions.iter().map(|position| (*position, date)))
+            .collect::<Vec<_>>();
+        deletions.sort_unstable();
+        let begin_snapshot = deletions.iter().map(|(_, s)| *s).min().unwrap_or(date);
+        let partial_max = deletions.iter().map(|(_, s)| *s).max().unwrap_or(date);
+        let mut written = Vec::new();
+        let delete = self
+            .write_delete_file_with_snapshots(
+                schema_name,
+                table_name,
+                &source.data_file_path,
+                &deletions,
+                &mut written,
+            )
+            .await?;
+        Ok((delete, begin_snapshot, partial_max))
+    }
+
+    /// Write a delete file that records, beside each `(file_path, pos)`, the
+    /// snapshot that deleted the row (`_ducklake_internal_snapshot_id`, the
+    /// layout official DuckLake's flush writes). `deletions` pairs each position
+    /// with its snapshot; readers apply a position only at snapshots at or after
+    /// its own.
+    ///
+    /// The object's key is pushed to `written` before the upload starts, so a
+    /// caller that abandons the write can remove it.
+    pub(crate) async fn write_delete_file_with_snapshots(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        deletions: &[(i64, i64)],
+        written: &mut Vec<ObjectPath>,
+    ) -> Result<DeleteFileInfo> {
+        let positions = deletions.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
+        let snapshots = deletions
+            .iter()
+            .map(|(_, snapshot)| *snapshot)
+            .collect::<Vec<_>>();
+        self.write_delete_file_inner(
+            schema_name,
+            table_name,
+            data_file_path,
+            &positions,
+            Some((&snapshots, written)),
+        )
+        .await
+    }
+
+    async fn write_delete_file_inner(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_file_path: &str,
+        positions: &[i64],
+        snapshots: Option<(&[i64], &mut Vec<ObjectPath>)>,
+    ) -> Result<DeleteFileInfo> {
+        self.refuse_encrypted_parquet("write a delete file")?;
         use arrow::array::{Int64Array, StringArray};
 
         let scoped_base = match self.metadata.catalog_id() {
@@ -1179,14 +1493,22 @@ impl DuckLakeTableWriter {
         // Strip leading slash for object_store Path (it expects relative keys).
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
 
-        let schema = delete_file_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
-                Arc::new(Int64Array::from(positions.to_vec())),
-            ],
-        )?;
+        let mut fields: Vec<Field> = delete_file_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        let mut columns: Vec<arrow::array::ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![data_file_path; positions.len()])),
+            Arc::new(Int64Array::from(positions.to_vec())),
+        ];
+        if let Some((snapshots, written)) = snapshots {
+            fields.push(embedded_snapshot_id_field());
+            columns.push(Arc::new(Int64Array::from(snapshots.to_vec())));
+            written.push(object_path.clone());
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
 
         // Stream to a local staging file, then multipart-upload it — the same
         // bounded-memory path `finish()` uses for data files.
@@ -1214,8 +1536,77 @@ impl DuckLakeTableWriter {
         // resolves it against the same table data dir.
         Ok(
             DeleteFileInfo::new(file_name, file_size, positions.len() as i64)
-                .with_footer_size(footer_size),
+                .with_footer_size(footer_size)
+                .with_deleted_positions(positions),
         )
+    }
+
+    /// Write rows that carry their embedded row id and insert snapshot into one or
+    /// more Parquet files under the table's directory (or its `partition_subpath`),
+    /// rolling over to a new file whenever the current one reaches
+    /// [`target_file_size`](Self::with_target_file_size) when `roll_over` is set,
+    /// as official DuckLake's flush `COPY` rotates the files of an unpartitioned
+    /// table; otherwise into one file. Performs no catalog work.
+    ///
+    /// Each batch holds `data_schema`'s columns, then an `Int64` row id and an
+    /// `Int64` snapshot id, in the order the files should hold them; files hold a
+    /// whole number of input batches, in input order. Returns one
+    /// [`DataFileInfo`] per file, in write order. Every object key is pushed to
+    /// `written` before its upload starts, so a caller that abandons the write can
+    /// remove what it left.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_rolled_lineage_files(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        data_schema: &Schema,
+        data_column_ids: &[i64],
+        stats_column_ids: &[i64],
+        batches: &[RecordBatch],
+        partition_subpath: Option<&str>,
+        roll_over: bool,
+        written: &mut Vec<ObjectPath>,
+    ) -> Result<Vec<DataFileInfo>> {
+        self.refuse_encrypted_parquet("write a data file")?;
+        let scoped_base = match self.metadata.catalog_id() {
+            Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
+            None => self.base_key_path.clone(),
+        };
+        let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
+        let schema_with_ids = {
+            let base = build_schema_with_field_ids(data_schema, data_column_ids)?;
+            let mut fields: Vec<Field> = base.fields().iter().map(|f| f.as_ref().clone()).collect();
+            fields.push(embedded_rowid_field());
+            fields.push(embedded_snapshot_id_field());
+            Arc::new(Schema::new_with_metadata(fields, base.metadata().clone()))
+        };
+        let mut roller = RollingFileWriter::new(
+            table_key,
+            partition_subpath
+                .filter(|prefix| !prefix.is_empty())
+                .map(str::to_string),
+            schema_with_ids,
+            stats_column_ids.len(),
+            self.build_writer_props(),
+            if roll_over {
+                self.target_file_size
+            } else {
+                usize::MAX
+            },
+            None,
+        );
+        let mut files = Vec::new();
+        for batch in batches {
+            if let Some(staged) = roller.write(batch)? {
+                written.push(staged.object_path.clone());
+                files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
+            }
+        }
+        if let Some(staged) = roller.finish()? {
+            written.push(staged.object_path.clone());
+            files.push(upload_staged_file(staged, &self.object_store, stats_column_ids).await?);
+        }
+        Ok(files)
     }
 
     /// Write ONE compacted parquet file to the table's data directory and return
@@ -1335,6 +1726,7 @@ impl DuckLakeTableWriter {
         embed_snapshot_id: bool,
         partition_subpath: Option<&str>,
     ) -> Result<DataFileInfo> {
+        self.refuse_encrypted_parquet("write a compacted data file")?;
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
@@ -1383,7 +1775,7 @@ impl DuckLakeTableWriter {
         let staging = std::io::BufWriter::new(temp.reopen()?);
         let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
         let mut row_count: i64 = 0;
-        let mut nan_flags: Vec<Option<bool>> = Vec::new();
+        let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
             let batch = batch?;
             if batch.num_columns() != schema_with_ids.fields().len() {
@@ -1394,11 +1786,7 @@ impl DuckLakeTableWriter {
                 )));
             }
             let batch_with_ids = apply_field_ids(&batch, schema_with_ids.clone())?;
-            crate::stats_collect::accumulate_nan_flags(
-                &mut nan_flags,
-                &batch,
-                stats_column_ids.len(),
-            );
+            leaf_stats.accumulate(&batch, stats_column_ids.len());
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
@@ -1414,13 +1802,14 @@ impl DuckLakeTableWriter {
         let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
         stream_to_upload(&mut reader, &mut upload).await?;
 
-        // Collect stats for catalog columns only. Track NaN values while
-        // consuming the stream because the Parquet footer omits that signal.
-        let column_stats = crate::stats_collect::collect_column_stats(
+        // Collect stats for catalog columns only. NaN presence and string
+        // bounds were tracked while consuming the stream: the footer records
+        // neither as official does.
+        let column_stats = crate::stats_collect::collect_written_column_stats(
             temp.path(),
             stats_column_ids,
             row_count,
-            &nan_flags,
+            &leaf_stats,
         );
 
         Ok(DataFileInfo::new(file_name, file_size, row_count)
@@ -1507,6 +1896,37 @@ impl DuckLakeTableWriter {
         groups: Vec<PartitionGroup>,
         options: &TableWriteOptions,
     ) -> Result<WriteResult> {
+        self.write_partition_groups_inlined_in(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            partition_id,
+            key_names,
+            groups,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::write_partitioned_with_options`], inlining `in_order` (the
+    /// rows of `groups` in the order they were written) when the write is
+    /// small enough to inline: official inlines a partitioned table's rows in
+    /// their insert order, which their row ids follow.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_partition_groups_inlined_in(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        partition_id: i64,
+        key_names: &[String],
+        groups: Vec<PartitionGroup>,
+        options: &TableWriteOptions,
+        in_order: Option<Vec<RecordBatch>>,
+    ) -> Result<WriteResult> {
         if groups.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
                 "write_partitioned: no partition groups".to_string(),
@@ -1517,15 +1937,27 @@ impl DuckLakeTableWriter {
             validate_not_null_batches(&validation_schema, batches)?;
         }
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
-        let setup =
-            self.metadata
-                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-
         let records_written: usize = groups
             .iter()
             .flat_map(|(_, batches)| batches)
             .map(RecordBatch::num_rows)
             .sum();
+        // Refused before the setup, which on some backends creates the table.
+        let all_batches: Vec<RecordBatch> = groups
+            .iter()
+            .flat_map(|(_, batches)| batches.iter().cloned())
+            .collect();
+        let inline = self.should_inline(
+            schema_name,
+            table_name,
+            records_written,
+            arrow_schema,
+            &all_batches,
+        )?;
+        if !inline {
+            self.refuse_encrypted_parquet("write a data file")?;
+        }
+        let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
         // Validate the caller's assignment against the live spec BEFORE writing
         // anything (inline or Parquet), so a bad one costs no uploads. A wrong
@@ -1553,11 +1985,8 @@ impl DuckLakeTableWriter {
             ));
         }
 
-        let batches: Vec<RecordBatch> = groups
-            .iter()
-            .flat_map(|(_, batches)| batches.iter().cloned())
-            .collect();
-        if self.should_inline(records_written, arrow_schema, &batches) {
+        let batches = in_order.unwrap_or(all_batches);
+        if inline {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1718,17 +2147,26 @@ impl DuckLakeTableWriter {
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
-        let setup =
-            self.metadata
-                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
-
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // Refused before the setup, which on some backends creates the table.
+        let inline = self.should_inline(
+            schema_name,
+            table_name,
+            records_written,
+            arrow_schema,
+            batches,
+        )?;
+        if !inline {
+            self.refuse_encrypted_parquet("write a data file")?;
+        }
+        let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+
         if !resolve_layout && self.metadata.live_partition_spec(setup.table_id)?.is_some() {
             return Err(crate::DuckLakeError::Conflict(
                 "table gained a partition spec before write; retry the write".to_string(),
             ));
         }
-        if self.should_inline(records_written, arrow_schema, batches) {
+        if inline {
             let committed = self.metadata.register_inlined_data(
                 setup.table_id,
                 schema_name,
@@ -1870,10 +2308,19 @@ impl DuckLakeTableWriter {
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
-        let setup =
-            self.metadata
-                .begin_write_transaction(schema_name, table_name, &columns, mode)?;
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        // Refused before the setup, which on some backends creates the table.
+        let inline = self.should_inline(
+            schema_name,
+            table_name,
+            records_written,
+            arrow_schema,
+            batches,
+        )?;
+        if records_written > 0 && !inline {
+            self.refuse_encrypted_parquet("write a data file")?;
+        }
+        let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
 
         if records_written == 0 {
             return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -1886,7 +2333,7 @@ impl DuckLakeTableWriter {
                 "table gained a partition spec before write; retry the write".to_string(),
             ));
         }
-        if self.should_inline(records_written, arrow_schema, batches) {
+        if inline {
             return Ok(PreparedTableWrite {
                 write: StagedTableWrite {
                     table_id: setup.table_id,
@@ -1900,11 +2347,16 @@ impl DuckLakeTableWriter {
                     snapshot_id_columns: Vec::new(),
                     positional_deletes: Vec::new(),
                     inlined_deletes: Vec::new(),
+                    inlined_row_ids: None,
+                    inlined_file_deletes: Vec::new(),
+                    rewritten_deletes: Vec::new(),
+                    dropped_files: Vec::new(),
                     inlined_flush: false,
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
                 records_written: records_written as i64,
+                rewrite_sources: Vec::new(),
             });
         }
 
@@ -1987,11 +2439,16 @@ impl DuckLakeTableWriter {
                 snapshot_id_columns: Vec::new(),
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
+                inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                rewritten_deletes: Vec::new(),
+                dropped_files: Vec::new(),
                 inlined_flush: false,
             },
             object_paths,
             files_written,
             records_written,
+            rewrite_sources: Vec::new(),
         })
     }
 
@@ -2087,13 +2544,39 @@ impl DuckLakeTableWriter {
         join_paths(&join_paths(&scoped_base, schema_name)?, table_name)
     }
 
-    fn should_inline(&self, rows: usize, arrow_schema: &Schema, batches: &[RecordBatch]) -> bool {
-        rows > 0
+    /// The id the catalog's next snapshot is expected to take, or `None` when
+    /// the backend does not say
+    /// ([`MetadataWriter::next_snapshot_id`](crate::metadata_writer::MetadataWriter::next_snapshot_id)).
+    pub(crate) fn next_snapshot_id(&self) -> Result<Option<i64>> {
+        self.metadata.next_snapshot_id()
+    }
+
+    /// The scoped `data_inlining_row_limit` this writer applies; `0` when
+    /// inlining is off.
+    pub(crate) fn data_inlining_row_limit(&self) -> usize {
+        self.data_inlining_row_limit.unwrap_or(0)
+    }
+
+    /// Whether `rows` rows of `schema_name.table_name` go to inlined storage:
+    /// at most the scoped limit, of types and values this writer inlines, in a
+    /// table whose columns official inlines (no GEOMETRY).
+    pub(crate) fn should_inline(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        rows: usize,
+        arrow_schema: &Schema,
+        batches: &[RecordBatch],
+    ) -> Result<bool> {
+        Ok(rows > 0
             && self
                 .data_inlining_row_limit
                 .is_some_and(|limit| rows <= limit)
             && self.metadata.supports_data_inlining(arrow_schema)
             && self.metadata.supports_data_inlining_values(batches)
+            && self
+                .metadata
+                .table_types_support_inlining(schema_name, table_name)?)
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -2189,6 +2672,7 @@ impl DuckLakeTableWriter {
         column_ids: &[i64],
         batches: &[RecordBatch],
     ) -> Result<Vec<DataFileInfo>> {
+        self.refuse_encrypted_parquet("write a data file")?;
         let data_column_count = schema_with_ids.fields().len();
         let mut roller = RollingFileWriter::new(
             table_key.to_string(),
@@ -2209,6 +2693,15 @@ impl DuckLakeTableWriter {
             files.push(upload_staged_file(staged, &self.object_store, column_ids).await?);
         }
         Ok(files)
+    }
+}
+
+impl<'a> DuckLakeWriteTransaction<'a> {
+    /// Read concurrent delete files through `positions` when the commit's
+    /// inlined deletions meet one, retrying the commit when it deletes none of
+    /// their rows instead of aborting.
+    pub(crate) fn set_delete_file_positions(&mut self, positions: &'a dyn DeleteFilePositions) {
+        self.delete_file_positions = Some(DeleteFilePositionsRef(positions));
     }
 }
 
@@ -2282,10 +2775,12 @@ impl DuckLakeWriteTransaction<'_> {
 
         let writer = self.writer.clone().with_options(options);
         if !writer.should_inline(
+            schema_name,
+            table_name,
             batches.iter().map(RecordBatch::num_rows).sum(),
             arrow_schema,
             batches,
-        ) {
+        )? {
             return Err(crate::DuckLakeError::InvalidConfig(
                 "commit snapshot columns require an inlined table stage".to_string(),
             ));
@@ -2442,7 +2937,7 @@ impl DuckLakeWriteTransaction<'_> {
             self.writer
                 .validation_schema(schema_name, table_name, arrow_schema)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
-        let setup = self.writer.metadata.begin_write_transaction(
+        let setup = self.writer.begin_write_transaction(
             schema_name,
             table_name,
             &columns,
@@ -2472,46 +2967,278 @@ impl DuckLakeWriteTransaction<'_> {
                 snapshot_id_columns: Vec::new(),
                 positional_deletes: positional_deletes.to_vec(),
                 inlined_deletes: inlined_deletes.to_vec(),
+                inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                rewritten_deletes: Vec::new(),
+                dropped_files: Vec::new(),
                 inlined_flush: false,
             },
             object_paths,
             files_written: 0,
             records_written: 0,
+            rewrite_sources: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Stages the changes one SQL `UPDATE` or `DELETE` makes to a table read at
+    /// `base_snapshot`: `data` holds the new row versions (Parquet files the
+    /// caller uploaded, or inlined rows that keep `inlined_row_ids`), followed by
+    /// the deletions of the rows they replace or remove. The transaction owns
+    /// the uploaded data and delete files: they are removed when staging them
+    /// fails validation or the commit is rejected. A database or transport
+    /// error while staging leaves them, as it does at the commit, to
+    /// orphan-file cleanup.
+    ///
+    /// `table_id` and `column_ids` (the table's field ids, flattened as
+    /// [`MetadataWriter::begin_write_transaction`] returns them) are those of the
+    /// table as read: the statement changes no column, so it reserves no ids,
+    /// and the commit refuses it if the table's columns changed since.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_row_mutation(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        table_id: i64,
+        column_ids: Vec<i64>,
+        arrow_schema: &Schema,
+        base_snapshot: i64,
+        data: StagedTableData,
+        inlined_row_ids: Option<Vec<i64>>,
+        positional_deletes: Vec<DeleteFileEntry>,
+        rewritten: Vec<RewrittenDelete>,
+        inlined_deletes: Vec<InlinedRowRef>,
+        inlined_file_deletes: Vec<crate::metadata_writer::InlinedFileDelete>,
+        dropped_files: Vec<crate::metadata_writer::DroppedDataFile>,
+    ) -> Result<()> {
+        let data_files: &[DataFileInfo] = match &data {
+            StagedTableData::Files(files) => files,
+            _ => &[],
+        };
+        let written: Vec<ObjectPath> = positional_deletes
+            .iter()
+            .map(|entry| &entry.delete)
+            .chain(
+                rewritten
+                    .iter()
+                    .map(|rewritten| &rewritten.entry.delete.delete),
+            )
+            .map(|delete| (&delete.path, delete.path_is_relative))
+            .chain(
+                data_files
+                    .iter()
+                    .map(|file| (&file.path, file.path_is_relative)),
+            )
+            .filter_map(|(path, relative)| {
+                self.writer
+                    .staged_object_path(schema_name, table_name, path, relative)
+                    .ok()
+            })
+            .collect();
+        let staged = self.prepare_row_mutation(
+            schema_name,
+            table_name,
+            table_id,
+            column_ids,
+            arrow_schema,
+            base_snapshot,
+            data,
+            inlined_row_ids,
+            positional_deletes,
+            rewritten,
+            inlined_deletes,
+            inlined_file_deletes,
+            dropped_files,
+        );
+        if let Err(error) = &staged
+            && !is_transport_error(error)
+        {
+            for path in &written {
+                if let Err(cleanup) = self.writer.object_store.delete(path).await {
+                    tracing::warn!(%path, error = %cleanup, "failed to remove an unstaged file");
+                }
+            }
+        }
+        staged
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_row_mutation(
+        &mut self,
+        schema_name: &str,
+        table_name: &str,
+        table_id: i64,
+        column_ids: Vec<i64>,
+        arrow_schema: &Schema,
+        base_snapshot: i64,
+        data: StagedTableData,
+        inlined_row_ids: Option<Vec<i64>>,
+        positional_deletes: Vec<DeleteFileEntry>,
+        rewritten: Vec<RewrittenDelete>,
+        inlined_deletes: Vec<InlinedRowRef>,
+        inlined_file_deletes: Vec<crate::metadata_writer::InlinedFileDelete>,
+        dropped_files: Vec<crate::metadata_writer::DroppedDataFile>,
+    ) -> Result<()> {
+        validate_delete_entries(WriteMode::Append, &positional_deletes)?;
+        let (rewritten_deletes, rewrite_sources): (Vec<_>, Vec<_>) = rewritten
+            .into_iter()
+            .map(|rewritten| (rewritten.entry, rewritten.source))
+            .unzip();
+        let validation_schema =
+            self.writer
+                .validation_schema(schema_name, table_name, arrow_schema)?;
+        let columns = arrow_schema_to_column_defs(&validation_schema)?;
+        let catalog_columns = crate::metadata_writer::catalog_column_defs(&columns)?;
+        if catalog_columns.len() != column_ids.len() {
+            return Err(crate::error::DuckLakeError::Internal(format!(
+                "row mutation of {schema_name}.{table_name}: {} columns but {} field ids",
+                catalog_columns.len(),
+                column_ids.len()
+            )));
+        }
+        let mut object_paths = positional_deletes
+            .iter()
+            .map(|entry| &entry.delete)
+            .chain(rewritten_deletes.iter().map(|entry| &entry.delete.delete))
+            .map(|delete| {
+                self.writer.staged_object_path(
+                    schema_name,
+                    table_name,
+                    &delete.path,
+                    delete.path_is_relative,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (files_written, records_written) = match &data {
+            StagedTableData::Files(files) => {
+                for file in files {
+                    object_paths.push(self.writer.staged_object_path(
+                        schema_name,
+                        table_name,
+                        &file.path,
+                        file.path_is_relative,
+                    )?);
+                }
+                (
+                    files.len(),
+                    files.iter().map(|file| file.record_count).sum(),
+                )
+            },
+            StagedTableData::Inlined(batches) => {
+                (0, batches.iter().map(|batch| batch.num_rows() as i64).sum())
+            },
+            StagedTableData::None => (0, 0),
+        };
+        self.writes.push(PreparedTableWrite {
+            write: StagedTableWrite {
+                table_id,
+                schema_name: schema_name.to_string(),
+                table_name: table_name.to_string(),
+                base_snapshot_id: base_snapshot,
+                mode: WriteMode::Append,
+                columns,
+                column_ids,
+                data,
+                snapshot_id_columns: Vec::new(),
+                positional_deletes,
+                rewritten_deletes,
+                inlined_deletes,
+                inlined_row_ids,
+                inlined_file_deletes,
+                dropped_files,
+                inlined_flush: false,
+            },
+            object_paths,
+            files_written,
+            records_written,
+            rewrite_sources,
         });
         Ok(())
     }
 
     /// Commits every staged table change in one metadata transaction.
+    ///
+    /// A `DELETE` or `UPDATE` that rewrites a delete file dates its deletions
+    /// to the snapshot after the one it read. When the catalog committed other
+    /// snapshots first, the commit is refused; the deletions are then re-dated
+    /// to the snapshot after the catalog's latest, the delete files written
+    /// again (removing those of the refused attempt), and the commit retried
+    /// after official DuckLake's backoff, for at most 10 attempts as its
+    /// default `ducklake_max_retry_count` allows; then it fails with
+    /// official's "Exceeded the maximum retry count" error.
+    /// An inlined deletion of rows of a data file that got a delete file since
+    /// the statement read it is retried, within the same attempts, when that
+    /// delete file deletes none of its rows. Any other change to the same data
+    /// file or delete file since the statement read it aborts with
+    /// [`DuckLakeError::Conflict`](crate::DuckLakeError::Conflict).
     pub async fn commit(mut self) -> Result<Vec<WriteResult>> {
         if self.writes.is_empty() {
             return Ok(Vec::new());
         }
-        let writes = self
-            .writes
-            .iter()
-            .map(|prepared| prepared.write.clone())
-            .collect::<Vec<_>>();
-        let committed = self.writer.metadata.commit_multi_table(
-            &writes,
-            &self.commit_metadata,
-            self.expected_base_snapshot_id,
-        );
-        let committed = match committed {
-            Ok(committed) => committed,
-            Err(e) => {
-                // Remove the staged files unless the outcome is unknown: a
-                // networked COMMIT that failed may still have applied, and
-                // deleting the objects then would leave a committed snapshot
-                // pointing at missing files. See `commit_definitely_rolled_back`.
-                // A cleanup failure is logged rather than returned, so the caller still
-                // sees the commit error it decides a retry on.
-                if commit_definitely_rolled_back(&e)
-                    && let Err(cleanup) = self.cleanup().await
-                {
-                    tracing::warn!(error = %cleanup, "failed to remove a file of a rejected commit");
+        let mut attempt = 0;
+        let committed = loop {
+            let writes = self
+                .writes
+                .iter()
+                .map(|prepared| prepared.write.clone())
+                .collect::<Vec<_>>();
+            let committed = self.writer.metadata.commit_multi_table(
+                &writes,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            );
+            let e = match committed {
+                Ok(committed) => break committed,
+                Err(e) => e,
+            };
+            // An inlined deletion that met a delete file its statement did not
+            // read is retried when that delete file deletes none of its rows,
+            // as official commits both.
+            if let Some(data_file_id) = crate::metadata_writer::changed_delete_file_of(&e)
+                && attempt + 1 < MAX_COMMIT_ATTEMPTS
+                && self.accept_disjoint_delete_file(data_file_id).await
+            {
+                attempt += 1;
+                continue;
+            }
+            // Only the refusal of a rewritten delete file's date is retried, as
+            // official retries only a commit that lost the race for its
+            // snapshot id and passes the conflict check.
+            let redate = if crate::metadata_writer::is_rewritten_delete_conflict(&e) {
+                match self.redate_target() {
+                    Ok(date) => date,
+                    Err(target) => return Err(self.fail_cleaned(target).await),
                 }
-                return Err(e);
-            },
+            } else {
+                None
+            };
+            if let Some(date) = redate {
+                attempt += 1;
+                if attempt >= MAX_COMMIT_ATTEMPTS {
+                    return Err(self
+                        .fail_cleaned(crate::error::DuckLakeError::Conflict(format!(
+                            "Failed to commit DuckLake transaction.\nExceeded the maximum retry \
+                             count of {MAX_COMMIT_ATTEMPTS} set by the ducklake_max_retry_count \
+                             setting.\n. Consider increasing the value with: e.g., \"SET \
+                             ducklake_max_retry_count = {};\"\n{e}",
+                            MAX_COMMIT_ATTEMPTS * 10
+                        )))
+                        .await);
+                }
+                tokio::time::sleep(retry_wait(attempt - 1)).await;
+                if let Err(redate) = self.redate(date).await {
+                    return Err(self.fail_cleaned(redate).await);
+                }
+                continue;
+            }
+            // Remove the staged files unless the outcome is unknown: a
+            // networked COMMIT that failed may still have applied, and
+            // deleting the objects then would leave a committed snapshot
+            // pointing at missing files. See `commit_definitely_rolled_back`.
+            if commit_definitely_rolled_back(&e) {
+                return Err(self.fail_cleaned(e).await);
+            }
+            return Err(e);
         };
         if committed.tables.len() != self.writes.len() {
             return Err(crate::error::DuckLakeError::Internal(format!(
@@ -2533,6 +3260,132 @@ impl DuckLakeWriteTransaction<'_> {
                 records_written: prepared.records_written,
             })
             .collect())
+    }
+
+    /// After a [`changed_delete_file_conflict`](crate::metadata_writer::changed_delete_file_conflict)
+    /// on `data_file_id`: whether the file's live delete file deletes none of
+    /// the rows a stage deletes from it inline, in which case each such stage
+    /// now expects that delete file. `false` when no [`DeleteFilePositions`]
+    /// was given, the file has no live delete file, or reading it failed.
+    async fn accept_disjoint_delete_file(&mut self, data_file_id: i64) -> bool {
+        let Some(DeleteFilePositionsRef(reader)) = self.delete_file_positions else {
+            return false;
+        };
+        let mut accepted = false;
+        for prepared in &mut self.writes {
+            let table_id = prepared.write.table_id;
+            for delete in &mut prepared.write.inlined_file_deletes {
+                if delete.data_file_id != data_file_id {
+                    continue;
+                }
+                let live = match reader.live_delete_file(table_id, data_file_id).await {
+                    Ok(Some(live)) => live,
+                    Ok(None) => return false,
+                    Err(error) => {
+                        tracing::warn!(
+                            data_file_id,
+                            %error,
+                            "could not read a concurrent delete file; aborting the commit"
+                        );
+                        return false;
+                    },
+                };
+                let (delete_file_id, positions) = live;
+                if delete.expected_delete_file == Some(delete_file_id)
+                    || delete
+                        .positions
+                        .iter()
+                        .any(|position| positions.contains(position))
+                {
+                    return false;
+                }
+                delete.expected_delete_file = Some(delete_file_id);
+                accepted = true;
+            }
+        }
+        accepted
+    }
+
+    /// The snapshot to re-date rewritten delete files to after a refused
+    /// commit: the one after the catalog's latest, when that is later than the
+    /// snapshot they are dated to. `None` when no stage rewrites a delete file,
+    /// the backend does not report its next snapshot id, or that id is not
+    /// past the date, so the refusal had another cause.
+    fn redate_target(&self) -> Result<Option<i64>> {
+        let dated = self
+            .writes
+            .iter()
+            .filter_map(|prepared| {
+                crate::metadata_writer::rewritten_deletes_snapshot(&prepared.write)
+            })
+            .min();
+        let Some(dated) = dated else {
+            return Ok(None);
+        };
+        let Some(next) = self.writer.metadata.next_snapshot_id()? else {
+            return Ok(None);
+        };
+        Ok((next > dated).then_some(next))
+    }
+
+    /// Write every rewritten delete file again with the statement's deletions
+    /// dated `date`, replacing the files of the refused attempt.
+    async fn redate(&mut self, date: i64) -> Result<()> {
+        let writer = self.writer;
+        for prepared in &mut self.writes {
+            let schema_name = prepared.write.schema_name.clone();
+            let table_name = prepared.write.table_name.clone();
+            for (entry, source) in prepared
+                .write
+                .rewritten_deletes
+                .iter_mut()
+                .zip(&prepared.rewrite_sources)
+            {
+                let (delete, begin_snapshot, partial_max) = writer
+                    .write_rewritten_delete_file(&schema_name, &table_name, source, date)
+                    .await?;
+                let new_path = writer.staged_object_path(
+                    &schema_name,
+                    &table_name,
+                    &delete.path,
+                    delete.path_is_relative,
+                )?;
+                let old_path = writer.staged_object_path(
+                    &schema_name,
+                    &table_name,
+                    &entry.delete.delete.path,
+                    entry.delete.delete.path_is_relative,
+                )?;
+                prepared.object_paths.push(new_path);
+                entry.delete.delete = delete;
+                entry.delete.begin_snapshot = begin_snapshot;
+                entry.delete.partial_max = Some(partial_max);
+                // The refused attempt's file is referenced by nothing.
+                match writer.object_store.delete(&old_path).await {
+                    Ok(())
+                    | Err(object_store::Error::NotFound {
+                        ..
+                    }) => {},
+                    Err(error) => return Err(error.into()),
+                }
+                prepared.object_paths.retain(|path| *path != old_path);
+            }
+        }
+        Ok(())
+    }
+
+    /// `error`, once the staged files are removed: the metadata transaction
+    /// was rolled back, so nothing references them. A cleanup failure is
+    /// logged rather than returned, so the caller still sees the error it
+    /// decides a retry on.
+    async fn fail_cleaned(
+        &mut self,
+        error: crate::error::DuckLakeError,
+    ) -> crate::error::DuckLakeError {
+        if let Err(cleanup) = self.cleanup().await {
+            tracing::warn!(error = %cleanup, "failed to remove a file of a rejected commit");
+        }
+        error
     }
 
     /// Removes uploaded files without committing the staged metadata.
@@ -2568,7 +3421,7 @@ impl DuckLakeWriteTransaction<'_> {
 /// would leave a committed snapshot naming objects that no longer exist. The price
 /// is an orphan when the commit did roll back, left for the orphan sweep, which
 /// removes only files no snapshot references.
-fn commit_definitely_rolled_back(error: &crate::error::DuckLakeError) -> bool {
+pub(crate) fn commit_definitely_rolled_back(error: &crate::error::DuckLakeError) -> bool {
     match error {
         #[cfg(any(feature = "metadata-postgres", feature = "metadata-mysql"))]
         crate::error::DuckLakeError::CommitOutcomeUnknown(_) => false,
@@ -2643,7 +3496,7 @@ struct OpenFile {
     catalog_path: String,
     object_path: ObjectPath,
     row_count: i64,
-    nan_flags: Vec<Option<bool>>,
+    leaf_stats: crate::stats_collect::WrittenLeafStats,
 }
 
 /// A finished parquet whose footer is written and whose staging file is complete on
@@ -2659,7 +3512,7 @@ struct StagedFile {
     catalog_path: String,
     object_path: ObjectPath,
     row_count: i64,
-    nan_flags: Vec<Option<bool>>,
+    leaf_stats: crate::stats_collect::WrittenLeafStats,
 }
 
 /// Writes batches into a sequence of parquet files, starting a new one whenever the
@@ -2736,11 +3589,8 @@ impl RollingFileWriter {
         }
         let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
         let open = self.open.as_mut().expect("file opened above");
-        crate::stats_collect::accumulate_nan_flags(
-            &mut open.nan_flags,
-            &batch_with_ids,
-            self.data_column_count,
-        );
+        open.leaf_stats
+            .accumulate(&batch_with_ids, self.data_column_count);
         open.writer.write(&batch_with_ids)?;
         open.row_count += batch.num_rows() as i64;
 
@@ -2794,7 +3644,7 @@ impl RollingFileWriter {
             catalog_path,
             object_path,
             row_count: 0,
-            nan_flags: Vec::new(),
+            leaf_stats: Default::default(),
         })
     }
 }
@@ -2814,7 +3664,7 @@ fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
         catalog_path: file.catalog_path,
         object_path: file.object_path,
         row_count: file.row_count,
-        nan_flags: file.nan_flags,
+        leaf_stats: file.leaf_stats,
     })
 }
 
@@ -2843,11 +3693,11 @@ async fn upload_staged_file(
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
 
-    let column_stats = crate::stats_collect::collect_column_stats(
+    let column_stats = crate::stats_collect::collect_written_column_stats(
         &staged.temp,
         column_ids,
         staged.row_count,
-        &staged.nan_flags,
+        &staged.leaf_stats,
     );
     Ok(
         DataFileInfo::new(&staged.catalog_path, file_size, staged.row_count)
@@ -3435,10 +4285,10 @@ pub struct TableWriteSession {
     /// (for Replace) prior-generation retirement commit atomically with the file.
     mode: WriteMode,
     row_count: i64,
-    /// Per-data-column NaN presence, accumulated across written batches (the
-    /// Parquet footer carries no NaN flag). One entry per catalog data column;
-    /// `None` for non-float columns. Fed into `collect_column_stats` at finish.
-    nan_flags: Vec<Option<bool>>,
+    /// What the written batches showed of each Parquet leaf that the footer
+    /// does not record exactly: NaN presence and DuckDB's string and blob
+    /// bounds. Fed into `collect_written_column_stats` at finish.
+    leaf_stats: crate::stats_collect::WrittenLeafStats,
     /// Set when the target table is partitioned: batches are routed here, one file
     /// per partition, and `writer`/`temp` above stay `None`. `finish` then commits
     /// every file the sink produced in a single snapshot.
@@ -3525,13 +4375,11 @@ impl TableWriteSession {
         self.validate_batch_schema(batch)?;
 
         let batch_with_ids = apply_field_ids(batch, self.schema_with_ids.clone())?;
-        // Note float-column NaN presence before the batch streams to disk (the
-        // footer we later harvest has no NaN flag). Only the catalog data columns.
-        crate::stats_collect::accumulate_nan_flags(
-            &mut self.nan_flags,
-            &batch_with_ids,
-            self.schema_with_ids.fields().len(),
-        );
+        // Note NaN presence and string bounds before the batch streams to disk
+        // (the footer records neither as official does). Only the catalog data
+        // columns.
+        self.leaf_stats
+            .accumulate(&batch_with_ids, self.schema_with_ids.fields().len());
         let writer = self.writer.as_mut().unwrap();
         writer.write(&batch_with_ids)?;
         self.row_count += batch.num_rows() as i64;
@@ -3958,6 +4806,13 @@ impl TableWriteSession {
         })
     }
 
+    /// Upload the files this session wrote without committing them, for a
+    /// caller that commits them together with other changes in one staged
+    /// write, and that owns their removal from then on.
+    pub(crate) async fn finish_files(mut self) -> Result<Vec<DataFileInfo>> {
+        Ok(self.finish_appended().await?.0)
+    }
+
     /// Finalise + upload the staged parquet and return its [`DataFileInfo`] and
     /// object key, leaving the metadata commit to the caller. Shared by
     /// [`finish`](Self::finish) and [`finish_with_deletes`](Self::finish_with_deletes).
@@ -4002,11 +4857,11 @@ impl TableWriteSession {
         // (mirrors DuckLake reading its writer's WRITTEN_FILE_STATISTICS) and
         // attach them for the catalog commit. Best-effort: on failure the file
         // is registered without stats, which is spec-safe.
-        let column_stats = crate::stats_collect::collect_column_stats(
+        let column_stats = crate::stats_collect::collect_written_column_stats(
             temp.path(),
             &self.column_ids,
             self.row_count,
-            &self.nan_flags,
+            &self.leaf_stats,
         );
 
         let mut file_info = DataFileInfo::new(&self.catalog_path, file_size, self.row_count)
@@ -4204,6 +5059,86 @@ fn calculate_footer_size_from_bytes(buffer: &[u8]) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Staging a row mutation that fails validation removes the files the
+    /// statement wrote for it; nothing references them.
+    #[cfg(feature = "write-sqlite")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refused_row_mutation_stage_removes_its_files() {
+        fn parquet_files(dir: &std::path::Path) -> usize {
+            let mut count = 0;
+            let mut pending = vec![dir.to_path_buf()];
+            while let Some(dir) = pending.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", temp.path().join("c.db").display());
+        let data = temp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let metadata = Arc::new(
+            crate::SqliteMetadataWriter::new_with_init(&url)
+                .await
+                .unwrap(),
+        );
+        metadata.set_data_path(data.to_str().unwrap()).unwrap();
+        let metadata: Arc<dyn MetadataWriter> = metadata;
+        let writer = DuckLakeTableWriter::new(
+            metadata,
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        )
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let written = writer.append_table("main", "t", &[batch]).await.unwrap();
+        let delete = writer
+            .write_delete_file("main", "t", "file.parquet", &[0])
+            .await
+            .unwrap();
+        assert_eq!(parquet_files(&data), 2);
+        let entry = DeleteFileEntry {
+            data_file_id: 1,
+            expected_prev_delete_file: None,
+            delete,
+        };
+        let mut transaction = writer.transaction();
+        let error = transaction
+            .stage_row_mutation(
+                "main",
+                "t",
+                written.table_id,
+                vec![1],
+                &schema,
+                written.snapshot_id,
+                StagedTableData::None,
+                None,
+                vec![entry.clone(), entry],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::DuckLakeError::InvalidConfig(_)),
+            "{error}"
+        );
+        assert_eq!(parquet_files(&data), 1);
+    }
     use arrow::array::{Decimal128Array, Int32Array, StringArray, StringViewArray, StructArray};
     use arrow::datatypes::DataType;
     use rstest::rstest;
@@ -4300,7 +5235,10 @@ mod tests {
             options.compression,
             Some(Compression::ZSTD(ZstdLevel::try_new(5).unwrap()))
         );
-        assert_eq!(options.data_inlining_row_limit, Some(0));
+        assert_eq!(
+            options.data_inlining_row_limit,
+            Some(DEFAULT_DATA_INLINING_ROW_LIMIT)
+        );
         assert_eq!(options.max_row_group_rows, Some(122_880));
         assert_eq!(options.max_row_group_bytes, Some(2 * 1_048_576));
         assert_eq!(options.target_file_size, Some(5_000_000));
@@ -4308,6 +5246,17 @@ mod tests {
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(false));
         assert_eq!(options.auto_compact, Some(false));
+    }
+
+    #[test]
+    fn auto_compact_is_on_only_for_exactly_true() {
+        for (value, on) in [("true", true), ("false", false), ("TRUE", false), ("1", false)] {
+            let settings = HashMap::from([("auto_compact".to_string(), value.to_string())]);
+            let options = DuckLakeWriteOptions::from_metadata_settings(&settings).unwrap();
+            assert_eq!(options.auto_compact, Some(on), "{value}");
+        }
+        let options = DuckLakeWriteOptions::from_metadata_settings(&HashMap::new()).unwrap();
+        assert_eq!(options.auto_compact, Some(true));
     }
 
     #[test]
@@ -4326,7 +5275,10 @@ mod tests {
         let options = stored.with_overrides(&explicit);
 
         assert_eq!(options.compression, Some(Compression::LZ4_RAW));
-        assert_eq!(options.data_inlining_row_limit, Some(0));
+        assert_eq!(
+            options.data_inlining_row_limit,
+            Some(DEFAULT_DATA_INLINING_ROW_LIMIT)
+        );
         assert_eq!(options.target_file_size, Some(5_000_000));
         assert_eq!(options.sort_on_insert, Some(false));
         assert_eq!(options.hive_file_pattern, Some(true));

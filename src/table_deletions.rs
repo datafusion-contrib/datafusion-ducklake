@@ -32,6 +32,7 @@ use datafusion::catalog::Session;
 use datafusion::common::Result as DataFusionResult;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::datasource::listing::PartitionedFile;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
@@ -50,7 +51,6 @@ use datafusion::physical_plan::{
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 
-use crate::metadata_provider::reject_inlined_changes;
 use crate::metadata_provider::{DeleteFileChange, DuckLakeTableColumn, MetadataProvider};
 use crate::path_resolver::resolve_path;
 use crate::row_id::{SNAPSHOT_ID_PARQUET_FIELD_ID, positional_table_schema_reserving};
@@ -59,7 +59,10 @@ use crate::table::{
     metadata_size_hint, read_parquet_file_layout, read_parquet_footer_facts,
     session_parquet_source, validated_file_size, validated_record_count,
 };
-use crate::table_changes::{check_column_count, present_catalog_schema};
+use crate::table_changes::{
+    InlinedChanges, InlinedFileDeletes, check_column_count, present_catalog_schema,
+};
+use crate::types::DuckLakeDefaultExprAdapterFactory;
 
 /// Delete file schema: (file_path: VARCHAR, pos: INT64)
 fn delete_file_schema() -> SchemaRef {
@@ -221,6 +224,7 @@ impl TableDeletionsTable {
         columns: &[DuckLakeTableColumn],
         need_rowid: bool,
         delete_file: &DeleteFileChange,
+        inlined_file_deletes: &mut InlinedFileDeletes,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Resolve data file path
         let data_file_path = resolve_path(
@@ -229,6 +233,8 @@ impl TableDeletionsTable {
             delete_file.data_file_path_is_relative,
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let (inlined_positions, full_file) =
+            inlined_file_deletes.claim(&data_file_path, delete_file.current_delete_path.is_none());
 
         // A cumulative (current-spec) delete file embeds each row's delete
         // snapshot; deletions are then windowed PER ROW on that column, and no
@@ -248,45 +254,40 @@ impl TableDeletionsTable {
             },
             None => None,
         };
-        if snapshot_name.is_none() && delete_file.snapshot_id < self.start_snapshot {
-            // Only cumulative files may begin before the window (included via
-            // ducklake_delete_file.partial_max); a legacy file here means the
-            // catalog is inconsistent, and its rows cannot be windowed.
-            return Err(DataFusionError::External(
-                format!(
-                    "delete file {:?} begins before the query window but carries no embedded \
-                     per-row snapshot column; its deletions cannot be attributed",
-                    delete_file.current_delete_path
-                )
-                .into(),
-            ));
-        }
+        // A delete file without per-row snapshots dates every deletion it adds
+        // at its own begin_snapshot, so one beginning before the window adds
+        // none in it (official subtracts the latest delete file before the
+        // window, which holds them all); only the data file's in-window
+        // inlined deletions remain.
+        let before_window =
+            snapshot_name.is_none() && delete_file.snapshot_id < self.start_snapshot;
 
         // Create scan for current delete file (if exists - None means full file delete)
-        let current_delete_exec = if let Some(ref current_path) = delete_file.current_delete_path {
-            Some(self.build_delete_file_scan(
+        let current_delete_exec = match &delete_file.current_delete_path {
+            Some(current_path) if !before_window => Some(self.build_delete_file_scan(
                 state,
                 current_path,
                 delete_file.current_delete_path_is_relative.unwrap_or(true),
                 delete_file.current_delete_file_size_bytes.unwrap_or(0),
                 delete_file.current_delete_footer_size.unwrap_or(0),
                 &snapshot_name,
-            )?)
-        } else {
-            None
+            )?),
+            _ => None,
         };
 
         // Create scan for previous delete file (if exists; not needed in
         // cumulative mode, where the per-row window filter replaces it)
         let previous_delete_exec = match &delete_file.previous_delete_path {
-            Some(prev_path) if snapshot_name.is_none() => Some(self.build_delete_file_scan(
-                state,
-                prev_path,
-                delete_file.previous_delete_path_is_relative.unwrap_or(true),
-                delete_file.previous_delete_file_size_bytes.unwrap_or(0),
-                delete_file.previous_delete_footer_size.unwrap_or(0),
-                &None,
-            )?),
+            Some(prev_path) if snapshot_name.is_none() && !before_window => {
+                Some(self.build_delete_file_scan(
+                    state,
+                    prev_path,
+                    delete_file.previous_delete_path_is_relative.unwrap_or(true),
+                    delete_file.previous_delete_file_size_bytes.unwrap_or(0),
+                    delete_file.previous_delete_footer_size.unwrap_or(0),
+                    &None,
+                )?)
+            },
             _ => None,
         };
 
@@ -365,6 +366,67 @@ impl TableDeletionsTable {
             pos_col_idx,
             need_rowid,
             cumulative: snapshot_name.is_some(),
+            full_file,
+            inlined_positions,
+            window: (self.start_snapshot, self.end_snapshot),
+            output_schema: self.output_schema.clone(),
+        })))
+    }
+
+    /// Build the plan reading one data file's rows whose only deletions in the
+    /// window are inlined (`ducklake_inlined_delete_<table_id>`).
+    async fn build_exec_for_inlined_file(
+        &self,
+        state: &dyn Session,
+        columns: &[DuckLakeTableColumn],
+        need_rowid: bool,
+        data_file_path: &str,
+        file: crate::table_changes::InlinedFileDeletesOfFile,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let change = &file.change;
+        let table_len = self.table_schema.fields().len();
+        check_column_count(table_len, columns.len())?;
+        validated_record_count(change.data_record_count, &change.data_file_path)?;
+        let layout = self
+            .file_layout(
+                state,
+                columns,
+                &change.data_file_path,
+                change.data_file_path_is_relative,
+                change.data_file_size_bytes,
+                change.data_file_footer_size,
+                change.data_mapping_id,
+            )
+            .await?;
+        let embedded_name = if need_rowid {
+            layout.embedded_rowid_parquet_name.clone()
+        } else {
+            None
+        };
+        let embedded_col_idx = embedded_name.as_ref().map(|_| table_len);
+        let pos_col_idx = table_len + usize::from(embedded_name.is_some());
+        let data_file_exec = self.build_data_file_scan(
+            state,
+            data_file_path,
+            change.data_file_size_bytes,
+            change.data_file_footer_size.unwrap_or(0),
+            &layout,
+            &embedded_name,
+        )?;
+        Ok(Arc::new(DeletedRowsExec::new(DeletionUnit {
+            current_delete_scan: None,
+            previous_delete_scan: None,
+            data_file_scan: data_file_exec,
+            record_count: change.data_record_count,
+            snapshot_id: change.snapshot_id,
+            row_id_start: change.data_row_id_start,
+            table_len,
+            embedded_col_idx,
+            pos_col_idx,
+            need_rowid,
+            cumulative: false,
+            full_file: false,
+            inlined_positions: file.positions,
             window: (self.start_snapshot, self.end_snapshot),
             output_schema: self.output_schema.clone(),
         })))
@@ -441,6 +503,7 @@ impl TableDeletionsTable {
                     .with_parquet_file_reader_factory(reader_factory),
             ),
         )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]));
 
         Ok(DataSourceExec::from_data_source(builder.build()))
@@ -500,6 +563,7 @@ impl TableDeletionsTable {
                     .with_parquet_file_reader_factory(reader_factory),
             ),
         )
+        .with_expr_adapter(Some(Arc::new(DuckLakeDefaultExprAdapterFactory)))
         .with_file_group(FileGroup::new(vec![pf]));
         let scan = DataSourceExec::from_data_source(builder.build());
         let table_fields: Vec<FieldRef> = self.table_schema.fields().iter().cloned().collect();
@@ -530,13 +594,6 @@ impl TableProvider for TableDeletionsTable {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // Get delete files added between snapshots
-        reject_inlined_changes(
-            self.provider.as_ref(),
-            self.table_id,
-            self.start_snapshot,
-            self.end_snapshot,
-            &["inlined_delete"],
-        )?;
         let delete_files = self
             .provider
             .get_delete_files_added_between_snapshots(
@@ -546,8 +603,23 @@ impl TableProvider for TableDeletionsTable {
             )
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        // The columns as of the window's END snapshot, carrying the field ids the
+        // per-file read schemas are built from — official DuckLake resolves a
+        // change feed against exactly that generation of the schema.
+        let columns = self.resolve_columns()?;
+
+        // Deletions stored in the catalog: inlined rows deleted or superseded in
+        // the window, and inlined deletions of Parquet-resident rows.
+        let window = (self.start_snapshot, self.end_snapshot);
+        let inlined_rows =
+            InlinedChanges::read_deletes(self.provider.as_ref(), self.table_id, &columns, window)?;
+        let inlined_file_deletes = self
+            .provider
+            .get_inlined_file_deletes_between(self.table_id, self.start_snapshot, self.end_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         // Handle empty case
-        if delete_files.is_empty() {
+        if delete_files.is_empty() && inlined_rows.is_empty() && inlined_file_deletes.is_empty() {
             use datafusion::physical_plan::empty::EmptyExec;
             let output_schema = match projection {
                 Some(indices) => {
@@ -569,18 +641,46 @@ impl TableProvider for TableDeletionsTable {
         // cannot be synthesized (no embedded rowid and a NULL row_id_start).
         let need_rowid = projection.is_none_or(|indices| indices.contains(&1));
 
-        // The columns as of the window's END snapshot, carrying the field ids the
-        // per-file read schemas are built from — official DuckLake resolves a
-        // change feed against exactly that generation of the schema.
-        let columns = self.resolve_columns()?;
-
         // Build execution plan for each delete entry
-        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len());
+        let mut inlined_file_deletes =
+            InlinedFileDeletes::group(&self.table_path, &inlined_file_deletes)?;
+        let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(delete_files.len() + 1);
         for delete_file in &delete_files {
             let exec = self
-                .build_exec_for_delete_entry(state, &columns, need_rowid, delete_file)
+                .build_exec_for_delete_entry(
+                    state,
+                    &columns,
+                    need_rowid,
+                    delete_file,
+                    &mut inlined_file_deletes,
+                )
                 .await?;
             execs.push(exec);
+        }
+        for (resolved, file) in inlined_file_deletes.unclaimed() {
+            execs.push(
+                self.build_exec_for_inlined_file(state, &columns, need_rowid, &resolved, file)
+                    .await?,
+            );
+        }
+        // Deleted inlined rows carry their row ids and deleting snapshots as
+        // data, so they need no positional matching.
+        if !inlined_rows.is_empty() {
+            let mut batches = Vec::with_capacity(inlined_rows.len());
+            for rows in &inlined_rows {
+                let n = rows.batch.num_rows();
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(rows.batch.num_columns() + 3);
+                columns.push(Arc::new(Int64Array::from(rows.snapshots.clone())));
+                columns.push(Arc::new(Int64Array::from(rows.row_ids.clone())));
+                columns.push(Arc::new(StringArray::from(vec!["delete"; n])));
+                columns.extend(rows.batch.columns().iter().cloned());
+                batches.push(RecordBatch::try_new(self.output_schema.clone(), columns)?);
+            }
+            execs.push(MemorySourceConfig::try_new_exec(
+                &[batches],
+                self.output_schema.clone(),
+                None,
+            )?);
         }
 
         // Combine with UnionExec if multiple
@@ -644,6 +744,12 @@ struct DeletionUnit {
     /// per-row delete-snapshot column as its third column). Rows are then
     /// windowed per row and emitted at their own delete snapshots.
     cumulative: bool,
+    /// Whether the whole data file was retired at `snapshot_id` (no delete
+    /// file), so every position not deleted before is deleted now.
+    full_file: bool,
+    /// Inlined deletions of the data file's rows made in the window: position
+    /// to deleting snapshot.
+    inlined_positions: HashMap<i64, i64>,
     /// The query's inclusive `[start, end]` snapshot window (cumulative mode).
     window: (i64, i64),
     /// Output schema (snapshot_id + rowid + change_type + table columns)
@@ -789,8 +895,14 @@ async fn deleted_rows_stream(
             }
             positions
         },
-        None => (0..unit.record_count).collect(),
+        None if unit.full_file => (0..unit.record_count).collect(),
+        None => HashSet::new(),
     };
+    let mut current_positions = current_positions;
+    for (&position, &snapshot) in &unit.inlined_positions {
+        current_positions.insert(position);
+        position_snapshots.insert(position, snapshot);
+    }
 
     // 2. Subtract the previous delete file's positions (legacy delta mode; the
     //    per-row window filter replaces this in cumulative mode).
@@ -968,15 +1080,13 @@ fn filter_batch(
                 }
             };
             rowids.push(rowid);
-            snapshots.push(if unit.cumulative {
-                // Kept positions come from the windowed extraction, so the
-                // map always holds them.
+            // Cumulative and inlined positions carry their own snapshots;
+            // the rest were deleted at the record's snapshot.
+            snapshots.push(
                 *position_snapshots
                     .get(&physical_pos)
-                    .unwrap_or(&unit.snapshot_id)
-            } else {
-                unit.snapshot_id
-            });
+                    .unwrap_or(&unit.snapshot_id),
+            );
         }
     }
 

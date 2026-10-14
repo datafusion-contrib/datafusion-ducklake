@@ -317,8 +317,9 @@ async fn invalid_write_setting_does_not_block_reads() {
     assert!(error.contains("Invalid DuckLake write settings"), "{error}");
 }
 
+/// Without a setting, the default limit of 10 inlines the two rows.
 #[rstest]
-#[case(None, 1, 0)]
+#[case(None, 0, 2)]
 #[case(Some("0"), 1, 0)]
 #[case(Some("2"), 0, 2)]
 #[tokio::test(flavor = "multi_thread")]

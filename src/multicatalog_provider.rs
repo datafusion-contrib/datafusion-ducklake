@@ -24,8 +24,14 @@ use crate::metadata_provider::{
     TagTarget, ViewMetadata, ViewWithSchema, block_on, reconstruct_columns,
     reconstruct_columns_with_table, resolve_metadata_settings,
 };
+use crate::metadata_provider::{
+    DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
+    InlinedFileDeleteChange, InlinedReadShape, InlinedRowSelection,
+};
 use crate::metadata_provider_postgres::{
-    PostgresStatsDialect, StatsFilterSql, fetch_data_file_page, inlined_data_with_row_ids_on,
+    PostgresStatsDialect, StatsFilterSql, delete_file_begin_snapshot_on, fetch_data_file_page,
+    first_inlined_snapshot_on, inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on,
+    inlined_table_for_flush_on, read_inlined_rows_on, registered_inlined_tables_on,
     scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
@@ -165,8 +171,13 @@ impl SchemaCapabilities {
 /// deletion creates.
 ///
 /// Kept as official DuckLake keeps it (`CheckInlinedDeletionTableCache`,
-/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Nothing drops the table
-/// once it exists, so "exists" holds for good. "Absent" holds for reads at or
+/// `src/storage/ducklake_catalog.cpp` at `d8a1881e`). Only two things drop the
+/// table once it exists: expiring snapshots, for a table no surviving snapshot
+/// can see, and dropping its catalog. Table ids are never reused, so a dropped
+/// one is never created again, and "exists" can go stale only for a table no
+/// surviving snapshot reads. A read that finds it gone reads no deletions, and
+/// `get_inlined_deletes` then forgets the entry.
+/// "Absent" holds for reads at or
 /// below the catalog's head at the time of the check: a deletion committed
 /// later takes a snapshot above that head, which such a read does not see.
 ///
@@ -461,6 +472,28 @@ impl MulticatalogProvider {
             .await
         })
         .await
+    }
+
+    /// The inlined row versions of `table_id` that `selection` picks, in
+    /// `shape`: the registry, then each inlined table's columns and rows, all
+    /// on one connection. None on a catalog without the registry.
+    fn read_inlined_rows_shaped(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+        shape: InlinedReadShape,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(Vec::new());
+            }
+            self.on_connection(async |connection| {
+                read_inlined_rows_on(connection, table_id, columns, selection, filter, shape).await
+            })
+            .await
+        })
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -1873,8 +1906,8 @@ impl MetadataProvider for MulticatalogProvider {
             if !self.schema_capabilities().await?.inlined_data_tables {
                 return Ok((crate::inlined_filter::InlinedDataScan::default(), None));
             }
-            // The registry, then each inlined table's columns and rows, all on
-            // one connection.
+            // The registry, then each inlined table's rows, all on one
+            // connection.
             self.on_connection(async |connection| {
                 scan_inlined_data_on(
                     connection,
@@ -1896,15 +1929,117 @@ impl MetadataProvider for MulticatalogProvider {
         snapshot_id: i64,
         columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
+        let rows = self.read_inlined_rows_shaped(
+            table_id,
+            columns,
+            InlinedRowSelection::VisibleAt(snapshot_id),
+            None,
+            InlinedReadShape::Mutation,
+        )?;
+        Ok(rows.into_iter().map(DuckLakeInlinedData::from).collect())
+    }
+
+    fn read_inlined_rows(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        self.read_inlined_rows_shaped(
+            table_id,
+            columns,
+            selection,
+            filter,
+            InlinedReadShape::Changes,
+        )
+    }
+
+    fn get_inlined_file_deletes_between(
+        &self,
+        table_id: i64,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
         block_on(async {
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, end_snapshot)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            self.on_connection(async |connection| {
+                inlined_file_deletes_between_on(connection, table_id, start_snapshot, end_snapshot)
+                    .await
+            })
+            .await
+        })
+    }
+
+    fn get_inlined_data_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFlushData>> {
+        let tables = block_on(async {
             if !self.schema_capabilities().await?.inlined_data_tables {
                 return Ok(Vec::new());
             }
             self.on_connection(async |connection| {
-                inlined_data_with_row_ids_on(connection, table_id, snapshot_id, columns).await
+                registered_inlined_tables_on(connection, table_id).await
+            })
+            .await
+        })?;
+        let mut flushed = Vec::new();
+        for table in tables {
+            let first = block_on(self.on_connection(async |connection| {
+                first_inlined_snapshot_on(connection, &table, snapshot_id).await
+            }))?;
+            let Some(first) = first else {
+                continue;
+            };
+            // Read with the connection released: the structure read takes it again.
+            let columns = self.get_table_structure(table_id, first)?;
+            let rows = block_on(self.on_connection(async |connection| {
+                inlined_table_for_flush_on(connection, table_id, &table, &columns, snapshot_id)
+                    .await
+            }))?;
+            if let Some(rows) = rows {
+                flushed.push(DuckLakeInlinedFlushData {
+                    rows,
+                    columns,
+                    columns_snapshot: first,
+                });
+            }
+        }
+        Ok(flushed)
+    }
+
+    fn get_inlined_file_deletes_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+        let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+        block_on(async {
+            if !self
+                .inlined_deletion_table_exists(table_id, &table, snapshot_id)
+                .await?
+            {
+                return Ok(Vec::new());
+            }
+            self.on_connection(async |connection| {
+                inlined_file_deletes_for_flush_on(connection, table_id, snapshot_id).await
             })
             .await
         })
+    }
+
+    fn get_delete_file_begin_snapshot(&self, delete_file_id: i64) -> Result<Option<i64>> {
+        block_on(self.on_connection(async |connection| {
+            delete_file_begin_snapshot_on(connection, delete_file_id).await
+        }))
     }
 
     fn get_inlined_deletes(
@@ -1939,9 +2074,10 @@ impl MetadataProvider for MulticatalogProvider {
                         })
                     })
                     .collect(),
-                // The table was seen, and is gone. Nothing in this crate drops
-                // one, but a missing table holds no deletions to apply, which is
-                // what a read of it has always returned.
+                // The table was seen, and is gone: expire dropped it with a
+                // table no surviving snapshot sees, or its catalog was dropped
+                // (see `InlinedDeletionTable`). A missing table holds no
+                // deletions to apply.
                 Err(error) if is_missing_statistics_table(&error) => {
                     self.inlined_deletion_tables().remove(&table_id);
                     Ok(Vec::new())
@@ -2558,18 +2694,15 @@ impl MetadataProvider for MulticatalogProvider {
         // Same shape as the single-catalog PostgresMetadataProvider — inherits
         // catalog via table_id.
         block_on(async {
-            // Cumulative (current-spec) delete files can hold in-window deletions
-            // even when their begin_snapshot predates the window; included via
-            // `ducklake_delete_file.partial_max`. Older catalogs lack the column
-            // (and cumulative delete files); degrade it to NULL there.
-            let pm = if self.schema_capabilities().await?.delete_file_partial_max {
-                "ddf.partial_max::bigint"
-            } else {
-                "NULL::bigint"
-            };
+            // `current_delete` takes every delete file that begins by the
+            // window's end, as official does: one that records each row's
+            // deleting snapshot (a flush's, dated at the earliest of them) can
+            // hold in-window deletions though it begins before the window. The
+            // feed windows its rows per row; a delete file without that column
+            // adds nothing before its own begin_snapshot.
             let rows = self
                 .read_all(
-                    sqlx::query(AssertSqlSafe(format!(
+                    sqlx::query(
                         r#"
 WITH current_delete AS (
     SELECT
@@ -2583,8 +2716,6 @@ WITH current_delete AS (
     FROM ducklake_delete_file ddf
     WHERE ddf.table_id = $1
       AND ddf.begin_snapshot <= $3
-      AND (ddf.begin_snapshot >= $2
-           OR ({pm} IS NOT NULL AND {pm} >= $2))
 ),
 data_files AS (
     SELECT df.*
@@ -2629,8 +2760,8 @@ LEFT JOIN LATERAL (
 WHERE data.table_id = $1
   AND data.end_snapshot >= $2
   AND data.end_snapshot <= $3
-"#
-                    )))
+"#,
+                    )
                     .bind(table_id)
                     .bind(start_snapshot)
                     .bind(end_snapshot),

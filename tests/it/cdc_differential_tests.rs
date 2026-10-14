@@ -28,8 +28,7 @@
 //! compaction REWRITES — as opposed to the adjacent-file merges two scenarios
 //! below do exercise — are still uncovered.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -309,37 +308,46 @@ async fn crate_feed(
     Ok(CanonFeed::new(all_columns, table_columns, rows))
 }
 
+/// The crate's provider for the catalog at `path`: DuckDB metadata, or SQLite
+/// metadata when `path` is spelled `sqlite:<file>` (as official's `ATTACH
+/// 'ducklake:sqlite:<file>'` names it).
+async fn crate_provider(path: &str) -> DataFusionResult<Arc<dyn MetadataProvider>> {
+    #[cfg(feature = "metadata-sqlite")]
+    if path.starts_with("sqlite:") {
+        return Ok(Arc::new(
+            datafusion_ducklake::SqliteMetadataProvider::new(path).await?,
+        ));
+    }
+    Ok(Arc::new(DuckdbMetadataProvider::new(path)?))
+}
+
+/// The crate reading the catalog at `path` (see [`crate_provider`]).
 async fn crate_context(path: &Path) -> DataFusionResult<SessionContext> {
     let path = path.to_str().expect("utf8 path");
-    let provider = DuckdbMetadataProvider::new(path)?;
-    let provider_arc: Arc<dyn MetadataProvider> = Arc::new(DuckdbMetadataProvider::new(path)?);
-    let catalog = DuckLakeCatalog::new(provider)?;
+    let provider = crate_provider(path).await?;
+    let snapshot = provider.get_current_snapshot()?;
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&provider), snapshot)?;
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
-    register_ducklake_functions(&ctx, provider_arc);
+    register_ducklake_functions(&ctx, provider);
     Ok(ctx)
 }
 
 /// The snapshot windows to diff for a catalog whose snapshots are `ids`
-/// (official inclusive-both-ends convention): every single snapshot from the
-/// table's creation on, every adjacent pair, every suffix, and the full range.
+/// (official inclusive-both-ends convention): every window `[a, b]` from the
+/// table's creation on, and the full range from snapshot 0.
 fn windows(ids: &[i64]) -> Vec<(i64, i64)> {
     // Snapshot 0 is the catalog-initialization snapshot; the scenario table
     // exists from snapshot 1 onward. Official table_changes resolves the table
     // at `end_snapshot`, so keep end >= 1.
     let usable: Vec<i64> = ids.iter().copied().filter(|&s| s >= 1).collect();
     let &max = usable.last().expect("at least one snapshot");
-    let mut out = HashSet::new();
-    out.insert((0, max));
-    for &s in &usable {
-        out.insert((s, s));
-        out.insert((s, max));
+    let mut out = vec![(0, max)];
+    for (i, &a) in usable.iter().enumerate() {
+        for &b in &usable[i..] {
+            out.push((a, b));
+        }
     }
-    for pair in usable.windows(2) {
-        out.insert((pair[0], pair[1]));
-    }
-    let mut out: Vec<_> = out.into_iter().collect();
-    out.sort();
     out
 }
 
@@ -389,7 +397,58 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
     let tmp = TempDir::new().map_err(box_err)?;
     let path = tmp.path().join("diff.ducklake");
     write_catalog(&path, statements)?;
+    assert_catalog_feeds_conform(table, &path).await
+}
 
+/// Diff the three feeds of `table` between the two engines over every derived
+/// snapshot window of the catalog at `path`.
+async fn assert_catalog_feeds_conform(table: &str, path: &Path) -> DataFusionResult<()> {
+    assert_catalog_feeds_conform_with(table, path, None).await
+}
+
+/// [`assert_catalog_feeds_conform`], where `dedupe_official` reads each
+/// official feed with rows it reports more than once reported once, and
+/// requires that official repeated some row: a history official reports twice.
+async fn assert_catalog_feeds_conform_with(
+    table: &str,
+    path: &Path,
+    rewrite_repeats: Option<(i64, &[i64])>,
+) -> DataFusionResult<()> {
+    let path = path.to_path_buf();
+    // The sibling of duckdb/ducklake#1571 (see COMPATIBILITY.md): when a data
+    // file with a delete file and inlined deletions is rewritten at snapshot
+    // `R`, official's change and deletion feeds report every row of the
+    // snapshots that inlined those deletions (`repeated`) twice in a window
+    // that also holds `R`; its insertion feed reports each once. This crate
+    // reports each once: the expected feed is official's with each such row
+    // once, after checking it was repeated exactly twice. Every other window
+    // and row must match as is.
+    let correct = |(a, b): (i64, i64), feed: CanonFeed| -> CanonFeed {
+        let Some((rewrite, repeated)) = rewrite_repeats else {
+            return feed;
+        };
+        if !(a < rewrite && rewrite <= b) {
+            return feed;
+        }
+        let mut rows = Vec::with_capacity(feed.rows.len());
+        let mut index = 0;
+        while index < feed.rows.len() {
+            let row = &feed.rows[index];
+            if repeated.contains(&row.snapshot_id) {
+                assert_eq!(
+                    feed.rows.get(index + 1),
+                    Some(row),
+                    "official reports {row:?} of window [{a},{b}] twice"
+                );
+                rows.push(row.clone());
+                index += 2;
+            } else {
+                rows.push(row.clone());
+                index += 1;
+            }
+        }
+        CanonFeed::new(feed.all_columns, feed.table_columns, rows)
+    };
     // Official side first, then drop the connection before the crate's
     // provider opens the metadata database.
     let mut official: Vec<((i64, i64), CanonFeed, CanonFeed, CanonFeed)> = Vec::new();
@@ -420,7 +479,12 @@ async fn assert_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionR
                 ),
                 false,
             )?;
-            official.push(((a, b), changes, deletions, insertions));
+            official.push((
+                (a, b),
+                correct((a, b), changes),
+                correct((a, b), deletions),
+                insertions,
+            ));
         }
     }
 
@@ -1499,4 +1563,577 @@ async fn diff_promoted_column_type() -> DataFusionResult<()> {
         ],
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Inlined rows
+//
+// The catalogs below are written with data inlining on, so small INSERTs land
+// in `ducklake_inlined_data_<table>_<schema_version>`, deletes and UPDATEs of
+// inlined rows set `end_snapshot` there (an UPDATE writes the new version with
+// the old row id), and small deletes of Parquet rows land in
+// `ducklake_inlined_delete_<table>`. Besides the three feeds, every snapshot's
+// row-lineage (`rowid`) scan is diffed.
+// ---------------------------------------------------------------------------
+
+/// Inlining limit for the writing connection: DuckDB's default, spelled out so
+/// the scenarios do not depend on it.
+const INLINING_ROW_LIMIT: usize = 10;
+
+/// Write a catalog at `path` with data inlining on.
+fn write_inlined_catalog(path: &Path, statements: &[&str]) -> DataFusionResult<()> {
+    let conn = duckdb::Connection::open_in_memory().map_err(box_err)?;
+    crate::common::ensure_ducklake_installed();
+    conn.execute("LOAD ducklake;", []).map_err(box_err)?;
+    // A SQLite catalog (`sqlite:<file>`) names its data directory.
+    let data_path = match path.to_str().and_then(|p| p.strip_prefix("sqlite:")) {
+        Some(file) => format!(", DATA_PATH '{file}.files/'"),
+        None => String::new(),
+    };
+    conn.execute(
+        &format!(
+            "ATTACH 'ducklake:{}' AS c (DATA_INLINING_ROW_LIMIT {INLINING_ROW_LIMIT}{data_path});",
+            path.display()
+        ),
+        [],
+    )
+    .map_err(box_err)?;
+    for s in statements {
+        // A batch runs a maintenance `CALL` to completion; `execute` would
+        // leave its result rows to be scanned after its transaction ended.
+        conn.execute_batch(s).map_err(box_err)?;
+    }
+    Ok(())
+}
+
+/// Write `statements` with inlining on, check the history really holds inlined
+/// changes of the kinds named in `expect_tokens`, then diff the feeds over every
+/// window and the row-lineage scan at every snapshot (unfiltered, and under
+/// `filter`).
+async fn assert_inlined_cdc_conformance(
+    table: &str,
+    statements: &[&str],
+    expect_tokens: &[&str],
+    filter: &str,
+) -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("inlined.ducklake");
+    write_inlined_catalog(&path, statements)?;
+    {
+        let conn = official_connection(&path)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT string_agg(CAST(changes AS VARCHAR), ' ') FROM ducklake_snapshots('c')",
+            )
+            .map_err(box_err)?;
+        let changes: String = stmt.query_row([], |row| row.get(0)).map_err(box_err)?;
+        for token in expect_tokens {
+            assert!(
+                changes.contains(token),
+                "scenario must produce `{token}` changes; snapshot ledger: {changes}"
+            );
+        }
+    }
+    assert_catalog_feeds_conform(table, &path).await?;
+    assert_rowid_scans_conform(table, &path, "").await?;
+    assert_rowid_scans_conform(table, &path, filter).await
+}
+
+/// Diff `SELECT *, rowid FROM table [WHERE filter]` between the engines at
+/// every snapshot the table exists in.
+async fn assert_rowid_scans_conform(
+    table: &str,
+    path: &Path,
+    filter: &str,
+) -> DataFusionResult<()> {
+    let where_clause = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {filter}")
+    };
+    let mut official: Vec<(i64, Vec<Vec<String>>)> = Vec::new();
+    {
+        let conn = official_connection(path)?;
+        let created: i64 = conn
+            .prepare(&format!(
+                "SELECT min(snapshot_id) FROM ducklake_snapshots('c') \
+                 WHERE CAST(changes AS VARCHAR) LIKE '%main.{table}%'"
+            ))
+            .map_err(box_err)?
+            .query_row([], |row| row.get(0))
+            .map_err(box_err)?;
+        for snapshot in snapshot_ids(&conn)?.into_iter().filter(|&s| s >= created) {
+            let mut stmt = match conn.prepare(&format!(
+                "SELECT *, rowid FROM c.main.{table} AT (VERSION => {snapshot}){where_clause}"
+            )) {
+                Ok(stmt) => stmt,
+                // The filter names a column this snapshot's schema lacks.
+                Err(error) if error.to_string().contains("Binder Error") => continue,
+                Err(error) => return Err(box_err(error)),
+            };
+            let mut rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    let mut out = Vec::new();
+                    let mut i = 0;
+                    while let Ok(v) = row.get::<usize, Value>(i) {
+                        out.push(duckdb_cell(&v));
+                        i += 1;
+                    }
+                    Ok(out)
+                })
+                .map_err(box_err)?
+                .collect::<Result<_, _>>()
+                .map_err(box_err)?;
+            rows.sort();
+            official.push((snapshot, rows));
+        }
+    }
+
+    let path = path.to_str().expect("utf8 path");
+    for (snapshot, official_rows) in official {
+        let provider = crate_provider(path).await?;
+        let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot)?.with_row_lineage(true);
+        let ctx = SessionContext::new();
+        ctx.register_catalog("ducklake", Arc::new(catalog));
+        let batches = ctx
+            .sql(&format!(
+                "SELECT * FROM ducklake.main.{table}{where_clause}"
+            ))
+            .await?
+            .collect()
+            .await?;
+        let mut rows: Vec<Vec<String>> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(|r| (0..b.num_columns()).map(|c| arrow_cell(b, c, r)).collect())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            official_rows, rows,
+            "rowid scan at snapshot {snapshot}{where_clause} diverges from official"
+        );
+    }
+    Ok(())
+}
+
+/// Inlined inserts across snapshots, one of them alongside a Parquet insert.
+#[tokio::test]
+async fn diff_inlined_inserts() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a'), (2, NULL), (3, 'c');",
+            "INSERT INTO c.t VALUES (4, 'd');",
+            "INSERT INTO c.t SELECT i, 'p' || i FROM range(100, 120) r(i);",
+            "INSERT INTO c.t VALUES (5, 'e'), (6, 'f');",
+        ],
+        &["inlined_insert", "tables_inserted_into"],
+        "id >= 4",
+    )
+    .await
+}
+
+/// Deletes of inlined rows: the row version gets an `end_snapshot`.
+#[tokio::test]
+async fn diff_inlined_row_deletes() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            "DELETE FROM c.t WHERE id = 2;",
+            "INSERT INTO c.t VALUES (4, 'd');",
+            "DELETE FROM c.t WHERE id IN (1, 4);",
+        ],
+        &["inlined_insert", "inlined_delete"],
+        "name <> 'c'",
+    )
+    .await
+}
+
+/// UPDATEs of inlined rows, repeated on one row, then a delete of it: each new
+/// version keeps the row id, so the feeds pair pre- and postimages.
+#[tokio::test]
+async fn diff_inlined_row_updates() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, val VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+            "UPDATE c.t SET val = 'TWO' WHERE id = 2;",
+            "UPDATE c.t SET val = 'TWO-AGAIN' WHERE id = 2;",
+            "UPDATE c.t SET val = val || '!';",
+            "DELETE FROM c.t WHERE id = 2;",
+        ],
+        &["inlined_insert", "inlined_delete"],
+        "val LIKE 'T%'",
+    )
+    .await
+}
+
+/// Small deletes and UPDATEs of Parquet rows: the deletions are inlined
+/// (`ducklake_inlined_delete_<table>`) and an UPDATE's new versions are inlined
+/// rows carrying the Parquet rows' row ids.
+#[tokio::test]
+async fn diff_inlined_deletes_of_parquet_rows() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t SELECT i, 'p' || i FROM range(0, 20) r(i);",
+            "DELETE FROM c.t WHERE id = 5;",
+            "DELETE FROM c.t WHERE id IN (7, 8);",
+            "UPDATE c.t SET name = 'q' WHERE id = 10;",
+            "UPDATE c.t SET name = 'qq' WHERE id = 10;",
+        ],
+        &["inlined_insert", "inlined_delete", "tables_inserted_into"],
+        "id < 9",
+    )
+    .await
+}
+
+/// One data file with both a delete file and inlined deletions, plus inlined
+/// inserts and updates in the same windows.
+#[tokio::test]
+async fn diff_inlined_and_file_deletes_mixed() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t SELECT i, 'p' || i FROM range(0, 100) r(i);",
+            "DELETE FROM c.t WHERE id < 30;",
+            "DELETE FROM c.t WHERE id = 50;",
+            "INSERT INTO c.t VALUES (1000, 'x'), (1001, 'y');",
+            "DELETE FROM c.t WHERE id >= 60 AND id < 80;",
+            "UPDATE c.t SET name = 'z' WHERE id IN (90, 1000);",
+            "DELETE FROM c.t WHERE id IN (91, 1001);",
+        ],
+        &["inlined_insert", "inlined_delete", "tables_deleted_from"],
+        "id >= 50",
+    )
+    .await
+}
+
+/// Inlined rows across schema versions: each version has its own inlined
+/// table, whose columns carry that version's names. A renamed column reads its
+/// old values, a column added later reads its default, and a column dropped and
+/// re-added under the same name is a different column.
+#[tokio::test]
+async fn diff_inlined_schema_evolution() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t VALUES (1, 'a'), (2, 'b');",
+            "ALTER TABLE c.t RENAME COLUMN name TO label;",
+            "INSERT INTO c.t VALUES (3, 'c');",
+            "ALTER TABLE c.t ADD COLUMN extra INTEGER DEFAULT 7;",
+            "INSERT INTO c.t VALUES (4, 'd', 40);",
+            "DELETE FROM c.t WHERE id = 1;",
+            "ALTER TABLE c.t DROP COLUMN label;",
+            "ALTER TABLE c.t ADD COLUMN label VARCHAR;",
+            "INSERT INTO c.t VALUES (5, 50, 'e');",
+            "UPDATE c.t SET extra = 99 WHERE id = 2;",
+        ],
+        &["inlined_insert", "inlined_delete", "tables_altered"],
+        "label IS NULL",
+    )
+    .await
+}
+
+/// A table well past one batch (8192 rows): inlined deletions and updates of
+/// rows deep in the file, a delete file, and inlined inserts. Positions and
+/// row ids must survive the scan being split across batches and cores.
+#[tokio::test]
+async fn diff_inlined_changes_on_a_large_table() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER, name VARCHAR);",
+            "INSERT INTO c.t SELECT i, 'p' || i FROM range(0, 20000) r(i);",
+            "DELETE FROM c.t WHERE id IN (3, 8191, 8192, 16384, 19999);",
+            "UPDATE c.t SET name = 'u' WHERE id IN (8200, 12000);",
+            "INSERT INTO c.t VALUES (-1, 'x'), (-2, 'y');",
+            "DELETE FROM c.t WHERE id >= 15000 AND id < 15100;",
+            "DELETE FROM c.t WHERE id = -1 OR id = 9000;",
+        ],
+        &["inlined_insert", "inlined_delete", "tables_deleted_from"],
+        "id > 8190 AND id < 8300",
+    )
+    .await
+}
+
+/// A data file retired by a rewrite after an inlined deletion of one of its
+/// rows. Official reports a window that holds both the inlined deletion and
+/// the retirement with only the inlined deletion (the retired file's other rows
+/// are not reported deleted, so its rewritten rows surface as inserts), and a
+/// window holding only the retirement with every row of the file, the one
+/// deleted earlier included.
+#[tokio::test]
+async fn diff_rewrite_after_inlined_delete() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &[
+            "CREATE TABLE c.t(id INTEGER);",
+            "INSERT INTO c.t SELECT i FROM range(0, 20) r(i);",
+            "DELETE FROM c.t WHERE id = 5;",
+            "CALL ducklake_rewrite_data_files('c', 't', delete_threshold => 0.0);",
+        ],
+        &["inlined_delete", "rewrite_delete"],
+        "id > 3",
+    )
+    .await
+}
+
+/// A data file with a delete file and inlined deletions, retired by a rewrite.
+/// Official reports each inlined deletion and each inlined update's preimage
+/// and postimage twice in every window that holds both the change and the
+/// rewrite's snapshot, a sibling of duckdb/ducklake#1571's upstream data bug;
+/// a window of the rewrite alone matches #1571. This crate reports each once.
+#[tokio::test]
+async fn diff_rewrite_of_file_with_delete_file_and_inlined_deletes() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("inlined.ducklake");
+    write_inlined_catalog(
+        &path,
+        &[
+            "CREATE TABLE c.t(id INTEGER);",
+            "INSERT INTO c.t SELECT i FROM range(0, 20) r(i);",
+            "DELETE FROM c.t WHERE id < 12;",
+            "DELETE FROM c.t WHERE id = 15;",
+            "UPDATE c.t SET id = 116 WHERE id = 16;",
+            "CALL ducklake_rewrite_data_files('c', 't', delete_threshold => 0.0);",
+        ],
+    )?;
+    // Official's actual change feed over [4, 6]: the inlined deletion of
+    // snapshot 4 and the inlined update of snapshot 5 each reported twice.
+    let row =
+        |snapshot: i64, rowid: i64, kind: &str, id: i32| format!("{snapshot},{rowid},{kind},{id}");
+    let window_4_6 = "SELECT * FROM ducklake_table_changes('c', 'main', 't', 4, 6) \
+         WHERE change_type <> 'insert' ORDER BY ALL";
+    let official_rows = {
+        let conn = official_connection(&path)?;
+        crate::inlined_mutation_differential_tests::query_lines(&conn, window_4_6)
+    };
+    assert_eq!(
+        official_rows,
+        vec![
+            row(4, 15, "delete", 15),
+            row(4, 15, "delete", 15),
+            row(5, 16, "update_postimage", 116),
+            row(5, 16, "update_postimage", 116),
+            row(5, 16, "update_preimage", 16),
+            row(5, 16, "update_preimage", 16),
+        ],
+        "official's feed over [4, 6]"
+    );
+    // This crate's: each change once.
+    let ctx = crate_context(&path).await?;
+    let crate_rows = ctx
+        .sql(
+            "SELECT snapshot_id, rowid, change_type, id FROM \
+             ducklake_table_changes('main.t', 4, 6) WHERE change_type <> 'insert' \
+             ORDER BY 1, 2, 3, 4",
+        )
+        .await?
+        .collect()
+        .await?;
+    let crate_rows = arrow::util::pretty::pretty_format_batches(&crate_rows)?.to_string();
+    for expected in [
+        "| 4           | 15    | delete           | 15  |",
+        "| 5           | 16    | update_postimage | 116 |",
+        "| 5           | 16    | update_preimage  | 16  |",
+    ] {
+        assert_eq!(
+            crate_rows.matches(expected).count(),
+            1,
+            "{expected} in\n{crate_rows}"
+        );
+    }
+    assert_catalog_feeds_conform_with("t", &path, Some((6, &[4, 5]))).await?;
+    assert_rowid_scans_conform("t", &path, "").await
+}
+
+/// The history of a column added with a default, before and after official
+/// flushes the inlined rows: the Parquet file holds no value of the column for
+/// the rows inserted before it, which every feed reads as its default.
+#[tokio::test]
+async fn diff_default_column_across_duckdb_flush() -> DataFusionResult<()> {
+    assert_inlined_cdc_conformance(
+        "t",
+        &DEFAULT_COLUMN_HISTORY
+            .iter()
+            .copied()
+            .chain(["CALL ducklake_flush_inlined_data('c');"])
+            .collect::<Vec<_>>(),
+        &["inlined_insert", "flushed_inlined"],
+        "id > 1",
+    )
+    .await
+}
+
+/// Inlined rows of a table that gained a column with a default since.
+const DEFAULT_COLUMN_HISTORY: [&str; 4] = [
+    "CREATE TABLE c.t(id INTEGER);",
+    "INSERT INTO c.t VALUES (1), (2);",
+    "ALTER TABLE c.t ADD COLUMN c INTEGER DEFAULT 7;",
+    "INSERT INTO c.t VALUES (3, 8);",
+];
+
+/// [`diff_default_column_across_duckdb_flush`] with this crate flushing: its
+/// feeds after the flush are official's before it.
+#[cfg(feature = "write-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn default_column_feeds_unchanged_by_crate_flush() -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let path = tmp.path().join("inlined.ducklake");
+    write_inlined_catalog(&path, &DEFAULT_COLUMN_HISTORY)?;
+    let mut official = Vec::new();
+    {
+        let conn = official_connection(&path)?;
+        for (a, b) in windows(&snapshot_ids(&conn)?) {
+            for function in ["ducklake_table_changes", "ducklake_table_insertions"] {
+                let projection = if function == "ducklake_table_changes" {
+                    "*"
+                } else {
+                    "snapshot_id, rowid, *"
+                };
+                official.push((
+                    (a, b, function),
+                    official_feed(
+                        &conn,
+                        &format!("SELECT {projection} FROM {function}('c', 'main', 't', {a}, {b})"),
+                        function == "ducklake_table_changes",
+                    )?,
+                ));
+            }
+        }
+    }
+    {
+        let writer = Arc::new(datafusion_ducklake::DuckdbMetadataWriter::new_with_init(
+            path.to_str().unwrap(),
+        )?);
+        let provider: Arc<dyn MetadataProvider> = Arc::new(writer.metadata_provider());
+        let writer: Arc<dyn datafusion_ducklake::MetadataWriter> = writer;
+        let ctx = SessionContext::new();
+        let catalog = DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&writer))?;
+        DuckLakeCatalog::register(&ctx, "lake", catalog);
+        let handle = DuckLakeCatalog::with_writer(provider, writer)?;
+        datafusion_ducklake::execute_ducklake_sql(
+            &ctx,
+            &handle,
+            "CALL ducklake_flush_inlined_data('lake')",
+        )
+        .await?
+        .collect()
+        .await?;
+    }
+    {
+        let conn = duckdb::Connection::open(&path).map_err(box_err)?;
+        let flushed: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM ducklake_snapshot_changes \
+                 WHERE changes_made LIKE '%inline_flush%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(box_err)?;
+        assert_eq!(flushed, 1);
+    }
+    let ctx = crate_context(&path).await?;
+    for ((a, b, function), official) in official {
+        let ours = crate_feed(
+            &ctx,
+            &format!("SELECT * FROM {function}('main.t', {a}, {b})"),
+            function == "ducklake_table_changes",
+        )
+        .await?;
+        assert_feeds_match(&format!("{function} window [{a},{b}]"), &official, &ours);
+    }
+    Ok(())
+}
+
+/// Inlined rows deleted at several snapshots, then flushed: the flush writes
+/// their deletions to one delete file dated at the earliest of them, each row
+/// keeping its own snapshot. Deletions, an update and an insert follow the
+/// flush. (Official repeats the update pairs of rows updated while inlined
+/// once they are flushed, duckdb/ducklake#1603; the fuzz harness models it.)
+const FLUSHED_DELETIONS_HISTORY: [&str; 9] = [
+    "CREATE TABLE c.t(id INTEGER, v VARCHAR);",
+    "INSERT INTO c.t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');",
+    "DELETE FROM c.t WHERE id = 1;",
+    "DELETE FROM c.t WHERE id = 2;",
+    "DELETE FROM c.t WHERE id = 3;",
+    "CALL ducklake_flush_inlined_data('c');",
+    "DELETE FROM c.t WHERE id = 4;",
+    "UPDATE c.t SET v = 'ee' WHERE id = 5;",
+    "INSERT INTO c.t VALUES (6, 'f');",
+];
+
+/// The history of upstream's `ducklake_table_deletions_inlined_flush.test`.
+const UPSTREAM_FLUSHED_DELETIONS_HISTORY: [&str; 9] = [
+    "CREATE TABLE c.test(i INTEGER, j VARCHAR);",
+    "INSERT INTO c.test SELECT i, 'row' || i::VARCHAR FROM range(10) t(i);",
+    "DELETE FROM c.test WHERE i = 2",
+    "DELETE FROM c.test WHERE i = 5",
+    "DELETE FROM c.test WHERE i = 8",
+    "CALL ducklake_flush_inlined_data('c')",
+    "DELETE FROM c.test WHERE i = 1",
+    "DELETE FROM c.test WHERE i = 4",
+    "DELETE FROM c.test WHERE i = 7",
+];
+
+/// Write `statements` with inlining on to a DuckDB and to a SQLite catalog,
+/// check official flushed inlined rows, and diff all three feeds of `table`
+/// over every window, and the row-lineage scan at every snapshot.
+async fn assert_flushed_cdc_conformance(table: &str, statements: &[&str]) -> DataFusionResult<()> {
+    let tmp = TempDir::new().map_err(box_err)?;
+    let mut paths = vec![tmp.path().join("flushed.ducklake")];
+    if cfg!(feature = "metadata-sqlite") {
+        paths.push(PathBuf::from(format!(
+            "sqlite:{}",
+            tmp.path().join("flushed.sqlite").display()
+        )));
+    }
+    for path in paths {
+        write_inlined_catalog(&path, statements)?;
+        {
+            let conn = official_connection(&path)?;
+            let changes: String = conn
+                .query_row(
+                    "SELECT string_agg(CAST(changes AS VARCHAR), ' ') FROM ducklake_snapshots('c')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(box_err)?;
+            assert!(
+                changes.contains("flushed_inlined"),
+                "{}: the history must flush; ledger: {changes}",
+                path.display()
+            );
+        }
+        assert_catalog_feeds_conform(table, &path).await?;
+        assert_rowid_scans_conform(table, &path, "").await?;
+    }
+    Ok(())
+}
+
+/// The deletions and update preimages a flush wrote to a delete file are
+/// reported in every window holding their snapshots, also those starting
+/// after the delete file's `begin_snapshot` (the earliest of them).
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_deletions_after_inlined_flush() -> DataFusionResult<()> {
+    assert_flushed_cdc_conformance("t", &FLUSHED_DELETIONS_HISTORY).await
+}
+
+/// [`diff_deletions_after_inlined_flush`] over the history of upstream's
+/// `ducklake_table_deletions_inlined_flush.test`, in every window rather than
+/// the six that file queries.
+#[tokio::test(flavor = "multi_thread")]
+async fn diff_upstream_inlined_flush_deletions_every_window() -> DataFusionResult<()> {
+    assert_flushed_cdc_conformance("test", &UPSTREAM_FLUSHED_DELETIONS_HISTORY).await
 }

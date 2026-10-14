@@ -654,3 +654,261 @@ async fn mysql_sqlite_style_inlined_rows_are_visible() {
         expected.len() as i64
     );
 }
+
+/// Render one cell of a DuckDB or DataFusion result for a cross-engine diff.
+fn duckdb_text(value: duckdb::types::Value) -> String {
+    use duckdb::types::Value;
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Int(v) => v.to_string(),
+        Value::BigInt(v) => v.to_string(),
+        Value::Text(v) => v,
+        other => panic!("unexpected duckdb value {other:?}"),
+    }
+}
+
+/// The change feeds and `rowid` scans over a PostgreSQL catalog whose history
+/// DuckDB wrote with inlining on — inlined inserts, updates and deletes of
+/// inlined rows, inlined deletions of Parquet rows, and a rename between
+/// inlined schema versions — match the extension's row for row.
+#[cfg(feature = "metadata-postgres")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_inlined_change_feeds_match_the_extension() {
+    use datafusion_ducklake::{PostgresMetadataProvider, register_ducklake_functions};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let libpq =
+        format!("host=127.0.0.1 port={port} dbname=postgres user=postgres password=postgres");
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    common::ensure_ducklake_installed();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("INSTALL postgres; LOAD postgres; LOAD ducklake;")
+        .unwrap();
+    conn.execute(
+        &format!(
+            "ATTACH 'ducklake:postgres:{libpq}' AS lake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 10)",
+            escaped_path(&data_path)
+        ),
+        [],
+    )
+    .unwrap();
+    for statement in [
+        "CREATE TABLE lake.t(id INTEGER, name VARCHAR)",
+        "INSERT INTO lake.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "UPDATE lake.t SET name = 'B' WHERE id = 2",
+        "DELETE FROM lake.t WHERE id = 1",
+        "INSERT INTO lake.t SELECT i, 'p' || i FROM range(100, 130) r(i)",
+        "DELETE FROM lake.t WHERE id IN (105, 106)",
+        "UPDATE lake.t SET name = 'q' WHERE id = 110",
+        "ALTER TABLE lake.t RENAME COLUMN name TO label",
+        "INSERT INTO lake.t VALUES (4, 'd')",
+        "DELETE FROM lake.t WHERE id = 3",
+    ] {
+        conn.execute_batch(statement).unwrap();
+    }
+    let last: i64 = conn
+        .query_row(
+            "SELECT max(snapshot_id) FROM ducklake_snapshots('lake')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let official_rows = |sql: &str| -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows: Vec<Vec<String>> = stmt
+            .query_map([], |row| {
+                let mut out = Vec::new();
+                let mut i = 0;
+                while let Ok(value) = row.get::<usize, duckdb::types::Value>(i) {
+                    out.push(duckdb_text(value));
+                    i += 1;
+                }
+                Ok(out)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    let mut official = Vec::new();
+    for (start, end) in [(0, last), (2, 4), (5, 7), (7, last), (last, last)] {
+        official.push((
+            format!("SELECT * FROM ducklake_table_changes('main.t', {start}, {end})"),
+            official_rows(&format!(
+                "SELECT * FROM ducklake_table_changes('lake', 'main', 't', {start}, {end})"
+            )),
+        ));
+        official.push((
+            format!("SELECT * FROM ducklake_table_insertions('main.t', {start}, {end})"),
+            official_rows(&format!(
+                "SELECT snapshot_id, rowid, * FROM \
+                 ducklake_table_insertions('lake', 'main', 't', {start}, {end})"
+            )),
+        ));
+        official.push((
+            format!(
+                "SELECT * EXCLUDE (change_type) \
+                 FROM ducklake_table_deletions('main.t', {start}, {end})"
+            ),
+            official_rows(&format!(
+                "SELECT snapshot_id, rowid, * FROM \
+                 ducklake_table_deletions('lake', 'main', 't', {start}, {end})"
+            )),
+        ));
+    }
+    let official_scan = official_rows("SELECT *, rowid FROM lake.t");
+    conn.execute("DETACH lake", []).unwrap();
+
+    let provider: Arc<dyn MetadataProvider> =
+        Arc::new(PostgresMetadataProvider::new(&url).await.unwrap());
+    let ctx = SessionContext::new();
+    register_ducklake_functions(&ctx, Arc::clone(&provider));
+    let catalog = DuckLakeCatalog::new(PostgresMetadataProvider::new(&url).await.unwrap())
+        .unwrap()
+        .with_row_lineage(true);
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let crate_rows = |batches: Vec<RecordBatch>| -> Vec<Vec<String>> {
+        let mut rows: Vec<Vec<String>> = batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows())
+                    .map(|row| {
+                        (0..batch.num_columns())
+                            .map(|column| {
+                                let array = batch.column(column);
+                                if array.is_null(row) {
+                                    return "NULL".to_string();
+                                }
+                                datafusion::arrow::util::display::array_value_to_string(array, row)
+                                    .unwrap()
+                            })
+                            .collect()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    for (sql, expected) in official {
+        let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+        assert_eq!(crate_rows(batches), expected, "{sql}");
+    }
+    let batches = ctx
+        .sql("SELECT * FROM ducklake.main.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(crate_rows(batches), official_scan);
+}
+
+/// Inlined rows written before `ALTER ... SET TYPE` widened a column hold
+/// values of the older type; they read as the widened type, as DuckDB reads
+/// them, on DuckDB and SQLite catalogs.
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_rows_read_through_a_widened_column_type() {
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    common::ensure_ducklake_installed();
+    common::ensure_extension_installed("sqlite");
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("LOAD ducklake; LOAD sqlite;").unwrap();
+    let catalogs = [
+        (
+            "duck",
+            format!("ducklake:{}", escaped_path(&temp.path().join("a.ducklake"))),
+        ),
+        (
+            "lite",
+            format!(
+                "ducklake:sqlite:{}",
+                escaped_path(&temp.path().join("b.db"))
+            ),
+        ),
+    ];
+    let mut expected = Vec::new();
+    for (name, uri) in &catalogs {
+        let data = data_path.join(name);
+        conn.execute_batch(&format!(
+            "ATTACH '{uri}' AS {name} (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 10);
+             CREATE TABLE {name}.t (i INTEGER, f FLOAT);
+             INSERT INTO {name}.t VALUES (1, 0.5), (-2, NULL);
+             ALTER TABLE {name}.t ALTER i SET TYPE BIGINT;
+             ALTER TABLE {name}.t ALTER f SET TYPE DOUBLE;
+             INSERT INTO {name}.t VALUES (10000000000, 1.25);",
+            escaped_path(&data)
+        ))
+        .unwrap();
+        let mut statement = conn
+            .prepare(&format!("SELECT i, f FROM {name}.t ORDER BY i"))
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<f64>>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        expected.push(rows);
+    }
+    drop(conn);
+    assert_eq!(
+        expected[0],
+        vec![(-2, None), (1, Some(0.5)), (10_000_000_000, Some(1.25))]
+    );
+
+    let mut providers: Vec<Arc<dyn MetadataProvider>> = vec![Arc::new(
+        DuckdbMetadataProvider::new(temp.path().join("a.ducklake").to_string_lossy().to_string())
+            .unwrap(),
+    )];
+    #[cfg(feature = "metadata-sqlite")]
+    providers.push(Arc::new(
+        datafusion_ducklake::SqliteMetadataProvider::new(&format!(
+            "sqlite:{}",
+            temp.path().join("b.db").display()
+        ))
+        .await
+        .unwrap(),
+    ));
+    for (index, provider) in providers.into_iter().enumerate() {
+        let ctx = SessionContext::new();
+        let head = provider.get_current_snapshot().unwrap();
+        ctx.register_catalog(
+            "lake",
+            Arc::new(DuckLakeCatalog::with_snapshot(provider, head).unwrap()),
+        );
+        let batches = ctx
+            .sql("SELECT i, f FROM lake.main.t ORDER BY i")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let i = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let f = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((i.value(row), f.is_valid(row).then(|| f.value(row))));
+            }
+        }
+        assert_eq!(rows, expected[index], "catalog {}", catalogs[index].0);
+    }
+}

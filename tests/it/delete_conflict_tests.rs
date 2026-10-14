@@ -618,6 +618,7 @@ async fn inlined_delete_conflicts(h: &Harness, a: &str, b: &str) {
 
 /// A flush of inlined rows commits over a concurrent commit that only deleted
 /// a Parquet row, as in official DuckLake, and the delete survives it.
+#[allow(deprecated)]
 async fn flush_commits_over_concurrent_delete_file(h: &Harness, a: &str) {
     let (table_id, base, rows) = parquet_and_inlined(h, a).await;
     delete_first_row(h, a, table_id, |file| file.delete_file_id.is_none()).await;
@@ -635,6 +636,7 @@ async fn flush_commits_over_concurrent_delete_file(h: &Harness, a: &str) {
 
 /// A flush fails over a concurrent inlined delete of a Parquet row, as in
 /// official DuckLake, and registers nothing.
+#[allow(deprecated)]
 async fn flush_conflicts_with_concurrent_inlined_delete(h: &Harness, a: &str, b: &str) {
     let (table_id, base, rows) = parquet_and_inlined(h, a).await;
     let provider = h.provider();
@@ -670,6 +672,7 @@ async fn flush_conflicts_with_concurrent_inlined_delete(h: &Harness, a: &str, b:
 
 /// A flush fails over a concurrent delete of one of the inlined rows it moves,
 /// and the table keeps the delete and its other rows.
+#[allow(deprecated)]
 async fn flush_conflicts_with_concurrent_inlined_row_delete(h: &Harness, a: &str) {
     let (_, base, rows) = parquet_and_inlined(h, a).await;
     let row = InlinedRowRef {

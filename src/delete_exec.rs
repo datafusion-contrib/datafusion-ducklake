@@ -7,13 +7,20 @@
 //!
 //! Two paths:
 //! - **Filtered delete** (a `WHERE` clause): for each live data file, resolve the
-//!   physical row positions matching the predicate, union them with the file's
-//!   already-deleted positions, write ONE cumulative positional delete file, and
-//!   commit every affected file's delete file in a SINGLE snapshot (atomic
+//!   physical row positions matching the predicate and record them as official
+//!   DuckLake's `DuckLakeDelete::FlushDelete` does: at most the scoped
+//!   `data_inlining_row_limit` go to
+//!   `ducklake_inlined_delete_<table_id>`; a file they empty is dropped; a file
+//!   with a live delete file gets a new one carrying each position's snapshot
+//!   in its place; any other gets a delete file of its new positions. Matching
+//!   inlined rows are ended. Everything commits in a SINGLE snapshot (atomic
 //!   multi-file delete). The read path is already delete-aware, so a subsequent
 //!   `SELECT` excludes the deleted rows automatically.
-//! - **Delete-all** (no `WHERE`): a metadata-only truncate — end every live data
-//!   file in one new snapshot. Much cheaper than positional-deleting every row.
+//! - **Delete-all** (no `WHERE`): every live row of every file is recorded the
+//!   same way — a file without inlined deletions over the limit is dropped
+//!   without reading its delete file — and every inlined row is ended, in one
+//!   snapshot. On a writer without staged row mutations it is a metadata-only
+//!   truncate that ends every live data file.
 //!
 //! A file rewritten by an UPDATE or by compaction is handled like any other. A
 //! delete file's `pos` is a row's physical index in the data file, which a
@@ -31,7 +38,7 @@
 //! [`Conflict`](crate::DuckLakeError::Conflict), which guards against a stale, non-cumulative
 //! delete file resurrecting already-deleted rows.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 
@@ -48,7 +55,10 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use futures::stream;
 
-use crate::metadata_writer::{DeleteFileEntry, InlinedRowRef, MetadataWriter};
+use crate::metadata_writer::{
+    DeleteFileEntry, DroppedDataFile, InlinedFileDelete, InlinedFlushDeleteFile,
+    InlinedFlushFileDelete, InlinedRowRef, MetadataWriter, StagedTableData,
+};
 use crate::table::DuckLakeTable;
 use crate::table_writer::DuckLakeTableWriter;
 
@@ -265,19 +275,27 @@ async fn run_delete(
         .inlined_data_with_row_ids()
         .map_err(|error| DataFusionError::External(Box::new(error)))?;
 
-    // Delete-all (no WHERE): metadata-only truncate — end every live data file in
-    // one snapshot. Skip the empty table entirely (no-op, no snapshot).
-    let predicate = match predicate {
-        None => {
-            if table_files.is_empty() && inlined_data.is_empty() {
-                return Ok(0);
-            }
-            return writer
-                .commit_truncate(table_id, schema_name, table_name, base_snapshot)
-                .map_err(|e| DataFusionError::External(Box::new(e)));
-        },
-        Some(p) => p,
+    // A writer that stages row mutations records each file's deletions as
+    // official DuckLake's `DuckLakeDelete::FlushDelete` does (see
+    // [`FileDeletions::record`]); any other writes cumulative delete files.
+    let capable = writer.supports_inlined_row_mutations();
+    let inline_limit = if capable {
+        table.write_options().data_inlining_row_limit.unwrap_or(0)
+    } else {
+        0
     };
+
+    // Delete-all (no WHERE) on a writer without staged row mutations:
+    // metadata-only truncate — end every live data file in one snapshot. Skip
+    // the empty table entirely (no-op, no snapshot).
+    if predicate.is_none() && !capable {
+        if table_files.is_empty() && inlined_data.is_empty() {
+            return Ok(0);
+        }
+        return writer
+            .commit_truncate(table_id, schema_name, table_name, base_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)));
+    }
 
     // Object store for writing delete files — the same store the positional reads
     // resolve against.
@@ -287,11 +305,31 @@ async fn run_delete(
     let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store)
         .map(|writer| writer.with_options(table.write_options()))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let inlined_deletes = table.inlined_deletes_by_file()?;
+
+    let predicate = match predicate {
+        None => {
+            return delete_all(
+                &table,
+                state,
+                &table_writer,
+                inline_limit,
+                &table_files,
+                &inlined_data,
+                &inlined_deletes,
+                schema_name,
+                table_name,
+                base_snapshot,
+            )
+            .await;
+        },
+        Some(p) => p,
+    };
 
     let mut entries: Vec<DeleteFileEntry> = Vec::new();
+    let mut deletions = FileDeletions::default();
     let mut inlined_rows: Vec<InlinedRowRef> = Vec::new();
     let mut total_deleted: u64 = 0;
-    let inlined_deletes = table.inlined_deletes_by_file()?;
 
     for inlined in &inlined_data {
         let values = predicate.evaluate(&inlined.batch)?;
@@ -336,24 +374,42 @@ async fn run_delete(
         // inlined deletes. Rows already deleted are neither re-counted nor
         // re-deleted, and a predicate matching only such rows commits nothing.
         let existing = match tf.delete_file {
-            Some(ref df) => table.read_delete_file_positions(state, df).await?,
-            None => HashSet::new(),
+            Some(ref df) => table.read_delete_file_entries(state, df).await?,
+            None => HashMap::new(),
         };
-        let mut already_deleted = existing.clone();
-        if let Some(inlined) = inlined_deletes.get(&tf.data_file_id) {
-            already_deleted.extend(inlined);
-        }
-
-        let newly_deleted: HashSet<i64> = matched.difference(&already_deleted).copied().collect();
+        let inlined = inlined_deletes.get(&tf.data_file_id);
+        let mut newly_deleted: Vec<i64> = matched
+            .into_iter()
+            .filter(|pos| {
+                !existing.contains_key(pos) && !inlined.is_some_and(|set| set.contains(pos))
+            })
+            .collect();
         if newly_deleted.is_empty() {
             // Every matched row was already deleted: nothing changes here.
             continue;
         }
+        newly_deleted.sort_unstable();
+        total_deleted += newly_deleted.len() as u64;
+
+        if capable {
+            deletions
+                .record(
+                    &table,
+                    &table_writer,
+                    schema_name,
+                    table_name,
+                    &DeletionTarget::of_file(tf, &existing),
+                    newly_deleted,
+                    inline_limit,
+                    base_snapshot,
+                )
+                .await?;
+            continue;
+        }
 
         // Carry forward prior Parquet positions and add only newly matched live
-        // rows. Inlined positions stay in their metadata table until a dedicated
-        // flush materializes and retires them.
-        let mut cumulative: Vec<i64> = existing.union(&newly_deleted).copied().collect();
+        // rows.
+        let mut cumulative: Vec<i64> = existing.keys().copied().chain(newly_deleted).collect();
         cumulative.sort_unstable();
 
         let delete_info = table_writer
@@ -366,16 +422,31 @@ async fn run_delete(
             expected_prev_delete_file: tf.delete_file_id,
             delete: delete_info,
         });
-        total_deleted += newly_deleted.len() as u64;
     }
+
+    if capable && (!inlined_rows.is_empty() || deletions.needs_staged_commit()) {
+        commit_row_deletes(
+            &table,
+            state,
+            &table_writer,
+            schema_name,
+            table_name,
+            base_snapshot,
+            deletions,
+            inlined_rows,
+        )
+        .await?;
+        return Ok(total_deleted);
+    }
+    entries.extend(deletions.positional);
 
     if entries.is_empty() && inlined_rows.is_empty() {
         // Predicate matched nothing new anywhere: no commit, no snapshot.
         return Ok(0);
     }
 
-    // Commit every affected file's cumulative delete file in ONE snapshot
-    // (atomic multi-file DELETE). No new data file is appended, so this uses the
+    // Commit every affected file's delete file in ONE snapshot (atomic
+    // multi-file DELETE). No new data file is appended, so this uses the
     // dedicated delete-only commit rather than `register_data_file_with_deletes`
     // (which requires an appended file).
     if let Err(error) = writer.commit_deletes(
@@ -386,16 +457,383 @@ async fn run_delete(
         &entries,
         &inlined_rows,
     ) {
-        let files = entries
-            .iter()
-            .map(|entry| (entry.delete.path.as_str(), entry.delete.path_is_relative));
         let error = table_writer
-            .release_refused_files(schema_name, table_name, error, files)
+            .release_written_delete_files(schema_name, table_name, error, &entries)
             .await;
         return Err(DataFusionError::External(Box::new(error)));
     }
 
     Ok(total_deleted)
+}
+
+/// A live data file a statement deletes rows from.
+pub(crate) struct DeletionTarget<'a> {
+    /// The data file's catalog id.
+    pub(crate) data_file_id: i64,
+    /// The data file's catalog path, recorded in its delete files.
+    pub(crate) data_file_path: &'a str,
+    /// The data file's `record_count`.
+    pub(crate) record_count: Option<i64>,
+    /// The file's live delete file: its id and every position it deletes with
+    /// the snapshot it records, or `None` where it records none.
+    pub(crate) delete_file: Option<(i64, &'a HashMap<i64, Option<i64>>)>,
+}
+
+impl<'a> DeletionTarget<'a> {
+    /// The target for `file`, whose live delete file deletes `existing`.
+    fn of_file(
+        file: &'a crate::metadata_provider::DuckLakeTableFile,
+        existing: &'a HashMap<i64, Option<i64>>,
+    ) -> Self {
+        Self {
+            data_file_id: file.data_file_id,
+            data_file_path: &file.file.path,
+            record_count: file.max_row_count,
+            delete_file: file.delete_file_id.map(|id| (id, existing)),
+        }
+    }
+}
+
+/// How one statement records its deletions of Parquet rows, per data file.
+#[derive(Default)]
+pub(crate) struct FileDeletions {
+    /// New delete files for files that had none.
+    pub(crate) positional: Vec<DeleteFileEntry>,
+    /// Delete files that replace a file's live one.
+    pub(crate) rewritten: Vec<crate::table_writer::RewrittenDelete>,
+    /// Deletions recorded in `ducklake_inlined_delete_<table_id>`.
+    pub(crate) inlined: Vec<InlinedFileDelete>,
+    /// Files whose rows are all deleted.
+    pub(crate) dropped: Vec<DroppedDataFile>,
+    /// The snapshot rewritten delete files date the statement's deletions to,
+    /// once the first is written.
+    commit_snapshot: Option<i64>,
+}
+
+impl FileDeletions {
+    /// Whether the deletions need the staged commit: anything beyond new delete
+    /// files for files that had none.
+    pub(crate) fn needs_staged_commit(&self) -> bool {
+        !self.rewritten.is_empty() || !self.inlined.is_empty() || !self.dropped.is_empty()
+    }
+
+    /// Record the deletion of `positions` (sorted, distinct, none of them
+    /// deleted already) from `target`, as official DuckLake's
+    /// `DuckLakeDelete::FlushDelete` does (`ducklake_delete.cpp`):
+    ///
+    /// - at most the scoped `inline_limit` (when positive) go to
+    ///   `ducklake_inlined_delete_<table_id>`;
+    /// - otherwise, when the file has a live delete file, a new one carries its
+    ///   positions with their snapshots and the new ones at the snapshot the
+    ///   commit is expected to take, replacing it; when that would delete
+    ///   every row of the file, the file is dropped instead;
+    /// - otherwise a new delete file holds the positions, or the file is
+    ///   dropped when they are all of its rows.
+    ///
+    /// Deletions a file has in `ducklake_inlined_delete_<table_id>` are not
+    /// counted towards dropping it, as official does not count them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record(
+        &mut self,
+        table: &DuckLakeTable,
+        table_writer: &DuckLakeTableWriter,
+        schema_name: &str,
+        table_name: &str,
+        target: &DeletionTarget<'_>,
+        positions: Vec<i64>,
+        inline_limit: usize,
+        base_snapshot: i64,
+    ) -> DataFusionResult<()> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        if inline_limit > 0 && positions.len() <= inline_limit {
+            self.inlined.push(InlinedFileDelete {
+                data_file_id: target.data_file_id,
+                positions,
+                expected_delete_file: target.delete_file.map(|(id, _)| id),
+            });
+            return Ok(());
+        }
+        let deletes_every_row = |count: usize| {
+            target
+                .record_count
+                .is_some_and(|rows| usize::try_from(rows).is_ok_and(|rows| rows == count))
+        };
+        let Some((delete_file_id, existing)) = target.delete_file else {
+            if deletes_every_row(positions.len()) {
+                self.dropped.push(DroppedDataFile {
+                    data_file_id: target.data_file_id,
+                    expected_delete_file: None,
+                });
+                return Ok(());
+            }
+            let delete = table_writer
+                .write_delete_file(schema_name, table_name, target.data_file_path, &positions)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            self.positional.push(DeleteFileEntry {
+                data_file_id: target.data_file_id,
+                expected_prev_delete_file: None,
+                delete,
+            });
+            return Ok(());
+        };
+        if deletes_every_row(existing.len() + positions.len()) {
+            self.dropped.push(DroppedDataFile {
+                data_file_id: target.data_file_id,
+                expected_delete_file: Some(delete_file_id),
+            });
+            return Ok(());
+        }
+        // A delete file that records no snapshot for a position deleted it at
+        // the file's own `begin_snapshot`.
+        let fallback = if existing.values().any(Option::is_none) {
+            Some(table.delete_file_begin_snapshot(delete_file_id)?)
+        } else {
+            None
+        };
+        // The statement's deletions are dated to the id the catalog's next
+        // snapshot is expected to take (on a multicatalog store, other
+        // catalogs' snapshots draw from the same sequence), and at least the
+        // snapshot after the one it read; the commit re-dates them should
+        // another snapshot take that id first.
+        let commit_snapshot = match self.commit_snapshot {
+            Some(snapshot) => snapshot,
+            None => {
+                let next = table_writer
+                    .next_snapshot_id()
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                    .map_or(base_snapshot + 1, |next| next.max(base_snapshot + 1));
+                self.commit_snapshot = Some(next);
+                next
+            },
+        };
+        let source = crate::table_writer::RewrittenDeleteSource {
+            data_file_path: target.data_file_path.to_string(),
+            existing: existing
+                .iter()
+                .map(|(position, snapshot)| {
+                    (*position, snapshot.or(fallback).unwrap_or(commit_snapshot))
+                })
+                .collect(),
+            positions,
+        };
+        let (delete, begin_snapshot, partial_max) = table_writer
+            .write_rewritten_delete_file(schema_name, table_name, &source, commit_snapshot)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.rewritten.push(crate::table_writer::RewrittenDelete {
+            entry: InlinedFlushFileDelete {
+                data_file_id: target.data_file_id,
+                data_file_end: None,
+                expected_prev_delete_file: Some(delete_file_id),
+                delete: InlinedFlushDeleteFile {
+                    delete,
+                    begin_snapshot,
+                    partial_max: Some(partial_max),
+                    end_snapshot: None,
+                },
+            },
+            source,
+        });
+        Ok(())
+    }
+}
+
+/// Reads the live delete file of one of `table`'s data files at the
+/// catalog's latest snapshot, for a commit whose inlined deletions met a
+/// delete file their statement did not read.
+pub(crate) struct LatestDeleteFiles<'a> {
+    pub(crate) table: &'a DuckLakeTable,
+    pub(crate) state: &'a dyn Session,
+}
+
+impl crate::table_writer::DeleteFilePositions for LatestDeleteFiles<'_> {
+    fn live_delete_file<'a>(
+        &'a self,
+        table_id: i64,
+        data_file_id: i64,
+    ) -> futures::future::BoxFuture<'a, crate::Result<Option<crate::table_writer::LiveDeleteFile>>>
+    {
+        Box::pin(async move {
+            let provider = self.table.provider();
+            let snapshot = provider.get_current_snapshot()?;
+            let file = provider
+                .get_table_files_for_select(table_id, snapshot)?
+                .into_iter()
+                .find(|file| file.data_file_id == data_file_id);
+            let Some(file) = file else {
+                return Ok(None);
+            };
+            let (Some(delete_file_id), Some(delete_file)) = (file.delete_file_id, file.delete_file)
+            else {
+                return Ok(None);
+            };
+            let positions = self
+                .table
+                .read_delete_file_entries(self.state, &delete_file)
+                .await?
+                .into_keys()
+                .collect();
+            Ok(Some((delete_file_id, positions)))
+        })
+    }
+}
+
+/// Commit a `DELETE` that ends inlined rows, records inlined file deletions,
+/// rewrites delete files or drops data files, as one staged write in one
+/// snapshot.
+#[allow(clippy::too_many_arguments)]
+async fn commit_row_deletes(
+    table: &DuckLakeTable,
+    state: &dyn Session,
+    table_writer: &DuckLakeTableWriter,
+    schema_name: &str,
+    table_name: &str,
+    base_snapshot: i64,
+    deletions: FileDeletions,
+    inlined_rows: Vec<InlinedRowRef>,
+) -> DataFusionResult<()> {
+    let latest = LatestDeleteFiles {
+        table,
+        state,
+    };
+    let mut transaction = table_writer.transaction();
+    transaction.set_delete_file_positions(&latest);
+    transaction
+        .stage_row_mutation(
+            schema_name,
+            table_name,
+            table.table_id(),
+            table.column_ids(),
+            table.physical_schema().as_ref(),
+            base_snapshot,
+            StagedTableData::None,
+            None,
+            deletions.positional,
+            deletions.rewritten,
+            inlined_rows,
+            deletions.inlined,
+            deletions.dropped,
+        )
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(())
+}
+
+/// `DELETE` without `WHERE` on a writer that stages row mutations, as official
+/// DuckLake deletes every row: each data file's live rows are recorded through
+/// [`FileDeletions::record`] — inlined when they number at most
+/// `inline_limit`, else the file is dropped when no deletion of it is inlined,
+/// or gets a delete file when one is — and every live inlined row is ended, all
+/// in one snapshot.
+#[allow(clippy::too_many_arguments)]
+async fn delete_all(
+    table: &DuckLakeTable,
+    state: &dyn Session,
+    table_writer: &DuckLakeTableWriter,
+    inline_limit: usize,
+    table_files: &[crate::metadata_provider::DuckLakeTableFile],
+    inlined_data: &[crate::metadata_provider::DuckLakeInlinedData],
+    inlined_deletes: &HashMap<i64, HashSet<i64>>,
+    schema_name: &str,
+    table_name: &str,
+    base_snapshot: i64,
+) -> DataFusionResult<u64> {
+    let inlined_rows: Vec<InlinedRowRef> = inlined_data
+        .iter()
+        .flat_map(|inlined| {
+            inlined.row_ids.iter().map(|row_id| InlinedRowRef {
+                table_name: inlined.table_name.clone(),
+                row_id: *row_id,
+            })
+        })
+        .collect();
+    let mut total = inlined_rows.len() as u64;
+    let mut deletions = FileDeletions::default();
+    for tf in table_files {
+        // A file whose catalog row records no count is counted from its
+        // footer and its delete file, so every row of it is deleted too.
+        let rows = match tf.max_row_count {
+            Some(rows) => rows,
+            None => table.data_file_row_count(state, &tf.file).await?,
+        };
+        let deleted = match (tf.delete_count, &tf.delete_file) {
+            (Some(count), _) => count,
+            (None, Some(delete_file)) => table
+                .read_delete_file_entries(state, delete_file)
+                .await?
+                .len() as i64,
+            (None, None) => 0,
+        };
+        let inlined = inlined_deletes.get(&tf.data_file_id);
+        let live = rows
+            .checked_sub(deleted)
+            .and_then(|live| live.checked_sub(inlined.map_or(0, |set| set.len() as i64)))
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "data file {} row counts overflow",
+                    tf.data_file_id
+                ))
+            })?;
+        if live <= 0 {
+            continue;
+        }
+        total += live as u64;
+        if inlined.is_none() && (inline_limit == 0 || live > inline_limit as i64) {
+            // Every remaining row is deleted, so the file is dropped; its
+            // positions need not be read.
+            deletions.dropped.push(DroppedDataFile {
+                data_file_id: tf.data_file_id,
+                expected_delete_file: tf.delete_file_id,
+            });
+            continue;
+        }
+        let existing = match tf.delete_file {
+            Some(ref df) => table.read_delete_file_entries(state, df).await?,
+            None => HashMap::new(),
+        };
+        let positions: Vec<i64> = (0..rows)
+            .filter(|pos| {
+                !existing.contains_key(pos) && !inlined.is_some_and(|set| set.contains(pos))
+            })
+            .collect();
+        deletions
+            .record(
+                table,
+                table_writer,
+                schema_name,
+                table_name,
+                &DeletionTarget::of_file(tf, &existing),
+                positions,
+                inline_limit,
+                base_snapshot,
+            )
+            .await?;
+    }
+    if inlined_rows.is_empty()
+        && deletions.positional.is_empty()
+        && !deletions.needs_staged_commit()
+    {
+        return Ok(0);
+    }
+    commit_row_deletes(
+        table,
+        state,
+        table_writer,
+        schema_name,
+        table_name,
+        base_snapshot,
+        deletions,
+        inlined_rows,
+    )
+    .await?;
+    Ok(total)
 }
 
 #[cfg(test)]

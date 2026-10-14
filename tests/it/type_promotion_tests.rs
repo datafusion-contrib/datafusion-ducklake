@@ -423,17 +423,18 @@ async fn append_session_racing_a_promote_never_corrupts() {
         }
     }
     got.sort();
-    // On SQLite the write lock serializes the two, so the Append commits (its
-    // int32 file casts up under the now-int64 column — benign), and all rows are
-    // present and correct. No NULL-fill, no lost rows, no reverted type.
+    // The Append's base predates the promote, so it refuses, as official's
+    // conflict check refuses an insert into a table altered since. No NULL-fill,
+    // no lost rows, no reverted type.
     assert!(
-        finish_result.is_ok(),
-        "the racing Append should commit cleanly: {finish_result:?}"
+        matches!(&finish_result, Err(DuckLakeError::Conflict(message))
+            if message.contains("another transaction has altered it")),
+        "the racing Append should refuse: {finish_result:?}"
     );
     assert_eq!(
         got,
-        vec![1, 2, 3, 4, 5],
-        "racing Append commits with all values intact under the widened type"
+        vec![1, 2, 3],
+        "the refused Append added nothing; the rows read under the widened type"
     );
 }
 

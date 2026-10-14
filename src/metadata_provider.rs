@@ -87,7 +87,7 @@ pub const SQL_GET_TABLE_COLUMNS: &str =
        AND (? < end_snapshot OR end_snapshot IS NULL)
      ORDER BY column_order";
 
-#[cfg(any(feature = "metadata-duckdb", feature = "metadata-sqlite"))]
+#[cfg(any(feature = "metadata-duckdb", feature = "metadata-sqlite", feature = "metadata-mysql"))]
 pub(crate) const SQL_FILE_SCHEMA_VERSION: &str = "(SELECT sv.schema_version
                   FROM ducklake_schema_versions sv
                   WHERE sv.table_id = data.table_id
@@ -292,8 +292,6 @@ current_delete AS (
     CROSS JOIN params p
     WHERE df.table_id = p.table_identifier
       AND df.begin_snapshot <= p.finish_snapshot
-      AND (df.begin_snapshot >= p.start_snapshot
-           OR (df.partial_max IS NOT NULL AND df.partial_max >= p.start_snapshot))
 ),
 
 all_deletes AS (
@@ -768,9 +766,234 @@ pub struct DuckLakeInlinedDelete {
     pub row_id: i64,
 }
 
+/// Every row one physical inlined-data table holds at a flush snapshot, as
+/// `ducklake_flush_inlined_data` moves it to Parquet.
+///
+/// Official DuckLake's flush scan (`ReadAllInlinedDataForFlush`) reads every
+/// row whose `begin_snapshot` is at or before the flush snapshot, deleted ones
+/// included, so the written file keeps each row's history: deleted rows become
+/// positions of a delete file stamped with the snapshot that deleted them.
+#[derive(Debug, Clone)]
+pub struct DuckLakeInlinedFlushData {
+    /// The rows, ordered by `(row_id, begin_snapshot)` and decoded at
+    /// [`Self::columns`]. `snapshots` holds each row's `begin_snapshot` and
+    /// `end_snapshots` the snapshot that deleted it, `None` while it is live.
+    pub rows: DuckLakeInlinedRows,
+    /// The table's columns at the snapshot that inserted the table's first
+    /// row. Every row of one inlined table was written at that table's schema
+    /// version, so these are the columns its Parquet file is written with, the
+    /// way official DuckLake binds the table entry of the inlined table's schema
+    /// version (`GetBeginSnapshotForSchemaVersion`).
+    pub columns: Vec<DuckLakeTableColumn>,
+    /// The snapshot `columns` were read at.
+    pub columns_snapshot: i64,
+}
+
+/// One row of `ducklake_inlined_delete_<table_id>` joined to its data file and
+/// that file's live delete file, as `ducklake_flush_inlined_data` reads it
+/// (`FlushInlinedFileDeletions`).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DuckLakeInlinedFileDeleteForFlush {
+    /// The Parquet data file the deleted row belongs to.
+    pub data_file_id: i64,
+    /// Physical row position within that data file.
+    pub row_id: i64,
+    /// Snapshot that recorded the deletion.
+    pub begin_snapshot: i64,
+    /// The data file (path relative to its table when `path_is_relative`).
+    pub data_file: DuckLakeFileData,
+    /// The delete file the deletions merge with, if any: its id, file and
+    /// `begin_snapshot`. For a live data file, its live delete file; for a
+    /// retired one, its latest delete file, ended or not.
+    pub existing_delete: Option<(i64, DuckLakeFileData, i64)>,
+    /// The data file's `end_snapshot`, set when the file is retired.
+    pub data_file_end: Option<i64>,
+    /// `existing_delete`'s `end_snapshot`.
+    pub existing_delete_end: Option<i64>,
+    /// The latest `end_snapshot` among the data file's other delete files.
+    pub earlier_delete_end: Option<i64>,
+}
+
+/// The query behind [`MetadataProvider::get_inlined_file_deletes_for_flush`],
+/// over the quoted inlined-delete table `table`. `param(n)` renders the `n`th
+/// (1-based) placeholder; all [`INLINED_FILE_DELETES_FOR_FLUSH_PARAMS`] bind the
+/// flush snapshot.
+///
+/// Columns: `file_id, row_id, begin_snapshot`, the data file's
+/// `path, path_is_relative, file_size_bytes, encryption_key`, its delete file's
+/// `delete_file_id, path, path_is_relative, file_size_bytes, footer_size,
+/// encryption_key, begin_snapshot`, the data file's `end_snapshot`, the delete
+/// file's `end_snapshot`, and the latest `end_snapshot` of the data file's other
+/// delete files.
+///
+/// As in official, deletions of a data file retired since are read too. A live
+/// data file joins its live delete file, as official does; a retired one joins
+/// its latest delete file, ended or not, which official's join misses.
+pub(crate) fn inlined_file_deletes_for_flush_sql(
+    table: &str,
+    param: impl Fn(usize) -> String,
+) -> String {
+    format!(
+        "SELECT del.file_id, del.row_id, del.begin_snapshot,
+                data.path, data.path_is_relative, data.file_size_bytes, data.encryption_key,
+                ex.delete_file_id, ex.path, ex.path_is_relative, ex.file_size_bytes,
+                ex.footer_size, ex.encryption_key, ex.begin_snapshot,
+                data.end_snapshot, ex.end_snapshot,
+                (SELECT MAX(other.end_snapshot) FROM ducklake_delete_file other
+                 WHERE other.data_file_id = del.file_id
+                   AND other.begin_snapshot < ex.begin_snapshot)
+         FROM {table} del
+         JOIN ducklake_data_file data ON data.data_file_id = del.file_id
+          AND data.begin_snapshot <= {p1}
+         LEFT JOIN (
+           SELECT data_file_id, MAX(begin_snapshot) AS begin_snapshot
+           FROM ducklake_delete_file WHERE begin_snapshot <= {p2}
+           GROUP BY data_file_id
+         ) latest ON latest.data_file_id = del.file_id
+         LEFT JOIN ducklake_delete_file ex ON ex.data_file_id = del.file_id
+          AND ex.begin_snapshot <= {p3}
+          AND (
+            ((data.end_snapshot IS NULL OR data.end_snapshot > {p4})
+              AND (ex.end_snapshot IS NULL OR ex.end_snapshot > {p5}))
+            OR (data.end_snapshot IS NOT NULL AND data.end_snapshot <= {p6}
+              AND ex.begin_snapshot = latest.begin_snapshot))
+         WHERE del.begin_snapshot <= {p7}",
+        p1 = param(1),
+        p2 = param(2),
+        p3 = param(3),
+        p4 = param(4),
+        p5 = param(5),
+        p6 = param(6),
+        p7 = param(7),
+    )
+}
+
+/// The placeholders of [`inlined_file_deletes_for_flush_sql`].
+pub(crate) const INLINED_FILE_DELETES_FOR_FLUSH_PARAMS: usize = 7;
+
 pub(crate) fn is_inlined_data_table(name: &str) -> bool {
     name.starts_with("ducklake_inlined_data_")
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Names of the system columns of one `ducklake_inlined_data_<table>_<version>`
+/// table, which come before the table's data columns.
+///
+/// DuckLake 1.0 names them `row_id`, `begin_snapshot`, `end_snapshot`. DuckLake
+/// 1.1 prefixes them with `_ducklake_` so data columns may use the bare names.
+///
+/// A new table takes the layout of the catalog version, as in DuckDB. An existing
+/// table is read with its own layout, because a `1.1-dev1` catalog can hold both:
+/// DuckDB renames the columns of older tables when it migrates a catalog with
+/// `AUTOMATIC_MIGRATION`, and on a plain read-write attach only best-effort (a
+/// read-only attach renames nothing), and a catalog can carry tables that a
+/// pre-rename `1.1-dev1` writer created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlinedSystemColumns {
+    pub(crate) row_id: &'static str,
+    pub(crate) begin_snapshot: &'static str,
+    pub(crate) end_snapshot: &'static str,
+}
+
+impl InlinedSystemColumns {
+    /// The DuckLake 1.0 layout.
+    pub(crate) const UNPREFIXED: Self = Self {
+        row_id: "row_id",
+        begin_snapshot: "begin_snapshot",
+        end_snapshot: "end_snapshot",
+    };
+
+    /// The DuckLake 1.1 layout.
+    pub(crate) const PREFIXED: Self = Self {
+        row_id: "_ducklake_row_id",
+        begin_snapshot: "_ducklake_begin_snapshot",
+        end_snapshot: "_ducklake_end_snapshot",
+    };
+
+    /// The layout of a new table in a catalog whose `ducklake_metadata` `version` is
+    /// `version`: prefixed from DuckLake 1.1 on. A catalog without a version
+    /// entry, as this crate initializes one, is not a 1.1 catalog.
+    pub(crate) fn for_catalog_version(version: Option<&str>) -> Self {
+        let release = version
+            .map(|version| version.split('-').next().unwrap_or(version))
+            .and_then(|release| {
+                let mut parts = release.split('.').map(str::parse::<u32>);
+                Some((parts.next()?.ok()?, parts.next()?.ok()?))
+            });
+        match release {
+            Some(release) if release >= (1, 1) => Self::PREFIXED,
+            _ => Self::UNPREFIXED,
+        }
+    }
+
+    /// Whether a data column named `name` collides with this layout's system
+    /// columns or with the internal names DuckDB uses while inlining, in which
+    /// case the table's rows are not inlined.
+    pub(crate) fn conflicts_with(&self, name: &str) -> bool {
+        [
+            self.row_id,
+            self.begin_snapshot,
+            self.end_snapshot,
+            "_ducklake_internal_row_id",
+            "_ducklake_internal_snapshot_id",
+        ]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    }
+
+    /// Read the layout from an inlined data table's columns, in table order.
+    ///
+    /// DuckLake always creates the system columns first, so only the first three
+    /// columns are compared; a data column may carry the other layout's names.
+    pub(crate) fn from_columns<S: AsRef<str>>(table_name: &str, columns: &[S]) -> Result<Self> {
+        let leading = columns
+            .iter()
+            .take(3)
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        [Self::PREFIXED, Self::UNPREFIXED]
+            .into_iter()
+            .find(|layout| {
+                leading.len() == 3
+                    && leading[0].eq_ignore_ascii_case(layout.row_id)
+                    && leading[1].eq_ignore_ascii_case(layout.begin_snapshot)
+                    && leading[2].eq_ignore_ascii_case(layout.end_snapshot)
+            })
+            .ok_or_else(|| {
+                DuckLakeError::Unsupported(format!(
+                    "inlined data table '{table_name}' does not start with the DuckLake system \
+                     columns (found {leading:?})"
+                ))
+            })
+    }
+}
+
+/// The physical columns of one inlined data table.
+#[derive(Debug)]
+pub(crate) struct InlinedTableLayout {
+    pub(crate) system: InlinedSystemColumns,
+    /// Data column names, which excludes the system columns.
+    pub(crate) present: HashSet<String>,
+    /// Declared type of each data column, keyed by name.
+    pub(crate) physical_types: HashMap<String, String>,
+}
+
+impl InlinedTableLayout {
+    /// Build the layout from `(name, declared type)` pairs in table order.
+    pub(crate) fn from_columns(table_name: &str, columns: Vec<(String, String)>) -> Result<Self> {
+        let names = columns
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let system = InlinedSystemColumns::from_columns(table_name, &names)?;
+        let physical_types = columns.into_iter().skip(3).collect::<HashMap<_, _>>();
+        Ok(Self {
+            system,
+            present: physical_types.keys().cloned().collect(),
+            physical_types,
+        })
+    }
 }
 
 pub(crate) const INLINED_DATA_REMEDIATION: &str =
@@ -799,11 +1022,14 @@ pub(crate) enum InlinedDataBackend {
     MySql,
 }
 
+/// The SQL that reads the inlined column `ident` as text: `physical_type` is
+/// its declared type in the inlined data table, when known.
 pub(crate) fn inlined_text_projection(
     backend: InlinedDataBackend,
     column: &DuckLakeTableColumn,
     data_type: &arrow::datatypes::DataType,
     ident: &str,
+    physical_type: Option<&str>,
 ) -> String {
     use arrow::datatypes::DataType;
 
@@ -818,10 +1044,18 @@ pub(crate) fn inlined_text_projection(
             | DataType::LargeBinary
             | DataType::BinaryView
             | DataType::FixedSizeBinary(_) => format!("encode({ident}, 'hex')"),
+            // Strings are stored as `BYTEA` (PostgreSQL text holds no NUL);
+            // a `TIMETZ` is a native `TIME WITH TIME ZONE`, or `BYTEA` in a
+            // table an earlier release created.
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-                if matches!(
-                    column.column_type.trim().to_ascii_lowercase().as_str(),
-                    "varchar" | "text" | "string" | "json"
+                if physical_type.map_or_else(
+                    || {
+                        matches!(
+                            column.column_type.trim().to_ascii_lowercase().as_str(),
+                            "varchar" | "text" | "string" | "json"
+                        )
+                    },
+                    |physical| physical.trim().eq_ignore_ascii_case("bytea"),
                 ) =>
             {
                 format!("convert_from({ident}, 'UTF8')")
@@ -829,6 +1063,11 @@ pub(crate) fn inlined_text_projection(
             _ => format!("CAST({ident} AS TEXT)"),
         },
         InlinedDataBackend::MySql => match data_type {
+            // MySQL's text of a `FLOAT` keeps six significant digits; through
+            // `DOUBLE` it keeps every digit of the stored value.
+            DataType::Float32 => {
+                format!("CAST(CAST({ident} AS DOUBLE) AS CHAR CHARACTER SET utf8mb4)")
+            },
             DataType::FixedSizeBinary(_)
                 if column.column_type.trim().eq_ignore_ascii_case("uuid") =>
             {
@@ -867,37 +1106,6 @@ pub(crate) fn snapshot_change_tokens(changes: &str) -> impl Iterator<Item = &str
         }
         character == ',' && !quoted
     })
-}
-
-pub(crate) fn reject_inlined_changes(
-    provider: &dyn MetadataProvider,
-    table_id: i64,
-    start_snapshot: i64,
-    end_snapshot: i64,
-    kinds: &[&str],
-) -> Result<()> {
-    let changes = match provider.list_snapshot_changes() {
-        Ok(changes) => changes,
-        Err(DuckLakeError::Unsupported(_)) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let tokens = kinds
-        .iter()
-        .map(|kind| format!("{kind}:{table_id}"))
-        .collect::<Vec<_>>();
-    if changes.iter().any(|change| {
-        change.snapshot_id >= start_snapshot
-            && change.snapshot_id <= end_snapshot
-            && change.changes_made.as_deref().is_some_and(|changes| {
-                snapshot_change_tokens(changes)
-                    .any(|token| tokens.iter().any(|expected| token == expected))
-            })
-    }) {
-        return Err(DuckLakeError::Unsupported(
-            "change feeds over inlined rows are not supported; use Parquet writes for change-feed tables".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1035,6 +1243,417 @@ pub struct DuckLakeInlinedData {
     pub begin_snapshots: Vec<i64>,
     /// Physical table columns in catalog order.
     pub batch: arrow::record_batch::RecordBatch,
+}
+
+/// Which row versions [`MetadataProvider::read_inlined_rows`] selects from a
+/// table's `ducklake_inlined_data_<table_id>_<schema_version>` tables.
+///
+/// Every inlined row version carries `begin_snapshot` (the snapshot that wrote
+/// it) and `end_snapshot` (the snapshot that deleted or superseded it, NULL while
+/// live), so one predicate per variant selects a scan, the insert side of a change
+/// feed, its delete side, or what a flush moves. A DuckLake 1.1 table names these
+/// columns `_ducklake_begin_snapshot` / `_ducklake_end_snapshot`; the predicate
+/// uses each table's own names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InlinedRowSelection {
+    /// Row versions visible at the snapshot: `begin_snapshot <= s` and
+    /// (`end_snapshot` NULL or `s < end_snapshot`). Each row reports its
+    /// `begin_snapshot`.
+    VisibleAt(i64),
+    /// Row versions written in the inclusive window: `start <= begin_snapshot <=
+    /// end`, whether or not they were deleted later. Each row reports its
+    /// `begin_snapshot`.
+    InsertedBetween {
+        start: i64,
+        end: i64,
+    },
+    /// Row versions deleted or superseded in the inclusive window: `start <=
+    /// end_snapshot <= end`. Each row reports its `end_snapshot`.
+    DeletedBetween {
+        start: i64,
+        end: i64,
+    },
+    /// Every row version written at or before the snapshot, deleted ones
+    /// included: `begin_snapshot <= s`, the rows official DuckLake's flush scan
+    /// (`ReadAllInlinedDataForFlush`) moves to Parquet. Each row reports its
+    /// `begin_snapshot`.
+    WrittenUpTo(i64),
+}
+
+impl InlinedRowSelection {
+    /// The physical column each selected row reports as its snapshot.
+    pub(crate) fn snapshot_column(&self, system: &InlinedSystemColumns) -> &'static str {
+        match self {
+            Self::DeletedBetween {
+                ..
+            } => system.end_snapshot,
+            Self::VisibleAt(_)
+            | Self::InsertedBetween {
+                ..
+            }
+            | Self::WrittenUpTo(_) => system.begin_snapshot,
+        }
+    }
+
+    /// The selection as a predicate over two placeholders, bound to
+    /// [`Self::bounds`] in order.
+    pub(crate) fn predicate(
+        &self,
+        system: &InlinedSystemColumns,
+        first: &str,
+        second: &str,
+    ) -> String {
+        let begin = system.begin_snapshot;
+        let end = system.end_snapshot;
+        match self {
+            Self::VisibleAt(_) => {
+                format!("{first} >= {begin} AND ({second} < {end} OR {end} IS NULL)")
+            },
+            Self::InsertedBetween {
+                ..
+            } => format!("{begin} >= {first} AND {begin} <= {second}"),
+            Self::DeletedBetween {
+                ..
+            } => format!("{end} >= {first} AND {end} <= {second}"),
+            // The second placeholder repeats the bound so every variant binds two.
+            Self::WrittenUpTo(_) => format!("{begin} <= {first} AND {begin} <= {second}"),
+        }
+    }
+
+    /// The two values the placeholders of [`Self::predicate`] bind to.
+    pub(crate) fn bounds(&self) -> (i64, i64) {
+        match *self {
+            Self::VisibleAt(snapshot) | Self::WrittenUpTo(snapshot) => (snapshot, snapshot),
+            Self::InsertedBetween {
+                start,
+                end,
+            }
+            | Self::DeletedBetween {
+                start,
+                end,
+            } => (start, end),
+        }
+    }
+
+    /// The system columns every backend selects before the data columns, in
+    /// order: row id, the reported snapshot, and `end_snapshot`.
+    pub(crate) fn system_select(&self, system: &InlinedSystemColumns) -> [&'static str; 3] {
+        [system.row_id, self.snapshot_column(system), system.end_snapshot]
+    }
+}
+
+/// Number of columns [`InlinedRowSelection::system_select`] puts before the
+/// data columns of an inlined-row query.
+pub(crate) const INLINED_SYSTEM_SELECT_WIDTH: usize = 3;
+
+/// What a backend's inlined-row read serves, which fixes its Arrow schema and
+/// row order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InlinedReadShape {
+    /// A table scan: read-compatible types, rows in row-id order.
+    Scan,
+    /// Mutation planning: the catalog's exact types, rows in write order.
+    Mutation,
+    /// A `rowid` scan or change feed: read-compatible types, rows by snapshot.
+    Changes,
+    /// A flush: the catalog's exact types, rows by `(row_id, begin_snapshot)`
+    /// as official's flush scan orders them.
+    Flush,
+}
+
+impl InlinedReadShape {
+    pub(crate) fn schema(
+        &self,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<arrow::datatypes::Schema> {
+        match self {
+            Self::Scan | Self::Changes => crate::types::build_arrow_schema(columns),
+            Self::Mutation | Self::Flush => crate::types::build_strict_arrow_schema(columns),
+        }
+    }
+
+    pub(crate) fn order_by(
+        &self,
+        system: &InlinedSystemColumns,
+        selection: InlinedRowSelection,
+    ) -> String {
+        let row_id = system.row_id;
+        let begin = system.begin_snapshot;
+        match self {
+            Self::Scan => row_id.to_string(),
+            Self::Mutation => format!("{begin}, {row_id}"),
+            Self::Changes => format!("{}, {row_id}", selection.snapshot_column(system)),
+            Self::Flush => format!("{row_id}, {begin}"),
+        }
+    }
+}
+
+impl From<DuckLakeInlinedRows> for DuckLakeInlinedData {
+    fn from(rows: DuckLakeInlinedRows) -> Self {
+        Self {
+            table_name: rows.table_name,
+            row_ids: rows.row_ids,
+            begin_snapshots: rows.snapshots,
+            batch: rows.batch,
+        }
+    }
+}
+
+/// Row versions read from one physical inlined-data table by
+/// [`MetadataProvider::read_inlined_rows`].
+#[derive(Debug, Clone)]
+pub struct DuckLakeInlinedRows {
+    /// Catalog physical table that owns the rows.
+    pub table_name: String,
+    /// Stable DuckLake row ids, aligned with `batch` rows.
+    pub row_ids: Vec<i64>,
+    /// Each row's snapshot, aligned with `batch` rows: its `end_snapshot` for
+    /// [`InlinedRowSelection::DeletedBetween`], else its `begin_snapshot`.
+    pub snapshots: Vec<i64>,
+    /// Each row's `end_snapshot`, aligned with `batch` rows; `None` while the
+    /// row is live.
+    pub end_snapshots: Vec<Option<i64>>,
+    /// The rows under the requested columns, resolved by column id against the
+    /// schema version the physical table was written with.
+    pub batch: RecordBatch,
+}
+
+/// One inlined deletion of a Parquet-resident row
+/// (`ducklake_inlined_delete_<table_id>`), with the data file it applies to.
+/// Returned by [`MetadataProvider::get_inlined_file_deletes_between`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InlinedFileDeleteChange {
+    /// Catalog id of the data file holding the deleted row.
+    pub data_file_id: i64,
+    pub data_file_path: String,
+    pub data_file_path_is_relative: bool,
+    pub data_file_size_bytes: i64,
+    pub data_file_footer_size: Option<i64>,
+    /// NULL for files that embed their row ids.
+    pub data_row_id_start: Option<i64>,
+    pub data_record_count: i64,
+    pub data_mapping_id: Option<i64>,
+    /// Zero-based physical position of the deleted row in the data file.
+    pub position: i64,
+    /// The snapshot that deleted the row.
+    pub snapshot_id: i64,
+}
+
+/// SQL listing the inlined deletions of Parquet-resident rows made in a
+/// change-feed window, each with its data file. Three placeholders, bound in
+/// order to `table_id, start, end`.
+pub(crate) fn inlined_file_deletes_between_sql(
+    inlined_delete_table: &str,
+    placeholders: [&str; 3],
+) -> String {
+    let [table_id, start, end] = placeholders;
+    format!(
+        "SELECT d.data_file_id, d.path, d.path_is_relative, d.file_size_bytes, d.footer_size, \
+                d.row_id_start, d.record_count, d.mapping_id, i.row_id, i.begin_snapshot \
+         FROM {inlined_delete_table} i \
+         JOIN ducklake_data_file d ON d.data_file_id = i.file_id \
+         WHERE d.table_id = {table_id} \
+           AND i.begin_snapshot >= {start} \
+           AND i.begin_snapshot <= {end} \
+         ORDER BY d.data_file_id, i.row_id"
+    )
+}
+
+/// SQL listing the top-level columns (`column_id`, `column_name`) of the schema
+/// version a physical inlined-data table was written with. Every row of the
+/// table was written under that version, so its oldest `begin_snapshot` names a
+/// snapshot that sees it. No rows means an empty table. One placeholder: the
+/// table id.
+pub(crate) fn inlined_version_columns_sql(
+    inlined_data_table: &str,
+    system: &InlinedSystemColumns,
+    table_id: &str,
+) -> String {
+    format!(
+        "SELECT c.column_id, c.column_name \
+         FROM ducklake_column c \
+         CROSS JOIN (SELECT MIN({begin}) AS version_snapshot FROM {inlined_data_table}) v \
+         WHERE c.table_id = {table_id} \
+           AND c.parent_column IS NULL \
+           AND v.version_snapshot >= c.begin_snapshot \
+           AND (c.end_snapshot IS NULL OR v.version_snapshot < c.end_snapshot)",
+        begin = system.begin_snapshot,
+    )
+}
+
+/// Where each requested column lives in one physical inlined-data table.
+///
+/// The table's columns carry the names of the schema version it was written
+/// with, so a column renamed since then is found under its old name, and one
+/// dropped and re-added under the same name is a different column there — it
+/// resolves by column id, never by name. A column the version did not have is
+/// absent and reads as its `initial_default`.
+#[derive(Debug, Clone)]
+pub(crate) struct InlinedColumnMapping {
+    physical: Vec<Option<String>>,
+}
+
+impl InlinedColumnMapping {
+    /// Resolve `columns` against a table whose physical columns are
+    /// `physical_names`, written under `version_columns` (`column_id`,
+    /// `column_name`). An empty `version_columns` — a table with no rows to
+    /// read — falls back to matching by name.
+    pub(crate) fn resolve(
+        columns: &[DuckLakeTableColumn],
+        version_columns: &[(i64, String)],
+        physical_names: &HashSet<String>,
+    ) -> Self {
+        let by_id: HashMap<i64, &str> = version_columns
+            .iter()
+            .map(|(id, name)| (*id, name.as_str()))
+            .collect();
+        let physical = columns
+            .iter()
+            .map(|column| {
+                let name = if version_columns.is_empty() {
+                    Some(column.column_name.as_str())
+                } else {
+                    by_id.get(&column.column_id).copied()
+                };
+                name.filter(|name| physical_names.contains(*name))
+                    .map(str::to_string)
+            })
+            .collect();
+        Self {
+            physical,
+        }
+    }
+
+    /// The physical column holding `columns[index]`, if the table has it.
+    pub(crate) fn physical(&self, index: usize) -> Option<&str> {
+        self.physical[index].as_deref()
+    }
+
+    /// The catalog names of the columns the table holds — the set the inlined
+    /// decoders treat as present when each physical column is selected under its
+    /// catalog name.
+    pub(crate) fn present(&self, columns: &[DuckLakeTableColumn]) -> HashSet<String> {
+        columns
+            .iter()
+            .zip(&self.physical)
+            .filter(|(_, physical)| physical.is_some())
+            .map(|(column, _)| column.column_name.clone())
+            .collect()
+    }
+
+    /// `filter` over the table's physical column names, and the schema to
+    /// render it against. Terms on a column the table does not hold are dropped
+    /// (an `OR` containing one is dropped whole), so the pushed filter never
+    /// excludes a row the original could keep.
+    pub(crate) fn physical_filter(
+        &self,
+        columns: &[DuckLakeTableColumn],
+        schema: &arrow::datatypes::Schema,
+        filter: &InlinedFilter,
+    ) -> Option<(InlinedFilter, arrow::datatypes::Schema)> {
+        let renames: HashMap<&str, &str> = columns
+            .iter()
+            .zip(&self.physical)
+            .filter_map(|(column, physical)| {
+                physical
+                    .as_deref()
+                    .map(|physical| (column.column_name.as_str(), physical))
+            })
+            .collect();
+        let filter =
+            filter.rename_columns(&|name| renames.get(name).map(|name| (*name).to_string()))?;
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .filter_map(|field| {
+                renames
+                    .get(field.name().as_str())
+                    .map(|physical| field.as_ref().clone().with_name(*physical))
+            })
+            .collect();
+        Some((filter, arrow::datatypes::Schema::new(fields)))
+    }
+}
+
+/// Decode the rows of [`inlined_file_deletes_between_sql`] already read into
+/// `(data_file_id, path, path_is_relative, file_size_bytes, footer_size,
+/// row_id_start, record_count, mapping_id, row_id, begin_snapshot)` tuples.
+pub(crate) type InlinedFileDeleteRow = (
+    i64,
+    String,
+    bool,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<i64>,
+    i64,
+    i64,
+);
+
+pub(crate) fn inlined_file_delete_change(row: InlinedFileDeleteRow) -> InlinedFileDeleteChange {
+    let (
+        data_file_id,
+        data_file_path,
+        data_file_path_is_relative,
+        data_file_size_bytes,
+        data_file_footer_size,
+        data_row_id_start,
+        data_record_count,
+        data_mapping_id,
+        position,
+        snapshot_id,
+    ) = row;
+    InlinedFileDeleteChange {
+        data_file_id,
+        data_file_path,
+        data_file_path_is_relative,
+        data_file_size_bytes,
+        data_file_footer_size,
+        data_row_id_start,
+        data_record_count,
+        data_mapping_id,
+        position,
+        snapshot_id,
+    }
+}
+
+/// Whether the snapshot ledger records an inlined change of `table_id` in the
+/// inclusive window. Providers that cannot list snapshot changes report none.
+fn ledger_records_inlined_change(
+    provider: &(impl MetadataProvider + ?Sized),
+    table_id: i64,
+    start_snapshot: i64,
+    end_snapshot: i64,
+    kinds: &[&str],
+) -> Result<bool> {
+    let changes = match provider.list_snapshot_changes() {
+        Ok(changes) => changes,
+        Err(DuckLakeError::Unsupported(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let tokens = kinds
+        .iter()
+        .map(|kind| format!("{kind}:{table_id}"))
+        .collect::<Vec<_>>();
+    Ok(changes.iter().any(|change| {
+        change.snapshot_id >= start_snapshot
+            && change.snapshot_id <= end_snapshot
+            && change.changes_made.as_deref().is_some_and(|changes| {
+                snapshot_change_tokens(changes)
+                    .any(|token| tokens.iter().any(|expected| token == expected))
+            })
+    }))
+}
+
+fn unsupported_inlined_changes() -> DuckLakeError {
+    DuckLakeError::Unsupported(
+        "this metadata provider does not read inlined rows for change feeds; \
+         use Parquet writes for change-feed tables"
+            .to_string(),
+    )
 }
 
 impl DuckLakeTableColumn {
@@ -1430,10 +2049,12 @@ pub struct DuckLakeTableColumnStatistics {
     pub contains_nan: Option<bool>,
     /// Sum of compressed bytes reported by every visible file for this column.
     pub column_size_bytes: Option<i64>,
-    /// Whether the table-wide bounds are exact for the requested snapshot.
+    /// Whether no delete file of the table is live at the requested snapshot.
     ///
-    /// DuckLake's rollup is complete for live data files, but positional
-    /// deletes can remove an extremal value without tightening the rollup.
+    /// This does not make the table-wide bounds exact: they only widen, so a
+    /// retired file, an inlined deletion or a truncate can leave them wider than
+    /// the live rows. [`DuckLakeTable`](crate::DuckLakeTable) reports them as
+    /// inexact.
     pub bounds_are_exact: bool,
 }
 
@@ -1832,7 +2453,9 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// DuckLake inlines small INSERTs into per-`(table, schema_version)` catalog
     /// tables `ducklake_inlined_data_<id>_<sv>(row_id, begin_snapshot,
     /// end_snapshot, <data cols>)`, registered in `ducklake_inlined_data_tables`.
-    /// A row is visible when `snapshot_id >= begin_snapshot AND (end_snapshot IS
+    /// DuckLake 1.1 names the three system columns `_ducklake_row_id`,
+    /// `_ducklake_begin_snapshot` and `_ducklake_end_snapshot`; an implementation
+    /// reads each table by the names it has. A row is visible when `snapshot_id >= begin_snapshot AND (end_snapshot IS
     /// NULL OR snapshot_id < end_snapshot)`; a deleted inlined row simply carries
     /// `end_snapshot`, so the predicate handles inlined-row deletes.
     ///
@@ -1877,21 +2500,22 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     /// [`Self::scan_inlined_data`], and the latest snapshot through which the
     /// catalog holds no inlined rows for `table_id`, if the read can tell.
     ///
-    /// `Some(through)` means `ducklake_inlined_data_tables` named no table for
-    /// `table_id`, and `through` is the lower of `snapshot_id` and the
-    /// catalog's head, read in the same statement. A writer registers an
-    /// inlined-data table in the transaction that commits its first rows, and
-    /// that commit takes a snapshot above the head. So no read at `through` or
-    /// an earlier snapshot can find inlined rows, and [`crate::DuckLakeTable`]
-    /// skips the read on its later scans at those snapshots. Official DuckLake
-    /// likewise keeps the registry with the catalog it loads once per
-    /// `schema_version`.
+    /// `Some(through)` means no inlined-data table registered for `table_id` in
+    /// `ducklake_inlined_data_tables` holds a row begun at or below `through`,
+    /// the lower of `snapshot_id` and the catalog's head, read in the same
+    /// statement as the registry. A writer inserts inlined rows, into a table
+    /// registered earlier (`CREATE TABLE` registers one before it holds a row)
+    /// or in the transaction that registers it, at its commit's snapshot, and
+    /// that snapshot lies above the head. So no read at `through` or an earlier
+    /// snapshot can find inlined rows, and [`crate::DuckLakeTable`] skips the
+    /// read on its later scans at those snapshots. Official DuckLake likewise
+    /// keeps the registry with the catalog it loads once per `schema_version`.
     ///
     /// `through` never exceeds the head: `snapshot_id` can lie above it (for
     /// example from [`crate::DuckLakeCatalog::with_snapshot`]), and a later
     /// commit can then inline rows at a snapshot that such a read sees.
     ///
-    /// `None` means the registry named at least one table, the catalog has no
+    /// `None` means a registered table holds such a row, the catalog has no
     /// registry yet, or the provider cannot tell. The default delegates to
     /// [`Self::scan_inlined_data`] and answers `None`, so a provider that does
     /// not override this one reads on every scan, as before.
@@ -1922,6 +2546,16 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(Vec::new())
     }
 
+    /// The `begin_snapshot` of delete file `delete_file_id`, or `None` when the
+    /// catalog has no such row. A `DELETE` or `UPDATE` that rewrites a delete
+    /// file recording no per-position snapshot takes it as the snapshot of each
+    /// position it carries over. The default reports the lookup as unsupported.
+    fn get_delete_file_begin_snapshot(&self, _delete_file_id: i64) -> Result<Option<i64>> {
+        Err(crate::DuckLakeError::Unsupported(
+            "this metadata provider cannot look up a delete file's begin_snapshot".to_string(),
+        ))
+    }
+
     /// Read visible inlined rows together with their physical table and stable
     /// row ids for mutation planning. Backends that only support read-only
     /// inlined scans may keep the empty default.
@@ -1931,6 +2565,160 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         _snapshot_id: i64,
         _columns: &[DuckLakeTableColumn],
     ) -> Result<Vec<DuckLakeInlinedData>> {
+        Ok(Vec::new())
+    }
+
+    /// Read every inlined-data table of `table_id` for a flush at
+    /// `snapshot_id`: all rows with `begin_snapshot <= snapshot_id`, deleted
+    /// ones included, each table decoded at the columns its rows were written
+    /// with. Tables holding no such row are omitted.
+    ///
+    /// The default reports nothing to flush for a table without inlined rows
+    /// visible at `snapshot_id` ([`Self::get_inlined_data`]), and refuses with
+    /// `Unsupported` rather than skip one that has them.
+    fn get_inlined_data_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFlushData>> {
+        let columns = self.get_table_structure(table_id, snapshot_id)?;
+        if self
+            .get_inlined_data(table_id, snapshot_id, &columns)?
+            .iter()
+            .any(|batch| batch.num_rows() > 0)
+        {
+            return Err(DuckLakeError::Unsupported(
+                "this metadata provider does not read inlined rows for a flush".to_string(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Read the rows of `ducklake_inlined_delete_<table_id>` with
+    /// `begin_snapshot <= snapshot_id`, each joined to its data file and the
+    /// delete file its deletions merge with (see
+    /// [`DuckLakeInlinedFileDeleteForFlush::existing_delete`]).
+    ///
+    /// The default reports nothing to flush for a table without inlined
+    /// deletions of Parquet rows visible at `snapshot_id`
+    /// ([`Self::get_inlined_deletes`]), and refuses with `Unsupported` rather
+    /// than skip one that has them.
+    fn get_inlined_file_deletes_for_flush(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> Result<Vec<DuckLakeInlinedFileDeleteForFlush>> {
+        if !self.get_inlined_deletes(table_id, snapshot_id)?.is_empty() {
+            return Err(DuckLakeError::Unsupported(
+                "this metadata provider does not read inlined deletions for a flush".to_string(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Read inlined row versions of `table_id` — every physical inlined-data
+    /// table, one entry per table with rows — as `columns`, with each row's
+    /// stable row id and snapshot. `selection` picks the versions visible at a
+    /// snapshot (a `rowid` scan), those written or deleted in a window (the
+    /// change feeds), or every version a flush moves.
+    ///
+    /// Columns resolve by column id against the schema version each physical
+    /// table was written with, so a renamed column reads its old values and a
+    /// column dropped and re-added under one name does not. `filter` may be
+    /// applied conservatively: an implementation must never exclude a row that
+    /// could satisfy it.
+    ///
+    /// The default serves [`InlinedRowSelection::VisibleAt`] from
+    /// [`Self::get_inlined_data_with_row_ids`], and refuses rather than reports
+    /// nothing when the provider holds inlined rows it cannot return with row
+    /// ids, or when the snapshot ledger records inlined changes in a window.
+    fn read_inlined_rows(
+        &self,
+        table_id: i64,
+        columns: &[DuckLakeTableColumn],
+        selection: InlinedRowSelection,
+        _filter: Option<&InlinedFilter>,
+    ) -> Result<Vec<DuckLakeInlinedRows>> {
+        match selection {
+            InlinedRowSelection::VisibleAt(snapshot_id) => {
+                let rows = self.get_inlined_data_with_row_ids(table_id, snapshot_id, columns)?;
+                if rows.is_empty()
+                    && self
+                        .get_inlined_data(table_id, snapshot_id, columns)?
+                        .iter()
+                        .any(|batch| batch.num_rows() > 0)
+                {
+                    return Err(DuckLakeError::Unsupported(
+                        "this metadata provider does not read inlined rows with their row ids"
+                            .to_string(),
+                    ));
+                }
+                Ok(rows
+                    .into_iter()
+                    .map(|rows| DuckLakeInlinedRows {
+                        end_snapshots: vec![None; rows.row_ids.len()],
+                        table_name: rows.table_name,
+                        row_ids: rows.row_ids,
+                        snapshots: rows.begin_snapshots,
+                        batch: rows.batch,
+                    })
+                    .collect())
+            },
+            InlinedRowSelection::WrittenUpTo(snapshot_id) => {
+                if self
+                    .get_inlined_data(table_id, snapshot_id, columns)?
+                    .iter()
+                    .any(|batch| batch.num_rows() > 0)
+                {
+                    return Err(DuckLakeError::Unsupported(
+                        "this metadata provider does not read inlined rows for a flush".to_string(),
+                    ));
+                }
+                Ok(Vec::new())
+            },
+            InlinedRowSelection::InsertedBetween {
+                start,
+                end,
+            }
+            | InlinedRowSelection::DeletedBetween {
+                start,
+                end,
+            } => {
+                if ledger_records_inlined_change(
+                    self,
+                    table_id,
+                    start,
+                    end,
+                    &["inlined_insert", "inlined_delete"],
+                )? {
+                    return Err(unsupported_inlined_changes());
+                }
+                Ok(Vec::new())
+            },
+        }
+    }
+
+    /// Inlined deletions of Parquet-resident rows of `table_id`
+    /// (`ducklake_inlined_delete_<table_id>`) made in the inclusive window, each
+    /// with the data file it applies to, ordered by data file and position.
+    ///
+    /// The default reports none unless the snapshot ledger records an inlined
+    /// deletion in the window, which it refuses.
+    fn get_inlined_file_deletes_between(
+        &self,
+        table_id: i64,
+        start_snapshot: i64,
+        end_snapshot: i64,
+    ) -> Result<Vec<InlinedFileDeleteChange>> {
+        if ledger_records_inlined_change(
+            self,
+            table_id,
+            start_snapshot,
+            end_snapshot,
+            &["inlined_delete"],
+        )? {
+            return Err(unsupported_inlined_changes());
+        }
         Ok(Vec::new())
     }
 
@@ -2063,9 +2851,13 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         end_snapshot: i64,
     ) -> Result<Vec<DataFileChange>>;
 
-    /// Get delete files added between two snapshots (inclusive on both ends, matching official DuckLake)
-    /// Returns delete files where begin_snapshot >= start_snapshot AND begin_snapshot <= end_snapshot
-    /// These represent DELETE changes - rows removed from the table
+    /// The deletions a change feed over `start_snapshot..=end_snapshot` reads,
+    /// selected as official DuckLake selects them: every delete file with
+    /// `begin_snapshot <= end_snapshot` (with the latest delete file of its data
+    /// file that begins before it), and every data file retired in the window.
+    /// A delete file recording each row's deleting snapshot can begin before
+    /// the window and still hold deletions in it; the feed windows those per
+    /// row, and a delete file without them adds nothing before it begins.
     fn get_delete_files_added_between_snapshots(
         &self,
         table_id: i64,
@@ -2295,6 +3087,67 @@ where
 }
 
 #[cfg(test)]
+mod inlined_system_columns_tests {
+    use super::InlinedSystemColumns;
+
+    #[test]
+    fn new_tables_follow_the_catalog_version() {
+        for (version, expected) in [
+            (None, InlinedSystemColumns::UNPREFIXED),
+            (Some("0.3"), InlinedSystemColumns::UNPREFIXED),
+            (Some("1.0"), InlinedSystemColumns::UNPREFIXED),
+            (Some("1.1-dev1"), InlinedSystemColumns::PREFIXED),
+            (Some("1.1"), InlinedSystemColumns::PREFIXED),
+            (Some("2.0"), InlinedSystemColumns::PREFIXED),
+            (Some("unknown"), InlinedSystemColumns::UNPREFIXED),
+        ] {
+            assert_eq!(
+                InlinedSystemColumns::for_catalog_version(version),
+                expected,
+                "{version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_layouts_own_names_are_reserved() {
+        let legacy = InlinedSystemColumns::UNPREFIXED;
+        let prefixed = InlinedSystemColumns::PREFIXED;
+        assert!(legacy.conflicts_with("ROW_ID"));
+        assert!(!prefixed.conflicts_with("row_id"));
+        assert!(!prefixed.conflicts_with("begin_snapshot"));
+        assert!(prefixed.conflicts_with("_DuckLake_End_Snapshot"));
+        assert!(!legacy.conflicts_with("_ducklake_end_snapshot"));
+        for layout in [legacy, prefixed] {
+            assert!(layout.conflicts_with("_ducklake_internal_row_id"));
+            assert!(layout.conflicts_with("_ducklake_internal_snapshot_id"));
+        }
+    }
+
+    #[test]
+    fn existing_tables_are_read_by_their_leading_columns() {
+        let prefixed = [
+            "_ducklake_row_id",
+            "_ducklake_begin_snapshot",
+            "_ducklake_end_snapshot",
+            "row_id",
+            "begin_snapshot",
+            "end_snapshot",
+        ];
+        assert_eq!(
+            InlinedSystemColumns::from_columns("t", &prefixed).unwrap(),
+            InlinedSystemColumns::PREFIXED
+        );
+        assert_eq!(
+            InlinedSystemColumns::from_columns("t", &["row_id", "begin_snapshot", "end_snapshot"])
+                .unwrap(),
+            InlinedSystemColumns::UNPREFIXED
+        );
+        assert!(InlinedSystemColumns::from_columns("t", &["id", "row_id"]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -2468,6 +3321,7 @@ mod tests {
                 &column("note", "varchar"),
                 &DataType::Utf8View,
                 "\"note\"",
+                None,
             ),
             "convert_from(\"note\", 'UTF8')"
         );
@@ -2477,6 +3331,7 @@ mod tests {
                 &column("payload", "blob"),
                 &DataType::BinaryView,
                 "\"payload\"",
+                None,
             ),
             "encode(\"payload\", 'hex')"
         );
@@ -2486,6 +3341,7 @@ mod tests {
                 &column("token", "uuid"),
                 &DataType::FixedSizeBinary(16),
                 "\"token\"",
+                None,
             ),
             "CAST(\"token\" AS TEXT)"
         );
@@ -2495,6 +3351,7 @@ mod tests {
                 &column("payload", "blob"),
                 &DataType::BinaryView,
                 "`payload`",
+                None,
             ),
             "HEX(`payload`)"
         );
@@ -2504,6 +3361,7 @@ mod tests {
                 &column("note", "varchar"),
                 &DataType::Utf8View,
                 "`note`",
+                None,
             ),
             "CAST(`note` AS CHAR CHARACTER SET utf8mb4)"
         );

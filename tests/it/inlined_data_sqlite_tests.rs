@@ -262,11 +262,15 @@ async fn seed_inlined(
     .execute(pool)
     .await
     .unwrap();
+    // The writer registers the table's first inlined data table when it
+    // creates the table, as official does.
     sqlx::query(
         "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
-         VALUES (?, ?, 1)",
+         SELECT ?, ?, 1 WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_inlined_data_tables WHERE table_name = ?)",
     )
     .bind(table_id)
+    .bind(&phys)
     .bind(&phys)
     .execute(pool)
     .await
@@ -461,8 +465,14 @@ async fn flush_inlined_data_preserves_current_and_pinned_reads() {
     );
 
     let flush_writer = DuckLakeTableWriter::new(writer.clone(), object_store()).unwrap();
+    let flush_provider: Arc<dyn MetadataProvider> = Arc::new(provider.clone());
     let flushed = flush_writer
-        .flush_inlined_data("main", "t", &inlined, inline_write.snapshot_id)
+        .flush_table_inlined_data(
+            flush_provider.clone(),
+            "main",
+            "t",
+            inline_write.snapshot_id,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -481,14 +491,13 @@ async fn flush_inlined_data_preserves_current_and_pinned_reads() {
             .unwrap()
             .is_empty(),
     );
-    assert_eq!(
+    // The flush deleted the rows it moved, as official's does; the file serves
+    // the earlier snapshot.
+    assert!(
         provider
-            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns,)
+            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
             .unwrap()
-            .iter()
-            .map(|data| data.batch.num_rows())
-            .sum::<usize>(),
-        2,
+            .is_empty(),
     );
     assert_eq!(
         provider
@@ -499,7 +508,7 @@ async fn flush_inlined_data_preserves_current_and_pinned_reads() {
     );
     assert!(
         flush_writer
-            .flush_inlined_data("main", "t", &[], flushed.snapshot_id)
+            .flush_table_inlined_data(flush_provider, "main", "t", flushed.snapshot_id)
             .await
             .unwrap()
             .is_none(),
@@ -576,11 +585,18 @@ async fn flush_inlined_data_preserves_deletion_history() {
     );
     let flush_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
     let flushed = flush_writer
-        .flush_inlined_data("main", "t", &live, delete_commit.snapshot_id)
+        .flush_table_inlined_data(
+            Arc::new(provider.clone()),
+            "main",
+            "t",
+            delete_commit.snapshot_id,
+        )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(flushed.records_written, 2);
+    // The deleted row is written too, masked by a delete file from its deleting
+    // snapshot, as official's flush writes it.
+    assert_eq!(flushed.records_written, 3);
     assert_eq!(read_rows(&temp, None).await, vec![(1, 10), (3, 30)]);
     assert_eq!(
         read_rows(&temp, Some(inline_write.snapshot_id)).await,
@@ -593,7 +609,7 @@ async fn flush_inlined_data_preserves_deletion_history() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn flush_inlined_data_conflicts_and_retries_from_fresh_snapshot() {
+async fn flush_inlined_data_conflicts_with_a_concurrent_delete_and_leaves_no_files() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&temp).await);
     let inline_options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
@@ -604,51 +620,77 @@ async fn flush_inlined_data_conflicts_and_retries_from_fresh_snapshot() {
         .append_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
         .await
         .unwrap();
-    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
-    let schema = provider
-        .get_schema_by_name("main", inline_write.snapshot_id)
-        .unwrap()
-        .unwrap();
-    let table = provider
-        .get_table_by_name(schema.schema_id, "t", inline_write.snapshot_id)
-        .unwrap()
-        .unwrap();
-    let columns = provider
-        .get_table_structure(table.table_id, inline_write.snapshot_id)
-        .unwrap();
-    let stale_rows = provider
-        .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
-        .unwrap();
+    let provider: Arc<dyn MetadataProvider> =
+        Arc::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap());
 
-    let concurrent = DuckLakeTableWriter::new(writer.clone(), object_store())
+    // A Parquet append does not conflict with a flush, as in official.
+    let appended = DuckLakeTableWriter::new(writer.clone(), object_store())
         .unwrap()
         .append_table("main", "t", &[batch(vec![3], vec![30])])
         .await
         .unwrap();
+
+    // An inlined delete after the flush's base does.
+    let columns = provider
+        .get_table_structure(inline_write.table_id, appended.snapshot_id)
+        .unwrap();
+    let rows = provider
+        .get_inlined_data_with_row_ids(inline_write.table_id, appended.snapshot_id, &columns)
+        .unwrap();
+    let deleted = InlinedRowRef {
+        table_name: rows[0].table_name.clone(),
+        row_id: rows[0].row_ids[0],
+    };
+    let delete_commit = writer
+        .commit_inlined_deletes(
+            inline_write.table_id,
+            "main",
+            "t",
+            appended.snapshot_id,
+            &[deleted],
+        )
+        .unwrap();
+    let files = parquet_files(&temp);
     let flush_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
     let error = flush_writer
-        .flush_inlined_data("main", "t", &stale_rows, inline_write.snapshot_id)
+        .flush_table_inlined_data(provider.clone(), "main", "t", appended.snapshot_id)
         .await
         .unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
-    assert_eq!(
-        read_rows(&temp, None).await,
-        vec![(1, 10), (2, 20), (3, 30)],
-    );
+    assert_eq!(parquet_files(&temp), files);
+    assert_eq!(read_rows(&temp, None).await, vec![(2, 20), (3, 30)]);
 
-    let fresh_rows = provider
-        .get_inlined_data_with_row_ids(table.table_id, concurrent.snapshot_id, &columns)
-        .unwrap();
+    // Read again at the new head, the flush commits; the deleted row is written
+    // and masked.
     let flushed = flush_writer
-        .flush_inlined_data("main", "t", &fresh_rows, concurrent.snapshot_id)
+        .flush_table_inlined_data(provider, "main", "t", delete_commit.snapshot_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(flushed.records_written, 2);
+    assert_eq!(read_rows(&temp, None).await, vec![(2, 20), (3, 30)]);
     assert_eq!(
-        read_rows(&temp, None).await,
+        read_rows(&temp, Some(appended.snapshot_id)).await,
         vec![(1, 10), (2, 20), (3, 30)],
     );
+}
+
+/// Every Parquet object under the catalog's data directory.
+fn parquet_files(temp: &TempDir) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![temp.path().to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                files.push(path.display().to_string());
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -923,7 +965,9 @@ async fn multi_table_write_commits_parquet_and_inline_rows_in_one_snapshot() {
     .unwrap();
     assert_eq!(snapshots, 3);
     assert_eq!(files, 1);
-    assert_eq!(inlined_tables, 1);
+    // Each table has the inlined data table its creation registered, as
+    // official's `CREATE TABLE` does.
+    assert_eq!(inlined_tables, 2);
     assert_eq!(
         changes,
         format!(
@@ -1015,7 +1059,9 @@ async fn multi_table_fence_rejection_removes_staged_parquet_file() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(coverage_rows, 0);
+    // Only the inlined data table `CREATE TABLE` registered; the refused
+    // commit registered none.
+    assert_eq!(coverage_rows, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1152,7 +1198,8 @@ async fn sqlite_inlined_uint64_round_trips_text_storage() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(declared_type, "TEXT");
+    // Official declares an inlined `UBIGINT` column `VARCHAR`.
+    assert_eq!(declared_type, "VARCHAR");
     let stored: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT value FROM {physical} ORDER BY row_id"
     )))
@@ -1839,6 +1886,10 @@ async fn delete_commits_parquet_and_inlined_rows_atomically() {
         .unwrap();
 
     let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
+    // The Parquet row's deletion goes to a delete file, not inlined.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
     let ctx = SessionContext::new();
@@ -2145,6 +2196,11 @@ async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
         .fetch_one(&pool)
         .await
         .unwrap();
+    let inline_tables_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_inlined_data_tables")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     let error = writer
         .register_inlined_data(
@@ -2179,13 +2235,13 @@ async fn stale_expected_base_snapshot_conflicts_and_commits_nothing() {
             .await
             .unwrap();
     assert_eq!(head_after, head_before, "conflict must commit no snapshot");
-    assert_eq!(inline_tables, 0);
+    assert_eq!(inline_tables, inline_tables_before);
     assert_eq!(record_count, 3);
     assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn update_refuses_tables_with_inlined_rows() {
+async fn update_reaches_parquet_and_inlined_rows() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
     let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
@@ -2196,7 +2252,6 @@ async fn update_refuses_tables_with_inlined_rows() {
         .await
         .unwrap();
 
-    // Explicitly enable inlining to exercise the current-snapshot UPDATE guard
     let writer = SqliteMetadataWriter::new(&rw_url(&t)).await.unwrap();
     let provider = SqliteMetadataProvider::new(&rw_url(&t)).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
@@ -2204,31 +2259,44 @@ async fn update_refuses_tables_with_inlined_rows() {
         .with_write_options(DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
-    ctx.sql("INSERT INTO ducklake.main.t VALUES (3, 30)")
-        .await
-        .unwrap()
-        .collect()
+    for sql in [
+        "INSERT INTO ducklake.main.t VALUES (3, 30)",
+        "UPDATE ducklake.main.t SET val = val + 1 WHERE id IN (1, 3)",
+    ] {
+        ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    }
+    assert_eq!(read_rows(&t, None).await, vec![(1, 11), (2, 20), (3, 31)]);
+    // The Parquet row's deletion and both new versions are inlined.
+    let pool = SqlitePool::connect(&rw_url(&t)).await.unwrap();
+    let inlined_deletes: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_inlined_delete_1")
+        .fetch_one(&pool)
         .await
         .unwrap();
-    let error = match ctx
-        .sql("UPDATE ducklake.main.t SET val = 99 WHERE id = 1")
+    assert_eq!(inlined_deletes, 1);
+    let delete_files: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_delete_file")
+        .fetch_one(&pool)
         .await
-    {
-        Ok(df) => df.collect().await.expect_err("UPDATE must refuse"),
-        Err(e) => e,
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("UPDATE on a table with inlined rows is not supported")
-            && message.contains("flush inlined data to Parquet"),
-        "{message}"
-    );
-    // Nothing changed.
-    assert_eq!(read_rows(&t, None).await, vec![(1, 10), (2, 20), (3, 30)]);
+        .unwrap();
+    assert_eq!(delete_files, 0);
+}
+
+/// `(rowid, id)` pairs of a two-column query result, sorted by rowid.
+async fn rowid_id_rows(ctx: &SessionContext, sql: &str) -> Vec<(i64, i32)> {
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut rows = batches
+        .iter()
+        .flat_map(|b| {
+            let rowids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let ids = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..b.num_rows()).map(move |i| (rowids.value(i), ids.value(i)))
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    rows
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn row_lineage_scan_refuses_tables_with_inlined_rows() {
+async fn row_lineage_scan_reads_inlined_rows_with_their_row_ids() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
     let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
@@ -2245,31 +2313,50 @@ async fn row_lineage_scan_refuses_tables_with_inlined_rows() {
         .with_row_lineage(true);
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
-    let error = match ctx.sql("SELECT rowid, id FROM ducklake.main.t").await {
-        Ok(df) => df.collect().await.expect_err("rowid scan must refuse"),
-        Err(e) => e,
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("row-lineage (rowid) scan on a table with inlined rows is not supported")
-            && message.contains("flush inlined data to Parquet"),
-        "{message}"
+    assert_eq!(
+        rowid_id_rows(&ctx, "SELECT rowid, id FROM ducklake.main.t").await,
+        vec![(0, 1), (1, 2)]
     );
-
-    // The same catalog still serves non-rowid reads, inlined rows included.
+    // `rowid` alone, and `rowid` after the table columns.
     let batches = ctx
-        .sql("SELECT id, val FROM ducklake.main.t ORDER BY id")
+        .sql("SELECT rowid FROM ducklake.main.t ORDER BY rowid")
         .await
         .unwrap()
         .collect()
         .await
         .unwrap();
-    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(total, 2);
+    let rowids = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rowids, vec![0, 1]);
+    let batches = ctx
+        .sql("SELECT * FROM ducklake.main.t ORDER BY rowid")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches[0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "val", "rowid"]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn row_lineage_scan_refuses_only_when_pushed_filters_keep_inlined_rows() {
+async fn row_lineage_scan_unions_inlined_and_parquet_rows_under_pushed_filters() {
     let t = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&t).await);
     let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
@@ -2295,38 +2382,18 @@ async fn row_lineage_scan_refuses_only_when_pushed_filters_keep_inlined_rows() {
     let ctx = SessionContext::new();
     ctx.register_catalog("ducklake", Arc::new(catalog));
 
-    // The pushed filter excludes every inlined row, so the Parquet-only
-    // rowid plan loses nothing and the scan succeeds.
-    let batches = ctx
-        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 100")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-    let rows = batches
-        .iter()
-        .flat_map(|b| {
-            let rowids = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let ids = b.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
-            (0..b.num_rows()).map(move |i| (rowids.value(i), ids.value(i)))
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(rows, vec![(2, 100)]);
-
-    // An inlined row still matches, so the scan keeps refusing.
-    let error = match ctx
-        .sql("SELECT rowid, id FROM ducklake.main.t WHERE id = 2")
-        .await
-    {
-        Ok(df) => df.collect().await.expect_err("rowid scan must refuse"),
-        Err(e) => e,
-    };
-    let message = error.to_string();
-    assert!(
-        message.contains("row-lineage (rowid) scan on a table with inlined rows is not supported"),
-        "{message}"
+    assert_eq!(
+        rowid_id_rows(&ctx, "SELECT rowid, id FROM ducklake.main.t WHERE id = 100").await,
+        vec![(2, 100)]
     );
+    assert_eq!(
+        rowid_id_rows(&ctx, "SELECT rowid, id FROM ducklake.main.t WHERE id = 2").await,
+        vec![(1, 2)]
+    );
+    let all = rowid_id_rows(&ctx, "SELECT rowid, id FROM ducklake.main.t").await;
+    assert_eq!(all.len(), 14);
+    assert_eq!(all[..3], [(0, 1), (1, 2), (2, 100)]);
+    assert_eq!(all[13], (13, 111));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2516,9 +2583,29 @@ async fn reserved_inline_columns_fall_back_to_parquet(#[case] name: &str) {
     let writer = Arc::new(make_writer(&temp).await);
     let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, false)]));
     let input = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![37]))]).unwrap();
-    let result = DuckLakeTableWriter::new(writer, object_store())
-        .unwrap()
-        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
+    let table_writer = |limit| {
+        DuckLakeTableWriter::new(Arc::clone(&writer) as _, object_store())
+            .unwrap()
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(limit))
+    };
+    // Creating the table while the catalog's inlining is enabled is refused,
+    // as in official, whatever limit the writer inlines under.
+    for limit in [10, 0] {
+        let error = table_writer(limit)
+            .write_table("main", "reserved", std::slice::from_ref(&input))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DuckLakeError::InvalidConfig(_)), "{error}");
+    }
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
+    table_writer(0)
+        .write_table("main", "reserved", std::slice::from_ref(&input))
+        .await
+        .unwrap();
+    // Writing the existing table under a limit goes to Parquet.
+    let result = table_writer(10)
         .write_table("main", "reserved", &[input])
         .await
         .unwrap();
@@ -2629,34 +2716,55 @@ async fn inlined_schema_versions_fill_new_columns_with_null() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn change_feed_refuses_inlined_inserts_in_its_window() {
+async fn change_feeds_read_inlined_rows_this_crate_writes() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&temp).await);
     let result = DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10))
-        .write_table("main", "t", &[batch(vec![1], vec![10])])
+        .write_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
         .await
         .unwrap();
     let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap());
     let ctx = SessionContext::new();
     datafusion_ducklake::register_ducklake_functions(&ctx, provider.clone());
+    let inserted = result.snapshot_id;
     for function in ["ducklake_table_changes", "ducklake_table_insertions"] {
         let query = format!(
-            "SELECT * FROM {function}('main.t', {}, {})",
-            result.snapshot_id, result.snapshot_id
+            "SELECT snapshot_id, rowid, id \
+             FROM {function}('main.t', {inserted}, {inserted}) ORDER BY rowid"
         );
-        let error = match ctx.sql(&query).await {
-            Ok(df) => df.collect().await.expect_err("inline CDC must refuse"),
-            Err(e) => e,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("change feeds over inlined rows are not supported"),
-            "{error}"
-        );
+        let batches = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+        let rows = batches
+            .iter()
+            .flat_map(|b| {
+                let snapshot = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let rowid = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let id = b.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(move |i| (snapshot.value(i), rowid.value(i), id.value(i)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![(inserted, 0, 1), (inserted, 1, 2)], "{function}");
     }
+    let batches = ctx
+        .sql(&format!(
+            "SELECT DISTINCT change_type FROM ducklake_table_changes('main.t', {inserted}, \
+             {inserted})"
+        ))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .unwrap()
+            .to_string()
+            .matches("insert")
+            .count(),
+        1
+    );
+
     let writer = Arc::new(SqliteMetadataWriter::new(&rw_url(&temp)).await.unwrap());
     let catalog = DuckLakeCatalog::with_writer(provider.clone(), writer).unwrap();
     ctx.register_catalog("ducklake", Arc::new(catalog));
@@ -2666,21 +2774,24 @@ async fn change_feed_refuses_inlined_inserts_in_its_window() {
         .collect()
         .await
         .unwrap();
-    let snapshot = provider.get_current_snapshot().unwrap();
-    let query = format!("SELECT * FROM ducklake_table_deletions('main.t', {snapshot}, {snapshot})");
-    let error = match ctx.sql(&query).await {
-        Ok(df) => df
-            .collect()
-            .await
-            .expect_err("inline deletion feed must refuse"),
-        Err(e) => e,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("change feeds over inlined rows are not supported"),
-        "{error}"
-    );
+    let deleted = provider.get_current_snapshot().unwrap();
+    for function in ["ducklake_table_changes", "ducklake_table_deletions"] {
+        let query = format!(
+            "SELECT snapshot_id, rowid, change_type, id, val \
+             FROM {function}('main.t', {deleted}, {deleted})"
+        );
+        let batches = ctx.sql(&query).await.unwrap().collect().await.unwrap();
+        let rows = batches
+            .iter()
+            .flat_map(|b| {
+                let snapshot = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let rowid = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let id = b.column(3).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..b.num_rows()).map(move |i| (snapshot.value(i), rowid.value(i), id.value(i)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![(deleted, 0, 1)], "{function}");
+    }
 }
 
 #[rstest::rstest]
@@ -2738,4 +2849,493 @@ async fn staged_inline_write_fences_partition_changes(#[case] reset: bool) {
         .expect_err("staged inline write must fence partition DDL");
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
     assert_eq!(read_rows(&temp, None).await, vec![(1, 10)]);
+}
+
+// The deprecated `DuckLakeTableWriter::flush_inlined_data`, which moves the
+// inlined rows it is given into a new Parquet file and ends them in the
+// inlined tables.
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)]
+async fn deprecated_flush_inlined_data_preserves_current_and_pinned_reads() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&options);
+    let inline_write = table_writer
+        .append_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    assert_eq!(inline_write.records_written, 2);
+    assert_eq!(read_rows(&temp, None).await, vec![(1, 10), (2, 20)]);
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let schema = provider
+        .get_schema_by_name("main", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, inline_write.snapshot_id)
+        .unwrap();
+    let inlined = provider
+        .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
+        .unwrap();
+    assert_eq!(
+        inlined
+            .iter()
+            .map(|data| data.batch.num_rows())
+            .sum::<usize>(),
+        2,
+    );
+
+    let flush_writer = DuckLakeTableWriter::new(writer.clone(), object_store()).unwrap();
+    let flushed = flush_writer
+        .flush_inlined_data("main", "t", &inlined, inline_write.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flushed.records_written, 2);
+    assert_eq!(flushed.files_written, 1);
+    assert_eq!(read_rows(&temp, None).await, vec![(1, 10), (2, 20)]);
+    assert_eq!(
+        read_rows(&temp, Some(inline_write.snapshot_id)).await,
+        vec![(1, 10), (2, 20)],
+    );
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    assert!(
+        provider
+            .get_inlined_data_with_row_ids(table.table_id, flushed.snapshot_id, &columns)
+            .unwrap()
+            .is_empty(),
+    );
+    assert_eq!(
+        provider
+            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns,)
+            .unwrap()
+            .iter()
+            .map(|data| data.batch.num_rows())
+            .sum::<usize>(),
+        2,
+    );
+    assert_eq!(
+        provider
+            .get_table_files_for_select(table.table_id, flushed.snapshot_id)
+            .unwrap()
+            .len(),
+        1,
+    );
+    assert!(
+        flush_writer
+            .flush_inlined_data("main", "t", &[], flushed.snapshot_id)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert_eq!(
+        provider.get_current_snapshot().unwrap(),
+        flushed.snapshot_id
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)]
+async fn deprecated_flush_inlined_data_preserves_deletion_history() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&options);
+    let inline_write = table_writer
+        .append_table("main", "t", &[batch(vec![1, 2, 3], vec![10, 20, 30])])
+        .await
+        .unwrap();
+
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let schema = provider
+        .get_schema_by_name("main", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, inline_write.snapshot_id)
+        .unwrap();
+    let before_delete = provider
+        .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
+        .unwrap();
+    let ids = before_delete[0]
+        .batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let row = (0..ids.len()).find(|index| ids.value(*index) == 2).unwrap();
+    let deleted = InlinedRowRef {
+        table_name: before_delete[0].table_name.clone(),
+        row_id: before_delete[0].row_ids[row],
+    };
+    let delete_commit = writer
+        .commit_inlined_deletes(
+            table.table_id,
+            "main",
+            "t",
+            inline_write.snapshot_id,
+            &[deleted],
+        )
+        .unwrap();
+    assert_eq!(
+        read_rows(&temp, Some(inline_write.snapshot_id)).await,
+        vec![(1, 10), (2, 20), (3, 30)],
+    );
+    assert_eq!(
+        read_rows(&temp, Some(delete_commit.snapshot_id)).await,
+        vec![(1, 10), (3, 30)],
+    );
+
+    let live = provider
+        .get_inlined_data_with_row_ids(table.table_id, delete_commit.snapshot_id, &columns)
+        .unwrap();
+    assert_eq!(
+        live.iter().map(|data| data.batch.num_rows()).sum::<usize>(),
+        2,
+    );
+    let flush_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let flushed = flush_writer
+        .flush_inlined_data("main", "t", &live, delete_commit.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flushed.records_written, 2);
+    assert_eq!(read_rows(&temp, None).await, vec![(1, 10), (3, 30)]);
+    assert_eq!(
+        read_rows(&temp, Some(inline_write.snapshot_id)).await,
+        vec![(1, 10), (2, 20), (3, 30)],
+    );
+    assert_eq!(
+        read_rows(&temp, Some(delete_commit.snapshot_id)).await,
+        vec![(1, 10), (3, 30)],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)]
+async fn deprecated_flush_inlined_data_conflicts_and_retries_from_fresh_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let inline_options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let inline_writer = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&inline_options);
+    let inline_write = inline_writer
+        .append_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let provider = SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap();
+    let schema = provider
+        .get_schema_by_name("main", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", inline_write.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, inline_write.snapshot_id)
+        .unwrap();
+    let stale_rows = provider
+        .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
+        .unwrap();
+
+    let concurrent = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .append_table("main", "t", &[batch(vec![3], vec![30])])
+        .await
+        .unwrap();
+    let flush_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let error = flush_writer
+        .flush_inlined_data("main", "t", &stale_rows, inline_write.snapshot_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(
+        read_rows(&temp, None).await,
+        vec![(1, 10), (2, 20), (3, 30)],
+    );
+
+    let fresh_rows = provider
+        .get_inlined_data_with_row_ids(table.table_id, concurrent.snapshot_id, &columns)
+        .unwrap();
+    let flushed = flush_writer
+        .flush_inlined_data("main", "t", &fresh_rows, concurrent.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flushed.records_written, 2);
+    assert_eq!(
+        read_rows(&temp, None).await,
+        vec![(1, 10), (2, 20), (3, 30)],
+    );
+}
+
+/// A flush through the deprecated writer path followed by the official flush
+/// leaves every snapshot's values as they were.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)]
+async fn deprecated_then_official_flush_keeps_values_at_every_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    let options = DuckLakeWriteOptions::default().with_data_inlining_row_limit(10);
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&options);
+    let first = table_writer
+        .append_table("main", "t", &[batch(vec![1, 2], vec![10, 20])])
+        .await
+        .unwrap();
+    let provider = Arc::new(SqliteMetadataProvider::new(&ro_url(&temp)).await.unwrap());
+    let schema = provider
+        .get_schema_by_name("main", first.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let table = provider
+        .get_table_by_name(schema.schema_id, "t", first.snapshot_id)
+        .unwrap()
+        .unwrap();
+    let columns = provider
+        .get_table_structure(table.table_id, first.snapshot_id)
+        .unwrap();
+    let rows = provider
+        .get_inlined_data_with_row_ids(table.table_id, first.snapshot_id, &columns)
+        .unwrap();
+    let old_flush = DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .flush_inlined_data("main", "t", &rows, first.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = table_writer
+        .append_table("main", "t", &[batch(vec![3, 4], vec![30, 40])])
+        .await
+        .unwrap();
+    let mut before = Vec::new();
+    for snapshot in 1..=second.snapshot_id {
+        before.push(read_rows(&temp, Some(snapshot)).await);
+    }
+    assert_eq!(
+        before.last().unwrap(),
+        &vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+    assert!(old_flush.snapshot_id < second.snapshot_id);
+
+    let flushed = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .flush_table_inlined_data(provider.clone(), "main", "t", second.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        flushed.records_written, 4,
+        "both the ended and the live rows move"
+    );
+    assert!(
+        provider
+            .get_inlined_data_for_flush(table.table_id, flushed.snapshot_id)
+            .unwrap()
+            .is_empty()
+    );
+    for (index, snapshot) in (1..=second.snapshot_id).enumerate() {
+        assert_eq!(
+            read_rows(&temp, Some(snapshot)).await,
+            before[index],
+            "snapshot {snapshot}"
+        );
+    }
+    assert_eq!(
+        read_rows(&temp, None).await,
+        vec![(1, 10), (2, 20), (3, 30), (4, 40)]
+    );
+}
+
+/// A one-table flush that commits only inlined deletions of Parquet rows,
+/// moved into a delete file, reports its commit with no rows flushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn table_flush_of_only_inlined_file_deletions_reports_its_commit() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(make_writer(&temp).await);
+    DuckLakeTableWriter::new(writer.clone(), object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
+        .write_table("main", "t", &[batch(vec![1, 2, 3], vec![10, 20, 30])])
+        .await
+        .unwrap();
+    let provider: Arc<dyn MetadataProvider> =
+        Arc::new(SqliteMetadataProvider::new(&rw_url(&temp)).await.unwrap());
+    let ctx = SessionContext::new();
+    let catalog = DuckLakeCatalog::with_writer(
+        Arc::clone(&provider),
+        writer.clone() as Arc<dyn MetadataWriter>,
+    )
+    .unwrap();
+    ctx.register_catalog("lake", Arc::new(catalog));
+    ctx.sql("DELETE FROM lake.main.t WHERE id = 2")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let head = provider.get_current_snapshot().unwrap();
+    let flushed = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .flush_table_inlined_data(Arc::clone(&provider), "main", "t", head)
+        .await
+        .unwrap()
+        .expect("the flush committed");
+    assert_eq!(flushed.snapshot_id, head + 1);
+    assert_eq!((flushed.files_written, flushed.records_written), (0, 0));
+    assert_eq!(read_rows(&temp, None).await, vec![(1, 10), (3, 30)]);
+}
+
+/// On a catalog official DuckDB created, `data_file_id` is a `BIGINT PRIMARY
+/// KEY` rather than SQLite's row id, so the two drift apart once delete files
+/// take ids. A file this crate registers on it, by an insert or a flush,
+/// keeps its statistics under its own id.
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn official_catalog_keys_file_stats_by_file_id() {
+    let temp = TempDir::new().unwrap();
+    let db = temp.path().join("official.db");
+    let data = temp.path().join("data");
+    {
+        crate::common::ensure_ducklake_installed();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "LOAD ducklake; \
+             ATTACH 'ducklake:sqlite:{}' AS lake \
+               (DATA_PATH '{}/', DATA_INLINING_ROW_LIMIT 0); \
+             CREATE TABLE lake.t(id INTEGER); \
+             INSERT INTO lake.t SELECT i FROM range(1, 6) r(i); \
+             DELETE FROM lake.t WHERE id = 1; \
+             DELETE FROM lake.t WHERE id = 2; \
+             DELETE FROM lake.t WHERE id = 3; \
+             CALL lake.set_option('data_inlining_row_limit', 10);",
+            db.display(),
+            data.display()
+        ))
+        .unwrap();
+    }
+    let url = format!("sqlite:{}", db.display());
+    // Opening it with initialization seeds this crate's id counters.
+    drop(SqliteMetadataWriter::new_with_init(&url).await.unwrap());
+    let session = || async {
+        let provider: Arc<dyn MetadataProvider> =
+            Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
+        let writer: Arc<dyn MetadataWriter> =
+            Arc::new(SqliteMetadataWriter::new(&url).await.unwrap());
+        let ctx = SessionContext::new();
+        let catalog =
+            DuckLakeCatalog::with_writer(Arc::clone(&provider), Arc::clone(&writer)).unwrap();
+        DuckLakeCatalog::register(&ctx, "lake", catalog);
+        (ctx, DuckLakeCatalog::with_writer(provider, writer).unwrap())
+    };
+    let (ctx, catalog) = session().await;
+    // Past the limit: a Parquet file. Then an inlined row, flushed.
+    ctx.sql("INSERT INTO lake.main.t SELECT CAST(value AS INT) FROM generate_series(100, 119)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO lake.main.t VALUES (200)")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    datafusion_ducklake::execute_ducklake_sql(
+        &ctx,
+        &catalog,
+        "CALL ducklake_flush_inlined_data('lake')",
+    )
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    let orphaned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ducklake_file_column_stats
+         WHERE data_file_id NOT IN (SELECT data_file_id FROM ducklake_data_file)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphaned, 0, "statistics keyed by no data file");
+    let without_stats: Vec<i64> = sqlx::query_scalar(
+        "SELECT data_file_id FROM ducklake_data_file f WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_file_column_stats s WHERE s.data_file_id = f.data_file_id)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        without_stats.is_empty(),
+        "files without statistics: {without_stats:?}"
+    );
+    let files: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_data_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(files, 3, "official's file, the insert's and the flush's");
+    pool.close().await;
+
+    let (ctx, _) = session().await;
+    let batches = ctx
+        .sql("SELECT count(*) FROM lake.main.t WHERE id = 200 OR id = 119 OR id = 5")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 3);
+}
+
+/// Each file id allocation reads the largest id scheduled for deletion; that
+/// read is an index search, not a scan of every scheduled file.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_id_allocation_reads_scheduled_ids_through_an_index() {
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite:{}?mode=rwc", dir.path().join("c.db").display());
+    SqliteMetadataWriter::new_with_init(&url).await.unwrap();
+    let pool = SqlitePool::connect(&url).await.unwrap();
+    let plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT MAX(data_file_id) FROM ducklake_files_scheduled_for_deletion",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get::<String, _>("detail"))
+    .collect();
+    assert!(
+        plan.iter().all(|step| !step.starts_with("SCAN"))
+            && plan.iter().any(|step| step.contains("INDEX")),
+        "{plan:?}"
+    );
 }

@@ -44,6 +44,54 @@ pub enum InlinedFilter {
     Or(Vec<InlinedFilter>),
 }
 
+impl InlinedFilter {
+    /// This filter with every column renamed by `rename`. A term whose column
+    /// `rename` cannot place is dropped from an `AND` and drops an enclosing
+    /// `OR` whole, so the result never excludes a row this filter keeps.
+    pub(crate) fn rename_columns(
+        &self,
+        rename: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<InlinedFilter> {
+        match self {
+            Self::Comparison {
+                column,
+                op,
+                value,
+            } => Some(Self::Comparison {
+                column: rename(column)?,
+                op: *op,
+                value: value.clone(),
+            }),
+            Self::IsNull(column) => Some(Self::IsNull(rename(column)?)),
+            Self::IsNotNull(column) => Some(Self::IsNotNull(rename(column)?)),
+            Self::Prefix {
+                column,
+                prefix,
+            } => Some(Self::Prefix {
+                column: rename(column)?,
+                prefix: prefix.clone(),
+            }),
+            Self::And(children) => {
+                let mut kept = children
+                    .iter()
+                    .filter_map(|child| child.rename_columns(rename))
+                    .collect::<Vec<_>>();
+                match kept.len() {
+                    0 => None,
+                    1 => kept.pop(),
+                    _ => Some(Self::And(kept)),
+                }
+            },
+            Self::Or(children) => Some(Self::Or(
+                children
+                    .iter()
+                    .map(|child| child.rename_columns(rename))
+                    .collect::<Option<Vec<_>>>()?,
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InlinedComparison {
     Eq,

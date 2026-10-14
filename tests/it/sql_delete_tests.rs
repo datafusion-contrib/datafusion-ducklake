@@ -184,6 +184,46 @@ async fn delete_all_rows_no_where() {
     assert_eq!(read_ids(&temp).await, Vec::<i32>::new(), "table empty");
 }
 
+/// `DELETE FROM t` deletes the rows of a file whose catalog row records no
+/// `record_count` (another writer may leave it NULL), counting them from the
+/// file; one with a delete file of unknown count too.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_all_rows_of_files_without_a_record_count() {
+    let temp = TempDir::new().unwrap();
+    let writer = Arc::new(new_writer(&temp).await);
+    let table_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    table_writer
+        .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
+        .await
+        .unwrap();
+    table_writer
+        .append_table("main", "t", &[id_batch(&[5, 6, 7])])
+        .await
+        .unwrap();
+    let ctx = writable_ctx(&temp).await;
+    assert_eq!(
+        run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id = 6").await,
+        1
+    );
+    let pool = SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_data_file SET record_count = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE ducklake_delete_file SET delete_count = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let ctx = writable_ctx(&temp).await;
+    let count = run_delete(&ctx, "DELETE FROM ducklake.main.t").await;
+    assert_eq!(read_ids(&temp).await, Vec::<i32>::new(), "table empty");
+    assert_eq!(count, 6, "every live row is counted");
+}
+
 /// Two DELETEs against the SAME data file. The second must UNION with the first
 /// (cumulative positions): the row deleted first stays deleted (no
 /// resurrection), and the second row is also removed.
@@ -295,6 +335,11 @@ async fn delete_of_inline_deleted_rows_is_noop() {
 async fn delete_keeps_inline_and_parquet_positions_in_separate_stores() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(new_writer(&temp).await);
+    // The SQL DELETEs write delete files; the inlined deletions are the
+    // fixture's.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .write_table("main", "t", &[id_batch(&[1, 2, 3, 4])])
@@ -375,6 +420,11 @@ async fn truncate_and_metadata_count_subtract_inlined_deletes() {
 async fn inlined_delete_uses_physical_position_with_nonzero_row_id_start() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(new_writer(&temp).await);
+    // The SQL DELETEs write delete files; the inlined deletions are the
+    // fixture's.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .write_table("main", "t", &[id_batch(&[1, 2, 3])])
@@ -588,4 +638,47 @@ async fn delete_resolves_physical_positions_under_filter_pushdown() {
             "ids 1..=149 must survive, with filter pushdown {pushdown}"
         );
     }
+}
+
+/// `DELETE` through `SqliteMetadataWriter::new` on a catalog official DuckLake
+/// created (no `new_with_init`): the deletion commits and a fresh read applies
+/// it.
+#[cfg(feature = "metadata-duckdb")]
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_on_a_duckdb_created_catalog() {
+    let temp = TempDir::new().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    crate::common::ensure_ducklake_installed();
+    crate::common::ensure_extension_installed("sqlite");
+    let connection = duckdb::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(&format!(
+            "LOAD ducklake; LOAD sqlite;
+             ATTACH 'ducklake:sqlite:{}' AS lake (DATA_PATH '{}/', DATA_INLINING_ROW_LIMIT 0);
+             CREATE TABLE lake.main.t (id INTEGER);
+             INSERT INTO lake.main.t SELECT range::INTEGER FROM range(1, 11);
+             DETACH lake;",
+            temp.path().join("test.db").display(),
+            data.display()
+        ))
+        .unwrap();
+    drop(connection);
+
+    let ctx = writable_ctx(&temp).await;
+    let count = run_delete(&ctx, "DELETE FROM ducklake.main.t WHERE id IN (2, 7)").await;
+    assert_eq!(count, 2);
+    assert_eq!(read_ids(&temp).await, vec![1, 3, 4, 5, 6, 8, 9, 10]);
+    // Under the default inlining limit the deletions are recorded inline, as
+    // official records them on this catalog.
+    let pool = SqlitePool::connect(&format!("sqlite:{}", temp.path().join("test.db").display()))
+        .await
+        .unwrap();
+    let inlined: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE name LIKE 'ducklake_inlined_delete_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inlined, 1);
 }

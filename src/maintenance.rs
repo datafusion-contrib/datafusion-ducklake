@@ -7,7 +7,9 @@
 //!    [`crate::multicatalog::MulticatalogManager::expire_snapshots_in_catalog`]) deletes the
 //!    chosen snapshots, garbage-collects every table / data file / delete file that is no
 //!    longer reachable by any surviving snapshot, and records the orphaned physical paths in
-//!    `ducklake_files_scheduled_for_deletion`. No object storage is touched.
+//!    `ducklake_files_scheduled_for_deletion`. No object storage is touched. A dead table's
+//!    catalog-inlined storage goes too, in the metadata database: its inlined data and
+//!    inlined delete tables are dropped.
 //! 2. **cleanup_old_files** ([`cleanup_old_files_sqlite`], [`cleanup_old_files_in_catalog`])
 //!    reads the scheduled rows, deletes the objects from the object store, and removes the rows.
 //! 3. **delete_orphaned_files** ([`delete_orphaned_files_sqlite`],
@@ -15,6 +17,10 @@
 //!    path, subtracts referenced data files, delete files, and files still scheduled for deletion,
 //!    and deletes whatever is left. The catalog-scoped form catches files left by aborted writes.
 //!    The global form also reclaims dropped-catalog files from retained data-path tombstones.
+//!
+//! [`CatalogMaintenance`] dispatches the three per backend; a writer exposes it through
+//! [`MetadataWriter::maintenance`](crate::metadata_writer::MetadataWriter::maintenance), which
+//! is how [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint) runs them.
 //!
 //! The metadata writers deliberately hold no object store — physical I/O lives here so the
 //! catalog layer stays storage-agnostic (the object store comes from the caller, e.g. the
@@ -55,6 +61,144 @@ pub enum CleanupCriteria {
     OlderThan(DateTime<Utc>),
 }
 
+/// The backend-specific maintenance commands, dispatched per metadata writer
+/// through [`MetadataWriter::maintenance`](crate::metadata_writer::MetadataWriter::maintenance).
+///
+/// Each method is the backend's own entry point (for example
+/// [`cleanup_old_files_sqlite`]); the trait only lets a caller holding a
+/// `dyn MetadataWriter` reach them.
+#[async_trait::async_trait]
+pub trait CatalogMaintenance: Send + Sync {
+    /// Expire snapshots; see the module docs.
+    async fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>>;
+
+    /// Physically delete files scheduled for deletion and drop their rows.
+    async fn cleanup_old_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>>;
+
+    /// Delete the Parquet files under the catalog's data path that no metadata
+    /// row references.
+    async fn delete_orphaned_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>>;
+}
+
+#[cfg(feature = "write-sqlite")]
+#[async_trait::async_trait]
+impl CatalogMaintenance for crate::metadata_writer_sqlite::SqliteMetadataWriter {
+    async fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        crate::metadata_writer_sqlite::SqliteMetadataWriter::expire_snapshots(self, criteria)
+    }
+
+    async fn cleanup_old_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        cleanup_old_files_sqlite(self, object_store, criteria, dry_run).await
+    }
+
+    async fn delete_orphaned_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        delete_orphaned_files_sqlite(self, object_store, criteria, dry_run).await
+    }
+}
+
+#[cfg(feature = "write-duckdb")]
+#[async_trait::async_trait]
+impl CatalogMaintenance for crate::metadata_writer_duckdb::DuckdbMetadataWriter {
+    async fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        crate::metadata_writer_duckdb::DuckdbMetadataWriter::expire_snapshots(self, criteria)
+    }
+
+    async fn cleanup_old_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        cleanup_old_files_duckdb(self, object_store, criteria, dry_run).await
+    }
+
+    async fn delete_orphaned_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        delete_orphaned_files_duckdb(self, object_store, criteria, dry_run).await
+    }
+}
+
+#[cfg(feature = "write-mysql")]
+#[async_trait::async_trait]
+impl CatalogMaintenance for crate::metadata_writer_mysql::MySqlMetadataWriter {
+    async fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        crate::metadata_writer_mysql::MySqlMetadataWriter::expire_snapshots(self, criteria)
+    }
+
+    async fn cleanup_old_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        cleanup_old_files_mysql(self, object_store, criteria, dry_run).await
+    }
+
+    async fn delete_orphaned_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        delete_orphaned_files_mysql(self, object_store, criteria, dry_run).await
+    }
+}
+
+/// The multicatalog layout's commands run on the writer's own catalog, through
+/// [`crate::multicatalog::MulticatalogManager`] and its catalog-scoped functions.
+#[cfg(feature = "write-postgres")]
+#[async_trait::async_trait]
+impl CatalogMaintenance for crate::metadata_writer_postgres::PostgresMetadataWriter {
+    async fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
+        let (manager, name) = self.catalog_manager().await?;
+        manager.expire_snapshots_in_catalog(&name, criteria).await
+    }
+
+    async fn cleanup_old_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        let (manager, name) = self.catalog_manager().await?;
+        cleanup_old_files_in_catalog(&manager, &name, object_store, criteria, dry_run).await
+    }
+
+    async fn delete_orphaned_files(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        criteria: CleanupCriteria,
+        dry_run: bool,
+    ) -> Result<Vec<String>> {
+        let (manager, name) = self.catalog_manager().await?;
+        delete_orphaned_files_in_catalog(&manager, &name, object_store, criteria, dry_run).await
+    }
+}
+
 #[cfg(feature = "write-postgres")]
 struct DataPathGroup {
     object_store_url: ObjectStoreUrl,
@@ -70,6 +214,326 @@ struct DataPathGroup {
 /// `TIMESTAMPTZ` (we explicitly cast at the bind site).
 pub(crate) fn format_sql_timestamp(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+/// The instant `interval` before `now`, for the `delete_older_than` catalog
+/// option, which holds a DuckDB `INTERVAL` string (see [`interval_before`]).
+///
+/// A negative interval is refused, where official accepts it: its cutoff lies
+/// in the future, so cleanup would delete the files of commits still in flight.
+pub(crate) fn older_than(interval: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let cutoff = interval_before(interval, now)?;
+    if cutoff > now {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "interval '{interval}' is negative; an older-than cutoff must not be in the future"
+        )));
+    }
+    Ok(cutoff)
+}
+
+/// The instant `interval` before `now`, for the `expire_older_than` and
+/// `delete_older_than` catalog options, which hold a DuckDB `INTERVAL` string
+/// (`'2 days'`, `'1h30m'`, `'-00:30:00'`, `'2 days ago'`); official parses it
+/// with DuckDB's `Interval::FromString` (see [`parse_duckdb_interval`]) and
+/// subtracts it from the current timestamp. A negative interval gives an
+/// instant after `now`, as in DuckDB. Months shift the calendar month,
+/// clamping the day, then days and microseconds follow, as DuckDB's
+/// timestamp arithmetic does.
+pub(crate) fn interval_before(interval: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let invalid =
+        || crate::DuckLakeError::InvalidConfig(format!("Failed to parse interval: '{interval}'"));
+    let parsed = parse_duckdb_interval(interval).ok_or_else(invalid)?;
+    let months = i64::from(parsed.months);
+    let shifted = if months >= 0 {
+        now.checked_sub_months(chrono::Months::new(
+            u32::try_from(months).map_err(|_| invalid())?,
+        ))
+    } else {
+        now.checked_add_months(chrono::Months::new(
+            u32::try_from(-months).map_err(|_| invalid())?,
+        ))
+    }
+    .ok_or_else(invalid)?;
+    shifted
+        .checked_sub_signed(chrono::Duration::days(i64::from(parsed.days)))
+        .and_then(|shifted| {
+            shifted.checked_sub_signed(chrono::Duration::microseconds(parsed.micros))
+        })
+        .ok_or_else(invalid)
+}
+
+/// A DuckDB `INTERVAL` value: months, days and microseconds, kept apart as
+/// DuckDB keeps them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct DuckdbInterval {
+    pub(crate) months: i32,
+    pub(crate) days: i32,
+    pub(crate) micros: i64,
+}
+
+/// Parse `text` as DuckDB 1.5.5's `Interval::FromCString` does, `None` where
+/// it fails:
+///
+/// - an optional leading `@`, then `<number> <unit>` pairs separated by
+///   optional whitespace; a number is digits, with an optional fraction, and
+///   `-` for a negative one (no `+`, and no bare `.5`);
+/// - a unit is one of DuckDB's date part names, any case; a fraction of a
+///   month or quarter becomes days of 30, of a week or day the time, of a
+///   year or longer whole months, each truncated;
+/// - a lone number with no unit is seconds;
+/// - a number followed by `:` starts an `HH:MM[:SS[.ffffff]]` time, which
+///   ends the interval (anything after it is ignored); a `-` before it negates
+///   every time part read so far;
+/// - a trailing `ago` negates the whole interval.
+pub(crate) fn parse_duckdb_interval(text: &str) -> Option<DuckdbInterval> {
+    const MICROS_PER_SEC: i64 = 1_000_000;
+    const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SEC;
+    const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+    const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+    const DAYS_PER_MONTH: i64 = 30;
+    const DAYS_PER_WEEK: i64 = 7;
+
+    fn add_i32(target: &mut i32, input: i64, multiplier: i64, fraction: i64) -> Option<()> {
+        let addition = i32::try_from(input.checked_mul(multiplier)?).ok()?;
+        *target = target.checked_add(addition)?;
+        if fraction != 0 {
+            let addition = i32::try_from((fraction * multiplier) / MICROS_PER_SEC).ok()?;
+            *target = target.checked_add(addition)?;
+        }
+        Some(())
+    }
+    fn add_i64(target: &mut i64, input: i64, multiplier: i64, fraction: i64) -> Option<()> {
+        *target = target.checked_add(input.checked_mul(multiplier)?)?;
+        if fraction != 0 {
+            *target = target.checked_add((fraction * multiplier) / MICROS_PER_SEC)?;
+        }
+        Some(())
+    }
+    let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n');
+
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut result = DuckdbInterval::default();
+    if len == 0 {
+        return None;
+    }
+    let mut pos = 0;
+    match bytes[0] {
+        b'@' => pos += 1,
+        b'P' | b'p' => return None,
+        _ => {},
+    }
+    let mut found_any = false;
+    loop {
+        // A number, `ago`, or the end.
+        while pos < len && is_space(bytes[pos]) {
+            pos += 1;
+        }
+        if pos >= len {
+            break;
+        }
+        let negative = match bytes[pos] {
+            b'0'..=b'9' => false,
+            b'-' => {
+                pos += 1;
+                true
+            },
+            b'a' | b'A' => {
+                // `ago`, then only whitespace.
+                if len - pos < 3
+                    || !bytes[pos + 1].eq_ignore_ascii_case(&b'g')
+                    || !bytes[pos + 2].eq_ignore_ascii_case(&b'o')
+                    || !bytes[pos + 3..].iter().all(|c| is_space(*c))
+                {
+                    return None;
+                }
+                if result.months == i32::MIN || result.days == i32::MIN {
+                    return None;
+                }
+                result.months = -result.months;
+                result.days = -result.days;
+                // DuckDB's negation of the microseconds wraps.
+                result.micros = result.micros.wrapping_neg();
+                break;
+            },
+            _ => return None,
+        };
+        let start = pos;
+        while pos < len && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos < len && bytes[pos] == b':' {
+            // `HH:MM[:SS[.ffffff]]`, at most 9 hour digits.
+            let time = parse_interval_time(&bytes[start..])?;
+            result.micros = result.micros.checked_add(time)?;
+            if negative {
+                result.micros = result.micros.wrapping_neg();
+            }
+            found_any = true;
+            break;
+        }
+        if pos == start {
+            return None;
+        }
+        let mut number: i64 = text[start..pos].parse().ok()?;
+        let mut fraction: i64 = 0;
+        if pos < len && bytes[pos] == b'.' {
+            let mut mult = 100_000;
+            pos += 1;
+            while pos < len && bytes[pos].is_ascii_digit() {
+                if mult > 0 {
+                    fraction += i64::from(bytes[pos] - b'0') * mult;
+                }
+                mult /= 10;
+                pos += 1;
+            }
+        }
+        if negative {
+            number = -number;
+            fraction = -fraction;
+        }
+        while pos < len && is_space(bytes[pos]) {
+            pos += 1;
+        }
+        let unit_start = pos;
+        while pos < len && bytes[pos].is_ascii_alphabetic() {
+            pos += 1;
+        }
+        let unit = text[unit_start..pos].to_ascii_lowercase();
+        if unit.is_empty() && !found_any {
+            // A lone number is seconds; only whitespace may follow.
+            add_i64(&mut result.micros, number, MICROS_PER_SEC, 0)?;
+            result.micros = result.micros.checked_add(fraction)?;
+            if !bytes[pos..].iter().all(|c| is_space(*c)) {
+                return None;
+            }
+            found_any = true;
+            break;
+        }
+        match unit.as_str() {
+            "millennium" | "mil" | "millenniums" | "millennia" | "mils" | "millenium" => {
+                add_i32(&mut result.months, number, 12_000, fraction)?
+            },
+            "century" | "cent" | "centuries" | "c" => {
+                add_i32(&mut result.months, number, 1_200, fraction)?
+            },
+            "decade" | "dec" | "decades" | "decs" => {
+                add_i32(&mut result.months, number, 120, fraction)?
+            },
+            "year" | "yr" | "y" | "years" | "yrs" => {
+                add_i32(&mut result.months, number, 12, fraction)?
+            },
+            "quarter" | "quarters" => {
+                add_i32(&mut result.months, number, 3, fraction)?;
+                let fraction = (fraction * 3) % MICROS_PER_SEC;
+                add_i32(&mut result.days, 0, DAYS_PER_MONTH, fraction)?;
+            },
+            "month" | "mon" | "months" | "mons" => {
+                add_i32(&mut result.months, number, 1, 0)?;
+                add_i32(&mut result.days, 0, DAYS_PER_MONTH, fraction)?;
+            },
+            "day" | "days" | "d" | "dayofmonth" => {
+                add_i32(&mut result.days, number, 1, 0)?;
+                add_i64(&mut result.micros, 0, MICROS_PER_DAY, fraction)?;
+            },
+            "week" | "weeks" | "w" | "weekofyear" => {
+                add_i32(&mut result.days, number, DAYS_PER_WEEK, fraction)?;
+                let fraction = (fraction * DAYS_PER_WEEK) % MICROS_PER_SEC;
+                add_i64(&mut result.micros, 0, MICROS_PER_DAY, fraction)?;
+            },
+            "microseconds" | "microsecond" | "us" | "usec" | "usecs" | "usecond" | "useconds" => {
+                let number = number.checked_add((fraction * 2) / MICROS_PER_SEC)?;
+                add_i64(&mut result.micros, number, 1, 0)?;
+            },
+            "milliseconds" | "millisecond" | "ms" | "msec" | "msecs" | "msecond" | "mseconds" => {
+                add_i64(&mut result.micros, number, 1_000, fraction)?
+            },
+            "second" | "sec" | "seconds" | "secs" | "s" => {
+                add_i64(&mut result.micros, number, MICROS_PER_SEC, fraction)?
+            },
+            "minute" | "min" | "minutes" | "mins" | "m" => {
+                add_i64(&mut result.micros, number, MICROS_PER_MINUTE, fraction)?
+            },
+            "hour" | "hr" | "hours" | "hrs" | "h" => {
+                add_i64(&mut result.micros, number, MICROS_PER_HOUR, fraction)?
+            },
+            _ => return None,
+        }
+        found_any = true;
+    }
+    found_any.then_some(result)
+}
+
+/// The microseconds of an `HH:MM[:SS[.ffffff]]` interval time at the start of
+/// `bytes`, as DuckDB's non-strict `Time::TryConvertInterval` reads it: up to
+/// 9 hour digits, minutes and seconds of one or two digits below 60, and
+/// whatever follows the seconds ignored.
+fn parse_interval_time(bytes: &[u8]) -> Option<i64> {
+    let len = bytes.len();
+    let mut pos = 0;
+    let mut hour: i64 = 0;
+    let mut digits = 0;
+    while pos < len && bytes[pos].is_ascii_digit() {
+        digits += 1;
+        if digits > 9 {
+            return None;
+        }
+        hour = hour * 10 + i64::from(bytes[pos] - b'0');
+        pos += 1;
+    }
+    if digits == 0 || pos >= len || bytes[pos] != b':' {
+        return None;
+    }
+    pos += 1;
+    let double_digit = |pos: &mut usize| -> Option<i64> {
+        if *pos < len && bytes[*pos].is_ascii_digit() {
+            let mut value = i64::from(bytes[*pos] - b'0');
+            *pos += 1;
+            if *pos < len && bytes[*pos].is_ascii_digit() {
+                value = value * 10 + i64::from(bytes[*pos] - b'0');
+                *pos += 1;
+            }
+            Some(value)
+        } else {
+            None
+        }
+    };
+    let minute = if pos == len {
+        0
+    } else {
+        double_digit(&mut pos)?
+    };
+    if minute >= 60 {
+        return None;
+    }
+    let second = if pos >= len {
+        0
+    } else if bytes[pos] != b':' {
+        return None;
+    } else {
+        pos += 1;
+        if pos == len {
+            0
+        } else {
+            double_digit(&mut pos)?
+        }
+    };
+    if second >= 60 {
+        return None;
+    }
+    let mut micros: i64 = 0;
+    if pos < len && bytes[pos] == b'.' {
+        pos += 1;
+        let mut mult = 100_000;
+        while pos < len && bytes[pos].is_ascii_digit() {
+            if mult > 0 {
+                micros += i64::from(bytes[pos] - b'0') * mult;
+            }
+            mult /= 10;
+            pos += 1;
+        }
+    }
+    Some(((hour * 60 + minute) * 60 + second) * 1_000_000 + micros)
 }
 
 /// A snapshot that was expired, as returned by the expire operations.
@@ -211,6 +675,31 @@ fn scheduled_ids(files: &[ScheduledFile]) -> Vec<i64> {
 #[cfg(feature = "write-duckdb")]
 pub async fn cleanup_old_files_duckdb(
     writer: &crate::metadata_writer_duckdb::DuckdbMetadataWriter,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
+    let files = writer.list_scheduled_for_deletion(&criteria)?;
+    run_cleanup(
+        &data_path,
+        files,
+        object_store,
+        dry_run,
+        |files| async move { writer.remove_scheduled(&scheduled_ids(&files)) },
+    )
+    .await
+}
+
+/// Physically delete files scheduled by
+/// [`MySqlMetadataWriter::expire_snapshots`] and remove their bookkeeping rows.
+/// Returns resolved absolute paths deleted (or, for `dry_run`, paths that would
+/// be deleted).
+///
+/// [`MySqlMetadataWriter::expire_snapshots`]: crate::metadata_writer_mysql::MySqlMetadataWriter::expire_snapshots
+#[cfg(feature = "write-mysql")]
+pub async fn cleanup_old_files_mysql(
+    writer: &crate::metadata_writer_mysql::MySqlMetadataWriter,
     object_store: Arc<dyn ObjectStore>,
     criteria: CleanupCriteria,
     dry_run: bool,
@@ -531,6 +1020,20 @@ pub async fn delete_orphaned_files_duckdb(
     run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
 }
 
+/// List the MySQL catalog's `data_path` and delete every unreferenced Parquet
+/// file.
+#[cfg(feature = "write-mysql")]
+pub async fn delete_orphaned_files_mysql(
+    writer: &crate::metadata_writer_mysql::MySqlMetadataWriter,
+    object_store: Arc<dyn ObjectStore>,
+    criteria: CleanupCriteria,
+    dry_run: bool,
+) -> Result<Vec<String>> {
+    let data_path = crate::metadata_writer::MetadataWriter::get_data_path(writer)?;
+    let referenced = writer.list_referenced_paths()?;
+    run_orphan_cleanup(&data_path, referenced, object_store, criteria, dry_run).await
+}
+
 /// Sweep every registered multicatalog data path and delete unreferenced Parquet files.
 ///
 /// All roots must resolve to the same object-store authority because this API
@@ -723,4 +1226,220 @@ fn merge_data_path_groups(groups: Vec<DataPathGroup>) -> Vec<DataPathGroup> {
         }
     }
     roots
+}
+
+#[cfg(test)]
+mod older_than_tests {
+    use super::older_than;
+    use chrono::{DateTime, Duration, TimeZone, Utc};
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 3, 31, 12, 0, 0).unwrap()
+    }
+
+    /// `TIMESTAMP '2026-03-31 12:00:00' - TRY_CAST(<text> AS INTERVAL)` on the
+    /// DuckDB 1.5.5 CLI, `None` where the cast fails: what official's
+    /// `Interval::FromString` makes of each option value.
+    #[test]
+    fn interval_before_matches_duckdb() {
+        for (text, expected) in [
+            ("-00:30:00", Some("2026-03-31 12:30:00")),
+            ("-01:30:00", Some("2026-03-31 13:30:00")),
+            ("00:30:00", Some("2026-03-31 11:30:00")),
+            ("1 day 02:00:00", Some("2026-03-30 10:00:00")),
+            ("1 hour -00:30:00", Some("2026-03-31 13:30:00")),
+            ("2 days ago", Some("2026-04-02 12:00:00")),
+            ("1 day ago", Some("2026-04-01 12:00:00")),
+            ("1", Some("2026-03-31 11:59:59")),
+            ("1.5", Some("2026-03-31 11:59:58.5")),
+            ("-1", Some("2026-03-31 12:00:01")),
+            ("-1.5", Some("2026-03-31 12:00:01.5")),
+            ("+1 day", None),
+            (".5 days", None),
+            ("0.5 days", Some("2026-03-31 00:00:00")),
+            ("1.5 hours", Some("2026-03-31 10:30:00")),
+            ("1h30m", Some("2026-03-31 10:30:00")),
+            ("90 min", Some("2026-03-31 10:30:00")),
+            ("2 weeks", Some("2026-03-17 12:00:00")),
+            ("1.5 weeks", Some("2026-03-21 00:00:00")),
+            ("1 mon", Some("2026-02-28 12:00:00")),
+            ("1.5 months", Some("2026-02-13 12:00:00")),
+            ("1.7 years", Some("2024-07-31 12:00:00")),
+            ("0.5 quarter", Some("2026-02-13 12:00:00")),
+            ("@ 2 days", Some("2026-03-29 12:00:00")),
+            ("@2 days", Some("2026-03-29 12:00:00")),
+            ("2 DAYS", Some("2026-03-29 12:00:00")),
+            ("2days", Some("2026-03-29 12:00:00")),
+            ("1 day garbage", None),
+            ("00:30:00 garbage", Some("2026-03-31 11:30:00")),
+            ("00:30:00 2 days", Some("2026-03-31 11:30:00")),
+            ("- 1 day", None),
+            ("--1 day", None),
+            ("1 day 1 day", Some("2026-03-29 12:00:00")),
+            ("1 fortnight", None),
+            ("25:00:00", Some("2026-03-30 11:00:00")),
+            ("00:60:00", None),
+            ("1:2:3", Some("2026-03-31 10:57:57")),
+            ("10:5", Some("2026-03-31 01:55:00")),
+            ("1 yr 2 mons 3 d", Some("2025-01-28 12:00:00")),
+            ("1 millenium", Some("1026-03-31 12:00:00")),
+            ("1 dayofmonth", Some("2026-03-30 12:00:00")),
+            ("1 epoch", None),
+            ("3 usecond", Some("2026-03-31 11:59:59.999997")),
+            ("1.5 microseconds", Some("2026-03-31 11:59:59.999998")),
+            ("1 ago", None),
+            ("ago", None),
+            ("1 day  ago  ", Some("2026-04-01 12:00:00")),
+            ("P1D", None),
+            (" 2 days", Some("2026-03-29 12:00:00")),
+            ("2 days ", Some("2026-03-29 12:00:00")),
+            ("00:30 garbage", None),
+            ("10:", Some("2026-03-31 02:00:00")),
+            ("1234567890:00:00", None),
+            ("1.5 quarters", Some("2025-11-15 12:00:00")),
+            ("1 day 2 hours ago", Some("2026-04-01 14:00:00")),
+            ("-1 day ago", Some("2026-03-30 12:00:00")),
+            ("1.5 days", Some("2026-03-30 00:00:00")),
+            ("3 ms", Some("2026-03-31 11:59:59.997")),
+            ("1.0000005 seconds", Some("2026-03-31 11:59:59")),
+            ("-2 days 03:00:00", Some("2026-04-02 09:00:00")),
+        ] {
+            let got = super::interval_before(text, now()).ok();
+            let expected = expected.map(|expected| {
+                chrono::NaiveDateTime::parse_from_str(expected, "%Y-%m-%d %H:%M:%S%.f")
+                    .unwrap()
+                    .and_utc()
+            });
+            assert_eq!(got, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parses_duckdb_interval_strings() {
+        for (text, expected) in [
+            ("2 days", now() - Duration::days(2)),
+            ("1 week", now() - Duration::days(7)),
+            ("1d", now() - Duration::days(1)),
+            ("90 min", now() - Duration::minutes(90)),
+            ("1h30m", now() - Duration::minutes(90)),
+            ("1.5 hours", now() - Duration::minutes(90)),
+            ("00:30:00", now() - Duration::minutes(30)),
+            ("1 day 02:00:00", now() - Duration::hours(26)),
+            (
+                "1 mon",
+                Utc.with_ymd_and_hms(2026, 2, 28, 12, 0, 0).unwrap(),
+            ),
+            (
+                "2 years",
+                Utc.with_ymd_and_hms(2024, 3, 31, 12, 0, 0).unwrap(),
+            ),
+        ] {
+            assert_eq!(older_than(text, now()).unwrap(), expected, "{text}");
+        }
+    }
+
+    /// Negating the microseconds for `ago` or a negative time wraps as
+    /// DuckDB 1.5.5's does: `'-1 us -9223372036854775807 us ago'` and
+    /// `'-1 us -9223372036854775807 us -00:00'` are both `-9223372036854775808`
+    /// microseconds.
+    #[test]
+    fn negating_the_smallest_micros_wraps_as_duckdb_does() {
+        for text in ["-1 us -9223372036854775807 us ago", "-1 us -9223372036854775807 us -00:00"] {
+            assert_eq!(
+                super::parse_duckdb_interval(text),
+                Some(super::DuckdbInterval {
+                    months: 0,
+                    days: 0,
+                    micros: i64::MIN,
+                }),
+                "{text}"
+            );
+            assert!(older_than(text, now()).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn rejects_what_duckdb_rejects() {
+        for text in ["", "soon", "2 fortnights", "1 q", "1 qtr"] {
+            assert!(older_than(text, now()).is_err(), "{text}");
+        }
+    }
+
+    /// Fractions of month-or-longer units as DuckDB 1.5.5 parses them:
+    /// `INTERVAL '1.5 months'` is `1 month 15 days`, `'1.04 months'` is `1 month
+    /// 1 day`, `'1.7 years'` is `1 year 8 months`, `'0.5 quarter'` is `1 month
+    /// 15 days`, `'0.001 centuries'` is `1 month`.
+    #[test]
+    fn parses_fractional_months_as_duckdb_does() {
+        let months_days = |months: u32, days: i64| {
+            now()
+                .checked_sub_months(chrono::Months::new(months))
+                .unwrap()
+                - Duration::days(days)
+        };
+        for (text, expected) in [
+            ("1.5 months", months_days(1, 15)),
+            ("1.04 months", months_days(1, 1)),
+            ("1.99 months", months_days(1, 29)),
+            ("1.7 years", months_days(20, 0)),
+            ("1.25 years", months_days(15, 0)),
+            ("0.15 decades", months_days(18, 0)),
+            ("0.5 quarter", months_days(1, 15)),
+            ("0.001 centuries", months_days(1, 0)),
+            ("1.5 weeks", now() - Duration::hours(252)),
+        ] {
+            assert_eq!(older_than(text, now()).unwrap(), expected, "{text}");
+        }
+    }
+
+    /// `expire_older_than` takes a negative interval, as official does: its
+    /// cutoff is after now.
+    #[test]
+    fn interval_before_accepts_negative_intervals() {
+        assert_eq!(
+            super::interval_before("-1 day", now()).unwrap(),
+            now() + Duration::days(1)
+        );
+        assert_eq!(
+            super::interval_before("-1.5 months", now()).unwrap(),
+            now().checked_add_months(chrono::Months::new(1)).unwrap() + Duration::days(15)
+        );
+    }
+
+    /// Values beyond any representable interval fail with a typed error rather
+    /// than overflowing.
+    #[test]
+    fn rejects_absurd_intervals() {
+        for text in [
+            "99999999999999999999 years",
+            "9223372036854775807 months",
+            "768614336404564650 years",
+            "99999999999999999999 days",
+            "9223372036854775807 years 9223372036854775807 years",
+            "999999999999999999999999:00:00",
+        ] {
+            assert!(
+                matches!(
+                    older_than(text, now()),
+                    Err(crate::DuckLakeError::InvalidConfig(_))
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    /// A negative interval would give a cutoff in the future.
+    #[test]
+    fn rejects_a_future_cutoff() {
+        for text in ["-1 day", "-1 mon", "1 day -2 days"] {
+            assert!(
+                matches!(
+                    older_than(text, now()),
+                    Err(crate::DuckLakeError::InvalidConfig(_))
+                ),
+                "{text}"
+            );
+        }
+        assert_eq!(older_than("0 days", now()).unwrap(), now());
+    }
 }

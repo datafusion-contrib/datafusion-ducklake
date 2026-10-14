@@ -437,6 +437,12 @@ async fn partitioned_update_commits_one_partition_file_atomically() {
     use sqlx::sqlite::SqlitePool;
 
     let env = setup().await;
+    // The row and its new version are written to Parquet, not inlined.
+    SqliteMetadataWriter::new(&env.conn_str)
+        .await
+        .unwrap()
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let ctx = write_ctx(&env.conn_str).await;
     let inserted = ctx
         .sql(
@@ -516,13 +522,21 @@ async fn partitioned_update_commits_one_partition_file_atomically() {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let ended: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ducklake_data_file WHERE end_snapshot = ?")
+            .bind(snapshot)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(snapshot, before_snapshot + 1);
     assert_eq!(
         partition_values,
         vec![(0, Some("eu".to_string())), (1, Some("2024".to_string()))],
     );
-    assert_eq!(delete_count, 1);
+    // The UPDATE rewrote the source file's only row, so the source is ended,
+    // as official ends a file a statement empties, rather than masked.
+    assert_eq!((delete_count, ended), (0, 1));
     assert_eq!(rows.num_rows(), 1);
     assert_eq!(
         rows.column(0)

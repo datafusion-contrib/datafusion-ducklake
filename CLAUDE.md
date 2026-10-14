@@ -10,7 +10,7 @@ DataFusion-DuckLake is a DataFusion extension that provides read and write acces
 
 The extension integrates DuckLake with Apache DataFusion by implementing DataFusion's catalog and table provider interfaces.
 
-Reads are supported on all four catalog backends. Writes are feature-gated and currently implemented for SQLite (`write-sqlite`) and PostgreSQL (`write-postgres`). Both have a **standard single-catalog** writer (`SqliteMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
+Reads are supported on all four catalog backends. Writes are feature-gated and implemented for SQLite (`write-sqlite`), PostgreSQL (`write-postgres`), DuckDB (`write-duckdb`) and MySQL (`write-mysql`). Both have a **standard single-catalog** writer (`SqliteMetadataWriter`, `PostgresSingleCatalogMetadataWriter`) that produces the spec-compliant layout and supports SQL `CREATE TABLE` + `INSERT INTO`. PostgreSQL additionally has `PostgresMetadataWriter`, the **experimental, library-specific multi-catalog layout** (not part of the DuckLake spec) where tables are created via `DuckLakeTableWriter` and appended to with `INSERT INTO`. See `COMPATIBILITY.md` for the full backend/feature matrix.
 
 ## Commands
 
@@ -239,8 +239,9 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 
 - Non-empty `CREATE TABLE AS SELECT` is rejected before publishing metadata.
   Create an empty table, reopen the catalog, then use `INSERT INTO ... SELECT`.
-- Writes are supported on SQLite and PostgreSQL only; DuckDB and MySQL are read-only
-- No `UPDATE` / `DELETE` operations yet (delete files are read but not written)
+- Writes, including SQL `UPDATE` and `DELETE`, are supported on SQLite, DuckDB, MySQL and
+  PostgreSQL; the single-catalog PostgreSQL writer supports neither `UPDATE` nor `DELETE`
+  (see `COMPATIBILITY.md`)
 - No SQL `AS OF` syntax; use `DuckLakeCatalog::with_snapshot`,
   `DuckLakeCatalog::with_snapshot_at`, or `ducklake_table_at` for snapshot selection
 - Complex types (nested lists, structs, maps) have minimal support (many cases return errors)
@@ -257,14 +258,12 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
   files in one commit and can establish the spec on that same snapshot). `enforce_partition_fence`
   guards every commit path, so a file can never land inconsistent with the table's live spec.
   See `src/partition.rs`.
-  Not yet supported: `UPDATE`/upsert on a partitioned table — the new row versions span one file
-  per partition, but the atomic append+delete commit registers a single data file; the session's
-  `finish_with_deletes` refuses it with a typed error. Likewise
-  `begin_write_with_embedded_rowid` and `begin_write_to_path`, which write to one
-  caller-determined file.
+  An `UPDATE` of a partitioned table writes one file per partition and commits them with its
+  deletions in one snapshot (`finish_with_deletes`). `begin_write_to_path`, which writes one
+  caller-determined file, refuses a partitioned table with a typed error.
 - DuckDB-encrypted (non-PME) Parquet files are not supported
-- Inlined rows participate in scans and `COUNT(*)`; see `COMPATIBILITY.md` for
-  mutation and CDC limits.
+- Inlined rows participate in scans, `COUNT(*)`, mutations, `rowid` and change feeds; see
+  `COMPATIBILITY.md` for the remaining differences from official DuckLake.
 - No optional metadata caching layer (all lookups are dynamic)
 
 ### Testing

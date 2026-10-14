@@ -67,6 +67,11 @@ async fn data_path_on_any_object_store_scheme(#[case] scheme: &str) {
 
     let writer = Arc::new(SqliteMetadataWriter::new_with_init(&conn).await.unwrap());
     writer.set_data_path(&data_path).unwrap();
+    // The DML below writes data and delete files through the store rather
+    // than inlining its few rows.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let batch = RecordBatch::try_new(
         schema(),
         vec![

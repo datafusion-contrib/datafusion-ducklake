@@ -26,7 +26,8 @@
 //! `MetadataWriter::commit_compaction`: the rewritten outputs are registered, the
 //! source files (and, for a rewrite, their delete files) are retired
 //! (`end_snapshot` set) and scheduled for physical deletion, and
-//! `ducklake_snapshot_changes.changes_made` records `compacted_table:<table_id>`.
+//! `ducklake_snapshot_changes.changes_made` records `merge_adjacent:<table_id>` or
+//! `rewrite_delete:<table_id>`, as official's compaction does.
 //! Compaction changes the physical layout, not the logical rows, so the commit is
 //! structured NOT to conflict with a concurrent append; it aborts only if a
 //! source file was retired, or its live rows changed, since it was read (the
@@ -789,34 +790,49 @@ fn without_column(
 }
 
 impl DuckLakeTable {
-    /// The live partition spec's key column names in key order, used only to build
-    /// the readable Hive directory of a compaction output.
-    ///
-    /// Empty when the table is unpartitioned, when `partition_id` is a *retired*
-    /// generation (whose key order may differ from the live one, so live names would
-    /// mislabel the directory), or when a key's column has since been dropped. The
-    /// catalog is the authoritative source of partition values, so degrading to
-    /// positional `key=…` naming costs readability only — never correctness.
+    /// The Hive directory a compaction output of the partition `(partition_id,
+    /// values)` lands in, whose sources include `source`: named as official
+    /// names a partition's directory (`GetPartitionKeyName`) when
+    /// `partition_id` is the live generation, else the source's own Hive
+    /// directory, which its generation's writer named. Empty names (positional
+    /// `key=…`) only when neither is known, as for a key whose column has since
+    /// been dropped. The catalog is the authoritative source of partition
+    /// values, so the directory costs readability only — never correctness.
     #[cfg(feature = "write")]
-    fn partition_path_names(
+    fn partition_subpath(
         &self,
         live: Option<&PartitionSpec>,
         partition_id: i64,
+        values: &[Option<String>],
         column_ids: &[i64],
-    ) -> Vec<String> {
-        let Some(spec) = live.filter(|spec| spec.partition_id == partition_id) else {
-            return Vec::new();
-        };
-        let schema = self.physical_schema();
-        let names: Option<Vec<String>> = spec
-            .columns
-            .iter()
-            .map(|column| {
-                let index = column_ids.iter().position(|id| *id == column.column_id)?;
-                Some(schema.field(index).name().to_string())
-            })
-            .collect();
-        names.unwrap_or_default()
+        source: &DuckLakeTableFile,
+    ) -> String {
+        if let Some(spec) = live.filter(|spec| spec.partition_id == partition_id) {
+            let schema = self.physical_schema();
+            let keys: Option<Vec<(String, &crate::partition::PartitionTransform)>> = spec
+                .columns
+                .iter()
+                .map(|column| {
+                    let index = column_ids.iter().position(|id| *id == column.column_id)?;
+                    Some((schema.field(index).name().to_string(), &column.transform))
+                })
+                .collect();
+            if let Some(keys) = keys {
+                let names = crate::partition::hive_key_names(
+                    keys.iter()
+                        .map(|(name, transform)| (name.as_str(), *transform)),
+                );
+                return crate::partition::hive_subpath(&names, values);
+            }
+        }
+        if source.file.path_is_relative
+            && let Some((directory, _)) = source.file.path.rsplit_once('/')
+            && !directory.is_empty()
+            && directory.split('/').all(|segment| segment.contains('='))
+        {
+            return directory.to_string();
+        }
+        crate::partition::hive_subpath(&[], values)
     }
 
     /// Merge several small adjacent data files of this table into fewer larger
@@ -883,6 +899,7 @@ impl DuckLakeTable {
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
+        crate::inlined_flush::refuse_encrypted_catalog(writer.as_ref(), "merge_adjacent_files")?;
         self.write_options().validate()?;
         if !self.write_options().auto_compact.unwrap_or(true) {
             return Ok(CompactionResult::empty());
@@ -1208,12 +1225,13 @@ impl DuckLakeTable {
             let subpath = partition_id
                 .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
                 .map(|pid| {
-                    let names = self.partition_path_names(
+                    self.partition_subpath(
                         live_partition_spec.as_ref(),
                         pid,
+                        &partition_values,
                         &top_level_column_ids,
-                    );
-                    crate::partition::hive_subpath(&names, &partition_values)
+                        bin[0],
+                    )
                 });
             let mut file = table_writer
                 .write_compacted_file_stream_with_lineage(
@@ -1319,6 +1337,7 @@ impl DuckLakeTable {
                     .to_string(),
             )
         })?;
+        crate::inlined_flush::refuse_encrypted_catalog(writer.as_ref(), "rewrite_data_files")?;
         let schema_name = self.schema_name().ok_or_else(|| {
             DuckLakeError::Internal("writable table has no schema name".to_string())
         })?;
@@ -1421,12 +1440,13 @@ impl DuckLakeTable {
             let subpath = partition_id
                 .filter(|_| self.write_options().hive_file_pattern.unwrap_or(true))
                 .map(|pid| {
-                    let names = self.partition_path_names(
+                    self.partition_subpath(
                         live_partition_spec.as_ref(),
                         pid,
+                        &partition_values,
                         &top_level_column_ids,
-                    );
-                    crate::partition::hive_subpath(&names, &partition_values)
+                        tf,
+                    )
                 });
             let file = table_writer
                 .write_compacted_file_stream(
@@ -1480,6 +1500,246 @@ impl DuckLakeTable {
             rows_written,
         })
     }
+}
+
+/// What [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint) did,
+/// phase by phase.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointResult {
+    /// Tables whose inlined rows were flushed to Parquet.
+    pub flushed: Vec<crate::inlined_flush::FlushedInlinedTable>,
+    /// Snapshots expired; empty when `expire_older_than` is not set.
+    pub expired: Vec<crate::maintenance::ExpiredSnapshot>,
+    /// `(schema, table, result)` for every table `merge_adjacent_files` compacted.
+    pub merged: Vec<(String, String, CompactionResult)>,
+    /// `(schema, table, result)` for every table `rewrite_data_files` rewrote.
+    pub rewritten: Vec<(String, String, CompactionResult)>,
+    /// Paths `cleanup_old_files` deleted.
+    pub cleaned_up: Vec<String>,
+    /// Paths `delete_orphaned_files` deleted.
+    pub orphans_deleted: Vec<String>,
+}
+
+/// `delete_older_than`'s default, as official's cleanup functions read it.
+const DEFAULT_DELETE_OLDER_THAN: &str = "2 days";
+
+impl crate::DuckLakeCatalog {
+    /// Run official DuckLake's `CHECKPOINT`: its six maintenance phases in its
+    /// order, each committing on its own, with official's option defaults.
+    ///
+    /// 1. [`Self::flush_inlined_data`] on every table (it can produce many small
+    ///    files, which compaction then merges).
+    /// 2. Snapshot expiry of the snapshots older than the catalog's
+    ///    `expire_older_than` option; skipped when the option is not set, as
+    ///    official's `ducklake_expire_snapshots` without arguments is.
+    /// 3. [`DuckLakeTable::merge_adjacent_files`] on every table, up to the
+    ///    table's `target_file_size`, with no cap on the files merged.
+    /// 4. [`DuckLakeTable::rewrite_data_files`] on every table, at the table's
+    ///    `rewrite_delete_threshold` (default `0.95`).
+    /// 5. File cleanup of the files scheduled for deletion before the catalog's
+    ///    `delete_older_than` option (default `2 days`).
+    /// 6. Deletion of the unreferenced Parquet files older than
+    ///    `delete_older_than`.
+    ///
+    /// Tables with `auto_compact` set to `false` are skipped by phases 1, 3 and
+    /// 4, as official does. Each phase stays callable on its own: the methods
+    /// above, and the backend's
+    /// [`CatalogMaintenance`](crate::maintenance::CatalogMaintenance) commands.
+    /// A failing phase stops the checkpoint with the phases before it committed,
+    /// as official's `CHECKPOINT` does.
+    ///
+    /// Phases 2, 5 and 6 are backend-specific and dispatched through
+    /// [`MetadataWriter::maintenance`](crate::metadata_writer::MetadataWriter::maintenance).
+    /// A writer without them (the single-catalog PostgreSQL writer) fails with
+    /// [`DuckLakeError::Unsupported`] before any phase runs. On a catalog whose
+    /// `encrypted` option is `true` the phases that write Parquet (1, 3 and 4)
+    /// are skipped, since this crate writes no encrypted Parquet files, and
+    /// expiry and cleanup run. Errors also when the catalog is read-only, or an
+    /// interval option does not parse.
+    pub async fn checkpoint(&self, state: &dyn Session) -> Result<CheckpointResult> {
+        let writer = self.writer().ok_or_else(|| {
+            DuckLakeError::InvalidConfig(
+                "checkpoint: catalog is read-only; open it with a writer".to_string(),
+            )
+        })?;
+        if writer.maintenance().is_none() {
+            return Err(DuckLakeError::Unsupported(
+                "checkpoint: this metadata writer implements no snapshot expiry or file \
+                 cleanup; run flush_inlined_data, merge_adjacent_files and \
+                 rewrite_data_files on their own"
+                    .to_string(),
+            ));
+        }
+        let provider = self.provider();
+        let settings = provider.get_metadata_settings(None, None)?;
+        let encrypted = writer.catalog_encrypted()?;
+        if encrypted {
+            tracing::warn!(
+                "checkpoint: the catalog is encrypted; skipping the flush, merge and rewrite \
+                 phases, which would write unencrypted Parquet"
+            );
+        }
+        let expire_older_than = settings
+            .get("expire_older_than")
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let delete_older_than = settings
+            .get("delete_older_than")
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_DELETE_OLDER_THAN.to_string());
+        // As official's CHECKPOINT runs its phases one after another, an
+        // option a phase cannot use fails that phase, after the earlier ones
+        // committed.
+
+        // 1. Flush.
+        let flushed = if encrypted {
+            Vec::new()
+        } else {
+            self.flush_inlined_data(state, None, None).await?
+        };
+        let mut result = CheckpointResult {
+            flushed,
+            ..CheckpointResult::default()
+        };
+        let maintenance = writer
+            .maintenance()
+            .expect("maintenance support checked above");
+
+        // 2. Expire.
+        if let Some(interval) = &expire_older_than {
+            let cutoff = crate::maintenance::interval_before(interval, chrono::Utc::now())?;
+            result.expired = maintenance
+                .expire_snapshots(crate::maintenance::ExpireCriteria::OlderThan(cutoff))
+                .await?;
+        }
+
+        // 3. Merge adjacent files.
+        let compacted_tables = if encrypted {
+            Vec::new()
+        } else {
+            self.live_table_names()?
+        };
+        for (schema, table) in compacted_tables.iter().cloned() {
+            if let Some(handle) = self.open_table(&schema, &table).await? {
+                let options = MergeOptions {
+                    target_file_size: handle
+                        .write_options()
+                        .target_file_size
+                        .unwrap_or(crate::table_writer::DEFAULT_TARGET_FILE_SIZE)
+                        as u64,
+                    max_merged_files: usize::MAX,
+                    min_file_size: 0,
+                };
+                let merged = handle.merge_adjacent_files(state, options).await?;
+                if merged.did_work() {
+                    result.merged.push((schema, table, merged));
+                }
+            }
+        }
+
+        // 4. Rewrite data files.
+        let rewritten_tables = if encrypted {
+            Vec::new()
+        } else {
+            self.live_table_names()?
+        };
+        for (schema, table) in rewritten_tables {
+            if let Some(handle) = self.open_table(&schema, &table).await? {
+                let options = RewriteOptions {
+                    delete_threshold: rewrite_delete_threshold(
+                        &handle,
+                        provider
+                            .get_schema_by_name(&schema, provider.get_current_snapshot()?)?
+                            .map(|meta| meta.schema_id),
+                    )?,
+                    data_file_ids: None,
+                };
+                let rewritten = handle.rewrite_data_files(state, options).await?;
+                if rewritten.did_work() {
+                    result.rewritten.push((schema, table, rewritten));
+                }
+            }
+        }
+
+        // 5. and 6. Clean up old and orphaned files.
+        if delete_older_than.is_empty() {
+            return Err(DuckLakeError::InvalidConfig(
+                "ducklake_cleanup_old_files: either cleanup_all OR older_than must be specified"
+                    .to_string(),
+            ));
+        }
+        let data_path = provider.get_data_path()?;
+        let (url, _) = crate::path_resolver::parse_object_store_url(&data_path)?;
+        let object_store = state.runtime_env().object_store(&url)?;
+        let cutoff = crate::maintenance::older_than(&delete_older_than, chrono::Utc::now())?;
+        result.cleaned_up = maintenance
+            .cleanup_old_files(
+                Arc::clone(&object_store),
+                crate::maintenance::CleanupCriteria::OlderThan(cutoff),
+                false,
+            )
+            .await?;
+        let cutoff = crate::maintenance::older_than(&delete_older_than, chrono::Utc::now())?;
+        result.orphans_deleted = maintenance
+            .delete_orphaned_files(
+                object_store,
+                crate::maintenance::CleanupCriteria::OlderThan(cutoff),
+                false,
+            )
+            .await?;
+        Ok(result)
+    }
+
+    /// `(schema, table)` for every table live at the catalog head.
+    fn live_table_names(&self) -> Result<Vec<(String, String)>> {
+        let provider = self.provider();
+        let snapshot = provider.get_current_snapshot()?;
+        let mut names = Vec::new();
+        for schema in provider.list_schemas(snapshot)? {
+            for table in provider.list_tables(schema.schema_id, snapshot)? {
+                names.push((schema.schema_name.clone(), table.table_name));
+            }
+        }
+        Ok(names)
+    }
+
+    /// Open `schema.table` at the catalog head; `None` for a view or a table
+    /// dropped meanwhile.
+    async fn open_table(&self, schema: &str, table: &str) -> Result<Option<Arc<DuckLakeTable>>> {
+        use datafusion::catalog::CatalogProvider;
+        let Some(schema) = self.schema(schema) else {
+            return Ok(None);
+        };
+        let Some(provider) = schema.table(table).await? else {
+            return Ok(None);
+        };
+        Ok(provider
+            .downcast_ref::<DuckLakeTable>()
+            .map(|table| Arc::new(table.clone())))
+    }
+}
+
+/// The table's `rewrite_delete_threshold` option (table, then schema, then
+/// global), `0.95` when unset, as official's rewrite reads it.
+fn rewrite_delete_threshold(table: &DuckLakeTable, schema_id: Option<i64>) -> Result<f64> {
+    let settings = table
+        .provider()
+        .get_metadata_settings(schema_id, Some(table.table_id()))?;
+    let Some(value) = settings.get("rewrite_delete_threshold") else {
+        return Ok(0.95);
+    };
+    let threshold = value.trim().parse::<f64>().map_err(|_| {
+        DuckLakeError::InvalidConfig(format!(
+            "rewrite_delete_threshold '{value}' is not a number"
+        ))
+    })?;
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err(DuckLakeError::InvalidConfig(
+            "The delete_threshold option must be between 0 and 1".to_string(),
+        ));
+    }
+    Ok(threshold)
 }
 
 #[cfg(test)]

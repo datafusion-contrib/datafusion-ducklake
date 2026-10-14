@@ -193,6 +193,12 @@ async fn files_matching_returns_only_the_file_whose_statistics_admit_the_key() {
 async fn a_rewritten_file_is_returned_and_reports_an_embedded_rowid() {
     let temp_dir = TempDir::new().unwrap();
     seed_table(&temp_dir, vec![1, 2, 3], vec![10, 20, 30]).await;
+    // The UPDATE writes Parquet rather than inlining its one row.
+    SqliteMetadataWriter::new(&conn_str(&temp_dir, true))
+        .await
+        .unwrap()
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     // Rewrites the seeded file: the new file carries the surviving rows with
     // their original row ids embedded, and a positional delete supersedes the
     // old copies.

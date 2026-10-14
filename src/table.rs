@@ -13,11 +13,15 @@ use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
 use crate::field_id_adapter::{DefaultFill, FieldIdExprAdapterFactory, RowLineageProbes};
 use crate::inlined_filter::{InlinedDataScan, InlinedFilter, translate_inlined_filters};
-use crate::lazy_delete_filter::{FileDeletes, LazyDeleteFilterExec, read_delete_positions};
+use crate::lazy_delete_filter::{
+    FileDeletes, LazyDeleteFilterExec, read_delete_entries, read_delete_positions,
+};
+#[cfg(feature = "write")]
+use crate::metadata_provider::INLINED_DATA_REMEDIATION;
 use crate::metadata_provider::{
     DuckLakeFileColumnStatistics, DuckLakeFileData, DuckLakeFileMetadata, DuckLakeNameMapping,
     DuckLakeStatistics, DuckLakeTableColumn, DuckLakeTableColumnStatistics, DuckLakeTableField,
-    DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, INLINED_DATA_REMEDIATION, MetadataProvider,
+    DuckLakeTableFile, FILE_METADATA_BATCH_SIZE, MetadataProvider,
 };
 use crate::nan_pruning_barrier::NanPruningBarrierExec;
 use crate::open_time_filter_barrier::OpenTimeFilterBarrierExec;
@@ -387,14 +391,25 @@ fn float_bound_is_usable(data_type: &DataType, contains_nan: Option<bool>) -> bo
     ) || contains_nan == Some(false)
 }
 
+/// A bound read from catalog statistics, `Exact` when `exact` says so. A float
+/// zero bound is never exact: `-0.0` and `0.0` compare equal, so a file of both
+/// may record either as both bounds (DuckDB records the first it meets), and
+/// an exact `min == max` would let DataFusion read the column as that one
+/// constant, changing the sign of the other rows.
 fn scalar_precision(
     value: Option<&str>,
     column: &DuckLakeTableColumn,
     data_type: &DataType,
     exact: bool,
 ) -> Precision<ScalarValue> {
+    let signed_zero = |value: &ScalarValue| match value {
+        ScalarValue::Float16(Some(v)) => v.to_f32() == 0.0,
+        ScalarValue::Float32(Some(v)) => *v == 0.0,
+        ScalarValue::Float64(Some(v)) => *v == 0.0,
+        _ => false,
+    };
     match value.and_then(|value| parse_statistic_scalar(value, column, data_type)) {
-        Some(value) if exact => Precision::Exact(value),
+        Some(value) if exact && !signed_zero(&value) => Precision::Exact(value),
         Some(value) => Precision::Inexact(value),
         None => Precision::Absent,
     }
@@ -590,7 +605,8 @@ fn build_datafusion_statistics(
     let mut table_statistics = Statistics::new_unknown(schema);
 
     // Per-file row counts are snapshot-aware and exact when all required
-    // counts are present. Fall back to the approximate current-table counter.
+    // counts are present. Fall back to the current-table counter, an upper
+    // bound: `ducklake_table_stats.record_count` counts every row ever inserted.
     let mut row_total = Some(0usize);
     for file in table_files {
         let value = file_row_count(file, file_column_rows.get(&file.data_file_id));
@@ -607,7 +623,7 @@ fn build_datafusion_statistics(
             .as_ref()
             .and_then(|stats| stats.record_count)
             .and_then(|value| statistic_usize(value, "table_stats.record_count"))
-            .map(Precision::Exact)
+            .map(Precision::Inexact)
             .unwrap_or(Precision::Absent)
     } else {
         Precision::Absent
@@ -633,8 +649,8 @@ fn build_datafusion_statistics(
         let output = &mut table_statistics.column_statistics[index];
 
         // Table-column rows are not snapshot-versioned. Only use them for the
-        // current table generation, and mark bounds inexact because deletes can
-        // leave conservative (wider) bounds behind.
+        // current table generation, and mark bounds inexact: they only widen, so
+        // deletes, retired files and truncates leave them wider than the rows.
         if use_current_table_statistics && let Some(raw) = table_column_rows.get(&column.column_id)
         {
             if raw.contains_null == Some(false) {
@@ -642,22 +658,12 @@ fn build_datafusion_statistics(
             }
             let bounds_usable = float_bound_is_usable(field_type, raw.contains_nan);
             output.min_value = if bounds_usable {
-                scalar_precision(
-                    raw.min_value.as_deref(),
-                    column,
-                    field_type,
-                    raw.bounds_are_exact,
-                )
+                scalar_precision(raw.min_value.as_deref(), column, field_type, false)
             } else {
                 Precision::Absent
             };
             output.max_value = if bounds_usable {
-                scalar_precision(
-                    raw.max_value.as_deref(),
-                    column,
-                    field_type,
-                    raw.bounds_are_exact,
-                )
+                scalar_precision(raw.max_value.as_deref(), column, field_type, false)
             } else {
                 Precision::Absent
             };
@@ -939,6 +945,8 @@ pub(crate) struct ParquetFooterFacts {
     /// Number of row groups in the file. Bounds how far a scan of it can
     /// usefully be split across partitions.
     pub(crate) row_group_count: usize,
+    /// Number of rows the footer records.
+    pub(crate) row_count: i64,
 }
 
 /// A file's footer resolved against a table's CURRENT columns: the schema to
@@ -1090,6 +1098,7 @@ pub(crate) async fn read_parquet_footer_facts(
         field_ids,
         arrow_schema,
         row_group_count: metadata.row_groups().len(),
+        row_count: metadata.file_metadata().num_rows(),
     })
 }
 
@@ -2662,6 +2671,57 @@ impl DuckLakeTable {
             .await
     }
 
+    /// Every position `delete_file` deletes, with the snapshot it records for
+    /// the position, or `None` where it records none.
+    pub(crate) async fn read_delete_file_entries(
+        &self,
+        state: &dyn Session,
+        delete_file: &DuckLakeFileData,
+    ) -> DataFusionResult<HashMap<i64, Option<i64>>> {
+        let (scan, resolved_delete_path) = self.delete_file_scan(state, delete_file)?;
+        let entries = read_delete_entries(
+            &scan,
+            &state.task_ctx(),
+            self.object_store_url.as_ref(),
+            &resolved_delete_path,
+        )
+        .await?;
+        Ok(entries.into_iter().collect())
+    }
+
+    /// The number of rows data file `file` holds, from its Parquet footer: for
+    /// a file whose catalog row records no `record_count`.
+    pub(crate) async fn data_file_row_count(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<i64> {
+        let resolved = resolve_path(&self.table_path, &file.path, file.path_is_relative)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let facts = read_parquet_footer_facts(
+            state,
+            self.object_store_url.as_ref(),
+            &resolved,
+            Some(file.file_size_bytes),
+            file.footer_size,
+            file.encryption_key.as_deref(),
+        )
+        .await?;
+        Ok(facts.row_count)
+    }
+
+    /// The `begin_snapshot` of delete file `delete_file_id`.
+    pub(crate) fn delete_file_begin_snapshot(&self, delete_file_id: i64) -> DataFusionResult<i64> {
+        self.provider
+            .get_delete_file_begin_snapshot(delete_file_id)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "delete file {delete_file_id} is not in the catalog"
+                ))
+            })
+    }
+
     /// The positions a delete file removes from a read at this table's
     /// snapshot: those whose recorded deletion snapshot, where the file records
     /// one, is not after it. For read paths only; a write that supersedes the
@@ -3962,9 +4022,9 @@ impl DuckLakeTable {
     /// `files` are resolved by field id; a name-mapped merged file, which neither
     /// this crate nor official writes, keeps [`Self::build_exec_for_partial_file`].
     ///
-    /// No delete file can be live on such a file at such a snapshot (a delete
-    /// on a merged file is authored after the merge that produced it); one that
-    /// is fails the plan rather than go unapplied. Inlined deletes apply.
+    /// `inlined_deletes` carries each file's deletions, its delete file's
+    /// included (see [`Self::absorb_partial_delete_files`]); a file still
+    /// carrying a delete file fails the plan rather than go unapplied.
     fn build_exec_for_partial_files(
         &self,
         state: &dyn Session,
@@ -4138,6 +4198,45 @@ impl DuckLakeTable {
     /// Output schema for a rowid-projected scan: physical fields
     /// (using their user-facing renamed names from `self.schema`) interleaved
     /// with the synthetic `rowid` field at `rowid_idx`.
+    /// The visible inlined rows under `user_proj`, with `rowid` at `rowid_idx`
+    /// taken from each row's stable row id, or `None` when there are none.
+    fn inlined_rowid_exec(
+        &self,
+        user_proj: &[usize],
+        rowid_idx: usize,
+        filter: Option<&crate::inlined_filter::InlinedFilter>,
+    ) -> DataFusionResult<Option<Arc<dyn ExecutionPlan>>> {
+        let inlined = self.provider.read_inlined_rows(
+            self.table_id,
+            &self.columns,
+            crate::metadata_provider::InlinedRowSelection::VisibleAt(self.snapshot_id),
+            filter,
+        )?;
+        self.inlined_materialized_row_count.store(
+            inlined.iter().map(|rows| rows.batch.num_rows()).sum(),
+            Ordering::Relaxed,
+        );
+        if inlined.is_empty() {
+            return Ok(None);
+        }
+        // `rowid_idx` is the slot just past the physical columns, which is
+        // where this schema carries it, so `user_proj` applies unchanged.
+        debug_assert_eq!(rowid_idx, self.physical_schema.fields().len());
+        let mut fields: Vec<Arc<Field>> = self.physical_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(rowid_field()));
+        let schema = Arc::new(Schema::new(fields));
+        let batches = inlined
+            .into_iter()
+            .map(|rows| {
+                let mut columns = rows.batch.columns().to_vec();
+                columns.push(Arc::new(arrow::array::Int64Array::from(rows.row_ids)));
+                RecordBatch::try_new(Arc::clone(&schema), columns)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let exec = MemorySourceConfig::try_new_exec(&[batches], schema, Some(user_proj.to_vec()))?;
+        Ok(Some(exec))
+    }
+
     fn output_schema_for_projection(&self, user_proj: &[usize], rowid_idx: usize) -> SchemaRef {
         let mut fields: Vec<Arc<Field>> = Vec::with_capacity(user_proj.len());
         for &i in user_proj {
@@ -4155,6 +4254,43 @@ impl DuckLakeTable {
     /// newer than the read snapshot and must be dropped per-row. When false (the
     /// common case: an ordinary file, or a partial file read at or after
     /// `partial_max`), the file is read by the existing paths with no filtering.
+    /// Partial files read below their `partial_max` keep only their inlined
+    /// deletions on the snapshot-filtered path, so a live delete file of one —
+    /// which a flush writes for the rows it moves that were deleted while
+    /// inlined, each position with the snapshot that deleted it — is read here,
+    /// at planning, and its positions visible at this snapshot join the file's
+    /// inlined deletions. Returns the files without their delete file, and the
+    /// deletions to apply to them.
+    async fn absorb_partial_delete_files(
+        &self,
+        state: &dyn Session,
+        files: Vec<&DuckLakeTableFile>,
+        inlined_deletes: &HashMap<i64, HashSet<i64>>,
+    ) -> DataFusionResult<(Vec<DuckLakeTableFile>, HashMap<i64, HashSet<i64>>)> {
+        let mut deletes = HashMap::new();
+        let mut out = Vec::with_capacity(files.len());
+        for file in files {
+            let mut file = file.clone();
+            let mut positions = inlined_deletes
+                .get(&file.data_file_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(delete_file) = file.delete_file.take() {
+                positions.extend(
+                    self.read_visible_delete_file_positions(state, &delete_file)
+                        .await?,
+                );
+                file.delete_file_id = None;
+                file.delete_count = None;
+            }
+            if !positions.is_empty() {
+                deletes.insert(file.data_file_id, positions);
+            }
+            out.push(file);
+        }
+        Ok((out, deletes))
+    }
+
     fn needs_snapshot_filter(&self, table_file: &DuckLakeTableFile) -> bool {
         table_file
             .partial_max
@@ -4175,21 +4311,10 @@ impl DuckLakeTable {
         inlined_positions: Option<&HashSet<i64>>,
         output_schema: SchemaRef,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // This path applies no delete filtering, and that has been safe only
-        // because the combination cannot arise: a delete on a merged partial file
-        // is authored in a snapshot later than the merge that produced it, which
-        // is itself later than `partial_max`, while this path is chosen only when
-        // reading BELOW `partial_max` (see `needs_snapshot_filter`) — and the
-        // metadata provider attaches a delete file only from its own
-        // `begin_snapshot` onward. So no delete file can be live at a snapshot
-        // this path serves.
-        //
-        // Nothing has been observed to violate that; the check exists because the
-        // assumption is newly load-bearing. Positional deletes on rewritten and
-        // partial files used to be refused outright, so this path could not meet
-        // one; now that it can in principle, an invariant that was safely
-        // implicit is worth failing loudly on rather than silently returning rows
-        // a delete file says are gone.
+        // This path applies only `inlined_positions`: callers fold a live delete
+        // file's visible positions into them first
+        // (`absorb_partial_delete_files`), so a file still carrying one fails
+        // loudly rather than return rows the delete file says are gone.
         if table_file.delete_file.is_some() {
             return Err(DataFusionError::Internal(format!(
                 "partial file \"{}\" has a live delete file at read snapshot {}, which the \
@@ -4397,6 +4522,19 @@ impl DuckLakeTable {
         self.table_id
     }
 
+    /// The metadata provider this table reads through.
+    #[cfg(feature = "write")]
+    pub(crate) fn provider(&self) -> &Arc<dyn MetadataProvider> {
+        &self.provider
+    }
+
+    /// The table's resolved data directory, which relative file paths resolve
+    /// against.
+    #[cfg(feature = "write")]
+    pub(crate) fn table_path(&self) -> &str {
+        &self.table_path
+    }
+
     /// The snapshot this table was opened at — the base the compaction sources
     /// are read against, threaded to the commit as its conflict base.
     #[cfg(feature = "write")]
@@ -4549,11 +4687,12 @@ impl DuckLakeTable {
         // Both delete sources mask the scan, but only prior Parquet positions are
         // carried into the replacement Parquet delete file. Inlined positions
         // remain owned by their metadata table until an explicit flush.
-        let existing_parquet_deleted = match &table_file.delete_file {
-            Some(delete_file) => self.read_delete_file_positions(state, delete_file).await?,
-            None => HashSet::new(),
+        let existing_parquet_deletes = match &table_file.delete_file {
+            Some(delete_file) => self.read_delete_file_entries(state, delete_file).await?,
+            None => HashMap::new(),
         };
-        let mut deleted_positions = existing_parquet_deleted.clone();
+        let mut deleted_positions: HashSet<i64> =
+            existing_parquet_deletes.keys().copied().collect();
         if let Some(inlined) = inlined_positions {
             deleted_positions.extend(inlined);
         }
@@ -4628,7 +4767,7 @@ impl DuckLakeTable {
         );
         let mut plan = self.split_across_partitions(scan, state, &file_cfg)?;
         // Mask with BOTH delete sources (#262): inlined positions and prior
-        // Parquet ones. Only `existing_parquet_deleted` is carried forward into
+        // Parquet ones. Only `existing_parquet_deletes` is carried forward into
         // the replacement delete file.
         if !deleted_positions.is_empty() {
             plan = Arc::new(DeleteFilterExec::try_new(
@@ -4649,7 +4788,8 @@ impl DuckLakeTable {
             embedded_snapshot_batch_idx,
             pos_index,
             row_id_start: table_file.row_id_start,
-            existing_parquet_deleted,
+            existing_parquet_deletes,
+            record_count: table_file.max_row_count,
             data_file_id: table_file.data_file_id,
             delete_file_id: table_file.delete_file_id,
             source_path: table_file.file.path.clone(),
@@ -4714,16 +4854,106 @@ impl DuckLakeTable {
         }
 
         let matched_count = new_positions.len();
-        let mut cumulative = scan.existing_parquet_deleted.clone();
-        cumulative.extend(new_positions);
+        let mut matched_positions = new_positions;
+        matched_positions.sort_unstable();
+        let mut cumulative: HashSet<i64> = scan.existing_parquet_deletes.keys().copied().collect();
+        cumulative.extend(matched_positions.iter().copied());
         let mut cumulative_positions: Vec<i64> = cumulative.into_iter().collect();
         cumulative_positions.sort_unstable();
 
         Ok(FileUpdateOutput {
             updated_batches,
             matched_count,
+            matched_positions,
             cumulative_positions,
         })
+    }
+
+    /// Rewrite the visible inlined rows of `inlined` that `predicate` matches,
+    /// as [`Self::apply_update_to_batches`] rewrites a Parquet file's rows: the
+    /// result is `[physical columns..., rowid]`, each row keeping its row id,
+    /// together with the row identities the new versions supersede.
+    #[cfg(feature = "write")]
+    pub(crate) fn apply_update_to_inlined(
+        &self,
+        inlined: &crate::metadata_provider::DuckLakeInlinedData,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+        assignments: &[(usize, Arc<dyn PhysicalExpr>)],
+    ) -> DataFusionResult<Option<(RecordBatch, Vec<crate::metadata_writer::InlinedRowRef>)>> {
+        let batch = &inlined.batch;
+        let n = batch.num_rows();
+        if n == 0 {
+            return Ok(None);
+        }
+        if batch.num_columns() != self.physical_schema.fields().len() {
+            return Err(DataFusionError::Internal(format!(
+                "inlined rows of '{}' have {} columns, the table has {}",
+                inlined.table_name,
+                batch.num_columns(),
+                self.physical_schema.fields().len()
+            )));
+        }
+        let mut phys_cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for (i, column) in batch.columns().iter().enumerate() {
+            phys_cols.push(crate::column_rename::coerce_column(
+                column,
+                self.physical_schema.field(i).data_type(),
+            )?);
+        }
+        let permissive = Arc::new(Schema::new(
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+                .collect::<Vec<_>>(),
+        ));
+        let phys_batch = RecordBatch::try_new(Arc::clone(&permissive), phys_cols.clone())?;
+        let mask: BooleanArray = match predicate {
+            Some(p) => {
+                let arr = p.evaluate(&phys_batch)?.into_array(n)?;
+                let b = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "UPDATE predicate did not evaluate to a boolean".to_string(),
+                    )
+                })?;
+                BooleanArray::from(
+                    (0..n)
+                        .map(|i| b.is_valid(i) && b.value(i))
+                        .collect::<Vec<bool>>(),
+                )
+            },
+            None => BooleanArray::from(vec![true; n]),
+        };
+        if mask.true_count() == 0 {
+            return Ok(None);
+        }
+        let matched = arrow::compute::filter_record_batch(&phys_batch, &mask)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let rows = matched.num_rows();
+        let mut out_cols: Vec<ArrayRef> = matched.columns().to_vec();
+        for (col_idx, expr) in assignments {
+            let val = expr.evaluate(&matched)?.into_array(rows)?;
+            out_cols[*col_idx] = crate::column_rename::coerce_column(
+                &val,
+                self.physical_schema.field(*col_idx).data_type(),
+            )?;
+        }
+        let mut superseded = Vec::with_capacity(rows);
+        let mut row_ids = Vec::with_capacity(rows);
+        for (row, row_id) in inlined.row_ids.iter().enumerate() {
+            if mask.value(row) {
+                row_ids.push(*row_id);
+                superseded.push(crate::metadata_writer::InlinedRowRef {
+                    table_name: inlined.table_name.clone(),
+                    row_id: *row_id,
+                });
+            }
+        }
+        out_cols.push(Arc::new(Int64Array::from(row_ids)));
+        let mut out_fields: Vec<Arc<Field>> = permissive.fields().iter().cloned().collect();
+        out_fields.push(Arc::new(rowid_field()));
+        let out = RecordBatch::try_new(Arc::new(Schema::new(out_fields)), out_cols)?;
+        Ok(Some((out, superseded)))
     }
 }
 
@@ -4935,9 +5165,12 @@ pub(crate) struct UpdateSourceScan {
     /// The source file's catalog `row_id_start` (used to synthesize rowids for a
     /// non-embedded file).
     pub(crate) row_id_start: Option<i64>,
-    /// Positions already masked by the live Parquet delete file, carried into
-    /// the replacement Parquet delete file.
-    pub(crate) existing_parquet_deleted: HashSet<i64>,
+    /// Positions already masked by the live Parquet delete file, each with the
+    /// snapshot the file records for it (`None` where it records none),
+    /// carried into the replacement Parquet delete file.
+    pub(crate) existing_parquet_deletes: HashMap<i64, Option<i64>>,
+    /// The source file's `record_count`.
+    pub(crate) record_count: Option<i64>,
     /// Catalog id of the source data file (the positional delete's target).
     pub(crate) data_file_id: i64,
     /// Catalog id of the file's currently-live delete file (compare-and-swap
@@ -4956,6 +5189,8 @@ pub(crate) struct FileUpdateOutput {
     pub(crate) updated_batches: Vec<RecordBatch>,
     /// Number of rows this update rewrote in the source file.
     pub(crate) matched_count: usize,
+    /// Physical positions of the rewritten rows (sorted).
+    pub(crate) matched_positions: Vec<i64>,
     /// Physical positions to mask on the source file afterwards: the rows this
     /// update supersedes unioned with any already-deleted rows (sorted).
     pub(crate) cumulative_positions: Vec<i64>,
@@ -5033,22 +5268,6 @@ impl TableProvider for DuckLakeTable {
             (None, _) => false,
         };
 
-        // The rowid plan below unions per-file scans only, so visible inlined
-        // rows would silently vanish from a row-lineage read. Refuse loudly
-        // instead until inlined rowid scans are supported.
-        if rowid_in_proj {
-            let inlined = self.scan_inlined_rows(inlined_filter.as_ref())?;
-            self.inlined_materialized_row_count
-                .store(inlined.materialized_row_count, Ordering::Relaxed);
-            if inlined.batches.iter().any(|batch| batch.num_rows() > 0) {
-                return Err(crate::DuckLakeError::Unsupported(format!(
-                    "row-lineage (rowid) scan on a table with inlined rows is not supported; \
-                     {INLINED_DATA_REMEDIATION}"
-                ))
-                .into());
-            }
-        }
-
         let mut execs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         let inlined_deletes = self.inlined_deletes_by_file()?;
         // One physical form of the filters feeds both pruning paths; see
@@ -5112,14 +5331,17 @@ impl TableProvider for DuckLakeTable {
                         limit,
                     )?);
                 }
+                let (needs_filter, partial_deletes) = self
+                    .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
+                    .await?;
                 let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
-                    .into_iter()
+                    .iter()
                     .partition(|table_file| table_file.file.mapping_id.is_some());
                 if !field_id.is_empty() {
                     execs.push(self.build_exec_for_partial_files(
                         state,
                         &field_id,
-                        &inlined_deletes,
+                        &partial_deletes,
                         &file_statistics,
                         &user_proj,
                         Some(rowid_idx),
@@ -5131,7 +5353,7 @@ impl TableProvider for DuckLakeTable {
                         self.build_exec_for_partial_file(
                             state,
                             table_file,
-                            inlined_deletes.get(&table_file.data_file_id),
+                            partial_deletes.get(&table_file.data_file_id),
                             output_schema,
                         )
                         .await?,
@@ -5168,8 +5390,11 @@ impl TableProvider for DuckLakeTable {
                     projection,
                 )?);
             }
+            let (needs_filter, partial_deletes) = self
+                .absorb_partial_delete_files(state, needs_filter, &inlined_deletes)
+                .await?;
             let (mapped, field_id): (Vec<_>, Vec<_>) = needs_filter
-                .into_iter()
+                .iter()
                 .partition(|table_file| table_file.file.mapping_id.is_some());
             if !field_id.is_empty() {
                 let user_proj: Vec<usize> = projection
@@ -5178,7 +5403,7 @@ impl TableProvider for DuckLakeTable {
                 execs.push(self.build_exec_for_partial_files(
                     state,
                     &field_id,
-                    &inlined_deletes,
+                    &partial_deletes,
                     &file_statistics,
                     &user_proj,
                     None,
@@ -5193,7 +5418,7 @@ impl TableProvider for DuckLakeTable {
                     self.build_exec_for_partial_file(
                         state,
                         table_file,
-                        inlined_deletes.get(&table_file.data_file_id),
+                        partial_deletes.get(&table_file.data_file_id),
                         output_schema,
                     )
                     .await?,
@@ -5202,12 +5427,19 @@ impl TableProvider for DuckLakeTable {
         }
 
         if rowid_in_proj {
+            let rowid_idx = rowid_idx.unwrap();
+            let user_proj: Vec<usize> = projection
+                .cloned()
+                .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+            // Inlined rows carry their stable row ids as data, so they join the
+            // row-lineage plan as one more branch with `rowid` filled in.
+            if let Some(exec) =
+                self.inlined_rowid_exec(&user_proj, rowid_idx, inlined_filter.as_ref())?
+            {
+                execs.push(exec);
+            }
             if execs.is_empty() {
                 use datafusion::physical_plan::empty::EmptyExec;
-                let rowid_idx = rowid_idx.unwrap();
-                let user_proj: Vec<usize> = projection
-                    .cloned()
-                    .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
                 let schema = self.output_schema_for_projection(&user_proj, rowid_idx);
                 return Ok(Arc::new(EmptyExec::new(schema)));
             }
@@ -5333,18 +5565,21 @@ impl TableProvider for DuckLakeTable {
             None => input,
         };
 
-        Ok(Arc::new(DuckLakeInsertExec::new(
-            input,
-            Arc::clone(writer),
-            schema_name.clone(),
-            self.table_name.clone(),
-            self.schema(),
-            write_mode,
-            self.object_store_url.clone(),
-            partition,
-            self.write_options.clone(),
-            ordering,
-        )))
+        Ok(Arc::new(
+            DuckLakeInsertExec::new(
+                input,
+                Arc::clone(writer),
+                schema_name.clone(),
+                self.table_name.clone(),
+                self.schema(),
+                write_mode,
+                self.object_store_url.clone(),
+                partition,
+                self.write_options.clone(),
+                ordering,
+            )
+            .with_planned_snapshot(self.snapshot_id),
+        ))
     }
 
     /// Plan an `UPDATE t SET col = expr [, ...] [WHERE ...]`.
@@ -5384,19 +5619,21 @@ impl TableProvider for DuckLakeTable {
             ));
         }
 
-        // UPDATE rewrites Parquet-resident rows only; visible inlined rows would
-        // be silently skipped. Refuse loudly instead (same detection DELETE uses).
-        let inlined = self.provider.get_inlined_data(
-            self.table_id,
-            self.provider.get_current_snapshot()?,
-            &self.columns,
-        )?;
-        if inlined.iter().any(|batch| batch.num_rows() > 0) {
-            return Err(crate::DuckLakeError::Unsupported(format!(
-                "UPDATE on a table with inlined rows is not supported; \
-                 {INLINED_DATA_REMEDIATION}"
-            ))
-            .into());
+        // A writer that cannot commit inlined row mutations updates Parquet rows
+        // only, so visible inlined rows would be silently skipped: refuse them.
+        if !writer.supports_inlined_row_mutations() {
+            let inlined = self.provider.get_inlined_data(
+                self.table_id,
+                self.provider.get_current_snapshot()?,
+                &self.columns,
+            )?;
+            if inlined.iter().any(|batch| batch.num_rows() > 0) {
+                return Err(crate::DuckLakeError::Unsupported(format!(
+                    "UPDATE on a table with inlined rows is not supported by this metadata \
+                     writer; {INLINED_DATA_REMEDIATION}"
+                ))
+                .into());
+            }
         }
 
         // Assignment / filter expressions reference the table's DATA columns
@@ -6099,14 +6336,16 @@ mod tests {
         )?;
         assert_eq!(provider.eager_file_reads.load(Ordering::Relaxed), 0);
         let statistics = table.statistics().unwrap();
-        assert_eq!(statistics.num_rows, Precision::Exact(1_000_000));
+        // `record_count` counts every row ever inserted and the table-wide
+        // bounds only widen, so both are upper bounds.
+        assert_eq!(statistics.num_rows, Precision::Inexact(1_000_000));
         assert_eq!(
             statistics.column_statistics[0].min_value,
-            Precision::Exact(ScalarValue::Int64(Some(1)))
+            Precision::Inexact(ScalarValue::Int64(Some(1)))
         );
         assert_eq!(
             statistics.column_statistics[0].max_value,
-            Precision::Exact(ScalarValue::Int64(Some(1_000_000)))
+            Precision::Inexact(ScalarValue::Int64(Some(1_000_000)))
         );
         assert_eq!(
             statistics.column_statistics[0].byte_size,
@@ -7553,9 +7792,10 @@ mod tests {
             let column = &statistics.column_statistics[0];
             // Both bounds are gated: negative NaN sits below a recorded min just
             // as positive NaN sits above a recorded max, and `contains_nan`
-            // does not record the sign.
+            // does not record the sign. Table-wide bounds only widen, so a
+            // usable bound is inexact.
             let expected_min = if max_usable {
-                Precision::Exact(ScalarValue::Float64(Some(1.0)))
+                Precision::Inexact(ScalarValue::Float64(Some(1.0)))
             } else {
                 Precision::Absent
             };
@@ -7564,7 +7804,7 @@ mod tests {
                 "contains_nan={contains_nan:?}"
             );
             let expected_max = if max_usable {
-                Precision::Exact(ScalarValue::Float64(Some(2.0)))
+                Precision::Inexact(ScalarValue::Float64(Some(2.0)))
             } else {
                 Precision::Absent
             };

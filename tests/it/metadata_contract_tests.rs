@@ -559,9 +559,21 @@ async fn postgres_flush_inlined_data() {
     let inlined = provider
         .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
         .unwrap();
+    assert_eq!(
+        inlined
+            .iter()
+            .map(|data| data.batch.num_rows())
+            .sum::<usize>(),
+        2
+    );
     let flush_writer = DuckLakeTableWriter::new(writer, object_store).unwrap();
     let flushed = flush_writer
-        .flush_inlined_data("main", "events", &inlined, inline_write.snapshot_id)
+        .flush_table_inlined_data(
+            Arc::new(manager.provider(catalog_id).await.unwrap()),
+            "main",
+            "events",
+            inline_write.snapshot_id,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -582,14 +594,12 @@ async fn postgres_flush_inlined_data() {
             .unwrap()
             .is_empty(),
     );
-    assert_eq!(
+    // The flush deleted the rows it moved, as official's does.
+    assert!(
         provider
-            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns,)
+            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
             .unwrap()
-            .iter()
-            .map(|data| data.batch.num_rows())
-            .sum::<usize>(),
-        2,
+            .is_empty(),
     );
 }
 
@@ -768,6 +778,116 @@ async fn postgres_single_metadata_contract() {
         snapshot,
         true,
     );
+}
+
+/// `cleanup_old_files_mysql` and `delete_orphaned_files_mysql` with
+/// `CleanupCriteria::All`: the first deletes the file an expired snapshot
+/// scheduled (a dry run only lists it), the second an unreferenced one,
+/// neither touching the live file.
+#[cfg(feature = "write-mysql")]
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn mysql_maintenance_contract() {
+    use datafusion_ducklake::maintenance::{
+        CleanupCriteria, ExpireCriteria, cleanup_old_files_mysql, delete_orphaned_files_mysql,
+    };
+    use object_store::ObjectStore;
+    use object_store::local::LocalFileSystem;
+
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    let temp = TempDir::new().unwrap();
+    let data_path = temp.path().join("data");
+    let table_path = data_path.join("main").join("events");
+    std::fs::create_dir_all(&table_path).unwrap();
+    let writer = MySqlMetadataWriter::new_with_init(&url).await.unwrap();
+    writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+    let first = writer
+        .begin_write_transaction("main", "events", &columns(), WriteMode::Replace)
+        .unwrap();
+    let first_commit = writer
+        .register_data_file(
+            first.table_id,
+            "main",
+            "events",
+            first.snapshot_id,
+            &DataFileInfo::new("first.parquet", 5, 1),
+            WriteMode::Replace,
+            first.base_snapshot_id,
+            &columns(),
+            &first.column_ids,
+        )
+        .unwrap();
+    std::fs::write(table_path.join("first.parquet"), b"first").unwrap();
+    let second = writer
+        .begin_write_transaction("main", "events", &columns(), WriteMode::Replace)
+        .unwrap();
+    writer
+        .register_data_file(
+            second.table_id,
+            "main",
+            "events",
+            second.snapshot_id,
+            &DataFileInfo::new("second.parquet", 6, 1),
+            WriteMode::Replace,
+            second.base_snapshot_id,
+            &columns(),
+            &second.column_ids,
+        )
+        .unwrap();
+    std::fs::write(table_path.join("second.parquet"), b"second").unwrap();
+    assert_eq!(
+        writer
+            .expire_snapshots(ExpireCriteria::Versions(vec![first_commit.snapshot_id]))
+            .unwrap()
+            .len(),
+        1,
+    );
+    let object_store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(LocalFileSystem::new());
+    let dry_run = cleanup_old_files_mysql(
+        &writer,
+        std::sync::Arc::clone(&object_store),
+        CleanupCriteria::All,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dry_run.len(), 1);
+    assert!(table_path.join("first.parquet").exists());
+    let deleted = cleanup_old_files_mysql(
+        &writer,
+        std::sync::Arc::clone(&object_store),
+        CleanupCriteria::All,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted, dry_run);
+    assert!(!table_path.join("first.parquet").exists());
+    assert!(table_path.join("second.parquet").exists());
+    assert!(
+        cleanup_old_files_mysql(
+            &writer,
+            std::sync::Arc::clone(&object_store),
+            CleanupCriteria::All,
+            false
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "the scheduled row is gone"
+    );
+
+    let orphan = table_path.join("orphan.parquet");
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let deleted = delete_orphaned_files_mysql(&writer, object_store, CleanupCriteria::All, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted.len(), 1);
+    assert!(deleted[0].ends_with("main/events/orphan.parquet"));
+    assert!(!orphan.exists());
+    assert!(table_path.join("second.parquet").exists());
 }
 
 #[cfg(feature = "write-mysql")]
@@ -974,7 +1094,12 @@ async fn duckdb_flush_inlined_data() {
     let writer = Arc::new(DuckdbMetadataWriter::new(path.to_str().unwrap()).unwrap());
     let table_writer = DuckLakeTableWriter::new(writer.clone(), object_store).unwrap();
     let flushed = table_writer
-        .flush_inlined_data("main", "events", &inlined, inline_write.snapshot_id)
+        .flush_table_inlined_data(
+            Arc::new(writer.metadata_provider()),
+            "main",
+            "events",
+            inline_write.snapshot_id,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -988,14 +1113,12 @@ async fn duckdb_flush_inlined_data() {
             .unwrap()
             .is_empty(),
     );
-    assert_eq!(
+    // The flush deleted the rows it moved, as official's does.
+    assert!(
         provider
-            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns,)
+            .get_inlined_data_with_row_ids(table.table_id, inline_write.snapshot_id, &columns)
             .unwrap()
-            .iter()
-            .map(|data| data.batch.num_rows())
-            .sum::<usize>(),
-        2,
+            .is_empty(),
     );
     assert_eq!(
         provider

@@ -117,8 +117,10 @@ impl PartitionTransform {
             return true;
         };
         match self {
+            // DuckDB's text of the value, as official stores it (`infinity`, a
+            // year before 1 or past 9999), or Arrow's.
             PartitionTransform::Identity => {
-                ScalarValue::try_from_string(value.to_string(), column_type).is_ok()
+                crate::types::parse_ducklake_scalar(value, column_type).is_some()
             },
             PartitionTransform::Year
             | PartitionTransform::Month
@@ -154,7 +156,7 @@ impl PartitionTransform {
     ) -> Option<(ScalarValue, ScalarValue)> {
         match self {
             PartitionTransform::Identity => {
-                let scalar = ScalarValue::try_from_string(value.to_string(), data_type).ok()?;
+                let scalar = crate::types::parse_ducklake_scalar(value, data_type)?;
                 Some((scalar.clone(), scalar))
             },
             PartitionTransform::Year => {
@@ -296,8 +298,12 @@ impl PartitionWriteSpec {
 
     /// The partition-key column names in key order — the input to
     /// [`hive_subpath`].
+    /// The Hive directory name of each key, as official names them
+    /// (`GetPartitionKeyName`): the column's name for an identity key, else
+    /// the transform's (`year`, `month`, `day`, `hour`, `bucket`), suffixed
+    /// with `_` and the column's name when an earlier key took it.
     pub(crate) fn key_names(&self) -> Vec<String> {
-        self.keys.iter().map(|k| k.name.clone()).collect()
+        hive_key_names(self.keys.iter().map(|k| (k.name.as_str(), &k.transform)))
     }
 
     /// Validate one file's partition `values` (in key order) against this spec and
@@ -346,6 +352,37 @@ impl PartitionWriteSpec {
         }
         Ok(())
     }
+}
+
+/// The Hive directory name of each partition key, given as `(column name,
+/// transform)` in key order, as official names them (`GetPartitionKeyName`):
+/// the column's name for an identity key, else the transform's (`year`,
+/// `month`, `day`, `hour`, `bucket`), suffixed with `_` and the column's name
+/// when an earlier key took it.
+pub(crate) fn hive_key_names<'a>(
+    keys: impl IntoIterator<Item = (&'a str, &'a PartitionTransform)>,
+) -> Vec<String> {
+    let mut used: Vec<String> = Vec::new();
+    keys.into_iter()
+        .map(|(column, transform)| {
+            let prefix = match transform {
+                PartitionTransform::Identity => column.to_string(),
+                PartitionTransform::Year => "year".to_string(),
+                PartitionTransform::Month => "month".to_string(),
+                PartitionTransform::Day => "day".to_string(),
+                PartitionTransform::Hour => "hour".to_string(),
+                PartitionTransform::Bucket(_) => "bucket".to_string(),
+                PartitionTransform::Unknown(transform) => transform.clone(),
+            };
+            let name = if used.iter().any(|u| u.eq_ignore_ascii_case(&prefix)) {
+                format!("{prefix}_{column}")
+            } else {
+                prefix
+            };
+            used.push(name.clone());
+            name
+        })
+        .collect()
 }
 
 /// The Hive-style relative subpath (`key=value/…`) a file carrying `values` is
@@ -408,6 +445,9 @@ fn transform_array(
     array: &arrow::array::ArrayRef,
 ) -> crate::Result<arrow::array::ArrayRef> {
     use arrow::compute::{DatePart, date_part};
+    if let Some(parts) = calendar_parts(transform, array) {
+        return Ok(parts);
+    }
     let part = match transform {
         PartitionTransform::Identity => return Ok(std::sync::Arc::clone(array)),
         PartitionTransform::Year => DatePart::Year,
@@ -422,6 +462,105 @@ fn transform_array(
         },
     };
     Ok(date_part(array, part)?)
+}
+
+/// The `year`, `month`, `day` or `hour` of each date or timestamp of `array`,
+/// as DuckDB's date-part functions give them for its whole range: a year
+/// before 1 counts back from 0 (44 BC is `-43`) except a `TIMESTAMPTZ`'s,
+/// which counts the era (44 BC is `44`), and `infinity` and `-infinity` have
+/// none. `None` for another transform or type.
+#[cfg(feature = "write")]
+fn calendar_parts(
+    transform: &PartitionTransform,
+    array: &arrow::array::ArrayRef,
+) -> Option<arrow::array::ArrayRef> {
+    use arrow::array::{Array, AsArray, Int64Array};
+    use arrow::datatypes::{
+        DataType, Date32Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+        TimestampNanosecondType, TimestampSecondType,
+    };
+    if !matches!(
+        transform,
+        PartitionTransform::Year
+            | PartitionTransform::Month
+            | PartitionTransform::Day
+            | PartitionTransform::Hour
+    ) {
+        return None;
+    }
+    // (days since 1970-01-01, hour of the day) of each value; `None` for NULL
+    // and the infinities.
+    let instants: Vec<Option<(i64, i64)>> = match array.data_type() {
+        DataType::Date32 => array
+            .as_primitive::<Date32Type>()
+            .iter()
+            .map(|days| {
+                days.filter(|d| *d != i32::MAX && *d != -i32::MAX)
+                    .map(|d| (i64::from(d), 0))
+            })
+            .collect(),
+        DataType::Timestamp(unit, _) => {
+            let (values, per_hour): (Vec<Option<i64>>, i64) = match unit {
+                TimeUnit::Second => (
+                    array.as_primitive::<TimestampSecondType>().iter().collect(),
+                    3_600,
+                ),
+                TimeUnit::Millisecond => (
+                    array
+                        .as_primitive::<TimestampMillisecondType>()
+                        .iter()
+                        .collect(),
+                    3_600_000,
+                ),
+                TimeUnit::Microsecond => (
+                    array
+                        .as_primitive::<TimestampMicrosecondType>()
+                        .iter()
+                        .collect(),
+                    3_600_000_000,
+                ),
+                TimeUnit::Nanosecond => (
+                    array
+                        .as_primitive::<TimestampNanosecondType>()
+                        .iter()
+                        .collect(),
+                    3_600_000_000_000,
+                ),
+            };
+            values
+                .into_iter()
+                .map(|value| {
+                    value
+                        .filter(|v| *v != i64::MAX && *v != -i64::MAX)
+                        .map(|v| {
+                            let hours = v.div_euclid(per_hour);
+                            (hours.div_euclid(24), hours.rem_euclid(24))
+                        })
+                })
+                .collect()
+        },
+        _ => return None,
+    };
+    // DuckDB takes a `TIMESTAMPTZ`'s parts through ICU, whose year counts
+    // eras: 44 BC is `44`, where the other types' year is `-43`.
+    let zoned = matches!(array.data_type(), DataType::Timestamp(_, Some(_)));
+    let parts = instants
+        .into_iter()
+        .map(|instant| {
+            instant.map(|(days, hour)| {
+                let (year, month, day) = crate::stats_encode::civil_from_days(days);
+                match transform {
+                    PartitionTransform::Year if zoned && year <= 0 => 1 - year,
+                    PartitionTransform::Year => year,
+                    PartitionTransform::Month => i64::from(month),
+                    PartitionTransform::Day => i64::from(day),
+                    _ => hour,
+                }
+            })
+        })
+        .collect::<Int64Array>();
+    debug_assert_eq!(parts.len(), array.len());
+    Some(std::sync::Arc::new(parts))
 }
 
 /// Split rows into groups keyed by the tuple of transformed, DuckDB-canonical
@@ -488,7 +627,16 @@ pub(crate) fn split_batches_by_partition(
                 let encoded = if scalar.is_null() {
                     None
                 } else {
-                    match crate::stats_encode::encode_scalar(&scalar) {
+                    // A partition value keeps the whole string, as official
+                    // stores it; the statistics rules that drop a long or
+                    // NUL-holding bound do not apply.
+                    let text = match &scalar {
+                        ScalarValue::Utf8(Some(text))
+                        | ScalarValue::LargeUtf8(Some(text))
+                        | ScalarValue::Utf8View(Some(text)) => Some(text.clone()),
+                        scalar => crate::stats_encode::encode_scalar(scalar),
+                    };
+                    match text {
                         Some(encoded) => Some(encoded),
                         None => {
                             return Err(crate::DuckLakeError::Unsupported(format!(
@@ -661,30 +809,27 @@ mod tests {
 
     #[cfg(feature = "write")]
     #[test]
-    fn split_errors_on_unencodable_non_null_value_instead_of_corrupting() {
+    fn split_keeps_a_nul_holding_string_as_its_own_partition() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
             "region",
             DataType::Utf8,
             true,
         )]));
-        // A NUL byte makes the value unencodable (encode_scalar returns None) but it
-        // is NOT null — it must error, not silently collapse into a NULL partition
-        // and commingle with genuinely-null rows.
+        // A NUL byte is part of the value, as official stores it: the row is not
+        // commingled with genuinely-null rows.
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(StringArray::from(vec![Some("a\u{0}b")])) as ArrayRef],
+            vec![Arc::new(StringArray::from(vec![Some("a\u{0}b"), None])) as ArrayRef],
         )
         .unwrap();
-        let err = split_batches_by_partition(
+        let groups = split_batches_by_partition(
             &schema,
             std::slice::from_ref(&batch),
             &identity_region_spec(),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("encode"),
-            "expected an encode error, got: {err}"
-        );
+        .unwrap();
+        let values: Vec<Option<String>> = groups.iter().map(|(v, _)| v[0].clone()).collect();
+        assert_eq!(values, vec![Some("a\u{0}b".to_string()), None]);
     }
 
     #[test]

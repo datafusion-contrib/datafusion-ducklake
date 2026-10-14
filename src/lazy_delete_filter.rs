@@ -547,6 +547,26 @@ pub(crate) async fn read_delete_positions(
     resolved_path: &str,
     read_snapshot: Option<i64>,
 ) -> DataFusionResult<HashSet<i64>> {
+    let entries = read_delete_entries(scan, context, object_store_url, resolved_path).await?;
+    Ok(entries
+        .into_iter()
+        .filter(|(_, snapshot)| match (read_snapshot, snapshot) {
+            (Some(read_snapshot), Some(snapshot)) => *snapshot <= read_snapshot,
+            _ => true,
+        })
+        .map(|(position, _)| position)
+        .collect())
+}
+
+/// Run the scan of one delete file and collect each deleted position with the
+/// snapshot the file records for it (`_ducklake_internal_snapshot_id`), or
+/// `None` where it records none. Reads as [`read_delete_positions`] does.
+pub(crate) async fn read_delete_entries(
+    scan: &Arc<dyn ExecutionPlan>,
+    context: &Arc<TaskContext>,
+    object_store_url: &ObjectStoreUrl,
+    resolved_path: &str,
+) -> DataFusionResult<Vec<(i64, Option<i64>)>> {
     let scan = reset_plan_states(Arc::clone(scan))?;
     let batches = match scan.execute(0, Arc::clone(context)) {
         Ok(stream) => stream.try_collect::<Vec<_>>().await,
@@ -564,7 +584,7 @@ pub(crate) async fn read_delete_positions(
             .await);
         },
     };
-    let mut positions = HashSet::new();
+    let mut entries = Vec::new();
     for batch in &batches {
         let pos_index = batch.schema().index_of(DELETE_POS_COL)?;
         let pos = int64_column(batch, pos_index, DELETE_POS_COL)?;
@@ -573,18 +593,16 @@ pub(crate) async fn read_delete_positions(
             Err(_) => None,
         };
         for row in 0..batch.num_rows() {
-            let applies = match (read_snapshot, snapshots) {
-                (Some(read_snapshot), Some(snapshots)) => {
-                    snapshots.is_null(row) || snapshots.value(row) <= read_snapshot
-                },
-                _ => true,
-            };
-            if applies && !pos.is_null(row) {
-                positions.insert(pos.value(row));
+            if pos.is_null(row) {
+                continue;
             }
+            let snapshot = snapshots
+                .filter(|snapshots| snapshots.is_valid(row))
+                .map(|snapshots| snapshots.value(row));
+            entries.push((pos.value(row), snapshot));
         }
     }
-    Ok(positions)
+    Ok(entries)
 }
 
 /// Turn a failed delete-file read into a caller-facing error, replacing the raw

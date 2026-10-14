@@ -3512,30 +3512,32 @@ async fn replace_preserves_next_row_id_monotonic() {
     assert_eq!(rc1, 5);
     assert_eq!(next1, 5);
 
-    // Second Replace: publish_snapshot retires the first generation's files and
-    // resets visible totals to zero while preserving next_row_id (the retirement
-    // moved here from begin_write_transaction).
+    // Second Replace: publish_snapshot retires the first generation's files,
+    // leaving ducklake_table_stats as official's DELETE does (record_count is the
+    // gross count of rows ever inserted) and preserving next_row_id.
     let s2 = w
         .begin_write_transaction("public", "users", &cols(), WriteMode::Replace)
         .unwrap();
-    w.publish_snapshot(
-        s2.table_id,
-        "public",
-        "users",
-        s2.snapshot_id,
-        WriteMode::Replace,
-        s2.base_snapshot_id,
-        &cols(),
-        &s2.column_ids,
-    )
-    .unwrap();
+    let published = w
+        .publish_snapshot(
+            s2.table_id,
+            "public",
+            "users",
+            s2.snapshot_id,
+            WriteMode::Replace,
+            s2.base_snapshot_id,
+            &cols(),
+            &s2.column_ids,
+        )
+        .unwrap();
     let (rc2, next2, bytes2) = read_table_stats(&pool, s2.table_id).await;
-    assert_eq!(rc2, 0, "record_count must reset on Replace");
+    assert_eq!(rc2, 5, "record_count stays the gross count on Replace");
     assert_eq!(next2, 5, "next_row_id must NOT reset on Replace");
-    assert_eq!(bytes2, 0);
+    assert!(bytes2 > 0, "file_size_bytes left as it was");
 
     // The first file of the new generation picks up at 5. The generation was
-    // already published above, so this registration is additive (Append).
+    // already published above, so this registration is additive (Append), on
+    // top of the published Replace.
     w.register_data_file(
         s2.table_id,
         "public",
@@ -3543,7 +3545,7 @@ async fn replace_preserves_next_row_id_monotonic() {
         s2.snapshot_id,
         &DataFileInfo::new("g2.parquet", 2048, 2),
         WriteMode::Append,
-        s2.base_snapshot_id,
+        published.snapshot_id,
         &cols(),
         &s2.column_ids,
     )
@@ -5259,9 +5261,9 @@ async fn multicatalog_schema_version_advances_on_promote_not_data_write() {
 }
 
 /// MAJOR-1 regression: an Append that BEGINS pre-promote (staged int32) and
-/// COMMITS after a promote (column now int64) is a benign data write — it must
-/// NOT be misclassified as DDL, so schema_version must stay put and no extra
-/// ducklake_schema_versions row is written. Values still round-trip.
+/// COMMITS after a promote (column now int64) refuses, as official refuses an
+/// insert into a table altered since; it must not bump schema_version or write
+/// a ducklake_schema_versions row on the way. The rows still read.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
@@ -5342,12 +5344,18 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
             .await
             .unwrap();
 
-    // Finish the Append AFTER the promote — must NOT bump schema_version.
-    session.finish().await.unwrap();
+    // Finish the Append AFTER the promote: an insert refuses a concurrent
+    // alter, as official's conflict check does, and bumps nothing.
+    let finished = session.finish().await;
+    assert!(
+        matches!(&finished, Err(datafusion_ducklake::DuckLakeError::Conflict(message))
+            if message.contains("another transaction has altered it")),
+        "{finished:?}"
+    );
     let sv_after_append = head_sv(&pool, cat).await;
     assert_eq!(
         sv_after_append, sv_after_promote,
-        "benign Append racing a promote must NOT bump schema_version ({sv_after_promote} -> {sv_after_append})"
+        "an Append racing a promote must NOT bump schema_version ({sv_after_promote} -> {sv_after_append})"
     );
 
     // The racing Append must NOT add a ducklake_schema_versions ledger row (it's a
@@ -5385,8 +5393,8 @@ async fn multicatalog_append_racing_promote_does_not_bump_schema_version() {
     got.sort();
     assert_eq!(
         got,
-        vec![1, 2, 3, 4, 5],
-        "all rows present and correct after the race"
+        vec![1, 2, 3],
+        "the refused Append added nothing; the rows read under the widened type"
     );
 }
 
@@ -6661,9 +6669,11 @@ async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
         "every stat handed in must be stored as given under its file"
     );
 
-    // The roll-up, rebuilt from those rows on the same commit. `id` widens
+    // The roll-up, merged from those rows on the same commit. `id` widens
     // numerically (12 > 3); `name` widens lexically and one file had a NULL;
-    // `score` has no bound because f2 recorded none, and a known NaN.
+    // `score` gets no row: f2 recorded no bounds for its NaN, so the merged
+    // bounds are unknown, which a row with neither bound would misstate as
+    // no value (official stores that row).
     let rollup = table_column_stats(&pool, out.table_id).await;
     assert_eq!(
         rollup,
@@ -6676,15 +6686,16 @@ async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
                 Some(true),
                 None
             ),
-            (300, None, None, Some(false), Some(true)),
         ],
         "the roll-up must be computed from the promoted rows, with the column \
          types resolved through the adopted ids"
     );
 
     // A Replace through the singular entry point — the degenerate batch —
-    // retires f1 and f2, and the roll-up follows the live generation: f3's
-    // bounds alone, and no row at all for the columns it recorded nothing for.
+    // retires f1 and f2. The roll-up only widens, as official DuckLake's does,
+    // since a read of an earlier snapshot still holds f1's and f2's rows: `id`
+    // keeps f1's lower bound, and the columns f3 recorded nothing for lose
+    // their rows, which is how a roll-up says it does not know them.
     let f3 = DataFileInfo::new("/src/f3.parquet", 512, 2)
         .with_absolute_path()
         .with_owner_catalog(source)
@@ -6693,8 +6704,8 @@ async fn register_existing_data_files_persists_column_stats_and_the_rollup() {
         .unwrap();
     assert_eq!(
         table_column_stats(&pool, out.table_id).await,
-        vec![(100, Some("50".into()), Some("60".into()), Some(false), None)],
-        "a Replace must rebuild the roll-up from the live generation only"
+        vec![(100, Some("1".into()), Some("60".into()), Some(false), None)],
+        "a Replace widens the roll-up by the live generation"
     );
 }
 
@@ -10147,4 +10158,213 @@ async fn a_cached_absence_of_inlined_data_stops_at_the_head() {
         "the pinned table reads the rows inlined at or below its snapshot"
     );
     assert_eq!(row_count(&lookup_at_pin().await).await, 7);
+}
+
+/// `CREATE TABLE` registers an inlined-data table before it holds a row. A
+/// registered table that holds no row begun at or below the read's snapshot
+/// answers like an empty registry, and stops answering once rows are inlined
+/// at that snapshot.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn an_empty_registered_inlined_table_answers_like_an_empty_registry() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion_ducklake::DuckLakeWriteOptions;
+    use object_store::local::LocalFileSystem;
+
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let catalog_id = MulticatalogManager::new(pool.clone())
+        .create_catalog("inline_absence_registered")
+        .await
+        .unwrap();
+    let writer = Arc::new(
+        PostgresMetadataWriter::with_pool(pool.clone(), catalog_id)
+            .await
+            .unwrap(),
+    );
+    let temp = tempfile::TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let rows = |ids: Vec<i64>| {
+        RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    };
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(10));
+
+    // Twenty rows exceed the limit and go to Parquet; the table still gets
+    // its inlined-data table.
+    let created = table_writer
+        .write_table("main", "t", &[rows((0..20).collect())])
+        .await
+        .unwrap();
+    let registered: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ducklake_inlined_data_tables WHERE table_id = $1")
+            .bind(created.table_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        registered, 1,
+        "CREATE TABLE registers an inlined-data table"
+    );
+
+    let provider = MulticatalogProvider::with_pool_and_id(pool.clone(), catalog_id)
+        .await
+        .unwrap();
+    let absent_through = |snapshot_id: i64| {
+        let columns = provider
+            .get_table_structure(created.table_id, snapshot_id)
+            .unwrap();
+        provider
+            .scan_inlined_data_noting_absence(created.table_id, snapshot_id, &columns, None)
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        absent_through(created.snapshot_id),
+        Some(created.snapshot_id)
+    );
+
+    // Two rows inlined by a later commit: the earlier snapshot still holds
+    // none, the later one does.
+    let appended = table_writer
+        .append_table("main", "t", &[rows(vec![20, 21])])
+        .await
+        .unwrap();
+    assert!(appended.snapshot_id > created.snapshot_id);
+    assert_eq!(
+        absent_through(created.snapshot_id),
+        Some(created.snapshot_id)
+    );
+    assert_eq!(absent_through(appended.snapshot_id), None);
+}
+
+/// Enabling inlining catalog-wide over a table with a column named like an
+/// inlined table's system column fails, as at table scope and on the other
+/// backends; another catalog's tables do not count.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+async fn enabling_inlining_catalog_wide_refuses_reserved_column_names() {
+    let (pool, _container) = spin_up_postgres().await.unwrap();
+    let manager = MulticatalogManager::new(pool.clone());
+    let reserved = manager.create_catalog("reserved").await.unwrap();
+    let other = manager.create_catalog("other").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), reserved)
+        .await
+        .unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
+    let writer = std::sync::Arc::new(writer);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int32, true),
+            arrow::datatypes::Field::new("row_id", arrow::datatypes::DataType::Int32, true),
+        ])),
+        vec![
+            std::sync::Arc::new(arrow::array::Int32Array::from(vec![1])),
+            std::sync::Arc::new(arrow::array::Int32Array::from(vec![2])),
+        ],
+    )
+    .unwrap();
+    datafusion_ducklake::DuckLakeTableWriter::new(
+        writer.clone(),
+        std::sync::Arc::new(object_store::local::LocalFileSystem::new()),
+    )
+    .unwrap()
+    .with_options(
+        &datafusion_ducklake::DuckLakeWriteOptions::default().with_data_inlining_row_limit(0),
+    )
+    .append_table("main", "t", &[batch])
+    .await
+    .unwrap();
+    let error = writer
+        .set_global_setting("data_inlining_row_limit", "10")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Cannot enable data inlining for table \"t\""),
+        "{error}"
+    );
+    let other = PostgresMetadataWriter::with_pool(pool.clone(), other)
+        .await
+        .unwrap();
+    other
+        .set_global_setting("data_inlining_row_limit", "10")
+        .unwrap();
+}
+
+/// An append whose table a concurrent commit dropped is refused with a
+/// conflict, as official refuses the insert, and the file it uploaded is
+/// removed.
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn append_racing_a_drop_conflicts_and_leaves_no_file() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+    use datafusion_ducklake::{DuckLakeError, DuckLakeTableWriter, DuckLakeWriteOptions};
+
+    let (pool, _c) = spin_up_postgres().await.unwrap();
+    let temp = tempfile::TempDir::new().unwrap();
+    let mgr = MulticatalogManager::new(pool.clone());
+    let cat = mgr.create_catalog("lake").await.unwrap();
+    let writer = PostgresMetadataWriter::with_pool(pool.clone(), cat)
+        .await
+        .unwrap();
+    writer.set_data_path(temp.path().to_str().unwrap()).unwrap();
+    let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let table_writer = DuckLakeTableWriter::new(
+        Arc::new(writer),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+    )
+    .unwrap()
+    .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
+    table_writer
+        .append_table("main", "t", std::slice::from_ref(&batch))
+        .await
+        .unwrap();
+    let count_files = || {
+        let mut count = 0;
+        let mut pending = vec![temp.path().to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    let mut session = table_writer
+        .begin_write("main", "t", &schema, WriteMode::Append)
+        .unwrap();
+    session.write_batch(&batch).unwrap();
+    assert!(
+        mgr.drop_table_in_catalog("lake", "main", "t")
+            .await
+            .unwrap()
+    );
+    let before = count_files();
+    match session.finish().await {
+        Err(DuckLakeError::Conflict(message)) => assert!(
+            message.contains("attempting to insert into table")
+                && message.contains("has dropped it"),
+            "{message}"
+        ),
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+    assert_eq!(count_files(), before, "the refused append removed its file");
 }

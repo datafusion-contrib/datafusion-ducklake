@@ -31,12 +31,15 @@ use crate::metadata_writer::{
     quote_snapshot_table, snapshot_has_change, staged_table_write_changes, table_write_changes,
     tag_change, top_level_column_ids, validate_name,
 };
+use crate::metadata_writer::{InlinedFlushTable, inlined_flush_changes, validate_inlined_flush};
+use crate::metadata_writer_postgres::apply_inlined_flush_at_snapshot;
 use crate::metadata_writer_postgres::{
     PostgresCommitGuard, SQL_CREATE_INLINED_DATA_TABLES, apply_inlined_deletes_at_snapshot,
-    apply_positional_deletes_at_snapshot, commit_files_at_snapshot, commit_guarded,
-    commit_inlined_at_snapshot, commit_networked_guarded, detect_inlined_delete_since,
-    detect_replace_conflict as detect_staged_conflict, quote_ident, set_postgres_table_setting,
-    validate_staged_table, with_postgres_commit_lock,
+    apply_positional_deletes_at_snapshot, apply_row_mutation_at_snapshot, check_staged_conflicts,
+    commit_files_at_snapshot, commit_guarded, commit_inlined_at_snapshot, commit_networked_guarded,
+    detect_inlined_delete_since, detect_replace_conflict as detect_staged_conflict,
+    detect_row_mutation_conflicts, drop_empty_superseded_inlined_tables_in, quote_ident,
+    set_postgres_table_setting, validate_staged_table, with_postgres_commit_lock,
 };
 use crate::partition::PartitionTransform;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -136,7 +139,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
         mapping_id BIGINT,
         begin_snapshot BIGINT NOT NULL,
         end_snapshot BIGINT,
-        partition_id BIGINT
+        partition_id BIGINT,
+        partial_max BIGINT
     )"#,
     // Per-table row-lineage + running totals. `next_row_id` allocates rowids
     // monotonically over the table's lifetime; `record_count`/`file_size_bytes`
@@ -184,7 +188,8 @@ const SQL_CREATE_TABLES: &[&str] = &[
         encryption_key VARCHAR,
         delete_count BIGINT,
         begin_snapshot BIGINT NOT NULL,
-        end_snapshot BIGINT
+        end_snapshot BIGINT,
+        partial_max BIGINT
     )"#,
     r#"CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
         data_file_id BIGINT NOT NULL,
@@ -429,10 +434,10 @@ async fn detect_replace_conflict(
     detect_inlined_delete_since(table_id, base_snapshot, tx).await
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id` and
-/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard spares
-/// files registered for *this* snapshot, so a multi-file write does not retire
-/// its own siblings. `next_row_id` is left untouched (rowids stay monotonic).
+/// Retire the prior generation's still-visible data files at `snapshot_id`. The `begin_snapshot < snapshot_id` guard spares files
+/// registered for *this* snapshot, so a multi-file write does not retire its
+/// own siblings. `ducklake_table_stats` is left as it is, as official's `DELETE`
+/// leaves it: `record_count` counts every row ever inserted.
 async fn retire_prior_generation(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table_id: i64,
@@ -443,13 +448,6 @@ async fn retire_prior_generation(
          WHERE table_id = $2 AND end_snapshot IS NULL AND begin_snapshot < $1",
     )
     .bind(snapshot_id)
-    .bind(table_id)
-    .execute(&mut **tx)
-    .await?;
-
-    sqlx::query(
-        "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0 WHERE table_id = $1",
-    )
     .bind(table_id)
     .execute(&mut **tx)
     .await?;
@@ -658,7 +656,8 @@ async fn bump_schema_version(
 }
 
 /// Record a `ducklake_schema_versions` ledger row for a DDL that leaves the table
-/// live (create, column add/remove/reorder). Not called for a drop.
+/// live (create, column add/remove/reorder, partitioning), and create the
+/// table's inlined data table for it as official does. Not called for a drop.
 async fn record_schema_version(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot_id: i64,
@@ -674,7 +673,8 @@ async fn record_schema_version(
     .bind(table_id)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    crate::metadata_writer_postgres::create_eager_inlined_table(tx, None, table_id, schema_version)
+        .await
 }
 
 /// Persist the harvested per-column stats for a just-registered data file
@@ -698,8 +698,17 @@ async fn insert_file_column_stats(
         .bind(stat.column_size_bytes)
         .bind(stat.value_count)
         .bind(stat.null_count)
-        .bind(stat.min_value.as_deref())
-        .bind(stat.max_value.as_deref())
+        // PostgreSQL text holds no NUL byte: such a bound is stored as unknown.
+        .bind(
+            stat.min_value
+                .as_deref()
+                .filter(|text| !text.contains('\0')),
+        )
+        .bind(
+            stat.max_value
+                .as_deref()
+                .filter(|text| !text.contains('\0')),
+        )
         .bind(stat.contains_nan)
         .execute(&mut **tx)
         .await?;
@@ -734,76 +743,6 @@ async fn insert_partition_metadata(
         .bind(table_id)
         .bind(i64::from(*key_index))
         .bind(value.clone())
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Recompute `ducklake_table_column_stats` from the table's live files and
-/// replace the stored rows. See the SQLite writer's equivalent for the rationale.
-async fn recompute_table_column_stats(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    table_id: i64,
-    columns: &[ColumnDef],
-    column_ids: &[i64],
-) -> Result<()> {
-    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
-
-    let live_file_count: i64 = sqlx::query(
-        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL",
-    )
-    .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
-
-    let mut per_file: Vec<FileColumnStat> = Vec::new();
-    for row in sqlx::query(
-        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
-         FROM ducklake_file_column_stats s
-         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
-         WHERE d.table_id = $1 AND d.end_snapshot IS NULL",
-    )
-    .bind(table_id)
-    .fetch_all(&mut **tx)
-    .await?
-    {
-        per_file.push(FileColumnStat {
-            column_id: row.try_get(0)?,
-            min_value: row.try_get(1)?,
-            max_value: row.try_get(2)?,
-            null_count: row.try_get(3)?,
-            contains_nan: row.try_get(4)?,
-        });
-    }
-
-    let numeric_of = |column_id: i64| -> bool {
-        column_ids
-            .iter()
-            .position(|id| *id == column_id)
-            .and_then(|i| columns.get(i))
-            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
-            .unwrap_or(false)
-    };
-    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
-
-    sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = $1")
-        .bind(table_id)
-        .execute(&mut **tx)
-        .await?;
-    for g in globals {
-        sqlx::query(
-            "INSERT INTO ducklake_table_column_stats
-                 (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES ($1, $2, $3, $4, $5, $6, NULL)",
-        )
-        .bind(table_id)
-        .bind(g.column_id)
-        .bind(g.contains_null)
-        .bind(g.contains_nan)
-        .bind(g.min_value)
-        .bind(g.max_value)
         .execute(&mut **tx)
         .await?;
     }
@@ -856,6 +795,7 @@ async fn finalize_snapshot(
         column_ids,
         mode,
         base_snapshot,
+        true,
     )
     .await
 }
@@ -871,6 +811,7 @@ async fn finalize_table_snapshot(
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
+    inserts: bool,
 ) -> Result<CommitIds> {
     // Allocate the snapshot FIRST (carrying schema_version forward): this takes
     // the counter lock up front, serializing concurrent commits. schema_version is
@@ -989,6 +930,16 @@ async fn finalize_table_snapshot(
             column_ids,
         );
     if is_ddl {
+        crate::metadata_writer_postgres::reject_new_reserved_columns(
+            tx,
+            None,
+            table_id,
+            &existing_catalog_columns,
+            &proposed,
+        )
+        .await?;
+    }
+    if is_ddl {
         // A DDL commit bumps the per-catalog schema_version (the insert above only
         // carried it forward). A pure data write keeps the carried value.
         schema_version = bump_schema_version(tx, snapshot_id).await?;
@@ -1100,10 +1051,20 @@ async fn finalize_table_snapshot(
         // Abort if a concurrent writer published a newer generation since this
         // write began.
         detect_replace_conflict(tx, table_id, base_snapshot, ConflictScope::Table).await?;
-        // Seed the stats row (first write to a brand-new table) so retire's
-        // zero-update has a row, then retire the prior data generation.
-        seed_table_stats(tx, table_id).await?;
+        // Retire the prior data generation. A table gets its stats row with
+        // its first rows, as official's `CREATE TABLE` writes none.
         retire_prior_generation(tx, table_id, snapshot_id).await?;
+    } else if inserts {
+        // An insert refuses a drop, alter or delete of the table since its
+        // base snapshot, as official's does; a stage that only deletes is
+        // checked by its own rules.
+        crate::metadata_writer_postgres::check_table_conflicts(
+            tx,
+            table_id,
+            base_snapshot,
+            crate::metadata_writer::TableChanges::append(),
+        )
+        .await?;
     }
 
     // Record the schema-change ledger row for a DDL commit. A pure data write
@@ -1119,6 +1080,23 @@ async fn finalize_table_snapshot(
 }
 
 impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
+    fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
+        block_on(async {
+            // Staged commits create the registry on demand; without it there is
+            // nothing inlined to drop.
+            if !crate::PostgresMetadataProvider::from_pool(self.pool.clone())
+                .has_inlined_data_registry()
+                .await?
+            {
+                return Ok(());
+            }
+            let mut tx = self.pool.begin().await?;
+            drop_empty_superseded_inlined_tables_in(&mut tx, None).await?;
+            self.commit(tx).await?;
+            Ok(())
+        })
+    }
+
     fn commit_multi_table(
         &self,
         writes: &[StagedTableWrite],
@@ -1147,7 +1125,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
             let mut had_data = Vec::with_capacity(writes.len());
             for write in writes {
+                // Official checks the table-level conflicts first.
+                check_staged_conflicts(&mut tx, write, Some(snapshot_id)).await?;
                 validate_staged_table(&mut tx, write).await?;
+                detect_row_mutation_conflicts(&mut tx, write).await?;
                 if let Some(expected) = expected_base_snapshot_id {
                     detect_staged_conflict(
                         write.table_id,
@@ -1158,17 +1139,14 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     .await?;
                 }
                 let files: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM ducklake_data_file WHERE table_id = $1 AND end_snapshot IS NULL)").bind(write.table_id).fetch_one(&mut *tx).await?;
-                let names: Vec<String> = sqlx::query_scalar(
-                    "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = $1",
-                )
-                .bind(write.table_id)
-                .fetch_all(&mut *tx)
-                .await?;
                 let mut inline = false;
-                for name in names {
+                for (name, system) in
+                    crate::metadata_writer_postgres::inlined_tables(&mut tx, write.table_id).await?
+                {
                     let sql = format!(
-                        "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot IS NULL)",
-                        quote_ident(&name)
+                        "SELECT EXISTS(SELECT 1 FROM {} WHERE {} IS NULL)",
+                        quote_ident(&name),
+                        system.end_snapshot,
                     );
                     inline |= sqlx::query_scalar::<_, bool>(AssertSqlSafe(sql))
                         .fetch_one(&mut *tx)
@@ -1189,6 +1167,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                         &write.column_ids,
                         write.mode,
                         write.base_snapshot_id,
+                        !matches!(write.data, StagedTableData::None),
                     )
                     .await?,
                 );
@@ -1221,6 +1200,7 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                     &write.inlined_deletes,
                 )
                 .await?;
+                apply_row_mutation_at_snapshot(&mut tx, snapshot_id, &write, None).await?;
                 let changes = staged_table_write_changes(&write, files, inline);
                 record_table_changes(
                     &mut tx,
@@ -1238,6 +1218,30 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 snapshot_id,
                 tables,
             })
+        })
+    }
+
+    fn commit_inlined_flush(
+        &self,
+        base_snapshot: i64,
+        tables: &[InlinedFlushTable],
+    ) -> Result<i64> {
+        validate_inlined_flush(tables)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // A flush is not DDL: schema_version carries forward.
+            let (snapshot_id, _) = insert_snapshot(&mut tx).await?;
+            apply_inlined_flush_at_snapshot(&mut tx, snapshot_id, base_snapshot, tables, None)
+                .await?;
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &inlined_flush_changes(tables),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            self.commit_networked(tx).await?;
+            Ok(snapshot_id)
         })
     }
 
@@ -1260,6 +1264,27 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         with_postgres_commit_lock(&self.pool, &format!("single:{identity}"), operation)
     }
 
+    fn catalog_encrypted(&self) -> Result<bool> {
+        block_on(async {
+            let values: Vec<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            crate::metadata_writer::encrypted_option(&values)
+        })
+    }
+
+    fn head_snapshot(&self) -> Result<Option<i64>> {
+        block_on(async {
+            Ok(
+                sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+                    .fetch_one(&self.pool)
+                    .await?,
+            )
+        })
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -1274,6 +1299,17 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
         block_on(async {
             let mut transaction = self.pool.begin().await?;
+            if crate::metadata_writer::enables_inlining(key, value) {
+                let columns: Vec<(String, String)> =
+                    sqlx::query_as(crate::metadata_writer::SQL_GLOBAL_INLINING_COLUMNS)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                let system = crate::metadata_provider_postgres::catalog_inlined_system_columns(
+                    &mut *transaction,
+                )
+                .await?;
+                crate::metadata_writer::reject_reserved_inlining_columns(&columns, system)?;
+            }
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = $1 AND scope IS NULL")
                 .bind(key)
                 .execute(&mut *transaction)
@@ -1598,7 +1634,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // Persist the file's zone maps + refresh the roll-up.
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            crate::metadata_writer_postgres::merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats([file]),
+            )
+            .await?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime.
@@ -1753,7 +1795,13 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            crate::metadata_writer_postgres::merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(files),
+            )
+            .await?;
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + $1,
@@ -2256,10 +2304,10 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
     }
 
     fn end_table_files(&self, table_id: i64, snapshot_id: i64) -> Result<u64> {
-        // Used by WriteMode::Replace. End-snapshotting every visible file drops the
-        // table's currently-visible row count and byte total to zero. `next_row_id`
-        // is deliberately NOT reset: rowids must stay monotonic across the table's
-        // lifetime so historical snapshots still resolve uniquely.
+        // Used by WriteMode::Replace. `ducklake_table_stats` is left as it is, as
+        // official's `DELETE` leaves it: `record_count` stays the gross count of
+        // rows ever inserted, and `next_row_id` stays monotonic so historical
+        // snapshots still resolve uniquely.
         block_on(async {
             let mut tx = self.pool.begin().await?;
 
@@ -2268,15 +2316,6 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
                  WHERE table_id = $2 AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET record_count = 0, file_size_bytes = 0
-                 WHERE table_id = $1",
-            )
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
@@ -2394,6 +2433,18 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
             // (idempotent, lossless — NULL means "not partitioned").
             sqlx::query(
                 "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partition_id BIGINT",
+            )
+            .execute(&self.pool)
+            .await?;
+            // `partial_max` (current DuckLake spec) records the largest embedded
+            // snapshot of a flushed file and of its delete files.
+            sqlx::query(
+                "ALTER TABLE ducklake_data_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
+            )
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                "ALTER TABLE ducklake_delete_file ADD COLUMN IF NOT EXISTS partial_max BIGINT",
             )
             .execute(&self.pool)
             .await?;

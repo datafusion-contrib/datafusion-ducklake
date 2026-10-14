@@ -29,15 +29,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MulticatalogManager::drop_table_in_catalog` does, through the writer's commit guard. It
   returns `CatalogNotFound` for a missing catalog where `drop_table_in_catalog` returns
   `false`, and waits for the catalog lock up to the writer's `with_lock_timeout`.
+- Change feeds and `rowid` scans read inlined rows and inlined deletions of Parquet rows,
+  matching official DuckLake; inlined rows resolve columns by id across schema versions (#270).
+- SQL `UPDATE` updates inlined rows, and `UPDATE` and `DELETE` inline small deletions and new
+  row versions under the scoped `data_inlining_row_limit`, as official DuckLake does (#270).
+- `CALL ducklake_flush_inlined_data`, `DuckLakeCatalog::flush_inlined_data` and
+  `DuckLakeTableWriter::flush_table_inlined_data` flush inlined data on every writable backend.
+- `stats_encode::StatKind`, `ColumnStats` and the `merge_*_column_stats` functions merge
+  table-wide statistics as official DuckLake does.
+- `MetadataProvider::get_inlined_data_for_flush`, `get_inlined_file_deletes_for_flush`,
+  `get_inlined_file_deletes_between`, `read_inlined_rows` and `get_delete_file_begin_snapshot`.
+- `table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT`.
+- `MetadataWriter::commit_inlined_flush`, `maintenance` and
+  `drop_empty_superseded_inlined_tables`, and the `inlined_flush` module's flush types.
+- `stats_collect::WrittenLeafStats` and `collect_written_column_stats` keep DuckDB's string
+  bounds.
+- `register_ducklake_maintenance_functions` registers the `ducklake_flush_inlined_data`
+  table function, which `register_ducklake_functions` leaves out.
+- `DuckLakeCatalog::checkpoint` runs official's `CHECKPOINT`, and `MetadataWriter::maintenance`
+  exposes expire and cleanup, on every writable backend but single-catalog PostgreSQL.
+- `cleanup_old_files_mysql` and `delete_orphaned_files_mysql` clean up MySQL catalogs.
 
 ### Changed
 
-- A `DuckLakeTable` whose catalog registers no inlined-data table for it reads that registry
-  once per snapshot, not on every scan.
+- A `DuckLakeTable` whose PostgreSQL catalog holds no inlined rows for it reads its inlined
+  data once per snapshot, not on every scan.
 - **BREAKING**: `DuckLakeError` gains `CommitRefused`, with the `write-postgres` feature; add
   an arm to exhaustive matches. Its source is the error a `PostgresCommitGuard` refused a
   commit with. Nothing was committed, so a caller may treat it like any other failure before
   `COMMIT`; it is never `CommitOutcomeUnknown`.
+- **BREAKING** for `MetadataProvider` implementors and wrappers: implement or forward the new
+  methods (see Added); their defaults fail with `Unsupported` on inlined data instead of
+  reading or flushing it.
+- **BREAKING** for `MetadataWriter` implementors and wrappers: implement or forward
+  `catalog_encrypted`, `head_snapshot`, `next_snapshot_id`, `reserved_inlining_column` and
+  `supports_inlined_row_mutations`.
+- **BREAKING** for `MetadataWriter` implementors and wrappers: implement or forward
+  `maintenance`, `commit_inlined_flush`, `drop_empty_superseded_inlined_tables` and
+  `table_types_support_inlining`.
+- **BREAKING** for rollback to 0.9: this release's first inlined write to a SQLite table
+  rewrites its inlined floats, 0.9's included, as text, which 0.9 cannot read.
+- **BREAKING** for rollback to 0.9: 0.9 fails to read a flushed file at a snapshot after one
+  of its rows was deleted, before its last row.
+- **BREAKING**: `DeleteFileInfo` gains a private field; build it with `DeleteFileInfo::new`,
+  and `with_deleted_positions` to commit it beside concurrent inlined deletions of other rows.
 - **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown`, with the `metadata-postgres` or
   `metadata-mysql` feature; add an arm to exhaustive matches. A PostgreSQL or MySQL commit
   that registers data files, or `commit_multi_table`, returns it in place of `Sqlx` when the
@@ -77,9 +112,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   column: reading its rowids, or updating it, fails.
 - Large row-ID scans use less CPU when no scanned file has file-based or inlined
   deletes (#368).
+- **BREAKING**: `data_inlining_row_limit` defaults to official's `10`, not `0`, and above `0` a
+  column named like an inlined system column (`row_id`, ...) is refused (#270). To write only
+  Parquet, set the `data_inlining_row_limit` option to `0` (catalog, schema or table scope).
+- **BREAKING**: a Parquet write to a catalog with `encrypted` set fails with `Unsupported`
+  instead of writing unencrypted; inlined writes succeed. To write Parquet, set `encrypted` to
+  `false`; no data migration is needed.
+- `DELETE` and `UPDATE` end a data file they empty and replace a live delete file with one that
+  records each deletion's snapshot, as official DuckLake does.
+- A `DELETE` or `UPDATE` that rewrites a delete file commits after concurrent commits to other
+  tables or files instead of failing, its deletions dated to its own snapshot.
+- `DELETE` and `UPDATE` fail with a conflict when the table was inserted into, altered,
+  compacted or dropped since they read it, as official DuckLake's conflict check does.
+- A `DELETE` writing a delete file commits beside a concurrent inlined deletion of other rows
+  of the data file, as official DuckLake does; one of the same rows still aborts it.
+- A `DELETE` or `UPDATE` recording inlined deletions commits beside a delete file the data file
+  got since it read the table, as official DuckLake does; one of the same rows aborts it.
+- The `with_write_options` `data_inlining_row_limit` applies where the catalog stores none, as
+  official's attach option does, also to inlined table creation and reserved column names.
+- **BREAKING**: appends, inlined inserts and `set_delete_file` fail on the concurrent changes
+  official's conflict check refuses since an `Append`'s `base_snapshot`; concurrent appends
+  still commit. Pass `WriteSetupResult::base_snapshot_id`.
+- A SQL `INSERT` checks for conflicts from the snapshot it was planned at.
+- `ducklake_table_stats.record_count` counts every row ever inserted, as official's does, and
+  `DuckLakeTable::statistics()` reports the table-wide row count and bounds as inexact.
+- SQLite catalogs store inlined floats as text and declare inlined `UBIGINT` columns `VARCHAR`,
+  as official does.
+- File statistics spell `BOOLEAN` bounds `0`/`1`, blob bounds in hex and `TIME` bounds as text,
+  and cover each nested leaf field and a float column's non-NaN values, as official's do.
+- File string and blob bounds over 256 bytes are truncated as DuckDB's Parquet writer truncates
+  them, instead of at 64 bytes.
+- `CREATE TABLE` and column changes create the table's inlined data table, inlined inserts go
+  to the newest, and create writes no statistics row, as official DuckLake does.
+- Partitioned writes name Hive directories and record partition values as official does, BC
+  dates and NUL-byte strings included; a flush writes one file per partition.
+- PostgreSQL inlined data tables store `TIMETZ` as `TIME WITH TIME ZONE`; existing `BYTEA`
+  columns still read.
+- **BREAKING**: `stats_encode::FileColumnStat` gains `value_count` and
+  `aggregate_global_column_stats` takes `kind: impl Fn(i64) -> StatKind`. Add
+  `value_count: None` and pass a closure such as `|_| StatKind::of_ducklake_type("int64")`.
+- A snapshot's `changes_made` lists `inserted_into_table` before `deleted_from_table` and
+  `inlined_insert` before `inlined_delete`, as official DuckLake does.
+- **BREAKING**: `stats_collect::collect_column_stats` and `compute_column_stats` take
+  `contains_nan_flags` per Parquet leaf, not per column; pass one flag per nested leaf.
+- A flush that moves inlined deletions of Parquet rows into delete files conflicts with a
+  concurrent insert, alter or compaction of the table, as official's flush does.
+- Writer initialization adds the columns this release writes to SQLite catalogs from 0.5 and
+  earlier and multicatalog stores from 0.6 and earlier; run it before writing to one.
+
+### Deprecated
+
+- `DuckLakeTableWriter::flush_inlined_data` and `StagedTableWrite::inlined_flush`; use
+  `DuckLakeCatalog::flush_inlined_data` or `DuckLakeTableWriter::flush_table_inlined_data`.
 
 ### Fixed
 
+- Rows of a table with a `GEOMETRY` column, nested ones included, are written to Parquet and
+  never inlined, and such a table gets no inlined data table, as in official DuckLake.
 - A write session whose commit fails with nothing committed removes the data and delete
   files it uploaded, on every session path — rolling, partitioned, single-file, and
   `finish_with_deletes` — as official DuckLake does; so does a multi-table transaction whose
@@ -95,6 +184,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since their base deleted rows of the table, as official DuckLake fails an insert. An
   inlined-data flush still commits over a delete file, and now fails over an inlined deletion
   of a Parquet row.
+- A filter on a `FLOAT` column at a value printed with an exponent (`1e20`, `FLT_MAX`) no
+  longer skips the data file holding the match on DuckDB catalogs (duckdb/ducklake#1604).
+- Inlined rows of a column `ALTER ... SET TYPE` widened since (DuckDB catalogs), and floats
+  official DuckLake inlined as text in SQLite catalogs, no longer fail to decode.
+- Expire drops a fully expired table's inlined tables, whatever their names, and `drop_catalog`
+  drops the catalog's inlined tables.
+- Inlined tables of DuckLake 1.1 catalogs (DuckDB 2.0) use the `_ducklake_`-prefixed system
+  columns: read and appended to on every backend, and new ones created with that layout (#356).
+- MySQL catalogs read a partial (merged or flushed) data file's rows only at snapshots they
+  exist (#194).
+- `ducklake_table_column_stats` never narrows and covers all-NULL files, added columns and
+  nested fields, so DuckDB skips no rows; a 0.9 row without bounds is dropped as unknown.
+- Table-wide bounds cover inlined rows. Where 0.9 or earlier inlined rows, run a flush or
+  `checkpoint` once (`auto_compact` unset or `true`) after upgrading so the bounds cover them.
+- Change feeds report the deletions and update preimages a flush wrote to a delete file in
+  every window holding them, also windows starting after the delete file's first deletion.
+- DuckDB no longer answers `MIN`/`MAX` from stale table-wide bounds after a delete or
+  `Replace`.
+- Inlined NaN and `-0.0` no longer read as NULL and `0.0` on SQLite.
+- MySQL writes NaN, infinities and dates outside the years 1000-9999 to Parquet instead of
+  failing.
+- Flush, compaction and `checkpoint` fail on an `encrypted` option other than `true` or
+  `false`, as writes do.
+- Table-wide numeric, boolean and temporal bounds compare by value; they were compared as text.
+- Change feeds read a column added with a default as that default in files written before it.
+- `retire_appends_since` retires inlined appends and refuses inlined and rewritten deletions.
+- Concurrent rewrites of one delete file on SQLite no longer both commit.
+- DuckDB and MySQL commits that refresh column statistics no longer fail on tables with nested
+  columns.
+- Inlined dates and timestamps before year 1 or after 9999, and `infinity`, are stored as
+  DuckDB's text and read back on every backend; values DuckDB cannot hold are refused.
+- `DELETE` without `WHERE` counts files with a NULL `record_count` from their footers.
+- A multicatalog append racing a `DROP` fails with a conflict and removes its file, instead of
+  failing with a unique violation.
+- `auto_compact` is on only for the exact value `true`, as official parses it.
+- `promote_column_type` on DuckDB and MySQL keeps the column's defaults, so rows written before
+  an added column still read its default after it is widened.
+- An `UPDATE` whose new row versions span several files (a partitioned table) commits on DuckDB
+  and MySQL catalogs instead of failing as unsupported.
+- MySQL catalogs inline `TIMESTAMPTZ` values instead of failing on their `Z` offset.
+- PostgreSQL catalogs read an inlined string holding a NUL byte instead of failing.
+- A multicatalog schema made by `get_or_create_schema` without a path lives under the catalog's
+  `cat_{id}` directory, where its writes put files, so they read back.
+- File float bounds keep the sign of the zero written first, as DuckDB's writer does; a lone
+  `0.0` no longer records a `-0.0` minimum.
+- A commit whose first file holds only NULLs of a column keeps the table-wide bounds of the
+  files after it, as upstream main does, instead of storing a row DuckDB reads as all NULL.
+- A commit of a float file without bounds (NaN only) no longer stores a table-wide row with
+  neither bound, which DuckDB reads as holding no value and narrows; the column gets no row.
+- A `TIMESTAMPTZ` column's `year` partition records a year before 1 as DuckDB does (44 BC is
+  `44`, counting the era), not `-43`.
+- SQLite catalogs never reuse a data or delete file id: a file written after expiry removed the
+  highest-numbered one could take its id and lose rows to a deletion still recorded against it.
+- A merge or rewrite of a partitioned table writes its output to the Hive directory official
+  names (`month=…`, or a retired spec's own) instead of the key column's name or `key=…`.
+- `merge_adjacent_files` and `checkpoint` on DuckDB and MySQL catalogs merge only within a
+  partition and keep partition values, instead of merging a partitioned table into one file.
+- A file's string bound holding a NUL byte is kept in its statistics, as official keeps it
+  (not on PostgreSQL), and no longer drops the table-wide row when another bound supersedes it.
+- A filter on a `DOUBLE` column at a value with more than 15 significant digits no longer skips
+  the data file holding the match on DuckDB catalogs.
+- `commit_truncate`, and DuckDB and MySQL `commit_deletes` and `commit_inlined_deletes`, record
+  `inlined_delete` when they end inlined rows, so a flush that read those rows conflicts.
+- The DuckDB writer declares inlined columns from its own type mapping, and a `decimal` column
+  type with trailing text is refused instead of read as its prefix.
+- A MySQL commit that fails after creating an inlined table no longer leaves that table's
+  columns for the next commit at the same schema version.
+- `ducklake_table_changes` reports a row once per row of the other side sharing its snapshot
+  and row id, as official's join does, instead of an update preimage without its postimage.
 
 ## [0.9.0] - 2026-10-07
 

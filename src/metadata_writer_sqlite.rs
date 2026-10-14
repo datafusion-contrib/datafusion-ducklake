@@ -11,22 +11,35 @@ use std::{
 
 use crate::Result;
 use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
+use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_storage};
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_provider::{TagObjectType, TagTarget, block_on};
+use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget, block_on};
+use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
     MultiTableCommit, SnapshotCommitMetadata, StagedTableData, StagedTableWrite, WriteMode,
     WriteSetupResult, assign_column_ids, catalog_column_defs, catalog_column_type_equal,
     catalog_column_type_requires_migration, catalog_columns_differ, encode_inlined_index_columns,
-    inlined_delete_conflicts, inlined_delete_groups, live_inlined_index_columns,
-    parse_inlined_index_columns, snapshot_has_change, staged_table_write_changes,
-    table_storage_changes, table_write_changes, top_level_column_ids, validate_delete_entries,
-    validate_inlined_index_columns, validate_name, validate_table_setting,
+    inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
+    snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
+    top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
+    validate_table_setting,
 };
-use crate::metadata_writer::{directory_path, is_inlined_system_column, tag_change};
+use crate::metadata_writer::{
+    DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_GLOBAL_INLINING_COLUMNS,
+    SQL_TABLE_INLINING_COLUMNS, SourceFile, TableChanges, enables_inlining,
+    inlined_deletion_conflict, reject_reserved_inlining_columns, rewritten_delete_conflict,
+    rewritten_deletes_snapshot, row_mutation_source_files, source_file_id_list, staged_conflict,
+    table_conflict, validate_row_mutation_stage,
+};
+use crate::metadata_writer::{
+    InlinedFlushDeleteFile, InlinedFlushTable, carried_row_id_start, inlined_flush_changes,
+    inlined_flush_conflict, validate_inlined_flush,
+};
+use crate::metadata_writer::{directory_path, tag_change};
 use crate::partition::PartitionTransform;
 use arrow::array::{
     Array, BinaryArray, BinaryViewArray, BooleanArray, FixedSizeBinaryArray, Float32Array,
@@ -56,15 +69,172 @@ fn inlined_sqlite_type(data_type: &DataType) -> &'static str {
         | DataType::UInt8
         | DataType::UInt16
         | DataType::UInt32 => "BIGINT",
-        DataType::UInt64 => "TEXT",
-        // DOUBLE has numeric affinity, so a bound f64 stays REAL; a VARCHAR
-        // column's TEXT affinity would coerce it to text, which the inline
-        // reader (which expects REAL) cannot decode.
-        DataType::Float32 | DataType::Float64 => "DOUBLE",
+        // Official declares `VARCHAR` and stores the decimal text.
+        DataType::UInt64 => "VARCHAR",
+        // DuckDB's text of the value, as official's SQLite catalogs store it:
+        // SQLite stores a bound NaN in a REAL column as NULL.
+        DataType::Float32 | DataType::Float64 => "VARCHAR",
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BLOB",
         DataType::FixedSizeBinary(size) if *size != 16 => "BLOB",
         _ => "VARCHAR",
     }
+}
+
+/// DuckDB's text of an inlined float (`1.5`, `nan`, `-inf`, `-0.0`), which
+/// official's SQLite catalogs store in a `VARCHAR` column.
+fn inlined_float_text(value: &datafusion::common::ScalarValue) -> String {
+    crate::stats_encode::inline_stat_text(value, "double").expect("every float has DuckDB text")
+}
+
+/// Whether a declared SQLite column type is a float type an inlined table of
+/// an earlier release declared, or another writer's float spelling.
+fn is_float_declaration(declared: &str) -> bool {
+    matches!(
+        declared.trim().to_ascii_uppercase().as_str(),
+        "DOUBLE" | "FLOAT" | "REAL" | "DOUBLE PRECISION" | "FLOAT4" | "FLOAT8"
+    )
+}
+
+/// Rebuild an inlined data table that releases of this crate created with
+/// float (`DOUBLE`, `FLOAT`) columns so those columns hold DuckDB's text in
+/// `VARCHAR`, as official's do, before more rows are written to it: SQLite
+/// stores a NaN bound to a `REAL` column as NULL, and DuckDB's reader rejects
+/// text in one. Each stored value keeps its double: it is read into Rust and
+/// written as the shortest text that parses back to it, as inserts write it
+/// ([`inlined_float_text`]); SQLite's own float-to-text conversions do not
+/// round-trip every double.
+///
+/// The new table is declared from this crate's own type mapping for `fields`
+/// (the table's data columns, after its three system columns), never from the
+/// declared types or index SQL stored in the catalog, and every identifier is
+/// quoted; the caller recreates the declared indexes.
+async fn migrate_double_inlined_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    physical_name: &str,
+    fields: &[(&str, &DataType)],
+) -> Result<()> {
+    let columns: Vec<(String, String)> =
+        sqlx::query_as("SELECT name, type FROM pragma_table_info(?) ORDER BY cid")
+            .bind(physical_name)
+            .fetch_all(&mut **tx)
+            .await?;
+    if !columns
+        .iter()
+        .skip(3)
+        .any(|(_, declared)| is_float_declaration(declared))
+    {
+        return Ok(());
+    }
+    let data_columns = &columns[3.min(columns.len())..];
+    if data_columns.len() != fields.len()
+        || data_columns
+            .iter()
+            .zip(fields)
+            .any(|((name, _), (field, _))| name != field)
+    {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "inlined data table {physical_name} does not hold the columns of its schema \
+             version; it cannot be converted to VARCHAR float columns"
+        )));
+    }
+    let rebuilt = format!("{physical_name}__varchar_floats");
+    let definitions = columns
+        .iter()
+        .take(3)
+        .map(|(name, _)| format!("{} BIGINT", quote_ident(name)))
+        .chain(fields.iter().map(|(name, data_type)| {
+            format!("{} {}", quote_ident(name), inlined_sqlite_type(data_type))
+        }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Rows are matched by their rowid, under an alias no column shadows.
+    let Some(rowid) = ["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
+        !columns
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(alias))
+    }) else {
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "inlined data table {physical_name} has columns named rowid, _rowid_ and oid; \
+             its float columns cannot be converted to VARCHAR"
+        )));
+    };
+    // Numbers in float columns are copied as NULL and written below; text (an
+    // official writer's, or NULL) is copied as it is.
+    let names = columns
+        .iter()
+        .map(|(name, _)| quote_ident(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = columns
+        .iter()
+        .map(|(name, declared)| {
+            let column = quote_ident(name);
+            if is_float_declaration(declared) {
+                format!(
+                    "CASE WHEN typeof({column}) IN ('real', 'integer') THEN NULL ELSE {column} END"
+                )
+            } else {
+                column
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    for statement in [
+        format!("DROP TABLE IF EXISTS {}", quote_ident(&rebuilt)),
+        format!("CREATE TABLE {} ({definitions})", quote_ident(&rebuilt)),
+        format!(
+            "INSERT INTO {} ({rowid}, {names}) SELECT {rowid}, {values} FROM {}",
+            quote_ident(&rebuilt),
+            quote_ident(physical_name)
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut **tx)
+            .await?;
+    }
+    for ((name, declared), (_, data_type)) in columns.iter().skip(3).zip(fields) {
+        if !is_float_declaration(declared) {
+            continue;
+        }
+        let column = quote_ident(name);
+        let numbers: Vec<(i64, f64)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT {rowid}, CAST({column} AS REAL) FROM {} \
+             WHERE typeof({column}) IN ('real', 'integer')",
+            quote_ident(physical_name)
+        )))
+        .fetch_all(&mut **tx)
+        .await?;
+        let update = format!(
+            "UPDATE {} SET {column} = ? WHERE {rowid} = ?",
+            quote_ident(&rebuilt)
+        );
+        for (row, value) in numbers {
+            let text = match data_type {
+                DataType::Float32 => inlined_float_text(&datafusion::common::ScalarValue::Float32(
+                    Some(value as f32),
+                )),
+                _ => inlined_float_text(&datafusion::common::ScalarValue::Float64(Some(value))),
+            };
+            sqlx::query(AssertSqlSafe(update.clone()))
+                .bind(text)
+                .bind(row)
+                .execute(&mut **tx)
+                .await?;
+        }
+    }
+    for statement in [
+        format!("DROP TABLE {}", quote_ident(physical_name)),
+        format!(
+            "ALTER TABLE {} RENAME TO {}",
+            quote_ident(&rebuilt),
+            quote_ident(physical_name)
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 // Nested values use reference DuckDB literal text so the shared parser and external readers
@@ -137,22 +307,24 @@ fn push_inlined_sqlite_value(
             ));
         },
         DataType::Float32 => {
-            query.push_bind(f64::from(
-                array
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .expect("Arrow data type and array implementation agree")
-                    .value(row),
+            let value = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(inlined_float_text(
+                &datafusion::common::ScalarValue::Float32(Some(value)),
             ));
         },
         DataType::Float64 => {
-            query.push_bind(
-                array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .expect("Arrow data type and array implementation agree")
-                    .value(row),
-            );
+            let value = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Arrow data type and array implementation agree")
+                .value(row);
+            query.push_bind(inlined_float_text(
+                &datafusion::common::ScalarValue::Float64(Some(value)),
+            ));
         },
         DataType::Utf8 => {
             query.push_bind(
@@ -501,6 +673,11 @@ CREATE TABLE IF NOT EXISTS ducklake_files_scheduled_for_deletion (
     schedule_start TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Every file id allocation reads the largest id scheduled here; indexed, that is
+-- one index search rather than a scan of every scheduled file.
+CREATE INDEX IF NOT EXISTS idx_files_scheduled_for_deletion_file_id
+    ON ducklake_files_scheduled_for_deletion (data_file_id);
+
 -- Partition spec generations (DuckLake spec). One row per version of a table's
 -- partition spec; `end_snapshot` NULL means currently active. Setting or
 -- resetting the spec ends the live row and (for SET) starts a new one, exactly
@@ -747,7 +924,11 @@ impl SqliteMetadataWriter {
     /// rows, every table / data file / delete file no longer reachable by any surviving
     /// snapshot is removed from the catalog and its physical path is recorded in
     /// `ducklake_files_scheduled_for_deletion` for later physical deletion via
-    /// [`crate::maintenance::cleanup_old_files_sqlite`]. Returns the expired snapshots.
+    /// [`crate::maintenance::cleanup_old_files_sqlite`]. A fully expired table's
+    /// inlined data and inlined delete tables are dropped with its registry rows
+    /// (see `crate::inlined_reclaim`); inlined rows no surviving snapshot can read
+    /// stay in tables still live, as official keeps them. Returns the expired
+    /// snapshots.
     ///
     /// Reachability is global here — correct for a single-catalog SQLite metadata DB.
     /// The whole operation runs in one transaction, so a crash can't leave scheduled
@@ -923,6 +1104,15 @@ impl SqliteMetadataWriter {
             //    dropped table's orphaned ducklake_table_stats row is removed).
             if !dead_tables.is_empty() {
                 let dead = id_list(&dead_tables);
+                // The table's inlined storage goes with it: its registered inlined data
+                // tables and its inlined delete table, listed before the registry rows are
+                // deleted below and dropped after them, as official does.
+                let registered = sqlx::query_scalar::<_, String>(AssertSqlSafe(format!(
+                    "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id IN ({dead})"
+                )))
+                .fetch_all(&mut *tx)
+                .await?;
+                let inlined_storage = dead_table_inlined_storage(registered, &dead_tables)?;
                 // `ducklake_schema_versions` is keyed by table_id and has no
                 // end_snapshot; reclaim its rows here once the table is fully
                 // expired (a recreate-after-drop gets a fresh table_id, so this
@@ -938,10 +1128,19 @@ impl SqliteMetadataWriter {
                     "ducklake_sort_info",
                     "ducklake_sort_expression",
                     "ducklake_schema_versions",
+                    "ducklake_inlined_data_tables",
                     "ducklake_column_tag",
                 ] {
                     sqlx::query(AssertSqlSafe(format!(
                         "DELETE FROM {table} WHERE table_id IN ({dead})"
+                    )))
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                for table in inlined_storage {
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DROP TABLE IF EXISTS {}",
+                        quote_ident(&table)
                     )))
                     .execute(&mut *tx)
                     .await?;
@@ -1137,6 +1336,69 @@ async fn schedule_files(
 /// the commit: rowid autoincrement can't be used there because inserting the
 /// `ducklake_snapshot` row would advance the head (`MAX(snapshot_id)`) before the
 /// data is committed.
+/// The next data or delete file id: one counter (`next_file_id` in
+/// `ducklake_metadata`) for both, as official's `next_file_id`, so an id is
+/// never handed out twice. SQLite's row ids would reuse the largest id once
+/// expiry removed its row, and a deletion still recorded against the old file
+/// (an inlined deletion, which official keeps after the file goes) would then
+/// apply to the new one. A catalog without the counter seeds it past every id
+/// in use, its inlined deletions' included. Each id is also past every data,
+/// delete and scheduled file id in use at the time, so a file row a writer
+/// without the counter inserted (an older release) is never collided with.
+async fn next_file_id(conn: &mut sqlx::SqliteConnection) -> Result<i64> {
+    let seeded: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM ducklake_metadata WHERE key = 'next_file_id' AND scope IS NULL)",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !seeded {
+        let mut highest: i64 = sqlx::query_scalar(
+            "SELECT MAX(COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), 0),
+                        COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), 0),
+                        COALESCE((SELECT MAX(data_file_id) FROM ducklake_files_scheduled_for_deletion), 0))",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        let deletion_tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'ducklake\\_inlined\\_delete\\_%' ESCAPE '\\'",
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        for table in deletion_tables {
+            // A table of another layout, without `file_id`, holds no id.
+            let max: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT MAX(file_id) FROM {}",
+                quote_ident(&table)
+            )))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or(None);
+            highest = highest.max(max.unwrap_or(0));
+        }
+        sqlx::query(
+            "INSERT INTO ducklake_metadata (key, value, scope) VALUES ('next_file_id', ?, NULL)",
+        )
+        .bind(highest.to_string())
+        .execute(&mut *conn)
+        .await?;
+    }
+    let id: i64 = sqlx::query_scalar(
+        "UPDATE ducklake_metadata
+         SET value = CAST(MAX(CAST(value AS INTEGER),
+                              COALESCE((SELECT MAX(data_file_id) FROM ducklake_data_file), 0),
+                              COALESCE((SELECT MAX(delete_file_id) FROM ducklake_delete_file), 0),
+                              COALESCE((SELECT MAX(data_file_id)
+                                        FROM ducklake_files_scheduled_for_deletion), 0)) + 1
+                         AS TEXT)
+         WHERE key = 'next_file_id' AND scope IS NULL
+         RETURNING CAST(value AS INTEGER)",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(id)
+}
+
 async fn reserve_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     key: &str,
@@ -1311,41 +1573,81 @@ async fn migrate_add_metadata_scope_columns(pool: &SqlitePool) -> Result<()> {
         .iter()
         .any(|row| row.get::<String, _>("name") == "scope_id");
     if !has_scope {
-        sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR")
-            .execute(pool)
-            .await?;
+        add_column(
+            pool,
+            "ducklake_metadata",
+            "scope",
+            "ALTER TABLE ducklake_metadata ADD COLUMN scope VARCHAR",
+        )
+        .await?;
     }
     if !has_scope_id {
-        sqlx::query("ALTER TABLE ducklake_metadata ADD COLUMN scope_id INTEGER")
-            .execute(pool)
-            .await?;
+        add_column(
+            pool,
+            "ducklake_metadata",
+            "scope_id",
+            "ALTER TABLE ducklake_metadata ADD COLUMN scope_id INTEGER",
+        )
+        .await?;
     }
     Ok(())
 }
 
-/// Add `ducklake_data_file.partial_max` to a pre-existing catalog (DuckLake
-/// v1.0). `CREATE TABLE IF NOT EXISTS` only shapes brand-new catalogs, so an
-/// older one needs this `ALTER`.
+/// Run `alter`, which adds `column` to `table`. SQLite has no `ADD COLUMN IF
+/// NOT EXISTS`, so the caller probes first; an initialization that passed the
+/// probe while another added the column fails with a duplicate column name,
+/// which is accepted when the column now exists.
+async fn add_column(pool: &SqlitePool, table: &str, column: &str, alter: &str) -> Result<()> {
+    let Err(error) = sqlx::query(AssertSqlSafe(alter.to_string()))
+        .execute(pool)
+        .await
+    else {
+        return Ok(());
+    };
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name = ?)")
+            .bind(table)
+            .bind(column)
+            .fetch_one(pool)
+            .await?;
+    if !exists {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Add `partial_max` to a pre-existing catalog's `ducklake_data_file` and
+/// `ducklake_delete_file` (DuckLake v1.0); catalogs from v0.5.0 and earlier
+/// lack the delete-file column. `CREATE TABLE IF NOT EXISTS` only shapes
+/// brand-new catalogs, so an older one needs this `ALTER`.
 ///
-/// **Idempotent:** a no-op once the column exists (re-runs on every
-/// `initialize_schema`). **Lossless:** existing data-file rows take the column
-/// `NULL`, which is exactly the "not a partial file" value — every file written
-/// before compaction existed is an ordinary single-origin file.
+/// **Idempotent:** a no-op once the columns exist (re-runs on every
+/// `initialize_schema`). **Lossless:** existing rows take the column `NULL`,
+/// which is exactly the "not a partial file" value, and a delete file without
+/// it holds deletions of its `begin_snapshot` only.
 async fn migrate_add_partial_max(pool: &SqlitePool) -> Result<()> {
-    let info = sqlx::query("SELECT name FROM pragma_table_info('ducklake_data_file')")
+    for table in ["ducklake_data_file", "ducklake_delete_file"] {
+        let info = sqlx::query(AssertSqlSafe(format!(
+            "SELECT name FROM pragma_table_info('{table}')"
+        )))
         .fetch_all(pool)
         .await?;
-    let mut has_partial_max = false;
-    for row in &info {
-        let name: String = row.try_get("name")?;
-        if name == "partial_max" {
-            has_partial_max = true;
+        let mut has_partial_max = false;
+        for row in &info {
+            let name: String = row.try_get("name")?;
+            if name == "partial_max" {
+                has_partial_max = true;
+            }
         }
-    }
-    if !has_partial_max {
-        sqlx::query("ALTER TABLE ducklake_data_file ADD COLUMN partial_max INTEGER")
-            .execute(pool)
+        if !has_partial_max {
+            add_column(
+                pool,
+                table,
+                "partial_max",
+                &format!("ALTER TABLE {table} ADD COLUMN partial_max INTEGER"),
+            )
             .await?;
+        }
     }
     Ok(())
 }
@@ -1508,16 +1810,12 @@ async fn detect_replace_conflict(
              snapshot {base_snapshot}; aborting (retry the write against the new generation)"
         )));
     }
-    let inlined_tables =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-            .bind(table_id)
-            .fetch_all(&mut **tx)
-            .await?;
-    for row in inlined_tables {
-        let table_name: String = row.try_get(0)?;
+    for (table_name, system) in inlined_tables(tx, table_id).await? {
         let sql = format!(
-            "SELECT 1 FROM {} WHERE begin_snapshot > ? OR end_snapshot > ? LIMIT 1",
-            quote_ident(&table_name)
+            "SELECT 1 FROM {} WHERE {} > ? OR {} > ? LIMIT 1",
+            quote_ident(&table_name),
+            system.begin_snapshot,
+            system.end_snapshot,
         );
         let conflict: Option<i64> = sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(base_snapshot)
@@ -1562,9 +1860,9 @@ async fn detect_new_inlined_deletes(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
     base_snapshot: i64,
-    data_file_ids: &[i64],
+    sources: &[SourceFile<'_>],
 ) -> Result<()> {
-    if data_file_ids.is_empty() {
+    if sources.is_empty() {
         return Ok(());
     }
 
@@ -1578,8 +1876,8 @@ async fn detect_new_inlined_deletes(
         return Ok(());
     }
 
-    let conflict: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT 1 FROM \"{table}\" newer
+    let concurrent: Vec<(i64, Option<i64>)> = sqlx::query_as(AssertSqlSafe(format!(
+        "SELECT newer.file_id, newer.row_id FROM \"{table}\" newer
          WHERE newer.file_id IN ({})
            AND (newer.begin_snapshot IS NULL OR (
              newer.begin_snapshot > ?
@@ -1589,28 +1887,23 @@ async fn detect_new_inlined_deletes(
                  AND prior.row_id = newer.row_id
                  AND prior.begin_snapshot <= ?
              ))
-           ))
-         LIMIT 1",
-        id_list(data_file_ids),
+           ))",
+        source_file_id_list(sources),
     )))
     .bind(base_snapshot)
     .bind(base_snapshot)
-    .fetch_optional(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
-    if conflict.is_some() {
-        return Err(crate::DuckLakeError::Conflict(format!(
-            "table {table_id} gained an inlined delete on a source file since snapshot \
-             {base_snapshot}; re-open the catalog and re-plan"
-        )));
-    }
-    Ok(())
+    inlined_deletion_conflict(table_id, base_snapshot, sources, &concurrent)
 }
 
-/// Retire the prior generation's still-visible data files at `snapshot_id` and
-/// zero the visible stat totals. The `begin_snapshot < snapshot_id` guard
-/// spares files registered for *this* snapshot, so a multi-file write does not
-/// retire its own siblings. `next_row_id` is left untouched (rowids stay
-/// monotonic across the table's lifetime). Mirrors the Postgres writer.
+/// Retire the prior generation's still-visible data files and inlined rows at
+/// `snapshot_id`. The `begin_snapshot < snapshot_id` guard spares files
+/// registered for *this* snapshot, so a multi-file write does not retire its
+/// own siblings. `ducklake_table_stats` is left as it is, as official's
+/// `DELETE` leaves it: `record_count` counts every row ever inserted, which is
+/// what DuckDB compares with the live count to decide whether the widen-only
+/// column bounds are exact. Mirrors the Postgres writer.
 async fn retire_prior_generation(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -1626,17 +1919,12 @@ async fn retire_prior_generation(
     .execute(&mut **tx)
     .await?;
 
-    let inlined_tables =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-            .bind(table_id)
-            .fetch_all(&mut **tx)
-            .await?;
-    for row in inlined_tables {
-        let table_name: String = row.try_get(0)?;
+    for (table_name, system) in inlined_tables(tx, table_id).await? {
         let sql = format!(
-            "UPDATE {} SET end_snapshot = ? \
-             WHERE end_snapshot IS NULL AND begin_snapshot < ?",
-            quote_ident(&table_name)
+            "UPDATE {} SET {end} = ? WHERE {end} IS NULL AND {begin} < ?",
+            quote_ident(&table_name),
+            end = system.end_snapshot,
+            begin = system.begin_snapshot,
         );
         sqlx::query(AssertSqlSafe(sql))
             .bind(snapshot_id)
@@ -1644,13 +1932,6 @@ async fn retire_prior_generation(
             .execute(&mut **tx)
             .await?;
     }
-
-    sqlx::query(
-        "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0 WHERE table_id = ?",
-    )
-    .bind(table_id)
-    .execute(&mut **tx)
-    .await?;
     Ok(())
 }
 
@@ -1670,10 +1951,11 @@ async fn replaced_storage(
     .bind(snapshot_id)
     .fetch_one(&mut **tx)
     .await?;
-    for table_name in inlined_table_names(tx, table_id).await? {
+    for (table_name, system) in inlined_tables(tx, table_id).await? {
         let sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM {} WHERE end_snapshot = ?)",
-            quote_ident(&table_name)
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} = ?)",
+            quote_ident(&table_name),
+            system.end_snapshot,
         );
         if sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(snapshot_id)
@@ -1686,16 +1968,23 @@ async fn replaced_storage(
     Ok((replaced, false))
 }
 
-async fn inlined_table_names(
+/// Each registered inlined data table of `table_id`, with its system column names.
+async fn inlined_tables(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
-) -> Result<Vec<String>> {
-    let rows =
-        sqlx::query("SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?")
-            .bind(table_id)
-            .fetch_all(&mut **tx)
-            .await?;
-    rows.into_iter().map(|row| Ok(row.try_get(0)?)).collect()
+) -> Result<Vec<(String, InlinedSystemColumns)>> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut tables = Vec::with_capacity(names.len());
+    for name in names {
+        let system = inlined_table_layout(&mut **tx, &name).await?.system;
+        tables.push((name, system));
+    }
+    Ok(tables)
 }
 
 async fn live_inlined_row_count(
@@ -1703,10 +1992,11 @@ async fn live_inlined_row_count(
     table_id: i64,
 ) -> Result<i64> {
     let mut total = 0;
-    for table_name in inlined_table_names(tx, table_id).await? {
+    for (table_name, system) in inlined_tables(tx, table_id).await? {
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE end_snapshot IS NULL",
-            quote_ident(&table_name)
+            "SELECT COUNT(*) FROM {} WHERE {} IS NULL",
+            quote_ident(&table_name),
+            system.end_snapshot,
         );
         total += sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql))
             .fetch_one(&mut **tx)
@@ -1761,12 +2051,14 @@ async fn apply_positional_deletes(
             .execute(&mut **tx)
             .await?;
         }
+        let file_id = next_file_id(tx).await?;
         sqlx::query(
             "INSERT INTO ducklake_delete_file
-                 (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                 (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                   footer_size, delete_count, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(file_id)
         .bind(entry.data_file_id)
         .bind(table_id)
         .bind(&entry.delete.path)
@@ -1781,6 +2073,66 @@ async fn apply_positional_deletes(
     Ok(())
 }
 
+/// Official's table-level conflict check for a staged insert, `DELETE` or
+/// `UPDATE` against every snapshot committed after its base snapshot and before
+/// `snapshot_id` (see [`staged_conflict`]).
+async fn check_staged_conflicts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    write: &StagedTableWrite,
+    snapshot_id: i64,
+) -> Result<()> {
+    let changes = changes_between(tx, write.base_snapshot_id, snapshot_id).await?;
+    staged_conflict(write, &changes).map_or(Ok(()), Err)
+}
+
+/// The `changes_made` of every snapshot after `base_snapshot` and before
+/// `snapshot_id`, the commit's own.
+async fn changes_between(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    base_snapshot: i64,
+    snapshot_id: i64,
+) -> Result<Vec<Option<String>>> {
+    Ok(sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes
+         WHERE snapshot_id > ? AND snapshot_id < ?",
+    )
+    .bind(base_snapshot)
+    .bind(snapshot_id)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+/// The table the data files `deletes` delete from belong to: the table the
+/// statement read, which a concurrent drop may have replaced under its name.
+async fn deleted_files_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    deletes: &[DeleteFileEntry],
+) -> Result<i64> {
+    let Some(entry) = deletes.first() else {
+        return Ok(table_id);
+    };
+    let source: Option<i64> =
+        sqlx::query_scalar("SELECT table_id FROM ducklake_data_file WHERE data_file_id = ?")
+            .bind(entry.data_file_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(source.unwrap_or(table_id))
+}
+
+/// Official's table-level conflict check for a commit at `snapshot_id` making
+/// `ours` to `table_id` (see [`table_conflict`]).
+async fn check_table_conflicts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    base_snapshot: i64,
+    snapshot_id: i64,
+    ours: TableChanges,
+) -> Result<()> {
+    let changes = changes_between(tx, base_snapshot, snapshot_id).await?;
+    table_conflict(table_id, ours, &changes).map_or(Ok(()), Err)
+}
+
 async fn apply_inlined_deletes(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
@@ -1791,26 +2143,13 @@ async fn apply_inlined_deletes(
     if rows.is_empty() {
         return Ok(());
     }
-    let registered: Vec<String> = sqlx::query_scalar(
-        "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
-    )
-    .bind(table_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let changes: Vec<Option<String>> = sqlx::query_scalar("SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id > ? AND snapshot_id < ?").bind(base_snapshot).bind(snapshot_id).fetch_all(&mut **tx).await?;
-    if changes
-        .iter()
-        .flatten()
-        .any(|changes| inlined_delete_conflicts(changes, table_id))
-    {
-        return Err(crate::DuckLakeError::Conflict(
-            "table changed since the inlined delete snapshot".to_string(),
-        ));
-    }
-    for name in &registered {
+    let registered = inlined_tables(tx, table_id).await?;
+    for (name, system) in &registered {
         let sql = format!(
-            "SELECT EXISTS(SELECT 1 FROM {} WHERE (begin_snapshot > ? AND begin_snapshot < ?) OR (end_snapshot > ? AND end_snapshot < ?))",
-            quote_ident(name)
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE ({begin} > ? AND {begin} < ?) OR ({end} > ? AND {end} < ?))",
+            quote_ident(name),
+            begin = system.begin_snapshot,
+            end = system.end_snapshot,
         );
         let changed: bool = sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(base_snapshot)
@@ -1826,19 +2165,22 @@ async fn apply_inlined_deletes(
         }
     }
     for (name, row_ids) in inlined_delete_groups(rows) {
-        if !registered.iter().any(|table| table == name) {
+        let Some((_, system)) = registered.iter().find(|(table, _)| table == name) else {
             return Err(crate::DuckLakeError::Conflict(format!(
                 "inlined deletes reference unregistered table '{name}'"
             )));
-        }
+        };
         let ids = row_ids
             .iter()
             .map(i64::to_string)
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "UPDATE {} SET end_snapshot = ? WHERE row_id IN ({ids}) AND end_snapshot IS NULL AND begin_snapshot <> ?",
-            quote_ident(name)
+            "UPDATE {} SET {end} = ? WHERE {row_id} IN ({ids}) AND {end} IS NULL AND {begin} <> ?",
+            quote_ident(name),
+            end = system.end_snapshot,
+            row_id = system.row_id,
+            begin = system.begin_snapshot,
         );
         sqlx::query(AssertSqlSafe(sql))
             .bind(snapshot_id)
@@ -1846,6 +2188,218 @@ async fn apply_inlined_deletes(
             .execute(&mut **tx)
             .await?;
     }
+    Ok(())
+}
+
+/// Record `deletes` in `ducklake_inlined_delete_<table_id>`, creating it as
+/// official DuckLake does. Aborts when a target data file is no longer live;
+/// the caller has checked the table-level conflicts ([`table_conflict`]).
+async fn apply_inlined_file_deletes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    deletes: &[InlinedFileDelete],
+) -> Result<()> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    for delete in deletes {
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM ducklake_data_file
+             WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(delete.data_file_id)
+        .bind(table_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if live.is_none() {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "data file {} is no longer live since snapshot {base_snapshot}; re-open the \
+                 catalog and retry the statement",
+                delete.data_file_id
+            )));
+        }
+        let delete_file: Option<i64> = sqlx::query_scalar(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(delete.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if delete_file != delete.expected_delete_file {
+            return Err(crate::metadata_writer::changed_delete_file_conflict(
+                delete.data_file_id,
+                base_snapshot,
+            ));
+        }
+    }
+    let table = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {} (file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)",
+        quote_ident(&table)
+    )))
+    .execute(&mut **tx)
+    .await?;
+    let rows = deletes.iter().flat_map(|delete| {
+        delete
+            .positions
+            .iter()
+            .map(move |position| (delete.data_file_id, *position))
+    });
+    let rows = rows.collect::<Vec<_>>();
+    for chunk in rows.chunks(300) {
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "INSERT INTO {} (file_id, row_id, begin_snapshot) ",
+            quote_ident(&table)
+        ));
+        query.push_values(chunk, |mut row, (file_id, position)| {
+            row.push_bind(*file_id)
+                .push_bind(*position)
+                .push_bind(snapshot_id);
+        });
+        query.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// End each of `files` at `snapshot_id`, leaving its live delete file as it
+/// is, as official's `DropDataFiles` does. Aborts when a file is no longer
+/// live or its live delete file changed.
+async fn drop_data_files(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+    base_snapshot: i64,
+    files: &[DroppedDataFile],
+) -> Result<()> {
+    for file in files {
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(file.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let ended = sqlx::query(
+            "UPDATE ducklake_data_file SET end_snapshot = ?
+             WHERE data_file_id = ? AND table_id = ? AND end_snapshot IS NULL",
+        )
+        .bind(snapshot_id)
+        .bind(file.data_file_id)
+        .bind(table_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if ended != 1 || current != file.expected_delete_file {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "data file {} or its delete file changed since snapshot {base_snapshot}; \
+                 re-open the catalog and retry the statement",
+                file.data_file_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Register each of `entries`, a delete file that records its positions'
+/// snapshots, against its data file. One that replaces the file's live delete
+/// file carries every position of it, so the replaced row is removed and its
+/// object scheduled for deletion, as official's `DeleteOverwrittenDeleteFiles`
+/// does. Fails with `conflict()` when a data file's `end_snapshot` is not the
+/// entry's, or the delete file it replaces (a live file's live one, a retired
+/// file's latest one) is not the entry's.
+async fn replace_delete_files(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    entries: &[InlinedFlushFileDelete],
+    conflict: impl Fn() -> crate::DuckLakeError,
+) -> Result<()> {
+    for entry in entries {
+        let target_end: Option<Option<i64>> = sqlx::query_scalar(
+            "SELECT end_snapshot FROM ducklake_data_file WHERE data_file_id = ?",
+        )
+        .bind(entry.data_file_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        // A live file's live delete file, or a retired file's latest one.
+        let current: Option<i64> = sqlx::query_scalar(
+            "SELECT delete_file_id FROM ducklake_delete_file
+             WHERE data_file_id = ? AND (end_snapshot IS NULL OR ?)
+             ORDER BY begin_snapshot DESC LIMIT 1",
+        )
+        .bind(entry.data_file_id)
+        .bind(entry.data_file_end.is_some())
+        .fetch_optional(&mut **tx)
+        .await?;
+        if target_end != Some(entry.data_file_end) || current != entry.expected_prev_delete_file {
+            return Err(conflict());
+        }
+        // A new id, never the replaced row's: a concurrent statement expecting
+        // the replaced file must not take the new one for it.
+        let delete_file_id = next_file_id(tx).await?;
+        if let Some(previous) = entry.expected_prev_delete_file {
+            let dead = sqlx::query(AssertSqlSafe(format!(
+                "SELECT df.delete_file_id, {RESOLVED_PATH} AS resolved_path,
+                        {REL_FLAG} AS rel
+                 FROM ducklake_delete_file df
+                 JOIN ducklake_table t ON t.table_id = df.table_id
+                 JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                 WHERE df.delete_file_id = ?"
+            )))
+            .bind(previous)
+            .fetch_all(&mut **tx)
+            .await?;
+            schedule_files(tx, dead).await?;
+            sqlx::query("DELETE FROM ducklake_delete_file WHERE delete_file_id = ?")
+                .bind(previous)
+                .execute(&mut **tx)
+                .await?;
+        }
+        insert_flush_delete_file(
+            tx,
+            table_id,
+            Some(delete_file_id),
+            entry.data_file_id,
+            &entry.delete,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Register a delete file an inlined flush wrote for `data_file_id`.
+/// `delete_file_id` `None` takes the next file id ([`next_file_id`]).
+async fn insert_flush_delete_file(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    delete_file_id: Option<i64>,
+    data_file_id: i64,
+    delete: &InlinedFlushDeleteFile,
+) -> Result<()> {
+    let delete_file_id = match delete_file_id {
+        Some(id) => id,
+        None => next_file_id(tx).await?,
+    };
+    sqlx::query(
+        "INSERT INTO ducklake_delete_file
+             (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
+              footer_size, delete_count, begin_snapshot, partial_max, end_snapshot)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(delete_file_id)
+    .bind(data_file_id)
+    .bind(table_id)
+    .bind(&delete.delete.path)
+    .bind(delete.delete.path_is_relative)
+    .bind(delete.delete.file_size_bytes)
+    .bind(delete.delete.footer_size)
+    .bind(delete.delete.delete_count)
+    .bind(delete.begin_snapshot)
+    .bind(delete.partial_max)
+    .bind(delete.end_snapshot)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -2016,7 +2570,9 @@ async fn insert_partition_metadata(
 /// Writes one `ducklake_file_column_stats` row per [`ColumnStat`] (the zone maps
 /// that drive file pruning), within the caller's commit transaction so the
 /// stats land atomically with the `ducklake_data_file` row. `data_file_id` is
-/// the id of the row just inserted (SQLite `last_insert_rowid()`). A `None`
+/// the id the row was inserted under (never SQLite's `last_insert_rowid()`: a
+/// catalog official DuckDB created declares `data_file_id BIGINT PRIMARY KEY`,
+/// which is not SQLite's row id). A `None`
 /// bound/count is written as SQL `NULL` — spec-safe: a file with NULL stats is
 /// never pruned.
 async fn insert_file_column_stats(
@@ -2047,106 +2603,109 @@ async fn insert_file_column_stats(
     Ok(())
 }
 
-/// Read the table's live column generation as `(ColumnDef, column_id)`, ordered
-/// by `column_order`. Used to drive [`recompute_table_column_stats`] from
-/// `retire_appends_since`, which (unlike a normal write) doesn't already hold the
-/// column list. `is_nullable` is irrelevant — recompute only reads the type.
-async fn live_columns_for_stats(
+/// The field ids and DuckLake types of the table's live columns and nested
+/// fields, by which the table-wide statistics merge compares bounds.
+async fn live_stat_fields(
     table_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-) -> Result<(Vec<ColumnDef>, Vec<i64>)> {
-    let mut columns = Vec::new();
-    let mut column_ids = Vec::new();
-    for row in sqlx::query(
-        "SELECT column_id, column_name, column_type
-         FROM ducklake_column
-         WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL
-         ORDER BY column_order",
+) -> Result<Vec<(i64, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT column_id, column_type FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL",
     )
     .bind(table_id)
     .fetch_all(&mut **tx)
-    .await?
-    {
-        let column_id: i64 = row.try_get(0)?;
-        let name: String = row.try_get(1)?;
-        let ducklake_type: String = row.try_get(2)?;
-        column_ids.push(column_id);
-        columns.push(ColumnDef {
-            name,
-            data_type: crate::types::ducklake_to_arrow_type(&ducklake_type)
-                .unwrap_or(arrow::datatypes::DataType::Null),
-            ducklake_type,
-            is_nullable: true,
-            initial_default: None,
-            default_value: None,
-            default_value_type: None,
-            default_value_dialect: None,
-        });
-    }
-    Ok((columns, column_ids))
+    .await?)
 }
 
-/// Recompute the table-wide `ducklake_table_column_stats` roll-up (optimizer
-/// stats) from the table's currently-live files, and replace the stored rows.
-///
-/// Recomputing from live files (rather than incrementally widening) is correct
-/// for every write mode without special cases: an Append adds a live file;
-/// Replace/compaction retire the prior generation (their files drop out of the
-/// `end_snapshot IS NULL` set); a positional delete leaves the data file live
-/// with unchanged stats — so global bounds widen on insert and never tighten on
-/// delete, matching official DuckLake. Min/max widen with a type-aware compare
-/// ([`crate::stats_encode::stat_cmp`]); `contains_null`/`contains_nan` are
-/// OR-reduced when every live file reported them, else NULL/unknown.
-async fn recompute_table_column_stats(
+/// Merge the statistics of `files`, newly committed to the table, into its
+/// `ducklake_table_column_stats` roll-up, as official DuckLake does when it
+/// commits data files (see [`crate::stats_encode::merge_file_column_stats`]).
+/// Called before the write advances `ducklake_table_stats`, which says whether
+/// the table had statistics before it.
+async fn merge_file_table_column_stats(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table_id: i64,
-    columns: &[ColumnDef],
-    column_ids: &[i64],
+    fields: &[(i64, String)],
+    files: &[Vec<crate::stats_encode::FileColumnStat>],
 ) -> Result<()> {
-    use crate::stats_encode::{FileColumnStat, aggregate_global_column_stats};
-    let catalog_columns = catalog_column_defs(columns)?;
-    let column_ids = top_level_column_ids(&catalog_columns, column_ids)?;
+    let initialized = table_stats_initialized(tx, table_id).await?;
+    let live: Vec<i64> = fields.iter().map(|(id, _)| *id).collect();
+    let existing = load_table_column_stats(tx, table_id).await?;
+    let merged =
+        crate::stats_encode::merge_file_column_stats(existing, initialized, files, &live, |id| {
+            crate::metadata_writer::stat_kind_of(fields, id)
+        });
+    store_table_column_stats(tx, table_id, merged).await
+}
 
-    // Total live files: the completeness denominator. A live file missing from
-    // the per-column rows below (statless) forces the roll-up to UNKNOWN.
-    let live_file_count: i64 = sqlx::query(
-        "SELECT COUNT(*) FROM ducklake_data_file WHERE table_id = ? AND end_snapshot IS NULL",
-    )
-    .bind(table_id)
-    .fetch_one(&mut **tx)
-    .await?
-    .try_get(0)?;
-
-    let mut per_file: Vec<FileColumnStat> = Vec::new();
+/// The table's stored `ducklake_table_column_stats` rows, less those whose
+/// bounds are unknown. A row with neither bound reads as holding no valid value
+/// (see [`crate::stats_encode::ColumnStats::from_global`]). Official writes one
+/// while the column's live files hold only NULLs or only NaN (whose bounds no
+/// reader uses once `contains_nan` is set), after a rewrite recomputes the
+/// statistics from such files, and for a `GEOMETRY` column, whose bounds are in
+/// `extra_stats`; this crate keeps those rows, as official merges into them.
+/// Releases of this crate up to 0.9 also wrote one, without NaN, when a live
+/// file's bounds were missing: a row with neither bound, no NaN and no
+/// `extra_stats` over a live file of an earlier commit not known to hold only
+/// NULLs or only NaN is dropped here, so the merge leaves the field with no row
+/// (unknown) instead of narrowing it to the new values. The commit's own
+/// snapshot is the newest, so its new files are not counted.
+async fn load_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<Vec<crate::stats_encode::GlobalColumnStat>> {
+    let mut existing = Vec::new();
     for row in sqlx::query(
-        "SELECT s.column_id, s.min_value, s.max_value, s.null_count, s.contains_nan
-         FROM ducklake_file_column_stats s
-         JOIN ducklake_data_file d ON d.data_file_id = s.data_file_id
-         WHERE d.table_id = ? AND d.end_snapshot IS NULL",
+        "SELECT s.column_id, s.contains_null, s.contains_nan, s.min_value, s.max_value
+         FROM ducklake_table_column_stats s
+         WHERE s.table_id = ?
+           AND NOT (s.min_value IS NULL AND s.max_value IS NULL
+                    AND (s.contains_nan IS NULL OR NOT s.contains_nan)
+                    AND s.extra_stats IS NULL AND EXISTS (
+               SELECT 1 FROM ducklake_data_file d
+               WHERE d.table_id = s.table_id AND d.end_snapshot IS NULL
+                 AND d.begin_snapshot < (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+                 AND NOT EXISTS (
+                     SELECT 1 FROM ducklake_file_column_stats f
+                     WHERE f.data_file_id = d.data_file_id AND f.column_id = s.column_id
+                       AND ((f.null_count IS NOT NULL AND f.value_count = 0)
+                            OR (f.contains_nan AND f.min_value IS NULL
+                                AND f.max_value IS NULL)))))",
     )
     .bind(table_id)
     .fetch_all(&mut **tx)
     .await?
     {
-        per_file.push(FileColumnStat {
+        existing.push(crate::stats_encode::GlobalColumnStat {
             column_id: row.try_get(0)?,
-            min_value: row.try_get(1)?,
-            max_value: row.try_get(2)?,
-            null_count: row.try_get(3)?,
-            contains_nan: row.try_get(4)?,
+            contains_null: row.try_get(1)?,
+            contains_nan: row.try_get(2)?,
+            min_value: row.try_get(3)?,
+            max_value: row.try_get(4)?,
         });
     }
+    Ok(existing)
+}
 
-    let numeric_of = |column_id: i64| -> bool {
-        column_ids
-            .iter()
-            .position(|id| *id == column_id)
-            .and_then(|i| columns.get(i))
-            .map(|c| crate::stats_encode::is_numeric_ducklake_type(c.ducklake_type()))
-            .unwrap_or(false)
-    };
-    let globals = aggregate_global_column_stats(&per_file, live_file_count, numeric_of);
-
+/// Replace the table's `ducklake_table_column_stats` rows with `globals`.
+async fn store_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    globals: Vec<crate::stats_encode::GlobalColumnStat>,
+) -> Result<()> {
+    // A kept row keeps its `extra_stats` (a `GEOMETRY` column's bounds), which
+    // this crate does not compute.
+    let extra: std::collections::HashMap<i64, String> = sqlx::query_as(
+        "SELECT column_id, extra_stats FROM ducklake_table_column_stats
+         WHERE table_id = ? AND extra_stats IS NOT NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
     sqlx::query("DELETE FROM ducklake_table_column_stats WHERE table_id = ?")
         .bind(table_id)
         .execute(&mut **tx)
@@ -2155,7 +2714,7 @@ async fn recompute_table_column_stats(
         sqlx::query(
             "INSERT INTO ducklake_table_column_stats
                  (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-             VALUES (?, ?, ?, ?, ?, ?, NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(table_id)
         .bind(g.column_id)
@@ -2163,10 +2722,64 @@ async fn recompute_table_column_stats(
         .bind(g.contains_nan)
         .bind(g.min_value)
         .bind(g.max_value)
+        .bind(extra.get(&g.column_id))
         .execute(&mut **tx)
         .await?;
     }
     Ok(())
+}
+
+/// Whether the table's statistics were initialized before this write, as
+/// official keys an inlined write's statistics on an existing
+/// `ducklake_table_stats` row. This crate's commits insert a missing row with
+/// zeros before updating it (`INSERT OR IGNORE`), so a zero row may predate
+/// any write; a row counts once it has recorded a row (`next_row_id > 0`) or
+/// the table has column statistics.
+async fn table_stats_initialized(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM ducklake_table_stats WHERE table_id = ? AND next_row_id > 0)
+             OR EXISTS (SELECT 1 FROM ducklake_table_column_stats WHERE table_id = ?)",
+    )
+    .bind(table_id)
+    .bind(table_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+/// Merge the statistics of `batches`, written inline to the table, into its
+/// `ducklake_table_column_stats`, as official DuckLake does on an inlined write
+/// (see [`crate::stats_encode::merge_inlined_column_stats`]). A NULL in one of
+/// `snapshot_id_columns` is stored as `snapshot_id`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the statistics merge needs the table, its fields, the rows and the stats state"
+)]
+async fn merge_inlined_table_column_stats(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    batches: &[RecordBatch],
+    snapshot_id_columns: &[String],
+    snapshot_id: i64,
+    initialized: bool,
+) -> Result<()> {
+    let fields = crate::metadata_writer::catalog_fields(columns, column_ids)?;
+    let inlined = crate::stats_encode::inlined_column_stats(batches, &fields, |i| {
+        columns
+            .get(i)
+            .filter(|column| snapshot_id_columns.iter().any(|name| name == column.name()))
+            .map(|_| datafusion::common::ScalarValue::Int64(Some(snapshot_id)))
+    })?;
+    let existing = load_table_column_stats(tx, table_id).await?;
+    let merged =
+        crate::stats_encode::merge_inlined_column_stats(existing, inlined, initialized, |id| {
+            crate::metadata_writer::stat_kind_of(&fields, id)
+        });
+    store_table_column_stats(tx, table_id, merged).await
 }
 
 #[expect(
@@ -2199,6 +2812,7 @@ async fn finalize_snapshot(
         column_ids,
         mode,
         base_snapshot,
+        true,
     )
     .await?;
     Ok(snapshot_id)
@@ -2220,6 +2834,7 @@ async fn finalize_table_snapshot(
     column_ids: &[i64],
     mode: WriteMode,
     base_snapshot: i64,
+    inserts: bool,
 ) -> Result<()> {
     // Classify this commit as DDL vs pure data write. The table's begin snapshot
     // identifies creation even when it has no columns; using an empty live-column
@@ -2290,6 +2905,9 @@ async fn finalize_table_snapshot(
             &proposed,
             column_ids,
         );
+    if is_ddl {
+        reject_new_reserved_columns(tx, table_id, &existing_catalog_columns, &proposed).await?;
+    }
     if is_ddl && !*schema_changed {
         // A DDL commit bumps the per-catalog schema_version (the insert above only
         // carried it forward). A pure data write keeps the carried value.
@@ -2401,17 +3019,21 @@ async fn finalize_table_snapshot(
         // write began (held under the write lock acquired by the MAX+1 insert
         // above, so the check sees a consistent committed state).
         detect_replace_conflict(tx, table_id, base_snapshot, ConflictScope::Table).await?;
-        // Seed the stats row (first write to a brand-new table) so retire's
-        // zero-update has a row, then retire the prior data generation.
-        sqlx::query(
-            "INSERT OR IGNORE INTO ducklake_table_stats
-                 (table_id, record_count, next_row_id, file_size_bytes)
-             VALUES (?, 0, 0, 0)",
-        )
-        .bind(table_id)
-        .execute(&mut **tx)
-        .await?;
+        // Retire the prior data generation. A table gets its stats row with
+        // its first rows, as official's `CREATE TABLE` writes none.
         retire_prior_generation(tx, table_id, snapshot_id).await?;
+    } else if inserts {
+        // An insert refuses a drop, alter or delete of the table since its
+        // base snapshot, as official's does; a stage that only deletes is
+        // checked by its own rules.
+        check_table_conflicts(
+            tx,
+            table_id,
+            base_snapshot,
+            snapshot_id,
+            TableChanges::append(),
+        )
+        .await?;
     }
 
     // Record the schema-change ledger row for a DDL commit (table create, or a
@@ -2420,6 +3042,7 @@ async fn finalize_table_snapshot(
     // writes no row, since the table has no live schema afterward.)
     if is_ddl {
         record_schema_version(tx, snapshot_id, *schema_version, table_id).await?;
+        create_eager_inlined_table(tx, table_id, *schema_version).await?;
     }
     let mut ddl_changes = Vec::new();
     if table_was_created {
@@ -2572,12 +3195,14 @@ async fn commit_files_at_snapshot(
     let mut total_bytes = 0;
     for file in files {
         let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
+        let file_id = next_file_id(tx).await?;
         sqlx::query(
             "INSERT INTO ducklake_data_file
-                 (table_id, path, path_is_relative, file_size_bytes, footer_size,
+                 (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size,
                   record_count, row_id_start, begin_snapshot)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
+        .bind(file_id)
         .bind(write.table_id)
         .bind(&file.path)
         .bind(file.path_is_relative)
@@ -2588,9 +3213,7 @@ async fn commit_files_at_snapshot(
         .bind(snapshot_id)
         .execute(&mut **tx)
         .await?;
-        let data_file_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
-            .fetch_one(&mut **tx)
-            .await?;
+        let data_file_id = file_id;
         insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += row_ids.advance;
@@ -2598,7 +3221,13 @@ async fn commit_files_at_snapshot(
         total_records += file.record_count;
         total_bytes += file.file_size_bytes;
     }
-    recompute_table_column_stats(tx, write.table_id, &write.columns, &write.column_ids).await?;
+    merge_file_table_column_stats(
+        tx,
+        write.table_id,
+        &crate::metadata_writer::catalog_fields(&write.columns, &write.column_ids)?,
+        &crate::metadata_writer::file_column_stats(files),
+    )
+    .await?;
     sqlx::query(
         "UPDATE ducklake_table_stats
          SET next_row_id = next_row_id + ?, record_count = record_count + ?,
@@ -2623,6 +3252,222 @@ async fn commit_files_at_snapshot(
     .await?)
 }
 
+/// The live column rows of `table_id`, each with its parent column id.
+async fn live_table_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<Vec<(crate::metadata_provider::DuckLakeTableColumn, Option<i64>)>> {
+    let rows = sqlx::query(
+        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+         FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let nullable: Option<bool> = row.try_get(3)?;
+            Ok((
+                crate::metadata_provider::DuckLakeTableColumn::new(
+                    row.try_get(0)?,
+                    row.try_get(1)?,
+                    row.try_get(2)?,
+                    nullable.unwrap_or(true),
+                ),
+                row.try_get::<Option<i64>, _>(4)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Create the inlined data table `ducklake_inlined_data_{table_id}_{schema_version}`
+/// holding `fields` after the system columns, as official's DDL does, and
+/// register it. Returns its name.
+async fn create_inlined_data_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    schema_version: i64,
+    fields: &[(String, DataType, String)],
+) -> Result<String> {
+    let physical_name = format!("ducklake_inlined_data_{table_id}_{schema_version}");
+    let system = catalog_inlined_system_columns(&mut **tx).await?;
+    let mut ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {} ({} BIGINT, {} BIGINT, {} BIGINT",
+        quote_ident(&physical_name),
+        system.row_id,
+        system.begin_snapshot,
+        system.end_snapshot,
+    );
+    for (name, data_type, _) in fields {
+        ddl.push_str(", ");
+        ddl.push_str(&quote_ident(name));
+        ddl.push(' ');
+        ddl.push_str(inlined_sqlite_type(data_type));
+    }
+    ddl.push(')');
+    sqlx::query(AssertSqlSafe(ddl)).execute(&mut **tx).await?;
+    ensure_sqlite_physical_indexes(tx, table_id, &physical_name).await?;
+    sqlx::query(
+        "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
+         SELECT ?, ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM ducklake_inlined_data_tables
+             WHERE table_id = ? AND schema_version = ?
+         )",
+    )
+    .bind(table_id)
+    .bind(&physical_name)
+    .bind(schema_version)
+    .bind(table_id)
+    .bind(schema_version)
+    .execute(&mut **tx)
+    .await?;
+    Ok(physical_name)
+}
+
+/// The `data_inlining_row_limit` in effect for the live table `table_id`;
+/// `0` when it is not live.
+async fn table_inlining_limit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+) -> Result<usize> {
+    let Some(schema_id): Option<i64> = sqlx::query_scalar(
+        "SELECT schema_id FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+    )
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(0);
+    };
+    let settings: Vec<(Option<String>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT scope, scope_id, value FROM ducklake_metadata
+         WHERE key = 'data_inlining_row_limit'",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    crate::metadata_writer::effective_inlining_limit(&settings, schema_id, table_id)
+}
+
+/// Refuse a commit that creates `table_id` or adds a column to it named like
+/// an inlined data table's system column while its inlining limit is above
+/// `0`, as official refuses `CREATE TABLE` and `ADD COLUMN`.
+async fn reject_new_reserved_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    existing: &[crate::metadata_writer::ExistingCatalogColumn],
+    proposed: &[crate::metadata_writer::CatalogColumnDef],
+) -> Result<()> {
+    let system = catalog_inlined_system_columns(&mut **tx).await?;
+    let Some(column) = crate::metadata_writer::new_reserved_column(existing, proposed, system)
+    else {
+        return Ok(());
+    };
+    if table_inlining_limit(tx, table_id).await? == 0 {
+        return Ok(());
+    }
+    Err(crate::metadata_writer::reserved_inlining_column_error(
+        &column,
+    ))
+}
+
+/// Official's eager inlined data table: a commit that creates `table_id` or
+/// changes its columns or partitioning creates the inlined data table of its
+/// `schema_version` while the table's `data_inlining_row_limit` is above `0`
+/// and its columns can be inlined (`WriteNewInlinedTables`).
+async fn create_eager_inlined_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    schema_version: i64,
+) -> Result<()> {
+    if table_inlining_limit(tx, table_id).await? == 0 {
+        return Ok(());
+    }
+    let columns = live_table_columns(tx, table_id).await?;
+    let system = catalog_inlined_system_columns(&mut **tx).await?;
+    if let Some(fields) =
+        crate::metadata_writer::inlinable_columns(columns, system, None, sqlite_type_inlines)?
+    {
+        create_inlined_data_table(tx, table_id, schema_version, &fields).await?;
+    }
+    Ok(())
+}
+
+/// The inlined data table rows of `table_id` written at `snapshot_id` go to:
+/// its latest, as official's `LatestInlinedTableQuery` picks it, or, when it
+/// has none, a new one for a schema version the commit takes for it, as
+/// official's `WriteNewInlinedData` creates one. Official inserts into the
+/// latest table whatever its columns; when they are not `fields` the insert
+/// fails as official's does, unless this commit itself changed the table's
+/// columns (a schema-changing append), which gets a new table.
+async fn inlined_insert_table(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table_id: i64,
+    snapshot_id: i64,
+    fields: &[(String, DataType, String)],
+) -> Result<String> {
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT table_name FROM ducklake_inlined_data_tables
+         WHERE table_id = ? ORDER BY schema_version DESC LIMIT 1",
+    )
+    .bind(table_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(name) = latest {
+        let present: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+                .bind(&name)
+                .fetch_all(&mut **tx)
+                .await?;
+        let matches = present.len() == fields.len() + 3
+            && present[3..]
+                .iter()
+                .zip(fields)
+                .all(|(stored, (name, _, _))| stored == name);
+        if matches {
+            let borrowed = fields
+                .iter()
+                .map(|(name, data_type, _)| (name.as_str(), data_type))
+                .collect::<Vec<_>>();
+            migrate_double_inlined_columns(tx, &name, &borrowed).await?;
+            ensure_sqlite_physical_indexes(tx, table_id, &name).await?;
+            return Ok(name);
+        }
+        let changed_now: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ducklake_column
+                           WHERE table_id = ? AND (begin_snapshot = ? OR end_snapshot = ?))",
+        )
+        .bind(table_id)
+        .bind(snapshot_id)
+        .bind(snapshot_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !changed_now {
+            return Err(crate::metadata_writer::inlined_table_shape_error(
+                &name,
+                present.len(),
+                fields.len() + 3,
+            ));
+        }
+    }
+    sqlx::query(
+        "UPDATE ducklake_snapshot SET schema_version = schema_version + 1 WHERE snapshot_id = ?",
+    )
+    .bind(snapshot_id)
+    .execute(&mut **tx)
+    .await?;
+    let schema_version: i64 =
+        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?")
+            .bind(snapshot_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    create_inlined_data_table(tx, table_id, schema_version, fields).await
+}
+
 async fn commit_inlined_at_snapshot(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     snapshot_id: i64,
@@ -2636,44 +3481,24 @@ async fn commit_inlined_at_snapshot(
             "multi-table inline stage must contain at least one row".to_string(),
         ));
     }
-    let schema_version: i64 =
-        sqlx::query_scalar("SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?")
-            .bind(snapshot_id)
-            .fetch_one(&mut **tx)
-            .await?;
-    let physical_name = format!(
-        "ducklake_inlined_data_{}_{}",
-        write.table_id, schema_version
-    );
-    let mut ddl = format!(
-        "CREATE TABLE IF NOT EXISTS {} (\
-         row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
-        quote_ident(&physical_name)
-    );
-    for (field, column) in batches[0].schema().fields().iter().zip(&write.columns) {
-        ddl.push_str(", ");
-        ddl.push_str(&quote_ident(column.name()));
-        ddl.push(' ');
-        ddl.push_str(inlined_sqlite_type(field.data_type()));
-    }
-    ddl.push(')');
-    sqlx::query(AssertSqlSafe(ddl)).execute(&mut **tx).await?;
-    ensure_sqlite_physical_indexes(tx, write.table_id, &physical_name).await?;
-    sqlx::query(
-        "INSERT INTO ducklake_inlined_data_tables (table_id, table_name, schema_version)
-         SELECT ?, ?, ?
-         WHERE NOT EXISTS (
-             SELECT 1 FROM ducklake_inlined_data_tables
-             WHERE table_id = ? AND schema_version = ?
-         )",
-    )
-    .bind(write.table_id)
-    .bind(&physical_name)
-    .bind(schema_version)
-    .bind(write.table_id)
-    .bind(schema_version)
-    .execute(&mut **tx)
-    .await?;
+    let fields = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .zip(&write.columns)
+        .map(|(field, column)| {
+            (
+                column.name().to_string(),
+                field.data_type().clone(),
+                column.ducklake_type().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let physical_name = inlined_insert_table(tx, write.table_id, snapshot_id, &fields).await?;
+    let system = inlined_table_layout(&mut **tx, &physical_name)
+        .await?
+        .system;
+    let stats_initialized = table_stats_initialized(tx, write.table_id).await?;
     sqlx::query(
         "INSERT OR IGNORE INTO ducklake_table_stats
              (table_id, record_count, next_row_id, file_size_bytes)
@@ -2693,14 +3518,22 @@ async fn commit_inlined_at_snapshot(
         .map(|column| quote_ident(column.name()))
         .collect::<Vec<_>>()
         .join(", ");
+    let mut written = 0usize;
     for batch in batches {
         for batch_row in 0..batch.num_rows() {
             let mut query = QueryBuilder::<Sqlite>::new(format!(
-                "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) VALUES (",
+                "INSERT INTO {} ({}, {}, {}, {}) VALUES (",
                 quote_ident(&physical_name),
+                system.row_id,
+                system.begin_snapshot,
+                system.end_snapshot,
                 column_list
             ));
-            query.push_bind(row_id);
+            let stored_row_id = match &write.inlined_row_ids {
+                Some(row_ids) => row_ids[written],
+                None => row_id,
+            };
+            query.push_bind(stored_row_id);
             query.push(", ").push_bind(snapshot_id);
             query.push(", NULL");
             for (array, column) in batch.columns().iter().zip(&write.columns) {
@@ -2719,17 +3552,35 @@ async fn commit_inlined_at_snapshot(
             query.push(')');
             query.build().execute(&mut **tx).await?;
             row_id += 1;
+            written += 1;
         }
     }
     let record_count = i64::try_from(record_count).map_err(|_| {
         crate::DuckLakeError::InvalidConfig("multi-table inline row count exceeds i64".to_string())
     })?;
+    merge_inlined_table_column_stats(
+        tx,
+        write.table_id,
+        &write.columns,
+        &write.column_ids,
+        batches,
+        &write.snapshot_id_columns,
+        snapshot_id,
+        stats_initialized,
+    )
+    .await?;
+    // Preserved row ids were drawn when the rows were first written.
+    let advance = if write.inlined_row_ids.is_some() {
+        0
+    } else {
+        record_count
+    };
     sqlx::query(
         "UPDATE ducklake_table_stats
          SET next_row_id = next_row_id + ?, record_count = record_count + ?
          WHERE table_id = ?",
     )
-    .bind(record_count)
+    .bind(advance)
     .bind(record_count)
     .bind(write.table_id)
     .execute(&mut **tx)
@@ -2738,10 +3589,51 @@ async fn commit_inlined_at_snapshot(
 }
 
 impl MetadataWriter for SqliteMetadataWriter {
+    fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
+        Some(self)
+    }
+
     /// SQLite implements the atomic append-with-deletes commit, so it supports
     /// row-level `UPDATE`.
     fn supports_update(&self) -> bool {
         true
+    }
+
+    fn supports_inlined_row_mutations(&self) -> bool {
+        true
+    }
+
+    fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
+        block_on(async {
+            // One transaction: a registry row and its physical table go together.
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let targets = sqlx::query_as::<_, (i64, i64, String)>(SUPERSEDED_INLINED_TABLES_SQL)
+                .fetch_all(&mut *tx)
+                .await?;
+            for (table_id, schema_version, table_name) in targets {
+                let quoted = quote_ident(&table_name);
+                let rows: i64 =
+                    sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM {quoted}")))
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if rows != 0 {
+                    continue;
+                }
+                sqlx::query(
+                    "DELETE FROM ducklake_inlined_data_tables
+                     WHERE table_id = ? AND schema_version = ?",
+                )
+                .bind(table_id)
+                .bind(schema_version)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {quoted}")))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
@@ -2756,6 +3648,17 @@ impl MetadataWriter for SqliteMetadataWriter {
             .await?;
             if !table_exists {
                 return Err(crate::DuckLakeError::TableNotFound(table_id.to_string()));
+            }
+            if enables_inlining(&key, value) {
+                let columns: Vec<(String, String)> = sqlx::query_as(SQL_TABLE_INLINING_COLUMNS)
+                    .bind(table_id)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                    &mut *transaction,
+                )
+                .await?;
+                reject_reserved_inlining_columns(&columns, system)?;
             }
 
             sqlx::query(
@@ -2877,6 +3780,27 @@ impl MetadataWriter for SqliteMetadataWriter {
         operation()
     }
 
+    fn catalog_encrypted(&self) -> Result<bool> {
+        block_on(async {
+            let values: Vec<String> = sqlx::query_scalar(
+                "SELECT value FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            crate::metadata_writer::encrypted_option(&values)
+        })
+    }
+
+    fn head_snapshot(&self) -> Result<Option<i64>> {
+        block_on(async {
+            Ok(
+                sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
+                    .fetch_one(&self.pool)
+                    .await?,
+            )
+        })
+    }
+
     fn create_snapshot(&self) -> Result<i64> {
         block_on(async {
             let mut tx = self.pool.begin().await?;
@@ -2892,6 +3816,16 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
         block_on(async {
             let mut transaction = self.pool.begin().await?;
+            if enables_inlining(key, value) {
+                let columns: Vec<(String, String)> = sqlx::query_as(SQL_GLOBAL_INLINING_COLUMNS)
+                    .fetch_all(&mut *transaction)
+                    .await?;
+                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                    &mut *transaction,
+                )
+                .await?;
+                reject_reserved_inlining_columns(&columns, system)?;
+            }
             sqlx::query("DELETE FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
                 .bind(key)
                 .execute(&mut *transaction)
@@ -3236,6 +4170,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Record the schema-change ledger row so consumers can detect the change.
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            create_eager_inlined_table(&mut tx, table_id, new_schema_version).await?;
             record_snapshot_changes(
                 &mut tx,
                 new_snapshot,
@@ -3334,6 +4269,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Setting a spec is DDL: bump + record schema_version.
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            create_eager_inlined_table(&mut tx, table_id, new_schema_version).await?;
             record_snapshot_changes(
                 &mut tx,
                 new_snapshot,
@@ -3406,6 +4342,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Removing the spec is DDL: bump + record schema_version.
             let new_schema_version = bump_schema_version(&mut tx, new_snapshot).await?;
             record_schema_version(&mut tx, new_snapshot, new_schema_version, table_id).await?;
+            create_eager_inlined_table(&mut tx, table_id, new_schema_version).await?;
             record_snapshot_changes(
                 &mut tx,
                 new_snapshot,
@@ -3762,12 +4699,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             let next_row_id: i64 = stats_row.try_get(0)?;
             let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
+            let file_id = next_file_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(file_id)
             .bind(table_id)
             .bind(&file.path)
             .bind(file.path_is_relative)
@@ -3779,17 +4718,18 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // Persist the file's per-column zone-map stats in the same tx. The
-            // data file is a fresh autoincrement rowid, so `last_insert_rowid()`
-            // (captured before any further INSERT) is its data_file_id.
-            let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
-                .fetch_one(&mut *tx)
-                .await?
-                .try_get(0)?;
+            // Persist the file's per-column zone-map stats in the same tx.
+            let data_file_id = file_id;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-            // Refresh the table-wide roll-up from the now-current live file set.
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            // Merge the file's statistics into the table-wide roll-up.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats([file]),
+            )
+            .await?;
 
             // Advance the counter and accumulate stats. `next_row_id`
             // monotonically increases over the table's lifetime — rowids
@@ -3938,12 +4878,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut total_bytes: i64 = 0;
             for file in files {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(table_id)
                 .bind(&file.path)
                 .bind(file.path_is_relative)
@@ -3954,10 +4896,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
+                let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -3966,8 +4905,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
-            // Refresh the table-wide roll-up once, from the now-current live file set.
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            // Merge the files' statistics into the table-wide roll-up.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(files),
+            )
+            .await?;
             sqlx::query(
                 "UPDATE ducklake_table_stats
                  SET next_row_id     = next_row_id + ?,
@@ -4000,11 +4945,22 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn reserved_inlining_column(&self, columns: &[String]) -> Result<Option<String>> {
+        let system = block_on(catalog_inlined_system_columns(&self.pool))?;
+        Ok(columns
+            .iter()
+            .find(|column| system.conflicts_with(column))
+            .cloned())
+    }
+
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
+        let Ok(system) = block_on(catalog_inlined_system_columns(&self.pool)) else {
+            return false;
+        };
         if schema
             .fields()
             .iter()
-            .any(|field| is_inlined_system_column(field.name()))
+            .any(|field| system.conflicts_with(field.name()))
         {
             return false;
         }
@@ -4012,6 +4968,26 @@ impl MetadataWriter for SqliteMetadataWriter {
             .fields()
             .iter()
             .all(|field| sqlite_type_inlines(field.data_type()))
+    }
+
+    fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        block_on(async {
+            let refused: bool = sqlx::query_scalar(AssertSqlSafe(format!(
+                "SELECT EXISTS(
+                     SELECT 1 FROM ducklake_column c
+                     JOIN ducklake_table t ON t.table_id = c.table_id
+                     JOIN ducklake_schema s ON s.schema_id = t.schema_id
+                     WHERE s.schema_name = ? AND s.end_snapshot IS NULL
+                       AND t.table_name = ? AND t.end_snapshot IS NULL
+                       AND c.end_snapshot IS NULL AND LOWER(c.column_type) IN ({}))",
+                crate::types::sql_uninlinable_types()
+            )))
+            .bind(schema_name)
+            .bind(table_name)
+            .fetch_one(&self.pool)
+            .await?;
+            Ok(!refused)
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4069,44 +5045,24 @@ impl MetadataWriter for SqliteMetadataWriter {
                 )
                 .await?;
             }
-            let schema_version: i64 = sqlx::query_scalar(
-                "SELECT schema_version FROM ducklake_snapshot WHERE snapshot_id = ?",
-            )
-            .bind(snapshot_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let physical_name = format!("ducklake_inlined_data_{table_id}_{schema_version}");
+            let fields = batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .zip(columns)
+                .map(|(field, column)| {
+                    (
+                        column.name().to_string(),
+                        field.data_type().clone(),
+                        column.ducklake_type().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let physical_name =
+                inlined_insert_table(&mut tx, table_id, snapshot_id, &fields).await?;
+            let system = inlined_table_layout(&mut *tx, &physical_name).await?.system;
 
-            let mut ddl = format!(
-                "CREATE TABLE IF NOT EXISTS {} (\
-                 row_id BIGINT, begin_snapshot BIGINT, end_snapshot BIGINT",
-                quote_ident(&physical_name)
-            );
-            for (field, column) in batches[0].schema().fields().iter().zip(columns) {
-                ddl.push_str(", ");
-                ddl.push_str(&quote_ident(column.name()));
-                ddl.push(' ');
-                ddl.push_str(inlined_sqlite_type(field.data_type()));
-            }
-            ddl.push(')');
-            sqlx::query(AssertSqlSafe(ddl)).execute(&mut *tx).await?;
-            ensure_sqlite_physical_indexes(&mut tx, table_id, &physical_name).await?;
-            sqlx::query(
-                "INSERT INTO ducklake_inlined_data_tables
-                     (table_id, table_name, schema_version)
-                 SELECT ?, ?, ?
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM ducklake_inlined_data_tables
-                     WHERE table_id = ? AND schema_version = ?)",
-            )
-            .bind(table_id)
-            .bind(&physical_name)
-            .bind(schema_version)
-            .bind(table_id)
-            .bind(schema_version)
-            .execute(&mut *tx)
-            .await?;
-
+            let stats_initialized = table_stats_initialized(&mut tx, table_id).await?;
             sqlx::query(
                 "INSERT OR IGNORE INTO ducklake_table_stats
                      (table_id, record_count, next_row_id, file_size_bytes)
@@ -4130,8 +5086,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             for batch in batches {
                 for batch_row in 0..batch.num_rows() {
                     let mut query = QueryBuilder::<Sqlite>::new(format!(
-                        "INSERT INTO {} (row_id, begin_snapshot, end_snapshot, {}) VALUES (",
+                        "INSERT INTO {} ({}, {}, {}, {}) VALUES (",
                         quote_ident(&physical_name),
+                        system.row_id,
+                        system.begin_snapshot,
+                        system.end_snapshot,
                         column_list
                     ));
                     query.push_bind(row_id);
@@ -4147,6 +5106,17 @@ impl MetadataWriter for SqliteMetadataWriter {
                 }
             }
 
+            merge_inlined_table_column_stats(
+                &mut tx,
+                table_id,
+                columns,
+                column_ids,
+                batches,
+                &[],
+                snapshot_id,
+                stats_initialized,
+            )
+            .await?;
             let record_count = i64::try_from(record_count).map_err(|_| {
                 crate::DuckLakeError::InvalidConfig(
                     "register_inlined_data: record count exceeds i64".to_string(),
@@ -4212,9 +5182,21 @@ impl MetadataWriter for SqliteMetadataWriter {
         }
 
         block_on(async {
+            for write in writes {
+                validate_row_mutation_stage(write)?;
+            }
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             for write in writes {
+                // Official checks the table-level conflicts first.
+                check_staged_conflicts(&mut tx, write, i64::MAX).await?;
                 validate_staged_table(&mut tx, write).await?;
+                detect_new_inlined_deletes(
+                    &mut tx,
+                    write.table_id,
+                    write.base_snapshot_id,
+                    &row_mutation_source_files(write),
+                )
+                .await?;
             }
             if let Some(expected) = expected_base_snapshot_id {
                 for write in writes {
@@ -4244,6 +5226,21 @@ impl MetadataWriter for SqliteMetadataWriter {
                 ));
             }
             let (snapshot_id, mut schema_version) = insert_snapshot(&mut tx).await?;
+            for write in writes {
+                if let Some(dated) = rewritten_deletes_snapshot(write) {
+                    let between: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM ducklake_snapshot
+                                       WHERE snapshot_id >= ? AND snapshot_id < ?)",
+                    )
+                    .bind(dated)
+                    .bind(snapshot_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if between {
+                        return Err(rewritten_delete_conflict(write.table_id, dated));
+                    }
+                }
+            }
             let mut schema_changed = false;
             for write in writes {
                 finalize_table_snapshot(
@@ -4258,6 +5255,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     &write.column_ids,
                     write.mode,
                     write.base_snapshot_id,
+                    !matches!(write.data, StagedTableData::None),
                 )
                 .await?;
             }
@@ -4281,12 +5279,36 @@ impl MetadataWriter for SqliteMetadataWriter {
                     &write.positional_deletes,
                 )
                 .await?;
+                replace_delete_files(&mut tx, write.table_id, &write.rewritten_deletes, || {
+                    crate::DuckLakeError::Conflict(format!(
+                        "a data file of table {} or its delete file changed since snapshot {}; \
+                         re-open the catalog and retry the statement",
+                        write.table_id, write.base_snapshot_id
+                    ))
+                })
+                .await?;
                 apply_inlined_deletes(
                     &mut tx,
                     write.table_id,
                     snapshot_id,
                     write.base_snapshot_id,
                     &write.inlined_deletes,
+                )
+                .await?;
+                apply_inlined_file_deletes(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.inlined_file_deletes,
+                )
+                .await?;
+                drop_data_files(
+                    &mut tx,
+                    write.table_id,
+                    snapshot_id,
+                    write.base_snapshot_id,
+                    &write.dropped_files,
                 )
                 .await?;
                 let changes_made = staged_table_write_changes(write, had_files, had_inlined_rows);
@@ -4335,14 +5357,20 @@ impl MetadataWriter for SqliteMetadataWriter {
             // First write takes the SQLite write lock up front (see
             // `insert_snapshot`); a delete carries `schema_version` forward.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            // Official's table-level check: a drop, alter, compaction or insert
+            // of the table since `base_snapshot` refuses the delete.
+            let ours = TableChanges {
+                deleted_from: true,
+                ..TableChanges::default()
+            };
+            check_table_conflicts(&mut tx, table_id, base_snapshot, snapshot_id, ours).await?;
 
             // Target-file fence: the resolved positions are physical row indices
             // in `data_file_id`, and a parquet data file is immutable — so only a
             // concurrent write that RETIRED this file (a Replace/compaction) since
-            // `base_snapshot` can invalidate them. An append that adds *other*
-            // files does not move this file's rows, and a concurrent delete on
-            // THIS file is caught by the compare-and-swap below; neither must
-            // block the delete. Abort iff the target is no longer the live file.
+            // `base_snapshot` can invalidate them; a concurrent delete on THIS
+            // file is caught by the compare-and-swap below. Abort iff the target
+            // is no longer the live file.
             let target_live: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_data_file
                  WHERE data_file_id = ? AND end_snapshot IS NULL",
@@ -4389,12 +5417,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
 
+            let file_id = next_file_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_delete_file
-                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                     (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, delete_count, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(file_id)
             .bind(data_file_id)
             .bind(table_id)
             .bind(&delete.path)
@@ -4508,11 +5538,17 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
             if !deletes.is_empty() {
-                let file_ids = deletes
-                    .iter()
-                    .map(|entry| entry.data_file_id)
-                    .collect::<Vec<_>>();
-                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
+                let ours = TableChanges {
+                    inserted_into: true,
+                    deleted_from: true,
+                    ..TableChanges::default()
+                };
+                let source = deleted_files_table(&mut tx, table_id, deletes).await?;
+                check_table_conflicts(&mut tx, source, base_snapshot, snapshot_id, ours).await?;
+            }
+            if !deletes.is_empty() {
+                let sources = SourceFile::of_entries(deletes, false);
+                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &sources).await?;
             }
 
             // Partition-spec fence: the new row versions are a NEW write, so they
@@ -4547,12 +5583,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             let next_row_id: i64 = stats_row.try_get(0)?;
             let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
 
+            let file_id = next_file_id(&mut tx).await?;
             sqlx::query(
                 "INSERT INTO ducklake_data_file
-                     (table_id, path, path_is_relative, file_size_bytes,
+                     (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                       footer_size, record_count, row_id_start, begin_snapshot)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
+            .bind(file_id)
             .bind(table_id)
             .bind(&file.path)
             .bind(file.path_is_relative)
@@ -4564,16 +5602,18 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&mut *tx)
             .await?;
 
-            // Persist the new file's per-column zone-map stats before any other
-            // INSERT (delete-file rows below) moves last_insert_rowid.
-            let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
-                .fetch_one(&mut *tx)
-                .await?
-                .try_get(0)?;
+            // Persist the new file's per-column zone-map stats.
+            let data_file_id = file_id;
             insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-            // Refresh the table-wide roll-up from the now-current live file set.
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            // Merge the file's statistics into the table-wide roll-up.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats([file]),
+            )
+            .await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -4637,12 +5677,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
                 }
 
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
-                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                         (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(entry.data_file_id)
                 .bind(table_id)
                 .bind(&entry.delete.path)
@@ -4759,11 +5801,17 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .await?;
             }
             if !deletes.is_empty() {
-                let file_ids = deletes
-                    .iter()
-                    .map(|entry| entry.data_file_id)
-                    .collect::<Vec<_>>();
-                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
+                let ours = TableChanges {
+                    inserted_into: !files.is_empty(),
+                    deleted_from: true,
+                    ..TableChanges::default()
+                };
+                let source = deleted_files_table(&mut tx, table_id, deletes).await?;
+                check_table_conflicts(&mut tx, source, base_snapshot, snapshot_id, ours).await?;
+            }
+            if !deletes.is_empty() {
+                let sources = SourceFile::of_entries(deletes, false);
+                detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &sources).await?;
             }
 
             // Partition-spec fence (both directions, every file): the new row
@@ -4803,12 +5851,14 @@ impl MetadataWriter for SqliteMetadataWriter {
             let mut total_bytes: i64 = 0;
             for file in files {
                 let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(table_id)
                 .bind(&file.path)
                 .bind(file.path_is_relative)
@@ -4819,12 +5869,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(snapshot_id)
                 .execute(&mut *tx)
                 .await?;
-                // Read the id back before the next INSERT (another data file, its
-                // stats rows, or a delete-file row) moves last_insert_rowid.
-                let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
+                let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
@@ -4833,8 +5878,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                 total_records += file.record_count;
                 total_bytes += file.file_size_bytes;
             }
-            // Refresh the table-wide roll-up once, from the now-current live file set.
-            recompute_table_column_stats(&mut tx, table_id, columns, column_ids).await?;
+            // Merge the files' statistics into the table-wide roll-up.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(files),
+            )
+            .await?;
 
             sqlx::query(
                 "UPDATE ducklake_table_stats
@@ -4898,12 +5949,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
                 }
 
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
-                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                         (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(entry.data_file_id)
                 .bind(table_id)
                 .bind(&entry.delete.path)
@@ -4963,11 +6016,13 @@ impl MetadataWriter for SqliteMetadataWriter {
             // Write-lock-first: the MAX+1 insert takes the SQLite write lock up
             // front, so concurrent writers can't collide or deadlock.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
-            let file_ids = deletes
-                .iter()
-                .map(|entry| entry.data_file_id)
-                .collect::<Vec<_>>();
-            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &file_ids).await?;
+            let ours = TableChanges {
+                deleted_from: true,
+                ..TableChanges::default()
+            };
+            check_table_conflicts(&mut tx, table_id, base_snapshot, snapshot_id, ours).await?;
+            let sources = SourceFile::of_entries(deletes, true);
+            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &sources).await?;
 
             for entry in deletes {
                 // Target-file fence: abort iff the data file is no longer live (a
@@ -5020,12 +6075,14 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .await?;
                 }
 
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_delete_file
-                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                         (delete_file_id, data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, delete_count, begin_snapshot)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(entry.data_file_id)
                 .bind(table_id)
                 .bind(&entry.delete.path)
@@ -5078,6 +6135,11 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let ours = TableChanges {
+                deleted_inlined: true,
+                ..TableChanges::default()
+            };
+            check_table_conflicts(&mut tx, table_id, base_snapshot, snapshot_id, ours).await?;
             apply_inlined_deletes(&mut tx, table_id, snapshot_id, base_snapshot, rows).await?;
             let changes_made = format!("inlined_delete:{table_id}");
             record_snapshot_changes(
@@ -5132,6 +6194,12 @@ impl MetadataWriter for SqliteMetadataWriter {
         block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let ours = TableChanges {
+                deleted_from: !positional.is_empty(),
+                deleted_inlined: !inlined.is_empty(),
+                ..TableChanges::default()
+            };
+            check_table_conflicts(&mut tx, table_id, base_snapshot, snapshot_id, ours).await?;
             apply_positional_deletes(&mut tx, table_id, snapshot_id, base_snapshot, positional)
                 .await?;
             apply_inlined_deletes(&mut tx, table_id, snapshot_id, base_snapshot, inlined).await?;
@@ -5183,7 +6251,11 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .iter()
                 .map(|source| source.data_file_id)
                 .collect::<Vec<_>>();
-            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &source_data_ids).await?;
+            let source_files = source_data_ids
+                .iter()
+                .map(|id| SourceFile::any(*id))
+                .collect::<Vec<_>>();
+            detect_new_inlined_deletes(&mut tx, table_id, base_snapshot, &source_files).await?;
 
             // Conflict fence per source: the data file must still be live, and its
             // live delete file must still match what the caller read the source's
@@ -5322,72 +6394,43 @@ impl MetadataWriter for SqliteMetadataWriter {
             // partial_max marks a merged partial file.
             for out in outputs {
                 let begin = out.begin_snapshot.unwrap_or(snapshot_id);
+                let file_id = next_file_id(&mut tx).await?;
                 sqlx::query(
                     "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
+                         (data_file_id, table_id, path, path_is_relative, file_size_bytes,
                           footer_size, record_count, row_id_start, begin_snapshot, partial_max)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
+                .bind(file_id)
                 .bind(table_id)
                 .bind(&out.file.path)
                 .bind(out.file.path_is_relative)
                 .bind(out.file.file_size_bytes)
                 .bind(out.file.footer_size)
                 .bind(out.file.record_count)
-                .bind(crate::metadata_writer::compaction_output_row_id_start(
-                    &out.file,
-                ))
+                .bind(crate::metadata_writer::carried_row_id_start(&out.file))
                 .bind(begin)
                 .bind(out.partial_max)
                 .execute(&mut *tx)
                 .await?;
-                // Persist the compacted file's harvested zone maps, tying them to
-                // the row just inserted (same tx). Mirrors how official DuckLake
-                // records stats for compaction outputs via the shared write path.
-                let data_file_id: i64 = sqlx::query("SELECT last_insert_rowid()")
-                    .fetch_one(&mut *tx)
-                    .await?
-                    .try_get(0)?;
+                // Persist the compacted file's harvested zone maps under its id
+                // (same tx). Mirrors how official DuckLake records stats for
+                // compaction outputs via the shared write path.
+                let data_file_id = file_id;
                 insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, &out.file).await?;
             }
 
-            // Recompute the visible stat totals from the surviving files. Robust
-            // for both ops: merge preserves the gross record_count (it refuses
-            // delete-bearing groups), while rewrite lowers it to the live count
-            // (its retired delete file's count drops out at the same time, so the
-            // net live count is unchanged). next_row_id is deliberately NOT
-            // advanced: compaction mints no new logical rows (outputs re-embed
-            // existing rowids), so the monotonic allocator must not move.
-            sqlx::query(
-                "INSERT OR IGNORE INTO ducklake_table_stats
-                     (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES (?, 0, 0, 0)",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query(
-                "UPDATE ducklake_table_stats SET
-                     record_count = (SELECT COALESCE(SUM(record_count), 0)
-                                     FROM ducklake_data_file
-                                     WHERE table_id = ? AND end_snapshot IS NULL),
-                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
-                                        FROM ducklake_data_file
-                                        WHERE table_id = ? AND end_snapshot IS NULL)
-                 WHERE table_id = ?",
-            )
-            .bind(table_id)
-            .bind(table_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
+            // `ducklake_table_stats` is left as it is, as official's compaction
+            // leaves it: `record_count` stays the gross count of rows ever
+            // inserted (DuckDB answers MIN/MAX from the widen-only column bounds
+            // only while it equals the live count), and next_row_id does not move
+            // because the outputs re-embed existing rowids.
 
             // Attribute the snapshot for spec readers (DuckDB reads this ledger).
-            let changes_made = format!("compacted_table:{table_id}");
-            let commit_metadata =
-                SnapshotCommitMetadata::new().with_message("datafusion compaction");
+            let changes_made = crate::metadata_writer::compaction_change(retirement, table_id);
+            let commit_metadata = SnapshotCommitMetadata::new();
             record_snapshot_changes(&mut tx, snapshot_id, &changes_made, &commit_metadata).await?;
 
             let schema_id: i64 =
@@ -5402,6 +6445,156 @@ impl MetadataWriter for SqliteMetadataWriter {
                 schema_id,
                 table_id,
             })
+        })
+    }
+
+    fn commit_inlined_flush(
+        &self,
+        base_snapshot: i64,
+        tables: &[InlinedFlushTable],
+    ) -> Result<i64> {
+        validate_inlined_flush(tables)?;
+        block_on(async {
+            let mut tx = self.pool.begin().await?;
+            // Write-lock-first; a flush is not DDL, so schema_version carries forward.
+            let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
+            let changes: Vec<Option<String>> = sqlx::query_scalar(
+                "SELECT changes_made FROM ducklake_snapshot_changes
+                 WHERE snapshot_id > ? AND snapshot_id < ?",
+            )
+            .bind(base_snapshot)
+            .bind(snapshot_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            if let Some(conflict) =
+                crate::metadata_writer::inlined_flush_table_conflict(tables, &changes)
+            {
+                return Err(conflict);
+            }
+            for table in tables {
+                let live: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(table.table_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if live.is_none() {
+                    return Err(inlined_flush_conflict(table.table_id, base_snapshot));
+                }
+                sqlx::query(
+                    "INSERT OR IGNORE INTO ducklake_table_stats
+                         (table_id, record_count, next_row_id, file_size_bytes)
+                     VALUES (?, 0, 0, 0)",
+                )
+                .bind(table.table_id)
+                .execute(&mut *tx)
+                .await?;
+                let mut added_bytes = 0;
+                for out in &table.files {
+                    let file_id = next_file_id(&mut tx).await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_data_file
+                             (data_file_id, table_id, path, path_is_relative, file_size_bytes, footer_size,
+                              record_count, row_id_start, begin_snapshot, partial_max)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(file_id)
+                    .bind(table.table_id)
+                    .bind(&out.file.path)
+                    .bind(out.file.path_is_relative)
+                    .bind(out.file.file_size_bytes)
+                    .bind(out.file.footer_size)
+                    .bind(out.file.record_count)
+                    .bind(carried_row_id_start(&out.file))
+                    .bind(out.begin_snapshot)
+                    .bind(out.partial_max)
+                    .execute(&mut *tx)
+                    .await?;
+                    let data_file_id = file_id;
+                    insert_file_column_stats(
+                        &mut tx,
+                        table.table_id,
+                        data_file_id,
+                        &out.file.column_stats,
+                    )
+                    .await?;
+                    insert_partition_metadata(&mut tx, table.table_id, data_file_id, &out.file)
+                        .await?;
+                    if let Some(delete) = &out.delete {
+                        insert_flush_delete_file(
+                            &mut tx,
+                            table.table_id,
+                            None,
+                            data_file_id,
+                            delete,
+                        )
+                        .await?;
+                    }
+                    added_bytes += out.file.file_size_bytes;
+                }
+                replace_delete_files(&mut tx, table.table_id, &table.file_deletes, || {
+                    inlined_flush_conflict(table.table_id, base_snapshot)
+                })
+                .await?;
+                if !table.file_deletes.is_empty() {
+                    let inlined_delete =
+                        crate::metadata_provider::inlined_delete_table_name(table.table_id)?;
+                    let ids = id_list(
+                        &table
+                            .file_deletes
+                            .iter()
+                            .map(|entry| entry.data_file_id)
+                            .collect::<Vec<_>>(),
+                    );
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {} WHERE file_id IN ({ids}) AND begin_snapshot <= ?",
+                        quote_ident(&inlined_delete)
+                    )))
+                    .bind(base_snapshot)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                for name in &table.inlined_tables {
+                    let system = inlined_table_layout(&mut *tx, name).await?.system;
+                    sqlx::query(AssertSqlSafe(format!(
+                        "DELETE FROM {} WHERE {} <= ?",
+                        quote_ident(name),
+                        system.begin_snapshot,
+                    )))
+                    .bind(base_snapshot)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                if !table.files.is_empty() {
+                    sqlx::query(
+                        "UPDATE ducklake_table_stats SET file_size_bytes = file_size_bytes + ?
+                         WHERE table_id = ?",
+                    )
+                    .bind(added_bytes)
+                    .bind(table.table_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let fields = live_stat_fields(table.table_id, &mut tx).await?;
+                    merge_file_table_column_stats(
+                        &mut tx,
+                        table.table_id,
+                        &fields,
+                        &crate::metadata_writer::file_column_stats(
+                            table.files.iter().map(|flushed| &flushed.file),
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            record_snapshot_changes(
+                &mut tx,
+                snapshot_id,
+                &inlined_flush_changes(tables),
+                &SnapshotCommitMetadata::default(),
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(snapshot_id)
         })
     }
 
@@ -5425,20 +6618,27 @@ impl MetadataWriter for SqliteMetadataWriter {
             // data file ended after base, or a post-base column version means a
             // non-append mutation we cannot faithfully revert with forward-only
             // retirement → Conflict.
+            // A delete file rewritten after base begins at its earliest deletion,
+            // which may precede base; its `partial_max` is its latest one.
             let impure_delete: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_delete_file
-                 WHERE table_id = ? AND begin_snapshot > ? LIMIT 1",
+                 WHERE table_id = ? AND (begin_snapshot > ? OR partial_max > ?) LIMIT 1",
             )
             .bind(table_id)
             .bind(base_snapshot)
+            .bind(base_snapshot)
             .fetch_optional(&mut *tx)
             .await?;
+            // A base-era file ended since, or a live file holding rows of both
+            // sides of base (a flush's file begins at its earliest row).
             let impure_ended: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM ducklake_data_file
                  WHERE table_id = ? AND begin_snapshot <= ?
-                   AND end_snapshot IS NOT NULL AND end_snapshot > ? LIMIT 1",
+                   AND ((end_snapshot IS NOT NULL AND end_snapshot > ?)
+                        OR (end_snapshot IS NULL AND partial_max > ?)) LIMIT 1",
             )
             .bind(table_id)
+            .bind(base_snapshot)
             .bind(base_snapshot)
             .bind(base_snapshot)
             .fetch_optional(&mut *tx)
@@ -5466,10 +6666,52 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(base_snapshot)
             .fetch_optional(&mut *tx)
             .await?;
+            // Inlined rows: a row ended after base is a deletion (or an update's
+            // old version), as is any inlined deletion of a Parquet row.
+            let has_registry: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'ducklake_inlined_data_tables'",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            let inlined = if has_registry.is_some() {
+                inlined_tables(&mut tx, table_id).await?
+            } else {
+                Vec::new()
+            };
+            let mut impure_inlined = false;
+            for (name, system) in &inlined {
+                let ended: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT 1 FROM {} WHERE {} > ? LIMIT 1",
+                    quote_ident(name),
+                    system.end_snapshot,
+                )))
+                .bind(base_snapshot)
+                .fetch_optional(&mut *tx)
+                .await?;
+                impure_inlined |= ended.is_some();
+            }
+            let inlined_deletes = crate::metadata_provider::inlined_delete_table_name(table_id)?;
+            let has_inlined_deletes: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(&inlined_deletes)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if has_inlined_deletes.is_some() {
+                let deleted: Option<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT 1 FROM {} WHERE begin_snapshot > ? LIMIT 1",
+                    quote_ident(&inlined_deletes),
+                )))
+                .bind(base_snapshot)
+                .fetch_optional(&mut *tx)
+                .await?;
+                impure_inlined |= deleted.is_some();
+            }
             if impure_delete.is_some()
                 || impure_ended.is_some()
                 || impure_column.is_some()
                 || impure_partition.is_some()
+                || impure_inlined
             {
                 return Err(crate::DuckLakeError::Conflict(format!(
                     "table {table_id}: changes since snapshot {base_snapshot} are not a pure \
@@ -5478,15 +6720,27 @@ impl MetadataWriter for SqliteMetadataWriter {
             }
 
             // No-op → None (no snapshot) if nothing was appended after base.
-            let has_appended: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM ducklake_data_file
-                 WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ? LIMIT 1",
+            let appended_rows: Option<i64> = sqlx::query_scalar(
+                "SELECT SUM(record_count) FROM ducklake_data_file
+                 WHERE table_id = ? AND end_snapshot IS NULL AND begin_snapshot > ?",
             )
             .bind(table_id)
             .bind(base_snapshot)
-            .fetch_optional(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
-            if has_appended.is_none() {
+            let mut appended_inlined = 0_i64;
+            for (name, system) in &inlined {
+                appended_inlined += sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {} WHERE {} > ? AND {} IS NULL",
+                    quote_ident(name),
+                    system.begin_snapshot,
+                    system.end_snapshot,
+                )))
+                .bind(base_snapshot)
+                .fetch_one(&mut *tx)
+                .await?;
+            }
+            if appended_rows.is_none() && appended_inlined == 0 {
                 return Ok(None);
             }
 
@@ -5499,28 +6753,29 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(base_snapshot)
             .execute(&mut *tx)
             .await?;
+            for (name, system) in &inlined {
+                sqlx::query(AssertSqlSafe(format!(
+                    "UPDATE {} SET {} = ? WHERE {} > ? AND {} IS NULL",
+                    quote_ident(name),
+                    system.end_snapshot,
+                    system.begin_snapshot,
+                    system.end_snapshot,
+                )))
+                .bind(snapshot_id)
+                .bind(base_snapshot)
+                .execute(&mut *tx)
+                .await?;
+            }
 
-            // Recompute visible totals from the survivors; next_row_id untouched.
-            sqlx::query(
-                "UPDATE ducklake_table_stats SET
-                     record_count = (SELECT COALESCE(SUM(record_count), 0)
-                                     FROM ducklake_data_file
-                                     WHERE table_id = ? AND end_snapshot IS NULL),
-                     file_size_bytes = (SELECT COALESCE(SUM(file_size_bytes), 0)
-                                        FROM ducklake_data_file
-                                        WHERE table_id = ? AND end_snapshot IS NULL)
-                 WHERE table_id = ?",
-            )
-            .bind(table_id)
-            .bind(table_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
+            // `ducklake_table_stats` is left as it is, as official's `DELETE`
+            // leaves it: `record_count` stays the gross count of rows ever
+            // inserted, and next_row_id is untouched.
 
-            let (columns, column_ids) = live_columns_for_stats(table_id, &mut tx).await?;
-            recompute_table_column_stats(&mut tx, table_id, &columns, &column_ids).await?;
-
-            let changes_made = format!("deleted_from_table:{table_id}");
+            let changes_made = match (appended_rows.is_some(), appended_inlined > 0) {
+                (true, true) => format!("deleted_from_table:{table_id},inlined_delete:{table_id}"),
+                (false, true) => format!("inlined_delete:{table_id}"),
+                _ => format!("deleted_from_table:{table_id}"),
+            };
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -5540,12 +6795,12 @@ impl MetadataWriter for SqliteMetadataWriter {
         // SQLite created the schema/table at begin; names unused (trait parity).
         _schema_name: &str,
         _table_name: &str,
-        _base_snapshot: i64,
+        base_snapshot: i64,
     ) -> Result<u64> {
         block_on(async {
             // Metadata-only truncate in one snapshot: end every live data file and
-            // its live delete file (as drop_table does) and zero the visible stat
-            // totals; next_row_id is preserved (rowids stay monotonic).
+            // its live delete file (as drop_table does); `ducklake_table_stats` is
+            // left as official's `DELETE` leaves it.
             let mut tx = self.pool.begin().await?;
 
             // Write-lock-first (carry schema_version forward — not DDL).
@@ -5568,6 +6823,12 @@ impl MetadataWriter for SqliteMetadataWriter {
             if has_live_data.is_none() && live_inlined == 0 {
                 return Ok(0);
             }
+            let ours = TableChanges {
+                deleted_from: has_live_data.is_some(),
+                deleted_inlined: live_inlined > 0,
+                ..TableChanges::default()
+            };
+            check_table_conflicts(&mut tx, table_id, base_snapshot, snapshot_id, ours).await?;
 
             // Rows removed = gross record_count minus still-live delete counts,
             // computed BEFORE ending anything so it matches what we retire.
@@ -5618,10 +6879,11 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            for table_name in inlined_table_names(&mut tx, table_id).await? {
+            for (table_name, system) in inlined_tables(&mut tx, table_id).await? {
                 let sql = format!(
-                    "UPDATE {} SET end_snapshot = ? WHERE end_snapshot IS NULL",
-                    quote_ident(&table_name)
+                    "UPDATE {} SET {end} = ? WHERE {end} IS NULL",
+                    quote_ident(&table_name),
+                    end = system.end_snapshot,
                 );
                 sqlx::query(AssertSqlSafe(sql))
                     .bind(snapshot_id)
@@ -5636,15 +6898,15 @@ impl MetadataWriter for SqliteMetadataWriter {
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
-                "UPDATE ducklake_table_stats SET record_count = 0, file_size_bytes = 0
-                 WHERE table_id = ?",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
 
-            let changes_made = format!("deleted_from_table:{table_id}");
+            // Official's tokens for the storage the truncate ended: Parquet
+            // files, inlined rows, or both.
+            let changes_made = crate::metadata_writer::table_storage_changes(
+                table_id,
+                None,
+                ours.deleted_from,
+                ours.deleted_inlined,
+            );
             record_snapshot_changes(
                 &mut tx,
                 snapshot_id,
@@ -5727,15 +6989,6 @@ impl MetadataWriter for SqliteMetadataWriter {
                  WHERE table_id = ? AND end_snapshot IS NULL",
             )
             .bind(snapshot_id)
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                "UPDATE ducklake_table_stats
-                 SET record_count = 0, file_size_bytes = 0
-                 WHERE table_id = ?",
-            )
             .bind(table_id)
             .execute(&mut *tx)
             .await?;
@@ -5843,8 +7096,8 @@ impl MetadataWriter for SqliteMetadataWriter {
             // ducklake_snapshot.schema_version column; idempotent, lossless).
             migrate_add_schema_version(&self.pool).await?;
             // Upgrade a pre-existing catalog to the v1.0 partial-file marker (add
-            // ducklake_data_file.partial_max; idempotent, lossless — NULL means
-            // "not a partial file", correct for every pre-compaction file).
+            // partial_max to ducklake_data_file and ducklake_delete_file;
+            // idempotent, lossless — NULL means "not a partial file").
             migrate_add_partial_max(&self.pool).await?;
             // Upgrade a pre-existing catalog to carry ducklake_data_file.partition_id
             // (idempotent, lossless — NULL means "not partitioned").
@@ -6129,9 +7382,9 @@ mod tests {
     #[test]
     fn sqlite_inlined_types_follow_ducklake_encodings() {
         assert_eq!(inlined_sqlite_type(&DataType::Int32), "BIGINT");
-        assert_eq!(inlined_sqlite_type(&DataType::UInt64), "TEXT");
-        assert_eq!(inlined_sqlite_type(&DataType::Float64), "DOUBLE");
-        assert_eq!(inlined_sqlite_type(&DataType::Float32), "DOUBLE");
+        assert_eq!(inlined_sqlite_type(&DataType::UInt64), "VARCHAR");
+        assert_eq!(inlined_sqlite_type(&DataType::Float64), "VARCHAR");
+        assert_eq!(inlined_sqlite_type(&DataType::Float32), "VARCHAR");
         assert_eq!(inlined_sqlite_type(&DataType::Binary), "BLOB");
         assert_eq!(inlined_sqlite_type(&DataType::BinaryView), "BLOB");
         assert_eq!(
@@ -6193,6 +7446,10 @@ mod tests {
                 snapshot_id_columns: Vec::new(),
                 positional_deletes: Vec::new(),
                 inlined_deletes: Vec::new(),
+                inlined_row_ids: None,
+                inlined_file_deletes: Vec::new(),
+                rewritten_deletes: Vec::new(),
+                dropped_files: Vec::new(),
                 inlined_flush: false,
             });
         }
@@ -6252,7 +7509,7 @@ mod tests {
         assert_eq!(
             changes.last().unwrap().changes_made,
             Some(format!(
-                "inlined_delete:{},inlined_insert:{}",
+                "inlined_insert:{},inlined_delete:{}",
                 replacement.table_id, replacement.table_id
             ))
         );
@@ -6307,7 +7564,8 @@ mod tests {
                 .fetch_one(&writer.pool)
                 .await
                 .unwrap();
-        assert_eq!(gross, 2);
+        // Every row ever inserted: the first write's two and the Replace's two.
+        assert_eq!(gross, 4);
         let mut update = writes[1].clone();
         update.base_snapshot_id = deleted.snapshot_id;
         update.data = StagedTableData::Inlined(vec![
@@ -6351,7 +7609,8 @@ mod tests {
                 .values(),
             &[59]
         );
-        assert_eq!(gross, 3);
+        // The update's new row is one more insert.
+        assert_eq!(gross, 5);
         let mut stale = writes[1].clone();
         stale.base_snapshot_id = deleted.snapshot_id;
         stale.data = StagedTableData::None;
@@ -7354,7 +8613,7 @@ mod tests {
                 ),
                 (
                     replaced.snapshot_id,
-                    format!("deleted_from_table:{table_id},inserted_into_table:{table_id}"),
+                    format!("inserted_into_table:{table_id},deleted_from_table:{table_id}"),
                     Some("Jane Doe".to_string()),
                     Some("Replace imported data".to_string()),
                     Some("opaque-application-value".to_string()),
@@ -7692,8 +8951,8 @@ mod tests {
 
         assert_eq!(
             read_table_column_stats(&writer, table_id).await,
-            vec![(1, None, None, None)],
-            "incomplete coverage (a statless live file) must NULL the roll-up"
+            Vec::new(),
+            "a statless file leaves the column with no roll-up row (unknown)"
         );
     }
 
@@ -7749,9 +9008,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn end_table_files_preserves_next_row_id() {
-        // Replace must reset record_count and file_size_bytes (those reflect
-        // currently-visible rows) but keep next_row_id monotonic so the next
-        // generation of files gets fresh, non-overlapping rowids.
+        // Replace leaves ducklake_table_stats as official's DELETE does
+        // (record_count is the gross count of rows ever inserted) and keeps
+        // next_row_id monotonic so the next generation of files gets fresh,
+        // non-overlapping rowids.
         let (writer, _temp) = create_test_writer().await;
         let snap1 = reserve_snapshot(&writer).await;
         let (schema_id, _) = writer.get_or_create_schema("main", None, snap1).unwrap();
@@ -7777,9 +9037,9 @@ mod tests {
         writer.end_table_files(table_id, snap2).unwrap();
 
         let (records, next, bytes) = read_table_stats(&writer, table_id).await;
-        assert_eq!(records, 0, "record_count cleared after end_table_files");
+        assert_eq!(records, 5, "record_count stays the gross count");
         assert_eq!(next, 5, "next_row_id preserved (monotonic across lifetime)");
-        assert_eq!(bytes, 0, "file_size_bytes cleared");
+        assert!(bytes > 0, "file_size_bytes left as it was");
 
         let snap3 = reserve_snapshot(&writer).await;
         writer
@@ -8091,10 +9351,11 @@ mod tests {
         assert!(read_end_snapshot(&writer, "a.parquet").await.is_none());
         assert!(read_end_snapshot(&writer, "b.parquet").await.is_some());
 
-        // Stats restored to base; next_row_id preserved (rowids never reused).
+        // Stats left as official's DELETE leaves them; next_row_id preserved
+        // (rowids never reused).
         let (rc_after, nri_after, size_after) = read_table_stats(&writer, table_id).await;
-        assert_eq!(rc_after, 100, "record_count back to base");
-        assert_eq!(size_after, 1000, "file_size_bytes back to base");
+        assert_eq!(rc_after, 150, "record_count stays the gross count");
+        assert_eq!(size_after, 3000, "file_size_bytes left as it was");
         assert_eq!(nri_after, 150, "next_row_id preserved");
 
         // Idempotent: nothing left above base -> no-op, no content-free snapshot.

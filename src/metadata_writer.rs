@@ -10,6 +10,7 @@ use arrow::array::{Array, FixedSizeBinaryArray};
 use arrow::datatypes::{DataType, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 /// Maximum allowed length for catalog entity names (schemas, tables, columns).
 pub const MAX_NAME_LENGTH: usize = 1024;
@@ -52,18 +53,6 @@ pub fn validate_name(name: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn is_inlined_system_column(name: &str) -> bool {
-    [
-        "row_id",
-        "begin_snapshot",
-        "end_snapshot",
-        "_ducklake_internal_row_id",
-        "_ducklake_internal_snapshot_id",
-    ]
-    .iter()
-    .any(|reserved| name.eq_ignore_ascii_case(reserved))
-}
-
 /// Write mode for table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
@@ -91,6 +80,216 @@ pub(crate) fn validate_table_setting(key: &str) -> Result<String> {
             "unsupported table setting '{key}'"
         ))),
     }
+}
+
+/// Whether setting `key` to `value` enables data inlining: a positive
+/// `data_inlining_row_limit`.
+pub(crate) fn enables_inlining(key: &str, value: &str) -> bool {
+    key.eq_ignore_ascii_case("data_inlining_row_limit")
+        && value.trim().parse::<u64>().is_ok_and(|limit| limit > 0)
+}
+
+/// The `data_inlining_row_limit` in effect for `table_id` of `schema_id`, from
+/// the `(scope, scope_id, value)` rows of `ducklake_metadata` setting it: the
+/// table's, else its schema's, else the catalog-wide one, else the limit
+/// [`with_inlining_limit`] set for this call, as official's stored settings
+/// outrank its `DATA_INLINING_ROW_LIMIT` attach option; else official's
+/// default.
+pub(crate) fn effective_inlining_limit(
+    rows: &[(Option<String>, Option<i64>, String)],
+    schema_id: i64,
+    table_id: i64,
+) -> Result<usize> {
+    let find = |scope: Option<&str>, id: Option<i64>| {
+        rows.iter().find(|(row_scope, row_id, _)| {
+            row_scope.as_deref() == scope && (scope.is_none() || *row_id == id)
+        })
+    };
+    let stored = find(Some("table"), Some(table_id))
+        .or_else(|| find(Some("schema"), Some(schema_id)))
+        .or_else(|| find(None, None));
+    let Some((_, _, value)) = stored else {
+        return Ok(inlining_limit_override()
+            .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT));
+    };
+    value.trim().parse::<usize>().map_err(|_| {
+        DuckLakeError::InvalidConfig(format!(
+            "invalid data_inlining_row_limit '{value}': expected a non-negative integer"
+        ))
+    })
+}
+
+thread_local! {
+    /// The `data_inlining_row_limit` configured in this process for the
+    /// metadata call running on this thread; see [`with_inlining_limit`].
+    static INLINING_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f`, a metadata call, with `limit` as the `data_inlining_row_limit` a
+/// commit applies, when it creates a table's inlined data table for a new
+/// table or schema version or checks reserved column names, where the catalog
+/// stores no setting of it, as official's `DATA_INLINING_ROW_LIMIT` attach
+/// option applies: a stored table, schema or catalog-wide setting outranks it
+/// ([`effective_inlining_limit`]). `None` reads the settings alone. The limit is the one `DuckLakeCatalog::with_write_options` set,
+/// as its inserts apply it; a `DuckLakeTableWriter`'s own limit, like
+/// official's `ducklake_default_data_inlining_row_limit` setting, applies to
+/// its inserts only.
+pub(crate) fn with_inlining_limit<T>(limit: Option<usize>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INLINING_LIMIT.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(INLINING_LIMIT.with(|cell| cell.replace(limit)));
+    f()
+}
+
+/// The limit [`with_inlining_limit`] set for the metadata call running on
+/// this thread.
+pub(crate) fn inlining_limit_override() -> Option<usize> {
+    INLINING_LIMIT.with(std::cell::Cell::get)
+}
+
+/// The columns an inlined data table of a table with `columns` (its live
+/// top-level columns) holds, as `(name, Arrow type, DuckLake type)`; `None`
+/// when official's
+/// `CanInlineColumns` refuses them: a column named like a `system` column,
+/// a name longer than `max_identifier_length`, a column or nested field of a
+/// type official does not inline (GEOMETRY), or a type `supported` refuses.
+///
+/// `rows` are the table's live column rows, nested fields included, with
+/// their parent column ids; a set no Arrow schema can be built from holds
+/// nothing that can be inlined.
+pub(crate) fn inlinable_columns(
+    rows: Vec<(crate::metadata_provider::DuckLakeTableColumn, Option<i64>)>,
+    system: crate::metadata_provider::InlinedSystemColumns,
+    max_identifier_length: Option<usize>,
+    supported: impl Fn(&DataType) -> bool,
+) -> Result<Option<Vec<(String, DataType, String)>>> {
+    if rows
+        .iter()
+        .any(|(column, _)| crate::types::refuses_inlining(&column.column_type))
+    {
+        return Ok(None);
+    }
+    let Ok(columns) = crate::metadata_provider::reconstruct_columns(rows) else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let Ok(data_type) = column.data_type() else {
+            return Ok(None);
+        };
+        if system.conflicts_with(&column.column_name)
+            || max_identifier_length.is_some_and(|max| column.column_name.len() > max)
+            || !supported(&data_type)
+        {
+            return Ok(None);
+        }
+        out.push((
+            column.column_name.clone(),
+            data_type,
+            column.column_type.clone(),
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// The `changes_made` token official records for a compaction of `table_id`:
+/// `merge_adjacent` for `merge_adjacent_files`, whose sources are removed,
+/// `rewrite_delete` for `rewrite_data_files`, whose sources are retired.
+pub(crate) fn compaction_change(retirement: SourceRetirement, table_id: i64) -> String {
+    match retirement {
+        SourceRetirement::Remove => format!("merge_adjacent:{table_id}"),
+        SourceRetirement::Retire => format!("rewrite_delete:{table_id}"),
+    }
+}
+
+/// The first top-level column of `proposed` that is new to the table (not one
+/// of `existing`) and named like an inlined data table's `system` column: a
+/// column official refuses to create or add while inlining is enabled.
+pub(crate) fn new_reserved_column(
+    existing: &[ExistingCatalogColumn],
+    proposed: &[CatalogColumnDef],
+    system: crate::metadata_provider::InlinedSystemColumns,
+) -> Option<String> {
+    proposed
+        .iter()
+        .filter(|column| column.parent_index.is_none())
+        .filter(|column| {
+            !existing.iter().any(|old| {
+                old.parent_column.is_none() && old.name.eq_ignore_ascii_case(&column.name)
+            })
+        })
+        .find(|column| system.conflicts_with(&column.name))
+        .map(|column| column.name.clone())
+}
+
+/// The error official's insert raises when a table's latest inlined data table
+/// does not hold the columns of the rows written to it: `physical` has
+/// `stored` columns (its three system columns included) for `supplied` values.
+pub(crate) fn inlined_table_shape_error(
+    physical: &str,
+    stored: usize,
+    supplied: usize,
+) -> DuckLakeError {
+    DuckLakeError::InvalidConfig(format!(
+        "table {physical} has {stored} columns but {supplied} values were supplied"
+    ))
+}
+
+/// `(table name, column name)` of the live top-level columns of the table
+/// whose id binds the placeholder, in column order.
+pub(crate) const SQL_TABLE_INLINING_COLUMNS: &str = "SELECT t.table_name, c.column_name
+     FROM ducklake_table t
+     JOIN ducklake_column c ON c.table_id = t.table_id
+     WHERE t.table_id = ? AND t.end_snapshot IS NULL
+       AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+     ORDER BY c.column_order";
+
+/// `(table name, column name)` of the live top-level columns of every live
+/// table a catalog-wide inlining limit applies to: those without a table- or
+/// schema-scoped limit of `0`, as official's `ValidateTablesInSchema` skips.
+pub(crate) const SQL_GLOBAL_INLINING_COLUMNS: &str = "SELECT t.table_name, c.column_name
+     FROM ducklake_table t
+     JOIN ducklake_column c ON c.table_id = t.table_id
+     WHERE t.end_snapshot IS NULL AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM ducklake_metadata m
+           WHERE m.key = 'data_inlining_row_limit' AND m.value = '0'
+             AND ((m.scope = 'table' AND m.scope_id = t.table_id)
+                  OR (m.scope = 'schema' AND m.scope_id = t.schema_id)))
+     ORDER BY t.table_id, c.column_order";
+
+/// Refuse to enable data inlining over `columns` (`(table name, column name)`)
+/// when one is named like a system column of an inlined data table in this
+/// catalog (`system`), as official's `ValidateNoInlinedSystemColumns` does.
+pub(crate) fn reject_reserved_inlining_columns(
+    columns: &[(String, String)],
+    system: crate::metadata_provider::InlinedSystemColumns,
+) -> Result<()> {
+    match columns
+        .iter()
+        .find(|(_, column)| system.conflicts_with(column))
+    {
+        Some((table, column)) => Err(DuckLakeError::InvalidConfig(format!(
+            "Cannot enable data inlining for table \"{table}\". Column \"{column}\" conflicts \
+             with a reserved DuckLake internal column name used for inlining. To enable inlining \
+             for this table, rename or drop column \"{column}\"."
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The error official raises for a column named like an inlined data table's
+/// system column, created or added while inlining is enabled.
+pub(crate) fn reserved_inlining_column_error(column: &str) -> DuckLakeError {
+    DuckLakeError::InvalidConfig(format!(
+        "Column name \"{column}\" is reserved by DuckLake for internal use when data inlining \
+         is enabled. If you must use this column name, disable inlining by calling \
+         ducklake_set_option('data_inlining_row_limit', 0)."
+    ))
 }
 
 pub(crate) fn table_write_changes(
@@ -123,11 +322,20 @@ pub(crate) fn staged_table_write_changes(
     table_storage_changes(
         write.table_id,
         insert,
-        !write.positional_deletes.is_empty() || (write.mode == WriteMode::Replace && had_files),
-        !write.inlined_deletes.is_empty() || (write.mode == WriteMode::Replace && had_inlined_rows),
+        !write.positional_deletes.is_empty()
+            || !write.rewritten_deletes.is_empty()
+            || !write.dropped_files.is_empty()
+            || (write.mode == WriteMode::Replace && had_files),
+        !write.inlined_deletes.is_empty()
+            || !write.inlined_file_deletes.is_empty()
+            || (write.mode == WriteMode::Replace && had_inlined_rows),
     )
 }
 
+/// One table's `changes_made` tokens, in official DuckLake's order
+/// (`ducklake_transaction_state.cpp`, `WriteSnapshotChanges`):
+/// `inserted_into_table`, `deleted_from_table`, `inlined_insert`,
+/// `inlined_delete`.
 pub(crate) fn table_storage_changes(
     table_id: i64,
     inlined_insert: Option<bool>,
@@ -135,41 +343,23 @@ pub(crate) fn table_storage_changes(
     deleted_inlined: bool,
 ) -> String {
     let mut changes = Vec::new();
+    if inlined_insert == Some(false) {
+        changes.push(format!("inserted_into_table:{table_id}"));
+    }
     if deleted_files {
         changes.push(format!("deleted_from_table:{table_id}"));
     }
+    if inlined_insert == Some(true) {
+        changes.push(format!("inlined_insert:{table_id}"));
+    }
     if deleted_inlined {
         changes.push(format!("inlined_delete:{table_id}"));
-    }
-    match inlined_insert {
-        Some(false) => changes.push(format!("inserted_into_table:{table_id}")),
-        Some(true) => changes.push(format!("inlined_insert:{table_id}")),
-        None => {},
     }
     changes.join(",")
 }
 
 pub(crate) fn snapshot_has_change(changes: &str, expected: &str) -> bool {
     snapshot_change_tokens(changes).any(|change| change == expected)
-}
-
-pub(crate) fn inlined_delete_conflicts(changes: &str, table_id: i64) -> bool {
-    snapshot_change_tokens(changes).any(|change| {
-        let Some((kind, id)) = change.split_once(':') else {
-            return false;
-        };
-        id.parse::<i64>().ok() == Some(table_id)
-            && [
-                "dropped_table",
-                "altered_table",
-                "inlined_delete",
-                "inline_flush",
-                "inserted_into_table",
-                "inlined_insert",
-            ]
-            .iter()
-            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
-    })
 }
 
 pub(crate) fn inlined_delete_groups(rows: &[InlinedRowRef]) -> BTreeMap<&str, BTreeSet<i64>> {
@@ -287,7 +477,32 @@ pub(crate) fn inlined_text_value(array: &dyn Array, row: usize) -> Result<String
             .map(|value| value.to_string())
             .map_err(|error| DuckLakeError::InvalidConfig(format!("invalid UUID bytes: {error}")));
     }
-    Ok(arrow::util::display::array_value_to_string(array, row)?)
+    if matches!(
+        array.data_type(),
+        DataType::Date32 | DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_)
+    ) {
+        // DuckDB's text, as official stores an inlined date, time or
+        // timestamp: `infinity` and `-infinity`, years before 1 spelled with
+        // ` (BC)` and years past 9999 unsigned, a fraction without trailing
+        // zeros. A value DuckDB has no such type for is refused rather than
+        // stored as text no reader takes.
+        let value = datafusion::common::ScalarValue::try_from_array(array, row)?;
+        return crate::stats_encode::duckdb_temporal_text(&value).ok_or_else(|| {
+            DuckLakeError::InvalidConfig(format!(
+                "cannot inline {value:?}: DuckDB has no {} value for it",
+                array.data_type()
+            ))
+        });
+    }
+    display_value(array, row)
+}
+
+/// Arrow's text of the value at `row`, failing where Arrow cannot format it
+/// instead of writing its error message as the text.
+pub(crate) fn display_value(array: &dyn Array, row: usize) -> Result<String> {
+    let options = arrow::util::display::FormatOptions::default();
+    let formatter = arrow::util::display::ArrayFormatter::try_new(array, &options)?;
+    Ok(formatter.value(row).try_to_string()?)
 }
 
 /// Column definition for creating or updating a table's schema.
@@ -539,6 +754,78 @@ fn catalog_type_name(data_type: &DataType) -> Result<String> {
     }
 }
 
+/// Every catalog field of `columns` with its field id and DuckLake type, depth
+/// first as [`catalog_column_defs`] lists them; `field_ids` is in that order.
+pub(crate) fn catalog_fields(
+    columns: &[ColumnDef],
+    field_ids: &[i64],
+) -> Result<Vec<(i64, String)>> {
+    let defs = catalog_column_defs(columns)?;
+    if defs.len() != field_ids.len() {
+        return Err(DuckLakeError::Internal(format!(
+            "catalog column count {} does not match field id count {}",
+            defs.len(),
+            field_ids.len()
+        )));
+    }
+    Ok(field_ids
+        .iter()
+        .copied()
+        .zip(defs.into_iter().map(|def| def.ducklake_type))
+        .collect())
+}
+
+/// The `ducklake_file_column_stats` rows of each of `files`, in commit order,
+/// as the table-wide roll-up merges them
+/// ([`crate::stats_encode::merge_file_column_stats`]).
+pub(crate) fn file_column_stats<'a>(
+    files: impl IntoIterator<Item = &'a DataFileInfo>,
+) -> Vec<Vec<crate::stats_encode::FileColumnStat>> {
+    files
+        .into_iter()
+        .map(|file| {
+            file.column_stats
+                .iter()
+                .map(|stat| crate::stats_encode::FileColumnStat {
+                    column_id: stat.column_id,
+                    min_value: stat.min_value.clone(),
+                    max_value: stat.max_value.clone(),
+                    null_count: stat.null_count,
+                    contains_nan: stat.contains_nan,
+                    value_count: stat.value_count,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Whether the catalog is encrypted, from the values of its global
+/// `encrypted` option in the order official loads them: the last decides, and
+/// a value other than exactly `true` or `false` fails, as official's attach
+/// does.
+pub(crate) fn encrypted_option(values: &[String]) -> Result<bool> {
+    match values.last().map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(DuckLakeError::Unsupported(
+            "Encrypted should be either true or false".to_string(),
+        )),
+    }
+}
+
+/// How the statistics of field `field_id` among `fields` compare.
+pub(crate) fn stat_kind_of(
+    fields: &[(i64, String)],
+    field_id: i64,
+) -> crate::stats_encode::StatKind {
+    fields
+        .iter()
+        .find(|(id, _)| *id == field_id)
+        .map_or(crate::stats_encode::StatKind::Text, |(_, ducklake_type)| {
+            crate::stats_encode::StatKind::of_ducklake_type(ducklake_type)
+        })
+}
+
 pub(crate) fn top_level_column_ids(
     columns: &[CatalogColumnDef],
     field_ids: &[i64],
@@ -719,10 +1006,9 @@ pub struct ColumnStat {
     pub value_count: Option<i64>,
     /// For `FLOAT`/`DOUBLE` columns: whether any NaN is present. `None` for
     /// non-floating columns, and for float columns whose NaN state is unknown
-    /// (footer-only harvests — the parquet footer carries no NaN signal). When
-    /// `true`, `min_value`/`max_value` are omitted (matching DuckLake); readers
-    /// may only trust a float `max_value` as an upper bound when this is
-    /// `false`, since NaN sorts above every value.
+    /// (footer-only harvests — the parquet footer carries no NaN signal). The
+    /// bounds leave NaN out, as DuckLake's do, so readers may only trust a
+    /// float bound when this is `false`, since NaN sorts above every value.
     pub contains_nan: Option<bool>,
     /// Total compressed size of the column in bytes, summed over the file's
     /// column chunks (parquet `total_compressed_size`).
@@ -982,14 +1268,15 @@ pub(crate) fn allocate_row_id_start(next_row_id: i64, file: &DataFileInfo) -> Ro
     }
 }
 
-/// The `row_id_start` a compaction output is registered with.
+/// The `row_id_start` a compaction or inlined-flush output is registered with.
 ///
 /// A merge of rowid-adjacent sources writes no rowid column and carries the
-/// first source's range over as [`RowIdStart::Preserved`]; every other output
-/// embeds its rowids and records `NULL`. The range was issued to the sources
-/// already, so nothing is minted and `next_row_id` does not move.
+/// first source's range over as [`RowIdStart::Preserved`]; a flush carries the
+/// range of the inlined rows it writes. Every other output embeds its rowids
+/// and records `NULL`. The range was issued already, so nothing is minted and
+/// `next_row_id` does not move.
 #[cfg_attr(not(feature = "write"), allow(dead_code))]
-pub(crate) fn compaction_output_row_id_start(file: &DataFileInfo) -> Option<i64> {
+pub(crate) fn carried_row_id_start(file: &DataFileInfo) -> Option<i64> {
     match file.row_id_start {
         RowIdStart::Preserved(start) => Some(start),
         RowIdStart::Assign | RowIdStart::Embedded => None,
@@ -1118,7 +1405,9 @@ pub(crate) fn validate_promoted_partition_values(
 /// Mirrors [`DataFileInfo`]; the parquet has the standard `(file_path, pos)`
 /// schema. Must be cumulative for its data file (all still-deleted positions),
 /// since at most one delete file is live per data file at a time.
-#[derive(Debug, Clone)]
+///
+/// Build it with [`DeleteFileInfo::new`].
+#[derive(Clone)]
 pub struct DeleteFileInfo {
     /// Path to the delete file (relative to the table path, or absolute).
     pub path: String,
@@ -1135,6 +1424,29 @@ pub struct DeleteFileInfo {
     /// catalog owns and reclaims it, `Some(id)` that the row references a file
     /// catalog `id` owns.
     pub owner_catalog_id: Option<i64>,
+    /// The positions the file holds, when known (see
+    /// [`DeleteFileInfo::with_deleted_positions`]).
+    deleted_positions: Option<Arc<[i64]>>,
+}
+
+impl std::fmt::Debug for DeleteFileInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteFileInfo")
+            .field("path", &self.path)
+            .field("path_is_relative", &self.path_is_relative)
+            .field("file_size_bytes", &self.file_size_bytes)
+            .field("footer_size", &self.footer_size)
+            .field("delete_count", &self.delete_count)
+            .field("owner_catalog_id", &self.owner_catalog_id)
+            .field(
+                "deleted_positions",
+                &self
+                    .deleted_positions
+                    .as_ref()
+                    .map(|positions| positions.len()),
+            )
+            .finish()
+    }
 }
 
 impl DeleteFileInfo {
@@ -1154,7 +1466,27 @@ impl DeleteFileInfo {
             footer_size: None,
             delete_count,
             owner_catalog_id: None,
+            deleted_positions: None,
         }
+    }
+
+    /// Record the positions the file holds. A `DELETE` committing it then
+    /// commits beside a concurrent inlined deletion of other rows of its data
+    /// file, as official DuckLake does; without them, any concurrent inlined
+    /// deletion of the data file aborts the commit, since it may delete a row
+    /// this file deletes too. [`DuckLakeTableWriter::write_delete_file`]
+    /// records them.
+    ///
+    /// [`DuckLakeTableWriter::write_delete_file`]: crate::DuckLakeTableWriter::write_delete_file
+    #[must_use]
+    pub fn with_deleted_positions(mut self, positions: impl Into<Arc<[i64]>>) -> Self {
+        self.deleted_positions = Some(positions.into());
+        self
+    }
+
+    /// The positions the file holds, when recorded.
+    pub(crate) fn deleted_positions(&self) -> Option<&[i64]> {
+        self.deleted_positions.as_deref()
     }
 
     /// Set the footer size for read optimization.
@@ -1353,6 +1685,137 @@ pub struct CompactionOutputFile {
     pub begin_snapshot: Option<i64>,
 }
 
+/// A delete file written by an inlined-data flush
+/// ([`MetadataWriter::commit_inlined_flush`]). Its parquet carries each deleted
+/// position's snapshot (`_ducklake_internal_snapshot_id`).
+#[derive(Debug, Clone)]
+pub struct InlinedFlushDeleteFile {
+    /// The written delete file.
+    pub delete: DeleteFileInfo,
+    /// `begin_snapshot` to register: the smallest snapshot among its positions,
+    /// so time travel sees each deletion from the snapshot that made it.
+    pub begin_snapshot: i64,
+    /// `partial_max` to register, or `None` to leave it NULL.
+    pub partial_max: Option<i64>,
+    /// `end_snapshot` to register: `None` for a delete file that stays live,
+    /// or the end of the ended delete file it replaces.
+    pub end_snapshot: Option<i64>,
+}
+
+/// One Parquet file an inlined-data flush wrote from a physical inlined table.
+///
+/// The file embeds each row's row id and the snapshot that inserted it, so it
+/// is registered with `begin_snapshot` = the smallest of those snapshots and
+/// `partial_max` = the largest, and its `row_id_start` is the smallest row id
+/// (the row id range is otherwise served from the embedded column). Rows the
+/// inlined table had already deleted are in the file too, masked by `delete`.
+#[derive(Debug, Clone)]
+pub struct InlinedFlushFile {
+    /// The written data file: path, size, record count, column stats, partition,
+    /// and `row_id_start` as [`RowIdStart::Preserved`].
+    pub file: DataFileInfo,
+    /// Smallest embedded snapshot id.
+    pub begin_snapshot: i64,
+    /// Largest embedded snapshot id.
+    pub partial_max: i64,
+    /// Delete file for the rows deleted while they were inlined.
+    pub delete: Option<InlinedFlushDeleteFile>,
+}
+
+/// A data file's inlined deletions (`ducklake_inlined_delete_<table_id>`) moved
+/// into one delete file by an inlined-data flush.
+#[derive(Debug, Clone)]
+pub struct InlinedFlushFileDelete {
+    /// The data file the deletions target.
+    pub data_file_id: i64,
+    /// The data file's `end_snapshot`: `None` for a live file, or the snapshot
+    /// that retired it. The commit aborts if the file no longer has this end.
+    pub data_file_end: Option<i64>,
+    /// The delete file the new one was merged with, or `None`: the file's live
+    /// delete file, or for a retired file its latest one. The commit aborts if
+    /// that delete file is no longer this one; when set, its catalog row is
+    /// removed and its object scheduled for deletion, since the new file
+    /// carries all of its positions with their snapshots.
+    pub expected_prev_delete_file: Option<i64>,
+    /// The merged delete file.
+    pub delete: InlinedFlushDeleteFile,
+}
+
+/// One table's part of an inlined-data flush
+/// ([`MetadataWriter::commit_inlined_flush`]).
+#[derive(Debug, Clone, Default)]
+pub struct InlinedFlushTable {
+    /// The table being flushed.
+    pub table_id: i64,
+    /// Physical inlined-data tables whose rows were flushed. The commit deletes
+    /// their rows with `begin_snapshot` at or before the flush's base snapshot.
+    pub inlined_tables: Vec<String>,
+    /// Files written from those rows.
+    pub files: Vec<InlinedFlushFile>,
+    /// Inlined deletions of Parquet rows moved into delete files. The commit
+    /// deletes the moved rows (those of these data files with `begin_snapshot`
+    /// at or before the base snapshot) from `ducklake_inlined_delete_<table_id>`.
+    pub file_deletes: Vec<InlinedFlushFileDelete>,
+}
+
+/// The `changes_made` ledger of an inlined-data flush, in official DuckLake's
+/// order: every `deleted_from_table` entry (inlined file deletions moved to
+/// delete files) before every `inline_flush` entry, each group by table id.
+pub(crate) fn inlined_flush_changes(tables: &[InlinedFlushTable]) -> String {
+    let mut deleted: Vec<i64> = tables
+        .iter()
+        .filter(|table| !table.file_deletes.is_empty())
+        .map(|table| table.table_id)
+        .collect();
+    let mut flushed: Vec<i64> = tables
+        .iter()
+        .filter(|table| !table.files.is_empty())
+        .map(|table| table.table_id)
+        .collect();
+    deleted.sort_unstable();
+    flushed.sort_unstable();
+    deleted
+        .iter()
+        .map(|id| format!("deleted_from_table:{id}"))
+        .chain(flushed.iter().map(|id| format!("inline_flush:{id}")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The error an inlined-flush commit returns when the table is no longer live
+/// or a flushed data file's delete file changed since its base snapshot. The
+/// changes official's check refuses are [`table_conflict`]'s.
+pub(crate) fn inlined_flush_conflict(table_id: i64, base_snapshot: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "flushing the inlined data of table {table_id} could not commit: the table was \
+         dropped, or a flushed data file's delete file changed, since snapshot \
+         {base_snapshot}. Re-open the catalog and flush again."
+    ))
+}
+
+/// Validate an inlined-flush request before any catalog work.
+pub(crate) fn validate_inlined_flush(tables: &[InlinedFlushTable]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for table in tables {
+        if !seen.insert(table.table_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "commit_inlined_flush: table {} appears more than once",
+                table.table_id
+            )));
+        }
+        if table.inlined_tables.iter().any(|name| {
+            !crate::metadata_provider::is_inlined_data_table(name)
+                || !name.starts_with(&format!("ducklake_inlined_data_{}_", table.table_id))
+        }) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "commit_inlined_flush: table {} names an inlined table it does not own",
+                table.table_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Result of a write operation.
 #[derive(Debug)]
 pub struct WriteResult {
@@ -1395,6 +1858,481 @@ pub struct InlinedRowRef {
     pub row_id: i64,
 }
 
+/// Rows of one Parquet data file deleted by recording their positions in
+/// `ducklake_inlined_delete_<table_id>` instead of writing a delete file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InlinedFileDelete {
+    /// The live data file the rows belong to.
+    pub(crate) data_file_id: i64,
+    /// Physical row positions within the file, sorted and distinct.
+    pub(crate) positions: Vec<i64>,
+    /// The file's live delete file when the statement read it. The commit
+    /// aborts when the file has another one (see
+    /// [`changed_delete_file_conflict`]).
+    pub(crate) expected_delete_file: Option<i64>,
+}
+
+/// The conflict an inlined deletion of rows of data file `data_file_id` meets
+/// when the file's live delete file is not the one its statement read at
+/// `base_snapshot`. Official's conflict check never compares the two and
+/// commits both; when the delete file deletes one of the same rows, official
+/// DuckLake (1.5.5) then reads other deleted rows of the file back and
+/// miscounts `count(*)`, and so would this crate's `count(*)`. The commit
+/// cannot read the delete file, so it aborts; a write transaction given a
+/// [`DeleteFilePositions`](crate::table_writer::DeleteFilePositions) reads it
+/// and retries when it deletes none of the same rows
+/// ([`changed_delete_file_of`]).
+pub(crate) fn changed_delete_file_conflict(data_file_id: i64, base_snapshot: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "data file {data_file_id}{CHANGED_DELETE_FILE_CONFLICT} {base_snapshot}; re-open the \
+         catalog and retry the statement"
+    ))
+}
+
+/// What [`changed_delete_file_conflict`] says, after the data file id.
+const CHANGED_DELETE_FILE_CONFLICT: &str = " got a delete file since snapshot";
+
+/// The data file of a [`changed_delete_file_conflict`], or `None` when
+/// `error` is another error.
+pub(crate) fn changed_delete_file_of(error: &DuckLakeError) -> Option<i64> {
+    let DuckLakeError::Conflict(message) = error else {
+        return None;
+    };
+    let (head, _) = message.split_once(CHANGED_DELETE_FILE_CONFLICT)?;
+    head.strip_prefix("data file ")?.parse().ok()
+}
+
+/// A live data file whose rows a `DELETE` or `UPDATE` deletes all of. The
+/// commit ends the data file only; its live delete file stays as it is, as
+/// official DuckLake's `DropFile` leaves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedDataFile {
+    /// The data file to end.
+    pub(crate) data_file_id: i64,
+    /// The live delete file the statement read the file's rows against; the
+    /// commit aborts when it changed.
+    pub(crate) expected_delete_file: Option<i64>,
+}
+
+/// Validate the row-mutation parts of a staged write before any catalog work:
+/// preserved row ids match the inlined rows one to one, and every data file is
+/// named once across positional deletes, inlined file deletes and drops.
+pub(crate) fn validate_row_mutation_stage(write: &StagedTableWrite) -> Result<()> {
+    if let Some(row_ids) = &write.inlined_row_ids {
+        let rows = match &write.data {
+            StagedTableData::Inlined(batches) => {
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            },
+            _ => 0,
+        };
+        if rows != row_ids.len() {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "staged write has {} preserved row ids for {rows} inlined rows",
+                row_ids.len()
+            )));
+        }
+    }
+    let mut files = std::collections::HashSet::new();
+    let named = write
+        .positional_deletes
+        .iter()
+        .map(|entry| entry.data_file_id)
+        .chain(write.rewritten_deletes.iter().map(|d| d.data_file_id))
+        .chain(write.inlined_file_deletes.iter().map(|d| d.data_file_id))
+        .chain(write.dropped_files.iter().map(|d| d.data_file_id));
+    for data_file_id in named {
+        if !files.insert(data_file_id) {
+            return Err(DuckLakeError::InvalidConfig(format!(
+                "staged write names data file {data_file_id} more than once"
+            )));
+        }
+    }
+    if write
+        .inlined_file_deletes
+        .iter()
+        .any(|delete| delete.positions.is_empty())
+    {
+        return Err(DuckLakeError::InvalidConfig(
+            "an inlined file delete must name at least one position".to_string(),
+        ));
+    }
+    if write
+        .rewritten_deletes
+        .iter()
+        .any(|delete| delete.expected_prev_delete_file.is_none())
+    {
+        return Err(DuckLakeError::InvalidConfig(
+            "a rewritten delete file must name the delete file it replaces".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The snapshot a staged write dates its deletions to inside the delete files
+/// it rewrites (each rewritten file's `partial_max`), or `None` when it rewrites
+/// none. The commit requires that no snapshot of the catalog lie between that
+/// snapshot and the commit snapshot, so time travel sees the deletions exactly
+/// from the commit on.
+pub(crate) fn rewritten_deletes_snapshot(write: &StagedTableWrite) -> Option<i64> {
+    write
+        .rewritten_deletes
+        .iter()
+        .filter_map(|entry| entry.delete.partial_max)
+        .max()
+}
+
+/// What [`rewritten_delete_conflict`] says, after the table id.
+const REWRITTEN_DELETE_CONFLICT: &str = ": the catalog committed a snapshot at or after snapshot";
+
+/// The conflict a staged write that dates deletions in a rewritten delete file
+/// raises when the catalog committed a snapshot at or after that date. The
+/// staged transaction re-dates the deletions to the next snapshot and retries
+/// (see `DuckLakeWriteTransaction::commit`).
+pub(crate) fn rewritten_delete_conflict(table_id: i64, dated: i64) -> DuckLakeError {
+    DuckLakeError::Conflict(format!(
+        "table {table_id}{REWRITTEN_DELETE_CONFLICT} {dated}, the snapshot the rewritten delete \
+         file dates its deletions to"
+    ))
+}
+
+/// Whether `error` is a [`rewritten_delete_conflict`], the only conflict a
+/// staged commit retries.
+pub(crate) fn is_rewritten_delete_conflict(error: &DuckLakeError) -> bool {
+    matches!(error, DuckLakeError::Conflict(message) if message.contains(REWRITTEN_DELETE_CONFLICT))
+}
+
+/// What one commit changes in a table, as official DuckLake's conflict check
+/// (`CheckForConflicts` in `ducklake_transaction_state.cpp`) classifies it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TableChanges {
+    /// Adds Parquet files of new rows (`inserted_into_table`).
+    pub(crate) inserted_into: bool,
+    /// Adds inlined rows (`inlined_insert`).
+    pub(crate) inserted_inlined: bool,
+    /// Deletes from Parquet files: new or rewritten delete files, or dropped
+    /// files (`deleted_from_table`).
+    pub(crate) deleted_from: bool,
+    /// Ends inlined rows or records inlined deletions of Parquet rows
+    /// (`inlined_delete`).
+    pub(crate) deleted_inlined: bool,
+    /// Flushes inlined rows to Parquet (`inline_flush`).
+    pub(crate) flushed_inlined: bool,
+}
+
+impl TableChanges {
+    /// An append: Parquet files or inlined rows of new rows, whose conflicts
+    /// with another transaction's changes are the same either way.
+    pub(crate) fn append() -> Self {
+        Self {
+            inserted_into: true,
+            ..Self::default()
+        }
+    }
+
+    /// The changes one table's part of an inlined-data flush makes, as
+    /// official's flush records them: moving inlined deletions of Parquet rows
+    /// into delete files deletes from the table (`AddDeletes`), and moving
+    /// inlined rows to Parquet flushes it. The flush checks both, deletions
+    /// first.
+    pub(crate) fn of_flush(table: &InlinedFlushTable) -> Self {
+        Self {
+            deleted_from: !table.file_deletes.is_empty(),
+            flushed_inlined: !table.files.is_empty() || !table.inlined_tables.is_empty(),
+            ..Self::default()
+        }
+    }
+
+    /// The changes a staged write makes.
+    pub(crate) fn of_staged(write: &StagedTableWrite) -> Self {
+        Self {
+            inserted_into: matches!(write.data, StagedTableData::Files(_)),
+            inserted_inlined: matches!(write.data, StagedTableData::Inlined(_)),
+            deleted_from: !write.positional_deletes.is_empty()
+                || !write.rewritten_deletes.is_empty()
+                || !write.dropped_files.is_empty(),
+            deleted_inlined: !write.inlined_deletes.is_empty()
+                || !write.inlined_file_deletes.is_empty(),
+            flushed_inlined: false,
+        }
+    }
+}
+
+/// Official DuckLake's table-level conflict check for a commit making `ours`
+/// to table `table_id`, against `changes`, the `changes_made` of every
+/// snapshot committed since the commit's base snapshot. Each change conflicts
+/// with these changes another transaction made to the same table, checked in
+/// official's order — inserts, then deletions from Parquet files, then
+/// deletions of inlined data, then flushes — and, for each, the other changes in its order:
+///
+/// - inserting (`inserted_into_table`, `inlined_insert`): dropping or altering
+///   it, or deleting from it, from Parquet files or inlined data;
+/// - deleting from Parquet files (`deleted_from_table`): dropping or altering
+///   it, compacting it, or inserting into it, inlined or not;
+/// - deleting inlined rows or recording inlined deletions (`inlined_delete`):
+///   dropping or altering it, deleting inlined rows from it, flushing its
+///   inlined data, or inserting into it;
+/// - flushing its inlined data (`inline_flush`): dropping it, deleting inlined
+///   rows from it, or flushing it.
+///
+/// Concurrent deletions from the same Parquet files are checked per file by
+/// the commit. Earlier releases of this crate recorded their compaction as
+/// `compacted_table`, which counts as compaction here. Returns the conflict,
+/// worded as official words it.
+pub(crate) fn table_conflict(
+    table_id: i64,
+    ours: TableChanges,
+    changes: &[Option<String>],
+) -> Option<DuckLakeError> {
+    let other: std::collections::HashSet<String> = changes
+        .iter()
+        .flatten()
+        .flat_map(|changes| snapshot_change_tokens(changes))
+        .filter_map(|token| {
+            let (kind, id) = token.split_once(':')?;
+            (id.parse::<i64>().ok() == Some(table_id)).then(|| kind.to_ascii_lowercase())
+        })
+        .collect();
+    let check = |action: &str, rules: &[(&[&str], &str)]| {
+        rules.iter().find_map(|(kinds, described)| {
+            kinds.iter().any(|kind| other.contains(*kind)).then(|| {
+                DuckLakeError::Conflict(format!(
+                    "Transaction conflict - attempting to {action} with index \"{table_id}\" - \
+                     but another transaction has {described}"
+                ))
+            })
+        })
+    };
+    const INSERT: &[(&[&str], &str)] = &[
+        (&["dropped_table"], "dropped it"),
+        (&["altered_table"], "altered it"),
+        (&["deleted_from_table"], "deleted from it"),
+        (&["inlined_delete"], "deleted inlined data from it"),
+    ];
+    const DELETE_FROM: &[(&[&str], &str)] = &[
+        (&["dropped_table"], "dropped it"),
+        (&["altered_table"], "altered it"),
+        (&["merge_adjacent"], "compacted it"),
+        (&["rewrite_delete", "compacted_table"], "compacted it"),
+        (&["inserted_into_table"], "inserted into it"),
+        (&["inlined_insert"], "inserted into it"),
+    ];
+    const DELETE_INLINED: &[(&[&str], &str)] = &[
+        (&["dropped_table"], "dropped it"),
+        (&["altered_table"], "altered it"),
+        (&["inlined_delete"], "deleted from it"),
+        (
+            &["flushed_inlined", "inline_flush"],
+            "flushed the inlined data",
+        ),
+        (&["inserted_into_table"], "inserted into it"),
+        (&["inlined_insert"], "inserted into it"),
+    ];
+    const FLUSH: &[(&[&str], &str)] = &[
+        (&["dropped_table"], "dropped it"),
+        (&["inlined_delete"], "deleted from it"),
+        (&["flushed_inlined", "inline_flush"], "flushed it"),
+    ];
+    let mut conflict = None;
+    if ours.inserted_into || ours.inserted_inlined {
+        conflict = conflict.or_else(|| check("insert into table", INSERT));
+    }
+    if ours.deleted_from {
+        conflict = conflict.or_else(|| check("delete from table", DELETE_FROM));
+    }
+    if ours.deleted_inlined {
+        conflict = conflict.or_else(|| check("delete from table", DELETE_INLINED));
+    }
+    if ours.flushed_inlined {
+        conflict = conflict.or_else(|| check("flush inline data", FLUSH));
+    }
+    conflict
+}
+
+/// [`table_conflict`] for an inlined-data flush of `tables`, checked in
+/// official's order: the deletions from every table by table id, then the
+/// flush of every table by table id.
+pub(crate) fn inlined_flush_table_conflict(
+    tables: &[InlinedFlushTable],
+    changes: &[Option<String>],
+) -> Option<DuckLakeError> {
+    let mut ordered: Vec<&InlinedFlushTable> = tables.iter().collect();
+    ordered.sort_by_key(|table| table.table_id);
+    let only = |table: &InlinedFlushTable, deletes: bool| {
+        let changes = TableChanges::of_flush(table);
+        if deletes {
+            TableChanges {
+                flushed_inlined: false,
+                ..changes
+            }
+        } else {
+            TableChanges {
+                deleted_from: false,
+                ..changes
+            }
+        }
+    };
+    [true, false].into_iter().find_map(|deletes| {
+        ordered
+            .iter()
+            .find_map(|table| table_conflict(table.table_id, only(table, deletes), changes))
+    })
+}
+
+/// [`table_conflict`] for a staged write: an insert, a `DELETE` or an
+/// `UPDATE`. The insert of a `Replace` is not checked here: the Replace
+/// conflict detection checks its retirement of the prior generation. A
+/// deprecated flush stage is checked only as the inlined delete that ends the
+/// rows it moves; its expected-base check covers the rest
+/// ([`ConflictScope::InlinedFlush`]).
+pub(crate) fn staged_conflict(
+    write: &StagedTableWrite,
+    changes: &[Option<String>],
+) -> Option<DuckLakeError> {
+    if write.inlined_flush {
+        let ours = TableChanges {
+            deleted_inlined: !write.inlined_deletes.is_empty(),
+            ..TableChanges::default()
+        };
+        return table_conflict(write.table_id, ours, changes);
+    }
+    let mut ours = TableChanges::of_staged(write);
+    if write.mode == WriteMode::Replace {
+        ours.inserted_into = false;
+        ours.inserted_inlined = false;
+    }
+    table_conflict(write.table_id, ours, changes)
+}
+
+/// A data file a commit deletes from or drops, which an inlined deletion of
+/// the file committed since the commit's base snapshot may conflict with (see
+/// [`inlined_deletion_conflict`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceFile<'a> {
+    pub(crate) data_file_id: i64,
+    /// The positions of the delete file a `DELETE` registers for the file:
+    /// only an inlined deletion of one of them conflicts. `None` when any
+    /// does: the commit drops the file, also inserts rows (an `UPDATE`, whose
+    /// new row versions would bring back a row deleted concurrently), or does
+    /// not know its delete file's positions.
+    pub(crate) positions: Option<&'a [i64]>,
+}
+
+impl<'a> SourceFile<'a> {
+    /// A file any concurrent inlined deletion of conflicts with.
+    pub(crate) fn any(data_file_id: i64) -> Self {
+        Self {
+            data_file_id,
+            positions: None,
+        }
+    }
+
+    /// The file a `DELETE` registers `delete` for.
+    pub(crate) fn deleted_by(data_file_id: i64, delete: &'a DeleteFileInfo) -> Self {
+        Self {
+            data_file_id,
+            positions: delete.deleted_positions(),
+        }
+    }
+
+    /// Every data file of `entries`, which a commit inserting rows deletes
+    /// from (`deleting` false), or a `DELETE` does (`deleting` true).
+    pub(crate) fn of_entries(entries: &'a [DeleteFileEntry], deleting: bool) -> Vec<Self> {
+        entries
+            .iter()
+            .map(|entry| {
+                if deleting {
+                    Self::deleted_by(entry.data_file_id, &entry.delete)
+                } else {
+                    Self::any(entry.data_file_id)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether `write` deletes rows without inserting any: a `DELETE`.
+pub(crate) fn is_pure_delete(write: &StagedTableWrite) -> bool {
+    matches!(write.data, StagedTableData::None) && !write.inlined_flush
+}
+
+/// The data files a staged write deletes from or drops, whose inlined
+/// deletions since the base snapshot may make the commit conflict.
+///
+/// A `DELETE` conflicts only with an inlined deletion of a row it deletes
+/// too: one its delete file holds, or any of a file it drops. Official's
+/// conflict check (`CheckForConflicts`) never compares a delete file or a
+/// dropped file with a concurrent inlined deletion and commits both; for a
+/// row deleted by both, official DuckLake (1.5.5) then reads back other
+/// deleted rows of the file (delete file), or its change feeds lose the
+/// drop's deletions in windows starting before it (dropped file). An `UPDATE`
+/// conflicts with any, as official's insert check (`deleted inlined data from
+/// it`) refuses it.
+pub(crate) fn row_mutation_source_files(write: &StagedTableWrite) -> Vec<SourceFile<'_>> {
+    let deleting = is_pure_delete(write);
+    write
+        .positional_deletes
+        .iter()
+        .map(|entry| {
+            if deleting {
+                SourceFile::deleted_by(entry.data_file_id, &entry.delete)
+            } else {
+                SourceFile::any(entry.data_file_id)
+            }
+        })
+        .chain(write.rewritten_deletes.iter().map(|d| {
+            if deleting {
+                SourceFile::deleted_by(d.data_file_id, &d.delete.delete)
+            } else {
+                SourceFile::any(d.data_file_id)
+            }
+        }))
+        .chain(
+            write
+                .dropped_files
+                .iter()
+                .map(|d| SourceFile::any(d.data_file_id)),
+        )
+        .collect()
+}
+
+/// The comma-separated ids of `sources`, for an `IN (...)` list.
+pub(crate) fn source_file_id_list(sources: &[SourceFile<'_>]) -> String {
+    sources
+        .iter()
+        .map(|source| source.data_file_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The conflict a commit to table `table_id` deleting from `sources` meets
+/// in `concurrent`, the `(file_id, row_id)` of the inlined deletions of
+/// those files recorded since `base_snapshot` (rows without a position or
+/// snapshot included): any of a file whose positions are unknown, else one
+/// of a position the file's new delete file holds.
+pub(crate) fn inlined_deletion_conflict(
+    table_id: i64,
+    base_snapshot: i64,
+    sources: &[SourceFile<'_>],
+    concurrent: &[(i64, Option<i64>)],
+) -> Result<()> {
+    for (file_id, row_id) in concurrent {
+        let conflicts = sources
+            .iter()
+            .filter(|source| source.data_file_id == *file_id)
+            .any(|source| match (source.positions, row_id) {
+                (Some(positions), Some(row_id)) => positions.contains(row_id),
+                _ => true,
+            });
+        if conflicts {
+            return Err(DuckLakeError::Conflict(format!(
+                "table {table_id} gained an inlined delete on a source file since snapshot \
+                 {base_snapshot}; re-open the catalog and re-plan"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Row storage staged for one table in a multi-table write.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -1420,7 +2358,23 @@ pub struct StagedTableWrite {
     pub(crate) data: StagedTableData,
     pub(crate) snapshot_id_columns: Vec<String>,
     pub(crate) positional_deletes: Vec<DeleteFileEntry>,
+    /// Delete files that replace a data file's live delete file, carrying every
+    /// position of it with its snapshot and the statement's new deletions at
+    /// `base_snapshot_id + 1`. The commit removes the replaced row and
+    /// schedules its object, as official's `DeleteOverwrittenDeleteFiles` does.
+    pub(crate) rewritten_deletes: Vec<InlinedFlushFileDelete>,
     pub(crate) inlined_deletes: Vec<InlinedRowRef>,
+    /// Row ids of [`StagedTableData::Inlined`] rows, in row order. `None` draws
+    /// them from the table's `next_row_id`; `Some` keeps them, as an `UPDATE`
+    /// keeps each updated row's id, and leaves `next_row_id` unchanged.
+    pub(crate) inlined_row_ids: Option<Vec<i64>>,
+    /// Deletions of Parquet rows recorded in `ducklake_inlined_delete_<table_id>`.
+    pub(crate) inlined_file_deletes: Vec<InlinedFileDelete>,
+    /// Live data files whose rows are all deleted: each is ended, its live
+    /// delete file left as it is.
+    pub(crate) dropped_files: Vec<DroppedDataFile>,
+    /// Set by the deprecated `DuckLakeTableWriter::flush_inlined_data`: the
+    /// stage moves inlined rows into Parquet without changing logical rows.
     pub(crate) inlined_flush: bool,
 }
 
@@ -1486,6 +2440,7 @@ impl StagedTableWrite {
     }
 
     /// Returns whether this stage moves inlined rows into Parquet without changing logical rows.
+    #[deprecated(note = "use DuckLakeCatalog::flush_inlined_data, which matches DuckLake's flush")]
     #[must_use]
     pub const fn inlined_flush(&self) -> bool {
         self.inlined_flush
@@ -1673,7 +2628,9 @@ pub(crate) async fn commit_networked<DB: sqlx::Database>(
 /// outcome is unknown. It tells the two apart by the error alone, so the commits
 /// it calls (`register_data_file`, `register_data_files`, their
 /// `_with_commit_metadata`, `_with_deletes` and `_with_deletes_and_commit_metadata`
-/// forms, and `commit_multi_table`) must keep this contract: return
+/// forms, and `commit_multi_table`) must keep this contract, as must
+/// `commit_deletes` and `commit_inlined_flush`, whose callers remove the delete
+/// files and flushed files they wrote the same way: return
 /// `DuckLakeError::CommitOutcomeUnknown` when the transaction's `COMMIT` itself
 /// fails and the catalog may have applied it, and any other error only when
 /// nothing was committed. In particular, an implementation must not return any
@@ -1683,6 +2640,28 @@ pub(crate) async fn commit_networked<DB: sqlx::Database>(
 pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Create a new snapshot and return its ID.
     fn create_snapshot(&self) -> Result<i64>;
+
+    /// Whether the catalog's `encrypted` option is `true`. Official DuckLake
+    /// writes such a catalog's Parquet files with Parquet Modular Encryption;
+    /// this crate refuses to write Parquet there.
+    fn catalog_encrypted(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The catalog's latest snapshot, or `None` when the backend does not say.
+    fn head_snapshot(&self) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// The id the catalog's next snapshot is expected to take, or `None` when
+    /// the backend does not say. A staged `DELETE` or `UPDATE` that rewrites a
+    /// delete file dates its deletions to it when it retries its commit, which
+    /// succeeds only when its snapshot takes that id.
+    ///
+    /// Default: the snapshot after [`Self::head_snapshot`].
+    fn next_snapshot_id(&self) -> Result<Option<i64>> {
+        Ok(self.head_snapshot()?.map(|head| head + 1))
+    }
 
     /// Replace a global-scoped catalog setting.
     fn set_global_setting(&self, _key: &str, _value: &str) -> Result<()> {
@@ -1953,7 +2932,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// with [`crate::DuckLakeError::Conflict`] if any data file of the table has
     /// `begin_snapshot` or `end_snapshot` greater than `base_snapshot` — i.e.
     /// another writer published a newer generation since this write began — so
-    /// concurrent replaces never silently union or clobber each other.
+    /// concurrent replaces never silently union or clobber each other. For
+    /// `Append`, the commit aborts as official's insert does if the table was
+    /// dropped, altered or deleted from (its files or its inlined rows) after
+    /// `base_snapshot`; concurrent appends do not conflict.
     ///
     /// `schema_name` / `table_name` identify the target. Multicatalog Postgres
     /// writes ALL metadata at this commit (the schema/table get-or-create happens
@@ -2115,6 +3097,25 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         true
     }
 
+    /// Whether rows of the live table `schema_name.table_name` may be inlined
+    /// by its column types: `false` when one of its live columns, a nested
+    /// field included, is a GEOMETRY, which official DuckLake never inlines
+    /// (`SupportsInliningColumns`). `true` for a table that does not exist.
+    ///
+    /// Default: `false`, inlining nothing.
+    fn table_types_support_inlining(&self, _schema_name: &str, _table_name: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// The first of `columns` named like a system column of this catalog's
+    /// inlined data tables (`row_id`, `begin_snapshot`, `end_snapshot` and
+    /// DuckDB's internal names in a DuckLake 1.0 catalog; their `_ducklake_`
+    /// forms in 1.1), which official refuses to create while inlining is
+    /// enabled. `None` for a backend that never inlines.
+    fn reserved_inlining_column(&self, _columns: &[String]) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Store a small insert in the catalog instead of writing a Parquet file.
     ///
     /// Implementations create or reuse the per-`(table_id, schema_version)`
@@ -2170,9 +3171,10 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Replace/compaction retired it since `base_snapshot`, invalidating the
     /// resolved positions) or the currently-live delete file for it no longer
     /// matches `expected_prev_delete_file` (a concurrent delete on the same file
-    /// won the race). A concurrent *append* that only adds other files does NOT
-    /// conflict — it never moves this file's rows. Otherwise end the prior delete
-    /// file and insert `delete`, which must carry the cumulative position set.
+    /// won the race), or if the table was dropped, altered, compacted or inserted
+    /// into since `base_snapshot`, as official DuckLake's delete refuses those
+    /// (`CheckForConflicts`). Otherwise end the prior delete file and insert
+    /// `delete`, which must carry the cumulative position set.
     ///
     /// Default: unsupported; backends override it.
     #[allow(clippy::too_many_arguments)]
@@ -2409,6 +3411,27 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// This backend's snapshot expiry and file cleanup, which
+    /// [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint) runs.
+    /// `None` when the backend implements neither.
+    fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
+        None
+    }
+
+    /// Unregister and drop every empty superseded inlined data table: one whose
+    /// schema version is below the newest version registered for its table and
+    /// which holds no rows. Ports official's `DropEmptySupersededInlinedTables`,
+    /// which runs after a flush commits, across the whole catalog (on the
+    /// multicatalog layout, across the writer's catalog).
+    ///
+    /// A superseded table that still holds rows is kept. A catalog without the
+    /// registry has nothing to drop.
+    ///
+    /// Default: no inlined storage, nothing to drop.
+    fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Apply positional and inlined-row deletes in one snapshot. The default
     /// dispatches when only one storage form is present; backends supporting a
     /// table that mixes both forms override this for an atomic combined commit.
@@ -2448,9 +3471,12 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
 
     /// Commit a compaction (`merge_adjacent_files` / `rewrite_data_files`) in
     /// ONE new snapshot: register the rewritten `outputs`, retire every `source`
-    /// data file AND its live delete file, recompute the table's visible stat
-    /// totals from the surviving files, and record `changes_made =
-    /// compacted_table:<id>` in `ducklake_snapshot_changes`.
+    /// data file AND its live delete file, and record official's
+    /// `merge_adjacent:<id>` (for [`SourceRetirement::Remove`]) or
+    /// `rewrite_delete:<id>` (for [`SourceRetirement::Retire`]) in
+    /// `ducklake_snapshot_changes`. `ducklake_table_stats`
+    /// is left as it is: `record_count` stays the gross count of rows ever
+    /// inserted, as official's compaction leaves it.
     ///
     /// `retirement` decides how the sources are retired:
     /// [`SourceRetirement::Remove`] (merge — the partial output covers every
@@ -2494,11 +3520,55 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Commit an inlined-data flush (`ducklake_flush_inlined_data`) of one or
+    /// more tables in ONE new snapshot, mirroring official DuckLake's flush.
+    ///
+    /// `base_snapshot` is the snapshot the inlined rows were read at. In one
+    /// transaction the implementation:
+    ///
+    /// - aborts with [`crate::DuckLakeError::Conflict`] when a table was dropped,
+    ///   or had inlined rows deleted or flushed, after `base_snapshot`, and when
+    ///   a table whose inlined file deletions it moves was inserted into,
+    ///   altered or compacted since, as official's check refuses those
+    ///   ([`InlinedFlushFileDelete::expected_prev_delete_file`] and the data
+    ///   file's liveness are compare-and-swap guards as well);
+    /// - registers each [`InlinedFlushFile`] with its own `begin_snapshot`,
+    ///   `partial_max` and `row_id_start`, its column stats and partition values,
+    ///   and its delete file;
+    /// - registers each [`InlinedFlushFileDelete`], removing and scheduling the
+    ///   delete file it replaces;
+    /// - deletes the flushed rows (`begin_snapshot <= base_snapshot`) from the
+    ///   inlined-data tables and the moved rows from the inlined-delete table;
+    /// - adds the files' sizes to `ducklake_table_stats.file_size_bytes` and
+    ///   refreshes the column stats, leaving `record_count` and `next_row_id`
+    ///   alone (the rows were counted when they were inlined);
+    /// - records `changes_made` as official does — `deleted_from_table:<id>` for
+    ///   moved file deletions, then `inline_flush:<id>` for flushed rows — and
+    ///   carries `schema_version` forward.
+    ///
+    /// Returns the new snapshot id. Dropping the superseded inlined tables the
+    /// commit empties is a separate step,
+    /// [`Self::drop_empty_superseded_inlined_tables`], which every flush runs after
+    /// this commit when it flushed rows.
+    ///
+    /// Default: unsupported.
+    fn commit_inlined_flush(
+        &self,
+        _base_snapshot: i64,
+        _tables: &[InlinedFlushTable],
+    ) -> Result<i64> {
+        Err(DuckLakeError::Unsupported(
+            "flushing inlined data is not supported by this metadata writer".to_string(),
+        ))
+    }
+
     /// Truncate a table: end EVERY live data file (and its live delete file) in
-    /// one new snapshot and zero the visible stat totals, WITHOUT rewriting any
-    /// data — the commit behind a SQL `DELETE FROM t` with no `WHERE`. Mirrors the
-    /// file-ending drop_table performs, but leaves the table's schema live.
-    /// `next_row_id` is deliberately preserved (rowids stay monotonic).
+    /// one new snapshot, WITHOUT rewriting any data — the commit behind a SQL
+    /// `DELETE FROM t` with no `WHERE`. Mirrors the file-ending drop_table
+    /// performs, but leaves the table's schema live. `ducklake_table_stats` is
+    /// left as it is, as official's `DELETE` leaves it: `record_count` stays the
+    /// gross count of rows ever inserted, and `next_row_id` is preserved (rowids
+    /// stay monotonic).
     ///
     /// Returns the number of rows removed (the table's live row count immediately
     /// before the truncate: gross `record_count` minus still-live delete counts),
@@ -2530,39 +3600,53 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// blind retry would stack a second copy on them. Retiring them here leaves a
     /// clean base so the retry appends exactly once.
     ///
+    /// The appended rows are the table's live data files with `begin_snapshot >
+    /// base_snapshot` and its live inlined rows (in its
+    /// `ducklake_inlined_data_<table_id>_<version>` tables) inserted after
+    /// `base_snapshot`; the files and the rows are ended at the new snapshot.
+    ///
     /// Refuses with [`crate::DuckLakeError::Conflict`] if the delta since
     /// `base_snapshot` is NOT a pure append — specifically if any of these exist
-    /// for the table: a delete file with `begin_snapshot > base_snapshot`, a data
-    /// file present at/before `base_snapshot` that was ended after it
-    /// (`begin_snapshot <= base_snapshot AND end_snapshot > base_snapshot`), or a
-    /// column version changed after it (`begin_snapshot > base_snapshot OR
-    /// end_snapshot > base_snapshot`). Forward-only file retirement cannot
-    /// faithfully revert a delete / replace / update / schema-promotion, so in
-    /// those cases the caller must keep its read freeze and surface the state
-    /// rather than expose a half-reverted table. The purity checks run BEFORE the
-    /// no-op return, so a delete-only orphan (no appended data file) still yields
-    /// `Conflict`, not a silent no-op.
+    /// for the table: a delete file with `begin_snapshot` or `partial_max` after
+    /// `base_snapshot` (a delete file rewritten by a later statement begins at its
+    /// earliest deletion, which may precede `base_snapshot`), a data file present
+    /// at/before `base_snapshot` that was ended after it (`begin_snapshot <=
+    /// base_snapshot AND end_snapshot > base_snapshot`) or that holds rows from
+    /// after it (`partial_max > base_snapshot`, as a flush writes), an inlined row
+    /// ended after `base_snapshot`, a row of `ducklake_inlined_delete_<table_id>`
+    /// with `begin_snapshot > base_snapshot`, a column version changed after it
+    /// (`begin_snapshot > base_snapshot OR end_snapshot > base_snapshot`), or a
+    /// partition-spec change after it where the backend checks one (SQLite, DuckDB
+    /// and MySQL). Forward-only retirement cannot faithfully revert a delete /
+    /// replace / update / flush / schema-promotion, so in those cases the caller
+    /// must keep its read freeze and surface the state rather than expose a
+    /// half-reverted table. The purity checks run BEFORE the no-op return, so a
+    /// delete-only orphan (nothing appended) still yields `Conflict`, not a silent
+    /// no-op.
     ///
     /// The guard covers the snapshot-visible change tables that can make a delta
-    /// non-append: data files, delete files, and columns. Per-file partition values
-    /// need no check — they hang off `data_file_id`, so retiring a file leaves its
-    /// values attached exactly as any other retired file's are. This crate writes no
-    /// inlined-data rows, so there is nothing else to check; if inlined-data support
-    /// is added, extend the guard to reject a post-base row there too.
+    /// non-append: data files, delete files, inlined rows and inlined deletions,
+    /// and columns. Per-file partition values need no check — they hang off
+    /// `data_file_id`, so retiring a file leaves its values attached exactly as
+    /// any other retired file's are.
     ///
-    /// Not covered: a `SET`/`RESET PARTITIONED BY` committed after `base_snapshot`.
-    /// It changes no column, so the delta still reads as a pure append and the
+    /// Not covered on multi-catalog PostgreSQL: a `SET`/`RESET PARTITIONED BY`
+    /// committed after `base_snapshot`. It changes no column, so the delta still
+    /// reads as a pure append and the
     /// appended files are retired — leaving the new spec in place with no data under
     /// it. That is a consistent state (the retry re-appends under the live spec), but
     /// it is not a *revert* to `base_snapshot`; a caller needing exact reversion must
     /// serialize partition DDL against this, as the contract below already requires
     /// for writes.
     ///
-    /// Recomputes the visible stat totals (`record_count`, `file_size_bytes`, and
-    /// the per-column stats) from the surviving live files, and preserves
-    /// `next_row_id` (rowids stay monotonic — retired ranges are never reused).
-    /// Advances the catalog head LAST. Returns the new snapshot id, or `None` if no
-    /// appended files exist (a no-op — no snapshot is created).
+    /// Leaves `ducklake_table_stats` and the table-wide column statistics as they
+    /// are, as official's `DELETE` does: `record_count` stays the gross count of
+    /// rows ever inserted, the bounds only widen, and `next_row_id` is preserved
+    /// (rowids stay monotonic — retired ranges are never reused).
+    /// The snapshot records `deleted_from_table` for retired files and
+    /// `inlined_delete` for retired inlined rows. Advances the catalog head LAST.
+    /// Returns the new snapshot id, or `None` if nothing was appended (a no-op —
+    /// no snapshot is created).
     ///
     /// # Caller contract
     /// `base_snapshot` MUST be a real `ducklake_snapshot.snapshot_id` — the table's
@@ -2572,7 +3656,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// legitimate append has a live file with `begin_snapshot > base_snapshot` that
     /// this would wrongly retire.
     ///
-    /// Default: unsupported; the SQLite and Postgres backends override it.
+    /// Default: unsupported; the SQLite, DuckDB, MySQL and multi-catalog
+    /// PostgreSQL backends override it.
     fn retire_appends_since(&self, _table_id: i64, _base_snapshot: i64) -> Result<Option<i64>> {
         Err(DuckLakeError::InvalidConfig(
             "retire_appends_since is not supported on this metadata backend".to_string(),
@@ -2629,8 +3714,8 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// Nothing is read here either, so statistics can only be *carried*:
     /// [`DataFileInfo::column_stats`] is persisted as given to
     /// `ducklake_file_column_stats` under the assigned `data_file_id`, and the
-    /// table's `ducklake_table_column_stats` roll-up is recomputed in the same
-    /// commit, as every other register path does. A promoted file is the same
+    /// files' statistics are merged into the table's `ducklake_table_column_stats`
+    /// roll-up in the same commit, as every other register path does. A promoted file is the same
     /// bytes the source catalog described, so the source's rows for it are
     /// exactly right for the copy — `contains_nan` included, which a footer
     /// re-read could not recover, and without which a float `max_value` is
@@ -2905,6 +3990,18 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     fn supports_update(&self) -> bool {
         false
     }
+
+    /// Whether [`commit_multi_table`](MetadataWriter::commit_multi_table)
+    /// commits the row mutations SQL `UPDATE` and `DELETE` stage on tables that
+    /// use data inlining: inlined rows that keep the row ids of the rows they
+    /// update, deletions of Parquet rows recorded in
+    /// `ducklake_inlined_delete_<table_id>`, and data files dropped whole.
+    ///
+    /// Default `false`: those statements then write delete files and Parquet
+    /// files only, and refuse to update inlined rows.
+    fn supports_inlined_row_mutations(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -2913,6 +4010,170 @@ mod tests {
     use crate::DuckLakeError;
     use arrow::datatypes::Field;
     use std::sync::Arc;
+
+    /// Official's table-level conflict check: inserts before deletions, each
+    /// against the other changes in official's order, across every snapshot
+    /// since the base, worded as official words it.
+    #[test]
+    fn table_conflicts_follow_official_order_and_wording() {
+        let changes = |list: &[&str]| -> Vec<Option<String>> {
+            list.iter().map(|c| Some((*c).to_string())).collect()
+        };
+        let message = |ours: TableChanges, list: &[&str]| {
+            table_conflict(7, ours, &changes(list)).map(|e| e.to_string())
+        };
+        let update = TableChanges {
+            inserted_into: true,
+            deleted_from: true,
+            ..TableChanges::default()
+        };
+        assert!(message(update, &["dropped_table:7"]).unwrap().contains(
+            "Transaction conflict - attempting to insert into table with index \"7\" - but \
+                 another transaction has dropped it"
+        ));
+        let inlined_update = TableChanges {
+            inserted_inlined: true,
+            deleted_inlined: true,
+            ..TableChanges::default()
+        };
+        assert!(
+            message(inlined_update, &["inlined_delete:7"])
+                .unwrap()
+                .contains(
+                    "attempting to insert into table with index \"7\" - but another \
+                           transaction has deleted inlined data from it"
+                )
+        );
+        // The rule's order decides, not the order the changes were made in,
+        // and every snapshot since the base counts.
+        let delete = TableChanges {
+            deleted_from: true,
+            ..TableChanges::default()
+        };
+        assert!(
+            message(delete, &["inserted_into_table:7", "altered_table:7"])
+                .unwrap()
+                .contains(
+                    "attempting to delete from table with index \"7\" - but another \
+                           transaction has altered it"
+                )
+        );
+        assert!(
+            message(delete, &["merge_adjacent:7"])
+                .unwrap()
+                .contains("has compacted it")
+        );
+        // Changes to other tables, and deletions of Parquet rows by another
+        // transaction (checked per file), do not conflict at table level.
+        assert_eq!(
+            message(delete, &["inserted_into_table:8", "deleted_from_table:7"]),
+            None
+        );
+        let inlined_delete = TableChanges {
+            deleted_inlined: true,
+            ..TableChanges::default()
+        };
+        assert!(
+            message(inlined_delete, &["inline_flush:7"])
+                .unwrap()
+                .contains("has flushed the inlined data")
+        );
+        assert!(
+            message(inlined_delete, &["inlined_delete:7"])
+                .unwrap()
+                .contains(
+                    "delete from table with index \"7\" - but another transaction has \
+                           deleted from it"
+                )
+        );
+        // A flush of inlined rows conflicts with a drop, an inlined delete or
+        // another flush, not with an insert, an alter or a delete file.
+        let rows_flush = InlinedFlushTable {
+            table_id: 7,
+            inlined_tables: vec!["ducklake_inlined_data_7_1".to_string()],
+            ..InlinedFlushTable::default()
+        };
+        let flush = TableChanges::of_flush(&rows_flush);
+        assert!(
+            message(flush, &["inlined_delete:7"])
+                .unwrap()
+                .contains("attempting to flush inline data with index \"7\" - but another transaction has deleted from it")
+        );
+        assert!(
+            message(flush, &["inline_flush:7"])
+                .unwrap()
+                .contains("has flushed it")
+        );
+        assert_eq!(
+            message(
+                flush,
+                &["inserted_into_table:7,deleted_from_table:7,inlined_insert:7,altered_table:7"]
+            ),
+            None
+        );
+        // A flush moving inlined deletions of Parquet rows into delete files
+        // deletes from the table (official's `AddDeletes`): an insert, alter or
+        // compaction conflicts, checked before the flush's own rules.
+        let file_delete = InlinedFlushFileDelete {
+            data_file_id: 3,
+            data_file_end: None,
+            expected_prev_delete_file: None,
+            delete: InlinedFlushDeleteFile {
+                delete: DeleteFileInfo::new("d.parquet", 1, 1),
+                begin_snapshot: 2,
+                partial_max: None,
+                end_snapshot: None,
+            },
+        };
+        let deletes_only = InlinedFlushTable {
+            table_id: 7,
+            file_deletes: vec![file_delete.clone()],
+            ..InlinedFlushTable::default()
+        };
+        let both = InlinedFlushTable {
+            file_deletes: vec![file_delete],
+            ..rows_flush.clone()
+        };
+        for (changes, described) in [
+            ("inserted_into_table:7", "inserted into it"),
+            ("inlined_insert:7", "inserted into it"),
+            ("altered_table:7", "altered it"),
+            ("merge_adjacent:7", "compacted it"),
+            ("rewrite_delete:7", "compacted it"),
+            ("inline_flush:7,altered_table:7", "altered it"),
+        ] {
+            for table in [&deletes_only, &both] {
+                let error = message(TableChanges::of_flush(table), &[changes]).unwrap();
+                assert!(
+                    error.contains(&format!(
+                        "attempting to delete from table with index \"7\" - but another \
+                         transaction has {described}"
+                    )),
+                    "{changes}: {error}"
+                );
+            }
+        }
+        // Moving only deletions is no flush: another flush does not conflict.
+        assert_eq!(
+            message(TableChanges::of_flush(&deletes_only), &["inline_flush:7"]),
+            None
+        );
+        // Across tables, every table's deletions are checked before any flush.
+        let rows_8 = InlinedFlushTable {
+            table_id: 8,
+            ..rows_flush.clone()
+        };
+        let error = inlined_flush_table_conflict(
+            &[rows_8, deletes_only],
+            &changes(&["inline_flush:8,inserted_into_table:7"]),
+        )
+        .unwrap()
+        .to_string();
+        assert!(
+            error.contains("attempting to delete from table with index \"7\""),
+            "{error}"
+        );
+    }
 
     #[test]
     fn directory_path_appends_one_trailing_slash() {
@@ -2948,13 +4209,13 @@ mod tests {
     #[test]
     fn compaction_output_stores_only_a_carried_range() {
         let file = DataFileInfo::new("a.parquet", 100, 4);
-        assert_eq!(compaction_output_row_id_start(&file), None);
+        assert_eq!(carried_row_id_start(&file), None);
         assert_eq!(
-            compaction_output_row_id_start(&file.clone().with_embedded_row_ids()),
+            carried_row_id_start(&file.clone().with_embedded_row_ids()),
             None
         );
         let carried = file.with_source_row_id_start(Some(40));
-        assert_eq!(compaction_output_row_id_start(&carried), Some(40));
+        assert_eq!(carried_row_id_start(&carried), Some(40));
     }
 
     #[test]

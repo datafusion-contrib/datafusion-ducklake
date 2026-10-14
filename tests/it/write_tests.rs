@@ -2960,3 +2960,66 @@ async fn staged_schema_change_rejects_without_reverting_columns() {
         .collect();
     assert_eq!(values, vec![11, 23]);
 }
+
+/// A file row an older writer inserted (taking the next id past the largest in
+/// use, not this crate's counter) does not make the next write reuse its id.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_file_ids_skip_an_older_writers_file_rows() {
+    let (writer, temp_dir) = create_test_env().await;
+    let object_store = create_object_store();
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = |values: Vec<i32>| {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+    };
+    let table_writer =
+        DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store)).unwrap();
+    table_writer
+        .write_table("main", "ids", &[batch(vec![1, 2])])
+        .await
+        .unwrap();
+
+    // The older writer's file: a copy of the row under the next id, ended at
+    // the snapshot it began in so no read sees it.
+    let db_path = temp_dir.path().join("test.db");
+    let mut connection = <sqlx::SqliteConnection as sqlx::Connection>::connect(&format!(
+        "sqlite:{}",
+        db_path.display()
+    ))
+    .await
+    .unwrap();
+    for statement in [
+        "CREATE TEMP TABLE older AS SELECT * FROM ducklake_data_file
+         WHERE data_file_id = (SELECT MAX(data_file_id) FROM ducklake_data_file)",
+        "UPDATE older SET data_file_id = data_file_id + 1, end_snapshot = begin_snapshot",
+        "INSERT INTO ducklake_data_file SELECT * FROM older",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+    }
+    drop(connection);
+
+    for round in 0..2 {
+        DuckLakeTableWriter::new(Arc::new(writer.clone()), Arc::clone(&object_store))
+            .unwrap()
+            .append_table("main", "ids", &[batch(vec![10 + round, 20 + round])])
+            .await
+            .unwrap();
+    }
+    let ctx = create_read_context(&temp_dir).await;
+    let batches = ctx
+        .sql("SELECT COUNT(*) FROM test.main.ids")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let count = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 6);
+}

@@ -494,13 +494,20 @@ async fn duckdb_writer_round_trips_nested_inlined_rows() {
 
     let writer =
         Arc::new(DuckdbMetadataWriter::new(catalog_path.to_string_lossy().into_owned()).unwrap());
-    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+    let table_writer =
+        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new())).unwrap();
     let flushed = table_writer
-        .flush_inlined_data("main", "nested", &live_after_delete, deleted.snapshot_id)
+        .flush_table_inlined_data(
+            Arc::new(writer.metadata_provider()),
+            "main",
+            "nested",
+            deleted.snapshot_id,
+        )
         .await
         .unwrap()
         .unwrap();
     drop(table_writer);
+    drop(writer);
 
     let provider = DuckdbMetadataProvider::new(catalog_path.to_string_lossy()).unwrap();
     assert!(
@@ -509,10 +516,15 @@ async fn duckdb_writer_round_trips_nested_inlined_rows() {
             .unwrap()
             .is_empty()
     );
-    let pinned = provider
-        .get_inlined_data(table.table_id, snapshot_id, &columns)
-        .unwrap();
-    assert_eq!(pinned, vec![expected]);
+    // The flush deleted every row it moved, deleted ones included, as official's
+    // does; earlier snapshots read them from the flushed file.
+    assert!(
+        provider
+            .get_inlined_data(table.table_id, snapshot_id, &columns)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(flushed.records_written, 4);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -739,5 +751,110 @@ async fn duckdb_multi_table_write_commits_parquet_and_inline_rows() {
             "inserted_into_table:{},inlined_insert:{}",
             committed[0].table_id, committed[1].table_id
         )
+    );
+}
+
+/// A catalog's `column_type` is text another writer controls, and the DuckDB
+/// writer declares each inlined column in DDL. A type with text after a valid
+/// `decimal(p, s)` prefix is no type: it is not read as its prefix, so a commit
+/// that creates an inlined table from the catalog's columns creates none for
+/// it, nothing of the text reaches DDL, and opening the table fails with the
+/// parser's typed error.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_inlined_ddl_ignores_hostile_column_type() {
+    let temp = TempDir::new().unwrap();
+    let catalog_path = temp.path().join("metadata.duckdb");
+    let data_path = temp.path().join("data");
+    std::fs::create_dir_all(&data_path).unwrap();
+    let columns = vec![
+        ColumnDef::new("id", "int32", true).unwrap(),
+        ColumnDef::new("d", "decimal(18,3)", true).unwrap(),
+    ];
+    let table_id = {
+        let writer =
+            DuckdbMetadataWriter::new_with_init(catalog_path.to_string_lossy().into_owned())
+                .unwrap();
+        writer.set_data_path(data_path.to_str().unwrap()).unwrap();
+        let setup = writer
+            .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+            .unwrap();
+        writer
+            .publish_snapshot(
+                setup.table_id,
+                "main",
+                "t",
+                setup.snapshot_id,
+                WriteMode::Replace,
+                setup.base_snapshot_id,
+                &columns,
+                &setup.field_ids,
+            )
+            .unwrap();
+        setup.table_id
+    };
+    {
+        let connection = duckdb::Connection::open(&catalog_path).unwrap();
+        connection
+            .execute_batch(
+                "UPDATE ducklake_column SET column_type = 'decimal(18,3), pwned INTEGER' \
+                 WHERE column_name = 'd'",
+            )
+            .unwrap();
+    }
+    // Setting a partition spec commits a new schema version, whose inlined
+    // table official creates eagerly from the table's catalog columns.
+    let writer =
+        DuckdbMetadataWriter::new_with_init(catalog_path.to_string_lossy().into_owned()).unwrap();
+    let added = writer.set_partition_spec(
+        table_id,
+        &[(
+            "id".to_string(),
+            datafusion_ducklake::PartitionTransform::Identity,
+        )],
+    );
+    drop(writer);
+    let connection = duckdb::Connection::open(&catalog_path).unwrap();
+    let injected: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM duckdb_columns() WHERE column_name = 'pwned'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(injected, 0, "the hostile type reached DDL ({added:?})");
+    // The column's type does not parse, so the new schema version gets no
+    // inlined table (as for any column that cannot be inlined), and opening
+    // the table fails with the parser's typed error.
+    added.unwrap();
+    let inlined: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM ducklake_inlined_data_tables",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(inlined, 1, "only the create's inlined table");
+    drop(connection);
+    let writer =
+        DuckdbMetadataWriter::new_with_init(catalog_path.to_string_lossy().into_owned()).unwrap();
+    let provider: Arc<dyn MetadataProvider> = Arc::new(writer.metadata_provider());
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let error = provider
+        .get_table_structure(table_id, snapshot)
+        .and_then(|columns| {
+            columns
+                .iter()
+                .map(|column| {
+                    datafusion_ducklake::types::ducklake_to_arrow_type(&column.column_type)
+                })
+                .collect::<datafusion_ducklake::Result<Vec<_>>>()
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            datafusion_ducklake::DuckLakeError::UnsupportedType(_)
+        ),
+        "{error}"
     );
 }

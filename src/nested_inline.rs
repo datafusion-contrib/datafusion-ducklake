@@ -253,7 +253,7 @@ fn render_text_at_depth(
             Ok(format!("{{{}}}", values.join(", ")))
         },
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            let value = arrow::util::display::array_value_to_string(array, row)?;
+            let value = crate::metadata_writer::display_value(array, row)?;
             if map_key && is_bare_map_key(&value) {
                 Ok(value)
             } else {
@@ -264,7 +264,11 @@ fn render_text_at_depth(
         | DataType::LargeBinary
         | DataType::BinaryView
         | DataType::FixedSizeBinary(_) => Ok(quote_text(&encode_blob(binary_value(array, row)?))),
-        _ => Ok(arrow::util::display::array_value_to_string(array, row)?),
+        DataType::Date32
+        | DataType::Timestamp(_, _)
+        | DataType::Time32(_)
+        | DataType::Time64(_) => crate::metadata_writer::inlined_text_value(array, row),
+        _ => crate::metadata_writer::display_value(array, row),
     }
 }
 

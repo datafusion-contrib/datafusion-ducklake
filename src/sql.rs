@@ -25,19 +25,30 @@
 //! # Ok(()) }
 //! ```
 //!
+//! It also runs official DuckLake's inlined-data flush,
+//! `CALL ducklake_flush_inlined_data('lake' [, schema_name => 's'] [, table_name => 't'])`,
+//! on `catalog` when the statement is executed, and returns the flush's result
+//! rows (`schema_name`, `table_name`, `rows_flushed`); see
+//! [`DuckLakeCatalog::flush_inlined_data`]. The catalog name the call passes,
+//! matched case-insensitively as DuckDB matches it, must name `catalog` as
+//! registered in the session; the function name may be qualified only as
+//! DuckDB resolves it (`main.`, `system.` or `system.main.`).
+//!
 //! Supported partition transforms: `identity` (a bare column), `year`, `month`,
 //! `day`, `hour`. Supported sort keys: bare columns only (`SORTED BY (a, b DESC)`),
 //! each with optional `ASC`/`DESC` and `NULLS FIRST`/`NULLS LAST`. Anything else
 //! fails closed.
+
+use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::LogicalPlanBuilder;
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{
     CommentObject, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    ObjectName, Statement,
+    ObjectName, Statement, Value,
 };
-use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::dialect::{DuckDbDialect, GenericDialect};
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::{Parser, ParserError};
 use datafusion::sql::sqlparser::tokenizer::Token;
@@ -53,7 +64,9 @@ use crate::sort::{NullOrder, SortDirection, SortField};
 ///
 /// For a recognized statement this resolves the target through `catalog`'s
 /// provider/writer, applies the change, and returns an empty result set matching
-/// DataFusion's own DDL. Callers can route all their SQL through it.
+/// DataFusion's own DDL; `CALL ducklake_flush_inlined_data(...)` flushes before
+/// returning and returns the flush's result rows. Callers can route all their
+/// SQL through it.
 ///
 /// The DDL targets `catalog` (the 1–3 part table name's catalog segment, if any,
 /// is not cross-checked); a read-only catalog yields a clear error.
@@ -62,10 +75,191 @@ pub async fn execute_ducklake_sql(
     catalog: &DuckLakeCatalog,
     sql: &str,
 ) -> DataFusionResult<DataFrame> {
+    if let Some(call) = parse_flush_inlined_data_call(sql)? {
+        return flush_inlined_data_call(ctx, catalog, call).await;
+    }
     match parse_ducklake_ddl(sql)? {
         Some(ddl) => apply_ducklake_ddl(ctx, catalog, ddl).await,
         None => ctx.sql(sql).await,
     }
+}
+
+/// A `CALL ducklake_flush_inlined_data(...)` statement.
+#[derive(Debug, PartialEq, Eq)]
+struct FlushInlinedDataCall {
+    catalog: String,
+    schema_name: Option<String>,
+    table_name: Option<String>,
+}
+
+/// Recognize `CALL ducklake_flush_inlined_data('catalog' [, schema_name => 's']
+/// [, table_name => 't'])`, official DuckLake's signature (`:=` is accepted for
+/// `=>`). `Ok(None)` for any other statement.
+fn parse_flush_inlined_data_call(sql: &str) -> DataFusionResult<Option<FlushInlinedDataCall>> {
+    // The parser skips leading whitespace and comments, as the other hooks do.
+    let is_call = Parser::new(&DuckDbDialect {})
+        .try_with_sql(sql)
+        .is_ok_and(|mut parser| parser.parse_keyword(Keyword::CALL));
+    if !is_call {
+        return Ok(None);
+    }
+    let Ok(mut statements) = Parser::parse_sql(&DuckDbDialect {}, sql) else {
+        return Ok(None);
+    };
+    if statements.len() != 1 {
+        return Ok(None);
+    }
+    let Statement::Call(function) = statements.pop().expect("one statement checked above") else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = function
+        .name
+        .0
+        .iter()
+        .filter_map(|part| part.as_ident())
+        .map(|ident| ident.value.as_str())
+        .collect();
+    let Some((name, qualifier)) = parts.split_last() else {
+        return Ok(None);
+    };
+    if !name.eq_ignore_ascii_case("ducklake_flush_inlined_data") {
+        return Ok(None);
+    }
+    // DuckDB finds the function in the `system` catalog's `main` schema.
+    let qualifier: Vec<String> = qualifier.iter().map(|q| q.to_ascii_lowercase()).collect();
+    let resolvable = matches!(
+        qualifier
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [] | ["main"] | ["system"] | ["system", "main"]
+    );
+    if !resolvable || parts.len() != function.name.0.len() {
+        return Err(DataFusionError::Plan(
+            "Catalog Error: Table Function with name \"ducklake_flush_inlined_data\" is not in \
+             the catalog, but it exists in the ducklake extension."
+                .to_string(),
+        ));
+    }
+    let string_arg = |arg: &FunctionArgExpr, what: &str| match arg {
+        FunctionArgExpr::Expr(Expr::Value(value)) => match &value.value {
+            Value::SingleQuotedString(text) => Ok(text.clone()),
+            _ => Err(DataFusionError::Plan(format!(
+                "ducklake_flush_inlined_data: {what} must be a string literal"
+            ))),
+        },
+        _ => Err(DataFusionError::Plan(format!(
+            "ducklake_flush_inlined_data: {what} must be a string literal"
+        ))),
+    };
+    let args = match &function.args {
+        FunctionArguments::List(list) => list.args.as_slice(),
+        _ => &[],
+    };
+    let mut catalog = None;
+    let mut schema_name = None;
+    let mut table_name = None;
+    for arg in args {
+        match arg {
+            FunctionArg::Unnamed(value) => {
+                if catalog.is_some() {
+                    return Err(DataFusionError::Plan(
+                        "ducklake_flush_inlined_data takes one positional argument, the \
+                         catalog name"
+                            .to_string(),
+                    ));
+                }
+                catalog = Some(string_arg(value, "the catalog name")?);
+            },
+            FunctionArg::Named {
+                name,
+                arg,
+                ..
+            } => match name.value.to_ascii_lowercase().as_str() {
+                "schema_name" => schema_name = Some(string_arg(arg, "schema_name")?),
+                "table_name" => table_name = Some(string_arg(arg, "table_name")?),
+                other => {
+                    return Err(DataFusionError::Plan(format!(
+                        "ducklake_flush_inlined_data: unknown parameter '{other}'"
+                    )));
+                },
+            },
+            FunctionArg::ExprNamed {
+                ..
+            } => {
+                return Err(DataFusionError::Plan(
+                    "ducklake_flush_inlined_data: unsupported argument".to_string(),
+                ));
+            },
+        }
+    }
+    let catalog = catalog.ok_or_else(|| {
+        DataFusionError::Plan("ducklake_flush_inlined_data requires the catalog name".to_string())
+    })?;
+    Ok(Some(FlushInlinedDataCall {
+        catalog,
+        schema_name,
+        table_name,
+    }))
+}
+
+/// Run the flush on `catalog` now, once, and return its result rows. The named
+/// catalog must be `catalog` as registered in `ctx`: official errors on a
+/// catalog it does not know.
+async fn flush_inlined_data_call(
+    ctx: &SessionContext,
+    catalog: &DuckLakeCatalog,
+    call: FlushInlinedDataCall,
+) -> DataFusionResult<DataFrame> {
+    // DuckDB matches a database name case-insensitively.
+    let name = ctx
+        .catalog_names()
+        .into_iter()
+        .find(|name| name.eq_ignore_ascii_case(&call.catalog))
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Binder Error: Failed to find attached database \"{}\"",
+                call.catalog
+            ))
+        })?;
+    let registered = ctx.catalog(&name).ok_or_else(|| {
+        DataFusionError::Plan(format!(
+            "Binder Error: Failed to find attached database \"{}\"",
+            call.catalog
+        ))
+    })?;
+    let same = registered
+        .downcast_ref::<DuckLakeCatalog>()
+        .is_some_and(|named| Arc::ptr_eq(&named.provider(), &catalog.provider()));
+    if !same {
+        return Err(DataFusionError::Plan(format!(
+            "ducklake_flush_inlined_data: catalog '{}' is not the DuckLake catalog this \
+             statement runs against",
+            call.catalog
+        )));
+    }
+    let state = ctx.state();
+    let flushed = catalog
+        .flush_inlined_data(
+            &state,
+            call.schema_name.as_deref(),
+            call.table_name.as_deref(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::DuckLakeError::SchemaNotFound(schema) => DataFusionError::Plan(format!(
+                "Binder Error: Schema \"{schema}\" not found in DuckLakeCatalog \"{name}\""
+            )),
+            crate::DuckLakeError::TableNotFound(_) => DataFusionError::Plan(format!(
+                "Catalog Error: Table with name {} does not exist!",
+                call.table_name.as_deref().unwrap_or_default()
+            )),
+            error => error.into(),
+        })?;
+    ctx.read_batch(crate::inlined_flush::flushed_inlined_tables_batch(
+        &flushed,
+    )?)
 }
 
 /// The DuckLake metadata and data-layout DDL statements this module recognizes.
@@ -556,16 +750,18 @@ async fn apply_ducklake_ddl(
             transforms,
             ..
         } => {
-            writer
-                .set_partition_spec(table.table_id, &transforms)
-                .map_err(DataFusionError::from)?;
+            crate::metadata_writer::with_inlining_limit(catalog.data_inlining_row_limit(), || {
+                writer.set_partition_spec(table.table_id, &transforms)
+            })
+            .map_err(DataFusionError::from)?;
         },
         DuckLakeDdl::ResetPartition {
             ..
         } => {
-            writer
-                .reset_partition_spec(table.table_id)
-                .map_err(DataFusionError::from)?;
+            crate::metadata_writer::with_inlining_limit(catalog.data_inlining_row_limit(), || {
+                writer.reset_partition_spec(table.table_id)
+            })
+            .map_err(DataFusionError::from)?;
         },
         DuckLakeDdl::SetSort {
             fields,
@@ -586,4 +782,58 @@ async fn apply_ducklake_ddl(
 
     // DDL returns an empty (0-row) result, matching DataFusion's own DDL.
     empty_dataframe(ctx)
+}
+
+#[cfg(test)]
+mod flush_call_tests {
+    use super::*;
+
+    fn call(
+        catalog: &str,
+        schema_name: Option<&str>,
+        table_name: Option<&str>,
+    ) -> Option<FlushInlinedDataCall> {
+        Some(FlushInlinedDataCall {
+            catalog: catalog.to_string(),
+            schema_name: schema_name.map(str::to_string),
+            table_name: table_name.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn parses_official_signature() {
+        let parse = |sql| parse_flush_inlined_data_call(sql).unwrap();
+        assert_eq!(
+            parse("CALL ducklake_flush_inlined_data('lake')"),
+            call("lake", None, None)
+        );
+        assert_eq!(
+            parse("call DuckLake_Flush_Inlined_Data('lake', table_name => 't');"),
+            call("lake", None, Some("t"))
+        );
+        assert_eq!(
+            parse(
+                "CALL ducklake_flush_inlined_data('lake', schema_name := 's', table_name => 't')"
+            ),
+            call("lake", Some("s"), Some("t"))
+        );
+        assert_eq!(
+            parse("-- flush\n  /* all */ CALL ducklake_flush_inlined_data('lake')"),
+            call("lake", None, None)
+        );
+        assert_eq!(parse("CALL other_procedure('lake')"), None);
+        assert_eq!(parse("SELECT 1"), None);
+    }
+
+    #[test]
+    fn rejects_malformed_arguments() {
+        for sql in [
+            "CALL ducklake_flush_inlined_data()",
+            "CALL ducklake_flush_inlined_data('a', 'b')",
+            "CALL ducklake_flush_inlined_data(lake)",
+            "CALL ducklake_flush_inlined_data('lake', table => 't')",
+        ] {
+            assert!(parse_flush_inlined_data_call(sql).is_err(), "{sql}");
+        }
+    }
 }

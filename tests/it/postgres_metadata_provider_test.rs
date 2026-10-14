@@ -1674,18 +1674,14 @@ async fn test_temporal_filter_prunes_the_same_without_soft_input_validation() {
     assert_eq!(listed_ids(&filtered), vec![2, 3, 4, 5]);
 }
 
-/// A temporal constant is never resolved by PostgreSQL, so one its input
-/// function refuses cannot abort the listing.
+/// A temporal constant is never resolved by PostgreSQL, so one outside the
+/// fixed-width four-digit-year encoding cannot abort the listing: it is
+/// declined, which prunes nothing.
 ///
 /// A cast would resolve it: the constant is spliced in as a literal on the other
 /// side of the comparison, and the server reads it against the cast target
-/// before any row is examined, so an unreadable one turns a scan that planned
-/// fine without pushdown into a hard failure. Comparing the encoded text instead
-/// removes that failure mode entirely — and it makes year zero, which
-/// PostgreSQL's calendar does not have, an ordinary comparison rather than
-/// something to decline.
-///
-/// What still declines is an encoding whose bytes do not order chronologically.
+/// before any row is examined, so an unreadable one would turn a scan that
+/// planned fine without pushdown into a hard failure.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
 async fn test_out_of_range_temporal_constant_does_not_fail_the_listing() {
@@ -1703,43 +1699,27 @@ async fn test_out_of_range_temporal_constant_does_not_fail_the_listing() {
             .expect("a constant PostgreSQL cannot read must not fail the listing")
     };
 
-    // Year zero: `0000-01-01 00:00:00`. Four digits and no sign, so it orders as
-    // text like any other timestamp — but PostgreSQL's calendar runs 1 BC
-    // straight into 1 AD, so casting it raises `date/time field value out of
-    // range`. Proof that this is a constant PostgreSQL refuses, and that it
-    // refuses it while *parsing*: `WHERE false AND ...` reads no row and the
-    // statement still fails.
+    // Year zero is 1 BC, which DuckDB spells `0001-01-01 (BC) 00:00:00`: not the
+    // fixed-width shape, so the comparison is declined and prunes nothing.
     let year_zero = -62_167_219_200_000_000i64;
-    let encoded = datafusion_ducklake::stats_encode::encode_scalar(
-        &datafusion::common::ScalarValue::TimestampMicrosecond(Some(year_zero), None),
-    )
-    .expect("the constant has a canonical encoding");
-    let refused: Result<i64, sqlx::Error> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*) FROM ducklake_file_column_stats
-         WHERE false AND CAST(min_value AS timestamp) < '{encoded}'"
-    )))
-    .fetch_one(&provider.pool)
-    .await;
-    assert!(
-        refused.is_err(),
-        "PostgreSQL must refuse the constant {encoded} in a cast, or this test proves nothing"
+    assert_eq!(
+        datafusion_ducklake::stats_encode::encode_scalar(
+            &datafusion::common::ScalarValue::TimestampMicrosecond(Some(year_zero), None),
+        )
+        .as_deref(),
+        Some("0001-01-01 (BC) 00:00:00")
     );
-
-    // Compared as text it prunes normally: files 1 and 2 carry real bounds that
-    // cannot be below year zero, and 3 to 5 have no usable statistics, so the
-    // guards keep them.
     assert_eq!(
         listed_ids(&listing_for(year_zero)),
-        vec![3, 4, 5],
-        "year zero is a comparison like any other once nothing is cast"
+        vec![1, 2, 3, 4, 5],
+        "a year before the common era does not order as text, so it is declined"
     );
 
-    // A year past 9999, which chrono renders with an explicit `+`. That sorts
-    // below every digit, so as text it would order *before* every ordinary
-    // timestamp — the comparison is declined and prunes nothing.
+    // A year past 9999 has a fifth digit, so as text it would order before
+    // every ordinary timestamp: the comparison is declined too.
     assert_eq!(
         listed_ids(&listing_for(400_000_000_000_000_000i64)),
         vec![1, 2, 3, 4, 5],
-        "a sign-prefixed year does not order as text, so it is declined"
+        "a five-digit year does not order as text, so it is declined"
     );
 }

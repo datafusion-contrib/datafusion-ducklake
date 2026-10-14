@@ -146,6 +146,31 @@ impl DuckLakeSchema {
 }
 
 impl DuckLakeSchema {
+    /// The write options of table `table_id` of this schema (or of a new
+    /// table, for `None`): its stored settings with the catalog's
+    /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options)
+    /// over them, except that a stored `data_inlining_row_limit` (table,
+    /// schema or catalog-wide) outranks the options' one, as official's stored
+    /// settings outrank its `DATA_INLINING_ROW_LIMIT` attach option.
+    #[cfg(feature = "write")]
+    fn table_write_options(
+        &self,
+        table_id: Option<i64>,
+    ) -> DataFusionResult<crate::table_writer::DuckLakeWriteOptions> {
+        let settings = self
+            .provider
+            .get_metadata_settings(Some(self.schema_id), table_id)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let stored =
+            crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings);
+        let stored_limit = stored.data_inlining_row_limit;
+        let mut options = stored.with_overrides(&self.write_options);
+        if settings.contains_key("data_inlining_row_limit") {
+            options.data_inlining_row_limit = stored_limit;
+        }
+        Ok(options)
+    }
+
     fn resolve_snapshot(&self) -> DataFusionResult<i64> {
         self.snapshot
             .resolve(self.provider.as_ref())
@@ -176,15 +201,7 @@ impl DuckLakeSchema {
         // Configure writer if this schema is writable
         #[cfg(feature = "write")]
         let table = if let Some(writer) = self.writer.as_ref() {
-            let settings = self
-                .provider
-                .get_metadata_settings(Some(self.schema_id), Some(meta.table_id))
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let options =
-                crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(
-                    &settings,
-                )
-                .with_overrides(&self.write_options);
+            let options = self.table_write_options(Some(meta.table_id))?;
             table
                 .with_writer(self.schema_name.clone(), Arc::clone(writer))
                 .with_write_options(options)
@@ -415,16 +432,39 @@ impl SchemaProvider for DuckLakeSchema {
             })
             .collect::<DataFusionResult<Vec<_>>>()?;
 
+        // Official refuses a column named like an inlined data table's system
+        // column while inlining is enabled.
+        let inlining = self
+            .table_write_options(None)?
+            .data_inlining_row_limit
+            .unwrap_or(0);
+        if inlining > 0 {
+            let names = columns
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect::<Vec<_>>();
+            if let Some(column) = writer
+                .reserved_inlining_column(&names)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?
+            {
+                return Err(DataFusionError::External(Box::new(
+                    crate::metadata_writer::reserved_inlining_column_error(&column),
+                )));
+            }
+        }
+
         // Create table in metadata (creates snapshot, table, columns in a transaction)
-        let setup = writer
-            .begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let inlining_limit = self.write_options.data_inlining_row_limit;
+        let setup = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
+            writer.begin_write_transaction(&self.schema_name, &name, &columns, WriteMode::Replace)
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // CREATE TABLE registers no data file, so publish the head here; without
         // this the new (empty) table never becomes visible on multicatalog
         // backends that defer the head advance out of begin_write_transaction.
-        let committed = writer
-            .publish_snapshot(
+        let committed = crate::metadata_writer::with_inlining_limit(inlining_limit, || {
+            writer.publish_snapshot(
                 setup.table_id,
                 &self.schema_name,
                 &name,
@@ -434,7 +474,8 @@ impl SchemaProvider for DuckLakeSchema {
                 &columns,
                 &setup.field_ids,
             )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Resolve table path
         let table_path = resolve_path(&self.schema_path, &name, true)
@@ -443,13 +484,7 @@ impl SchemaProvider for DuckLakeSchema {
         // Build the table provider from the COMMITTED ids/snapshot (the begin-time
         // `setup.snapshot_id` is vestigial on the commit-time path; the real
         // snapshot is assigned at commit).
-        let settings = self
-            .provider
-            .get_metadata_settings(Some(self.schema_id), Some(committed.table_id))
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let options =
-            crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings)
-                .with_overrides(&self.write_options);
+        let options = self.table_write_options(Some(committed.table_id))?;
         let writable_table = DuckLakeTable::new(
             committed.table_id,
             name,

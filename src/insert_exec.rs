@@ -56,6 +56,9 @@ pub struct DuckLakeInsertExec {
     /// spec). Declared via `required_input_ordering` so DataFusion's EnforceSorting
     /// keeps the input sorted instead of pruning the SortExec as unused.
     required_ordering: Option<datafusion::physical_expr::LexOrdering>,
+    /// The snapshot the statement was planned at; changes committed since it
+    /// conflict with the insert, as official checks its insert.
+    planned_snapshot: Option<i64>,
     cache: Arc<PlanProperties>,
 }
 
@@ -86,8 +89,21 @@ impl DuckLakeInsertExec {
             partition,
             write_options,
             required_ordering,
+            planned_snapshot: None,
             cache,
         }
+    }
+
+    fn with_planned_snapshot_opt(mut self, snapshot_id: Option<i64>) -> Self {
+        self.planned_snapshot = snapshot_id;
+        self
+    }
+
+    /// Check the insert against the changes committed since `snapshot_id`,
+    /// the snapshot the statement was planned at.
+    pub(crate) fn with_planned_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.planned_snapshot = Some(snapshot_id);
+        self
     }
 
     fn compute_properties() -> Arc<PlanProperties> {
@@ -178,18 +194,21 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 "DuckLakeInsertExec requires exactly one child".to_string(),
             ));
         }
-        Ok(Arc::new(Self::new(
-            Arc::clone(&children[0]),
-            Arc::clone(&self.writer),
-            self.schema_name.clone(),
-            self.table_name.clone(),
-            Arc::clone(&self.arrow_schema),
-            self.write_mode,
-            self.object_store_url.clone(),
-            self.partition.clone(),
-            self.write_options.clone(),
-            self.required_ordering.clone(),
-        )))
+        Ok(Arc::new(
+            Self::new(
+                Arc::clone(&children[0]),
+                Arc::clone(&self.writer),
+                self.schema_name.clone(),
+                self.table_name.clone(),
+                Arc::clone(&self.arrow_schema),
+                self.write_mode,
+                self.object_store_url.clone(),
+                self.partition.clone(),
+                self.write_options.clone(),
+                self.required_ordering.clone(),
+            )
+            .with_planned_snapshot_opt(self.planned_snapshot),
+        ))
     }
 
     fn execute(
@@ -213,6 +232,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let object_store_url = self.object_store_url.clone();
         let partition = self.partition.clone();
         let write_options = self.write_options.clone();
+        let planned_snapshot = self.planned_snapshot;
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -234,9 +254,12 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 .runtime_env()
                 .object_store(object_store_url.as_ref())?;
 
-            let table_writer = DuckLakeTableWriter::new(writer, object_store)
+            let mut table_writer = DuckLakeTableWriter::new(writer, object_store)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?
                 .with_options(&write_options);
+            if let Some(snapshot_id) = planned_snapshot {
+                table_writer = table_writer.with_planned_base_snapshot(snapshot_id);
+            }
 
             let schema_without_metadata =
                 Schema::new(arrow_schema.fields().iter().cloned().collect::<Vec<_>>());
@@ -255,9 +278,9 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 )
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
                 if !groups.is_empty() {
-                    let key_names: Vec<String> = spec.keys.iter().map(|k| k.name.clone()).collect();
+                    let key_names = spec.key_names();
                     let result = table_writer
-                        .write_partitioned(
+                        .write_partition_groups_inlined_in(
                             &schema_name,
                             &table_name,
                             &schema_without_metadata,
@@ -265,6 +288,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                             spec.partition_id,
                             &key_names,
                             groups,
+                            &crate::table_writer::TableWriteOptions::new(),
+                            Some(batches.clone()),
                         )
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;

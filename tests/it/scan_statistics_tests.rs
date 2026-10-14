@@ -637,6 +637,10 @@ async fn a_shared_delete_file_is_counted_once_per_data_file_as_official_does() {
     let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
         .await
         .unwrap();
+    // The DELETE writes a delete file rather than an inlined deletion.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
         .await
         .unwrap();

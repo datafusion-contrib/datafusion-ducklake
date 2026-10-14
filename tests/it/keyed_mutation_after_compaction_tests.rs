@@ -141,6 +141,11 @@ async fn opt_i64(p: &SqlitePool, sql: &str) -> Option<i64> {
 /// A fresh catalog is opened per call so each statement sees the latest head.
 async fn run_dml(temp: &TempDir, sql: &str) -> u64 {
     let writer = SqliteMetadataWriter::new(&db_url(temp)).await.unwrap();
+    // These tests pin the positions written to delete files, so no deletion
+    // or new row version is inlined.
+    writer
+        .set_global_setting("data_inlining_row_limit", "0")
+        .unwrap();
     let provider = SqliteMetadataProvider::new(&db_url(temp)).await.unwrap();
     let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
     let ctx = SessionContext::new();

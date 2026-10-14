@@ -345,7 +345,10 @@ fn parse_cdc_args(
     let fields = provider
         .get_table_fields(table.table_id, end_snapshot)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-    let columns = crate::types::top_level_columns(&fields)
+    // The full column records: a row written before a column was added reads
+    // that column's `initial_default`, which the field list does not carry.
+    let columns = provider
+        .get_table_structure(table.table_id, end_snapshot)
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
     let table_schema = Arc::new(
         crate::types::build_arrow_schema_from_fields(&fields)
@@ -483,6 +486,25 @@ pub fn register_ducklake_functions(
     ctx.register_udtf(
         "ducklake_table_deletions",
         Arc::new(DucklakeTableDeletionsFunction::new(provider.clone())),
+    );
+}
+
+/// Registers the ducklake_*() table functions that write to a catalog:
+/// `ducklake_flush_inlined_data`.
+///
+/// Opt-in, and separate from [`register_ducklake_functions`], because these
+/// functions commit catalog changes from a `SELECT`: a session built with
+/// `SQLOptions::with_allow_dml(false)` still runs them, since DataFusion
+/// treats a table function as a read. Register them only in sessions whose SQL
+/// may change the catalog. The `CALL ducklake_flush_inlined_data(...)` form
+/// through [`crate::execute_ducklake_sql`] needs no registration.
+#[cfg(feature = "write")]
+pub fn register_ducklake_maintenance_functions(
+    ctx: &datafusion::execution::context::SessionContext,
+) {
+    ctx.register_udtf(
+        "ducklake_flush_inlined_data",
+        Arc::new(crate::inlined_flush::DucklakeFlushInlinedDataFunction),
     );
 }
 

@@ -397,14 +397,12 @@ async fn resolve_write_and_apply_positional_delete() {
     );
 }
 
-/// Fence: a concurrent APPEND that adds an unrelated data file must NOT
-/// block a positional delete on a still-live data file. The resolved positions
-/// are physical row indices in the target file, which an append never moves, so
-/// the delete commits even against a pre-append `base_snapshot` and both files
-/// coexist. (The old table-wide fence rejected this; the target-file fence does
-/// not.)
+/// A concurrent APPEND refuses a positional delete committed against a
+/// pre-append `base_snapshot`, as official DuckLake's conflict check refuses a
+/// delete from a table another transaction inserted into
+/// (`CheckForConflicts`), even though the append only added another file.
 #[tokio::test(flavor = "multi_thread")]
-async fn set_delete_file_allows_concurrent_append_to_other_file() {
+async fn set_delete_file_refuses_concurrent_append() {
     let temp_dir = TempDir::new().unwrap();
     let writer = Arc::new(create_writer(&temp_dir).await);
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
@@ -466,18 +464,23 @@ async fn set_delete_file_allows_concurrent_append_to_other_file() {
     );
 
     // Delete positions {1,3} (ids 2,4) on the ORIGINAL file, committing against
-    // the pre-append `base`. Must succeed despite the intervening append.
+    // the pre-append `base`: the intervening insert refuses it.
     let del = temp_dir.path().join("delete_append.parquet");
     let size = write_delete_parquet(&del, &data_file_path, &[1, 3]);
     let info = DeleteFileInfo::new(del.to_string_lossy().to_string(), size, 2).with_absolute_path();
-    writer
+    let error = writer
         .set_delete_file(table_id, "main", "t", base, data_file_id, None, base, &info)
-        .expect("append to an unrelated file must not block the delete");
+        .expect_err("a concurrent insert refuses the delete");
+    assert!(
+        matches!(&error, datafusion_ducklake::DuckLakeError::Conflict(message)
+            if message.contains("but another transaction has inserted into it")),
+        "{error}"
+    );
 
     assert_eq!(
         read_ids(&temp_dir).await,
-        vec![1, 3, 5, 6],
-        "positions 1,3 deleted from the original file; appended rows untouched"
+        vec![1, 2, 3, 4, 5, 6],
+        "the refused delete removed nothing"
     );
 }
 
