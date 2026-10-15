@@ -60,32 +60,53 @@ use crate::stats_filter::StatsFilter;
 /// (the newest snapshot id) before it serves them. It is correct only while
 /// these facts hold:
 ///
-/// 1. Every commit that changes what a scan reads also moves the head. An
-///    insert, a delete, an update, a merge of adjacent files, a rewrite of data
-///    files and a flush of inlined data each commit a new snapshot, in official
-///    DuckLake and in this crate. The merge, the rewrite and the flush also
-///    change the listing of older snapshots. A writer that changes the catalog
-///    tables without a new snapshot breaks the memo.
+/// 1. Every commit that changes what a scan reads also moves the head. SQL
+///    writes (insert, delete, update) and the maintenance calls (merge adjacent
+///    files, rewrite data files, flush inlined data) each commit a new snapshot
+///    together with their changes, in official DuckLake and in this crate. The
+///    merge, the rewrite and the flush also change the listing of older
+///    snapshots.
+///
+///    The low-level [`MetadataWriter`](crate::metadata_writer::MetadataWriter)
+///    API does not keep this fact. `create_snapshot` moves the head, and later
+///    calls such as `register_data_file` or `end_table_files` change the
+///    catalog at that snapshot without moving the head again. A memo filled
+///    between them misses those changes until the next commit. Any other writer
+///    that changes the catalog tables without a new snapshot breaks the memo in
+///    the same way.
 /// 2. Snapshot ids only grow. A bind that reads a newer head drops every
 ///    entry, because no entry can serve that head.
 /// 3. Expiring snapshots and cleaning up old files commit no snapshot, so they
-///    do not move the head. A memo entry of an expired snapshot keeps the files
-///    of its fill, and a read fails once cleanup deletes them. Official DuckLake
-///    refuses a read at an expired snapshot ("No snapshot found"). Entries of
-///    the head snapshot cannot be affected, because the head cannot expire.
-/// 4. A key is a table id and a snapshot id, so one memo serves one catalog.
+///    do not move the head. Official DuckLake refuses a read at an expired
+///    snapshot ("No snapshot found"). Without a memo, this crate returns no rows
+///    for it. With a memo, a kept entry of the expired snapshot returns the old
+///    rows until cleanup deletes their files, and then the read fails. Entries
+///    of the head snapshot are safe, because the head cannot expire.
+/// 4. A key is a table id and a snapshot id, with no catalog identity. Use one
+///    memo per catalog. A catalog that is restored to an older head and then
+///    committed up to the same snapshot id again gets the old entries.
 ///
 /// # Consistency
 ///
-/// A fill reads all of a table's scan-time reads together: the listing, the
-/// inlined deletions and the inlined rows, with and without row ids. Every
-/// served call of the table takes its answer from one fill. The reads are separate statements, so a
-/// commit between two of them can split them: a flush can move a row from the
-/// inlined rows into a file between the two reads. The memo keeps a fill only
-/// when the head after the fill is still the head that the bind read. So
-/// every kept fill shows the catalog at that one head. A fill during which the
-/// head moved serves its own query and is not kept, which is the risk that
-/// every scan without a memo takes too.
+/// A query uses one set of reads for each table. The first call of the query
+/// for a table picks them, and every later call of that query, from any of its
+/// scans, uses the same reads.
+///
+/// A fill reads in the order of a scan without a memo: the inlined deletions,
+/// then the listing, then the inlined rows. The reads are separate statements,
+/// so a commit between two of them can split them. The memo keeps a fill only
+/// when the head after the fill is still the head that the bind read. So every
+/// kept fill shows the catalog at that one head. A query whose own fill a
+/// commit split uses a fill that another query kept at its head, when there is
+/// one. Otherwise it uses its own fill, which then has the same split as a scan
+/// without a memo.
+///
+/// # One bound provider per query
+///
+/// A bound provider keeps the reads that it picked, and checks nothing after
+/// its bind. A provider kept past its query serves old reads, and the reads
+/// that only it uses have no budget. Bind again for each query. A catalog over
+/// a bound provider must also be built for each query.
 ///
 /// # What the bound provider serves
 ///
@@ -102,7 +123,8 @@ use crate::stats_filter::StatsFilter;
 ///
 /// Every other method, `get_current_snapshot` included, goes to the wrapped
 /// provider. A write must act on the current layout, so give a bound provider
-/// to read-only tables only.
+/// to read-only tables only. Nothing stops `DuckLakeCatalog::with_writer` from
+/// taking one.
 ///
 /// # Cost
 ///
@@ -110,17 +132,21 @@ use crate::stats_filter::StatsFilter;
 /// scan without a memo does: the whole listing without the scan's filters, the
 /// table's columns, the inlined rows with their row ids (unless the provider
 /// showed that there are none), and the head after the fill. A commit to any
-/// table of the catalog moves the head and empties the memo. On a catalog that commits
-/// between most queries, the memo costs more than it saves.
+/// table of the catalog moves the head and empties the memo. On a catalog that
+/// commits between most queries, the memo costs more than it saves.
 ///
 /// # Budget
 ///
 /// [`Self::new`] takes the bytes the memo can keep, for all of its tables
-/// together. Byte counts are estimates of the heap memory held. A table whose
-/// reads do not fit the whole budget is not memoized: its scans read the
-/// catalog, as without a memo, and the memo does not try to fill it again. A
-/// table whose reads fit the budget, but not what is left of it, is read
-/// again by each query until a newer head empties the memo.
+/// together. Byte counts are estimates of the heap memory held.
+///
+/// - A table whose reads do not fit the whole budget is not memoized. Its
+///   scans read the catalog, as without a memo, and this memo does not fill
+///   that table again, at any snapshot.
+/// - A table whose reads fit the budget, but not what is left of it, uses its
+///   fill for the query that read it. Later queries at the same head read the
+///   catalog for it, as without a memo. A newer head empties the memo, and the
+///   table can then fill again.
 pub struct CatalogReadMemo {
     max_bytes: usize,
     state: Mutex<MemoState>,
@@ -135,26 +161,28 @@ struct MemoState {
     head: Option<i64>,
     bytes: usize,
     tables: HashMap<TableKey, Arc<TableReads>>,
-    /// Tables whose reads did not fit the whole budget.
-    too_large: HashSet<TableKey>,
+    /// Tables whose fill at this head did not fit what was left of the budget.
+    no_room: HashSet<TableKey>,
+    /// Tables, by id, whose reads did not fit the whole budget.
+    too_large: HashSet<i64>,
 }
 
 /// The catalog reads of one table at one snapshot, read together.
 struct TableReads {
+    inlined_deletes: Vec<DuckLakeInlinedDelete>,
     /// The whole listing, ordered by data file id.
     listing: Vec<DuckLakeFileMetadata>,
-    inlined_deletes: Vec<DuckLakeInlinedDelete>,
     /// The columns the inlined rows were read in.
     columns: Vec<DuckLakeTableColumn>,
     /// Every visible inlined row, unfiltered.
     inlined_rows: Vec<RecordBatch>,
+    /// What the provider said about inlined rows through this snapshot (see
+    /// [`MetadataProvider::scan_inlined_data_noting_absence`]).
+    inlined_absent_through: Option<i64>,
     /// The same rows with their row ids, as `read_inlined_rows` reads them at
     /// this snapshot. `None` when the provider could not read them: a `rowid`
     /// scan then reads the catalog.
     visible_rows: Option<Vec<DuckLakeInlinedRows>>,
-    /// What the provider said about inlined rows through this snapshot (see
-    /// [`MetadataProvider::scan_inlined_data_noting_absence`]).
-    inlined_absent_through: Option<i64>,
 }
 
 impl CatalogReadMemo {
@@ -176,8 +204,8 @@ impl CatalogReadMemo {
     ///
     /// This reads the catalog head once, through `provider`. A head newer than
     /// the memo's drops every entry. Bind once per query, not once for many
-    /// queries: the bound provider checks its entries against this head only.
-    /// `provider` must read the catalog this memo serves.
+    /// queries: see [`CatalogReadMemo`]. `provider` must read the catalog this
+    /// memo serves.
     pub fn bind(
         self: &Arc<Self>,
         provider: Arc<dyn MetadataProvider>,
@@ -188,6 +216,7 @@ impl CatalogReadMemo {
             if state.head.is_none_or(|kept| kept < head) {
                 state.head = Some(head);
                 state.tables.clear();
+                state.no_room.clear();
                 state.bytes = 0;
             }
         }
@@ -195,7 +224,7 @@ impl CatalogReadMemo {
             memo: Arc::clone(self),
             inner: provider,
             head,
-            own_reads: Mutex::default(),
+            picked: Mutex::default(),
         })
     }
 
@@ -226,8 +255,9 @@ pub struct MemoizedMetadataProvider {
     inner: Arc<dyn MetadataProvider>,
     /// The head the bind read.
     head: i64,
-    /// Fills during which the head moved: they serve this query alone.
-    own_reads: Mutex<HashMap<TableKey, Arc<TableReads>>>,
+    /// The reads this query uses for each table, or `None` where it reads the
+    /// catalog for that table.
+    picked: Mutex<HashMap<TableKey, Option<Arc<TableReads>>>>,
 }
 
 impl fmt::Debug for MemoizedMetadataProvider {
@@ -241,56 +271,79 @@ impl fmt::Debug for MemoizedMetadataProvider {
 }
 
 impl MemoizedMetadataProvider {
-    /// The reads of `table_id` at `snapshot_id`: a fill kept at this query's
-    /// head, else a fill of this query, else a new fill. `None` when they do
-    /// not fit the memo's budget, and the caller reads the catalog itself.
+    /// The reads this query uses for `table_id` at `snapshot_id`, or `None`
+    /// when the query reads the catalog for that table. The first call of the
+    /// query for the table picks them, and later calls get the same answer.
     fn table_reads(&self, table_id: i64, snapshot_id: i64) -> Result<Option<Arc<TableReads>>> {
+        let key = (table_id, snapshot_id);
+        if let Some(picked) = self.picked().get(&key) {
+            return Ok(picked.clone());
+        }
+        let reads = self.pick(table_id, snapshot_id)?;
+        // Two scans of the query can pick at the same time: the first one wins.
+        Ok(self.picked().entry(key).or_insert(reads).clone())
+    }
+
+    /// A fill kept at this query's head, else a new fill, else `None` when the
+    /// table does not fit the memo.
+    fn pick(&self, table_id: i64, snapshot_id: i64) -> Result<Option<Arc<TableReads>>> {
         let key = (table_id, snapshot_id);
         {
             let state = self.memo.lock();
-            if state.too_large.contains(&key) {
+            if state.too_large.contains(&table_id) {
                 return Ok(None);
             }
-            if state.head == Some(self.head)
-                && let Some(reads) = state.tables.get(&key)
-            {
-                return Ok(Some(Arc::clone(reads)));
+            if state.head == Some(self.head) {
+                if let Some(kept) = state.tables.get(&key) {
+                    return Ok(Some(Arc::clone(kept)));
+                }
+                if state.no_room.contains(&key) {
+                    return Ok(None);
+                }
             }
         }
-        if let Some(reads) = self.own_reads().get(&key) {
-            return Ok(Some(Arc::clone(reads)));
-        }
         let Some((reads, bytes)) = self.fill(table_id, snapshot_id)? else {
-            self.memo.lock().too_large.insert(key);
+            self.memo.lock().too_large.insert(table_id);
             return Ok(None);
         };
         let reads = Arc::new(reads);
         // Every commit adds a snapshot, so a head that has not moved since the
         // bind means that no commit landed before the fill ended. A head that
         // cannot be read counts as moved.
-        if self.inner.get_current_snapshot().ok() == Some(self.head) {
-            let mut state = self.memo.lock();
-            if state.head == Some(self.head) {
-                if let Some(kept) = state.tables.get(&key) {
-                    return Ok(Some(Arc::clone(kept)));
-                }
+        let unmoved = self.inner.get_current_snapshot().ok() == Some(self.head);
+        let mut state = self.memo.lock();
+        if state.head == Some(self.head) {
+            // Another query kept a fill at this head while this one read: it
+            // shows the catalog at the head, which this fill may not.
+            if let Some(kept) = state.tables.get(&key) {
+                return Ok(Some(Arc::clone(kept)));
+            }
+            if unmoved {
                 if state.bytes.saturating_add(bytes) <= self.memo.max_bytes {
                     state.bytes += bytes;
                     state.tables.insert(key, Arc::clone(&reads));
-                    return Ok(Some(reads));
+                } else {
+                    state.no_room.insert(key);
                 }
             }
         }
-        self.own_reads().insert(key, Arc::clone(&reads));
         Ok(Some(reads))
     }
 
     /// Read everything a scan of `table_id` at `snapshot_id` reads from the
     /// catalog, without the scan's filters, so that the reads serve any later
     /// scan. `None` once the reads exceed the memo's whole budget.
+    ///
+    /// The reads run in the order of a scan without a memo, so that a commit
+    /// between two of them splits them as it splits such a scan: the inlined
+    /// deletions, then the listing, then the inlined rows.
     fn fill(&self, table_id: i64, snapshot_id: i64) -> Result<Option<(TableReads, usize)>> {
         let max_bytes = self.memo.max_bytes;
-        let mut bytes = 0usize;
+        let inlined_deletes = self.inner.get_inlined_deletes(table_id, snapshot_id)?;
+        let mut bytes = inlined_deletes.len() * size_of::<DuckLakeInlinedDelete>();
+        if bytes > max_bytes {
+            return Ok(None);
+        }
         let mut listing = Vec::new();
         let mut after = None;
         // Page as `DuckLakeTable` does, until a short page.
@@ -323,11 +376,6 @@ impl MemoizedMetadataProvider {
             if short {
                 break;
             }
-        }
-        let inlined_deletes = self.inner.get_inlined_deletes(table_id, snapshot_id)?;
-        bytes = bytes.saturating_add(inlined_deletes.len() * size_of::<DuckLakeInlinedDelete>());
-        if bytes > max_bytes {
-            return Ok(None);
         }
         // `DuckLakeTable` reads its inlined rows in these columns.
         let columns = self.inner.get_table_structure(table_id, snapshot_id)?;
@@ -366,8 +414,8 @@ impl MemoizedMetadataProvider {
         }
         Ok(Some((
             TableReads {
-                listing,
                 inlined_deletes,
+                listing,
                 columns,
                 inlined_rows: inlined.batches,
                 inlined_absent_through,
@@ -377,8 +425,8 @@ impl MemoizedMetadataProvider {
         )))
     }
 
-    fn own_reads(&self) -> MutexGuard<'_, HashMap<TableKey, Arc<TableReads>>> {
-        self.own_reads
+    fn picked(&self) -> MutexGuard<'_, HashMap<TableKey, Option<Arc<TableReads>>>> {
+        self.picked
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -822,6 +870,107 @@ mod tests {
             file,
             column_statistics: Vec::new(),
         }
+    }
+
+    /// A catalog of one table, `1`, at snapshot `1`, whose listing holds
+    /// `files` data files and nothing else.
+    #[derive(Debug)]
+    struct ManyFiles {
+        files: i64,
+    }
+
+    impl MetadataProvider for ManyFiles {
+        fn get_current_snapshot(&self) -> Result<i64> {
+            Ok(1)
+        }
+        fn get_data_path(&self) -> Result<String> {
+            Ok("/data".to_string())
+        }
+        fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
+            unreachable!()
+        }
+        fn list_schemas(&self, _: i64) -> Result<Vec<SchemaMetadata>> {
+            unreachable!()
+        }
+        fn list_tables(&self, _: i64, _: i64) -> Result<Vec<TableMetadata>> {
+            unreachable!()
+        }
+        fn get_table_structure(&self, _: i64, _: i64) -> Result<Vec<DuckLakeTableColumn>> {
+            Ok(Vec::new())
+        }
+        fn get_table_files_for_select(&self, _: i64, _: i64) -> Result<Vec<DuckLakeTableFile>> {
+            unreachable!()
+        }
+        fn get_table_file_metadata_page(
+            &self,
+            _: i64,
+            _: i64,
+            after_data_file_id: Option<i64>,
+            limit: usize,
+        ) -> Result<Vec<DuckLakeFileMetadata>> {
+            let first = after_data_file_id.map_or(1, |after| after + 1);
+            Ok((first..=self.files).take(limit).map(file).collect())
+        }
+        fn get_schema_by_name(&self, _: &str, _: i64) -> Result<Option<SchemaMetadata>> {
+            unreachable!()
+        }
+        fn get_table_by_name(&self, _: i64, _: &str, _: i64) -> Result<Option<TableMetadata>> {
+            unreachable!()
+        }
+        fn table_exists(&self, _: i64, _: &str, _: i64) -> Result<bool> {
+            unreachable!()
+        }
+        fn list_all_tables(&self, _: i64) -> Result<Vec<TableWithSchema>> {
+            unreachable!()
+        }
+        fn list_all_columns(&self, _: i64) -> Result<Vec<ColumnWithTable>> {
+            unreachable!()
+        }
+        fn list_all_files(&self, _: i64) -> Result<Vec<FileWithTable>> {
+            unreachable!()
+        }
+        fn get_data_files_added_between_snapshots(
+            &self,
+            _: i64,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<DataFileChange>> {
+            unreachable!()
+        }
+        fn get_delete_files_added_between_snapshots(
+            &self,
+            _: i64,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<DeleteFileChange>> {
+            unreachable!()
+        }
+    }
+
+    /// The fill pages through a listing of several full pages, and the bound
+    /// provider serves all of it, page by page, as the scan reads it.
+    #[test]
+    fn a_fill_keeps_every_page_of_a_long_listing() {
+        let files = 2 * FILE_METADATA_BATCH_SIZE as i64 + 5;
+        let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+        let bound = memo
+            .bind(Arc::new(ManyFiles {
+                files,
+            }))
+            .unwrap();
+        let mut ids = Vec::new();
+        let mut after = None;
+        loop {
+            let page = bound
+                .get_table_file_metadata_page_filtered(1, 1, after, FILE_METADATA_BATCH_SIZE, None)
+                .unwrap();
+            ids.extend(page.iter().map(|metadata| metadata.file.data_file_id));
+            if page.len() < FILE_METADATA_BATCH_SIZE {
+                break;
+            }
+            after = ids.last().copied();
+        }
+        assert_eq!(ids, (1..=files).collect::<Vec<_>>());
     }
 
     #[test]

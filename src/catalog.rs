@@ -232,9 +232,13 @@ impl DuckLakeCatalog {
     /// Set how each table of this catalog reuses what its scans read. By
     /// default every scan reads again each delete file it reaches; see
     /// [`DuckLakeReadOptions`] for the memo it can keep instead. Tables behind
-    /// a view get the same options. To keep a scan's catalog reads across
-    /// queries, build the catalog over a provider from
-    /// [`crate::CatalogReadMemo::bind`].
+    /// a view get the same options.
+    ///
+    /// Each table that a lookup builds starts with an empty memo, and DataFusion
+    /// looks a table up again for each statement. So the memo helps only a
+    /// caller that keeps the table it took from this catalog. To keep a scan's
+    /// catalog reads across queries, build the catalog for each query over a
+    /// provider from [`crate::CatalogReadMemo::bind`].
     pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
         self.read_options = options;
         self

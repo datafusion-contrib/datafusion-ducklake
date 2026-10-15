@@ -67,7 +67,8 @@ The codebase follows a layered architecture with clear separation of concerns:
      query. It returns a `MemoizedMetadataProvider`, which serves those reads while the head stays the same
      and forwards every other call. **This is not DuckLake behavior**: official lists a scan's files in
      every transaction. The memo is correct only because every commit that changes a listing (insert,
-     delete, update, merge, rewrite, flush) moves the head. Expire and cleanup do not move it. `scan()` has
+     delete, update, merge, rewrite, flush) moves the head. Expire, cleanup and the low-level
+     `MetadataWriter` calls after `create_snapshot` do not move it. `scan()` has
      no memo code. Keep it that way, and put memo logic in the wrapper. Forward every new
      `MetadataProvider` method in `MemoizedMetadataProvider` too. Otherwise the memo runs the trait
      default without notice. A unit test checks this
@@ -147,7 +148,7 @@ When querying a DuckLake table:
 2. User registers required object stores (S3, MinIO, etc.) with the `RuntimeEnv`
 3. SQL query references table as `catalog.schema.table`
 4. DataFusion resolves path: catalog -> schema -> table (queries metadata on-demand)
-5. `DuckLakeTable` queries metadata provider for table structure and data files (cached at table creation)
+5. `DuckLakeTable` reads table structure from the metadata provider at creation, and the data files at each scan
 6. Paths are resolved hierarchically using `path_resolver` utilities:
    - Global `data_path` from `ducklake_metadata` table
    - Schema path (relative to `data_path` or absolute)

@@ -138,7 +138,7 @@ reads instead. Both memos are off by default.
 
 A `CatalogReadMemo` keeps the catalog reads. Bind it to the provider once per query. The bind
 reads the catalog head (the newest snapshot id). The bound provider serves the reads while the
-head stays where the memo was filled:
+head stays where the memo was filled. Do not keep a bound provider past its query:
 
 ```rust,ignore
 use datafusion_ducklake::CatalogReadMemo;
@@ -147,23 +147,31 @@ let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
 // For each query:
 let provider = memo.bind(Arc::clone(&provider))?;
 let table = cached_table.with_metadata_provider(Arc::new(provider));
-// or: DuckLakeCatalog::new(provider)?
+// or, also for each query: DuckLakeCatalog::new(provider)?
 ```
 
 The memo is not DuckLake behavior. Official DuckLake lists a scan's files again in every
 transaction. The memo is correct only because every commit that changes a listing also moves the
-head. Expiring snapshots and cleanup move nothing, so a memoized read at an expired snapshot fails
-once cleanup deletes its files. A commit to any table moves the head and empties the memo. On a
-catalog that commits between most queries, the memo costs more than it saves. See
-`CatalogReadMemo` for the details.
+head. These cases do not move the head:
+
+- The low-level `MetadataWriter` API changes the catalog at a snapshot that `create_snapshot`
+  made earlier. A memo filled between the two misses the change until the next commit.
+- Expiring snapshots and cleanup commit nothing. Official DuckLake refuses a read at an expired
+  snapshot. Without a memo, this crate returns no rows for it. With a memo, a fill kept before
+  the expire returns the old rows until cleanup deletes their files, and then the read fails.
+
+A commit to any table moves the head and empties the memo. On a catalog that commits between most
+queries, the memo costs more than it saves. See `CatalogReadMemo` for the details.
 
 `DuckLakeReadOptions` keeps the delete positions that a table's scans read. A delete file is
-never changed after it is written, so this memo needs no check:
+never changed after it is written, so this memo needs no check. The memo lives with the table, so
+it helps only a caller that keeps the table. A table that a catalog lookup builds for each
+statement starts with an empty memo:
 
 ```rust,ignore
 use datafusion_ducklake::DuckLakeReadOptions;
 
-let catalog = DuckLakeCatalog::new(provider)?.with_read_options(DuckLakeReadOptions::memoized());
+let table = cached_table.with_read_options(DuckLakeReadOptions::memoized());
 ```
 
 ---

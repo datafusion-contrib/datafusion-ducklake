@@ -21,9 +21,9 @@ use datafusion_ducklake::inlined_filter::{InlinedDataScan, InlinedFilter};
 use datafusion_ducklake::metadata_provider::{
     ColumnWithTable, DataFileChange, DeleteFileChange, DuckLakeFileMetadata, DuckLakeInlinedData,
     DuckLakeInlinedDelete, DuckLakeInlinedRows, DuckLakeNameMapping, DuckLakeStatistics,
-    DuckLakeTableColumn, DuckLakeTableField, DuckLakeTableFile, FileWithTable,
-    InlinedFileDeleteChange, InlinedRowSelection, SchemaMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, ViewMetadata, ViewWithSchema,
+    DuckLakeTableColumn, DuckLakeTableField, DuckLakeTableFile, FILE_METADATA_BATCH_SIZE,
+    FileWithTable, InlinedFileDeleteChange, InlinedRowSelection, SchemaMetadata, SnapshotMetadata,
+    TableMetadata, TableWithSchema, ViewMetadata, ViewWithSchema,
 };
 use datafusion_ducklake::stats_filter::StatsFilter;
 use datafusion_ducklake::{
@@ -922,16 +922,17 @@ async fn a_table_over_the_budget_reads_the_catalog_on_every_query() -> anyhow::R
     let expected = Caller::plain(&lake).await?.query(all).await?;
 
     let caller = Caller::new(&lake, Some(CatalogReadMemo::new(1)), false).await?;
-    // The first query lists the files for the memo, finds that they do not
-    // fit, and reads the catalog for itself. Later queries do not try again.
-    for (run, listings) in [(0, 2), (1, 1)] {
+    // The first query reads the inlined deletions and the files for the memo,
+    // finds that they do not fit, and reads the catalog for itself. Later
+    // queries do not try again.
+    for (run, reads) in [(0, 2), (1, 1)] {
         assert_eq!(caller.query(all).await?, expected);
         assert_eq!(
             caller.counting.take(),
             BTreeMap::from([
                 ("get_current_snapshot", 1),
-                ("get_inlined_deletes", 1),
-                ("get_table_file_metadata_page_filtered", listings),
+                ("get_inlined_deletes", reads),
+                ("get_table_file_metadata_page_filtered", reads),
                 ("scan_inlined_data_noting_absence", 1),
             ]),
             "query {run}"
@@ -1199,6 +1200,222 @@ async fn commit_during_the_fill_does_not_count_from_the_catalog(
     for run in 0..2 {
         assert_eq!(memoized.count().await?, 3, "query {run}");
     }
+    Ok(())
+}
+
+/// Two queries bound at one head. Inside the second query's fill, the first
+/// query fills and keeps its reads, and then a flush commits: it moves the
+/// inlined deletions into a delete file. The second query must not mix the
+/// reads of the two fills, which would bring the deleted rows 3 and 7 back.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_queries_at_one_head_do_not_mix_their_reads() -> anyhow::Result<()> {
+    for before in ["get_inlined_deletes", "get_table_structure"] {
+        let lake = Lake::new(10, INLINED)?;
+        let all = "SELECT id FROM t ORDER BY id";
+        let expected = Caller::plain(&lake).await?.query(all).await?;
+        let memoized = Caller::memoized(&lake).await?;
+        let (table_id, snapshot) = table_at_head(&memoized.counting)?;
+
+        let first = Arc::new(memoized.bind()?);
+        let second = memoized.bind()?;
+        let flush = lake.runner(&["CALL ducklake_flush_inlined_data('lake')"]);
+        let fills = Arc::clone(&first);
+        memoized.counting.before(before, move || {
+            fills
+                .get_inlined_deletes(table_id, snapshot)
+                .expect("the first query fills");
+            flush();
+        });
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "t",
+            Arc::new(memoized.table.with_metadata_provider(Arc::new(second))),
+        )?;
+        // Before the structure read, the second query's own fill has its
+        // listing from before the flush and its inlined rows from after it, and
+        // lacks rows 100 and 101. It uses the first query's fill instead.
+        assert_eq!(query(&ctx, all).await?, expected, "flush before {before}");
+    }
+    Ok(())
+}
+
+/// A query keeps the reads it picked for a table, also after a bind at a
+/// newer head empties the memo between two of its calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_keeps_the_reads_it_picked() -> anyhow::Result<()> {
+    let lake = Lake::new(0, THREE_FILES)?;
+    let memoized = Caller::memoized(&lake).await?;
+    let (table_id, snapshot) = table_at_head(&memoized.counting)?;
+    memoized.query("SELECT id FROM t").await?;
+
+    let bound = memoized.bind()?;
+    assert!(bound.get_inlined_deletes(table_id, snapshot)?.is_empty());
+    lake.run(0, &["INSERT INTO lake.t VALUES (30)"])?;
+    memoized.bind()?;
+    memoized.counting.take();
+
+    let files = bound.get_table_file_metadata_page_filtered(
+        table_id,
+        snapshot,
+        None,
+        FILE_METADATA_BATCH_SIZE,
+        None,
+    )?;
+    assert_eq!(files.len(), 3);
+    assert_eq!(memoized.counting.take(), BTreeMap::new());
+    Ok(())
+}
+
+/// A fill that a commit split is not kept, so a query bound before the
+/// commit, at the same head, fills again instead of taking it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_split_fill_is_not_kept_for_other_queries() -> anyhow::Result<()> {
+    let lake = Lake::new(0, THREE_FILES)?;
+    let all = "SELECT id FROM t ORDER BY id";
+    let memoized = Caller::memoized(&lake).await?;
+    let earlier = Arc::new(memoized.bind()?);
+
+    memoized.counting.before(
+        "get_table_structure",
+        lake.runner(&["CREATE TABLE lake.u (id INT)"]),
+    );
+    let expected = memoized.query(all).await?;
+    memoized.counting.take();
+
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "t",
+        Arc::new(memoized.table.with_metadata_provider(earlier)),
+    )?;
+    assert_eq!(query(&ctx, all).await?, expected);
+    let calls = memoized.counting.take();
+    assert_eq!(
+        calls.get("get_table_file_metadata_page_filtered"),
+        Some(&1),
+        "{calls:?}"
+    );
+    Ok(())
+}
+
+/// A table whose reads fit the budget, but not what another table left of it,
+/// uses its fill for one query. Later queries at the same head read the
+/// catalog for it, as without a memo, and do not fill it again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_without_room_reads_the_catalog_until_the_head_moves() -> anyhow::Result<()> {
+    let lake = Lake::new(
+        0,
+        &[
+            "CREATE TABLE lake.t (id INT)",
+            "INSERT INTO lake.t VALUES (1), (2)",
+            "INSERT INTO lake.t VALUES (10), (11)",
+            "CREATE TABLE lake.u (id INT)",
+            "INSERT INTO lake.u VALUES (1), (2)",
+            "INSERT INTO lake.u VALUES (10), (11)",
+        ],
+    )?;
+    let counting = lake.provider().await?;
+    let catalog = DuckLakeCatalog::new(counting.clone())?;
+    let schema = catalog.schema("main").expect("schema main");
+    let mut tables = Vec::new();
+    for name in ["t", "u"] {
+        let table = schema.table(name).await?.expect("the table");
+        tables.push(
+            table
+                .downcast_ref::<DuckLakeTable>()
+                .expect("a DuckLake table")
+                .clone(),
+        );
+    }
+    let (t, u) = (&tables[0], &tables[1]);
+    let run = async |table: &DuckLakeTable, memo: &Arc<CatalogReadMemo>| {
+        let provider = Arc::new(memo.bind(Arc::new(counting.clone()))?);
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(table.with_metadata_provider(provider)))?;
+        query(&ctx, "SELECT id FROM t ORDER BY id").await
+    };
+
+    // Measure one table's fill, then leave room for one and a half.
+    let probe = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+    let expected = run(t, &probe).await?;
+    let one: usize = format!("{probe:?}")
+        .split(", bytes: ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect("the memo's bytes")
+        .parse()?;
+    let memo = CatalogReadMemo::new(one + one / 2);
+    run(u, &memo).await?;
+    counting.take();
+
+    for run_no in 0..3 {
+        assert_eq!(run(t, &memo).await?, expected);
+        let calls = counting.take();
+        if run_no == 0 {
+            assert_fill(calls, 0, "the fill without room");
+        } else {
+            assert_eq!(
+                calls,
+                BTreeMap::from([
+                    ("get_current_snapshot", 1),
+                    ("get_inlined_deletes", 1),
+                    ("get_table_file_metadata_page_filtered", 1),
+                    ("scan_inlined_data_noting_absence", 1),
+                ]),
+                "query {run_no}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reads at a snapshot that expire removed. Official DuckLake refuses them
+/// ("No snapshot found"). Without a memo, this crate returns no rows. With a
+/// memo, a fill kept before the expire returns the old rows until cleanup
+/// deletes their files, and then the read fails. See `CatalogReadMemo`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kept_fill_of_an_expired_snapshot_reads_until_cleanup() -> anyhow::Result<()> {
+    let lake = Lake::new(
+        0,
+        &["CREATE TABLE lake.t (id INT)", "INSERT INTO lake.t VALUES (1), (2)"],
+    )?;
+    let counting = lake.provider().await?;
+    let (_, snapshot) = table_at_head(&counting)?;
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::new(counting.clone()), snapshot)?;
+    let kept = catalog.schema("main").unwrap().table("t").await?.unwrap();
+    let kept = kept
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLake table")
+        .clone();
+    let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+    let read = async |memoized: bool| -> anyhow::Result<String> {
+        let provider: Arc<dyn MetadataProvider> = if memoized {
+            Arc::new(memo.bind(Arc::new(counting.clone()))?)
+        } else {
+            Arc::new(counting.clone())
+        };
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(kept.with_metadata_provider(provider)))?;
+        query(&ctx, "SELECT id FROM t ORDER BY id").await
+    };
+
+    lake.run(0, &["DELETE FROM lake.t", "INSERT INTO lake.t VALUES (10)"])?;
+    let old_rows = read(true).await?;
+    assert!(
+        old_rows.contains("| 1  |") && old_rows.contains("| 2  |"),
+        "{old_rows}"
+    );
+    assert_eq!(read(false).await?, old_rows);
+
+    lake.run(
+        0,
+        &["CALL ducklake_expire_snapshots('lake', older_than => now())"],
+    )?;
+    assert_eq!(read(true).await?, old_rows);
+    let plain = read(false).await?;
+    assert!(!plain.contains("| 1 "), "no rows without a memo: {plain}");
+
+    lake.run(0, &[CLEANUP_ALL])?;
+    assert!(read(true).await.is_err(), "the kept fill's files are gone");
     Ok(())
 }
 
