@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use crate::Result;
 use crate::column_rename::ColumnRenameExec;
 use crate::delete_filter::DeleteFilterExec;
+use crate::delete_memo::{DeletePositionMemo, DuckLakeReadOptions};
 use crate::field_id_adapter::{DefaultFill, FieldIdExprAdapterFactory, RowLineageProbes};
 use crate::inlined_filter::{InlinedDataScan, InlinedFilter, translate_inlined_filters};
 use crate::lazy_delete_filter::{
@@ -1345,6 +1346,12 @@ pub struct DuckLakeTable {
     /// every clone, as the other caches are, and keyed by snapshot so that a
     /// clone at a later snapshot reads again.
     inlined_absent_through: Arc<AtomicI64>,
+    /// How this table reuses what its scans read. The delete memo is off by
+    /// default.
+    read_options: DuckLakeReadOptions,
+    /// Delete-file positions this table's scans read, when `read_options` keep
+    /// them. Shared with every clone.
+    delete_memo: Option<Arc<DeletePositionMemo>>,
     /// Decryption keys for the encrypted files this table has listed, and the
     /// factory built from them. Shared with every clone of the table, so a key
     /// one of them installs is available to all of them.
@@ -1499,6 +1506,8 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::new(AtomicUsize::new(0)),
             inlined_absent_through: Arc::new(AtomicI64::new(i64::MIN)),
+            read_options: DuckLakeReadOptions::default(),
+            delete_memo: None,
             #[cfg(feature = "write")]
             schema_name: None,
             #[cfg(feature = "write")]
@@ -1515,12 +1524,22 @@ impl DuckLakeTable {
     /// its schema, statistics, name mappings, file read configuration and
     /// decryption keys. `provider` must read the same catalog as the table's
     /// own, for example the table's provider bound to one query's read session
-    /// with `MulticatalogProvider::with_read_session`.
+    /// with `MulticatalogProvider::with_read_session`, or bound to a
+    /// [`crate::CatalogReadMemo`] for one query.
     #[must_use]
     pub fn with_metadata_provider(&self, provider: Arc<dyn MetadataProvider>) -> Self {
         let mut table = self.clone();
         table.provider = provider;
         table
+    }
+
+    /// Set how this table reuses what its scans read: by default every scan
+    /// reads again each delete file it reaches. See [`DuckLakeReadOptions`].
+    /// The table starts with an empty memo.
+    pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
+        self.delete_memo = DeletePositionMemo::new(options.delete_memo_bytes);
+        self.read_options = options;
+        self
     }
 
     /// Enable / disable the row-lineage feature. When enabled, the table's
@@ -3895,7 +3914,8 @@ impl DuckLakeTable {
                     deletes,
                     self.object_store_url.as_ref().clone(),
                 )?
-                .with_read_order(read_order),
+                .with_read_order(read_order)
+                .with_position_memo(self.delete_memo.clone()),
             );
             if !name_mapping.is_empty() || !constants.is_empty() || exec.schema() != output_schema {
                 let defaults = if resolved_by_field_id {
@@ -4231,7 +4251,8 @@ impl DuckLakeTable {
                     deletes,
                     self.object_store_url.as_ref().clone(),
                 )?
-                .with_read_order(read_order),
+                .with_read_order(read_order)
+                .with_position_memo(self.delete_memo.clone()),
             );
             if !name_mapping.is_empty() || !constants.is_empty() || exec.schema() != output_schema {
                 let defaults = if resolved_by_field_id {
@@ -4415,7 +4436,8 @@ impl DuckLakeTable {
                         deletes,
                         self.object_store_url.as_ref().clone(),
                     )?
-                    .with_read_order(read_order),
+                    .with_read_order(read_order)
+                    .with_position_memo(self.delete_memo.clone()),
                 )
             },
             None => Arc::new(
@@ -4426,7 +4448,8 @@ impl DuckLakeTable {
                     deletes,
                     self.object_store_url.as_ref().clone(),
                 )?
-                .with_read_order(read_order),
+                .with_read_order(read_order)
+                .with_position_memo(self.delete_memo.clone()),
             ),
         };
         // Present the catalog columns (and `rowid`) in the requested order; the
@@ -4712,6 +4735,8 @@ impl DuckLakeTable {
             file_read_config_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inlined_materialized_row_count: Arc::clone(&self.inlined_materialized_row_count),
             inlined_absent_through: Arc::clone(&self.inlined_absent_through),
+            read_options: self.read_options.clone(),
+            delete_memo: self.delete_memo.clone(),
             #[cfg(feature = "encryption")]
             encryption_keys: Arc::clone(&self.encryption_keys),
             schema_name: None,

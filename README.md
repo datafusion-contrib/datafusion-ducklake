@@ -129,6 +129,43 @@ let df = ctx.sql("SELECT * FROM ducklake.main.my_table").await?;
 df.show().await?;
 ```
 
+### Keeping a table's reads across queries
+
+By default, every scan of a table reads the catalog again: the file list, the inlined rows and
+the inlined deletions. It also reads again each delete file that it reaches. A caller that keeps
+built tables across queries, for example in a cache keyed by table and snapshot, can keep these
+reads instead. Both memos are off by default.
+
+A `CatalogReadMemo` keeps the catalog reads. Bind it to the provider once per query. The bind
+reads the catalog head (the newest snapshot id). The bound provider serves the reads while the
+head stays where the memo was filled:
+
+```rust,ignore
+use datafusion_ducklake::CatalogReadMemo;
+
+let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+// For each query:
+let provider = memo.bind(Arc::clone(&provider))?;
+let table = cached_table.with_metadata_provider(Arc::new(provider));
+// or: DuckLakeCatalog::new(provider)?
+```
+
+The memo is not DuckLake behavior. Official DuckLake lists a scan's files again in every
+transaction. The memo is correct only because every commit that changes a listing also moves the
+head. Expiring snapshots and cleanup move nothing, so a memoized read at an expired snapshot fails
+once cleanup deletes its files. A commit to any table moves the head and empties the memo. On a
+catalog that commits between most queries, the memo costs more than it saves. See
+`CatalogReadMemo` for the details.
+
+`DuckLakeReadOptions` keeps the delete positions that a table's scans read. A delete file is
+never changed after it is written, so this memo needs no check:
+
+```rust,ignore
+use datafusion_ducklake::DuckLakeReadOptions;
+
+let catalog = DuckLakeCatalog::new(provider)?.with_read_options(DuckLakeReadOptions::memoized());
+```
+
 ---
 
 ## Writing a catalog

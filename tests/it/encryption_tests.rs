@@ -12,15 +12,16 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion::catalog::CatalogProvider;
 use datafusion::prelude::*;
 use parquet::arrow::ArrowWriter;
 use parquet::encryption::encrypt::FileEncryptionProperties;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use datafusion_ducklake::MetadataProvider;
 use datafusion_ducklake::catalog::DuckLakeCatalog;
 use datafusion_ducklake::metadata_provider_duckdb::DuckdbMetadataProvider;
+use datafusion_ducklake::{CatalogReadMemo, DuckLakeTable, MetadataProvider};
 
 /// Test encryption key (128-bit / 16 bytes)
 const TEST_ENCRYPTION_KEY: &[u8; 16] = b"0123456789abcdef";
@@ -526,5 +527,74 @@ async fn test_rowid_on_pme_encrypted_parquet() -> anyhow::Result<()> {
     // Rows were written in id order, so physical position is 0,1,2 and
     // row_id_start is 0.
     assert_eq!(pairs, vec![(0, 1), (1, 2), (2, 3)]);
+    Ok(())
+}
+
+/// A scan whose listing comes from a `CatalogReadMemo` installs the decryption
+/// keys of the files it lists, on every query: for a table that each query
+/// builds, and for a table kept across queries.
+#[tokio::test]
+async fn test_memoized_scans_of_pme_encrypted_parquet() -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let parquet_path = temp_dir.path().join("encrypted_data.parquet");
+    let catalog_path = temp_dir.path().join("catalog.duckdb");
+
+    let file_size = create_encrypted_parquet_file(&parquet_path, TEST_ENCRYPTION_KEY)?;
+    let key_str = std::str::from_utf8(TEST_ENCRYPTION_KEY)?;
+    create_catalog_with_encrypted_file(&catalog_path, &parquet_path, file_size, key_str)?;
+
+    let provider: Arc<dyn MetadataProvider> =
+        Arc::new(DuckdbMetadataProvider::new(catalog_path.to_str().unwrap())?);
+    let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+    let table = async || -> anyhow::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        let catalog = DuckLakeCatalog::new(memo.bind(Arc::clone(&provider))?)?;
+        Ok(catalog
+            .schema("main")
+            .expect("schema main")
+            .table("encrypted_users")
+            .await?
+            .expect("table encrypted_users"))
+    };
+
+    async fn ids(table: Arc<dyn datafusion::catalog::TableProvider>) -> anyhow::Result<Vec<i32>> {
+        let ctx = SessionContext::new();
+        ctx.register_table("t", table)?;
+        let batches = ctx
+            .sql("SELECT id FROM t ORDER BY id")
+            .await?
+            .collect()
+            .await?;
+        Ok(batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is Int32")
+                    .values()
+                    .to_vec()
+            })
+            .collect())
+    }
+
+    // A table built for each query: the first fills the memo, the second is
+    // served from it.
+    for _ in 0..2 {
+        assert_eq!(ids(table().await?).await?, vec![1, 2, 3]);
+    }
+    // A table kept across queries, given a bound provider for each.
+    let kept = table().await?;
+    let kept = kept
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLake table")
+        .clone();
+    for _ in 0..2 {
+        let bound = Arc::new(memo.bind(Arc::clone(&provider))?);
+        assert_eq!(
+            ids(Arc::new(kept.with_metadata_provider(bound))).await?,
+            vec![1, 2, 3]
+        );
+    }
     Ok(())
 }

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::Result;
+use crate::delete_memo::DuckLakeReadOptions;
 use crate::information_schema::InformationSchemaProvider;
 use crate::metadata_provider::{MetadataProvider, resolve_snapshot_at_or_before};
 use crate::path_resolver::{parse_object_store_url, resolve_path};
@@ -66,6 +67,8 @@ pub struct DuckLakeCatalog {
     /// (DuckLake row-lineage feature). Default: false, to preserve existing
     /// `SELECT *` shape for callers that haven't opted in.
     row_lineage: bool,
+    /// How each table reuses its scans' reads. Off by default.
+    read_options: DuckLakeReadOptions,
     /// Write configuration (when write feature is enabled)
     #[cfg(feature = "write")]
     write_config: Option<WriteConfig>,
@@ -88,6 +91,7 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
+            read_options: DuckLakeReadOptions::default(),
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -109,6 +113,7 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
+            read_options: DuckLakeReadOptions::default(),
             #[cfg(feature = "write")]
             write_config: None,
         })
@@ -168,6 +173,7 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
+            read_options: DuckLakeReadOptions::default(),
             write_config: Some(WriteConfig {
                 writer,
                 options: crate::table_writer::DuckLakeWriteOptions::default(),
@@ -220,6 +226,17 @@ impl DuckLakeCatalog {
     /// extension where `rowid` is hidden unless explicitly referenced.
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
+        self
+    }
+
+    /// Set how each table of this catalog reuses what its scans read. By
+    /// default every scan reads again each delete file it reaches; see
+    /// [`DuckLakeReadOptions`] for the memo it can keep instead. Tables behind
+    /// a view get the same options. To keep a scan's catalog reads across
+    /// queries, build the catalog over a provider from
+    /// [`crate::CatalogReadMemo::bind`].
+    pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
+        self.read_options = options;
         self
     }
 
@@ -314,7 +331,8 @@ impl CatalogProvider for DuckLakeCatalog {
                     schema_path,
                 )
                 .with_snapshot_selection(self.snapshot, self.view_guards.clone())
-                .with_row_lineage(self.row_lineage);
+                .with_row_lineage(self.row_lineage)
+                .with_read_options(self.read_options.clone());
 
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]

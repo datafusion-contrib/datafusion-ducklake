@@ -9,6 +9,7 @@ use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::TableType;
 
 use crate::catalog::SnapshotSelection;
+use crate::delete_memo::DuckLakeReadOptions;
 use crate::metadata_provider::{MetadataProvider, TableMetadata, ViewMetadata};
 use crate::path_resolver::resolve_path;
 use crate::snapshot_consistency::{SnapshotRebind, ViewGuard};
@@ -66,6 +67,8 @@ pub struct DuckLakeSchema {
     schema_path: String,
     /// Propagated from the catalog: when true, tables expose a `rowid` column.
     row_lineage: bool,
+    /// Propagated from the catalog: how each table reuses its scans' reads.
+    read_options: DuckLakeReadOptions,
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
@@ -93,6 +96,7 @@ impl DuckLakeSchema {
             object_store_url,
             schema_path,
             row_lineage: false,
+            read_options: DuckLakeReadOptions::default(),
             #[cfg(feature = "write")]
             writer: None,
             #[cfg(feature = "write")]
@@ -118,6 +122,13 @@ impl DuckLakeSchema {
     /// schema. Set by the parent catalog (see `DuckLakeCatalog::with_row_lineage`).
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
+        self
+    }
+
+    /// Set how each table of this schema reuses what its scans read. Set by the
+    /// parent catalog (see `DuckLakeCatalog::with_read_options`).
+    pub fn with_read_options(mut self, options: DuckLakeReadOptions) -> Self {
+        self.read_options = options;
         self
     }
 
@@ -211,7 +222,8 @@ impl DuckLakeSchema {
             table_path,
         )
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-        .with_row_lineage(self.row_lineage);
+        .with_row_lineage(self.row_lineage)
+        .with_read_options(self.read_options.clone());
 
         // Configure writer if this schema is writable
         #[cfg(feature = "write")]
@@ -333,6 +345,7 @@ impl SchemaProvider for DuckLakeSchema {
                                 snapshot_id,
                                 &self.schema_name,
                                 self.row_lineage,
+                                self.read_options.clone(),
                                 self.view_guards.as_ref().map(|guards| {
                                     let mut chain = guards.to_vec();
                                     chain.push(ViewGuard::new(view.clone()));
@@ -511,6 +524,7 @@ impl SchemaProvider for DuckLakeSchema {
             table_path,
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .with_read_options(self.read_options.clone())
         .with_writer(self.schema_name.clone(), Arc::clone(writer))
         .with_write_options(options);
 
