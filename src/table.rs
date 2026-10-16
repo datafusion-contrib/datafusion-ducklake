@@ -73,7 +73,6 @@ use datafusion::common::stats::Precision;
 use datafusion::common::{Column, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
-#[cfg(feature = "ext-file-order")]
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
@@ -86,7 +85,6 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
-#[cfg(feature = "ext-file-order")]
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
@@ -1318,9 +1316,6 @@ pub struct DuckLakeTable {
     /// When true, `schema` includes a trailing `rowid` column and `scan()`
     /// resolves it per file via [`RowLineageExec`].
     row_lineage: bool,
-    /// See [`Self::with_ext_file_order`].
-    #[cfg(feature = "ext-file-order")]
-    ext_file_order: bool,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
     /// Literal defaults used by DataFusion when an INSERT omits a column
@@ -1502,8 +1497,6 @@ impl DuckLakeTable {
             schema,
             physical_schema,
             row_lineage: false,
-            #[cfg(feature = "ext-file-order")]
-            ext_file_order: false,
             columns,
             column_defaults,
             fields,
@@ -1540,16 +1533,6 @@ impl DuckLakeTable {
         let mut table = self.clone();
         table.provider = provider;
         table
-    }
-
-    /// EXPERIMENTAL, opt-in: declare a sort order for files the
-    /// `ext_ducklake_file_order` sidecar records as verified (see
-    /// [`DuckLakeCatalog::with_ext_file_order`](crate::DuckLakeCatalog::with_ext_file_order)).
-    /// Also on when the table's write options enable `ext_file_order`.
-    #[cfg(feature = "ext-file-order")]
-    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
-        self.ext_file_order = enabled;
-        self
     }
 
     /// Set how this table reuses what its scans read: by default every scan
@@ -4743,8 +4726,6 @@ impl DuckLakeTable {
             schema: self.physical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
             row_lineage: false,
-            #[cfg(feature = "ext-file-order")]
-            ext_file_order: self.ext_file_order,
             columns: self.columns.clone(),
             column_defaults: self.column_defaults.clone(),
             fields: self.fields.clone(),
@@ -4901,7 +4882,7 @@ impl DuckLakeTable {
         ids
     }
 
-    #[cfg(all(feature = "write", feature = "ext-file-order"))]
+    #[cfg(feature = "write")]
     pub(crate) fn metadata_provider(&self) -> &Arc<dyn MetadataProvider> {
         &self.provider
     }
@@ -5535,7 +5516,6 @@ pub(crate) struct FileUpdateOutput {
 /// EXPERIMENTAL (`ext_file_order`): the ordered alternative's ingredients,
 /// gathered across a scan's pages of files and only used if a sort asks for
 /// them (see [`crate::order_on_request`]).
-#[cfg(feature = "ext-file-order")]
 struct OrderRecipe {
     /// The verified files every page agreed on, to be chained.
     files: Vec<PartitionedFile>,
@@ -5545,7 +5525,6 @@ struct OrderRecipe {
     ok: bool,
 }
 
-#[cfg(feature = "ext-file-order")]
 impl OrderRecipe {
     fn new(enabled: bool) -> Self {
         Self {
@@ -5556,7 +5535,6 @@ impl OrderRecipe {
     }
 }
 
-#[cfg(feature = "ext-file-order")]
 impl DuckLakeTable {
     /// Add one page's files without deletes to `recipe`: one sidecar query
     /// for the page, then the files sharing the declarable ordering.
@@ -5626,13 +5604,9 @@ impl DuckLakeTable {
     }
 
     /// Whether scans read the `ext_file_order` sidecar (see
-    /// [`Self::with_ext_file_order`]).
+    /// [`DuckLakeReadOptions::with_ext_file_order`]).
     fn ext_file_order_enabled(&self) -> bool {
-        #[cfg(feature = "write")]
-        if self.write_options.ext_file_order == Some(true) {
-            return true;
-        }
-        self.ext_file_order
+        self.read_options.ext_file_order
     }
 
     /// Each file's verified ordering over the table schema, from the
@@ -5907,7 +5881,6 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
-        #[cfg(feature = "ext-file-order")]
         let mut order_recipe = OrderRecipe::new(!rowid_in_proj && self.ext_file_order_enabled());
         for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
             let (table_files, file_statistics, summary_statistics) =
@@ -5978,7 +5951,6 @@ impl TableProvider for DuckLakeTable {
                 });
 
             if !files_without_deletes.is_empty() {
-                #[cfg(feature = "ext-file-order")]
                 self.add_to_order_recipe(
                     &mut order_recipe,
                     &files_without_deletes,
@@ -6087,7 +6059,6 @@ impl TableProvider for DuckLakeTable {
         let plan = combine_execution_plans(execs)?;
         // With verified files the plan is still today's plan; the wrapper only
         // offers an ordered alternative to a sort that asks for one.
-        #[cfg(feature = "ext-file-order")]
         let plan = self.offer_order(state, plan, order_recipe);
         Ok(plan)
     }

@@ -110,7 +110,6 @@ AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before cre
 | `tls-rustls-aws-lc-rs`     | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                            |           |
 | `tls-rustls-ring`          | Use Rustls with Ring for SQLx PostgreSQL connections                              |           |
 | `encryption`               | Parquet Modular Encryption (PME) reads                                            |           |
-| `ext-file-order`           | EXPERIMENTAL: record verified per-file sort order, see below; not under semver    |           |
 | `skip-tests-with-docker`   | CI-only: skip tests that require Docker                                           |           |
 
 For dynamic linking against a system `libduckdb`, disable defaults and re-enable just
@@ -244,6 +243,7 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Parquet Modular Encryption (PME) reads (feature `encryption`)                                                                                                                                                                                                                                                                    | ✅        |
 | Keep a table's catalog reads across queries (`CatalogReadMemo`, opt-in, not DuckLake behavior: see Limitations)                                                                                                                                                                                                                   | 🟧       |
 | Keep a table's delete positions across scans (`DuckLakeReadOptions`, opt-in)                                                                                                                                                                                                                                                     | ✅        |
+| Serve `ORDER BY <sort key> LIMIT n` from files with a verified order (`ext_file_order` read/write options, opt-in, not in the spec: see below)                                                                                                                                                                                   | 🟧        |
 | Configurable writer output (compression, row-group sizing)                                                                                                                                                                                                                                                                       | ✅        |
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned)                                                                                                                                                                                 | ✅        |
 | Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅        |
@@ -1032,11 +1032,13 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   a file with inlined deletions (merging it would lose them); `rewrite_data_files` counts them
   towards the deleted fraction and retires a file they empty.
 
-## Experimental: verified file order (`ext-file-order`)
+## Experimental: verified file order (opt-in)
 
-Off unless the `ext-file-order` feature is compiled in **and** a catalog opts in with
-`DuckLakeCatalog::with_ext_file_order(true)`. With either missing, no extra table is
-created, read or written, and plans are unchanged.
+Off unless a caller opts in: `DuckLakeWriteOptions::with_ext_file_order(true)` for writes
+and `DuckLakeReadOptions::with_ext_file_order(true)` for scans (apply them with
+`with_write_options` / `with_read_options` on the catalog, schema or table). With both off,
+no extra table is created, read or written, no extra catalog query runs, and plans are
+unchanged.
 
 DuckLake's `SET SORTED BY` is a write-time hint: no catalog row says which files follow
 it, so a reader cannot rely on it. This feature proves the order per file instead and

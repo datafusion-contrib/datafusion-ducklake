@@ -45,6 +45,11 @@ pub struct DuckLakeReadOptions {
     /// Bytes of delete-file positions a table can keep across scans. Zero, the
     /// default, turns the delete memo off.
     pub delete_memo_bytes: usize,
+    /// EXPERIMENTAL: whether scans read the `ext_ducklake_file_order` table
+    /// (see [`crate::ext_file_order`]) and serve `ORDER BY <sort key> LIMIT n`
+    /// from the files it records, in order and without a sort. Off by default:
+    /// the table is never read, and scans plan as without this option.
+    pub ext_file_order: bool,
 }
 
 impl DuckLakeReadOptions {
@@ -63,6 +68,14 @@ impl DuckLakeReadOptions {
     #[must_use]
     pub fn with_delete_memo(mut self, max_bytes: usize) -> Self {
         self.delete_memo_bytes = max_bytes;
+        self
+    }
+
+    /// EXPERIMENTAL: declare the verified sort order of recorded files to a
+    /// sort that asks for it; see [`Self::ext_file_order`].
+    #[must_use]
+    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
+        self.ext_file_order = enabled;
         self
     }
 }

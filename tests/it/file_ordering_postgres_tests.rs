@@ -3,7 +3,7 @@
 //! `MulticatalogProvider`, including a writer role without DDL rights.
 //! Docker-gated (testcontainers Postgres).
 
-#![cfg(all(feature = "write-postgres", feature = "ext-file-order"))]
+#![cfg(feature = "write-postgres")]
 
 use std::sync::Arc;
 
@@ -14,9 +14,9 @@ use datafusion::execution::context::SessionConfig;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::*;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions, MetadataWriter,
-    MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter, SortDirection,
-    SortField, VerifyOrderOptions,
+    DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
+    MetadataWriter, MulticatalogManager, MulticatalogProvider, NullOrder, PostgresMetadataWriter,
+    SortDirection, SortField, VerifyOrderOptions,
 };
 use object_store::local::LocalFileSystem;
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -132,7 +132,8 @@ impl Env {
         let catalog =
             DuckLakeCatalog::with_writer(Arc::new(provider), self.writer(&self.pool).await)
                 .unwrap()
-                .with_ext_file_order(true);
+                .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(true))
+                .with_write_options(DuckLakeWriteOptions::default().with_ext_file_order(true));
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(partitions)

@@ -645,7 +645,6 @@ impl MetadataProvider for MemoizedMetadataProvider {
 
     // Not memoized: a row describes an immutable file and is read once per
     // page of a scan's files.
-    #[cfg(feature = "ext-file-order")]
     fn verified_file_orders(
         &self,
         table_id: i64,

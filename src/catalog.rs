@@ -67,9 +67,6 @@ pub struct DuckLakeCatalog {
     /// (DuckLake row-lineage feature). Default: false, to preserve existing
     /// `SELECT *` shape for callers that haven't opted in.
     row_lineage: bool,
-    /// See [`Self::with_ext_file_order`].
-    #[cfg(feature = "ext-file-order")]
-    ext_file_order: bool,
     /// How each table reuses its scans' reads. Off by default.
     read_options: DuckLakeReadOptions,
     /// Write configuration (when write feature is enabled)
@@ -94,8 +91,6 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
-            #[cfg(feature = "ext-file-order")]
-            ext_file_order: false,
             read_options: DuckLakeReadOptions::default(),
             #[cfg(feature = "write")]
             write_config: None,
@@ -118,8 +113,6 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
-            #[cfg(feature = "ext-file-order")]
-            ext_file_order: false,
             read_options: DuckLakeReadOptions::default(),
             #[cfg(feature = "write")]
             write_config: None,
@@ -180,8 +173,6 @@ impl DuckLakeCatalog {
             object_store_url: Arc::new(object_store_url),
             catalog_path,
             row_lineage: false,
-            #[cfg(feature = "ext-file-order")]
-            ext_file_order: false,
             read_options: DuckLakeReadOptions::default(),
             write_config: Some(WriteConfig {
                 writer,
@@ -235,21 +226,6 @@ impl DuckLakeCatalog {
     /// extension where `rowid` is hidden unless explicitly referenced.
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
-        self
-    }
-
-    /// EXPERIMENTAL, opt-in (`ext-file-order` feature): let scans declare a
-    /// sort order for files the `ext_ducklake_file_order` sidecar records as
-    /// verified (see [`crate::ext_file_order`]), and on a writable catalog
-    /// check and record it for every file written. Off by default: no sidecar
-    /// is read or written.
-    #[cfg(feature = "ext-file-order")]
-    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
-        self.ext_file_order = enabled;
-        #[cfg(feature = "write")]
-        if let Some(config) = self.write_config.as_mut() {
-            config.options.ext_file_order = Some(enabled);
-        }
         self
     }
 
@@ -361,8 +337,6 @@ impl CatalogProvider for DuckLakeCatalog {
                 .with_snapshot_selection(self.snapshot, self.view_guards.clone())
                 .with_row_lineage(self.row_lineage)
                 .with_read_options(self.read_options.clone());
-                #[cfg(feature = "ext-file-order")]
-                let schema = schema.with_ext_file_order(self.ext_file_order);
 
                 // Configure writer if this catalog is writable
                 #[cfg(feature = "write")]

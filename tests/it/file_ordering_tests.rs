@@ -8,7 +8,7 @@
 //! the table, so a declared ordering that is not true fails here as wrong rows,
 //! not just as a different plan.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "ext-file-order"))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,9 +24,9 @@ use tempfile::TempDir;
 
 use datafusion_ducklake::ext_file_order::FileOrder;
 use datafusion_ducklake::{
-    ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
-    MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField, SqliteMetadataProvider,
-    SqliteMetadataWriter, VerifyOrderOptions, WriteMode,
+    ColumnDef, DuckLakeCatalog, DuckLakeReadOptions, DuckLakeTable, DuckLakeTableWriter,
+    DuckLakeWriteOptions, MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField,
+    SqliteMetadataProvider, SqliteMetadataWriter, VerifyOrderOptions, WriteMode,
 };
 
 const TOP_N: &str = "SELECT ts, level, id FROM ducklake.main.logs ORDER BY ts DESC LIMIT 7";
@@ -168,7 +168,10 @@ impl Env {
         let provider = SqliteMetadataProvider::new(&self.url()).await.unwrap();
         let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer))
             .unwrap()
-            .with_ext_file_order(ext_file_order);
+            .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(ext_file_order))
+            .with_write_options(
+                DuckLakeWriteOptions::default().with_ext_file_order(ext_file_order),
+            );
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(target_partitions)
@@ -600,7 +603,8 @@ async fn inlined_rows_mixed_with_verified_files_and_flushed() {
         Arc::new(env.writer().await),
     )
     .unwrap()
-    .with_ext_file_order(true);
+    .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(true))
+    .with_write_options(DuckLakeWriteOptions::default().with_ext_file_order(true));
     let flushed = catalog
         .flush_inlined_data(&SessionContext::new().state(), Some("main"), Some("logs"))
         .await

@@ -80,10 +80,8 @@ pub mod delete_filter;
 mod delete_memo;
 pub mod encryption;
 pub mod error;
-#[cfg(feature = "ext-file-order")]
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
-#[cfg(any(feature = "ext-file-order", feature = "write"))]
 pub(crate) mod file_ordering;
 pub mod information_schema;
 pub mod inlined_filter;
@@ -92,7 +90,6 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
-#[cfg(feature = "ext-file-order")]
 mod order_on_request;
 pub mod partition;
 pub mod path_resolver;
@@ -210,7 +207,7 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
 pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
-#[cfg(all(feature = "write", feature = "ext-file-order"))]
+#[cfg(feature = "write")]
 pub use compaction::{VerifyOrderOptions, VerifyOrderResult};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;

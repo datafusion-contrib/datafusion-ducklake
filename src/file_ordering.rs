@@ -21,11 +21,9 @@
 //! Keys are recorded by field id, so a renamed column keeps its record and a
 //! dropped-and-re-added column (new field id) does not inherit one.
 
-#[cfg(feature = "ext-file-order")]
 use arrow::compute::SortOptions;
 
 /// One attested sort key: a parquet field id and its direction / null order.
-#[cfg(feature = "ext-file-order")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AttestedKey {
     pub(crate) field_id: i32,
@@ -33,7 +31,7 @@ pub(crate) struct AttestedKey {
 }
 
 /// `field_id:asc|desc:nulls_first|nulls_last`, comma-separated, primary key first.
-#[cfg(all(feature = "write", feature = "ext-file-order"))]
+#[cfg(feature = "write")]
 pub(crate) fn encode(keys: &[AttestedKey]) -> String {
     keys.iter()
         .map(|key| {
@@ -59,7 +57,6 @@ pub(crate) fn encode(keys: &[AttestedKey]) -> String {
 /// Parse [`encode`]'s output. Anything malformed yields `None` (no attestation),
 /// never a partial key: a prefix of a garbled value could claim an ordering the
 /// writer never checked.
-#[cfg(feature = "ext-file-order")]
 pub(crate) fn decode(value: &str) -> Option<Vec<AttestedKey>> {
     let keys = value
         .split(',')
@@ -91,49 +88,10 @@ pub(crate) fn decode(value: &str) -> Option<Vec<AttestedKey>> {
     (!keys.is_empty()).then_some(keys)
 }
 
-#[cfg(all(feature = "write", not(feature = "ext-file-order")))]
-pub(crate) use disabled::{FileOrderRequest, SortCheck};
-#[cfg(all(feature = "write", feature = "ext-file-order"))]
+#[cfg(feature = "write")]
 pub(crate) use write::{FileOrderRequest, SortCheck};
 
-/// Without the `ext-file-order` feature the writer's hooks take these
-/// uninhabited stand-ins: every `Option` of them is `None`, so no check runs,
-/// nothing is recorded, and the calls compile away.
-#[cfg(all(feature = "write", not(feature = "ext-file-order")))]
-mod disabled {
-    use arrow::datatypes::Schema;
-    use arrow::record_batch::RecordBatch;
-
-    use crate::Result;
-
-    #[derive(Debug, Clone)]
-    pub(crate) enum FileOrderRequest {}
-
-    impl FileOrderRequest {
-        pub(crate) fn check(&self, _schema: &Schema) -> Option<SortCheck> {
-            match *self {}
-        }
-
-        pub(crate) fn record(&self, _path: &str, _file_size_bytes: i64, _sort_key: String) {
-            match *self {}
-        }
-    }
-
-    #[derive(Debug)]
-    pub(crate) enum SortCheck {}
-
-    impl SortCheck {
-        pub(crate) fn observe(&mut self, _batch: &RecordBatch) -> Result<()> {
-            match *self {}
-        }
-
-        pub(crate) fn attestation(&self) -> Option<String> {
-            match *self {}
-        }
-    }
-}
-
-#[cfg(all(feature = "write", feature = "ext-file-order"))]
+#[cfg(feature = "write")]
 mod write {
     use std::sync::Arc;
 
@@ -338,10 +296,11 @@ mod write {
     }
 }
 
-#[cfg(all(test, feature = "ext-file-order"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "write")]
     #[test]
     fn encode_decode_round_trip() {
         let keys = vec![

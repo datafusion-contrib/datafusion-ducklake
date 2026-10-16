@@ -1999,7 +1999,6 @@ impl DuckLakeTable {
     /// What a maintenance write of this table (merge, rewrite, inlined flush)
     /// asks of its outputs under the experimental `ext_file_order` option;
     /// `schema` holds the written data columns.
-    #[cfg(feature = "ext-file-order")]
     pub(crate) fn ext_file_order_request(
         &self,
         schema: &Schema,
@@ -2017,18 +2016,8 @@ impl DuckLakeTable {
             schema,
         ))
     }
-
-    /// Without the `ext-file-order` feature no output is checked.
-    #[cfg(not(feature = "ext-file-order"))]
-    pub(crate) fn ext_file_order_request(
-        &self,
-        _schema: &Schema,
-    ) -> Result<Option<crate::file_ordering::FileOrderRequest>> {
-        Ok(None)
-    }
 }
 
-#[cfg(feature = "ext-file-order")]
 /// Options for [`DuckLakeTable::verify_file_orders`].
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOrderOptions {
@@ -2038,7 +2027,6 @@ pub struct VerifyOrderOptions {
     pub max_files: Option<usize>,
 }
 
-#[cfg(feature = "ext-file-order")]
 /// What [`DuckLakeTable::verify_file_orders`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyOrderResult {
@@ -2058,7 +2046,6 @@ pub struct VerifyOrderResult {
     pub bytes_read: u64,
 }
 
-#[cfg(feature = "ext-file-order")]
 impl DuckLakeTable {
     /// EXPERIMENTAL (`ext_file_order`): record the verified sort order of live
     /// data files that have no record under the table's current sort key:

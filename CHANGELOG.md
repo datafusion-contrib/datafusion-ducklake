@@ -9,15 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- EXPERIMENTAL `ext-file-order` feature, off by default and not covered by semver: with
-  `DuckLakeCatalog::with_ext_file_order(true)` (or `DuckLakeWriteOptions::ext_file_order`), the
-  writer checks every row it writes against the table's sort key and records each file that
-  follows it in an `ext_ducklake_file_order` table beside the catalog; scans then serve
-  `ORDER BY <sort key> LIMIT n` from the recorded files in order, without a sort, and stop
-  early. `DuckLakeTable::verify_file_orders` records existing files without rewriting them, and
-  `MetadataWriter::prune_file_orders` drops rows of files that are gone. SQLite and multicatalog
-  PostgreSQL record; other backends read every file as unrecorded. Divergence: the sidecar is
-  not part of the DuckLake spec; DuckDB's extension ignores it (see `COMPATIBILITY.md`).
+- EXPERIMENTAL, opt-in verified file order: with `DuckLakeWriteOptions::with_ext_file_order(true)`
+  the writer checks every row it writes against the table's sort key and records each file that
+  follows it in an `ext_ducklake_file_order` table beside the catalog; with
+  `DuckLakeReadOptions::with_ext_file_order(true)` scans serve `ORDER BY <sort key> LIMIT n` from
+  the recorded files in order, without a sort, and stop early. `DuckLakeTable::verify_file_orders`
+  records existing files without rewriting them, and `MetadataWriter::prune_file_orders` drops rows
+  of files that are gone. Both options are off by default: no table is created, read or written.
+  SQLite and multicatalog PostgreSQL record; other backends read every file as unrecorded. The
+  table is not part of the DuckLake spec (see `COMPATIBILITY.md`).
 - `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
   It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
 - `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).
