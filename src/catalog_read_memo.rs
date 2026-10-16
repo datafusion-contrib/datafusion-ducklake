@@ -643,6 +643,17 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner.get_sort_spec(table_id, snapshot_id)
     }
 
+    // Not memoized: a row describes an immutable file and is read once per
+    // page of a scan's files.
+    #[cfg(feature = "ext-file-order")]
+    fn verified_file_orders(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
+        self.inner.verified_file_orders(table_id, paths)
+    }
+
     fn get_table_statistics(&self, table_id: i64, snapshot_id: i64) -> Result<DuckLakeStatistics> {
         self.inner.get_table_statistics(table_id, snapshot_id)
     }
