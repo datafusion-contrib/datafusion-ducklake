@@ -2034,10 +2034,13 @@ pub struct VerifyOrderResult {
     pub files_verified: usize,
     /// Of those, files recorded as ordered (rows inserted into the sidecar).
     pub files_recorded: u64,
-    /// Of those, files whose rows are NOT in sort order (nothing recorded).
+    /// Of those, files whose rows are NOT in sort order in the catalog's
+    /// column types, or whose key values do not cast to them (nothing
+    /// recorded).
     pub files_unsorted: usize,
     /// Files not read: already recorded under the current key, name-mapped,
-    /// encrypted, or a footer without the key columns.
+    /// encrypted, a footer without the key columns, or a key column whose
+    /// type does not cast to the catalog's.
     pub files_skipped: usize,
     /// Compressed bytes of the key column chunks read.
     pub bytes_read: u64,
@@ -2092,10 +2095,13 @@ impl DuckLakeTable {
         let physical_schema = self.physical_schema();
         let column_ids = self.top_level_column_ids();
         let mut key_ids: Vec<(i64, SortOptions)> = Vec::with_capacity(keys.len());
+        // Each key's catalog type: the reader casts the file's column to it.
+        let mut key_types: Vec<DataType> = Vec::with_capacity(keys.len());
         for (name, direction, nulls) in &keys {
             let Ok(index) = physical_schema.index_of(name) else {
                 return Ok(result);
             };
+            key_types.push(physical_schema.field(index).data_type().clone());
             key_ids.push((
                 column_ids[index],
                 SortOptions {
@@ -2241,23 +2247,63 @@ impl DuckLakeTable {
                     nulls_first: options.nulls_first,
                 })
                 .collect();
+            // Check the rows as the reader sees them, in the catalog's type.
+            // An order in the file's own type need not survive the cast: ISO
+            // text with mixed UTC offsets read as a TIMESTAMP, for one.
+            let file_schema = stream.schema();
+            let catalog_typed: Option<Vec<Field>> = sorted_roots
+                .iter()
+                .zip(file_schema.fields())
+                .map(|(root, field)| {
+                    let key = roots.iter().position(|r| r == root)?;
+                    let target = &key_types[key];
+                    arrow::compute::can_cast_types(field.data_type(), target)
+                        .then(|| field.as_ref().clone().with_data_type(target.clone()))
+                })
+                .collect();
             let catalog_ids: Option<Vec<i32>> = key_ids
                 .iter()
                 .map(|(id, _)| i32::try_from(*id).ok())
                 .collect();
-            let Some(mut check) = catalog_ids.and_then(|ids| {
-                crate::file_ordering::SortCheck::with_field_ids(
-                    stream.schema().as_ref(),
+            let checked = catalog_typed.and_then(|fields| {
+                let schema = Arc::new(Schema::new(fields));
+                let check = crate::file_ordering::SortCheck::with_field_ids(
+                    schema.as_ref(),
                     &requested,
-                    &ids,
-                )
-            }) else {
+                    &catalog_ids?,
+                )?;
+                Some((schema, check))
+            });
+            let Some((catalog_schema, mut check)) = checked else {
                 result.files_skipped += 1;
                 continue;
             };
             result.files_verified += 1;
+            let mut castable = true;
             while let Some(batch) = stream.next().await {
-                check.observe(&batch?)?;
+                let batch = batch?;
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .zip(catalog_schema.fields())
+                    .map(|(column, field)| {
+                        arrow::compute::cast_with_options(
+                            column,
+                            field.data_type(),
+                            &datafusion::common::format::DEFAULT_CAST_OPTIONS,
+                        )
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>();
+                // A value the cast refuses fails the reader too: not verified.
+                let Ok(columns) = columns else {
+                    castable = false;
+                    break;
+                };
+                check.observe(&RecordBatch::try_new(Arc::clone(&catalog_schema), columns)?)?;
+            }
+            if !castable {
+                result.files_unsorted += 1;
+                continue;
             }
             match check.attestation() {
                 Some(sort_key) => orders.push(crate::ext_file_order::FileOrder {
