@@ -767,11 +767,11 @@ fn table_at_head(provider: &dyn MetadataProvider) -> anyhow::Result<(i64, i64)> 
     Ok((table.table_id, snapshot))
 }
 
-/// Check that `calls` are those of a query that fills the memo for `t`: the
-/// head at the bind and after the fill, and each read of the fill once.
-/// `scan_heads` are the head reads of the query's scans: a scan of a table with
-/// delete files reads the head to know whether the catalog's delete counts
-/// hold, as without a memo.
+/// Check that `calls` are those of a query that fills the memo for `t` for
+/// the first time: the head at the bind and after the fill, and each read of
+/// the fill once. `scan_heads` are the head reads of the query's scans: a scan
+/// of a table with delete files reads the head to know whether the catalog's
+/// delete counts hold, as without a memo.
 ///
 /// The fill reads the inlined rows with their row ids too, unless the provider
 /// showed that the table has none. The PostgreSQL provider can show that, and
@@ -789,6 +789,26 @@ fn assert_fill(mut calls: BTreeMap<&'static str, usize>, scan_heads: usize, cont
         ("get_table_file_metadata_page_filtered", 1),
         ("get_table_structure", 1),
         ("scan_inlined_data_noting_absence", 1),
+    ]);
+    assert_eq!(calls, expected, "{context}");
+}
+
+/// As [`assert_fill`], for a fill after a commit: it takes the table's columns
+/// from the fill before. It reads the inlined rows again unless the provider
+/// showed that the table has none, which the PostgreSQL provider can show.
+#[track_caller]
+fn assert_refill(mut calls: BTreeMap<&'static str, usize>, scan_heads: usize, context: &str) {
+    for read in ["read_inlined_rows", "scan_inlined_data_noting_absence"] {
+        let reads = calls.remove(read);
+        assert!(
+            reads.is_none_or(|reads| reads == 1),
+            "{context}, {read}: {reads:?}"
+        );
+    }
+    let expected = BTreeMap::from([
+        ("get_current_snapshot", 2 + scan_heads),
+        ("get_inlined_deletes", 1),
+        ("get_table_file_metadata_page_filtered", 1),
     ]);
     assert_eq!(calls, expected, "{context}");
 }
@@ -1056,7 +1076,7 @@ async fn a_kept_table_keeps_reading_its_snapshot() -> anyhow::Result<()> {
 
     memoized.counting.take();
     assert_eq!(memoized.query(all).await?, before);
-    assert_fill(memoized.counting.take(), 0, all);
+    assert_refill(memoized.counting.take(), 0, all);
     assert_eq!(memoized.query(all).await?, before);
     assert_eq!(memoized.counting.take(), bind_calls(0));
 
@@ -1093,7 +1113,7 @@ async fn commit_to_another_table_fills_the_memo_again(backend: &Backend) -> anyh
 
     memoized.counting.take();
     assert_eq!(memoized.query(all).await?, before);
-    assert_fill(memoized.counting.take(), 0, all);
+    assert_refill(memoized.counting.take(), 0, all);
     assert_eq!(memoized.query(all).await?, before);
     assert_eq!(memoized.counting.take(), bind_calls(0));
     Ok(())
@@ -1166,7 +1186,7 @@ async fn a_commit_during_the_fill_is_not_kept() -> anyhow::Result<()> {
 
     // Not kept: the next query fills the memo again, and now keeps it.
     assert_eq!(memoized.query(all).await?, before);
-    assert_fill(memoized.counting.take(), 0, all);
+    assert_refill(memoized.counting.take(), 0, all);
     assert_eq!(memoized.query(all).await?, before);
     assert_eq!(memoized.counting.take(), bind_calls(0));
 
