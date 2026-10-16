@@ -66,6 +66,12 @@ The codebase follows a layered architecture with clear separation of concerns:
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
    - `column_rename.rs`: reads Parquet files whose physical column names predate a rename
    - `table_changes.rs` / `table_deletions.rs`: change-data-capture between snapshots
+   - `keyed_mutation.rs`: delete / update / upsert by key from a staged batch, and
+     `delete_positions` / `delete_rowids`, over Parquet and inlined rows alike
+   - `rowid_lookup.rs`: find rows by `rowid` (inlined, positional, or embedded row ids)
+   - `change_detection.rs`: whether a table's rows changed between snapshots (the `changes_made`
+     ledger, falling back to the change feed for flush and compaction snapshots)
+   - `fork.rs`: fork a table into another catalog of a multi-catalog PostgreSQL store
    - physical row positions (used by rowid and delete filtering) come from the parquet
      reader's `row_number` virtual column — see `row_id.rs::positional_table_schema` and
      `docs/physical-row-positions.md`
@@ -264,6 +270,9 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - DuckDB-encrypted (non-PME) Parquet files are not supported
 - Inlined rows participate in scans, `COUNT(*)`, mutations, `rowid` and change feeds; see
   `COMPATIBILITY.md` for the remaining differences from official DuckLake.
+- One `data_inlining_row_limit` governs every write path: stored table > schema >
+  catalog-wide setting > the writer's limit (`with_write_options` / `with_data_inlining_row_limit`)
+  > `10`.
 - No optional metadata caching layer (all lookups are dynamic)
 
 ### Testing

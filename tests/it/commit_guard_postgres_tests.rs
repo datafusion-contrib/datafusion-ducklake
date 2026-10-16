@@ -203,7 +203,9 @@ impl Lake {
         std::fs::create_dir_all(&data).unwrap();
         writer.set_data_path(data.to_str().unwrap()).unwrap();
         let os: ObjStore = Arc::new(LocalFileSystem::new());
-        let table_writer = DuckLakeTableWriter::new(writer.clone(), os.clone()).unwrap();
+        let table_writer = DuckLakeTableWriter::new(writer.clone(), os.clone())
+            .unwrap()
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
         let first = table_writer
             .write_table("public", "t", &[batch(&[1, 2], &[10, 20])])
             .await
@@ -227,8 +229,11 @@ impl Lake {
         }
     }
 
+    /// A table writer that writes every row to Parquet.
     fn table_writer(&self) -> DuckLakeTableWriter {
-        DuckLakeTableWriter::new(self.writer.clone(), self.os.clone()).unwrap()
+        DuckLakeTableWriter::new(self.writer.clone(), self.os.clone())
+            .unwrap()
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
     }
 
     fn inlining_writer(&self) -> DuckLakeTableWriter {
@@ -839,7 +844,7 @@ async fn multicatalog_refusal_commits_nothing_on_every_path() {
         ),
         (
             "set_table_setting",
-            Box::new(|| w.set_table_setting(t, "target_file_size", "1000")),
+            Box::new(|| w.set_table_setting(t, "target_file_size", "1KB")),
         ),
         (
             "set_global_setting",
@@ -1021,7 +1026,7 @@ async fn single_catalog_refusal_commits_nothing() {
         ),
         (
             "set_table_setting",
-            Box::new(|| w.set_table_setting(t, "target_file_size", "1000")),
+            Box::new(|| w.set_table_setting(t, "target_file_size", "1KB")),
         ),
         (
             "create_snapshot",

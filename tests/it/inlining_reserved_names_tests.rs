@@ -339,8 +339,7 @@ async fn postgres_single_catalog_refuses_reserved_columns() {
 }
 
 impl Lake {
-    /// An append through a `DuckLakeTableWriter` built without options, whose own
-    /// inlining limit is `0`.
+    /// An append through a `DuckLakeTableWriter` built without options.
     async fn append_default(
         &self,
         table: &str,
@@ -409,28 +408,39 @@ impl Lake {
     }
 }
 
-/// A `DuckLakeTableWriter` whose own limit is the default `0` applies it where
-/// the catalog stores none, as official's `DATA_INLINING_ROW_LIMIT 0` attach
-/// option does: on a catalog storing no limit it writes Parquet, accepts a
-/// reserved name, and creates no inlined data table.
+/// A `DuckLakeTableWriter` built without options applies the default limit of
+/// `10` where neither the catalog nor the metadata writer sets one: it refuses
+/// a reserved name and inlines a small write. Its explicit limit of `0`, as
+/// official's `DATA_INLINING_ROW_LIMIT 0` attach option, writes Parquet,
+/// accepts a reserved name, and creates no inlined data table.
 #[tokio::test(flavor = "multi_thread")]
-async fn default_table_writer_does_not_inline_on_an_unconfigured_catalog() {
+async fn default_table_writer_inlines_on_an_unconfigured_catalog() {
     let lake = lake().await;
-    lake.append_default("t", &["id", "row_id"]).await.unwrap();
-    assert_eq!(lake.inlined_tables("t").await, 0);
-    assert_eq!(lake.data_files("t").await, 1);
-    lake.append_default("t", &["id", "row_id", "end_snapshot"])
+    let error = lake
+        .append_default("t", &["id", "row_id"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    lake.append_default("t", &["id"]).await.unwrap();
+    assert_eq!(lake.inlined_tables("t").await, 1);
+    assert_eq!(lake.data_files("t").await, 0);
+
+    lake.append("u", &["id", "row_id"], 0).await.unwrap();
+    assert_eq!(lake.inlined_tables("u").await, 0);
+    assert_eq!(lake.data_files("u").await, 1);
+    lake.append("u", &["id", "row_id", "end_snapshot"], 0)
         .await
         .unwrap();
-    assert_eq!(lake.inlined_tables("t").await, 0);
-    assert_eq!(lake.data_files("t").await, 2);
+    assert_eq!(lake.inlined_tables("u").await, 0);
+    assert_eq!(lake.data_files("u").await, 2);
 }
 
 /// A positive limit the catalog stores, catalog-wide or at schema scope,
-/// outranks the writer's own `0`: a reserved name is refused and a new table
-/// gets its inlined data table.
+/// outranks a table writer's limit of `0`: a reserved name is refused, a new
+/// table gets its inlined data table, and a small write is inlined.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stored_limit_outranks_the_default_table_writer() {
+async fn a_stored_limit_outranks_a_table_writer_limit_of_zero() {
     for scope in ["catalog", "schema"] {
         let lake = lake().await;
         match scope {
@@ -441,36 +451,35 @@ async fn a_stored_limit_outranks_the_default_table_writer() {
             _ => lake.set_schema_limit("5").await,
         }
         let error = lake
-            .append_default("u", &["id", "row_id"])
+            .append("u", &["id", "row_id"], 0)
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains(RESERVED), "{scope}: {error}");
-        lake.append_default("t", &["id"]).await.unwrap();
+        lake.append("t", &["id"], 0).await.unwrap();
         assert_eq!(lake.inlined_tables("t").await, 1, "{scope}");
-        // The writer's own limit still decides whether its rows are inlined.
-        assert_eq!(lake.data_files("t").await, 1, "{scope}");
+        assert_eq!(lake.data_files("t").await, 0, "{scope}");
     }
 }
 
-/// A table-scoped positive limit applies to a later write by a default
-/// writer: it refuses a new reserved column and creates the inlined data
+/// A table-scoped positive limit outranks a table writer's limit of `0` on a
+/// later write: it refuses a new reserved column and creates the inlined data
 /// table of the new schema version.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_table_limit_outranks_the_default_table_writer() {
+async fn a_table_limit_outranks_a_table_writer_limit_of_zero() {
     let lake = lake().await;
-    lake.append_default("t", &["id"]).await.unwrap();
+    lake.append("t", &["id"], 0).await.unwrap();
     assert_eq!(lake.inlined_tables("t").await, 0);
     lake.writer
         .set_table_setting(lake.table_id("t"), "data_inlining_row_limit", "5")
         .unwrap();
     let error = lake
-        .append_default("t", &["id", "begin_snapshot"])
+        .append("t", &["id", "begin_snapshot"], 0)
         .await
         .unwrap_err()
         .to_string();
     assert!(error.contains(RESERVED), "{error}");
-    lake.append_default("t", &["id", "v"]).await.unwrap();
+    lake.append("t", &["id", "v"], 0).await.unwrap();
     assert!(lake.inlined_tables("t").await >= 1);
 }
 

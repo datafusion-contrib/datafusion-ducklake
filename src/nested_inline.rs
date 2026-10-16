@@ -427,23 +427,40 @@ impl<'a> Parser<'a> {
         build_list_scalar(data_type, values)
     }
 
+    /// A struct's text, `{'name': value, ...}`, holding each of `fields` at
+    /// most once. Fields are matched by name, in whatever order the text lists
+    /// them, and one the text leaves out is NULL, as DuckDB's cast from text to
+    /// a struct reads it: a catalog whose struct children an earlier writer
+    /// renumbered lists them in another order than the text was written in.
     fn parse_struct(&mut self, fields: &Fields, depth: usize) -> Option<ScalarValue> {
         self.expect(b'{')?;
-        let mut values = Vec::with_capacity(fields.len());
-        for (index, field) in fields.iter().enumerate() {
-            if index > 0 {
+        let mut values: Vec<Option<ScalarValue>> = vec![None; fields.len()];
+        self.skip_whitespace();
+        if !self.consume(b'}') {
+            loop {
+                self.skip_whitespace();
+                let name = self.parse_quoted()?;
+                let index = fields.iter().position(|field| field.name() == &name)?;
+                // A field named twice takes its last value, as DuckDB's cast
+                // from text takes it.
+                self.expect(b':')?;
+                values[index] =
+                    Some(self.parse_value(fields[index].data_type(), depth + 1, b",}")?);
+                self.skip_whitespace();
+                if self.consume(b'}') {
+                    break;
+                }
                 self.expect(b',')?;
             }
-            self.skip_whitespace();
-            if self.parse_quoted()? != field.name().as_str() {
-                return None;
-            }
-            self.skip_whitespace();
-            self.expect(b':')?;
-            values.push(self.parse_value(field.data_type(), depth + 1, b",}")?);
         }
-        self.skip_whitespace();
-        self.expect(b'}')?;
+        let values = values
+            .into_iter()
+            .zip(fields.iter())
+            .map(|(value, field)| match value {
+                Some(value) => Some(value),
+                None => ScalarValue::try_from(field.data_type()).ok(),
+            })
+            .collect::<Option<Vec<_>>>()?;
         build_struct_scalar(&DataType::Struct(fields.clone()), values)
     }
 
@@ -652,6 +669,277 @@ pub(crate) fn build_map_scalar(
     )))
 }
 
+/// One node below a nested column: its catalog column id and its own child
+/// nodes, in the order its Arrow type lists them.
+#[derive(Debug, PartialEq, Eq)]
+struct NestedNode {
+    id: i64,
+    children: Vec<NestedNode>,
+}
+
+/// The child nodes of `data_type`, taking their ids from `ids` in the
+/// pre-order `DuckLakeTableColumn::nested_column_ids` lists them: a struct's
+/// fields, a list's element, a map's key then value. `None` when `ids` runs out.
+fn nested_nodes(
+    data_type: &DataType,
+    ids: &mut std::slice::Iter<'_, i64>,
+) -> Option<Vec<NestedNode>> {
+    let child_types: Vec<&DataType> = match data_type {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+            vec![field.data_type()]
+        },
+        DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => fields.iter().map(|field| field.data_type()).collect(),
+            _ => return None,
+        },
+        _ => Vec::new(),
+    };
+    child_types
+        .into_iter()
+        .map(|child| {
+            let id = *ids.next()?;
+            Some(NestedNode {
+                id,
+                children: nested_nodes(child, ids)?,
+            })
+        })
+        .collect()
+}
+
+/// The nodes of a nested column of type `data_type` whose pre-order node ids
+/// are `ids`; an error when the two disagree.
+fn column_nodes(data_type: &DataType, ids: &[i64]) -> crate::Result<Vec<NestedNode>> {
+    let mut iter = ids.iter();
+    match nested_nodes(data_type, &mut iter) {
+        Some(nodes) if iter.next().is_none() => Ok(nodes),
+        _ => Err(crate::DuckLakeError::InvalidConfig(format!(
+            "nested column ids {ids:?} do not match the shape of {data_type}"
+        ))),
+    }
+}
+
+/// Whether a nested value of type `read` with node ids `read_ids` already has
+/// the shape of `target` with `target_ids`: the same nodes, names and leaf types,
+/// whatever each field's nullability.
+pub(crate) fn same_nested_shape(
+    read: &DataType,
+    read_ids: &[i64],
+    target: &DataType,
+    target_ids: &[i64],
+) -> bool {
+    fn nullable(data_type: &DataType) -> DataType {
+        let field = |field: &Arc<Field>| {
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(nullable(field.data_type()))
+                    .with_nullable(true),
+            )
+        };
+        match data_type {
+            DataType::List(child) => DataType::List(field(child)),
+            DataType::LargeList(child) => DataType::LargeList(field(child)),
+            DataType::FixedSizeList(child, size) => DataType::FixedSizeList(field(child), *size),
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(field).collect()),
+            DataType::Map(entries, sorted) => DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(nullable(entries.data_type())),
+                ),
+                *sorted,
+            ),
+            other => other.clone(),
+        }
+    }
+    read_ids == target_ids && nullable(read) == nullable(target)
+}
+
+/// `array`, a nested column of type `read` whose nodes carry the column ids
+/// `read_ids`, rebuilt as `target` with node ids `target_ids`.
+///
+/// Every node is matched by column id, never by name or position, so a field
+/// renamed since `array` was written keeps its values, one dropped is left out,
+/// and one `array` predates takes its `initial_default` from
+/// `initial_defaults` (by column id), or NULL without one. A leaf whose type
+/// was widened is cast.
+pub(crate) fn adapt_nested_array(
+    array: &ArrayRef,
+    read: &DataType,
+    read_ids: &[i64],
+    target: &DataType,
+    target_ids: &[i64],
+    initial_defaults: &std::collections::HashMap<i64, String>,
+) -> crate::Result<ArrayRef> {
+    let read_nodes = column_nodes(read, read_ids)?;
+    let target_nodes = column_nodes(target, target_ids)?;
+    adapt_nodes(
+        array,
+        read,
+        &read_nodes,
+        target,
+        &target_nodes,
+        initial_defaults,
+    )
+}
+
+fn adapt_nodes(
+    array: &ArrayRef,
+    read: &DataType,
+    read_nodes: &[NestedNode],
+    target: &DataType,
+    target_nodes: &[NestedNode],
+    initial_defaults: &std::collections::HashMap<i64, String>,
+) -> crate::Result<ArrayRef> {
+    use arrow::array::AsArray;
+
+    if read == target && read_nodes == target_nodes {
+        return Ok(Arc::clone(array));
+    }
+    Ok(match (read, target) {
+        (DataType::Struct(read_fields), DataType::Struct(target_fields)) => {
+            let read_array = array.as_struct();
+            let children = target_fields
+                .iter()
+                .zip(target_nodes)
+                .map(|(target_field, target_node)| {
+                    match read_nodes.iter().position(|node| node.id == target_node.id) {
+                        Some(index) => adapt_nodes(
+                            read_array.column(index),
+                            read_fields[index].data_type(),
+                            &read_nodes[index].children,
+                            target_field.data_type(),
+                            &target_node.children,
+                            initial_defaults,
+                        ),
+                        None => absent_field(
+                            target_field.data_type(),
+                            initial_defaults.get(&target_node.id),
+                            array.len(),
+                        ),
+                    }
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                target_fields.clone(),
+                children,
+                read_array.nulls().cloned(),
+            )?)
+        },
+        (DataType::List(read_field), DataType::List(target_field)) => {
+            let read_array = array.as_list::<i32>();
+            let values = adapt_nodes(
+                read_array.values(),
+                read_field.data_type(),
+                only(read_nodes)?,
+                target_field.data_type(),
+                only(target_nodes)?,
+                initial_defaults,
+            )?;
+            Arc::new(ListArray::try_new(
+                Arc::clone(target_field),
+                read_array.offsets().clone(),
+                values,
+                read_array.nulls().cloned(),
+            )?)
+        },
+        (DataType::LargeList(read_field), DataType::LargeList(target_field)) => {
+            let read_array = array.as_list::<i64>();
+            let values = adapt_nodes(
+                read_array.values(),
+                read_field.data_type(),
+                only(read_nodes)?,
+                target_field.data_type(),
+                only(target_nodes)?,
+                initial_defaults,
+            )?;
+            Arc::new(LargeListArray::try_new(
+                Arc::clone(target_field),
+                read_array.offsets().clone(),
+                values,
+                read_array.nulls().cloned(),
+            )?)
+        },
+        (
+            DataType::FixedSizeList(read_field, read_size),
+            DataType::FixedSizeList(target_field, target_size),
+        ) if read_size == target_size => {
+            let read_array = array.as_fixed_size_list();
+            let values = adapt_nodes(
+                read_array.values(),
+                read_field.data_type(),
+                only(read_nodes)?,
+                target_field.data_type(),
+                only(target_nodes)?,
+                initial_defaults,
+            )?;
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(target_field),
+                *target_size,
+                values,
+                read_array.nulls().cloned(),
+            )?)
+        },
+        (DataType::Map(read_entries, _), DataType::Map(target_entries, sorted)) => {
+            let read_array = array.as_map();
+            let entries: ArrayRef = Arc::new(read_array.entries().clone());
+            let entries = adapt_nodes(
+                &entries,
+                read_entries.data_type(),
+                read_nodes,
+                target_entries.data_type(),
+                target_nodes,
+                initial_defaults,
+            )?;
+            Arc::new(MapArray::try_new(
+                Arc::clone(target_entries),
+                read_array.offsets().clone(),
+                entries.as_struct().clone(),
+                read_array.nulls().cloned(),
+                *sorted,
+            )?)
+        },
+        (read, target) if read.is_nested() || target.is_nested() => {
+            return Err(crate::DuckLakeError::Unsupported(format!(
+                "inlined nested value of type {read} cannot be read as {target}"
+            )));
+        },
+        (_, target) => arrow::compute::cast(array, target)?,
+    })
+}
+
+/// The child nodes of a list's single element node.
+fn only(nodes: &[NestedNode]) -> crate::Result<&[NestedNode]> {
+    match nodes {
+        [node] => Ok(node.children.as_slice()),
+        _ => Err(crate::DuckLakeError::Internal(
+            "a list has exactly one element node".to_string(),
+        )),
+    }
+}
+
+/// `len` values of a field the value predates: its `initial_default`, or NULL.
+fn absent_field(
+    data_type: &DataType,
+    initial_default: Option<&String>,
+    len: usize,
+) -> crate::Result<ArrayRef> {
+    match initial_default.filter(|value| !value.eq_ignore_ascii_case("NULL")) {
+        Some(value) => crate::types::parse_ducklake_default_scalar(value, data_type)
+            .ok_or_else(|| {
+                crate::DuckLakeError::InvalidConfig(format!(
+                    "Cannot decode initial_default '{value}' of a nested field as {data_type}"
+                ))
+            })?
+            .to_array_of_size(len)
+            .map_err(Into::into),
+        None => Ok(arrow::array::new_null_array(data_type, len)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +964,42 @@ mod tests {
         let struct_type = DataType::Struct(fields);
         let scalar = parse_text("{'plain': 7, 'q\"uote': 'a,b\\'c'}", &struct_type).unwrap();
         assert!(!scalar.is_null());
+    }
+
+    /// A struct's text names its fields in any order and may leave one out,
+    /// which reads as NULL, or name one twice, taking the last value, as
+    /// DuckDB's cast from text to a struct reads it.
+    #[test]
+    fn struct_text_matches_fields_by_name() {
+        let struct_type = DataType::Struct(Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        assert_eq!(
+            parse_text("{'b': 1, 'a': 2}", &struct_type)
+                .unwrap()
+                .to_string(),
+            "{a:2,b:1}"
+        );
+        assert_eq!(
+            parse_text("{'a': 1}", &struct_type).unwrap().to_string(),
+            "{a:1,b:}"
+        );
+        assert!(parse_text("{'z': 1}", &struct_type).is_none());
+        // `'{''a'': 1, ''b'': 3, ''a'': 2}'::STRUCT(a INT, b INT)` is
+        // `{'a': 2, 'b': 3}` in DuckDB 1.5.5.
+        assert_eq!(
+            parse_text("{'a': 1, 'b': 3, 'a': 2}", &struct_type)
+                .unwrap()
+                .to_string(),
+            "{a:2,b:3}"
+        );
+        assert_eq!(
+            parse_text("{'a': 1, 'a': NULL}", &struct_type)
+                .unwrap()
+                .to_string(),
+            "{a:,b:}"
+        );
     }
 
     #[cfg(feature = "write")]

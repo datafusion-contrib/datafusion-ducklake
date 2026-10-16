@@ -282,14 +282,94 @@ arrow-rs's 1,048,576 rows, so its buffered row group is correspondingly larger.
 Scoped writer settings and catalog‑backed data inlining are supported. DuckDB, SQLite, MySQL, and
 multi‑catalog PostgreSQL support multi‑table Parquet, inline, and delete commits.
 
-A stored table, schema or catalog‑wide `data_inlining_row_limit` decides whether a table gets an
-inlined data table and refuses inlined system column names (`row_id`, ...). Where none is stored,
-the writer's own limit does, as official's `DATA_INLINING_ROW_LIMIT` attach option does: the
-`DuckLakeCatalog::with_write_options` limit for SQL (`10` when unset), a `DuckLakeTableWriter`'s
-own limit for its writes (`0` unless set), and official's default `10` for a direct
-`MetadataWriter` call. A SQL `INSERT` inlines under the stored limit, else that writer limit, as
-official's insert does. A direct `DuckLakeTableWriter` write is this crate's own: it inlines under
-the writer's limit alone, whatever the catalog stores.
+Every write path resolves one `data_inlining_row_limit` per table, as official's
+`DataInliningRowLimit` does: the table's stored setting, else its schema's, else the catalog-wide
+one, else the limit configured on the writer, as official's `DATA_INLINING_ROW_LIMIT` attach option
+applies, else official's default `10`. The writer's limit is the metadata writer's own
+(`with_data_inlining_row_limit` on every writer, `MetadataWriter::data_inlining_row_limit`), which
+`DuckLakeWriteOptions::with_data_inlining_row_limit` on a `DuckLakeTableWriter` or
+`DuckLakeCatalog::with_write_options` overrides. The resolved limit decides whether a write is
+inlined (SQL `INSERT`, `UPDATE` and `DELETE`, every `DuckLakeTableWriter` write and streaming
+session, keyed mutations), whether a new schema version gets an inlined data table, and whether
+inlined system column names (`row_id`, ...) are refused, for direct `MetadataWriter` calls too
+(`register_data_file*`, `register_existing_data_files`, `promote_column_type`,
+`set_partition_spec`, `set_sort_spec`, ...). `MetadataWriter::table_data_inlining_row_limit`
+returns it. `set_table_setting`, `set_schema_setting` and `set_global_setting` store the table,
+schema and catalog-wide (on multi-catalog PostgreSQL, catalog-scoped) settings on every writable
+backend; a table that needs a column named like a system column is created under a limit of `0`
+(the writer's, or its schema's), and this crate stores no setting for it, as official stores none:
+official never inlines a table with a column named like a system column (`CanInlineColumns`), so
+it creates no inlined data table for it either. Every option is cast and stored as official's
+`ducklake_set_option` stores it, and a value it refuses is refused: booleans are cast to
+`BOOLEAN` (`'T'`, `'yes'`, `'1'`) and stored as `true`/`false`; `data_inlining_row_limit`,
+`parquet_row_group_size` and `parquet_compression_level` are cast to `UBIGINT` (DuckDB's
+`VARCHAR` cast: `'1.5'` is `2`, `'1e2'` is `100`, a negative value fails);
+`target_file_size` and `parquet_row_group_size_bytes` are parsed as DuckDB memory sizes (a
+unit is required) and stored in bytes; `parquet_version` is stored as `V1`/`V2`;
+`parquet_compression` is lowercased and checked; `rewrite_delete_threshold` is stored as C++
+prints a double (`0.500000`). This crate takes values as text and casts `hive_file_pattern` and
+`require_commit_message` as official casts a text value of them: to an integer, stored as `true`
+when not zero (`'2'` is on, `'0.4'` is off, `'true'` is refused). `delete_older_than` and
+`expire_older_than` must be empty or an interval. Every option official knows is accepted at
+catalog, schema and table scope, as official accepts it; an unknown one is refused. Stored
+`UBIGINT` values are read with the same cast, booleans are on only for exactly `true`, and
+setting keys are stored lowercased, as official stores them. Writer initialization rewrites a
+`sort_on_insert` or `hive_file_pattern` that earlier releases stored as a case variant of
+`true`, which they read as on, to `true`.
+
+Every insert path reads `sort_on_insert` as official's `PlanInsert` does: the table's stored
+setting, else its schema's, else the catalog-wide one (`MetadataWriter::table_setting`), on only
+while it reads exactly `true`. Official has no session setting outranking it, so the option a
+`DuckLakeTableWriter`, `DuckLakeCatalog::with_write_options` or
+`DuckLakeTable::with_write_options` carries applies only where none is stored
+(`DuckLakeTableWriter::table_sort_on_insert`). SQL `INSERT` reads it once, when it plans the
+statement, as official does: the plan sorts every row when it reads it on and every key is a bare
+column, and otherwise the writer lays the rows out at execution under the value the plan read.
+Exactly one of them sorts. A streaming session reads it when it begins. `upsert_by_keys` lays out
+its new rows as an insert does: official has no upsert, and it is checked against official's
+`DELETE` followed by `INSERT`.
+
+A sort key names a column as DuckDB's binder names it: the column spelled exactly as the key,
+else the one equal to it ignoring ASCII case, so a key DuckDB stored as typed (`SET SORTED BY
+(ID)` over a column `id`) orders every insert, flush and compaction. `execute_ducklake_sql` and
+`SortField::column` store a key as DuckDB writes a column reference, as typed and quoted only when
+it must be (`"My Col"`, a keyword such as `"name"`). Two columns equal ignoring case, neither
+spelled as the key, fail the write (DuckDB refuses such a table). Keys of a dialect other than
+exactly `duckdb` are skipped, as official skips them. A key naming a column the table lacks fails
+an insert with official's binder error ("Columns in the SET SORTED BY statement were not found in
+the DuckLake table. Unmatched columns were: ...") whenever official plans the sort: with
+`sort_on_insert` on, or off while inlining is enabled, also when the rows are inlined or there are
+none. `set_sort_spec` refuses such a key with the same error. As official refuses `DROP COLUMN`
+of a column a sort key references, a write that drops one (a `Replace` without the column) is
+refused ("Cannot drop column "v" - the table is sorted by this column. ..."); reset or change
+the sort order first. A qualified reference (`t.v`, a struct field `s.x`) names its last part, as
+DuckDB's binder names it, and a key this crate cannot parse refuses every drop, since it might
+reference the column. A catalog another writer leaves with such a key fails the insert, as does
+a key with a qualified reference ("Unexpected qualified column reference - only unqualified
+columns are supported"). Each `SET SORTED BY` and `RESET SORTED BY`, a `RESET` of an unsorted
+table too, commits a snapshot that bumps `schema_version` and records `altered_table`, with no
+`ducklake_schema_versions` row, as official's do.
+
+Sort keys that are expressions (written by DuckDB) are evaluated with DataFusion; where its
+semantics differ from DuckDB's (integer division, overflow, type promotion, function behaviour),
+rows may be ordered differently inside files. Query results are unaffected. If an expression can't
+be evaluated (DataFusion cannot plan it, such as a DuckDB macro or `main.list_value`, or it fails
+over the rows being written), rows keep their arrival order (a flush: row id order) and the write
+proceeds. A function DuckDB wrote qualified by its default schema (`main.abs(...)`) resolves by its
+name, and a key naming a column the table lacks still fails as in official. Bare float column keys
+sort as DuckDB sorts them (every `nan` after `inf`, `-0.0` equal to `0.0`). Compaction orders its
+output by the same keys, evaluated the same way; when they can't be evaluated it writes the rows in
+the order it writes an unsorted table's.
+
+A streaming session (`begin_write`, `begin_write_single_file`) holds its rows while they number at
+most the limit and commits them inlined when it finishes there, as official's insert inlines a
+statement of at most the limit's rows; the first batch past the limit writes them to Parquet, so a
+session holds at most the limit's rows in memory. `finish_with_deletes` commits inlined rows with
+its deletes in one snapshot. `begin_write_with_embedded_rowid` and `begin_write_to_path` never
+inline: their rows carry caller-chosen row ids or a caller-chosen file. A session over a type or
+value the backend cannot inline writes Parquet. Rows a caller registers through
+`MetadataWriter::begin_write_transaction` and `register_data_file` are files the caller wrote and
+are never inlined.
 
 ### Views
 
@@ -528,11 +608,11 @@ created before data inlining has no registry, and these steps reclaim nothing
 there. A failure of the post-commit drop is returned as an error although the
 flush committed.
 
-SQL writes honor the scoped `data_inlining_row_limit`, which defaults to `10` as
+Every write honors the scoped `data_inlining_row_limit`, which defaults to `10` as
 official DuckLake's does; the threshold is inclusive, and a table setting overrides a
-schema setting, which overrides the global one. Set it to `0` to write every insert to
-Parquet. `DuckLakeTableWriter` inlines only under a limit its options set. Unsupported
-schemas or writer capabilities fall back to Parquet. As in official, while inlining is
+schema setting, which overrides the global one, which overrides the writer's limit. Set it
+to `0` to write every insert to Parquet. Unsupported schemas or writer capabilities fall back
+to Parquet. As in official, while inlining is
 enabled a table cannot be created, or gain a column, named like an inlined data
 table's system column (`row_id`, `begin_snapshot`, `end_snapshot`, and DuckDB's
 `_ducklake_internal_row_id` / `_ducklake_internal_snapshot_id`; in a DuckLake 1.1
@@ -844,6 +924,111 @@ Known edges:
 
 ---
 
+## Row-level APIs over inlined data
+
+These APIs let a caller change and read rows without knowing whether they are inlined in the
+catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
+
+- **Keyed mutations** (`DuckLakeTable::keyed_mutation(keys)`, on SQLite, DuckDB, MySQL and
+  multi-catalog PostgreSQL): `delete_by_keys` deletes the rows whose key equals a staged row's
+  (`DELETE ... WHERE (k) IN (SELECT k FROM staged)`), `update_by_keys` gives each matched row its
+  staged row's values, matched to the table's columns by name, and keeps its `rowid` (`MERGE ...
+  WHEN MATCHED THEN UPDATE SET *`; of staged rows sharing a key, the last one's values win, as a
+  small `MERGE` source updates in source order, and the row counts once), and `upsert_by_keys`
+  deletes the matched rows and appends every staged row in one snapshot. Matches come from
+  Parquet files, pruned by the catalog statistics of the key columns and read `concurrency` files
+  at a time, and from inlined rows. Deletions are recorded as a SQL `DELETE` records them, new
+  rows inlined or written as a SQL `INSERT` or `UPDATE` writes them, and the commit runs the
+  conflict checks and retries of a SQL `DELETE` or `UPDATE`. A NULL key matches nothing. Every
+  column is found by name, so a `delete_by_keys` batch may hold the key columns alone. These are
+  typed Rust APIs, so staged types are strict rather than cast as SQL casts them: each staged key
+  and value column must have its table column's Arrow type or a lossless widening of it (a wider
+  integer of the same signedness, or a signed one wider than an unsigned; `Float32` to `Float64`;
+  a decimal with at least the integer digits and scale; any of the string types for another,
+  likewise the binary types and `FixedSizeBinary` to binary; `Date32`/`Date64`, a `Date64` that
+  is not a whole day refused; a timestamp of the same time zone at the same or a finer unit;
+  lists, structs and maps whose children widen under these rules, field ids and metadata
+  ignored). A nullable staged column is accepted for a `NOT NULL` one, a NULL written there
+  failing with `NOT NULL constraint failed`. Any other type fails the mutation with
+  ``InvalidConfig("column `id`: expected Int64, got Utf8")`` before anything is written. Keys
+  compare in the table's type after widening: exactly, and floats numerically at any depth
+  (`-0.0` equals `0`, NaN equals NaN), as DuckDB's `DISTINCT` compares them. Refusing a type
+  changes no catalog data, so official DuckLake reads every table these APIs write unchanged.
+  `upsert_by_keys` lays its rows out as official's insert does under the table's stored
+  `sort_on_insert`; `update_by_keys` sorts none, as official's `UPDATE` and `MERGE` do not.
+- **Positional deletes** (`DuckLakeTable::delete_positions`, `delete_rowids`): delete given
+  positions of live data files, or the live rows with given `rowid`s wherever they are, as a SQL
+  `DELETE` records them: at most the limit's positions of a file go to
+  `ducklake_inlined_delete_<table_id>`, and a file they empty stays live, as official's does;
+  more go to a delete file, which replaces the file's live one carrying every position with its
+  snapshot, and a file it would empty is ended instead. `DuckLakeTableWriter::write_delete_file`
+  with `MetadataWriter::set_delete_file` still writes a delete file unconditionally.
+- **Row lookup by `rowid`** (`DuckLakeTable::locate_rowids`, `read_rows_by_rowid`): where each
+  live row is (inlined, or a data file and position) and the rows themselves, reading only the
+  files that hold them. A file that embeds `_ducklake_internal_row_id` (a flush, merge, rewrite
+  or `UPDATE` output) takes its row ids from that column, as official's reader does, even when
+  the catalog records a `row_id_start`; `DuckLakeTable::file_row_id_layout` tells which a file is,
+  from its footer, and `DuckLakeTableFile::may_embed_row_ids` gives the catalog's hint.
+- **Change detection** (`change_detection::table_data_changes`, `table_rows_changed`,
+  `last_rows_changed_snapshot`): what a window of snapshots did to a table, from the
+  `changes_made` ledger and the window's snapshot ids, with no file listing, and where the
+  ledger cannot tell, this crate's port of official's change feed. `rows_changed` is the
+  `ducklake_table_insertions` or `ducklake_table_deletions` feed over the window being
+  non-empty, decided from the tokens wherever they can: no token naming the table (or only
+  `altered_table`) is no change; an insert or delete token (`inserted_into_table`,
+  `deleted_from_table`, `inlined_insert`, `inlined_delete`), `dropped_table` or a token this
+  crate does not know is a change without reading data. Only snapshots recording just a flush
+  or a compaction (`inline_flush`, `flushed_inlined`, `merge_adjacent`, `rewrite_delete`,
+  `compacted_table`) read the feed, each feed up to its first row: a `DELETE` committed after
+  official's flush in one transaction records only `inline_flush`, and the feed lists the
+  deletion; official's `ducklake_rewrite_data_files` lists the rows it rewrote as `UPDATE`
+  pairs, so a rewrite is a change, while a pure flush or merge lists nothing. One case errs
+  towards a change: official's flush of inlined deletions of Parquet rows records
+  `deleted_from_table`, as a `DELETE` does, with nothing in the feed. `layout_changed` adds
+  every flush and compaction from the tokens alone. A snapshot without a
+  ledger row counts as a change, and so do snapshots expired from the window
+  (`history_incomplete`; found by snapshot id: every id from the window's start to the catalog's
+  head must survive, so a gap at the window's end is found too. A multi-catalog store, whose
+  catalogs share one id sequence, finds only an expired starting snapshot and an expired first
+  snapshot of the table). A window that starts
+  after snapshot `0` of a catalog this crate created, which never had one, is complete.
+- **Table fork** (`MulticatalogManager::fork_table`, multi-catalog PostgreSQL): a table in another
+  catalog of the store holding what the source reads at its snapshot, in one commit, its columns
+  copying the source's catalog rows (exact types, nullability, defaults) and its tags and
+  comments the source's. Data files
+  and delete files are registered by reference with their owning catalog; a file with inlined
+  deletions gets a delete file of the fork's own holding every deleted position; the source's
+  inlined rows are written to a Parquet file of the fork's own, as a flush writes them (row ids
+  and insert snapshots embedded, split by partition), so the fork holds what a flush of the
+  source would have without changing the source. Row ids are preserved and the fork's allocator
+  starts past the source's. A source opened at an earlier snapshot masks later deletions and
+  later rows of partial files with a delete file of the fork's own. Forking into the source's own
+  catalog is refused (one catalog would own a file twice), as is a source with a live file of
+  another partition spec than its current one, an encrypted file (the key cannot be carried) or a
+  file read through a name mapping, and a source with a column tag other than `comment`. A fork
+  into an existing table replaces it when its columns have the source's ids (an earlier fork),
+  recording changed tags as `set_tag` does; one created there on its own, sharing a column name
+  under another id, is refused before anything is written (the fork's files carry the source's
+  field ids, which a replace keeps by name). A list column in the legacy one-row catalog shape
+  forks into upstream's `list` and `element` rows. Official DuckLake has no fork; its closest
+  equivalent, `CREATE TABLE AS SELECT`, copies rows with new row ids.
+- **Maintenance flush** (`InlinedFlushPolicy`, carried by `DuckLakeWriteOptions`; an opt-in
+  addition of this crate): by default `merge_adjacent_files` and `rewrite_data_files` flush
+  nothing, as official's `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`; its
+  `CHECKPOINT` flushes every table first, as `DuckLakeCatalog::checkpoint` does. With a policy
+  (`InlinedFlushPolicy::when_due()`: 10,000 inlined rows and deletions, or an hour-old unflushed
+  change; or custom triggers) a merge or rewrite first flushes a due table's inlined data, as
+  `CALL ducklake_flush_inlined_data` does, then plans over the flushed table;
+  `CompactionResult::inlined_flush_snapshot` reports it. The triggers count what the flush
+  moves: the inlined rows and the inlined deletions of Parquet rows, not a retired file's
+  deletions the flush leaves inlined (see the flush above). The age is measured from the oldest
+  of them (its insert or deletion snapshot, or the first surviving snapshot after it when that
+  one was expired), each snapshot's time read as a UTC instant whatever the offset the backend
+  prints it with; PostgreSQL writers store snapshot times in UTC. A metadata provider without
+  the flush reads (a third-party one keeping the trait's defaults) has nothing to flush. A merge leaves out
+  a file with inlined deletions (merging it would lose them); `rewrite_data_files` counts them
+  towards the deleted fraction and retires a file they empty.
+
 ## Limitations
 
 - **Catalog-side filter pushdown declines a few type/backend combinations.** A
@@ -955,7 +1140,9 @@ Known edges:
   the library-specific catalog-id layout.
 - **No `AS OF` syntax:** select a catalog snapshot by ID with
   `DuckLakeCatalog::with_snapshot`, by UTC timestamp with
-  `DuckLakeCatalog::with_snapshot_at`, or select one table per query with
+  `DuckLakeCatalog::with_snapshot_at` (a stored snapshot time with a UTC offset, as PostgreSQL
+  and DuckDB print a `TIMESTAMPTZ` outside UTC, is converted to UTC; one without is read as UTC,
+  which a MySQL session outside UTC does not print), or select one table per query with
   `ducklake_table_at`. Timestamp selection uses the latest snapshot at or before the requested
   time. For snapshots with the same timestamp, an as-of or change-data end bound selects the
   highest ID, while a change-data start bound selects the lowest ID.
@@ -983,6 +1170,16 @@ Known edges:
   per-row snapshot column cannot be read). Non-encrypted catalogs emit the full
   official change-set (inserts, deletes, update pre/postimages, merged-file rows at
   their origin snapshots).
+- **Change feeds over a merged (partial) file with a damaged per-row snapshot column fail.**
+  Official's change feed reads such a file's rows with a NULL
+  `_ducklake_internal_snapshot_id` with a NULL `snapshot_id` when the window covers the whole
+  file and leaves them out otherwise, and reads a file without the column as written at its
+  `begin_snapshot` when the window covers the whole file (failing otherwise). This crate's
+  change feed fails on both. Official writers always write the column, without NULLs.
+- **Streaming write sessions write Parquet rows in the caller's order.** Official's insert
+  sorts them by `SET SORTED BY` (with `sort_on_insert` off, while inlining is enabled); a
+  `TableWriteSession` cannot without holding the whole write, so it sorts only the rows it
+  inlines. `DuckLakeTableWriter::write_rows`, `append_table` and SQL `INSERT` sort as official.
 - **Change feeds over an encrypted table whose columns evolved are refused.** A change
   feed resolves each data file's columns by field id, read from that file's parquet
   footer, so a column renamed (or dropped and re-added under the same name) after a file
@@ -1028,7 +1225,9 @@ Known edges:
   deletes (`ducklake_inlined_delete_<table_id>`) are applied by scans, `UPDATE`,
   `DELETE`, and compaction on all four backends. Row-lineage (`rowid`) scans
   include inlined rows with their stable row ids. Inlined rows resolve columns by
-  column id against the schema version their inlined table was written with, so
+  column id against the schema version their inlined table was registered for
+  (`ducklake_inlined_data_tables.schema_version` in `ducklake_schema_versions`,
+  else the table's creation, as official's `GetBeginSnapshotForSchemaVersion`), so
   a renamed column reads its old values and a column dropped and re-added under
   one name does not. Lists, structs, and maps inline on SQLite,
   DuckDB, MySQL, and the multicatalog PostgreSQL writer when every field passes

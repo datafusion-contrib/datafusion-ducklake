@@ -98,6 +98,75 @@ fn write_contract_data(writer: &dyn MetadataWriter, identity: &str) -> (i64, i64
     (setup.table_id, commit.snapshot_id)
 }
 
+/// Every option official's `ducklake_set_option` knows, with a value and the
+/// value official stores for it — the same at table and schema scope
+/// (checked with the DuckDB 1.5.5 CLI: `CALL l.set_option('<option>', <value>,
+/// table_name => 't')` and `..., schema => 'main')`).
+const EVERY_OPTION: [(&str, &str, &str); 16] = [
+    ("parquet_compression", "ZSTD", "zstd"),
+    ("parquet_compression_level", "3", "3"),
+    ("parquet_version", "2", "V2"),
+    ("parquet_row_group_size", "100", "100"),
+    ("parquet_row_group_size_bytes", "1MB", "1000000"),
+    ("target_file_size", "1MB", "1000000"),
+    ("data_inlining_row_limit", "5", "5"),
+    ("sort_on_insert", "true", "true"),
+    ("hive_file_pattern", "1", "true"),
+    ("auto_compact", "false", "false"),
+    ("rewrite_delete_threshold", "0.5", "0.500000"),
+    ("per_thread_output", "true", "true"),
+    ("write_deletion_vectors", "yes", "true"),
+    ("require_commit_message", "1", "true"),
+    ("delete_older_than", "1 day", "1 day"),
+    ("expire_older_than", "2 days", "2 days"),
+];
+
+fn assert_every_option_at_table_and_schema_scope(
+    provider: &dyn MetadataProvider,
+    writer: &dyn MetadataWriter,
+    table_id: i64,
+) {
+    let snapshot = provider.get_current_snapshot().unwrap();
+    let schema_id = provider
+        .get_schema_by_name("main", snapshot)
+        .unwrap()
+        .unwrap()
+        .schema_id;
+    for (option, value, stored) in EVERY_OPTION {
+        writer
+            .set_schema_setting(schema_id, &option.to_ascii_uppercase(), value)
+            .unwrap_or_else(|error| panic!("schema {option}: {error}"));
+        writer
+            .set_table_setting(table_id, option, value)
+            .unwrap_or_else(|error| panic!("table {option}: {error}"));
+        for (scope, settings) in [
+            (
+                "schema",
+                provider.get_metadata_settings(Some(schema_id), None),
+            ),
+            (
+                "table",
+                provider.get_metadata_settings(None, Some(table_id)),
+            ),
+        ] {
+            assert_eq!(
+                settings.unwrap().get(option).map(String::as_str),
+                Some(stored),
+                "{scope} {option}"
+            );
+        }
+    }
+    for set in [
+        writer.set_schema_setting(schema_id, "misspelled_option", "1"),
+        writer.set_table_setting(table_id, "misspelled_option", "1"),
+    ] {
+        assert_eq!(
+            set.unwrap_err().to_string(),
+            "Unsupported feature: Unsupported option misspelled_option"
+        );
+    }
+}
+
 fn assert_metadata_contract(
     provider: &dyn MetadataProvider,
     writer: &dyn MetadataWriter,
@@ -111,7 +180,7 @@ fn assert_metadata_contract(
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "Unsupported feature: unsupported table setting 'misspelled_option'"
+        "Unsupported feature: Unsupported option misspelled_option"
     );
     assert_eq!(
         provider
@@ -158,6 +227,7 @@ fn assert_metadata_contract(
             .map(String::as_str),
         Some("42"),
     );
+    assert_every_option_at_table_and_schema_scope(provider, writer, table_id);
 
     let called = AtomicBool::new(false);
     writer
@@ -973,8 +1043,9 @@ async fn postgres_single_multi_table_commit_reads_both_tables(#[case] existing: 
 
 #[cfg(any(feature = "write-duckdb", feature = "write-postgres"))]
 async fn commit_tables(writer: Arc<dyn MetadataWriter>, existing: bool) -> Vec<WriteResult> {
-    let table_writer =
-        DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new())).unwrap();
+    let table_writer = DuckLakeTableWriter::new(writer.clone(), Arc::new(LocalFileSystem::new()))
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
     let first = batch(vec![11, 23]);
     let second = batch(vec![37]);
     if existing {

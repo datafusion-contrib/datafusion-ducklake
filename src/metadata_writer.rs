@@ -62,24 +62,164 @@ pub enum WriteMode {
     Append,
 }
 
-pub(crate) fn validate_table_setting(key: &str) -> Result<String> {
+/// `value` as official's `ducklake_set_option` stores option `key`
+/// (`ducklake_set_option.cpp`), or official's error for a value it refuses.
+///
+/// This crate takes every value as text, and casts it as official casts the
+/// string literal it spells: `sort_on_insert`, `auto_compact`,
+/// `per_thread_output` and `write_deletion_vectors` are cast to `BOOLEAN`
+/// (`'T'`, `'yes'`, `'1'` are `true`) and stored as `true` or `false`;
+/// `hive_file_pattern` and `require_commit_message`, which official reads with
+/// `Value::GetValue<bool>()`, are cast to `TINYINT` and stored as `true` when
+/// not zero (`'2'` and `'0.5'` are `true`, `'0.4'` is `false`, and `'true'`
+/// or `'128'` fail to cast); `parquet_compression` is checked
+/// against official's codecs and lowercased; `parquet_version` is stored as
+/// `V1` or `V2`; `parquet_compression_level`, `parquet_row_group_size` and
+/// `data_inlining_row_limit` are cast to `UBIGINT` (`'1.5'` is `2`, a
+/// negative value fails); `target_file_size` and
+/// `parquet_row_group_size_bytes` are parsed as DuckDB's memory limits
+/// (`'512MB'`; a bare number has no unit and fails, as in official) and
+/// stored in bytes; `rewrite_delete_threshold` is cast to `DOUBLE`, checked
+/// to lie in `[0, 1]` and stored as C++'s `std::to_string` prints it
+/// (`0.500000`); `delete_older_than` and `expire_older_than` are checked to be
+/// empty or an interval. A key official does not know is refused, as
+/// official refuses it ("Unsupported option <key>").
+pub(crate) fn normalize_setting_value(key: &str, value: &str) -> Result<String> {
+    use crate::duckdb_cast::{
+        double_to_std_string, parse_memory_limit, varchar_to_boolean, varchar_to_double,
+        varchar_to_ubigint,
+    };
+    let invalid = |message: String| DuckLakeError::InvalidConfig(message);
+    let ubigint = || {
+        varchar_to_ubigint(value).ok_or_else(|| {
+            invalid(format!(
+                "Failed to cast value: Could not convert string '{value}' to UINT64"
+            ))
+        })
+    };
+    let memory_limit = || parse_memory_limit(value).map_err(invalid);
     let key = key.to_ascii_lowercase();
-    match key.as_str() {
-        "parquet_compression"
-        | "parquet_compression_level"
-        | "parquet_version"
-        | "parquet_row_group_size"
-        | "parquet_row_group_size_bytes"
-        | "target_file_size"
-        | "data_inlining_row_limit"
-        | "sort_on_insert"
-        | "hive_file_pattern"
-        | "auto_compact"
-        | "rewrite_delete_threshold" => Ok(key),
-        _ => Err(DuckLakeError::Unsupported(format!(
-            "unsupported table setting '{key}'"
-        ))),
-    }
+    Ok(match key.as_str() {
+        "parquet_compression" => {
+            const CODECS: [&str; 7] =
+                ["uncompressed", "snappy", "gzip", "zstd", "brotli", "lz4", "lz4_raw"];
+            if !CODECS.iter().any(|codec| codec.eq_ignore_ascii_case(value)) {
+                return Err(DuckLakeError::Unsupported(format!(
+                    "Unsupported codec \"{value}\" for parquet, supported options are {}",
+                    CODECS.join(", ")
+                )));
+            }
+            value.to_ascii_lowercase()
+        },
+        "parquet_version" => match ubigint()? {
+            version @ (1 | 2) => format!("V{version}"),
+            _ => {
+                return Err(DuckLakeError::Unsupported(
+                    "Only Parquet version 1 and 2 are supported".to_string(),
+                ));
+            },
+        },
+        "parquet_compression_level" | "data_inlining_row_limit" => ubigint()?.to_string(),
+        "parquet_row_group_size" => match ubigint()? {
+            0 => {
+                return Err(DuckLakeError::Unsupported(
+                    "Row group size cannot be 0".to_string(),
+                ));
+            },
+            size => size.to_string(),
+        },
+        "parquet_row_group_size_bytes" => match memory_limit()? {
+            0 => {
+                return Err(DuckLakeError::Unsupported(
+                    "Row group size bytes cannot be 0".to_string(),
+                ));
+            },
+            size => size.to_string(),
+        },
+        "target_file_size" => memory_limit()?.to_string(),
+        "rewrite_delete_threshold" => {
+            let threshold = varchar_to_double(value)
+                .ok_or_else(|| invalid(format!("Could not convert string '{value}' to DOUBLE")))?;
+            // `threshold < 0 || threshold > 1`, which a NaN passes, as in official.
+            #[allow(clippy::manual_range_contains)]
+            let out_of_range = threshold < 0.0 || threshold > 1.0;
+            if out_of_range {
+                return Err(invalid(
+                    "The rewrite_delete_threshold must be between 0 and 1".to_string(),
+                ));
+            }
+            double_to_std_string(threshold)
+        },
+        "require_commit_message" | "hive_file_pattern" => {
+            match crate::duckdb_cast::varchar_to_tinyint(value) {
+                Some(value) => (value != 0).to_string(),
+                None => {
+                    return Err(invalid(format!(
+                        "Could not convert string '{value}' to INT8"
+                    )));
+                },
+            }
+        },
+        "auto_compact" | "per_thread_output" | "write_deletion_vectors" | "sort_on_insert" => {
+            match varchar_to_boolean(value) {
+                Some(on) => on.to_string(),
+                None => {
+                    return Err(invalid(format!(
+                        "Failed to cast value: Could not convert string '{value}' to BOOL"
+                    )));
+                },
+            }
+        },
+        "delete_older_than" | "expire_older_than" => {
+            if !value.is_empty() && crate::maintenance::parse_duckdb_interval(value).is_none() {
+                return Err(invalid(format!("{key} is not a valid interval value.")));
+            }
+            value.to_string()
+        },
+        _ => {
+            return Err(DuckLakeError::Unsupported(format!(
+                "Unsupported option {key}"
+            )));
+        },
+    })
+}
+
+/// Rewrites a `sort_on_insert` or `hive_file_pattern` stored as a case
+/// variant of `true` (`TRUE`, `True`) to `true`. Releases before this one
+/// stored a setting's value as given and read these two options without
+/// regard to case, so such a value turned them on; official, and this crate
+/// now, turn them on only for exactly `true`. Writers run it when they
+/// initialise a catalog's schema; any other value already reads as official
+/// reads it. Idempotent.
+#[cfg_attr(
+    not(any(feature = "write-sqlite", feature = "write-duckdb", feature = "write-postgres")),
+    allow(dead_code)
+)]
+pub(crate) const SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS: &str = "UPDATE ducklake_metadata \
+     SET value = 'true' \
+     WHERE key IN ('sort_on_insert', 'hive_file_pattern') \
+       AND LOWER(value) = 'true' AND value <> 'true'";
+
+/// [`SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS`] for MySQL, whose default
+/// collation compares `'TRUE'` and `'trúe'` equal to `'true'`: both sides
+/// compare as bytes.
+#[cfg_attr(not(feature = "write-mysql"), allow(dead_code))]
+pub(crate) const SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS_MYSQL: &str = "UPDATE ducklake_metadata \
+     SET `value` = 'true' \
+     WHERE `key` IN ('sort_on_insert', 'hive_file_pattern') \
+       AND CAST(LOWER(`value`) AS BINARY) = 'true' AND CAST(`value` AS BINARY) <> 'true'";
+
+/// A stored `data_inlining_row_limit`, read as official reads a stored
+/// `UBIGINT` setting (DuckDB's `VARCHAR` cast), so a value another writer
+/// stored uncanonically (`'1.5'`, `' 7 '`) reads as official's does.
+pub(crate) fn stored_inlining_limit(value: &str) -> Result<usize> {
+    crate::duckdb_cast::varchar_to_ubigint(value)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .ok_or_else(|| {
+            DuckLakeError::InvalidConfig(format!(
+                "invalid data_inlining_row_limit '{value}': could not convert it to UBIGINT"
+            ))
+        })
 }
 
 /// Whether setting `key` to `value` enables data inlining: a positive
@@ -89,35 +229,57 @@ pub(crate) fn enables_inlining(key: &str, value: &str) -> bool {
         && value.trim().parse::<u64>().is_ok_and(|limit| limit > 0)
 }
 
-/// The `data_inlining_row_limit` in effect for `table_id` of `schema_id`, from
-/// the `(scope, scope_id, value)` rows of `ducklake_metadata` setting it: the
-/// table's, else its schema's, else the catalog-wide one, else the limit
-/// [`with_inlining_limit`] set for this call, as official's stored settings
-/// outrank its `DATA_INLINING_ROW_LIMIT` attach option; else official's
-/// default (`10`), which a direct `MetadataWriter` call outside a table writer
-/// gets.
-pub(crate) fn effective_inlining_limit(
+/// The stored value of one option in effect for `table_id` of `schema_id`,
+/// from the `(scope, scope_id, value)` rows of `ducklake_metadata` setting
+/// it: the table's, else its schema's, else the catalog-wide one, as
+/// official's `TryGetConfigOption` searches them; `None` when none is stored.
+pub(crate) fn scoped_setting(
     rows: &[(Option<String>, Option<i64>, String)],
     schema_id: i64,
     table_id: i64,
-) -> Result<usize> {
+) -> Option<&str> {
     let find = |scope: Option<&str>, id: Option<i64>| {
         rows.iter().find(|(row_scope, row_id, _)| {
             row_scope.as_deref() == scope && (scope.is_none() || *row_id == id)
         })
     };
-    let stored = find(Some("table"), Some(table_id))
+    find(Some("table"), Some(table_id))
         .or_else(|| find(Some("schema"), Some(schema_id)))
-        .or_else(|| find(None, None));
-    let Some((_, _, value)) = stored else {
+        .or_else(|| find(None, None))
+        .map(|(_, _, value)| value.as_str())
+}
+
+/// [`scoped_setting`] for a table and schema that may not exist yet (`None`),
+/// whose scopes then contribute nothing.
+pub(crate) fn scoped_setting_of(
+    rows: &[(Option<String>, Option<i64>, String)],
+    schema_id: Option<i64>,
+    table_id: Option<i64>,
+) -> Option<String> {
+    // `-1` names no schema or table: catalog ids are never negative.
+    scoped_setting(rows, schema_id.unwrap_or(-1), table_id.unwrap_or(-1)).map(str::to_string)
+}
+
+/// The `data_inlining_row_limit` in effect for `table_id` of `schema_id`, from
+/// the `(scope, scope_id, value)` rows of `ducklake_metadata` setting it: the
+/// table's, else its schema's, else the catalog-wide one, else the limit
+/// [`with_inlining_limit`] set for this call (a table writer's or the
+/// metadata writer's own, [`MetadataWriter::data_inlining_row_limit`]), as
+/// official's stored settings outrank its `DATA_INLINING_ROW_LIMIT` attach
+/// option; else official's default (`10`).
+///
+/// `schema_id` or `table_id` may name nothing (a table or schema a write is
+/// about to create): its scope then contributes nothing.
+pub(crate) fn effective_inlining_limit(
+    rows: &[(Option<String>, Option<i64>, String)],
+    schema_id: i64,
+    table_id: i64,
+) -> Result<usize> {
+    let Some(value) = scoped_setting(rows, schema_id, table_id) else {
         return Ok(inlining_limit_override()
             .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT));
     };
-    value.trim().parse::<usize>().map_err(|_| {
-        DuckLakeError::InvalidConfig(format!(
-            "invalid data_inlining_row_limit '{value}': expected a non-negative integer"
-        ))
-    })
+    stored_inlining_limit(value)
 }
 
 thread_local! {
@@ -131,11 +293,12 @@ thread_local! {
 /// table or schema version or checks reserved column names, where the catalog
 /// stores no setting of it, as official's `DATA_INLINING_ROW_LIMIT` attach
 /// option applies: a stored table, schema or catalog-wide setting outranks it
-/// ([`effective_inlining_limit`]). `None` falls back to official's default.
-/// SQL `CREATE TABLE` and partitioning changes pass the limit
+/// ([`effective_inlining_limit`]). `None` falls back to the metadata
+/// writer's own limit ([`with_writer_inlining_limit`]), else official's
+/// default. SQL `CREATE TABLE` and partitioning changes pass the limit
 /// `DuckLakeCatalog::with_write_options` set, `None` when unset; a
-/// `DuckLakeTableWriter` passes its own limit, `0` unless configured, so a SQL
-/// `INSERT`, which writes through one, passes the limit its table resolved.
+/// `DuckLakeTableWriter` passes its own limit, else its metadata writer's, so a
+/// SQL `INSERT`, which writes through one, passes the limit its table resolved.
 pub(crate) fn with_inlining_limit<T>(limit: Option<usize>, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<usize>);
     impl Drop for Restore {
@@ -151,6 +314,57 @@ pub(crate) fn with_inlining_limit<T>(limit: Option<usize>, f: impl FnOnce() -> T
 /// this thread.
 pub(crate) fn inlining_limit_override() -> Option<usize> {
     INLINING_LIMIT.with(std::cell::Cell::get)
+}
+
+/// Run `f`, a call of a metadata writer configured with `configured` as its
+/// [`MetadataWriter::data_inlining_row_limit`], with that limit as the one
+/// [`effective_inlining_limit`] falls back on, unless a caller in this crate
+/// already set one for the call ([`with_inlining_limit`]), which is the
+/// writer's limit or a table writer's own.
+#[cfg_attr(
+    not(any(feature = "write-sqlite", feature = "write-mysql", feature = "write-postgres")),
+    allow(dead_code)
+)]
+pub(crate) fn with_writer_inlining_limit<T>(configured: Option<usize>, f: impl FnOnce() -> T) -> T {
+    let _scope = WriterInliningLimitScope::enter(configured);
+    f()
+}
+
+/// [`with_writer_inlining_limit`] for as long as the value lives, for a
+/// writer whose calls hold a guard (a locked connection) rather than run a
+/// closure. Drop it on the thread that entered it.
+pub(crate) struct WriterInliningLimitScope(Option<Option<usize>>);
+
+impl WriterInliningLimitScope {
+    pub(crate) fn enter(configured: Option<usize>) -> Self {
+        match (inlining_limit_override(), configured) {
+            (None, Some(limit)) => {
+                Self(Some(INLINING_LIMIT.with(|cell| cell.replace(Some(limit)))))
+            },
+            _ => Self(None),
+        }
+    }
+}
+
+impl Drop for WriterInliningLimitScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0 {
+            INLINING_LIMIT.with(|cell| cell.set(previous));
+        }
+    }
+}
+
+/// The scoped `data_inlining_row_limit` of `table_name` in `schema_name`,
+/// resolved from `rows` (the `(scope, scope_id, value)` rows of
+/// `ducklake_metadata` setting it) as [`effective_inlining_limit`] does, where
+/// `ids` are the live schema's and table's ids when they exist.
+pub(crate) fn effective_inlining_limit_of(
+    rows: &[(Option<String>, Option<i64>, String)],
+    schema_id: Option<i64>,
+    table_id: Option<i64>,
+) -> Result<usize> {
+    // `-1` names no schema or table: catalog ids are never negative.
+    effective_inlining_limit(rows, schema_id.unwrap_or(-1), table_id.unwrap_or(-1))
 }
 
 /// The columns an inlined data table of a table with `columns` (its live
@@ -262,6 +476,21 @@ pub(crate) const SQL_GLOBAL_INLINING_COLUMNS: &str = "SELECT t.table_name, c.col
            WHERE m.key = 'data_inlining_row_limit' AND m.value = '0'
              AND ((m.scope = 'table' AND m.scope_id = t.table_id)
                   OR (m.scope = 'schema' AND m.scope_id = t.schema_id)))
+     ORDER BY t.table_id, c.column_order";
+
+/// `(table name, column name)` of the live top-level columns of every live
+/// table of the schema whose id binds the placeholder that a schema-scoped
+/// inlining limit applies to: those without a table-scoped limit of `0`, as
+/// official's `ValidateTablesInSchema` skips for a schema-scoped option.
+pub(crate) const SQL_SCHEMA_INLINING_COLUMNS: &str = "SELECT t.table_name, c.column_name
+     FROM ducklake_table t
+     JOIN ducklake_column c ON c.table_id = t.table_id
+     WHERE t.schema_id = ? AND t.end_snapshot IS NULL
+       AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+       AND NOT EXISTS (
+           SELECT 1 FROM ducklake_metadata m
+           WHERE m.key = 'data_inlining_row_limit' AND m.value = '0'
+             AND m.scope = 'table' AND m.scope_id = t.table_id)
      ORDER BY t.table_id, c.column_order";
 
 /// Refuse to enable data inlining over `columns` (`(table name, column name)`)
@@ -529,6 +758,58 @@ pub struct ColumnDef {
     pub(crate) default_value_type: Option<String>,
     /// SQL dialect recorded for interoperability
     pub(crate) default_value_dialect: Option<String>,
+    /// The catalog rows this column and its nested fields copy, depth first,
+    /// when it reproduces another table's column: their exact types (`json`,
+    /// `geometry`, `timetz`, ... which the Arrow type cannot tell apart),
+    /// nullability and defaults.
+    pub(crate) catalog_nodes: Option<Vec<CatalogNode>>,
+}
+
+/// Tags a registration gives the table it registers
+/// ([`MetadataWriter::register_existing_data_files_with_tags`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CarriedTags {
+    /// `(key, value)` of the table's tags.
+    pub table: Vec<(String, Option<String>)>,
+    /// `(column_id, key, value)` of its columns' tags.
+    pub columns: Vec<(i64, String, Option<String>)>,
+}
+
+impl CarriedTags {
+    /// Whether there is no tag to record.
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty() && self.columns.is_empty()
+    }
+
+    /// The tags in a canonical order, for comparing two sets of them.
+    #[cfg_attr(not(feature = "write-postgres"), allow(dead_code))]
+    pub(crate) fn sorted(&self) -> SortedTags {
+        let mut table = self.table.clone();
+        table.sort();
+        let mut columns = self.columns.clone();
+        columns.sort();
+        (table, columns)
+    }
+}
+
+/// A table's and its columns' tags in canonical order
+/// ([`CarriedTags::sorted`]).
+#[cfg_attr(not(feature = "write-postgres"), allow(dead_code))]
+pub(crate) type SortedTags = (
+    Vec<(String, Option<String>)>,
+    Vec<(i64, String, Option<String>)>,
+);
+
+/// One catalog row a [`ColumnDef`] copies ([`ColumnDef::catalog_nodes`]).
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogNode {
+    pub ducklake_type: String,
+    pub is_nullable: bool,
+    pub initial_default: Option<String>,
+    pub default_value: Option<String>,
+    pub default_value_type: Option<String>,
+    pub default_value_dialect: Option<String>,
 }
 
 impl ColumnDef {
@@ -571,6 +852,7 @@ impl ColumnDef {
             default_value: None,
             default_value_type: None,
             default_value_dialect: None,
+            catalog_nodes: None,
         })
     }
 
@@ -598,7 +880,33 @@ impl ColumnDef {
             default_value: None,
             default_value_type: None,
             default_value_dialect: None,
+            catalog_nodes: None,
         })
+    }
+
+    #[cfg_attr(not(feature = "write-postgres"), allow(dead_code))]
+    /// The column `data_type` named `name` copying the catalog rows `nodes`
+    /// (the column's own, then its nested fields', depth first): their types,
+    /// nullability and defaults are recorded as they are.
+    pub(crate) fn copying(
+        name: &str,
+        data_type: &DataType,
+        nodes: Vec<CatalogNode>,
+    ) -> Result<Self> {
+        let root = nodes.first().ok_or_else(|| {
+            DuckLakeError::Internal(format!("column '{name}' copies no catalog row"))
+        })?;
+        let mut column = Self::from_arrow(name, data_type, root.is_nullable)?;
+        column.initial_default.clone_from(&root.initial_default);
+        column.default_value.clone_from(&root.default_value);
+        column
+            .default_value_type
+            .clone_from(&root.default_value_type);
+        column
+            .default_value_dialect
+            .clone_from(&root.default_value_dialect);
+        column.catalog_nodes = Some(nodes);
+        Ok(column)
     }
 
     /// Set a DuckLake literal default for this column.
@@ -640,6 +948,19 @@ pub(crate) struct ExistingCatalogColumn {
     pub parent_column: Option<i64>,
 }
 
+/// The names of `existing`'s top-level columns a write proposing
+/// `column_ids` drops.
+pub(crate) fn dropped_top_level_columns<'a>(
+    existing: &'a [ExistingCatalogColumn],
+    column_ids: &[i64],
+) -> Vec<&'a str> {
+    existing
+        .iter()
+        .filter(|column| column.parent_column.is_none() && !column_ids.contains(&column.column_id))
+        .map(|column| column.name.as_str())
+        .collect()
+}
+
 pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogColumnDef>> {
     let mut result = Vec::new();
     for column in columns {
@@ -658,6 +979,26 @@ pub(crate) fn catalog_column_defs(columns: &[ColumnDef]) -> Result<Vec<CatalogCo
             .clone_from(&column.default_value_type);
         root.default_value_dialect
             .clone_from(&column.default_value_dialect);
+        if let Some(nodes) = &column.catalog_nodes {
+            let defs = &mut result[root_index..];
+            if defs.len() != nodes.len() {
+                return Err(DuckLakeError::Internal(format!(
+                    "column '{}' copies {} catalog rows for {} nodes",
+                    column.name,
+                    nodes.len(),
+                    defs.len()
+                )));
+            }
+            for (def, node) in defs.iter_mut().zip(nodes) {
+                def.ducklake_type.clone_from(&node.ducklake_type);
+                def.is_nullable = node.is_nullable;
+                def.initial_default.clone_from(&node.initial_default);
+                def.default_value.clone_from(&node.default_value);
+                def.default_value_type.clone_from(&node.default_value_type);
+                def.default_value_dialect
+                    .clone_from(&node.default_value_dialect);
+            }
+        }
     }
     Ok(result)
 }
@@ -938,6 +1279,18 @@ pub(crate) fn assign_column_ids(
         .collect())
 }
 
+/// Whether `proposed` (depth first, with `field_ids`) changes the live
+/// columns `existing` (ordered by `column_order`, with
+/// `existing_nullability`): a commit carrying it is DDL.
+///
+/// Columns are matched by id, never by position: official DuckLake numbers
+/// `column_order` by column id, so a struct field added after a later
+/// top-level column sorts after it, where a depth-first listing puts it
+/// before. A column differs in its name, type (beyond a widening a promote
+/// already made), parent, top-level nullability, or its place among its
+/// siblings. A nested field's nullability is not compared: the Arrow schema a
+/// data write proposes reads nested fields as nullable whatever the catalog
+/// says.
 pub(crate) fn catalog_columns_differ(
     existing: &[ExistingCatalogColumn],
     existing_nullability: &[bool],
@@ -950,20 +1303,124 @@ pub(crate) fn catalog_columns_differ(
     {
         return true;
     }
-    existing
+    let by_id: HashMap<i64, (&ExistingCatalogColumn, bool)> = existing
         .iter()
         .zip(existing_nullability)
-        .zip(proposed.iter().zip(field_ids))
-        .any(|((existing, existing_nullable), (proposed, field_id))| {
-            let parent_id = proposed.parent_index.map(|index| field_ids[index]);
-            let same_type = catalog_column_type_equal(&existing.ducklake_type, proposed)
-                || crate::types::is_promotable(&proposed.ducklake_type, &existing.ducklake_type);
-            existing.column_id != *field_id
-                || existing.name != proposed.name
-                || !same_type
-                || *existing_nullable != proposed.is_nullable
-                || existing.parent_column != parent_id
-        })
+        .map(|(column, nullable)| (column.column_id, (column, *nullable)))
+        .collect();
+    let column_differs = proposed.iter().zip(field_ids).any(|(proposed, field_id)| {
+        let Some((existing, existing_nullable)) = by_id.get(field_id) else {
+            return true;
+        };
+        let parent_id = proposed.parent_index.map(|index| field_ids[index]);
+        let same_type = catalog_column_type_equal(&existing.ducklake_type, proposed)
+            || crate::types::is_promotable(&proposed.ducklake_type, &existing.ducklake_type);
+        existing.name != proposed.name
+            || !same_type
+            || (proposed.parent_index.is_none() && *existing_nullable != proposed.is_nullable)
+            || existing.parent_column != parent_id
+    });
+    column_differs || !keeps_sibling_order(existing, proposed, field_ids)
+}
+
+/// Whether a staged write's columns (`proposed`, depth first, with
+/// `field_ids`) are still the live ones (`existing`, with
+/// `existing_nullability`), matched by id: the same columns, types and
+/// parents, and the same top-level nullability. Order is not compared: a
+/// staged batch binds its columns by id.
+pub(crate) fn staged_columns_match(
+    existing: &[ExistingCatalogColumn],
+    existing_nullability: &[bool],
+    proposed: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> bool {
+    if existing.len() != proposed.len()
+        || existing.len() != existing_nullability.len()
+        || proposed.len() != field_ids.len()
+    {
+        return false;
+    }
+    let by_id: HashMap<i64, (&ExistingCatalogColumn, bool)> = existing
+        .iter()
+        .zip(existing_nullability)
+        .map(|(column, nullable)| (column.column_id, (column, *nullable)))
+        .collect();
+    proposed.iter().zip(field_ids).all(|(proposed, field_id)| {
+        let Some((existing, existing_nullable)) = by_id.get(field_id) else {
+            return false;
+        };
+        catalog_column_type_equal(&existing.ducklake_type, proposed)
+            && (proposed.parent_index.is_some() || *existing_nullable == proposed.is_nullable)
+            && existing.parent_column == proposed.parent_index.map(|index| field_ids[index])
+    })
+}
+
+/// Whether the proposed columns keep the live ones (`existing`, ordered by
+/// `column_order`) in their order among their siblings.
+fn keeps_sibling_order(
+    existing: &[ExistingCatalogColumn],
+    proposed: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> bool {
+    let live: HashSet<i64> = existing.iter().map(|column| column.column_id).collect();
+    let proposed_ids: HashSet<i64> = field_ids.iter().copied().collect();
+    let mut existing_siblings: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
+    for column in existing
+        .iter()
+        .filter(|column| proposed_ids.contains(&column.column_id))
+    {
+        existing_siblings
+            .entry(column.parent_column)
+            .or_default()
+            .push(column.column_id);
+    }
+    let mut proposed_siblings: HashMap<Option<i64>, Vec<i64>> = HashMap::new();
+    for (column, field_id) in proposed.iter().zip(field_ids) {
+        if live.contains(field_id) {
+            proposed_siblings
+                .entry(column.parent_index.map(|index| field_ids[index]))
+                .or_default()
+                .push(*field_id);
+        }
+    }
+    proposed_siblings == existing_siblings
+}
+
+/// The `column_order` each proposed column (depth first, with `field_ids`)
+/// takes, given the live columns `existing` (with `existing_orders`). A live
+/// column keeps its order and a new one takes its column id, as official
+/// numbers every column it creates (`column_order = column_id`), so a commit
+/// renumbers no live column. Only when that would not order some column's
+/// siblings as proposed (a live column moved among them, or a new one placed
+/// before a live one numbered higher) does every column take its depth-first
+/// position, an order official, which never reorders columns, has no rule
+/// for.
+pub(crate) fn proposed_column_orders(
+    existing: &[ExistingCatalogColumn],
+    existing_orders: &[i64],
+    proposed: &[CatalogColumnDef],
+    field_ids: &[i64],
+) -> Vec<i64> {
+    let current: HashMap<i64, i64> = existing
+        .iter()
+        .zip(existing_orders)
+        .map(|(column, order)| (column.column_id, *order))
+        .collect();
+    let orders: Vec<i64> = field_ids
+        .iter()
+        .map(|field_id| current.get(field_id).copied().unwrap_or(*field_id))
+        .collect();
+    // The last order given among each parent's children, in proposed order.
+    let mut last: HashMap<Option<usize>, i64> = HashMap::new();
+    let ordered = proposed.iter().zip(&orders).all(|(column, order)| {
+        let previous = last.insert(column.parent_index, *order);
+        previous.is_none_or(|previous| previous < *order)
+    });
+    if ordered {
+        orders
+    } else {
+        (0..proposed.len() as i64).collect()
+    }
 }
 
 /// Whether `proposed` is a *schema change* relative to `existing` — i.e. whether a
@@ -1532,8 +1989,9 @@ impl DeleteFileInfo {
 
 /// One file of a [`MetadataWriter::register_existing_data_files`] batch: an
 /// already-written data file to adopt, plus the positional delete file that
-/// travels with it.
+/// travels with it. Build it with [`PromotedFile::new`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PromotedFile {
     /// The data file to register.
     pub file: DataFileInfo,
@@ -1541,6 +1999,11 @@ pub struct PromotedFile {
     /// hanging off the `data_file_id` this call assigns. `None` when the source
     /// file has no live deletes.
     pub delete: Option<DeleteFileInfo>,
+    /// The file's `partial_max`: the largest insert snapshot of the rows it
+    /// embeds (a flushed or merged file), whose readers then take each row's
+    /// snapshot from its embedded column. `None` registers `NULL`. Only
+    /// multi-catalog PostgreSQL registers it; the other writers refuse it.
+    pub partial_max: Option<i64>,
 }
 
 impl PromotedFile {
@@ -1549,12 +2012,19 @@ impl PromotedFile {
         Self {
             file,
             delete: None,
+            partial_max: None,
         }
     }
 
     /// Attach the file's existing positional delete file.
     pub fn with_delete(mut self, delete: DeleteFileInfo) -> Self {
         self.delete = Some(delete);
+        self
+    }
+
+    /// Register the file's `partial_max` ([`Self::partial_max`]).
+    pub fn with_partial_max(mut self, partial_max: Option<i64>) -> Self {
+        self.partial_max = partial_max;
         self
     }
 }
@@ -2690,11 +3160,108 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// Replace a supported write option on a live table.
+    /// Replace a catalog option on a live table, as official's
+    /// `ducklake_set_option(..., table_name => ...)` does. Every option
+    /// official knows is accepted, cast as official casts it; an unknown one
+    /// fails with official's "Unsupported option" error.
+    ///
+    /// A table-scoped `data_inlining_row_limit` outranks the schema's, the
+    /// catalog-wide one and [`Self::data_inlining_row_limit`]. Setting it to
+    /// `0` is how a table whose column is named like an inlined data table's
+    /// system column (`row_id`, `begin_snapshot`, ...) keeps writing while the
+    /// rest of the catalog inlines; enabling inlining over such a table is
+    /// refused, as official refuses it.
     fn set_table_setting(&self, _table_id: i64, _key: &str, _value: &str) -> Result<()> {
         Err(DuckLakeError::Unsupported(
             "table-scoped settings are not supported by this metadata backend".to_string(),
         ))
+    }
+
+    /// Replace a catalog option on a live schema, as official's
+    /// `ducklake_set_option(..., schema => ...)` does: it applies to every table
+    /// of the schema without a table-scoped value of its own. Every option
+    /// official knows is accepted, as at table scope.
+    ///
+    /// Enabling inlining (a positive `data_inlining_row_limit`) is refused when
+    /// a table of the schema without a table-scoped limit of `0` has a column
+    /// named like an inlined data table's system column, as official refuses it.
+    fn set_schema_setting(&self, _schema_id: i64, _key: &str, _value: &str) -> Result<()> {
+        Err(DuckLakeError::Unsupported(
+            "schema-scoped settings are not supported by this metadata backend".to_string(),
+        ))
+    }
+
+    /// The `data_inlining_row_limit` this writer applies where the catalog
+    /// stores none at table, schema or catalog scope, as official's
+    /// `DATA_INLINING_ROW_LIMIT` attach option applies; `None` when unset, in
+    /// which case official's default ([`DEFAULT_DATA_INLINING_ROW_LIMIT`],
+    /// `10`) applies.
+    ///
+    /// Every write through this writer resolves its limit the same way: SQL
+    /// writes through a catalog built on it, every [`DuckLakeTableWriter`]
+    /// write and streaming session, and direct calls of this trait (creating
+    /// a table's inlined data table for a new schema version, refusing
+    /// reserved column names, [`Self::register_existing_data_files`],
+    /// [`Self::promote_column_type`], [`Self::set_partition_spec`] and the
+    /// rest). Concrete writers set it with their `with_data_inlining_row_limit`
+    /// builder.
+    ///
+    /// Default: `None`. A writer wrapping another must forward it.
+    ///
+    /// A [`DuckLakeTableWriter`] whose own limit differs passes it to the
+    /// metadata calls it makes on the calling thread, for the duration of
+    /// each call. A writer wrapping another must therefore call the inner
+    /// writer on that same thread: a call moved to another thread (a spawned
+    /// task, `spawn_blocking`) resolves its limit without the table writer's,
+    /// from the catalog's stored settings and the inner writer's own limit.
+    ///
+    /// [`DEFAULT_DATA_INLINING_ROW_LIMIT`]: crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT
+    /// [`DuckLakeTableWriter`]: crate::DuckLakeTableWriter
+    fn data_inlining_row_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// The `data_inlining_row_limit` in effect for `table_name` in
+    /// `schema_name`: the table's stored setting, else its schema's, else the
+    /// catalog-wide one, else [`Self::data_inlining_row_limit`], else `10`, as
+    /// official's `DataInliningRowLimit` resolves it. A table or schema that
+    /// does not exist yet contributes no setting.
+    ///
+    /// Default: [`Self::data_inlining_row_limit`], else `10`, reading no
+    /// stored setting.
+    fn table_data_inlining_row_limit(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+    ) -> Result<usize> {
+        Ok(inlining_limit_override()
+            .or(self.data_inlining_row_limit())
+            .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT))
+    }
+
+    /// The stored value of option `key` (lowercase, as official stores it)
+    /// in effect for `table_name` in `schema_name`: the table's setting, else
+    /// its schema's, else the catalog-wide one (on multi-catalog PostgreSQL,
+    /// the catalog-scoped one), as official's `TryGetConfigOption` searches
+    /// them; `None` when none is stored. A table or schema that does not
+    /// exist yet contributes no setting.
+    ///
+    /// Every [`DuckLakeTableWriter`] write reads `sort_on_insert` through it,
+    /// so a setting stored with [`Self::set_table_setting`],
+    /// [`Self::set_schema_setting`] or [`Self::set_global_setting`] (or by
+    /// official's `set_option`) decides whether an insert sorts.
+    ///
+    /// Default: `None`, reading no stored setting; every writer in this crate
+    /// implements it.
+    ///
+    /// [`DuckLakeTableWriter`]: crate::DuckLakeTableWriter
+    fn table_setting(
+        &self,
+        _schema_name: &str,
+        _table_name: &str,
+        _key: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Declare table columns that every physical inlined-data table should
@@ -2904,11 +3471,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// `fields` must be non-empty (use
     /// [`reset_sort_spec`](MetadataWriter::reset_sort_spec) to remove a spec).
     ///
-    /// Unlike [`set_partition_spec`](MetadataWriter::set_partition_spec), this does
-    /// **not** bump `schema_version`: DuckLake treats a sort-order change as
-    /// metadata that does not alter the logical schema (existing readers are
-    /// unaffected — sort order only influences how *future* writes are laid out).
-    /// Existing data files are left untouched. Returns the new snapshot id.
+    /// As official's `SET SORTED BY`, the snapshot bumps `schema_version` and
+    /// records `altered_table`, but adds no `ducklake_schema_versions` row: the
+    /// table's columns are unchanged, so its inlined data table stays the one
+    /// it has. Existing data files are left untouched. Returns the new snapshot
+    /// id.
     ///
     /// Default: unsupported; writable backends override it.
     fn set_sort_spec(&self, _table_id: i64, _fields: &[crate::sort::SortField]) -> Result<i64> {
@@ -2921,11 +3488,11 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// BY`.
     ///
     /// In one transaction: create a new snapshot and end the currently-live
-    /// `ducklake_sort_info` row (a no-op if none is live). Does not bump
-    /// `schema_version` (see [`set_sort_spec`](MetadataWriter::set_sort_spec)).
+    /// `ducklake_sort_info` row, if one is live. As official's `RESET SORTED BY`,
+    /// the snapshot bumps `schema_version` and records `altered_table` even when
+    /// no order was set (see [`set_sort_spec`](MetadataWriter::set_sort_spec)).
     /// Existing data files keep whatever order they were written in; only
-    /// subsequent writes are unsorted. Returns the new snapshot id (or the current
-    /// head if there was nothing to reset).
+    /// subsequent writes are unsorted. Returns the new snapshot id.
     ///
     /// Default: unsupported; writable backends override it.
     fn reset_sort_spec(&self, _table_id: i64) -> Result<i64> {
@@ -3195,6 +3762,12 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// into since `base_snapshot`, as official DuckLake's delete refuses those
     /// (`CheckForConflicts`). Otherwise end the prior delete file and insert
     /// `delete`, which must carry the cumulative position set.
+    ///
+    /// Sees only Parquet data and delete files, never inlined rows or inlined
+    /// deletions. On a table with data inlining enabled, use
+    /// [`DuckLakeTable::keyed_mutation`](crate::DuckLakeTable::keyed_mutation), a
+    /// scan, or [`DuckLakeTable::locate_rowids`](crate::DuckLakeTable::locate_rowids)
+    /// instead.
     ///
     /// Default: unsupported; backends override it.
     #[allow(clippy::too_many_arguments)]
@@ -3907,6 +4480,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     ) -> Result<CommitIds> {
         let no_layout = layout.is_none_or(PromoteLayout::is_empty);
         match files {
+            [only] if only.partial_max.is_some() => Err(DuckLakeError::Unsupported(
+                "this metadata writer cannot register a promoted file's partial_max".to_string(),
+            )),
             [only] if no_layout => self.register_existing_data_file_with_delete(
                 schema_name,
                 table_name,
@@ -3921,6 +4497,42 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
                     .to_string(),
             )),
         }
+    }
+
+    /// [`register_existing_data_files`](MetadataWriter::register_existing_data_files)
+    /// that also gives the registered table exactly `tags` (its comment among
+    /// them) in the same commit, ending any other tag it had: a table fork
+    /// carries its source's tags.
+    ///
+    /// Default: with no tags, `register_existing_data_files`; otherwise
+    /// unsupported. Multi-catalog PostgreSQL implements it.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    fn register_existing_data_files_with_tags(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        files: &[PromotedFile],
+        layout: Option<&PromoteLayout>,
+        mode: WriteMode,
+        tags: &CarriedTags,
+    ) -> Result<CommitIds> {
+        if !tags.is_empty() {
+            return Err(DuckLakeError::Unsupported(
+                "this metadata writer cannot record tags with a registration".to_string(),
+            ));
+        }
+        self.register_existing_data_files(
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            files,
+            layout,
+            mode,
+        )
     }
 
     /// Publish a write's snapshot as the catalog head with no data file (CREATE
@@ -4030,6 +4642,139 @@ mod tests {
     use crate::DuckLakeError;
     use arrow::datatypes::Field;
     use std::sync::Arc;
+
+    fn proposed_def(name: &str, parent_index: Option<usize>) -> CatalogColumnDef {
+        CatalogColumnDef {
+            name: name.to_string(),
+            ducklake_type: "int32".to_string(),
+            logical_type: "int32".to_string(),
+            is_nullable: true,
+            parent_index,
+            initial_default: None,
+            default_value: None,
+            default_value_type: None,
+            default_value_dialect: None,
+        }
+    }
+
+    fn live_column(
+        column_id: i64,
+        name: &str,
+        parent_column: Option<i64>,
+    ) -> ExistingCatalogColumn {
+        ExistingCatalogColumn {
+            column_id,
+            name: name.to_string(),
+            ducklake_type: "int32".to_string(),
+            parent_column,
+        }
+    }
+
+    /// A new column, top-level or nested, takes its column id as its order,
+    /// as official numbers every column; live columns keep theirs, also when
+    /// an earlier writer numbered them otherwise.
+    #[test]
+    fn new_columns_take_their_id_as_order() {
+        // `a`, `s STRUCT(x)` as official numbered them; `c` (4) was dropped.
+        let existing =
+            [live_column(1, "a", None), live_column(2, "s", None), live_column(3, "x", Some(2))];
+        let proposed = [
+            proposed_def("a", None),
+            proposed_def("s", None),
+            proposed_def("x", Some(1)),
+            proposed_def("y", Some(1)),
+            proposed_def("d", None),
+        ];
+        assert_eq!(
+            proposed_column_orders(&existing, &[1, 2, 3], &proposed, &[1, 2, 3, 5, 6]),
+            vec![1, 2, 3, 5, 6]
+        );
+        // Orders numbered from 0 by an earlier writer stay as they are.
+        assert_eq!(
+            proposed_column_orders(&existing, &[0, 1, 2], &proposed, &[1, 2, 3, 5, 6]),
+            vec![0, 1, 2, 5, 6]
+        );
+        // A table's first columns.
+        assert_eq!(
+            proposed_column_orders(&[], &[], &proposed[..3], &[1, 2, 3]),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// A live column moved among its siblings changes the table; one kept in
+    /// place beside a dropped or added sibling does not.
+    #[test]
+    fn keeps_sibling_order_compares_live_siblings_only() {
+        let existing = [
+            live_column(1, "a", None),
+            live_column(2, "s", None),
+            live_column(3, "x", Some(2)),
+            live_column(4, "z", None),
+        ];
+        let kept = [
+            proposed_def("a", None),
+            proposed_def("s", None),
+            proposed_def("x", Some(1)),
+            proposed_def("c", Some(1)),
+            proposed_def("z", None),
+        ];
+        assert!(keeps_sibling_order(&existing, &kept, &[1, 2, 3, 5, 4]));
+        let dropped = [proposed_def("a", None), proposed_def("z", None)];
+        assert!(keeps_sibling_order(&existing, &dropped, &[1, 4]));
+        let moved = [
+            proposed_def("z", None),
+            proposed_def("a", None),
+            proposed_def("s", None),
+            proposed_def("x", Some(2)),
+        ];
+        assert!(!keeps_sibling_order(&existing, &moved, &[4, 1, 2, 3]));
+    }
+
+    /// Siblings must keep the proposed order: a live column moved among them,
+    /// or a new one before a live sibling numbered higher, renumbers every
+    /// column by depth-first position; siblings under different parents are
+    /// ordered apart.
+    #[test]
+    fn sibling_order_decides_between_ids_and_positions() {
+        let existing = [live_column(1, "a", None), live_column(5, "b", None)];
+        let orders = [1, 5];
+        // A new column between two live ones with ids around its own.
+        let between = [proposed_def("a", None), proposed_def("n", None), proposed_def("b", None)];
+        assert_eq!(
+            proposed_column_orders(&existing, &orders, &between, &[1, 3, 5]),
+            vec![1, 3, 5]
+        );
+        // A new column numbered after a live one it precedes.
+        assert_eq!(
+            proposed_column_orders(&existing, &orders, &between, &[1, 9, 5]),
+            vec![0, 1, 2]
+        );
+        // Two live columns swapped.
+        let swapped = [proposed_def("b", None), proposed_def("a", None)];
+        assert_eq!(
+            proposed_column_orders(&existing, &orders, &swapped, &[5, 1]),
+            vec![0, 1]
+        );
+        // A struct field added after a later top-level column is numbered
+        // after it, and in order among its own siblings.
+        let live = [
+            live_column(1, "a", None),
+            live_column(2, "s", None),
+            live_column(3, "x", Some(2)),
+            live_column(4, "z", None),
+        ];
+        let nested = [
+            proposed_def("a", None),
+            proposed_def("s", None),
+            proposed_def("x", Some(1)),
+            proposed_def("c", Some(1)),
+            proposed_def("z", None),
+        ];
+        assert_eq!(
+            proposed_column_orders(&live, &[1, 2, 3, 4], &nested, &[1, 2, 3, 5, 4]),
+            vec![1, 2, 3, 5, 4]
+        );
+    }
 
     /// Official's table-level conflict check: inserts before deletions, each
     /// against the other changes in official's order, across every snapshot

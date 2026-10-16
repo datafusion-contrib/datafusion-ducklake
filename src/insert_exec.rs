@@ -52,13 +52,18 @@ pub struct DuckLakeInsertExec {
     /// Write-layout options applied to the DuckLakeTableWriter built at execute
     /// time (compression, row-group caps, file-rollover target).
     write_options: crate::table_writer::DuckLakeWriteOptions,
-    /// The sort order this insert requires of its input (the table's live sort
-    /// spec). Declared via `required_input_ordering` so DataFusion's EnforceSorting
+    /// The sort order this insert requires of its input: the table's live sort
+    /// spec, when the plan sorts by it (`None` leaves any sort to the writer).
+    /// Declared via `required_input_ordering` so DataFusion's EnforceSorting
     /// keeps the input sorted instead of pruning the SortExec as unused.
     required_ordering: Option<datafusion::physical_expr::LexOrdering>,
     /// The snapshot the statement was planned at; changes committed since it
     /// conflict with the insert, as official checks its insert.
     planned_snapshot: Option<i64>,
+    /// The `sort_on_insert` the statement was planned with, which the writer
+    /// lays the rows out under, as official reads it once, in `PlanInsert`.
+    /// `None` when the plan read none, and the writer reads it.
+    planned_sort_on_insert: Option<bool>,
     cache: Arc<PlanProperties>,
 }
 
@@ -90,12 +95,20 @@ impl DuckLakeInsertExec {
             write_options,
             required_ordering,
             planned_snapshot: None,
+            planned_sort_on_insert: None,
             cache,
         }
     }
 
     fn with_planned_snapshot_opt(mut self, snapshot_id: Option<i64>) -> Self {
         self.planned_snapshot = snapshot_id;
+        self
+    }
+
+    /// Lay the rows out under `sort_on_insert`, the value the statement was
+    /// planned with, rather than reading it again at execution.
+    pub(crate) fn with_planned_sort_on_insert(mut self, sort_on_insert: Option<bool>) -> Self {
+        self.planned_sort_on_insert = sort_on_insert;
         self
     }
 
@@ -207,7 +220,8 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 self.write_options.clone(),
                 self.required_ordering.clone(),
             )
-            .with_planned_snapshot_opt(self.planned_snapshot),
+            .with_planned_snapshot_opt(self.planned_snapshot)
+            .with_planned_sort_on_insert(self.planned_sort_on_insert),
         ))
     }
 
@@ -233,6 +247,12 @@ impl ExecutionPlan for DuckLakeInsertExec {
         let partition = self.partition.clone();
         let write_options = self.write_options.clone();
         let planned_snapshot = self.planned_snapshot;
+        // The plan sorted every row exactly when it required an ordering, so
+        // the writer sorts only when it did not, under the plan's setting.
+        let sort_plan = crate::table_writer::InsertSortPlan {
+            sort_on_insert: self.planned_sort_on_insert,
+            sorted: self.required_ordering.is_some(),
+        };
         let output_schema = make_insert_count_schema();
 
         let stream = stream::once(async move {
@@ -290,6 +310,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
                             groups,
                             &crate::table_writer::TableWriteOptions::new(),
                             Some(batches.clone()),
+                            sort_plan,
                         )
                         .await
                         .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -299,11 +320,12 @@ impl ExecutionPlan for DuckLakeInsertExec {
                 }
             }
 
-            // Write the (already sorted, if the table has a sort order) rows through
-            // the size-rolling writer: it produces one file per target_file_size and
-            // commits them in one snapshot. Only for non-empty input — an empty
-            // Replace still needs the single-file truncate marker below, and empty
-            // Append already returned above.
+            // Write the rows (sorted by the plan, or by the writer when the
+            // plan did not) through the size-rolling writer: it produces one
+            // file per target_file_size and commits them in one snapshot. Only
+            // for non-empty input — an empty Replace still needs the
+            // single-file truncate marker below, and empty Append already
+            // returned above.
             //
             // `_unpartitioned_as_planned`: reaching here means the plan resolved the
             // table as unpartitioned. If a SET PARTITIONED BY went live since, the
@@ -319,6 +341,7 @@ impl ExecutionPlan for DuckLakeInsertExec {
                         &schema_without_metadata,
                         write_mode,
                         &batches,
+                        sort_plan,
                     )
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?;

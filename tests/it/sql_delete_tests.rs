@@ -44,7 +44,10 @@ async fn new_writer(temp: &TempDir) -> SqliteMetadataWriter {
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
     let conn = format!("sqlite:{}?mode=rwc", db_path.display());
-    let writer = SqliteMetadataWriter::new_with_init(&conn).await.unwrap();
+    let writer = SqliteMetadataWriter::new_with_init(&conn)
+        .await
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     writer
 }

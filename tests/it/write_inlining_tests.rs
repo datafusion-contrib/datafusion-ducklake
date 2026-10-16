@@ -601,16 +601,18 @@ async fn duckdb_multi_table_write_commits_nested_inline_rows() {
     let columns = provider
         .get_table_structure(committed[0].table_id, committed[0].snapshot_id)
         .unwrap();
+    // Nested fields read back nullable, as official DuckLake reads them; the
+    // values are the ones written.
+    let read = provider
+        .get_inlined_data_with_row_ids(committed[0].table_id, committed[0].snapshot_id, &columns)
+        .unwrap()
+        .remove(0)
+        .batch;
     assert_eq!(
-        provider
-            .get_inlined_data_with_row_ids(
-                committed[0].table_id,
-                committed[0].snapshot_id,
-                &columns,
-            )
-            .unwrap()[0]
-            .batch,
-        batch,
+        read.column(0).as_ref(),
+        arrow::compute::cast(batch.column(0), read.schema().field(0).data_type())
+            .unwrap()
+            .as_ref(),
     );
     drop(provider);
 

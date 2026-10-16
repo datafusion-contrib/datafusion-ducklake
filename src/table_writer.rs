@@ -75,9 +75,98 @@ pub const DEFAULT_TARGET_FILE_SIZE: usize = 1 << 29;
 
 /// Default scoped `data_inlining_row_limit`, matching official DuckLake's
 /// (`DuckLakeCatalog::DataInliningRowLimit`): an insert of at most this many rows
-/// is stored in the catalog rather than in a Parquet file. Set the catalog,
-/// schema or table option to `0` to write every insert to Parquet.
+/// is stored in the catalog rather than in a Parquet file. It applies to every
+/// write path when neither the catalog (table, schema or catalog-wide option)
+/// nor the writer ([`MetadataWriter::data_inlining_row_limit`],
+/// [`DuckLakeWriteOptions::with_data_inlining_row_limit`]) sets a limit; set
+/// either to `0` to write every insert to Parquet.
 pub const DEFAULT_DATA_INLINING_ROW_LIMIT: usize = 10;
+
+/// When the routine compaction entry points
+/// ([`DuckLakeTable::merge_adjacent_files`](crate::DuckLakeTable::merge_adjacent_files)
+/// and [`DuckLakeTable::rewrite_data_files`](crate::DuckLakeTable::rewrite_data_files))
+/// first flush a table's inlined data to Parquet, as
+/// [`DuckLakeCatalog::flush_inlined_data`](crate::DuckLakeCatalog::flush_inlined_data)
+/// flushes it. An addition of this crate: official DuckLake's
+/// `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files` never
+/// flush, and only its `CHECKPOINT` and `ducklake_flush_inlined_data` do.
+///
+/// The default, [`Self::never`], matches official: a merge or rewrite leaves
+/// inlined rows and inlined deletions where they are, and
+/// [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint) or an
+/// explicit flush moves them. Opting in with [`Self::when_due`] (or the
+/// builders) makes a pass flush the table first when either trigger fires,
+/// then plan its merge or rewrite over the flushed files, so a trickle of
+/// small writes does not stay in the catalog until the next checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InlinedFlushPolicy {
+    /// Flush when the table holds at least this many live inlined rows and
+    /// inlined deletions of Parquet rows together; `None` never flushes on
+    /// count.
+    pub min_inlined_rows: Option<u64>,
+    /// Flush when the table has inlined rows or deletions and its oldest
+    /// inlined change not flushed since was committed at least this long ago;
+    /// `None` never flushes on age.
+    pub max_inlined_age: Option<std::time::Duration>,
+}
+
+impl InlinedFlushPolicy {
+    /// Row trigger of [`Self::when_due`]: `10_000` inlined rows and deletions.
+    pub const DEFAULT_MIN_INLINED_ROWS: u64 = 10_000;
+    /// Age trigger of [`Self::when_due`]: one hour.
+    pub const DEFAULT_MAX_INLINED_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Never flush from a compaction pass, as official; the default.
+    #[must_use]
+    pub const fn never() -> Self {
+        Self {
+            min_inlined_rows: None,
+            max_inlined_age: None,
+        }
+    }
+
+    /// Flush once the table holds [`Self::DEFAULT_MIN_INLINED_ROWS`] inlined
+    /// rows and inlined deletions, or its oldest unflushed inlined change is
+    /// [`Self::DEFAULT_MAX_INLINED_AGE`] old.
+    #[must_use]
+    pub const fn when_due() -> Self {
+        Self {
+            min_inlined_rows: Some(Self::DEFAULT_MIN_INLINED_ROWS),
+            max_inlined_age: Some(Self::DEFAULT_MAX_INLINED_AGE),
+        }
+    }
+
+    /// Flush whenever the table holds any inlined row or deletion.
+    #[must_use]
+    pub const fn always() -> Self {
+        Self {
+            min_inlined_rows: Some(1),
+            max_inlined_age: None,
+        }
+    }
+
+    /// Set the row trigger; `None` disables it.
+    #[must_use]
+    pub const fn with_min_inlined_rows(mut self, rows: Option<u64>) -> Self {
+        self.min_inlined_rows = rows;
+        self
+    }
+
+    /// Set the age trigger; `None` disables it.
+    #[must_use]
+    pub const fn with_max_inlined_age(mut self, age: Option<std::time::Duration>) -> Self {
+        self.max_inlined_age = age;
+        self
+    }
+}
+
+impl Default for InlinedFlushPolicy {
+    /// [`Self::never`], as official's merge and rewrite flush nothing.
+    fn default() -> Self {
+        Self::never()
+    }
+}
 
 /// Write and maintenance options carried from the catalog down to each table.
 /// A SQL `INSERT`, update rewrite, or compaction output uses the same compression,
@@ -109,7 +198,10 @@ pub struct DuckLakeWriteOptions {
     /// How many finished data files to upload concurrently; `None` leaves the
     /// writer default ([`DEFAULT_UPLOAD_CONCURRENCY`]). Clamped to at least 1.
     pub upload_concurrency: Option<usize>,
-    /// Whether inserts honor the table's active sort order.
+    /// Whether inserts honor the table's active sort order where the catalog
+    /// stores no `sort_on_insert` setting: a stored table, schema or
+    /// catalog-wide setting outranks it, as official has no session override
+    /// of its stored option ([`DuckLakeTableWriter::table_sort_on_insert`]).
     pub sort_on_insert: Option<bool>,
     /// Whether partition values appear as Hive-style directories in file paths.
     pub hive_file_pattern: Option<bool>,
@@ -117,6 +209,9 @@ pub struct DuckLakeWriteOptions {
     pub auto_compact: Option<bool>,
     /// Minimum deleted-row fraction for automatic rewrite selection.
     pub rewrite_delete_threshold: Option<f64>,
+    /// When merge and rewrite first flush the table's inlined data; `None`
+    /// takes [`InlinedFlushPolicy::default`], which never does.
+    pub inlined_flush_policy: Option<InlinedFlushPolicy>,
     deferred_error: Option<String>,
 }
 
@@ -135,11 +230,13 @@ impl DuckLakeWriteOptions {
             .flatten();
 
         Ok(Self {
-            data_inlining_row_limit: setting_usize(
-                settings,
-                "data_inlining_row_limit",
-                Some(DEFAULT_DATA_INLINING_ROW_LIMIT),
-            )?,
+            data_inlining_row_limit: Some(
+                settings
+                    .get("data_inlining_row_limit")
+                    .map(|value| crate::metadata_writer::stored_inlining_limit(value))
+                    .transpose()?
+                    .unwrap_or(DEFAULT_DATA_INLINING_ROW_LIMIT),
+            ),
             compression: Some(setting_compression(compression_name, compression_level)?),
             parquet_version: setting_parquet_version(settings)?,
             max_row_group_rows: setting_usize(settings, "parquet_row_group_size", Some(122_880))?,
@@ -151,8 +248,19 @@ impl DuckLakeWriteOptions {
             )?,
             max_open_partitions: None,
             upload_concurrency: None,
-            sort_on_insert: setting_bool(settings, "sort_on_insert", true)?,
-            hive_file_pattern: setting_bool(settings, "hive_file_pattern", true)?,
+            // Official sorts only while the option reads exactly `true`.
+            sort_on_insert: Some(
+                settings
+                    .get("sort_on_insert")
+                    .is_none_or(|value| value == "true"),
+            ),
+            // Official writes Hive-style paths only while the option reads
+            // exactly `true` (`UseHiveFilePattern`).
+            hive_file_pattern: Some(
+                settings
+                    .get("hive_file_pattern")
+                    .is_none_or(|value| value == "true"),
+            ),
             // Official compacts and flushes a table only while its option
             // reads exactly `true`; any other value turns them off.
             auto_compact: Some(
@@ -165,6 +273,7 @@ impl DuckLakeWriteOptions {
                 "rewrite_delete_threshold",
                 Some(0.95),
             )?,
+            inlined_flush_policy: None,
             deferred_error: None,
         })
     }
@@ -176,16 +285,28 @@ impl DuckLakeWriteOptions {
         })
     }
 
-    /// Sets the maximum row count for catalog-backed inlining. Where the
-    /// catalog stores no limit, a [`DuckLakeTableWriter`] given it applies it
-    /// to reserved column names and to creating inlined data tables, as
-    /// official applies its `DATA_INLINING_ROW_LIMIT` attach option. Whether
-    /// the writer's own inserts are inlined is decided by this limit alone,
-    /// whatever the catalog stores; a SQL `INSERT` resolves the stored limit
-    /// first. A writer without it uses `0`.
+    /// Sets the `data_inlining_row_limit` a [`DuckLakeTableWriter`] (or a
+    /// catalog's SQL writes, through
+    /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options))
+    /// applies where the catalog stores none, as official's
+    /// `DATA_INLINING_ROW_LIMIT` attach option applies: a stored table, schema
+    /// or catalog-wide setting outranks it, and it outranks the metadata
+    /// writer's own ([`MetadataWriter::data_inlining_row_limit`]). It decides
+    /// whether a write is inlined, whether reserved column names are refused,
+    /// and whether a new schema version gets an inlined data table. Without
+    /// any of them, official's default ([`DEFAULT_DATA_INLINING_ROW_LIMIT`])
+    /// applies; `0` writes every row to Parquet.
     #[must_use]
     pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
         self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Sets when merge and rewrite first flush a table's inlined data
+    /// ([`InlinedFlushPolicy`]).
+    #[must_use]
+    pub fn with_inlined_flush_policy(mut self, policy: InlinedFlushPolicy) -> Self {
+        self.inlined_flush_policy = Some(policy);
         self
     }
 
@@ -235,10 +356,15 @@ impl DuckLakeWriteOptions {
         if overrides.rewrite_delete_threshold.is_some() {
             self.rewrite_delete_threshold = overrides.rewrite_delete_threshold;
         }
+        if overrides.inlined_flush_policy.is_some() {
+            self.inlined_flush_policy = overrides.inlined_flush_policy;
+        }
         self
     }
 }
 
+/// A stored `UBIGINT` option, read with DuckDB's `VARCHAR` cast as official
+/// reads it.
 fn setting_usize(
     settings: &HashMap<String, String>,
     key: &str,
@@ -247,11 +373,14 @@ fn setting_usize(
     settings
         .get(key)
         .map(|value| {
-            value.parse::<usize>().map_err(|e| {
-                crate::error::DuckLakeError::InvalidConfig(format!(
-                    "Invalid ducklake_metadata {key} value '{value}': {e}"
-                ))
-            })
+            crate::duckdb_cast::varchar_to_ubigint(value)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::error::DuckLakeError::InvalidConfig(format!(
+                        "Invalid ducklake_metadata {key} value '{value}': could not convert it \
+                         to UBIGINT"
+                    ))
+                })
         })
         .transpose()
         .map(|value| value.or(default))
@@ -275,18 +404,23 @@ fn setting_f64(
     key: &str,
     default: Option<f64>,
 ) -> Result<Option<f64>> {
+    // Read with DuckDB's `VARCHAR` cast, as official reads a stored `DOUBLE`.
     let value = settings
         .get(key)
         .map(|value| {
-            value.parse::<f64>().map_err(|e| {
+            crate::duckdb_cast::varchar_to_double(value).ok_or_else(|| {
                 crate::error::DuckLakeError::InvalidConfig(format!(
-                    "Invalid ducklake_metadata {key} value '{value}': {e}"
+                    "Invalid ducklake_metadata {key} value '{value}': could not convert it to \
+                     DOUBLE"
                 ))
             })
         })
         .transpose()?
         .or(default);
-    if value.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+    // `value < 0 || value > 1`, which a NaN passes, as `ducklake_set_option`
+    // accepts it.
+    #[allow(clippy::manual_range_contains)]
+    if value.is_some_and(|value| value < 0.0 || value > 1.0) {
         return Err(crate::error::DuckLakeError::InvalidConfig(format!(
             "ducklake_metadata {key} must be in [0.0, 1.0]"
         )));
@@ -312,9 +446,19 @@ fn setting_size(
     key: &str,
     default: Option<usize>,
 ) -> Result<Option<usize>> {
+    // Official stores a byte count and reads it as a `UBIGINT`; a value with a
+    // unit (`512MB`), which releases before this one stored as given, still
+    // reads as that many bytes.
     settings
         .get(key)
-        .map(|value| parse_size(key, value))
+        .map(|value| {
+            match crate::duckdb_cast::varchar_to_ubigint(value)
+                .and_then(|value| usize::try_from(value).ok())
+            {
+                Some(bytes) => Ok(bytes),
+                None => parse_size(key, value),
+            }
+        })
         .transpose()
         .map(|value| value.or(default))
 }
@@ -354,26 +498,6 @@ fn parse_size(key: &str, value: &str) -> Result<usize> {
             "ducklake_metadata {key} size '{value}' exceeds usize"
         ))
     })
-}
-
-fn setting_bool(
-    settings: &HashMap<String, String>,
-    key: &str,
-    default: bool,
-) -> Result<Option<bool>> {
-    let value = match settings.get(key) {
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "true" => true,
-            "false" => false,
-            _ => {
-                return Err(crate::error::DuckLakeError::InvalidConfig(format!(
-                    "Invalid ducklake_metadata {key} value '{value}'; expected true or false"
-                )));
-            },
-        },
-        None => default,
-    };
-    Ok(Some(value))
 }
 
 fn setting_compression(name: &str, level: Option<i32>) -> Result<Compression> {
@@ -573,7 +697,13 @@ pub struct DuckLakeTableWriter {
     /// [`DuckLakeTableWriter::with_max_open_partitions`].
     max_open_partitions: usize,
     data_inlining_row_limit: Option<usize>,
+    /// The `sort_on_insert` applied where the catalog stores none
+    /// ([`Self::table_sort_on_insert`]).
     sort_on_insert: bool,
+    /// Set by the deprecated flush: every write goes to Parquet, whatever
+    /// inlining limit is stored, and sorts by the table's sort order whatever
+    /// `sort_on_insert` says, as official's flush does.
+    flushing_inlined: bool,
     hive_file_pattern: bool,
 }
 
@@ -618,6 +748,7 @@ impl DuckLakeTableWriter {
             max_open_partitions: DEFAULT_MAX_OPEN_PARTITIONS,
             data_inlining_row_limit: None,
             sort_on_insert: true,
+            flushing_inlined: false,
             hive_file_pattern: true,
         })
     }
@@ -744,6 +875,33 @@ impl DuckLakeTableWriter {
         builder.build()
     }
 
+    /// Check the write against the changes committed since `snapshot_id`, the
+    /// snapshot its rows were planned at, rather than since the head it begins
+    /// at. SQL `INSERT` passes the snapshot its source and target were read at.
+    pub(crate) fn with_planned_base_snapshot(mut self, snapshot_id: i64) -> Self {
+        self.planned_base_snapshot = Some(snapshot_id);
+        self
+    }
+
+    /// [`MetadataWriter::begin_write_transaction`], based at the planned
+    /// snapshot when one was set and is earlier.
+    fn begin_write_transaction(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        mode: WriteMode,
+    ) -> Result<WriteSetupResult> {
+        let mut setup = self.with_inlining_limit(|| {
+            self.metadata
+                .begin_write_transaction(schema_name, table_name, columns, mode)
+        })?;
+        if let Some(planned) = self.planned_base_snapshot {
+            setup.base_snapshot_id = setup.base_snapshot_id.min(planned);
+        }
+        Ok(setup)
+    }
+
     /// Begin a streaming write session.
     /// If mode is `WriteMode::Replace`, ends existing files.
     ///
@@ -781,34 +939,34 @@ impl DuckLakeTableWriter {
     /// This is also the right default for a session finished with
     /// [`TableWriteSession::finish_with_deletes`]: that commit registers every
     /// appended file, however many the session rolled or partitioned into, in the
-    /// Check the write against the changes committed since `snapshot_id`, the
-    /// snapshot its rows were planned at, rather than since the head it begins
-    /// at. SQL `INSERT` passes the snapshot its source and target were read at.
-    pub(crate) fn with_planned_base_snapshot(mut self, snapshot_id: i64) -> Self {
-        self.planned_base_snapshot = Some(snapshot_id);
-        self
-    }
-
-    /// [`MetadataWriter::begin_write_transaction`], based at the planned
-    /// snapshot when one was set and is earlier.
-    fn begin_write_transaction(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-        columns: &[ColumnDef],
-        mode: WriteMode,
-    ) -> Result<WriteSetupResult> {
-        let mut setup = self.with_inlining_limit(|| {
-            self.metadata
-                .begin_write_transaction(schema_name, table_name, columns, mode)
-        })?;
-        if let Some(planned) = self.planned_base_snapshot {
-            setup.base_snapshot_id = setup.base_snapshot_id.min(planned);
-        }
-        Ok(setup)
-    }
-
     /// same snapshot as the deletes.
+    ///
+    /// **Inlines small writes.** While the rows written number at most the
+    /// table's `data_inlining_row_limit` (its stored table, schema or
+    /// catalog-wide setting, else this writer's limit, else
+    /// [`MetadataWriter::data_inlining_row_limit`], else
+    /// [`DEFAULT_DATA_INLINING_ROW_LIMIT`]), the session holds them in memory
+    /// instead of writing Parquet; the first batch past the limit writes them
+    /// to the Parquet output, so the session never holds more than the limit's
+    /// rows. A session that finishes still holding them commits them inlined in
+    /// the catalog, as official DuckLake's insert stores a statement of at most
+    /// the limit's rows: [`TableWriteSession::finish`] reports
+    /// `files_written == 0`, and [`TableWriteSession::finish_with_deletes`]
+    /// commits them with its deletes in one snapshot.
+    /// [`TableWriteSession::is_inlining`] tells whether it still holds them.
+    /// Rows of types or values the backend cannot inline go to Parquet.
+    ///
+    /// With the table's `sort_on_insert` on ([`Self::table_sort_on_insert`],
+    /// read when the session begins), [`TableWriteSession::finish`] and
+    /// [`TableWriteSession::finish_with_deletes`] inline the rows it holds in
+    /// the table's `SET SORTED BY` order, as official's insert does. A sort
+    /// key naming a column the rows lack fails the session's start, with the
+    /// option on or while inlining is enabled, as it fails official's insert
+    /// however many rows it holds. Rows
+    /// written to Parquet stream in the order they arrive, where official's
+    /// insert would sort them: a session cannot sort a write globally without
+    /// holding all of it, so a caller wanting files in the sort order sorts
+    /// its batches first (or uses [`Self::write_rows`]).
     pub fn begin_write(
         &self,
         schema_name: &str,
@@ -841,6 +999,7 @@ impl DuckLakeTableWriter {
             mode,
             StreamPartitionMode::Split,
             true,
+            true,
         )
     }
 
@@ -850,6 +1009,11 @@ impl DuckLakeTableWriter {
     /// A single file is not reorganizable later — DuckLake compaction merges but never
     /// splits — so prefer [`Self::begin_write`] unless the caller genuinely needs one
     /// output object (for example to address the whole write by path).
+    ///
+    /// It inlines a small write as [`Self::begin_write`] does: a session that
+    /// finishes holding at most the table's `data_inlining_row_limit` rows
+    /// writes no file at all, and [`TableWriteSession::file_path`] then names no
+    /// object.
     pub fn begin_write_single_file(
         &self,
         schema_name: &str,
@@ -875,6 +1039,7 @@ impl DuckLakeTableWriter {
             mode,
             StreamPartitionMode::Split,
             false,
+            true,
         )
     }
 
@@ -902,6 +1067,9 @@ impl DuckLakeTableWriter {
     /// [`TableWriteSession::finish_with_deletes`] commits all of them in the one
     /// snapshot that carries the deletes.
     ///
+    /// It never inlines: its rows carry row ids of their own, which only the
+    /// staged commit of an `UPDATE` keeps for inlined rows.
+    ///
     /// [`ROW_ID_PARQUET_FIELD_ID`]: crate::row_id::ROW_ID_PARQUET_FIELD_ID
     pub fn begin_write_with_embedded_rowid(
         &self,
@@ -928,10 +1096,13 @@ impl DuckLakeTableWriter {
             mode,
             StreamPartitionMode::Split,
             false,
+            false,
         )
     }
 
     /// Begin a streaming write session with a custom file path (registered as absolute).
+    ///
+    /// It never inlines: the caller chose the file the rows must land in.
     pub fn begin_write_to_path(
         &self,
         schema_name: &str,
@@ -956,6 +1127,7 @@ impl DuckLakeTableWriter {
                 entry_point: "begin_write_to_path",
             },
             false,
+            false,
         )
     }
 
@@ -973,12 +1145,37 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         partition_mode: StreamPartitionMode,
         roll: bool,
+        inline: bool,
     ) -> Result<TableWriteSession> {
         self.refuse_encrypted_parquet("write a data file")?;
         let validation_schema =
             Arc::new(self.validation_schema(schema_name, table_name, arrow_schema)?);
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let setup = self.begin_write_transaction(schema_name, table_name, &columns, mode)?;
+        // A session buffers its first rows while they number at most the
+        // table's limit, as official's insert does, and commits them inlined
+        // when the write ends there.
+        let inline_limit = if inline && self.metadata.supports_data_inlining(arrow_schema) {
+            let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
+            (limit > 0
+                && self
+                    .metadata
+                    .table_types_support_inlining(schema_name, table_name)?)
+            .then_some(limit)
+        } else {
+            None
+        };
+        let inline_sort = if inline {
+            self.session_inline_sort(
+                schema_name,
+                table_name,
+                setup.table_id,
+                arrow_schema,
+                inline_limit.is_some(),
+            )?
+        } else {
+            None
+        };
         // Data columns carry their catalog field-ids. When embedding row lineage,
         // append the reserved-field-id rowid column AFTER them; it is a parquet-only
         // column (not a catalog column), so it is absent from `columns`/`column_ids`
@@ -1083,7 +1280,13 @@ impl DuckLakeTableWriter {
         );
         Ok(TableWriteSession {
             metadata: Arc::clone(&self.metadata),
-            data_inlining_row_limit: self.data_inlining_row_limit(),
+            configured_inlining_limit: self.configured_inlining_limit(),
+            inline_buffer: inline_limit.map(|limit| InlineBuffer {
+                limit,
+                rows: 0,
+                batches: Vec::new(),
+            }),
+            inline_sort,
             object_store: Arc::clone(&self.object_store),
             object_path,
             table_key,
@@ -1261,7 +1464,13 @@ impl DuckLakeTableWriter {
             target_file_size: Some(usize::MAX),
             ..DuckLakeWriteOptions::default()
         };
-        let flush_writer = self.clone().with_options(&write_options);
+        // Ordered as official's flush orders them whatever `sort_on_insert`
+        // says: by the table's current sort order, then row id and insert
+        // snapshot. The rows go in by row id and snapshot; the writer's
+        // stable sort by the sort order keeps that order among ties.
+        let batches = by_row_id(schema.as_ref(), batches, inlined_data)?;
+        let mut flush_writer = self.clone().with_options(&write_options);
+        flush_writer.flushing_inlined = true;
         let transaction_options =
             TableWriteOptions::new().with_expected_base_snapshot_id(expected_base_snapshot_id);
         let mut transaction = flush_writer
@@ -1405,6 +1614,12 @@ impl DuckLakeTableWriter {
     /// registered relative to the table, so the reader resolves it exactly like a
     /// data file. Readers key deletes off `pos`; `file_path` is recorded for
     /// provenance.
+    ///
+    /// Sees only Parquet data and delete files, never inlined rows or inlined
+    /// deletions. On a table with data inlining enabled, use
+    /// [`DuckLakeTable::keyed_mutation`](crate::DuckLakeTable::keyed_mutation), a
+    /// scan, or [`DuckLakeTable::locate_rowids`](crate::DuckLakeTable::locate_rowids)
+    /// instead.
     pub async fn write_delete_file(
         &self,
         schema_name: &str,
@@ -1914,6 +2129,7 @@ impl DuckLakeTableWriter {
             groups,
             options,
             None,
+            InsertSortPlan::default(),
         )
         .await
     }
@@ -1922,6 +2138,10 @@ impl DuckLakeTableWriter {
     /// rows of `groups` in the order they were written) when the write is
     /// small enough to inline: official inlines a partitioned table's rows in
     /// their insert order, which their row ids follow.
+    ///
+    /// `in_order` comes from the SQL `INSERT` plan, and `plan` says what it
+    /// decided about their order ([`InsertSortPlan`]). Rows the plan did not
+    /// sort are sorted here as official's insert sorts them ([`insert_sorts`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn write_partition_groups_inlined_in(
         &self,
@@ -1934,6 +2154,7 @@ impl DuckLakeTableWriter {
         groups: Vec<PartitionGroup>,
         options: &TableWriteOptions,
         in_order: Option<Vec<RecordBatch>>,
+        plan: InsertSortPlan,
     ) -> Result<WriteResult> {
         if groups.is_empty() {
             return Err(crate::error::DuckLakeError::InvalidConfig(
@@ -1955,13 +2176,14 @@ impl DuckLakeTableWriter {
             .iter()
             .flat_map(|(_, batches)| batches.iter().cloned())
             .collect();
-        let inline = self.should_inline(
+        let decision = self.inline_decision(
             schema_name,
             table_name,
             records_written,
             arrow_schema,
             &all_batches,
         )?;
+        let inline = decision.inline;
         if !inline {
             self.refuse_encrypted_parquet("write a data file")?;
         }
@@ -1993,8 +2215,23 @@ impl DuckLakeTableWriter {
             ));
         }
 
+        // In the table's sort order, as official's insert lays them out
+        // ([`insert_sorts`]): the inlined rows as one, each partition's on its
+        // own, as a global sort split by partition orders them.
+        let sort_spec = self.insert_sort_spec(
+            schema_name,
+            table_name,
+            setup.table_id,
+            arrow_schema,
+            decision,
+            plan,
+        )?;
         let batches = in_order.unwrap_or(all_batches);
         if inline {
+            let batches = match &sort_spec {
+                Some(spec) => sort_insert_rows(batches, arrow_schema, spec)?,
+                None => batches,
+            };
             let committed = self.with_inlining_limit(|| {
                 self.metadata.register_inlined_data(
                     setup.table_id,
@@ -2027,6 +2264,13 @@ impl DuckLakeTableWriter {
         };
         let table_key = join_paths(&join_paths(&scoped_base, schema_name)?, table_name)?;
 
+        let groups = match &sort_spec {
+            Some(spec) => groups
+                .into_iter()
+                .map(|(values, rows)| Ok((values, sort_insert_rows(rows, arrow_schema, spec)?)))
+                .collect::<Result<Vec<_>>>()?,
+            None => groups,
+        };
         let file_infos = self
             .write_partition_groups(
                 &table_key,
@@ -2093,10 +2337,12 @@ impl DuckLakeTableWriter {
     /// declares a sort order.
     ///
     /// The sort is global across `batches`, mirroring official DuckLake's blocking
-    /// `PhysicalOrder` above the insert plan, so successive rolled files cover
+    /// `PhysicalOrder` in the insert plan, so successive rolled files cover
     /// contiguous, non-overlapping ranges. It therefore holds the whole write in
-    /// memory; the streaming [`Self::begin_write`] path cannot do this and leaves sort
-    /// order to the caller.
+    /// memory; the streaming [`Self::begin_write`] path cannot do this and leaves the
+    /// order of its Parquet rows to the caller. Rows are sorted as official's
+    /// insert sorts them: all of them with `sort_on_insert` on, and with it off
+    /// only rows written to Parquet while inlining is enabled.
     ///
     /// The spec is read after the write transaction opens, which is the only view a
     /// caller without a `MetadataProvider` has. A spec change racing the commit is
@@ -2119,8 +2365,16 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         batches: &[RecordBatch],
     ) -> Result<WriteResult> {
-        self.write_rows_inner(schema_name, table_name, arrow_schema, mode, batches, true)
-            .await
+        self.write_rows_inner(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            batches,
+            true,
+            InsertSortPlan::default(),
+        )
+        .await
     }
 
     /// Write `batches` as UNPARTITIONED because the caller already established that
@@ -2130,7 +2384,9 @@ impl DuckLakeTableWriter {
     /// `SET PARTITIONED BY` went live between planning and this commit, the partition
     /// fence rejects with a conflict and the caller retries against the new spec —
     /// deliberately, rather than re-laying-out the rows under a spec the plan never
-    /// saw.
+    /// saw. `plan` says what the plan decided about the rows' order
+    /// ([`InsertSortPlan`]); rows it did not sort are sorted here as official's
+    /// insert sorts them.
     pub(crate) async fn write_rows_unpartitioned_as_planned(
         &self,
         schema_name: &str,
@@ -2138,15 +2394,26 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
         batches: &[RecordBatch],
+        plan: InsertSortPlan,
     ) -> Result<WriteResult> {
-        self.write_rows_inner(schema_name, table_name, arrow_schema, mode, batches, false)
-            .await
+        self.write_rows_inner(
+            schema_name,
+            table_name,
+            arrow_schema,
+            mode,
+            batches,
+            false,
+            plan,
+        )
+        .await
     }
 
     /// Shared body of [`Self::write_rows`] and
     /// `write_rows_unpartitioned_as_planned`. `resolve_layout` selects
     /// whether the table's live partition spec drives the layout, or the caller's
     /// earlier "unpartitioned" determination stands (and the fence adjudicates).
+    /// `plan` is the SQL `INSERT` plan's sort decision ([`InsertSortPlan`]).
+    #[allow(clippy::too_many_arguments)]
     async fn write_rows_inner(
         &self,
         schema_name: &str,
@@ -2155,19 +2422,21 @@ impl DuckLakeTableWriter {
         mode: WriteMode,
         batches: &[RecordBatch],
         resolve_layout: bool,
+        plan: InsertSortPlan,
     ) -> Result<WriteResult> {
         let validation_schema = self.validation_schema(schema_name, table_name, arrow_schema)?;
         validate_not_null_batches(&validation_schema, batches)?;
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // Refused before the setup, which on some backends creates the table.
-        let inline = self.should_inline(
+        let decision = self.inline_decision(
             schema_name,
             table_name,
             records_written,
             arrow_schema,
             batches,
         )?;
+        let inline = decision.inline;
         if !inline {
             self.refuse_encrypted_parquet("write a data file")?;
         }
@@ -2178,6 +2447,30 @@ impl DuckLakeTableWriter {
                 "table gained a partition spec before write; retry the write".to_string(),
             ));
         }
+        // Lay the rows out in the table's sort order before inlining, splitting
+        // or rolling them, as official's insert plan does ([`insert_sorts`]).
+        // This is a GLOBAL sort over the whole write, matching official's
+        // blocking PhysicalOrder: that is what makes successive rolled files
+        // cover contiguous, non-overlapping ranges, so a reader can skip whole
+        // files. Splitting by partition afterwards preserves relative order
+        // within each partition, so every file it produces stays sorted.
+        let sort_spec = self.insert_sort_spec(
+            schema_name,
+            table_name,
+            setup.table_id,
+            arrow_schema,
+            decision,
+            plan,
+        )?;
+        let sorted_owned = match &sort_spec {
+            Some(spec) => sort_insert_rows(batches.to_vec(), arrow_schema, spec)?,
+            None => Vec::new(),
+        };
+        let batches: &[RecordBatch] = if sort_spec.is_some() {
+            &sorted_owned
+        } else {
+            batches
+        };
         if inline {
             let committed = self.with_inlining_limit(|| {
                 self.metadata.register_inlined_data(
@@ -2215,38 +2508,6 @@ impl DuckLakeTableWriter {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
             None
-        };
-
-        // Lay the rows out in the table's sort order before splitting or rolling.
-        // This is a GLOBAL sort over the whole write, matching official DuckLake's
-        // blocking PhysicalOrder above the insert plan — that is what makes successive
-        // rolled files cover contiguous, non-overlapping ranges, so a reader can skip
-        // whole files. Splitting by partition afterwards preserves relative order
-        // within each partition, so every file it produces stays sorted.
-        //
-        // Skipped when the caller already arranged the rows (`!resolve_layout` — the
-        // SQL INSERT path, whose plan carries a SortExec for this same spec).
-        let sorted_owned: Vec<RecordBatch> = if resolve_layout && self.sort_on_insert {
-            let lengths: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
-            let sorted = crate::sort::sort_batches_by_spec(
-                batches.to_vec(),
-                arrow_schema,
-                self.metadata.live_sort_spec(setup.table_id)?.as_ref(),
-            )?;
-            // The sort concatenates into ONE batch. Rollover is evaluated at batch
-            // boundaries, so handing that single batch onward would emit one file of
-            // unbounded size no matter how large the write — losing rollover exactly
-            // when a sort order makes it most valuable. Re-slice back into the
-            // caller's batch lengths (order-preserving, zero-copy) so rollover sees
-            // the same boundaries it would have without the sort.
-            reslice_to_lengths(sorted, &lengths)
-        } else {
-            Vec::new()
-        };
-        let batches: &[RecordBatch] = if resolve_layout && self.sort_on_insert {
-            &sorted_owned
-        } else {
-            batches
         };
 
         let file_infos = match partition.as_ref() {
@@ -2326,13 +2587,14 @@ impl DuckLakeTableWriter {
         let columns = arrow_schema_to_column_defs(&validation_schema)?;
         let records_written: usize = batches.iter().map(RecordBatch::num_rows).sum();
         // Refused before the setup, which on some backends creates the table.
-        let inline = self.should_inline(
+        let decision = self.inline_decision(
             schema_name,
             table_name,
             records_written,
             arrow_schema,
             batches,
         )?;
+        let inline = decision.inline;
         if records_written > 0 && !inline {
             self.refuse_encrypted_parquet("write a data file")?;
         }
@@ -2349,6 +2611,25 @@ impl DuckLakeTableWriter {
                 "table gained a partition spec before write; retry the write".to_string(),
             ));
         }
+        // In the table's sort order, as official's insert lays them out
+        // ([`insert_sorts`]).
+        let sort_spec = self.insert_sort_spec(
+            schema_name,
+            table_name,
+            setup.table_id,
+            arrow_schema,
+            decision,
+            InsertSortPlan::default(),
+        )?;
+        let sorted_owned = match &sort_spec {
+            Some(spec) => sort_insert_rows(batches.to_vec(), arrow_schema, spec)?,
+            None => Vec::new(),
+        };
+        let batches: &[RecordBatch] = if sort_spec.is_some() {
+            &sorted_owned
+        } else {
+            batches
+        };
         if inline {
             return Ok(PreparedTableWrite {
                 write: StagedTableWrite {
@@ -2387,25 +2668,6 @@ impl DuckLakeTableWriter {
             self.resolve_partition(setup.table_id, &setup.column_ids, arrow_schema)?
         } else {
             None
-        };
-        let sorted_owned = if resolve_layout && self.sort_on_insert {
-            let lengths = batches
-                .iter()
-                .map(RecordBatch::num_rows)
-                .collect::<Vec<_>>();
-            let sorted = crate::sort::sort_batches_by_spec(
-                batches.to_vec(),
-                arrow_schema,
-                self.metadata.live_sort_spec(setup.table_id)?.as_ref(),
-            )?;
-            reslice_to_lengths(sorted, &lengths)
-        } else {
-            Vec::new()
-        };
-        let batches = if resolve_layout && self.sort_on_insert {
-            &sorted_owned
-        } else {
-            batches
         };
         let file_infos = match partition.as_ref() {
             Some(spec) => {
@@ -2537,7 +2799,7 @@ impl DuckLakeTableWriter {
         error
     }
 
-    fn staged_object_path(
+    pub(crate) fn staged_object_path(
         &self,
         schema_name: &str,
         table_name: &str,
@@ -2567,17 +2829,43 @@ impl DuckLakeTableWriter {
         self.metadata.next_snapshot_id()
     }
 
-    /// The scoped `data_inlining_row_limit` this writer applies; `0` when
-    /// inlining is off.
+    /// The `data_inlining_row_limit` this writer applies where the catalog
+    /// stores none: its own ([`DuckLakeWriteOptions::with_data_inlining_row_limit`]),
+    /// else its metadata writer's
+    /// ([`MetadataWriter::data_inlining_row_limit`]); `None` when neither is
+    /// set, and official's default applies.
+    fn configured_inlining_limit(&self) -> Option<usize> {
+        self.data_inlining_row_limit
+            .or_else(|| self.metadata.data_inlining_row_limit())
+    }
+
+    /// [`Self::configured_inlining_limit`], else official's default.
     pub(crate) fn data_inlining_row_limit(&self) -> usize {
-        self.data_inlining_row_limit.unwrap_or(0)
+        self.configured_inlining_limit()
+            .unwrap_or(DEFAULT_DATA_INLINING_ROW_LIMIT)
+    }
+
+    /// The `data_inlining_row_limit` in effect for `schema_name.table_name`:
+    /// its stored table, schema or catalog-wide setting, else this writer's
+    /// limit ([`DuckLakeWriteOptions::with_data_inlining_row_limit`]), else
+    /// its metadata writer's, else `10`
+    /// ([`MetadataWriter::table_data_inlining_row_limit`]).
+    pub fn table_data_inlining_row_limit(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> Result<usize> {
+        self.with_inlining_limit(|| {
+            self.metadata
+                .table_data_inlining_row_limit(schema_name, table_name)
+        })
     }
 
     /// Run `f`, a commit through this writer's metadata writer, with this
     /// writer's limit as the one it applies where the catalog stores none
     /// ([`crate::metadata_writer::with_inlining_limit`]).
     fn with_inlining_limit<T>(&self, f: impl FnOnce() -> T) -> T {
-        crate::metadata_writer::with_inlining_limit(Some(self.data_inlining_row_limit()), f)
+        crate::metadata_writer::with_inlining_limit(self.configured_inlining_limit(), f)
     }
 
     /// Whether `rows` rows of `schema_name.table_name` go to inlined storage:
@@ -2591,15 +2879,163 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         batches: &[RecordBatch],
     ) -> Result<bool> {
-        Ok(rows > 0
-            && self
-                .data_inlining_row_limit
-                .is_some_and(|limit| rows <= limit)
-            && self.metadata.supports_data_inlining(arrow_schema)
+        Ok(self
+            .inline_decision(schema_name, table_name, rows, arrow_schema, batches)?
+            .inline)
+    }
+
+    /// [`Self::should_inline`], with the scoped limit it read to decide, so
+    /// the rest of the write does not read it again.
+    fn inline_decision(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        rows: usize,
+        arrow_schema: &Schema,
+        batches: &[RecordBatch],
+    ) -> Result<InlineDecision> {
+        let mut decision = InlineDecision {
+            inline: false,
+            limit: None,
+        };
+        // The deprecated flush writes the rows it flushes to Parquet.
+        if self.flushing_inlined || rows == 0 || !self.metadata.supports_data_inlining(arrow_schema)
+        {
+            return Ok(decision);
+        }
+        let limit = self.table_data_inlining_row_limit(schema_name, table_name)?;
+        decision.limit = Some(limit);
+        decision.inline = rows <= limit
             && self.metadata.supports_data_inlining_values(batches)
             && self
                 .metadata
+                .table_types_support_inlining(schema_name, table_name)?;
+        Ok(decision)
+    }
+
+    /// Whether inlining is enabled for `schema_name.table_name`, as official's
+    /// `DuckLakeCatalog::GetInliningLimit` decides it: its scoped
+    /// `data_inlining_row_limit` is above `0` and its columns can be inlined.
+    pub(crate) fn inlining_enabled(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+    ) -> Result<bool> {
+        self.inlining_enabled_under(schema_name, table_name, arrow_schema, None)
+    }
+
+    /// [`Self::inlining_enabled`], under the scoped `limit` when the write
+    /// already read it ([`InlineDecision::limit`]).
+    fn inlining_enabled_under(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        limit: Option<usize>,
+    ) -> Result<bool> {
+        if !self.metadata.supports_data_inlining(arrow_schema) {
+            return Ok(false);
+        }
+        let limit = match limit {
+            Some(limit) => limit,
+            None => self.table_data_inlining_row_limit(schema_name, table_name)?,
+        };
+        Ok(limit > 0
+            && self
+                .metadata
                 .table_types_support_inlining(schema_name, table_name)?)
+    }
+
+    /// The `sort_on_insert` in effect for `schema_name.table_name`, as
+    /// official's `PlanInsert` reads it: the table's stored setting, else its
+    /// schema's, else the catalog-wide one ([`MetadataWriter::table_setting`]),
+    /// on only while it reads exactly `true`; else this writer's
+    /// ([`DuckLakeWriteOptions::sort_on_insert`]), else `true`. Official has no
+    /// session setting that outranks the stored one, so neither does this
+    /// writer's.
+    pub fn table_sort_on_insert(&self, schema_name: &str, table_name: &str) -> Result<bool> {
+        Ok(resolve_sort_on_insert(
+            self.metadata
+                .table_setting(schema_name, table_name, "sort_on_insert")?,
+            self.sort_on_insert,
+        ))
+    }
+
+    /// The live sort order an insert of rows into table `table_id` lays them
+    /// out in ([`insert_sorts`]), or `None` when they keep their order.
+    /// `decision` is the write's [`Self::inline_decision`]; `plan` is the SQL
+    /// `INSERT` plan's decision ([`InsertSortPlan`]): nothing is sorted here
+    /// when the plan sorted every row, and its `sort_on_insert` is used when
+    /// it read one.
+    ///
+    /// Official plans a sort, and so validates its keys' columns
+    /// ([`crate::sort::validate_sort_columns`]), with `sort_on_insert` on, or
+    /// off while inlining is enabled, whether or not the rows are inlined; a
+    /// key naming a missing column then fails the write. The setting is read
+    /// only for a sorted table, and the inlining limit not again.
+    fn insert_sort_spec(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        table_id: i64,
+        arrow_schema: &Schema,
+        decision: InlineDecision,
+        plan: InsertSortPlan,
+    ) -> Result<Option<crate::sort::SortSpec>> {
+        if self.flushing_inlined {
+            return self.metadata.live_sort_spec(table_id);
+        }
+        if plan.sorted {
+            return Ok(None);
+        }
+        let Some(spec) = self.metadata.live_sort_spec(table_id)? else {
+            return Ok(None);
+        };
+        let sort_on_insert = match plan.sort_on_insert {
+            Some(sort_on_insert) => sort_on_insert,
+            None => self.table_sort_on_insert(schema_name, table_name)?,
+        };
+        // Rows that inline are proof that inlining is enabled.
+        let inlining_enabled = !sort_on_insert
+            && (decision.inline
+                || self.inlining_enabled_under(
+                    schema_name,
+                    table_name,
+                    arrow_schema,
+                    decision.limit,
+                )?);
+        if !sort_on_insert && !inlining_enabled {
+            return Ok(None);
+        }
+        crate::sort::validate_sort_columns(&spec, arrow_schema)?;
+        Ok(insert_sorts(sort_on_insert, inlining_enabled, decision.inline).then_some(spec))
+    }
+
+    /// The sort order an inserting session (`begin_write`,
+    /// `begin_write_single_file`) inlines its held rows in: the table's live
+    /// one with `sort_on_insert` on, read when the session begins, as
+    /// official reads it when it plans its insert. The keys' columns are
+    /// validated whenever official plans the sort
+    /// ([`crate::sort::validate_sort_columns`]): with `sort_on_insert` on, or
+    /// off while inlining is enabled (`inlining_enabled`), so an empty
+    /// session fails as official's empty insert does.
+    fn session_inline_sort(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        table_id: i64,
+        arrow_schema: &Schema,
+        inlining_enabled: bool,
+    ) -> Result<Option<crate::sort::SortSpec>> {
+        let Some(spec) = self.metadata.live_sort_spec(table_id)? else {
+            return Ok(None);
+        };
+        let sort_on_insert = self.table_sort_on_insert(schema_name, table_name)?;
+        if sort_on_insert || inlining_enabled {
+            crate::sort::validate_sort_columns(&spec, arrow_schema)?;
+        }
+        Ok(sort_on_insert.then_some(spec))
     }
 
     /// Resolve the table's live partition spec against the columns this write is
@@ -3483,6 +3919,92 @@ fn commit_refused(error: &crate::error::DuckLakeError) -> bool {
     false
 }
 
+/// `batches`, the rows of `inlined` (one batch each, in `schema`), as one
+/// batch ordered by row id, then insert snapshot.
+fn by_row_id(
+    schema: &Schema,
+    batches: Vec<RecordBatch>,
+    inlined: &[DuckLakeInlinedData],
+) -> Result<Vec<RecordBatch>> {
+    let combined = arrow::compute::concat_batches(&Arc::new(schema.clone()), &batches)?;
+    let key = |values: Vec<i64>| arrow::compute::SortColumn {
+        values: Arc::new(arrow::array::Int64Array::from(values)),
+        options: None,
+    };
+    let columns = [
+        key(inlined
+            .iter()
+            .flat_map(|data| data.row_ids.iter().copied())
+            .collect()),
+        key(inlined
+            .iter()
+            .flat_map(|data| data.begin_snapshots.iter().copied())
+            .collect()),
+    ];
+    let indices = arrow::compute::lexsort_to_indices(&columns, None)?;
+    let sorted = combined
+        .columns()
+        .iter()
+        .map(|column| arrow::compute::take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(vec![RecordBatch::try_new(combined.schema(), sorted)?])
+}
+
+/// The `sort_on_insert` a `stored` setting gives, as official's `PlanInsert`
+/// reads it (`GetConfigOption(...) == "true"`): on only while it reads exactly
+/// `true`; `fallback` (a writer's or table handle's option) where none is
+/// stored.
+pub(crate) fn resolve_sort_on_insert(stored: Option<String>, fallback: bool) -> bool {
+    match stored {
+        Some(value) => value == "true",
+        None => fallback,
+    }
+}
+
+/// What a SQL `INSERT` plan decided about its rows' order, handed to the
+/// writer so the write lays them out under the `sort_on_insert` the
+/// statement was planned with, as official reads it once, in `PlanInsert`.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InsertSortPlan {
+    /// The `sort_on_insert` the plan read; `None` when it read none (the
+    /// table has no sort order, or the write was not planned), and the
+    /// writer reads it.
+    pub(crate) sort_on_insert: Option<bool>,
+    /// Whether the plan sorted every row.
+    pub(crate) sorted: bool,
+}
+
+/// How a write's rows are stored ([`DuckLakeTableWriter::inline_decision`]).
+#[derive(Debug, Clone, Copy)]
+struct InlineDecision {
+    /// Whether they go to inlined storage.
+    inline: bool,
+    /// The table's scoped `data_inlining_row_limit`, when read to decide.
+    limit: Option<usize>,
+}
+
+/// Whether an insert lays its rows out in the table's `SET SORTED BY` order,
+/// as official's `DuckLakeCatalog::PlanInsert` plans it: with `sort_on_insert`
+/// on, its sort sits below the inlining operator and orders every row; with
+/// it off but inlining enabled, a sort above that operator orders only the
+/// rows that reach Parquet (`inlined` false); otherwise nothing is sorted.
+pub(crate) fn insert_sorts(sort_on_insert: bool, inlining_enabled: bool, inlined: bool) -> bool {
+    sort_on_insert || (inlining_enabled && !inlined)
+}
+
+/// `batches` globally sorted by `sort_spec`
+/// ([`crate::sort::sort_batches_by_spec`]), re-sliced to their own lengths so
+/// file rollover sees the boundaries it would without the sort.
+pub(crate) fn sort_insert_rows(
+    batches: Vec<RecordBatch>,
+    data_schema: &Schema,
+    sort_spec: &crate::sort::SortSpec,
+) -> Result<Vec<RecordBatch>> {
+    let lengths: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+    let sorted = crate::sort::sort_batches_by_spec(batches, data_schema, Some(sort_spec))?;
+    Ok(reslice_to_lengths(sorted, &lengths))
+}
+
 /// Split `batches` back into slices of `lengths` rows, in order.
 ///
 /// A global sort returns one concatenated batch, but rollover is evaluated per batch,
@@ -3494,7 +4016,7 @@ fn commit_refused(error: &crate::error::DuckLakeError) -> bool {
 /// Returns the input untouched when it already matches `lengths` (no sort was applied)
 /// or when the totals disagree, so a mismatch degrades to "write what we have" rather
 /// than dropping or duplicating rows.
-fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<RecordBatch> {
+pub(crate) fn reslice_to_lengths(batches: Vec<RecordBatch>, lengths: &[usize]) -> Vec<RecordBatch> {
     let total: usize = lengths.iter().sum();
     if batches.len() != 1 || batches[0].num_rows() != total || lengths.len() <= 1 {
         return batches;
@@ -4233,7 +4755,7 @@ fn object_key(table_key: &str, path: &str, path_is_relative: bool) -> Result<Obj
 /// `delete_stream`, not a loop of `delete`: its S3 implementation batches into
 /// `DeleteObjects` and other backends run deletes concurrently. A sequential loop
 /// costs one full retry budget per file precisely when the store is unhealthy.
-async fn remove_objects(
+pub(crate) async fn remove_objects(
     object_store: &Arc<dyn ObjectStore>,
     paths: Vec<ObjectPath>,
 ) -> Vec<String> {
@@ -4270,7 +4792,15 @@ pub struct TableWriteSession {
     metadata: Arc<dyn MetadataWriter>,
     /// The `data_inlining_row_limit` of the writer that began this session,
     /// applied by its commit where the catalog stores none.
-    data_inlining_row_limit: usize,
+    configured_inlining_limit: Option<usize>,
+    /// The rows written so far while they number at most the table's
+    /// `data_inlining_row_limit`; `None` once they exceed it (they are then in
+    /// the Parquet output) or when the session cannot inline.
+    inline_buffer: Option<InlineBuffer>,
+    /// The sort order the held rows are inlined in: the table's, when the
+    /// session began with `sort_on_insert` on
+    /// ([`DuckLakeTableWriter::session_inline_sort`]).
+    inline_sort: Option<crate::sort::SortSpec>,
     object_store: Arc<dyn ObjectStore>,
     object_path: ObjectPath,
     /// Object-store key of the table directory, which a relative delete-file path
@@ -4332,12 +4862,63 @@ pub struct TableWriteSession {
     commit_metadata: SnapshotCommitMetadata,
 }
 
+/// The rows a [`TableWriteSession`] holds while they number at most the
+/// table's `data_inlining_row_limit`.
+#[derive(Debug)]
+struct InlineBuffer {
+    limit: usize,
+    rows: usize,
+    batches: Vec<RecordBatch>,
+}
+
 impl TableWriteSession {
     /// Run `f`, this session's commit, with the limit of the writer that began
     /// it as the one it applies where the catalog stores none
     /// ([`crate::metadata_writer::with_inlining_limit`]).
     fn with_inlining_limit<T>(&self, f: impl FnOnce() -> T) -> T {
-        crate::metadata_writer::with_inlining_limit(Some(self.data_inlining_row_limit), f)
+        crate::metadata_writer::with_inlining_limit(self.configured_inlining_limit, f)
+    }
+
+    /// Whether the rows written so far are still held to be committed inlined:
+    /// they number at most the table's `data_inlining_row_limit` (see
+    /// [`DuckLakeTableWriter::begin_write`]).
+    pub fn is_inlining(&self) -> bool {
+        self.inline_buffer.is_some()
+    }
+
+    /// Write the held rows to the Parquet output, once they exceed the limit
+    /// or cannot be inlined.
+    fn spill_inline_buffer(&mut self) -> Result<()> {
+        if let Some(buffer) = self.inline_buffer.take() {
+            self.row_count -= buffer.rows as i64;
+            for batch in &buffer.batches {
+                self.write_to_files(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `batches`, the held rows a finish inlines, in the table's sort order
+    /// when the session began with `sort_on_insert` on, as official's insert
+    /// inlines them ([`insert_sorts`]).
+    fn inline_order(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
+        match &self.inline_sort {
+            Some(spec) => sort_insert_rows(batches, &self.validation_schema, spec),
+            None => Ok(batches),
+        }
+    }
+
+    fn take_inlinable_rows(&mut self) -> Result<Option<Vec<RecordBatch>>> {
+        let Some(buffer) = self.inline_buffer.as_ref() else {
+            return Ok(None);
+        };
+        if buffer.rows > 0 && self.metadata.supports_data_inlining_values(&buffer.batches) {
+            let buffer = self.inline_buffer.take().expect("checked above");
+            validate_not_null_batches(&self.validation_schema, &buffer.batches)?;
+            return Ok(Some(buffer.batches));
+        }
+        self.spill_inline_buffer()?;
+        Ok(None)
     }
 
     // Keep the read plan's snapshot for source-scoped conflict checks without
@@ -4379,6 +4960,25 @@ impl TableWriteSession {
     /// Returns an upload failure as soon as it is observed. The session must then be
     /// dropped or [aborted](Self::abort), which removes what it uploaded.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.inline_buffer.is_some() {
+            self.validate_batch_schema(batch)?;
+            let rows = batch.num_rows();
+            let buffer = self.inline_buffer.as_mut().expect("checked above");
+            if buffer.rows + rows <= buffer.limit {
+                if rows > 0 {
+                    buffer.rows += rows;
+                    buffer.batches.push(batch.clone());
+                    self.row_count += rows as i64;
+                }
+                return Ok(());
+            }
+            self.spill_inline_buffer()?;
+        }
+        self.write_to_files(batch)
+    }
+
+    /// Route `batch` to the session's Parquet output.
+    fn write_to_files(&mut self, batch: &RecordBatch) -> Result<()> {
         // Rolling or partitioned target: validate up front so the shared borrow of
         // `self` that `validate_batch_schema` takes is released before the roller or
         // sink is borrowed mutably.
@@ -4563,6 +5163,10 @@ impl TableWriteSession {
 
     #[tracing::instrument(name = "ducklake.write_session_finish", level = "info", skip_all)]
     pub async fn finish(mut self) -> Result<WriteResult> {
+        if let Some(batches) = self.take_inlinable_rows()? {
+            let batches = self.inline_order(batches)?;
+            return self.commit_inlined(batches);
+        }
         // Rolling: finish the in-progress file, upload every file this session
         // produced, and commit them in ONE snapshot.
         if let Some(mut roller) = self.roller.take() {
@@ -4659,6 +5263,88 @@ impl TableWriteSession {
         self.finish_single_file().await
     }
 
+    /// Commit the session's rows inlined, in one snapshot, as
+    /// [`MetadataWriter::register_inlined_data`] stores them.
+    fn commit_inlined(self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
+        let committed = self.with_inlining_limit(|| {
+            self.metadata.register_inlined_data(
+                self.table_id,
+                &self.schema_name,
+                &self.table_name,
+                self.snapshot_id,
+                &batches,
+                self.mode,
+                self.base_snapshot_id,
+                &self.columns,
+                &self.field_ids,
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )
+        })?;
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: committed.table_id,
+            schema_id: committed.schema_id,
+            files_written: 0,
+            records_written: self.row_count,
+        })
+    }
+
+    /// Commit the session's rows inlined together with `deletes`, the
+    /// positional deletes of [`Self::finish_with_deletes`], in one snapshot.
+    async fn commit_inlined_with_deletes(
+        self,
+        batches: Vec<RecordBatch>,
+        deletes: &[DeleteFileEntry],
+        delete_objects: Vec<ObjectPath>,
+    ) -> Result<WriteResult> {
+        let write = StagedTableWrite {
+            table_id: self.table_id,
+            schema_name: self.schema_name.clone(),
+            table_name: self.table_name.clone(),
+            base_snapshot_id: self.base_snapshot_id,
+            mode: self.mode,
+            columns: self.columns.clone(),
+            column_ids: self.field_ids.clone(),
+            data: StagedTableData::Inlined(batches),
+            snapshot_id_columns: Vec::new(),
+            positional_deletes: deletes.to_vec(),
+            rewritten_deletes: Vec::new(),
+            inlined_deletes: Vec::new(),
+            inlined_row_ids: None,
+            inlined_file_deletes: Vec::new(),
+            dropped_files: Vec::new(),
+            inlined_flush: false,
+        };
+        let committed = self.with_inlining_limit(|| {
+            self.metadata.commit_multi_table(
+                std::slice::from_ref(&write),
+                &self.commit_metadata,
+                self.expected_base_snapshot_id,
+            )
+        });
+        let committed = match committed {
+            Ok(committed) => committed,
+            Err(e) => {
+                return Err(
+                    release_after_failed_commit(&self.object_store, e, delete_objects).await,
+                );
+            },
+        };
+        let table = committed.tables.first().ok_or_else(|| {
+            crate::error::DuckLakeError::Internal(
+                "multi-table commit returned no table ids for one stage".to_string(),
+            )
+        })?;
+        Ok(WriteResult {
+            snapshot_id: committed.snapshot_id,
+            table_id: table.table_id,
+            schema_id: table.schema_id,
+            files_written: 0,
+            records_written: self.row_count,
+        })
+    }
+
     /// Commit this session's single staged file (the unpartitioned path, and the
     /// 0-row truncate marker of a partitioned Replace).
     async fn finish_single_file(mut self) -> Result<WriteResult> {
@@ -4748,6 +5434,23 @@ impl TableWriteSession {
             }
             return Err(error);
         }
+        match self
+            .take_inlinable_rows()
+            .and_then(|rows| rows.map(|batches| self.inline_order(batches)).transpose())
+        {
+            Ok(Some(batches)) => {
+                return self
+                    .commit_inlined_with_deletes(batches, deletes, delete_objects)
+                    .await;
+            },
+            Ok(None) => {},
+            Err(error) => {
+                for failure in remove_objects(&self.object_store, delete_objects).await {
+                    tracing::warn!(error = %failure, "failed to remove a delete file of a failed write");
+                }
+                return Err(error);
+            },
+        }
         // Every failure from here on commits nothing, except a `COMMIT` whose
         // outcome is unknown; the delete files are removed with the appended ones.
         let (file_infos, mut objects) = match self.finish_appended().await {
@@ -4814,6 +5517,7 @@ impl TableWriteSession {
     /// [`DataFileInfo`] and object key. A session with no rows yields the 0-row
     /// single file, whose marker is what carries a Replace truncation.
     async fn finish_appended(&mut self) -> Result<(Vec<DataFileInfo>, Vec<ObjectPath>)> {
+        self.spill_inline_buffer()?;
         Ok(if let Some(mut sink) = self.partition_sink.take() {
             let uploaded = sink.finish_uploads().await?;
             if uploaded.infos.is_empty() {
@@ -4845,6 +5549,24 @@ impl TableWriteSession {
             let (info, object) = self.upload_staged().await?;
             (vec![info], vec![object])
         })
+    }
+
+    /// The session's rows as one staged write's data, without committing
+    /// them: inlined when the session still holds them
+    /// ([`Self::is_inlining`]), else its uploaded files. The caller commits
+    /// them together with other changes and owns the files' removal from then
+    /// on. `None` when the session holds no rows.
+    pub(crate) async fn finish_staged(mut self) -> Result<Option<StagedTableData>> {
+        if let Some(batches) = self.take_inlinable_rows()? {
+            return Ok(Some(StagedTableData::Inlined(batches)));
+        }
+        if self.row_count == 0 {
+            self.abort().await?;
+            return Ok(None);
+        }
+        Ok(Some(StagedTableData::Files(
+            self.finish_appended().await?.0,
+        )))
     }
 
     /// Upload the files this session wrote without committing them, for a

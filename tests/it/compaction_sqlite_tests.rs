@@ -55,7 +55,8 @@ async fn make_writer(temp: &TempDir) -> SqliteMetadataWriter {
     std::fs::create_dir_all(&data_path).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&db_url(temp))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     writer
 }
@@ -80,7 +81,12 @@ async fn seed(temp: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
 
 /// Append one more `(id, val)` data file to `main.t`.
 async fn append(temp: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
-    let writer = Arc::new(SqliteMetadataWriter::new(&db_url(temp)).await.unwrap());
+    let writer = Arc::new(
+        SqliteMetadataWriter::new(&db_url(temp))
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(0),
+    );
     let b = batch(
         two_col_schema(),
         vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
@@ -452,6 +458,7 @@ async fn mapped_hive_values_survive_merge_adjacent_files() -> anyhow::Result<()>
             files_processed: 2,
             files_created: 1,
             rows_written: 2,
+            inlined_flush_snapshot: None,
         }
     );
     assert_eq!(read_mapped_rows(&temp).await?, vec![(1, 7), (2, 8)]);
@@ -526,7 +533,7 @@ async fn run_rewrite(temp: &TempDir, opts: RewriteOptions) -> CompactionResult {
 /// A sort spec whose fields are ALL from a foreign dialect must compact unsorted, not
 /// fail.
 ///
-/// `producible_columns` filters out any field whose dialect is not `duckdb`, so such a
+/// Compaction skips any field whose dialect is not `duckdb` (`sort_exprs`), so such a
 /// spec leaves no usable keys. Official DuckLake skips those fields and proceeds with
 /// whatever remains — nothing, here — so compaction completes and simply writes
 /// unsorted. Erroring instead would fail on a catalog official compacts fine.
@@ -786,6 +793,7 @@ async fn merge_reads_a_whole_bin_in_one_pass() {
             files_processed: usize::try_from(APPENDS).unwrap() * 2,
             files_created: 2,
             rows_written: i64::from(APPENDS) * 2,
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(read_rows(&temp).await, rows_before, "same rows");
@@ -1017,6 +1025,7 @@ async fn rewrite_can_target_explicit_data_files_without_deletes() {
             files_processed: 1,
             files_created: 1,
             rows_written: 2,
+            inlined_flush_snapshot: None,
         },
     );
 
@@ -1062,6 +1071,7 @@ async fn rewrite_does_not_resurrect_inlined_deletes() {
             files_processed: 1,
             files_created: 1,
             rows_written: 2,
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(read_rows(&temp).await, vec![(1, 10), (3, 30)]);
@@ -1145,6 +1155,7 @@ async fn merge_skips_files_masked_by_inlined_deletes() {
             files_processed: 2,
             files_created: 1,
             rows_written: 4,
+            inlined_flush_snapshot: None,
         },
     );
 
@@ -1246,6 +1257,7 @@ async fn sorted_merge_under_memory_limit_preserves_rowids_and_snapshot_lineage()
             files_processed: 2,
             files_created: 1,
             rows_written: i64::from(TOTAL_ROWS),
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(files.len(), 1);
@@ -1364,6 +1376,7 @@ async fn merge_nested_table_uses_top_level_stats_ids() {
             files_processed: 2,
             files_created: 1,
             rows_written: 4,
+            inlined_flush_snapshot: None,
         },
     );
 
@@ -1601,6 +1614,7 @@ async fn merge_applies_sqlite_sort_order_to_physical_output() {
             files_processed: 3,
             files_created: 1,
             rows_written: 6,
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(file_values(&temp, &live_path), vec![60, 50, 40, 30, 20, 10]);
@@ -1690,6 +1704,7 @@ async fn sorted_merge_with_limited_memory_preserves_row_and_snapshot_lineage() {
             files_processed: 3,
             files_created: 1,
             rows_written: i64::from(ROW_COUNT),
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(
@@ -1890,7 +1905,12 @@ async fn merge_respects_schema_version_boundary() {
             Field::new("val", DataType::Int32, false),
             Field::new("note", DataType::Int32, true),
         ]));
-        let writer = Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+        let writer = Arc::new(
+            SqliteMetadataWriter::new(&db_url(&temp))
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(0),
+        );
         let b = batch(
             three_col,
             vec![
@@ -2202,7 +2222,12 @@ async fn merge_skips_files_whose_columns_were_dropped() {
     // whose schema includes a column absent from the current one.
     {
         let id_only = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let writer = Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+        let writer = Arc::new(
+            SqliteMetadataWriter::new(&db_url(&temp))
+                .await
+                .unwrap()
+                .with_data_inlining_row_limit(0),
+        );
         let b = batch(id_only, vec![Arc::new(Int32Array::from(vec![5]))]);
         DuckLakeTableWriter::new(writer, object_store())
             .unwrap()
@@ -2498,6 +2523,7 @@ async fn auto_compact_false_skips_explicit_merge() {
             files_processed: 0,
             files_created: 0,
             rows_written: 0,
+            inlined_flush_snapshot: None,
         }
     );
     let p = pool(&temp).await;

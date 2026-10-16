@@ -160,7 +160,7 @@ async fn test_concurrent_writes_same_table_append() {
 async fn replacement_rejects_table_change_after_expected_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
-    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer.with_data_inlining_row_limit(0));
     let table_writer =
         DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
 
@@ -211,7 +211,7 @@ async fn replacement_rejects_table_change_after_expected_snapshot() {
 async fn replacement_accepts_current_expected_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
-    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer.with_data_inlining_row_limit(0));
     let table_writer =
         DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
 
@@ -250,7 +250,7 @@ async fn replacement_accepts_current_expected_snapshot() {
 async fn conditional_append_rejects_table_change_after_expected_snapshot() {
     let temp_dir = TempDir::new().unwrap();
     let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
-    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer.with_data_inlining_row_limit(0));
     let table_writer =
         DuckLakeTableWriter::new(Arc::clone(&writer), create_object_store()).unwrap();
 
@@ -301,7 +301,7 @@ async fn conditional_append_rejects_table_change_after_expected_snapshot() {
 async fn test_write_session_cleanup_on_drop() {
     let temp_dir = TempDir::new().unwrap();
     let (writer, _): (SqliteMetadataWriter, _) = create_test_writer(&temp_dir).await;
-    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer.with_data_inlining_row_limit(0));
     let schema = create_user_schema();
     let object_store = create_object_store();
 

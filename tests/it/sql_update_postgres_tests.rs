@@ -56,7 +56,8 @@ async fn writer_for(
 ) -> Arc<PostgresMetadataWriter> {
     let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     w.set_data_path(data_path.to_str().unwrap()).unwrap();
     Arc::new(w)
 }
@@ -175,9 +176,12 @@ async fn update_where_end_to_end_postgres() {
     );
 }
 
+/// Official's `UPDATE` plans no sort (`DuckLakeCatalog::PlanUpdate`): on a
+/// table with a sort order, the rewritten rows keep the order they were read
+/// in. Guards against sorting them.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn update_applies_postgres_sort_order() {
+async fn update_keeps_read_order_under_postgres_sort_order() {
     let (pool, _container) = spin_up_postgres().await.unwrap();
     let temp = TempDir::new().unwrap();
     let data = temp.path().join("data");
@@ -208,7 +212,7 @@ async fn update_applies_postgres_sort_order() {
             &[SortField::column(0, "val", SortDirection::Asc, NullOrder::NullsLast)],
         )
         .unwrap();
-    // The new versions go to a sorted Parquet file rather than being inlined.
+    // The new versions go to a Parquet file rather than being inlined.
     writer
         .set_global_setting("data_inlining_row_limit", "0")
         .unwrap();
@@ -262,7 +266,7 @@ async fn update_applies_postgres_sort_order() {
     assert_eq!(files.len(), 1);
     assert_eq!(
         values.values().iter().copied().collect::<Vec<_>>(),
-        vec![11, 21, 31],
+        vec![31, 11, 21],
     );
 }
 

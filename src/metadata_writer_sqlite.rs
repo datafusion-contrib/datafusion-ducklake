@@ -15,7 +15,7 @@ use crate::inlined_reclaim::{SUPERSEDED_INLINED_TABLES_SQL, dead_table_inlined_s
 use crate::maintenance::{
     CleanupCriteria, ExpireCriteria, ExpiredSnapshot, ScheduledFile, format_sql_timestamp,
 };
-use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget, block_on};
+use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget};
 use crate::metadata_provider_sqlite::{catalog_inlined_system_columns, inlined_table_layout};
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
@@ -26,7 +26,6 @@ use crate::metadata_writer::{
     inlined_delete_groups, live_inlined_index_columns, parse_inlined_index_columns,
     snapshot_has_change, staged_table_write_changes, table_storage_changes, table_write_changes,
     top_level_column_ids, validate_delete_entries, validate_inlined_index_columns, validate_name,
-    validate_table_setting,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_GLOBAL_INLINING_COLUMNS,
@@ -720,8 +719,9 @@ CREATE INDEX IF NOT EXISTS idx_file_partition_value_table_key
 
 -- Sort spec (DuckLake spec). Snapshot-versioned like the partition spec:
 -- `end_snapshot` NULL means currently active; SET/RESET ends the live row and
--- (for SET) starts a new one. Unlike partitioning, a sort-spec change does NOT
--- bump `schema_version`. `sort_id` is allocated from the `next_sort_id` counter.
+-- (for SET) starts a new one. A sort-spec change bumps `schema_version`, as
+-- official's does, with no `ducklake_schema_versions` row. `sort_id` is
+-- allocated from the `next_sort_id` counter.
 CREATE TABLE IF NOT EXISTS ducklake_sort_info (
     sort_id INTEGER NOT NULL,
     table_id INTEGER NOT NULL,
@@ -778,6 +778,7 @@ pub struct SqliteMetadataWriter {
     pool: SqlitePool,
     lock_path: Option<PathBuf>,
     commit_lock: Arc<Mutex<()>>,
+    data_inlining_row_limit: Option<usize>,
 }
 
 impl SqliteMetadataWriter {
@@ -817,6 +818,7 @@ impl SqliteMetadataWriter {
             pool,
             lock_path,
             commit_lock: Arc::new(Mutex::new(())),
+            data_inlining_row_limit: None,
         })
     }
 
@@ -824,6 +826,25 @@ impl SqliteMetadataWriter {
         let writer = Self::new(connection_string).await?;
         writer.initialize_schema()?;
         Ok(writer)
+    }
+
+    /// Set the `data_inlining_row_limit` this writer applies where the
+    /// catalog stores none at table, schema or catalog scope, as official's
+    /// `DATA_INLINING_ROW_LIMIT` attach option does; see
+    /// [`MetadataWriter::data_inlining_row_limit`]. `0` stores every write in
+    /// Parquet and creates no inlined data tables.
+    #[must_use]
+    pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
+        self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Drive `future`, a catalog call of this writer, with its
+    /// `data_inlining_row_limit` in effect for the call.
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
+            crate::metadata_provider::block_on(future)
+        })
     }
 
     /// Tombstone a live table at a new "drop snapshot".
@@ -846,7 +867,7 @@ impl SqliteMetadataWriter {
     pub fn drop_table(&self, schema_name: &str, table_name: &str) -> Result<bool> {
         validate_name(schema_name, "Schema")?;
         validate_name(table_name, "Table")?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
             // Take the write lock up front (write-lock-first invariant; see
@@ -934,7 +955,7 @@ impl SqliteMetadataWriter {
     /// The whole operation runs in one transaction, so a crash can't leave scheduled
     /// rows out of sync with the catalog.
     pub fn expire_snapshots(&self, criteria: ExpireCriteria) -> Result<Vec<ExpiredSnapshot>> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
             // The most recent snapshot is never expirable.
@@ -1181,7 +1202,7 @@ impl SqliteMetadataWriter {
         &self,
         criteria: &CleanupCriteria,
     ) -> Result<Vec<ScheduledFile>> {
-        block_on(async {
+        self.block_on(async {
             let rows = match criteria {
                 CleanupCriteria::All => {
                     sqlx::query(
@@ -1223,7 +1244,7 @@ impl SqliteMetadataWriter {
         if ids.is_empty() {
             return Ok(());
         }
-        block_on(async {
+        self.block_on(async {
             sqlx::query(AssertSqlSafe(format!(
                 "DELETE FROM ducklake_files_scheduled_for_deletion WHERE data_file_id IN ({})",
                 id_list(ids)
@@ -1244,7 +1265,7 @@ impl SqliteMetadataWriter {
     ///
     /// Used by [`crate::maintenance::delete_orphaned_files_sqlite`].
     pub(crate) fn list_referenced_paths(&self) -> Result<Vec<(String, bool)>> {
-        block_on(async {
+        self.block_on(async {
             let q = format!(
                 "SELECT {RESOLVED_PATH} AS p, {REL_FLAG} AS rel
                  FROM ducklake_data_file df
@@ -2921,6 +2942,16 @@ async fn finalize_table_snapshot(
     // insert only new ones, and leave unchanged columns (and their ids) in place.
     // Re-minting ids every write would orphan the field_ids baked into
     // already-written files, making their rows read back as NULL.
+    // Official refuses to drop a column its sort order references.
+    let dropped =
+        crate::metadata_writer::dropped_top_level_columns(&existing_catalog_columns, column_ids);
+    if !dropped.is_empty() {
+        let keys: Vec<(String, String)> = sqlx::query_as(crate::sort::LIVE_SORT_KEYS_SQL)
+            .bind(table_id)
+            .fetch_all(&mut **tx)
+            .await?;
+        crate::sort::refuse_dropping_sort_columns(&keys, &dropped)?;
+    }
     let proposed_ids = column_ids.iter().copied().collect::<HashSet<_>>();
     let mut current_by_id: HashMap<i64, (i64, bool, String)> = HashMap::new();
     for row in &current {
@@ -2944,50 +2975,71 @@ async fn finalize_table_snapshot(
         current_by_id.insert(column_id, (order, nullable, ducklake_type));
     }
 
-    for (order, (column, column_id)) in proposed.iter().zip(column_ids).enumerate() {
+    let existing_orders = current
+        .iter()
+        .map(|row| row.try_get::<i64, _>("column_order"))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let orders = crate::metadata_writer::proposed_column_orders(
+        &existing_catalog_columns,
+        &existing_orders,
+        &proposed,
+        column_ids,
+    );
+    for ((column, column_id), order) in proposed.iter().zip(column_ids).zip(orders) {
         let parent_id = column.parent_index.map(|index| column_ids[index]);
         match current_by_id.get(column_id) {
             Some((cur_order, cur_nullable, cur_type)) => {
-                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
-                if migrate_type {
-                    sqlx::query(
-                        "UPDATE ducklake_column SET end_snapshot = ?
-                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
-                    )
-                    .bind(snapshot_id)
-                    .bind(table_id)
-                    .bind(column_id)
-                    .execute(&mut **tx)
-                    .await?;
-                    sqlx::query(
-                        "INSERT INTO ducklake_column
-                             (column_id, table_id, column_name, column_type, column_order,
-                              nulls_allowed, parent_column, begin_snapshot)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    )
-                    .bind(column_id)
-                    .bind(table_id)
-                    .bind(&column.name)
-                    .bind(&column.ducklake_type)
-                    .bind(order as i64)
-                    .bind(column.is_nullable)
-                    .bind(parent_id)
-                    .bind(snapshot_id)
-                    .execute(&mut **tx)
-                    .await?;
-                } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
-                    sqlx::query(
-                        "UPDATE ducklake_column
-                         SET column_order = ?, nulls_allowed = ?
-                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
-                    )
-                    .bind(order as i64)
-                    .bind(column.is_nullable)
-                    .bind(table_id)
-                    .bind(column_id)
-                    .execute(&mut **tx)
-                    .await?;
+                // A data write leaves a live column's row as it is, as
+                // official's does. A schema change that retypes it, changes
+                // its top-level nullability or moves it records a new row
+                // version, keeping the old one for time travel.
+                if !is_ddl {
+                    continue;
                 }
+                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
+                let nullable = if column.parent_index.is_none() {
+                    column.is_nullable
+                } else {
+                    *cur_nullable
+                };
+                if !migrate_type && *cur_order == order && *cur_nullable == nullable {
+                    continue;
+                }
+                let column_type = if migrate_type {
+                    column.ducklake_type.as_str()
+                } else {
+                    cur_type.as_str()
+                };
+                sqlx::query(
+                    "UPDATE ducklake_column SET end_snapshot = ?
+                     WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(column_id)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO ducklake_column
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot, initial_default,
+                          default_value, default_value_type, default_value_dialect)
+                     SELECT column_id, table_id, column_name, ?, ?, ?, parent_column, ?,
+                            initial_default, default_value, default_value_type,
+                            default_value_dialect
+                     FROM ducklake_column
+                     WHERE table_id = ? AND column_id = ? AND end_snapshot = ?
+                     LIMIT 1",
+                )
+                .bind(column_type)
+                .bind(order)
+                .bind(nullable)
+                .bind(snapshot_id)
+                .bind(table_id)
+                .bind(column_id)
+                .bind(snapshot_id)
+                .execute(&mut **tx)
+                .await?;
             },
             None => {
                 sqlx::query(
@@ -3001,7 +3053,7 @@ async fn finalize_table_snapshot(
                 .bind(table_id)
                 .bind(&column.name)
                 .bind(&column.ducklake_type)
-                .bind(order as i64)
+                .bind(order)
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
@@ -3131,24 +3183,39 @@ async fn validate_staged_table(
             "staged table was dropped".to_string(),
         ));
     }
-    let current = sqlx::query("SELECT column_id, column_type, nulls_allowed, parent_column FROM ducklake_column WHERE table_id = ? AND end_snapshot IS NULL ORDER BY column_order").bind(write.table_id).fetch_all(&mut **tx).await?;
+    let current = sqlx::query(
+        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+         FROM ducklake_column
+         WHERE table_id = ? AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(write.table_id)
+    .fetch_all(&mut **tx)
+    .await?;
     let proposed = catalog_column_defs(&write.columns)?;
     if current.is_empty() && proposed.len() == write.column_ids.len() {
         return Ok(());
     }
-    let mut matches = current.len() == proposed.len() && proposed.len() == write.column_ids.len();
-    if matches {
-        for (index, (row, column)) in current.iter().zip(&proposed).enumerate() {
-            let column_id: i64 = row.try_get("column_id")?;
-            let column_type: String = row.try_get("column_type")?;
-            let nullable: Option<bool> = row.try_get("nulls_allowed")?;
-            let parent: Option<i64> = row.try_get("parent_column")?;
-            matches &= column_id == write.column_ids[index]
-                && catalog_column_type_equal(&column_type, column)
-                && nullable.unwrap_or(true) == column.is_nullable
-                && parent == column.parent_index.map(|i| write.column_ids[i]);
-        }
+    let mut existing = Vec::with_capacity(current.len());
+    let mut nullability = Vec::with_capacity(current.len());
+    for row in &current {
+        existing.push(ExistingCatalogColumn {
+            column_id: row.try_get("column_id")?,
+            name: row.try_get("column_name")?,
+            ducklake_type: row.try_get("column_type")?,
+            parent_column: row.try_get("parent_column")?,
+        });
+        nullability.push(
+            row.try_get::<Option<bool>, _>("nulls_allowed")?
+                .unwrap_or(true),
+        );
     }
+    let matches = crate::metadata_writer::staged_columns_match(
+        &existing,
+        &nullability,
+        &proposed,
+        &write.column_ids,
+    );
     if !matches {
         return Err(crate::DuckLakeError::Conflict(
             "table schema changed after staging".to_string(),
@@ -3589,6 +3656,52 @@ async fn commit_inlined_at_snapshot(
     Ok(())
 }
 
+impl SqliteMetadataWriter {
+    /// The `(scope, scope_id, value)` rows storing option `key`, with the
+    /// live ids of `schema_name` and its `table_name` when they exist.
+    #[allow(clippy::type_complexity)]
+    fn scoped_setting_rows(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        key: &str,
+    ) -> Result<(
+        Vec<(Option<String>, Option<i64>, String)>,
+        Option<i64>,
+        Option<i64>,
+    )> {
+        self.block_on(async {
+            let schema_id: Option<i64> = sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .fetch_optional(&self.pool)
+            .await?;
+            let table_id: Option<i64> = match schema_id {
+                Some(schema_id) => {
+                    sqlx::query_scalar(
+                        "SELECT table_id FROM ducklake_table
+                         WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                    )
+                    .bind(schema_id)
+                    .bind(table_name)
+                    .fetch_optional(&self.pool)
+                    .await?
+                },
+                None => None,
+            };
+            let settings: Vec<(Option<String>, Option<i64>, String)> = sqlx::query_as(
+                "SELECT scope, scope_id, value FROM ducklake_metadata WHERE key = ?",
+            )
+            .bind(key)
+            .fetch_all(&self.pool)
+            .await?;
+            Ok((settings, schema_id, table_id))
+        })
+    }
+}
+
 impl MetadataWriter for SqliteMetadataWriter {
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         Some(self)
@@ -3605,7 +3718,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             // One transaction: a registry row and its physical table go together.
             let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             let targets = sqlx::query_as::<_, (i64, i64, String)>(SUPERSEDED_INLINED_TABLES_SQL)
@@ -3638,8 +3751,11 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
-        let key = validate_table_setting(key)?;
-        block_on(async {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+        let value = value.as_str();
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             let table_exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM ducklake_table WHERE table_id = ? AND end_snapshot IS NULL)",
@@ -3686,7 +3802,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
         let value = encode_inlined_index_columns(columns)?;
-        block_on(async {
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             let available = sqlx::query_scalar::<_, String>(
                 "SELECT column_name FROM ducklake_column
@@ -3736,7 +3852,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             let physical_tables = sqlx::query_scalar::<_, String>(
                 "SELECT table_name FROM ducklake_inlined_data_tables WHERE table_id = ?",
@@ -3782,7 +3898,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn catalog_encrypted(&self) -> Result<bool> {
-        block_on(async {
+        self.block_on(async {
             let values: Vec<String> = sqlx::query_scalar(
                 "SELECT value FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL",
             )
@@ -3793,7 +3909,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn head_snapshot(&self) -> Result<Option<i64>> {
-        block_on(async {
+        self.block_on(async {
             Ok(
                 sqlx::query_scalar("SELECT MAX(snapshot_id) FROM ducklake_snapshot")
                     .fetch_one(&self.pool)
@@ -3803,7 +3919,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn create_snapshot(&self) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             // A bare snapshot carries no schema change of its own, so carry
             // schema_version forward with the empty change summary inserted by
@@ -3814,8 +3930,90 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn data_inlining_row_limit(&self) -> Option<usize> {
+        self.data_inlining_row_limit
+    }
+
+    fn table_data_inlining_row_limit(&self, schema_name: &str, table_name: &str) -> Result<usize> {
+        let (settings, schema_id, table_id) =
+            self.scoped_setting_rows(schema_name, table_name, "data_inlining_row_limit")?;
+        // With this writer's limit in effect, as every call of it has.
+        let _scope =
+            crate::metadata_writer::WriterInliningLimitScope::enter(self.data_inlining_row_limit);
+        crate::metadata_writer::effective_inlining_limit_of(&settings, schema_id, table_id)
+    }
+
+    fn table_setting(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let (settings, schema_id, table_id) =
+            self.scoped_setting_rows(schema_name, table_name, key)?;
+        Ok(crate::metadata_writer::scoped_setting_of(
+            &settings, schema_id, table_id,
+        ))
+    }
+
+    fn set_schema_setting(&self, schema_id: i64, key: &str, value: &str) -> Result<()> {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+        let value = value.as_str();
+        self.block_on(async {
+            let mut transaction = self.pool.begin().await?;
+            let schema_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ducklake_schema
+                               WHERE schema_id = ? AND end_snapshot IS NULL)",
+            )
+            .bind(schema_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !schema_exists {
+                return Err(crate::DuckLakeError::SchemaNotFound(schema_id.to_string()));
+            }
+            if enables_inlining(&key, value) {
+                let columns: Vec<(String, String)> =
+                    sqlx::query_as(crate::metadata_writer::SQL_SCHEMA_INLINING_COLUMNS)
+                        .bind(schema_id)
+                        .fetch_all(&mut *transaction)
+                        .await?;
+                let system = crate::metadata_provider_sqlite::catalog_inlined_system_columns(
+                    &mut *transaction,
+                )
+                .await?;
+                reject_reserved_inlining_columns(&columns, system)?;
+            }
+            sqlx::query(
+                "DELETE FROM ducklake_metadata
+                 WHERE key = ? AND scope = 'schema' AND scope_id = ?",
+            )
+            .bind(&key)
+            .bind(schema_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+                 VALUES (?, ?, 'schema', ?)",
+            )
+            .bind(&key)
+            .bind(value)
+            .bind(schema_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            Ok(())
+        })
+    }
+
     fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
-        block_on(async {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let key = key.as_str();
+        let value = crate::metadata_writer::normalize_setting_value(key, value)?;
+        let value = value.as_str();
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             if enables_inlining(key, value) {
                 let columns: Vec<(String, String)> = sqlx::query_as(SQL_GLOBAL_INLINING_COLUMNS)
@@ -3846,7 +4044,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
         validate_name(key, "Tag key")?;
         let change = tag_change(target, key)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             carry_allocator_watermarks(&mut tx, snapshot_id).await?;
@@ -3967,7 +4165,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Schema")?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT schema_id FROM ducklake_schema
@@ -4017,7 +4215,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let existing = sqlx::query(
                 "SELECT table_id FROM ducklake_table
@@ -4075,7 +4273,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     ) -> Result<i64> {
         // Reject an unknown target type up front (before opening a transaction).
         crate::types::ducklake_to_arrow_type(new_ducklake_type)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
             // Take the write lock up front (write-lock-first invariant; see
@@ -4205,7 +4403,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             // Write-lock-first: reserve the new partition id (a metadata-counter
             // UPDATE) before any read, so a concurrent DDL blocks on the lock.
@@ -4288,7 +4486,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         &self,
         table_id: i64,
     ) -> Result<Option<crate::partition::PartitionSpec>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
@@ -4317,7 +4515,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
             let ended = sqlx::query(
@@ -4357,7 +4555,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
                         se.sort_direction, se.null_order
@@ -4394,39 +4592,28 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             // Reserve the sort_id first so the counter UPDATE takes the write lock
             // before any read, so a concurrent DDL blocks on the lock.
             let sort_id = reserve_ids(&mut tx, "next_sort_id", 1).await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
+            // Official bumps the schema version on every sort-order change, with no
+            // `ducklake_schema_versions` row (checked with the DuckDB CLI).
+            bump_schema_version(&mut tx, new_snapshot).await?;
 
             // Validate every sort key resolves to a live column (v1 supports bare
             // column keys only), so a bad SET fails here rather than silently
-            // producing unsorted writes later.
-            for field in fields {
-                let column = field.column_candidate().ok_or_else(|| {
-                    crate::DuckLakeError::InvalidConfig(format!(
-                        "set_sort_spec: sort key '{}' is not a bare column; only column \
-                         sort keys are supported",
-                        field.expression
-                    ))
-                })?;
-                let exists: Option<i64> = sqlx::query_scalar(
-                    "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
-                       AND parent_column IS NULL",
-                )
-                .bind(table_id)
-                .bind(&column)
-                .fetch_optional(&mut *tx)
-                .await?;
-                if exists.is_none() {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "set_sort_spec: no live column '{column}' in table {table_id}"
-                    )));
-                }
-            }
+            // producing unsorted writes later. A key binds to its column ignoring
+            // case, as DuckDB's binder binds it.
+            let names: Vec<String> = sqlx::query_scalar(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+            )
+            .bind(table_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            crate::sort::check_sort_key_columns(fields, &names)?;
 
             // End the currently-live spec generation (if any), then insert the new
             // one and its per-key expressions.
@@ -4465,9 +4652,6 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
             }
-
-            // A sort-order change does NOT bump schema_version (see the trait doc):
-            // it does not alter the logical schema, only future write layout.
             record_snapshot_changes(
                 &mut tx,
                 new_snapshot,
@@ -4481,30 +4665,18 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn reset_sort_spec(&self, table_id: i64) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (new_snapshot, _carried) = insert_snapshot(&mut tx).await?;
-            let ended = sqlx::query(
+            bump_schema_version(&mut tx, new_snapshot).await?;
+            sqlx::query(
                 "UPDATE ducklake_sort_info SET end_snapshot = ?
                  WHERE table_id = ? AND end_snapshot IS NULL",
             )
             .bind(new_snapshot)
             .bind(table_id)
             .execute(&mut *tx)
-            .await?
-            .rows_affected();
-            if ended == 0 {
-                // Nothing to reset: roll back the just-allocated snapshot (drop tx)
-                // so a no-op RESET creates no empty snapshot, and report the head.
-                drop(tx);
-                let head: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
-                )
-                .fetch_one(&self.pool)
-                .await?;
-                return Ok(head);
-            }
-            // A sort-order change does NOT bump schema_version.
+            .await?;
             record_snapshot_changes(
                 &mut tx,
                 new_snapshot,
@@ -4528,7 +4700,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "Table must have at least one column".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             // Use a transaction to ensure atomicity: if column insertion fails,
             // we don't leave existing columns marked as ended
             let mut tx = self.pool.begin().await?;
@@ -4555,9 +4727,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             let last_column_id = reserve_ids(&mut tx, "next_column_id", n).await?;
             let first_column_id = last_column_id - n + 1;
             let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
-            for (order, (column, column_id)) in
-                catalog_columns.iter().zip(column_ids.iter()).enumerate()
-            {
+            for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
                 let parent_id = column.parent_index.map(|index| column_ids[index]);
                 sqlx::query(
                     "INSERT INTO ducklake_column
@@ -4570,7 +4740,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .bind(table_id)
                 .bind(&column.name)
                 .bind(&column.ducklake_type)
-                .bind(order as i64)
+                // Official numbers a column it creates by its id.
+                .bind(*column_id)
                 .bind(column.is_nullable)
                 .bind(parent_id)
                 .bind(snapshot_id)
@@ -4637,7 +4808,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             // Single atomic commit: insert the deferred snapshot row + finalize
             // the column generation + retire the prior generation (Replace),
             // then register this file and advance the monotonic row-lineage
@@ -4817,7 +4988,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "register_data_files: files must be non-empty".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             // One atomic snapshot for all N partition files: finalize the snapshot +
             // (Replace) retire the prior generation ONCE, then insert every file with
             // a distinct row_id_start from the advancing row-lineage counter.
@@ -4947,7 +5118,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn reserved_inlining_column(&self, columns: &[String]) -> Result<Option<String>> {
-        let system = block_on(catalog_inlined_system_columns(&self.pool))?;
+        let system = self.block_on(catalog_inlined_system_columns(&self.pool))?;
         Ok(columns
             .iter()
             .find(|column| system.conflicts_with(column))
@@ -4955,7 +5126,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
-        let Ok(system) = block_on(catalog_inlined_system_columns(&self.pool)) else {
+        let Ok(system) = self.block_on(catalog_inlined_system_columns(&self.pool)) else {
             return false;
         };
         if schema
@@ -4972,7 +5143,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
-        block_on(async {
+        self.block_on(async {
             let refused: bool = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT EXISTS(
                      SELECT 1 FROM ducklake_column c
@@ -5006,7 +5177,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             let record_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
             if record_count == 0 {
                 return Err(crate::DuckLakeError::InvalidConfig(
@@ -5022,7 +5193,10 @@ impl MetadataWriter for SqliteMetadataWriter {
                 ));
             }
 
-            let mut tx = self.pool.begin().await?;
+            // Take the write lock up front: the commit reads before it writes,
+            // and SQLite refuses to upgrade a deferred transaction's read lock
+            // while another writer holds the database, rather than wait.
+            let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
             enforce_inline_partition_fence(&mut tx, table_id, base_snapshot).await?;
             let snapshot_id = finalize_snapshot(
                 &mut tx,
@@ -5182,7 +5356,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             ));
         }
 
-        block_on(async {
+        self.block_on(async {
             for write in writes {
                 validate_row_mutation_stage(write)?;
             }
@@ -5346,7 +5520,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         base_snapshot: i64,
         delete: &DeleteFileInfo,
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             // Single atomic commit: allocate the snapshot (write-lock-first),
             // fence against a concurrent generation change, compare-and-swap the
             // live delete file for this data file, retire the prior one, and
@@ -5508,7 +5682,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         validate_delete_entries(mode, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // One atomic commit for a combined append + positional deletes (an
             // update/upsert). finalize_snapshot allocates the snapshot + finalizes
             // the column generation; the new data file AND every delete file are
@@ -5770,7 +5944,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             ));
         }
         validate_delete_entries(mode, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // One atomic commit for a combined N-file append + positional deletes
             // (a keyed mutation whose new row versions span several partitions or
             // rolled files). finalize_snapshot allocates the snapshot + finalizes
@@ -6006,7 +6180,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         // A positional delete never retires the data files it targets, so it is
         // Append-semantics for validation (also enforces distinct data files).
         validate_delete_entries(WriteMode::Append, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // One atomic commit for an N-file positional DELETE with no append.
             // Mirrors register_data_file_with_deletes' delete loop, but allocates
             // the snapshot via insert_snapshot (no column generation, no data
@@ -6133,7 +6307,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "commit_inlined_deletes requires at least one row".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             let ours = TableChanges {
@@ -6192,7 +6366,7 @@ impl MetadataWriter for SqliteMetadataWriter {
             );
         }
         validate_delete_entries(WriteMode::Append, positional)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
             let ours = TableChanges {
@@ -6241,7 +6415,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "commit_compaction requires at least one source file".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             // One atomic snapshot for the whole compaction. insert_snapshot takes
             // the SQLite write lock up front (write-lock-first) and carries
             // schema_version forward — compaction is not DDL. The head
@@ -6455,7 +6629,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         tables: &[InlinedFlushTable],
     ) -> Result<i64> {
         validate_inlined_flush(tables)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             // Write-lock-first; a flush is not DDL, so schema_version carries forward.
             let (snapshot_id, _schema_version) = insert_snapshot(&mut tx).await?;
@@ -6600,7 +6774,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn retire_appends_since(&self, table_id: i64, base_snapshot: i64) -> Result<Option<i64>> {
-        block_on(async {
+        self.block_on(async {
             // Metadata-only rollback of a pure-append delta in one snapshot: end
             // every live data file added after base_snapshot, recompute the visible
             // stats from the survivors. next_row_id is preserved (rowids never
@@ -6798,7 +6972,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         _table_name: &str,
         base_snapshot: i64,
     ) -> Result<u64> {
-        block_on(async {
+        self.block_on(async {
             // Metadata-only truncate in one snapshot: end every live data file and
             // its live delete file (as drop_table does); `ducklake_table_stats` is
             // left as official's `DELETE` leaves it.
@@ -6939,7 +7113,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         // atomically. Used by CREATE TABLE (schema.rs); the crate's own write
         // path always registers a file (even for zero rows) and so commits via
         // register_data_file instead.
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             let snapshot_id = finalize_snapshot(
                 &mut tx,
@@ -6982,7 +7156,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         // zero (the new files written next will rebuild them). `next_row_id`
         // is deliberately NOT reset: rowids must stay monotonic across the
         // table's lifetime so historical snapshots still resolve uniquely.
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
             let result = sqlx::query(
@@ -7000,7 +7174,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn get_data_path(&self) -> Result<String> {
-        block_on(async {
+        self.block_on(async {
             let row =
                 sqlx::query("SELECT value FROM ducklake_metadata WHERE key = ? AND scope IS NULL")
                     .bind("data_path")
@@ -7021,7 +7195,7 @@ impl MetadataWriter for SqliteMetadataWriter {
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<Vec<(String, bool)>>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT c.column_name, c.nulls_allowed
                  FROM ducklake_column c
@@ -7053,7 +7227,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
     fn set_data_path(&self, path: &str) -> Result<()> {
         let path = directory_path(path);
-        block_on(async {
+        self.block_on(async {
             let current: Option<String> = sqlx::query_scalar(
                 "SELECT value FROM ducklake_metadata WHERE key = 'data_path' AND scope IS NULL",
             )
@@ -7080,7 +7254,7 @@ impl MetadataWriter for SqliteMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             sqlx::query(SQL_CREATE_SCHEMA).execute(&self.pool).await?;
             sqlx::query(SQL_CREATE_INLINED_DATA_TABLES)
                 .execute(&self.pool)
@@ -7151,6 +7325,9 @@ impl MetadataWriter for SqliteMetadataWriter {
             .execute(&self.pool)
             .await?;
             migrate_directory_paths(&self.pool).await?;
+            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
     }
@@ -7169,7 +7346,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 "Table must have at least one column".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
             // Reserve the column ids first so the counter UPDATE takes the write

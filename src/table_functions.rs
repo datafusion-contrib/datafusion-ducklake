@@ -179,14 +179,14 @@ impl DucklakeTableChangesFunction {
 }
 
 /// Everything a CDC table function needs about its target table.
-struct CdcTableContext {
-    table_id: i64,
-    object_store_url: datafusion::execution::object_store::ObjectStoreUrl,
-    table_path: String,
-    table_schema: Arc<arrow::datatypes::Schema>,
+pub(crate) struct CdcTableContext {
+    pub(crate) table_id: i64,
+    pub(crate) object_store_url: datafusion::execution::object_store::ObjectStoreUrl,
+    pub(crate) table_path: String,
+    pub(crate) table_schema: Arc<arrow::datatypes::Schema>,
     /// The columns the `table_schema` was built from, carrying the field ids each
     /// data file's columns are resolved by.
-    columns: Vec<crate::metadata_provider::DuckLakeTableColumn>,
+    pub(crate) columns: Vec<crate::metadata_provider::DuckLakeTableColumn>,
 }
 
 /// Split `'schema.table'` (defaulting to schema `main`).
@@ -333,6 +333,21 @@ fn parse_cdc_args(
                  {end_snapshot}"
             ))
         })?;
+    Ok((
+        start_snapshot,
+        end_snapshot,
+        cdc_table_context(provider.as_ref(), &schema, &table, end_snapshot)?,
+    ))
+}
+
+/// What a change feed over table `table` of schema `schema` needs, its columns
+/// as of `end_snapshot`.
+pub(crate) fn cdc_table_context(
+    provider: &dyn MetadataProvider,
+    schema: &crate::metadata_provider::SchemaMetadata,
+    table: &crate::metadata_provider::TableMetadata,
+    end_snapshot: i64,
+) -> DataFusionResult<CdcTableContext> {
     let data_path = provider
         .get_data_path()
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
@@ -355,17 +370,13 @@ fn parse_cdc_args(
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
     );
 
-    Ok((
-        start_snapshot,
-        end_snapshot,
-        CdcTableContext {
-            table_id: table.table_id,
-            object_store_url,
-            table_path,
-            table_schema,
-            columns,
-        },
-    ))
+    Ok(CdcTableContext {
+        table_id: table.table_id,
+        object_store_url,
+        table_path,
+        table_schema,
+        columns,
+    })
 }
 
 impl TableFunctionImpl for DucklakeTableChangesFunction {
@@ -533,6 +544,28 @@ mod snapshot_bound_tests {
             parse_snapshot_timestamp("2026-07-16").unwrap(),
             parse_snapshot_timestamp("2026-07-16 00:00:00").unwrap()
         );
+    }
+
+    /// Every UTC offset form PostgreSQL and DuckDB print a `TIMESTAMPTZ` with
+    /// (`+05:30` in `Asia/Kolkata`, `+00:19:32` for Amsterdam's 1930s mean
+    /// time, `-03` in `America/Sao_Paulo`) reads as the same UTC instant.
+    #[test]
+    fn offsets_convert_to_utc() {
+        let utc = parse_snapshot_timestamp("2026-07-16 12:00:00.5").unwrap();
+        for raw in [
+            "2026-07-16 17:30:00.5+05:30",
+            "2026-07-16 17:30:00.5+0530",
+            "2026-07-16 09:00:00.5-03",
+            "2026-07-16T09:00:00.5-03:00",
+            "2026-07-16 12:19:32.5+00:19:32",
+            "2026-07-16 12:00:00.5Z",
+            "2026-07-17 01:45:00.5+13:45",
+        ] {
+            assert_eq!(parse_snapshot_timestamp(raw), Some(utc), "{raw:?}");
+        }
+        for raw in ["2026-07-16 12:00:00+5", "2026-07-16 12:00:00+05:3", "2026-07-16 12:00:00+aa"] {
+            assert!(parse_snapshot_timestamp(raw).is_none(), "{raw:?}");
+        }
     }
 
     #[test]

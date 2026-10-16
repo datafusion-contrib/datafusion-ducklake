@@ -68,7 +68,8 @@ async fn seed_two_files(temp_dir: &TempDir) {
     std::fs::create_dir_all(&data_path).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(temp_dir, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -78,7 +79,8 @@ async fn seed_two_files(temp_dir: &TempDir) {
 
     let writer = SqliteMetadataWriter::new(&conn_str(temp_dir, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
         .append_table("main", "t", &[batch(vec![10, 11, 12], vec![40, 50, 60])])
@@ -366,7 +368,8 @@ async fn null_record_count_never_folds_a_wrong_count() {
 
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -614,7 +617,8 @@ async fn a_shared_delete_file_is_counted_once_per_data_file_as_official_does() {
     // delete at position 5 of the big file cannot exist in the small one.
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -623,7 +627,8 @@ async fn a_shared_delete_file_is_counted_once_per_data_file_as_official_does() {
         .unwrap();
     let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
         .append_table(
@@ -636,7 +641,8 @@ async fn a_shared_delete_file_is_counted_once_per_data_file_as_official_does() {
 
     let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     // The DELETE writes a delete file rather than an inlined deletion.
     writer
         .set_global_setting("data_inlining_row_limit", "0")
@@ -881,7 +887,8 @@ async fn a_short_record_count_loses_no_rows() {
 
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -895,7 +902,8 @@ async fn a_short_record_count_loses_no_rows() {
 
     let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
         .await
         .unwrap();
@@ -971,7 +979,8 @@ async fn an_update_rewrite_cannot_erase_rows_past_a_short_record_count() {
 
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -986,7 +995,8 @@ async fn an_update_rewrite_cannot_erase_rows_past_a_short_record_count() {
     let session_with_writer = || async {
         let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
             .await
-            .unwrap();
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
             .await
             .unwrap();

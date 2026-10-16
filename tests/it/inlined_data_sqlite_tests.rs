@@ -626,6 +626,7 @@ async fn flush_inlined_data_conflicts_with_a_concurrent_delete_and_leaves_no_fil
     // A Parquet append does not conflict with a flush, as in official.
     let appended = DuckLakeTableWriter::new(writer.clone(), object_store())
         .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
         .append_table("main", "t", &[batch(vec![3], vec![30])])
         .await
         .unwrap();
@@ -803,7 +804,10 @@ async fn conflicted_multi_table_commit_leaves_no_partial_state_and_no_staged_fil
     let base = provider.get_current_snapshot().unwrap();
 
     let writer: Arc<dyn MetadataWriter> = writer;
-    let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store()).unwrap();
+    let parquet = DuckLakeWriteOptions::default().with_data_inlining_row_limit(0);
+    let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store())
+        .unwrap()
+        .with_options(&parquet);
     let options = TableWriteOptions::new().with_expected_base_snapshot_id(base);
     let mut transaction = table_writer.transaction().with_options(&options);
     transaction
@@ -819,7 +823,9 @@ async fn conflicted_multi_table_commit_leaves_no_partial_state_and_no_staged_fil
 
     // A concurrent commit moves the staged table's generation past the
     // fenced base (the fence is per staged table).
-    let concurrent = DuckLakeTableWriter::new(Arc::clone(&writer), object_store()).unwrap();
+    let concurrent = DuckLakeTableWriter::new(Arc::clone(&writer), object_store())
+        .unwrap()
+        .with_options(&parquet);
     concurrent
         .append_table("main", "data", &[batch(vec![9], vec![90])])
         .await
@@ -862,7 +868,9 @@ fn walkdir_parquet(dir: &std::path::Path) -> usize {
 async fn multi_table_commit_records_created_schema_once() {
     let temp = TempDir::new().unwrap();
     let writer = Arc::new(make_writer(&temp).await);
-    let table_writer = DuckLakeTableWriter::new(writer, object_store()).unwrap();
+    let table_writer = DuckLakeTableWriter::new(writer, object_store())
+        .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0));
     let mut transaction = table_writer.transaction();
     for table_name in ["t1", "t2"] {
         transaction
@@ -3053,6 +3061,7 @@ async fn deprecated_flush_inlined_data_conflicts_and_retries_from_fresh_snapshot
 
     let concurrent = DuckLakeTableWriter::new(writer.clone(), object_store())
         .unwrap()
+        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
         .append_table("main", "t", &[batch(vec![3], vec![30])])
         .await
         .unwrap();

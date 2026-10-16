@@ -163,7 +163,8 @@ async fn streaming_session_splits_rows_across_partitions() {
     let env = setup().await;
     let writer = SqliteMetadataWriter::new_with_init(&env.conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new());
     let table_writer = DuckLakeTableWriter::new(Arc::new(writer), object_store).unwrap();
@@ -574,7 +575,8 @@ async fn partitioned_append_with_deletes_commits_one_partition_file_atomically()
     let writer: Arc<dyn MetadataWriter> = Arc::new(
         SqliteMetadataWriter::new_with_init(&env.conn_str)
             .await
-            .unwrap(),
+            .unwrap()
+            .with_data_inlining_row_limit(0),
     );
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new());
@@ -665,7 +667,8 @@ async fn partitioned_append_with_deletes_commits_every_partition_file_atomically
     let writer: Arc<dyn MetadataWriter> = Arc::new(
         SqliteMetadataWriter::new_with_init(&env.conn_str)
             .await
-            .unwrap(),
+            .unwrap()
+            .with_data_inlining_row_limit(0),
     );
     let object_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::local::LocalFileSystem::new());

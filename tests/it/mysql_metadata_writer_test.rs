@@ -1249,7 +1249,12 @@ async fn mysql_multi_table_write_commits_two_tables(#[case] existing: bool) {
     let temp = TempDir::new().unwrap();
     let data_path = temp.path().join("data");
     std::fs::create_dir_all(&data_path).unwrap();
-    let writer = Arc::new(MySqlMetadataWriter::new_with_init(&conn_str).await.unwrap());
+    let writer = Arc::new(
+        MySqlMetadataWriter::new_with_init(&conn_str)
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(0),
+    );
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let pool = sqlx::MySqlPool::connect(&conn_str).await.unwrap();
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));

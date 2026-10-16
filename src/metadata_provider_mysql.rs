@@ -20,9 +20,10 @@ use crate::metadata_provider::{
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange,
-    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, SQL_FILE_SCHEMA_VERSION,
-    inlined_file_delete_change, inlined_file_deletes_between_sql,
-    inlined_file_deletes_for_flush_sql, inlined_version_columns_sql,
+    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedVersionColumn,
+    SQL_FILE_SCHEMA_VERSION, SchemaVersionLedger, inlined_file_delete_change,
+    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
+    inlined_version_columns_sql, inlined_version_snapshot_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -37,31 +38,45 @@ use sqlx::types::chrono::NaiveDateTime;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+/// How a MySQL catalog finds an inlined table's schema version: its quoted
+/// strings read `\` as an escape unless `NO_BACKSLASH_ESCAPES` is set.
+fn mysql_lookup(ledger: SchemaVersionLedger) -> crate::metadata_provider::InlinedVersionLookup {
+    crate::metadata_provider::InlinedVersionLookup {
+        ledger,
+        catalog_scoped: false,
+        backslash_escapes: true,
+    }
+}
+
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
 /// was written with. `None` when no row matches.
+#[allow(clippy::too_many_arguments)]
 async fn read_mysql_inlined_table(
     pool: &MySqlPool,
     table_id: i64,
     table: &str,
+    ledger: SchemaVersionLedger,
     columns: &[DuckLakeTableColumn],
     selection: InlinedRowSelection,
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
 ) -> Result<Option<DuckLakeInlinedRows>> {
-    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
         present,
         physical_types,
     } = inlined_table_layout(pool, table).await?;
-    let version_columns: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(
-        inlined_version_columns_sql(&quote_ident(table), &system, "?"),
+    let version_columns: Vec<InlinedVersionColumn> = sqlx::query_as(AssertSqlSafe(
+        inlined_version_columns_sql(table, mysql_lookup(ledger), "?"),
     ))
     .bind(table_id)
     .fetch_all(pool)
     .await?;
-    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present)?;
+    let decode_columns = mapping.decode_columns(columns);
+    let decode_schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(&decode_columns)?);
 
     let mut select_list = selection
         .system_select(&system)
@@ -146,11 +161,15 @@ async fn read_mysql_inlined_table(
         row_ids,
         snapshots,
         end_snapshots,
-        batch: parse_inlined_rows_with_present(
+        batch: mapping.adapt(
+            parse_inlined_rows_with_present(
+                decode_schema,
+                &decode_columns,
+                values,
+                Some(&mapping.present(columns)),
+            )?,
             schema,
             columns,
-            values,
-            Some(&mapping.present(columns)),
         )?,
     }))
 }
@@ -443,11 +462,7 @@ impl StatsSqlDialect for MySqlStatsDialect {
     /// Text with no backslash — every temporal and boolean constant, and nearly
     /// every string one — takes the ordinary quoted form, quotes doubled.
     fn quote_literal(&self, text: &str) -> String {
-        if !text.contains('\\') {
-            return format!("'{}'", text.replace('\'', "''"));
-        }
-        let hex: String = text.bytes().map(|byte| format!("{byte:02X}")).collect();
-        format!("_utf8mb4 X'{hex}'")
+        crate::metadata_provider::text_literal(text, true)
     }
 }
 
@@ -766,9 +781,10 @@ impl MySqlMetadataProvider {
         shape: InlinedReadShape,
     ) -> Result<Vec<DuckLakeInlinedRows>> {
         let mut out = Vec::new();
+        let ledger = self.schema_version_ledger().await?;
         for table in self.registered_inlined_tables(table_id).await? {
             if let Some(rows) = read_mysql_inlined_table(
-                &self.pool, table_id, &table, columns, selection, filter, shape,
+                &self.pool, table_id, &table, ledger, columns, selection, filter, shape,
             )
             .await?
             {
@@ -776,6 +792,15 @@ impl MySqlMetadataProvider {
             }
         }
         Ok(out)
+    }
+
+    /// What the catalog's `ducklake_schema_versions` ledger records.
+    async fn schema_version_ledger(&self) -> Result<SchemaVersionLedger> {
+        Ok(if self.schema_capabilities().await?.schema_versions {
+            SchemaVersionLedger::PerTable
+        } else {
+            SchemaVersionLedger::Absent
+        })
     }
 
     /// Whether the catalog has the `ducklake_inlined_data_tables` registry, from
@@ -964,6 +989,45 @@ impl MetadataProvider for MySqlMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        block_on(async {
+            Ok(sqlx::query_scalar(
+                "SELECT snapshot_id FROM ducklake_snapshot
+                 WHERE snapshot_id >= ? AND snapshot_id <= ?
+                 ORDER BY snapshot_id",
+            )
+            .bind(from_snapshot)
+            .bind(through_snapshot)
+            .fetch_all(&self.pool)
+            .await?)
+        })
+    }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        let pattern = crate::change_detection::table_change_like_pattern(table_id);
+        block_on(async {
+            Ok(sqlx::query_as(
+                "SELECT snapshot.snapshot_id, changes.changes_made
+                 FROM ducklake_snapshot AS snapshot
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 WHERE snapshot.snapshot_id > ? AND snapshot.snapshot_id <= ?
+                   AND (changes.changes_made IS NULL OR changes.changes_made LIKE ?)
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .bind(after_snapshot)
+            .bind(through_snapshot)
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?)
         })
     }
 
@@ -1890,12 +1954,47 @@ impl MetadataProvider for MySqlMetadataProvider {
         ))
     }
 
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        let ledger = block_on(self.schema_version_ledger())?;
+        let mut oldest: Option<i64> = None;
+        for table in block_on(self.registered_inlined_tables(table_id))? {
+            let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
+            let sql = format!(
+                "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
+                quote_ident(&table),
+                begin = system.begin_snapshot,
+            );
+            let first: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .fetch_one(&self.pool),
+            )?;
+            // As the flush, which skips a table whose schema version it
+            // cannot resolve.
+            if first.is_none() {
+                continue;
+            }
+            let version: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT {}",
+                    inlined_version_snapshot_sql(&table, mysql_lookup(ledger))
+                )))
+                .fetch_one(&self.pool),
+            )?;
+            if version.is_some() {
+                oldest = oldest.into_iter().chain(first).min();
+            }
+        }
+        Ok(oldest)
+    }
+
     fn get_inlined_data_for_flush(
         &self,
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFlushData>> {
         let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let ledger = block_on(self.schema_version_ledger())?;
         let mut flushed = Vec::new();
         for table in tables {
             let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
@@ -1909,14 +2008,25 @@ impl MetadataProvider for MySqlMetadataProvider {
                     .bind(snapshot_id)
                     .fetch_one(&self.pool),
             )?;
-            let Some(first) = first else {
+            if first.is_none() {
+                continue;
+            }
+            let version: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT {}",
+                    inlined_version_snapshot_sql(&table, mysql_lookup(ledger))
+                )))
+                .fetch_one(&self.pool),
+            )?;
+            let Some(version) = version else {
                 continue;
             };
-            let columns = self.get_table_structure(table_id, first)?;
+            let columns = self.get_table_structure(table_id, version)?;
             if let Some(rows) = block_on(read_mysql_inlined_table(
                 &self.pool,
                 table_id,
                 &table,
+                ledger,
                 &columns,
                 InlinedRowSelection::WrittenUpTo(snapshot_id),
                 None,
@@ -1925,7 +2035,7 @@ impl MetadataProvider for MySqlMetadataProvider {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
-                    columns_snapshot: first,
+                    columns_snapshot: version,
                 });
             }
         }

@@ -13,14 +13,14 @@ use crate::metadata_provider::{
     DuckLakeTableColumnStatistics, DuckLakeTableField, DuckLakeTableFile, DuckLakeTableStatistics,
     DuckLakeTag, FileWithTable, InlinedColumnMapping, InlinedFileDeleteChange,
     InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedTableLayout,
-    MetadataProvider, MetadataSetting, ObjectTag, SQL_GET_FILE_PARTITION_VALUES,
-    SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC, SQL_GET_TABLE_COLUMNS,
-    SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata, TableWithSchema,
-    TagTarget, ViewMetadata, ViewWithSchema, block_on, inlined_delete_table_name,
-    inlined_file_delete_change, inlined_file_deletes_between_sql,
-    inlined_file_deletes_for_flush_sql, inlined_missing_scalar, inlined_version_columns_sql,
-    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
-    resolve_metadata_settings,
+    InlinedVersionColumn, MetadataProvider, MetadataSetting, ObjectTag,
+    SQL_GET_FILE_PARTITION_VALUES, SQL_GET_NAME_MAPPING, SQL_GET_PARTITION_SPEC, SQL_GET_SORT_SPEC,
+    SQL_GET_TABLE_COLUMNS, SchemaMetadata, SchemaVersionLedger, SnapshotChangeMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
+    block_on, inlined_delete_table_name, inlined_file_delete_change,
+    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
+    inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -388,28 +388,32 @@ fn build_inlined_temporal_array(
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
 /// was written with. `None` when no row matches.
+#[allow(clippy::too_many_arguments)]
 async fn read_sqlite_inlined_table(
     pool: &SqlitePool,
     table_id: i64,
     table: &str,
+    ledger: SchemaVersionLedger,
     columns: &[DuckLakeTableColumn],
     selection: InlinedRowSelection,
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
 ) -> Result<Option<DuckLakeInlinedRows>> {
-    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
         present,
         physical_types,
     } = inlined_table_layout(pool, table).await?;
-    let version_columns: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(
-        inlined_version_columns_sql(&quote_ident(table), &system, "?"),
+    let version_columns: Vec<InlinedVersionColumn> = sqlx::query_as(AssertSqlSafe(
+        inlined_version_columns_sql(table, ledger, "?"),
     ))
     .bind(table_id)
     .fetch_all(pool)
     .await?;
-    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present)?;
+    let decode_columns = mapping.decode_columns(columns);
+    let decode_schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(&decode_columns)?);
 
     // Each physical column is selected under its catalog name, which is what
     // `build_inlined_batch` reads it by.
@@ -484,12 +488,16 @@ async fn read_sqlite_inlined_table(
         .iter()
         .map(|row| row.try_get(2))
         .collect::<std::result::Result<Vec<Option<i64>>, _>>()?;
-    let batch = build_inlined_batch(
-        &schema,
+    let batch = mapping.adapt(
+        build_inlined_batch(
+            &decode_schema,
+            &decode_columns,
+            &mapping.present(columns),
+            &physical_types,
+            &rows,
+        )?,
+        schema,
         columns,
-        &mapping.present(columns),
-        &physical_types,
-        &rows,
     )?;
     Ok(Some(DuckLakeInlinedRows {
         table_name: table.to_string(),
@@ -976,9 +984,10 @@ impl SqliteMetadataProvider {
         shape: InlinedReadShape,
     ) -> Result<Vec<DuckLakeInlinedRows>> {
         let mut out = Vec::new();
+        let ledger = self.schema_version_ledger().await?;
         for table in self.registered_inlined_tables(table_id).await? {
             if let Some(rows) = read_sqlite_inlined_table(
-                &self.pool, table_id, &table, columns, selection, filter, shape,
+                &self.pool, table_id, &table, ledger, columns, selection, filter, shape,
             )
             .await?
             {
@@ -986,6 +995,15 @@ impl SqliteMetadataProvider {
             }
         }
         Ok(out)
+    }
+
+    /// What the catalog's `ducklake_schema_versions` ledger records.
+    async fn schema_version_ledger(&self) -> Result<SchemaVersionLedger> {
+        Ok(if self.schema_capabilities().await?.schema_versions {
+            SchemaVersionLedger::PerTable
+        } else {
+            SchemaVersionLedger::Absent
+        })
     }
 
     /// Whether the schema-capability memo is populated. Exposed for tests.
@@ -1159,6 +1177,45 @@ impl MetadataProvider for SqliteMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        block_on(async {
+            Ok(sqlx::query_scalar(
+                "SELECT snapshot_id FROM ducklake_snapshot
+                 WHERE snapshot_id >= ? AND snapshot_id <= ?
+                 ORDER BY snapshot_id",
+            )
+            .bind(from_snapshot)
+            .bind(through_snapshot)
+            .fetch_all(&self.pool)
+            .await?)
+        })
+    }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        let pattern = crate::change_detection::table_change_like_pattern(table_id);
+        block_on(async {
+            Ok(sqlx::query_as(
+                "SELECT snapshot.snapshot_id, changes.changes_made
+                 FROM ducklake_snapshot AS snapshot
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 WHERE snapshot.snapshot_id > ? AND snapshot.snapshot_id <= ?
+                   AND (changes.changes_made IS NULL OR changes.changes_made LIKE ?)
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .bind(after_snapshot)
+            .bind(through_snapshot)
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?)
         })
     }
 
@@ -2168,12 +2225,47 @@ impl MetadataProvider for SqliteMetadataProvider {
         ))
     }
 
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        let ledger = block_on(self.schema_version_ledger())?;
+        let mut oldest: Option<i64> = None;
+        for table in block_on(self.registered_inlined_tables(table_id))? {
+            let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
+            let sql = format!(
+                "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
+                quote_ident(&table),
+                begin = system.begin_snapshot,
+            );
+            let first: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(sql))
+                    .bind(snapshot_id)
+                    .fetch_one(&self.pool),
+            )?;
+            // As the flush, which skips a table whose schema version it
+            // cannot resolve.
+            if first.is_none() {
+                continue;
+            }
+            let version: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT {}",
+                    inlined_version_snapshot_sql(&table, ledger)
+                )))
+                .fetch_one(&self.pool),
+            )?;
+            if version.is_some() {
+                oldest = oldest.into_iter().chain(first).min();
+            }
+        }
+        Ok(oldest)
+    }
+
     fn get_inlined_data_for_flush(
         &self,
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFlushData>> {
         let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let ledger = block_on(self.schema_version_ledger())?;
         let mut flushed = Vec::new();
         for table in tables {
             let system = block_on(inlined_table_layout(&self.pool, &table))?.system;
@@ -2187,14 +2279,25 @@ impl MetadataProvider for SqliteMetadataProvider {
                     .bind(snapshot_id)
                     .fetch_one(&self.pool),
             )?;
-            let Some(first) = first else {
+            if first.is_none() {
+                continue;
+            }
+            let version: Option<i64> = block_on(
+                sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT {}",
+                    inlined_version_snapshot_sql(&table, ledger)
+                )))
+                .fetch_one(&self.pool),
+            )?;
+            let Some(version) = version else {
                 continue;
             };
-            let columns = self.get_table_structure(table_id, first)?;
+            let columns = self.get_table_structure(table_id, version)?;
             if let Some(rows) = block_on(read_sqlite_inlined_table(
                 &self.pool,
                 table_id,
                 &table,
+                ledger,
                 &columns,
                 InlinedRowSelection::WrittenUpTo(snapshot_id),
                 None,
@@ -2203,7 +2306,7 @@ impl MetadataProvider for SqliteMetadataProvider {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
-                    columns_snapshot: first,
+                    columns_snapshot: version,
                 });
             }
         }

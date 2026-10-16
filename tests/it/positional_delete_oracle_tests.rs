@@ -53,7 +53,8 @@ async fn create_writer(temp_dir: &TempDir) -> Arc<SqliteMetadataWriter> {
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
     let writer = SqliteMetadataWriter::new_with_init(&conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     Arc::new(writer)
 }

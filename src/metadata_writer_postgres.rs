@@ -14,6 +14,7 @@ use crate::error::{TypeChangeOperation, TypeChangeWriteMode};
 use crate::inlined_reclaim::SUPERSEDED_INLINED_TABLES_SQL;
 use crate::metadata_provider::{InlinedSystemColumns, TagObjectType, TagTarget, block_on};
 use crate::metadata_provider_postgres::{catalog_inlined_system_columns, inlined_table_layout};
+use crate::metadata_writer::CarriedTags;
 use crate::metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, ConflictScope, DataFileInfo, DeleteFileEntry, DeleteFileInfo,
     ExistingCatalogColumn, INLINED_INDEX_COLUMNS_SETTING, InlinedRowRef, MetadataWriter,
@@ -23,7 +24,7 @@ use crate::metadata_writer::{
     encode_inlined_index_columns, inlined_delete_groups, live_inlined_index_columns,
     parse_inlined_index_columns, snapshot_has_change, staged_table_write_changes,
     table_storage_changes, table_write_changes, tag_change, top_level_column_ids,
-    validate_delete_entries, validate_inlined_index_columns, validate_name, validate_table_setting,
+    validate_delete_entries, validate_inlined_index_columns, validate_name,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SourceFile, TableChanges,
@@ -971,6 +972,18 @@ async fn record_file_reference(
     Ok(())
 }
 
+/// Run the rest of the transaction on `conn` in UTC (`SET LOCAL TIME ZONE
+/// 'UTC'`), so a snapshot's `NOW()` lands as UTC in a `TIMESTAMP` column (the
+/// layout this crate creates) as well as in official's `TIMESTAMPTZ` one,
+/// whatever the session's `TimeZone`. Readers take a `snapshot_time` without an
+/// offset as UTC.
+pub(crate) async fn utc_snapshot_time(conn: &mut sqlx::PgConnection) -> Result<()> {
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Give legacy `data_path`, schema path, and table path values the trailing `/`
 /// DuckLake readers expect. Idempotent. Used by the single-catalog writer; the
 /// multicatalog layout keeps its paths as given because its cleanup APIs match
@@ -1194,9 +1207,650 @@ pub struct PostgresMetadataWriter {
     catalog_id: i64,
     lock_timeout_ms: u32,
     commit_guard: Option<Arc<dyn PostgresCommitGuard>>,
+    data_inlining_row_limit: Option<usize>,
 }
 
 impl PostgresMetadataWriter {
+    /// [`MetadataWriter::register_existing_data_files`], giving the table
+    /// exactly `tags` in the same commit when they are given.
+    #[allow(clippy::too_many_arguments)]
+    fn register_existing_data_files_tagged(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        files: &[PromotedFile],
+        layout: Option<&PromoteLayout>,
+        mode: WriteMode,
+        tags: Option<&CarriedTags>,
+    ) -> Result<CommitIds> {
+        // This method bypasses begin_write_transaction, so it must do begin's
+        // input validation itself. `column_ids[i]` is inserted for `columns[i]`
+        // (finalize_snapshot zips them), so a length mismatch would silently drop
+        // the trailing columns.
+        if let Some(tags) = tags {
+            validate_carried_tags(0, tags)?;
+        }
+        if columns.is_empty() {
+            return Err(crate::DuckLakeError::InvalidConfig(
+                "register_existing_data_file requires at least one column".to_string(),
+            ));
+        }
+        let catalog_column_count = catalog_column_defs(columns)?.len();
+        if column_ids.len() != catalog_column_count {
+            return Err(crate::DuckLakeError::InvalidConfig(format!(
+                "register_existing_data_file: column_ids (len {}) must match catalog column nodes (len {})",
+                column_ids.len(),
+                catalog_column_count
+            )));
+        }
+        // An all-empty layout is the same as none, so the commit path below never
+        // has to distinguish "asked for nothing" from "asked for no layout".
+        let layout = match layout {
+            Some(layout) if !layout.is_empty() => Some(layout),
+            _ => None,
+        };
+        let mints_partition_spec = layout.is_some_and(|layout| !layout.partition_by.is_empty());
+
+        // One path may appear once in a batch. Official's plural entry point
+        // DEDUPLICATES instead, keeping the first and skipping the rest
+        // (`ducklake_add_data_files.cpp:241-246` at d8a1881, pinned by
+        // `test/sql/add_files/add_files_overlapping_globs.test`), because its entries
+        // are bare paths produced by glob expansion: overlapping globs are routine,
+        // and two entries for one path are byte-identical, so dropping one loses
+        // nothing.
+        //
+        // Here an entry is not a path but a `PromotedFile` carrying record count,
+        // sizes, row-id policy, partition values, ownership and its own delete file —
+        // none of it derived, all of it the caller's. Two entries for one path can
+        // disagree on every field, so "keep the first" is a silent choice between
+        // them. The case that decides it: two entries, same path, only the second
+        // carrying the delete file. Deduplicating drops that delete and the
+        // destination then reads rows the source had deleted — a wrong answer
+        // produced by the safer-looking option. Refusing loses nothing, since a
+        // caller passing an explicit list has no glob to overlap.
+        //
+        // The residual is narrower than the refusal: the argument above only bites
+        // when the entries DISAGREE. Two structurally identical entries have no
+        // delete file to lose and no field to choose between, so refusing those is
+        // stricter than official with nothing gained. Splitting the two cases is
+        // #328.
+        //
+        // Exact spellings only. Two ways of writing one object (relative vs absolute)
+        // are not resolvable here — that needs the table path the commit has not
+        // looked up yet — and official's normalization is likewise about glob and URL
+        // forms, not catalog path resolution.
+        let mut seen_paths = std::collections::HashSet::with_capacity(files.len());
+        // Indexed once for the batch: every stat of every file is checked against
+        // it, and a wide table's batch would otherwise scan the id list per stat.
+        let adopted_column_ids: std::collections::HashSet<i64> =
+            column_ids.iter().copied().collect();
+        for entry in files {
+            let (file, delete) = (&entry.file, entry.delete.as_ref());
+            if !seen_paths.insert(file.path.as_str()) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "register_existing_data_files: {} appears more than once in the batch. Each \
+                     entry becomes its own ducklake_data_file row, so a repeat would double the \
+                     table's record count and hand one object two row-id ranges. Union the \
+                     entries for a path into one.",
+                    file.path
+                )));
+            }
+            // Both ways of getting ownership wrong are refused here, where the caller
+            // can still fix them.
+            //
+            // Naming THIS catalog as owner is a contradiction, and a silent leak: the
+            // row would be a reference nobody schedules, while the owner cleanup that
+            // would have reclaimed it is this very catalog, holding itself back for as
+            // long as its own row stands.
+            //
+            // A reference with a RELATIVE path is worse — it deletes rather than leaks.
+            // `all_reference_paths` hands cleanup the stored path verbatim, which the
+            // owner then compares against its own fully-resolved key; a relative
+            // spelling can never match, so the owner's cleanup is not deferred and
+            // reclaims the object while this row still names it. (The row does not even
+            // read back correctly here: a relative path resolves through THIS catalog's
+            // schema and table rows, not the owner's.)
+            for (kind, path, owner, is_relative) in [
+                Some((
+                    "file",
+                    file.path.as_str(),
+                    file.owner_catalog_id,
+                    file.path_is_relative,
+                )),
+                delete.map(|delete| {
+                    (
+                        "delete file",
+                        delete.path.as_str(),
+                        delete.owner_catalog_id,
+                        delete.path_is_relative,
+                    )
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let Some(owner) = owner else {
+                    continue;
+                };
+                if owner == self.catalog_id {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_file: {kind} {path} owner_catalog_id {owner} is \
+                         this catalog; a row that references its own catalog's file is never \
+                         reclaimed by anyone. Leave it unset for a file this catalog owns."
+                    )));
+                }
+                if is_relative {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_file: {kind} {path} references catalog {owner} \
+                         but its path is relative, so it resolves through this catalog's layout \
+                         and never matches the object the owner's cleanup defers against. Mark \
+                         it absolute with `with_absolute_path()`."
+                    )));
+                }
+            }
+            // A partition_id alongside a layout that mints one can only name a
+            // generation this very commit is about to retire. Refuse rather than
+            // silently overwrite it: the caller is working from a stale spec.
+            if let Some(partition_id) = file.partition_id.filter(|_| mints_partition_spec) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "register_existing_data_files: {} carries partition_id {partition_id} while \
+                     this batch establishes a new partition spec, whose generation does not exist \
+                     yet. Supply the values alone with DataFileInfo::with_partition_values.",
+                    file.path
+                )));
+            }
+            // A file's statistics are stored as given, under the ids adopted
+            // above, so each must name one of them. A stat for any other column
+            // is not merely dead weight: the commit merges every per-file row
+            // into the roll-up by `column_id`, so it would put a table-wide
+            // bound on a column the table does not have. And a column may be
+            // described once per file: a repeat would merge one file's values
+            // twice under rows that disagree. Both are a caller working from
+            // the wrong column set — refused here, where it can still fix them.
+            let mut seen_columns =
+                std::collections::HashSet::with_capacity(file.column_stats.len());
+            for stat in &file.column_stats {
+                if !adopted_column_ids.contains(&stat.column_id) {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_files: {} carries statistics for column_id {}, \
+                         which is not among the adopted column_ids {column_ids:?}. A promoted \
+                         file's statistics are stored as given, so they must describe the \
+                         columns this registration creates.",
+                        file.path, stat.column_id
+                    )));
+                }
+                if !seen_columns.insert(stat.column_id) {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "register_existing_data_files: {} carries statistics for column_id {} \
+                         more than once. One row per column per file, or the table roll-up \
+                         counts this file twice.",
+                        file.path, stat.column_id
+                    )));
+                }
+            }
+        }
+        self.block_on(async {
+            let mut tx = self.pool.begin().await?;
+            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            let legacy = legacy_owner_columns(&mut tx).await?;
+            let existing_table = refuse_foreign_column_ids(
+                self.catalog_id,
+                schema_name,
+                table_name,
+                columns,
+                column_ids,
+                &mut tx,
+            )
+            .await?;
+
+            // No begin_write_transaction: derive the conflict base (catalog head)
+            // and a table-id hint (used only if the table doesn't exist yet) here.
+            let base_snapshot: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
+                 WHERE catalog_id = $1",
+            )
+            .bind(self.catalog_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let table_id_hint = reserve_ids("ducklake_table", "table_id", 1, &mut tx).await?[0];
+
+            // finalize inserts the columns with the adopted `column_ids`
+            // (OVERRIDING SYSTEM VALUE), so the file's field-ids match. `mode`
+            // applies to the batch as a whole: a Replace retires the prior
+            // generation exactly once, here, before any of `files` lands.
+            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
+                self.catalog_id,
+                schema_name,
+                table_name,
+                table_id_hint,
+                columns,
+                column_ids,
+                mode,
+                base_snapshot,
+                &mut tx,
+            )
+            .await?;
+
+            // The layout goes on this same snapshot, between the columns and the
+            // fence. It has to: a partition spec names its keys by column NAME, and
+            // the only commit that creates those columns under the SOURCE's
+            // `column_ids` is this one. Establishing it here is what lets a
+            // partitioned promote be a single commit rather than a bootstrap
+            // registration, a SET, and a re-registration.
+            if let Some(layout) = layout {
+                if !layout.partition_by.is_empty() {
+                    // Setting a partition spec is DDL. Idempotent against the bump
+                    // finalize_snapshot already made when it created the table.
+                    record_schema_version_bump(self.catalog_id, table_id, snapshot_id, &mut tx)
+                        .await?;
+                    write_partition_generation(
+                        table_id,
+                        snapshot_id,
+                        &layout.partition_by,
+                        &mut tx,
+                    )
+                    .await?;
+                }
+                if !layout.sorted_by.is_empty() {
+                    // Sort order is not DDL (see `set_sort_spec`): no version bump.
+                    write_sort_generation(table_id, snapshot_id, &layout.sorted_by, &mut tx)
+                        .await?;
+                }
+            }
+
+            // The table's tags, exactly `tags`: every other live one ends here.
+            // Changing an existing table's tags is what `set_tag` records: a
+            // `schema_version` bump (no ledger row) and `altered_table`.
+            let tags_changed = match (tags, existing_table) {
+                (Some(tags), Some(existing)) if existing == table_id => {
+                    live_tags(self.catalog_id, table_id, &mut tx).await? != tags.sorted()
+                },
+                _ => false,
+            };
+            let rewrite_tags = existing_table != Some(table_id) || tags_changed;
+            if let Some(tags) = tags.filter(|_| rewrite_tags) {
+                sqlx::query(
+                    "UPDATE ducklake_catalog_tag SET end_snapshot = $1
+                     WHERE catalog_id = $2 AND object_type = 'table' AND object_id = $3
+                       AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(self.catalog_id)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE ducklake_catalog_column_tag SET end_snapshot = $1
+                     WHERE catalog_id = $2 AND table_id = $3 AND end_snapshot IS NULL",
+                )
+                .bind(snapshot_id)
+                .bind(self.catalog_id)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+                for (key, value) in &tags.table {
+                    sqlx::query(
+                        "INSERT INTO ducklake_catalog_tag
+                             (catalog_id, object_type, object_id, begin_snapshot,
+                              end_snapshot, key, value)
+                         VALUES ($1, 'table', $2, $3, NULL, $4, $5)",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(table_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                for (column_id, key, value) in &tags.columns {
+                    sqlx::query(
+                        "INSERT INTO ducklake_catalog_column_tag
+                             (catalog_id, table_id, column_id, begin_snapshot,
+                              end_snapshot, key, value)
+                         VALUES ($1, $2, $3, $4, NULL, $5, $6)",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .bind(snapshot_id)
+                    .bind(key)
+                    .bind(value)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
+            if tags_changed {
+                let previous: Option<i64> = sqlx::query_scalar(
+                    "SELECT MAX(s.schema_version) FROM ducklake_snapshot s
+                     JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
+                     WHERE m.catalog_id = $1 AND s.snapshot_id < $2",
+                )
+                .bind(self.catalog_id)
+                .bind(snapshot_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE ducklake_snapshot SET schema_version = $1
+                     WHERE snapshot_id = $2 AND schema_version <= $1",
+                )
+                .bind(previous.unwrap_or(0) + 1)
+                .bind(snapshot_id)
+                .execute(&mut *tx)
+                .await?;
+                let altered = format!("altered_table:{table_id}");
+                let recorded: Option<String> = sqlx::query_scalar(
+                    "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+                )
+                .bind(snapshot_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+                if !snapshot_has_change(&recorded.unwrap_or_default(), &altered) {
+                    record_snapshot_changes(
+                        &mut tx,
+                        snapshot_id,
+                        &altered,
+                        &SnapshotCommitMetadata::default(),
+                    )
+                    .await?;
+                }
+            }
+
+            // Rowids: a fresh range by default, or the source's carried value
+            // when the caller supplied one. See `allocate_row_id_start`. Within a
+            // batch the allocator moves file by file, so two Assign files never
+            // draw the same range.
+            sqlx::query(
+                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
+                 VALUES ($1, 0, 0, 0)
+                 ON CONFLICT (table_id) DO NOTHING",
+            )
+            .bind(table_id)
+            .execute(&mut *tx)
+            .await?;
+            let first_row_id: i64 = sqlx::query_scalar(
+                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1",
+            )
+            .bind(table_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            // Partition-spec fence + validation. A promoted file is registered
+            // as-is, so the caller is asserting it already holds rows of exactly one
+            // partition (official DuckLake's ducklake_add_data_files makes the same
+            // assumption, deriving the values from the file's Hive path). We check
+            // everything checkable without reading the data: the file agrees with the
+            // live generation, and its values fit that generation's keys.
+            //
+            // Read once for the batch — the catalog lock is held, so the live
+            // generation cannot move underneath the loop, including when the block
+            // above is what made it live.
+            let live_partition_id: Option<i64> = sqlx::query_scalar(
+                "SELECT partition_id FROM ducklake_partition_info
+                 WHERE table_id = $1 AND end_snapshot IS NULL",
+            )
+            .bind(table_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let mut transforms: Vec<String> = Vec::new();
+            let mut key_column_types: Vec<Option<arrow::datatypes::DataType>> = Vec::new();
+            if let Some(partition_id) = live_partition_id {
+                let key_rows = sqlx::query(
+                    "SELECT transform, column_id FROM ducklake_partition_column
+                     WHERE table_id = $1 AND partition_id = $2
+                     ORDER BY partition_key_index",
+                )
+                .bind(table_id)
+                .bind(partition_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in &key_rows {
+                    transforms.push(row.try_get::<String, _>(0)?);
+                    // Resolve each key's column_id to the Arrow type of the matching
+                    // promoted column, so an `identity` value can be cast-checked the
+                    // way official's MapHiveColumn does.
+                    let column_id: i64 = row.try_get(1)?;
+                    key_column_types.push(
+                        column_ids
+                            .iter()
+                            .position(|id| *id == column_id)
+                            .and_then(|index| columns.get(index))
+                            .and_then(|column| {
+                                crate::types::ducklake_to_arrow_type(column.ducklake_type()).ok()
+                            }),
+                    );
+                }
+            }
+
+            let mut next_row_id = first_row_id;
+            let mut batch_records: i64 = 0;
+            let mut batch_bytes: i64 = 0;
+            for entry in files {
+                // A minted generation is stamped on here, not by the caller: its id
+                // did not exist when the batch was built (the `partition_id.is_some()`
+                // combination was refused above).
+                let stamped;
+                let file = match live_partition_id.filter(|_| mints_partition_spec) {
+                    Some(partition_id) => {
+                        stamped = entry
+                            .file
+                            .clone()
+                            .with_partition(partition_id, entry.file.partition_values.clone());
+                        &stamped
+                    },
+                    None => &entry.file,
+                };
+
+                // Diagnose the promote-specific case before the shared fence: a caller
+                // that supplied no partition assignment for a partitioned table has not
+                // lost a race, so the fence's "concurrent SET PARTITIONED BY … retry"
+                // wording would send them chasing a problem that does not exist. Tell
+                // them what to actually do instead.
+                //
+                // Deliberately NOT exempting a 0-row file, unlike the shared fence.
+                // That exemption exists for the empty-Replace truncate marker a write
+                // session emits, which has no promote equivalent — a promoted file is
+                // one the caller actually produced. Official agrees: `AddFileToTable`
+                // compares the derived value count against the spec's key count with no
+                // row-count exception, so an empty file with no assignment is rejected
+                // there too.
+                if file.partition_id.is_none() && live_partition_id.is_some() {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "cannot promote {} into table {table_id}: the table is partitioned, so a \
+                         registered file must declare the single partition its rows belong to. \
+                         Attach it with DataFileInfo::with_partition (copy the values from the \
+                         source catalog, or derive them from the file's Hive path).",
+                        file.path
+                    )));
+                }
+                // The mirror of the stale-`partition_id` refusal above: values with no
+                // generation to hang them off. Nothing downstream catches this —
+                // `enforce_partition_fence` passes when both ids are None and
+                // `validate_promoted_partition_values` is gated on the file's id — so
+                // `insert_partition_metadata` would write
+                // `ducklake_file_partition_value` rows under a NULL `partition_id` in a
+                // table with no live spec. No reader can use that shape and no other
+                // write path produces it. Reached only on an unpartitioned table: a
+                // partitioned one is diagnosed above, and a batch that mints a spec has
+                // already stamped every file.
+                if file.partition_id.is_none() && !file.partition_values.is_empty() {
+                    return Err(crate::DuckLakeError::InvalidConfig(format!(
+                        "cannot promote {} into table {table_id}: it carries {} partition \
+                         value(s) but names no partition generation, and the table has no live \
+                         spec for them to belong to. Establish one in this commit \
+                         (PromoteLayout::partition_by), or drop the values.",
+                        file.path,
+                        file.partition_values.len()
+                    )));
+                }
+                crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
+                if live_partition_id.is_some() && file.partition_id.is_some() {
+                    crate::metadata_writer::validate_promoted_partition_values(
+                        table_id,
+                        &transforms,
+                        &key_column_types,
+                        file,
+                    )?;
+                }
+
+                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
+                next_row_id = next_row_id.saturating_add(row_ids.advance);
+                batch_records = batch_records.saturating_add(file.record_count);
+                batch_bytes = batch_bytes.saturating_add(file.file_size_bytes);
+
+                let data_file_id: i64 = sqlx::query_scalar(
+                    "INSERT INTO ducklake_data_file
+                         (table_id, path, path_is_relative, file_size_bytes,
+                          footer_size, record_count, row_id_start, begin_snapshot,
+                          partial_max)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING data_file_id",
+                )
+                .bind(table_id)
+                .bind(&file.path)
+                .bind(file.path_is_relative)
+                .bind(file.file_size_bytes)
+                .bind(file.footer_size)
+                .bind(file.record_count)
+                .bind(row_ids.stored)
+                .bind(snapshot_id)
+                .bind(entry.partial_max)
+                .fetch_one(&mut *tx)
+                .await?;
+                // Ownership is the one thing registration decides that no other
+                // write path does: no reference row for a file this catalog owns
+                // (including one promoted from outside its own layout), one naming
+                // the source's catalog for a reference. Every reclaim path reads it.
+                if let Some(owner) = file.owner_catalog_id {
+                    record_file_reference(&mut tx, FileTable::Data, data_file_id, owner, legacy)
+                        .await?;
+                }
+                // Persist the caller-supplied partition assignment. Without this a
+                // promoted file lands with no partition_id and no
+                // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
+                // with the table's spec.
+                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
+                // And its per-column zone maps, under the id just assigned. A
+                // promoted file is registered as-is, so these are the source
+                // catalog's rows for the same bytes — which is why the caller
+                // copies them rather than re-reading the footer: `contains_nan`
+                // is not in a footer, and without it a float max is never
+                // trusted. Empty means no rows, and the roll-up below then
+                // reports the file's columns as unknown, exactly as the source did.
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
+
+                // An existing positional delete file travels with its data file: same
+                // commit, same snapshot, hanging off the id just assigned. The path is
+                // stored as given (a fork marks it absolute, pointing at the source's
+                // object), like the data file's.
+                if let Some(delete) = &entry.delete {
+                    let delete_file_id: i64 = sqlx::query_scalar(
+                        "INSERT INTO ducklake_delete_file
+                             (data_file_id, table_id, path, path_is_relative, file_size_bytes,
+                              footer_size, delete_count, begin_snapshot)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delete_file_id",
+                    )
+                    .bind(data_file_id)
+                    .bind(table_id)
+                    .bind(&delete.path)
+                    .bind(delete.path_is_relative)
+                    .bind(delete.file_size_bytes)
+                    .bind(delete.footer_size)
+                    .bind(delete.delete_count)
+                    .bind(snapshot_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    if let Some(owner) = delete.owner_catalog_id {
+                        record_file_reference(
+                            &mut tx,
+                            FileTable::Delete,
+                            delete_file_id,
+                            owner,
+                            legacy,
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            // Merge the batch's statistics into the table-wide roll-up, as every
+            // other register path does.
+            merge_file_table_column_stats(
+                &mut tx,
+                table_id,
+                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
+                &crate::metadata_writer::file_column_stats(files.iter().map(|entry| &entry.file)),
+            )
+            .await?;
+
+            // A layout is DDL, but only worth its own entry when finalize did not
+            // already record one for this table on this snapshot: a table created
+            // here is `created_table`, and a column change is already
+            // `altered_table`. Appending a second entry would report one DDL as two.
+            if layout.is_some() {
+                let created = format!(
+                    "created_table:{}",
+                    crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
+                );
+                let altered = format!("altered_table:{table_id}");
+                let recorded: Option<String> = sqlx::query_scalar(
+                    "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+                )
+                .bind(snapshot_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+                let recorded = recorded.unwrap_or_default();
+                if !snapshot_has_change(&recorded, &created)
+                    && !snapshot_has_change(&recorded, &altered)
+                {
+                    record_snapshot_changes(
+                        &mut tx,
+                        snapshot_id,
+                        &altered,
+                        &SnapshotCommitMetadata::default(),
+                    )
+                    .await?;
+                }
+            }
+
+            if !files.is_empty() {
+                sqlx::query(
+                    "UPDATE ducklake_table_stats
+                     SET next_row_id     = next_row_id + $1,
+                         record_count    = record_count + $2,
+                         file_size_bytes = file_size_bytes + $3
+                     WHERE table_id = $4",
+                )
+                .bind(next_row_id - first_row_id)
+                .bind(batch_records)
+                .bind(batch_bytes)
+                .bind(table_id)
+                .execute(&mut *tx)
+                .await?;
+
+                record_snapshot_changes(
+                    &mut tx,
+                    snapshot_id,
+                    &format!("inserted_into_table:{table_id}"),
+                    &SnapshotCommitMetadata::default(),
+                )
+                .await?;
+            }
+            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
+            self.commit(tx).await?;
+            Ok(CommitIds {
+                snapshot_id,
+                schema_id,
+                table_id,
+            })
+        })
+    }
+
     /// A manager on this writer's store, with the name of the writer's catalog.
     pub(crate) async fn catalog_manager(
         &self,
@@ -1227,6 +1881,7 @@ impl PostgresMetadataWriter {
             catalog_id,
             lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
             commit_guard: None,
+            data_inlining_row_limit: None,
         })
     }
 
@@ -1264,6 +1919,25 @@ impl PostgresMetadataWriter {
         self
     }
 
+    /// Set the `data_inlining_row_limit` this writer applies where the
+    /// catalog stores none at table, schema or catalog scope, as official's
+    /// `DATA_INLINING_ROW_LIMIT` attach option does; see
+    /// [`MetadataWriter::data_inlining_row_limit`]. `0` stores every write in
+    /// Parquet and creates no inlined data tables.
+    #[must_use]
+    pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
+        self.data_inlining_row_limit = Some(limit);
+        self
+    }
+
+    /// Drive `future`, a catalog call of this writer, with its
+    /// `data_inlining_row_limit` in effect for the call.
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        crate::metadata_writer::with_writer_inlining_limit(self.data_inlining_row_limit, || {
+            crate::metadata_provider::block_on(future)
+        })
+    }
+
     pub fn catalog_id(&self) -> i64 {
         self.catalog_id
     }
@@ -1281,7 +1955,7 @@ impl PostgresMetadataWriter {
                 )));
             }
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             let dropped = crate::multicatalog::drop_live_table(
@@ -1303,6 +1977,171 @@ impl PostgresMetadataWriter {
     async fn commit_networked(&self, tx: sqlx::Transaction<'_, Postgres>) -> Result<()> {
         commit_networked_guarded(tx, self.commit_guard.as_deref()).await
     }
+}
+
+/// The live table `schema_name.table_name` of `catalog_id`, if any, with its
+/// live columns.
+pub(crate) async fn live_named_table_columns(
+    catalog_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<(i64, Vec<ExistingCatalogColumn>)>> {
+    let table_id: Option<i64> = sqlx::query_scalar(
+        "SELECT t.table_id FROM ducklake_table t
+         JOIN ducklake_schema s ON s.schema_id = t.schema_id AND s.end_snapshot IS NULL
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+         WHERE m.catalog_id = $1 AND s.schema_name = $2 AND t.table_name = $3
+           AND t.end_snapshot IS NULL",
+    )
+    .bind(catalog_id)
+    .bind(schema_name)
+    .bind(table_name)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(table_id) = table_id else {
+        return Ok(None);
+    };
+    let rows = sqlx::query(
+        "SELECT column_id, column_name, column_type, parent_column FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY column_order",
+    )
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let columns = rows
+        .iter()
+        .map(|row| {
+            Ok(ExistingCatalogColumn {
+                column_id: row.try_get(0)?,
+                name: row.try_get(1)?,
+                ducklake_type: row.try_get(2)?,
+                parent_column: row.try_get(3)?,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, sqlx::Error>>()?;
+    Ok(Some((table_id, columns)))
+}
+
+/// Refuse to register `columns` under the caller's `column_ids` (the field
+/// ids its files carry) as `schema_name.table_name` of `catalog_id` when a
+/// live table there gives one of those columns another id, or one of those
+/// ids to another column: a write keeps a column's id by its name, so the
+/// files' field ids would never resolve, and no retry changes that. Returns
+/// the live table's id, if any.
+pub(crate) async fn refuse_foreign_column_ids(
+    catalog_id: i64,
+    schema_name: &str,
+    table_name: &str,
+    columns: &[ColumnDef],
+    column_ids: &[i64],
+    connection: &mut sqlx::PgConnection,
+) -> Result<Option<i64>> {
+    let Some((table_id, existing)) =
+        live_named_table_columns(catalog_id, schema_name, table_name, connection).await?
+    else {
+        return Ok(None);
+    };
+    let proposed = catalog_column_defs(columns)?;
+    let assigned = assign_column_ids(&proposed, &existing, column_ids)?;
+    let mut paths: Vec<String> = Vec::with_capacity(proposed.len());
+    for column in &proposed {
+        let path = match column.parent_index {
+            Some(parent) => format!("{}.{}", paths[parent], column.name),
+            None => column.name.clone(),
+        };
+        paths.push(path);
+    }
+    // Each live column's path, by id.
+    let mut existing_paths: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::with_capacity(existing.len());
+    while existing_paths.len() < existing.len() {
+        let before = existing_paths.len();
+        for column in &existing {
+            if existing_paths.contains_key(&column.column_id) {
+                continue;
+            }
+            let path = match column.parent_column {
+                None => column.name.clone(),
+                Some(parent) => match existing_paths.get(&parent) {
+                    Some(parent) => format!("{parent}.{}", column.name),
+                    None => continue,
+                },
+            };
+            existing_paths.insert(column.column_id, path);
+        }
+        if existing_paths.len() == before {
+            break;
+        }
+    }
+    for ((path, wanted), assigned) in paths.iter().zip(column_ids).zip(&assigned) {
+        let reason = if wanted != assigned {
+            format!("has column_id {assigned} there")
+        } else if let Some(other) = existing_paths.get(wanted)
+            && other != path
+        {
+            format!("would take column_id {wanted}, which '{other}' has there")
+        } else {
+            continue;
+        };
+        return Err(crate::DuckLakeError::InvalidConfig(format!(
+            "register_existing_data_files: column '{path}' of the existing table \
+             {schema_name}.{table_name} (table_id {table_id}) {reason}, but the \
+             registration adopts column_id {wanted}, the field id its files carry. A write \
+             keeps a column's id by name, so the files would not resolve; drop the \
+             destination table first, or register under its column ids."
+        )));
+    }
+    Ok(Some(table_id))
+}
+
+/// The live tags of table `table_id` in `catalog_id`, as
+/// [`CarriedTags::sorted`] lists them.
+async fn live_tags(
+    catalog_id: i64,
+    table_id: i64,
+    connection: &mut sqlx::PgConnection,
+) -> Result<crate::metadata_writer::SortedTags> {
+    let table: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT key, value FROM ducklake_catalog_tag
+         WHERE catalog_id = $1 AND object_type = 'table' AND object_id = $2
+           AND end_snapshot IS NULL",
+    )
+    .bind(catalog_id)
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    let columns: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_id, key, value FROM ducklake_catalog_column_tag
+         WHERE catalog_id = $1 AND table_id = $2 AND end_snapshot IS NULL",
+    )
+    .bind(catalog_id)
+    .bind(table_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    Ok(CarriedTags {
+        table,
+        columns,
+    }
+    .sorted())
+}
+
+/// Refuse tags `set_tag` refuses: a column tag other than `comment`.
+pub(crate) fn validate_carried_tags(table_id: i64, tags: &CarriedTags) -> Result<()> {
+    for (key, _) in &tags.table {
+        validate_name(key, "Tag key")?;
+    }
+    for (column_id, key, _) in &tags.columns {
+        validate_name(key, "Tag key")?;
+        tag_change(
+            TagTarget::Column {
+                table_id,
+                column_id: *column_id,
+            },
+            key,
+        )?;
+    }
+    Ok(())
 }
 
 async fn lock_catalog(
@@ -1387,14 +2226,14 @@ async fn assert_table_in_catalog(
 }
 
 /// Create a new snapshot for a sort-spec DDL change and advance this catalog's
-/// head, carrying the current `schema_version` FORWARD unchanged. Unlike a
-/// partition-spec change, a sort-spec change does not bump `schema_version` or write
-/// a `ducklake_schema_versions` ledger row — sort order does not alter the logical
-/// schema. Returns the new snapshot id.
+/// head, carrying the current `schema_version` forward; the caller bumps it, as
+/// official does for a sort change, and writes no `ducklake_schema_versions`
+/// row. Returns the new snapshot id.
 async fn insert_metadata_snapshot(
     catalog_id: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<i64> {
+    crate::metadata_writer_postgres::utc_snapshot_time(tx).await?;
     let snapshot_id: i64 = sqlx::query(
         "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
          VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -1409,8 +2248,7 @@ async fn insert_metadata_snapshot(
     .bind(snapshot_id)
     .execute(&mut **tx)
     .await?;
-    // Carry the live schema_version forward (no bump) so reads at the new head see
-    // the same schema as before the sort change.
+    // Carry the live schema_version forward; the sort change's caller bumps it.
     let carried: i64 = sqlx::query(
         "SELECT COALESCE(MAX(s.schema_version), 0) FROM ducklake_snapshot s
          JOIN ducklake_catalog_snapshot_map m ON m.snapshot_id = s.snapshot_id
@@ -1965,30 +2803,16 @@ async fn write_sort_generation(
 ) -> Result<()> {
     // Validate every sort key resolves to a live column (v1 supports bare column
     // keys only), so a bad SET fails here rather than silently producing unsorted
-    // writes later.
-    for field in fields {
-        let column = field.column_candidate().ok_or_else(|| {
-            crate::DuckLakeError::InvalidConfig(format!(
-                "set_sort_spec: sort key '{}' is not a bare column; only column \
-                 sort keys are supported",
-                field.expression
-            ))
-        })?;
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT column_id FROM ducklake_column
-             WHERE table_id = $1 AND column_name = $2 AND end_snapshot IS NULL
-               AND parent_column IS NULL",
-        )
-        .bind(table_id)
-        .bind(&column)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if exists.is_none() {
-            return Err(crate::DuckLakeError::InvalidConfig(format!(
-                "set_sort_spec: no live column '{column}' in table {table_id}"
-            )));
-        }
-    }
+    // writes later. A key binds to its column ignoring case, as DuckDB's binder
+    // binds it.
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL AND parent_column IS NULL",
+    )
+    .bind(table_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    crate::sort::check_sort_key_columns(fields, &names)?;
 
     // End the currently-live spec generation (if any), then insert the new one
     // (sort_id is IDENTITY → RETURNING) and its per-key expressions.
@@ -2265,6 +3089,7 @@ async fn finalize_snapshot(
     base_snapshot: i64,
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(i64, i64, i64)> {
+    crate::metadata_writer_postgres::utc_snapshot_time(tx).await?;
     let snapshot_id: i64 = sqlx::query(
         "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
          VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -2533,7 +3358,7 @@ async fn finalize_table_snapshot(
     // 6. Write the column generation surgically (mode-independent, matching the
     //    SQLite writer) so each kept column keeps a STABLE column_id (== parquet
     //    field_id). End only removed columns, insert only genuinely-new ones (with
-    //    their reserved ids), and sync order/nullability on the rest in place.
+    //    their reserved ids), and leave a data write's live columns untouched.
     //    Stable ids are required even for Replace: a concurrent in-flight Append
     //    baked the kept columns' ids into its parquet, so re-minting them would make
     //    that Append's rows read back as all-NULL. The prior generation's retired
@@ -2541,6 +3366,18 @@ async fn finalize_table_snapshot(
     //    not depend on a column re-mint — see the data-file/column scan above.)
     {
         use std::collections::HashSet;
+        // Official refuses to drop a column its sort order references.
+        let dropped = crate::metadata_writer::dropped_top_level_columns(
+            &existing_catalog_columns,
+            column_ids,
+        );
+        if !dropped.is_empty() {
+            let keys: Vec<(String, String)> = sqlx::query_as(crate::sort::LIVE_SORT_KEYS_SQL_PG)
+                .bind(table_id)
+                .fetch_all(&mut **tx)
+                .await?;
+            crate::sort::refuse_dropping_sort_columns(&keys, &dropped)?;
+        }
         let proposed_ids = column_ids.iter().copied().collect::<HashSet<_>>();
         for column_id in current_by_id.keys() {
             if !proposed_ids.contains(column_id) {
@@ -2555,59 +3392,71 @@ async fn finalize_table_snapshot(
                 .await?;
             }
         }
-        for (order, (column, column_id)) in proposed.iter().zip(column_ids).enumerate() {
+        let existing_orders = existing_column_rows
+            .iter()
+            .map(|row| row.try_get::<i64, _>(3))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let orders = crate::metadata_writer::proposed_column_orders(
+            &existing_catalog_columns,
+            &existing_orders,
+            &proposed,
+            column_ids,
+        );
+        for ((column, column_id), order) in proposed.iter().zip(column_ids).zip(orders) {
             let parent_id = column.parent_index.map(|index| column_ids[index]);
             match current_by_id.get(column_id) {
+                // A data write leaves a live column's row as it is, as
+                // official's does. A schema change that retypes it, changes
+                // its top-level nullability or moves it records a new row
+                // version, keeping the old one for time travel.
                 Some((cur_order, cur_nullable, cur_type)) => {
-                    // Field-id drift: the staged parquet baked `*column_id` for this
-                    // column at begin, but the committed column now has a different
-                    // id (a concurrent writer created the table/column with other
-                    // ids between this writer's begin and commit). Registering the
-                    // file would make this column read back as all-NULL, so abort —
-                    // the caller retries against the now-committed schema. (Append
-                    // is otherwise not conflict-checked; this guards correctness,
-                    // not isolation.)
-                    let migrate_type = catalog_column_type_requires_migration(cur_type, column);
-                    if migrate_type {
-                        sqlx::query(
-                            "UPDATE ducklake_column SET end_snapshot = $1
-                             WHERE table_id = $2 AND column_id = $3 AND end_snapshot IS NULL",
-                        )
-                        .bind(snapshot_id)
-                        .bind(table_id)
-                        .bind(column_id)
-                        .execute(&mut **tx)
-                        .await?;
-                        sqlx::query(
-                            "INSERT INTO ducklake_column
-                                 (column_id, table_id, column_name, column_type, column_order,
-                                  nulls_allowed, parent_column, begin_snapshot)
-                             OVERRIDING SYSTEM VALUE
-                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                        )
-                        .bind(column_id)
-                        .bind(table_id)
-                        .bind(&column.name)
-                        .bind(&column.ducklake_type)
-                        .bind(order as i64)
-                        .bind(column.is_nullable)
-                        .bind(parent_id)
-                        .bind(snapshot_id)
-                        .execute(&mut **tx)
-                        .await?;
-                    } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
-                        sqlx::query(
-                            "UPDATE ducklake_column
-                             SET column_order = $1, nulls_allowed = $2
-                             WHERE table_id = $3 AND column_id = $4 AND end_snapshot IS NULL",
-                        )
-                        .bind(order as i64)
-                        .bind(column.is_nullable)
-                        .bind(table_id)
-                        .bind(column_id)
-                        .execute(&mut **tx)
-                        .await?;
+                    if !is_ddl {
+                        continue;
                     }
+                    let migrate_type = catalog_column_type_requires_migration(cur_type, column);
+                    let nullable = if column.parent_index.is_none() {
+                        column.is_nullable
+                    } else {
+                        *cur_nullable
+                    };
+                    if !migrate_type && *cur_order == order && *cur_nullable == nullable {
+                        continue;
+                    }
+                    let column_type = if migrate_type {
+                        column.ducklake_type.as_str()
+                    } else {
+                        cur_type.as_str()
+                    };
+                    sqlx::query(
+                        "UPDATE ducklake_column SET end_snapshot = $1
+                         WHERE table_id = $2 AND column_id = $3 AND end_snapshot IS NULL",
+                    )
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .execute(&mut **tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO ducklake_column
+                             (column_id, table_id, column_name, column_type, column_order,
+                              nulls_allowed, parent_column, begin_snapshot, initial_default,
+                              default_value, default_value_type, default_value_dialect)
+                         OVERRIDING SYSTEM VALUE
+                         SELECT column_id, table_id, column_name, $1, $2, $3, parent_column, $4,
+                                initial_default, default_value, default_value_type,
+                                default_value_dialect
+                         FROM ducklake_column
+                         WHERE table_id = $5 AND column_id = $6 AND end_snapshot = $4
+                         LIMIT 1",
+                    )
+                    .bind(column_type)
+                    .bind(order)
+                    .bind(nullable)
+                    .bind(snapshot_id)
+                    .bind(table_id)
+                    .bind(column_id)
+                    .execute(&mut **tx)
+                    .await?;
                 },
                 None => {
                     sqlx::query(
@@ -2622,7 +3471,7 @@ async fn finalize_table_snapshot(
                     .bind(table_id)
                     .bind(&column.name)
                     .bind(&column.ducklake_type)
-                    .bind(order as i64)
+                    .bind(order)
                     .bind(column.is_nullable)
                     .bind(parent_id)
                     .bind(snapshot_id)
@@ -2779,24 +3628,39 @@ pub(crate) async fn validate_staged_table(
             "staged table was dropped".to_string(),
         ));
     }
-    let current = sqlx::query("SELECT column_id, column_type, nulls_allowed, parent_column FROM ducklake_column WHERE table_id = $1 AND end_snapshot IS NULL ORDER BY column_order").bind(write.table_id).fetch_all(&mut **tx).await?;
+    let current = sqlx::query(
+        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
+         FROM ducklake_column
+         WHERE table_id = $1 AND end_snapshot IS NULL
+         ORDER BY column_order",
+    )
+    .bind(write.table_id)
+    .fetch_all(&mut **tx)
+    .await?;
     let proposed = catalog_column_defs(&write.columns)?;
     if current.is_empty() && proposed.len() == write.column_ids.len() {
         return Ok(());
     }
-    let mut matches = current.len() == proposed.len() && proposed.len() == write.column_ids.len();
-    if matches {
-        for (index, (row, column)) in current.iter().zip(&proposed).enumerate() {
-            let column_id: i64 = row.try_get("column_id")?;
-            let column_type: String = row.try_get("column_type")?;
-            let nullable: Option<bool> = row.try_get("nulls_allowed")?;
-            let parent: Option<i64> = row.try_get("parent_column")?;
-            matches &= column_id == write.column_ids[index]
-                && catalog_column_type_equal(&column_type, column)
-                && nullable.unwrap_or(true) == column.is_nullable
-                && parent == column.parent_index.map(|i| write.column_ids[i]);
-        }
+    let mut existing = Vec::with_capacity(current.len());
+    let mut nullability = Vec::with_capacity(current.len());
+    for row in &current {
+        existing.push(ExistingCatalogColumn {
+            column_id: row.try_get("column_id")?,
+            name: row.try_get("column_name")?,
+            ducklake_type: row.try_get("column_type")?,
+            parent_column: row.try_get("parent_column")?,
+        });
+        nullability.push(
+            row.try_get::<Option<bool>, _>("nulls_allowed")?
+                .unwrap_or(true),
+        );
     }
+    let matches = crate::metadata_writer::staged_columns_match(
+        &existing,
+        &nullability,
+        &proposed,
+        &write.column_ids,
+    );
     if !matches {
         return Err(crate::DuckLakeError::Conflict(
             "table schema changed after staging".to_string(),
@@ -3888,6 +4752,197 @@ const SQL_TABLE_INLINING_COLUMNS_POSTGRES: &str = "SELECT t.table_name, c.column
        AND c.end_snapshot IS NULL AND c.parent_column IS NULL
      ORDER BY c.column_order";
 
+/// The `data_inlining_row_limit` in effect for `table_name` in `schema_name`
+/// ([`MetadataWriter::table_data_inlining_row_limit`]). On the multi-catalog
+/// layout (`catalog_id`) the schema is looked up in that catalog and a setting
+/// of the catalog stands in for the catalog-wide one.
+pub(crate) async fn postgres_inlining_limit_by_name(
+    pool: &PgPool,
+    catalog_id: Option<i64>,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<usize> {
+    let (settings, schema_id, table_id) = postgres_scoped_setting_rows(
+        pool,
+        catalog_id,
+        schema_name,
+        table_name,
+        "data_inlining_row_limit",
+    )
+    .await?;
+    crate::metadata_writer::effective_inlining_limit_of(&settings, schema_id, table_id)
+}
+
+/// [`MetadataWriter::table_setting`] on PostgreSQL: on the multi-catalog
+/// layout (`catalog_id`), a catalog-scoped setting outranks a catalog-wide
+/// one with no scope.
+pub(crate) async fn postgres_table_setting_by_name(
+    pool: &PgPool,
+    catalog_id: Option<i64>,
+    schema_name: &str,
+    table_name: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let (settings, schema_id, table_id) =
+        postgres_scoped_setting_rows(pool, catalog_id, schema_name, table_name, key).await?;
+    Ok(crate::metadata_writer::scoped_setting_of(
+        &settings, schema_id, table_id,
+    ))
+}
+
+/// The `(scope, scope_id, value)` rows storing option `key` (a
+/// catalog-scoped one of `catalog_id` read as catalog-wide, ahead of one with
+/// no scope), with the live ids of `schema_name` and its `table_name` when
+/// they exist.
+#[allow(clippy::type_complexity)]
+async fn postgres_scoped_setting_rows(
+    pool: &PgPool,
+    catalog_id: Option<i64>,
+    schema_name: &str,
+    table_name: &str,
+    key: &str,
+) -> Result<(
+    Vec<(Option<String>, Option<i64>, String)>,
+    Option<i64>,
+    Option<i64>,
+)> {
+    let schema_id: Option<i64> = match catalog_id {
+        Some(catalog_id) => {
+            sqlx::query_scalar(
+                "SELECT s.schema_id FROM ducklake_schema s
+                 JOIN ducklake_catalog_schema_map m ON m.schema_id = s.schema_id
+                 WHERE m.catalog_id = $1 AND s.schema_name = $2 AND s.end_snapshot IS NULL",
+            )
+            .bind(catalog_id)
+            .bind(schema_name)
+            .fetch_optional(pool)
+            .await?
+        },
+        None => {
+            sqlx::query_scalar(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = $1 AND end_snapshot IS NULL",
+            )
+            .bind(schema_name)
+            .fetch_optional(pool)
+            .await?
+        },
+    };
+    let table_id: Option<i64> = match schema_id {
+        Some(schema_id) => {
+            sqlx::query_scalar(
+                "SELECT table_id FROM ducklake_table
+                 WHERE schema_id = $1 AND table_name = $2 AND end_snapshot IS NULL",
+            )
+            .bind(schema_id)
+            .bind(table_name)
+            .fetch_optional(pool)
+            .await?
+        },
+        None => None,
+    };
+    // Ordered as the commit path reads them (`table_inlining_limit`), so a
+    // catalog-scoped setting outranks a catalog-wide one with no scope.
+    let rows: Vec<(Option<String>, Option<i64>, String)> = sqlx::query_as(
+        "SELECT scope, scope_id, value FROM ducklake_metadata
+         WHERE key = $2
+           AND (scope IS DISTINCT FROM 'catalog' OR scope_id = $1)
+         ORDER BY CASE WHEN scope = 'catalog' THEN 0 ELSE 1 END",
+    )
+    .bind(catalog_id)
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
+    let settings = rows
+        .into_iter()
+        .map(|(scope, scope_id, value)| match scope.as_deref() {
+            Some("catalog") => (None, None, value),
+            _ => (scope, scope_id, value),
+        })
+        .collect::<Vec<_>>();
+    Ok((settings, schema_id, table_id))
+}
+
+/// [`MetadataWriter::set_schema_setting`] on PostgreSQL. On the multi-catalog
+/// layout (`catalog_id`) the schema must belong to that catalog.
+pub(crate) fn set_postgres_schema_setting(
+    pool: &PgPool,
+    guard: Option<&dyn PostgresCommitGuard>,
+    catalog_id: Option<i64>,
+    schema_id: i64,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    // Option names are case-insensitive; official stores them lowercased.
+    let key = key.to_ascii_lowercase();
+    let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+    let value = value.as_str();
+    block_on(async {
+        let mut tx = pool.begin().await?;
+        let live: Option<i64> = sqlx::query_scalar(
+            "SELECT schema_id FROM ducklake_schema
+             WHERE schema_id = $1 AND end_snapshot IS NULL FOR UPDATE",
+        )
+        .bind(schema_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if live.is_none() {
+            return Err(crate::DuckLakeError::SchemaNotFound(schema_id.to_string()));
+        }
+        if let Some(catalog_id) = catalog_id {
+            let owner: Option<i64> = sqlx::query_scalar(
+                "SELECT catalog_id FROM ducklake_catalog_schema_map WHERE schema_id = $1",
+            )
+            .bind(schema_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if owner != Some(catalog_id) {
+                return Err(crate::DuckLakeError::InvalidConfig(format!(
+                    "schema_id {schema_id} does not belong to catalog_id {catalog_id}"
+                )));
+            }
+        }
+        if enables_inlining(&key, value) {
+            let columns: Vec<(String, String)> = sqlx::query_as(
+                "SELECT t.table_name, c.column_name
+                 FROM ducklake_table t
+                 JOIN ducklake_column c ON c.table_id = t.table_id
+                 WHERE t.schema_id = $1 AND t.end_snapshot IS NULL
+                   AND c.end_snapshot IS NULL AND c.parent_column IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM ducklake_metadata md
+                       WHERE md.key = 'data_inlining_row_limit' AND md.value = '0'
+                         AND md.scope = 'table' AND md.scope_id = t.table_id)
+                 ORDER BY t.table_id, c.column_order",
+            )
+            .bind(schema_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            let system =
+                crate::metadata_provider_postgres::catalog_inlined_system_columns(&mut *tx).await?;
+            reject_reserved_inlining_columns(&columns, system)?;
+        }
+        sqlx::query(
+            "DELETE FROM ducklake_metadata WHERE key = $1 AND scope = 'schema' AND scope_id = $2",
+        )
+        .bind(&key)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO ducklake_metadata (key, value, scope, scope_id)
+             VALUES ($1, $2, 'schema', $3)",
+        )
+        .bind(&key)
+        .bind(value)
+        .bind(schema_id)
+        .execute(&mut *tx)
+        .await?;
+        commit_guarded(tx, guard).await?;
+        Ok(())
+    })
+}
+
 pub(crate) fn set_postgres_table_setting(
     pool: &PgPool,
     guard: Option<&dyn PostgresCommitGuard>,
@@ -3896,7 +4951,10 @@ pub(crate) fn set_postgres_table_setting(
     key: &str,
     value: &str,
 ) -> Result<()> {
-    let key = validate_table_setting(key)?;
+    // Option names are case-insensitive; official stores them lowercased.
+    let key = key.to_ascii_lowercase();
+    let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+    let value = value.as_str();
     block_on(async {
         let mut tx = pool.begin().await?;
         if let Some(catalog_id) = catalog_id {
@@ -4005,6 +5063,45 @@ impl MetadataWriter for PostgresMetadataWriter {
         Some(self)
     }
 
+    fn data_inlining_row_limit(&self) -> Option<usize> {
+        self.data_inlining_row_limit
+    }
+
+    fn table_data_inlining_row_limit(&self, schema_name: &str, table_name: &str) -> Result<usize> {
+        self.block_on(postgres_inlining_limit_by_name(
+            &self.pool,
+            Some(self.catalog_id),
+            schema_name,
+            table_name,
+        ))
+    }
+
+    fn table_setting(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        self.block_on(postgres_table_setting_by_name(
+            &self.pool,
+            Some(self.catalog_id),
+            schema_name,
+            table_name,
+            key,
+        ))
+    }
+
+    fn set_schema_setting(&self, schema_id: i64, key: &str, value: &str) -> Result<()> {
+        set_postgres_schema_setting(
+            &self.pool,
+            self.commit_guard.as_deref(),
+            Some(self.catalog_id),
+            schema_id,
+            key,
+            value,
+        )
+    }
+
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
         set_postgres_table_setting(
             &self.pool,
@@ -4017,7 +5114,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn drop_empty_superseded_inlined_tables(&self) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             drop_empty_superseded_inlined_tables_in(&mut tx, Some(self.catalog_id)).await?;
@@ -4028,7 +5125,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     fn set_inlined_index_columns(&self, table_id: i64, columns: &[String]) -> Result<()> {
         let value = encode_inlined_index_columns(columns)?;
-        block_on(async {
+        self.block_on(async {
             // Fast path without the catalog lock: callers re-declare the same
             // columns on every catalog open, and a matching stored value needs
             // neither the lock nor a DELETE+INSERT rewrite.
@@ -4079,7 +5176,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn ensure_inlined_indexes(&self, table_id: i64) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut transaction).await?;
@@ -4112,7 +5209,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn catalog_encrypted(&self) -> Result<bool> {
-        block_on(async {
+        self.block_on(async {
             // The catalog's own setting is this layout's global one; it
             // overrides a store-wide row.
             let values: Vec<String> = sqlx::query_scalar(
@@ -4129,7 +5226,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn head_snapshot(&self) -> Result<Option<i64>> {
-        block_on(async {
+        self.block_on(async {
             Ok(sqlx::query_scalar(
                 "SELECT MAX(snapshot_id) FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1",
             )
@@ -4142,13 +5239,14 @@ impl MetadataWriter for PostgresMetadataWriter {
     /// The next value of the snapshot id sequence every catalog of the store
     /// draws from.
     fn next_snapshot_id(&self) -> Result<Option<i64>> {
-        block_on(next_snapshot_sequence_value(&self.pool))
+        self.block_on(next_snapshot_sequence_value(&self.pool))
     }
 
     fn create_snapshot(&self) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
 
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let row = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (CURRENT_TIMESTAMP, 0) RETURNING snapshot_id",
@@ -4176,7 +5274,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     fn set_tag(&self, target: TagTarget, key: &str, value: Option<&str>) -> Result<i64> {
         validate_name(key, "Tag key")?;
         let change = tag_change(target, key)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
 
@@ -4333,7 +5431,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     ) -> Result<i64> {
         // Reject an unknown target type before opening a transaction.
         crate::types::ducklake_to_arrow_type(new_ducklake_type)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             // Ownership guard (matches every other table_id-taking mutator,
@@ -4389,6 +5487,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             }
 
             // New snapshot + advance this catalog's head.
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -4488,7 +5587,12 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
-        block_on(async {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let key = key.as_str();
+        let value = crate::metadata_writer::normalize_setting_value(key, value)?;
+        let value = value.as_str();
+        self.block_on(async {
             let mut transaction = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut transaction).await?;
             if enables_inlining(key, value) {
@@ -4546,7 +5650,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Schema")?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
 
@@ -4615,7 +5719,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         snapshot_id: i64,
     ) -> Result<(i64, bool)> {
         validate_name(name, "Table")?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_schema_in_catalog(self.catalog_id, schema_id, &mut tx).await?;
@@ -4680,7 +5784,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 "Table must have at least one column".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -4726,6 +5830,16 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
                 column_ids.push(row.try_get(0)?);
             }
+            // Official numbers a column it creates by its id, which the
+            // insert assigns.
+            sqlx::query(
+                "UPDATE ducklake_column SET column_order = column_id
+                 WHERE table_id = $1 AND begin_snapshot = $2",
+            )
+            .bind(table_id)
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
 
             if table_begin_snapshot != snapshot_id {
                 record_snapshot_changes(
@@ -4782,7 +5896,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         commit_metadata: &SnapshotCommitMetadata,
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             // Single atomic commit. finalize_snapshot writes ALL metadata (the
             // snapshot row, get-or-create schema/table, the column generation, the
             // schema_versions row, and the Replace retirement) and returns the
@@ -4970,7 +6084,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 "register_data_files: files must be non-empty".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -5092,7 +6206,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
     #[allow(clippy::too_many_arguments)]
     fn reserved_inlining_column(&self, columns: &[String]) -> Result<Option<String>> {
-        let system = block_on(catalog_inlined_system_columns(&self.pool))?;
+        let system = self.block_on(catalog_inlined_system_columns(&self.pool))?;
         Ok(columns
             .iter()
             .find(|column| system.conflicts_with(column))
@@ -5100,7 +6214,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn supports_data_inlining(&self, schema: &arrow::datatypes::Schema) -> bool {
-        let Ok(system) = block_on(catalog_inlined_system_columns(&self.pool)) else {
+        let Ok(system) = self.block_on(catalog_inlined_system_columns(&self.pool)) else {
             return false;
         };
         if schema
@@ -5124,7 +6238,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn table_types_support_inlining(&self, schema_name: &str, table_name: &str) -> Result<bool> {
-        block_on(async {
+        self.block_on(async {
             let refused: bool = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT EXISTS(
                      SELECT 1 FROM ducklake_column c
@@ -5175,7 +6289,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             ));
         }
 
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_not_in_other_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -5345,7 +6459,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             ));
         }
 
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             for write in writes {
@@ -5390,6 +6504,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 }
                 had_live_data.push((files, inline_rows > 0));
             }
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query_scalar(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -5481,12 +6596,13 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
             // New snapshot + advance this catalog's head.
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -5522,7 +6638,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         &self,
         table_id: i64,
     ) -> Result<Option<crate::partition::PartitionSpec>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT pi.partition_id, pc.partition_key_index, pc.column_id, pc.transform
                  FROM ducklake_partition_info AS pi
@@ -5551,7 +6667,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn reset_partition_spec(&self, table_id: i64) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -5575,6 +6691,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 return Ok(head);
             }
 
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -5643,7 +6760,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT si.sort_id, se.sort_key_index, se.expression, se.dialect,
                         se.sort_direction, se.null_order
@@ -5680,12 +6797,21 @@ impl MetadataWriter for PostgresMetadataWriter {
                     .to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
             let snapshot_id = insert_metadata_snapshot(self.catalog_id, &mut tx).await?;
+            // Official bumps the schema version on every sort-order change, with
+            // no `ducklake_schema_versions` row (checked with the DuckDB CLI).
+            sqlx::query(
+                "UPDATE ducklake_snapshot SET schema_version = schema_version + 1
+                 WHERE snapshot_id = $1",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
             write_sort_generation(table_id, snapshot_id, fields, &mut tx).await?;
 
             record_snapshot_changes(
@@ -5701,31 +6827,21 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn reset_sort_spec(&self, table_id: i64) -> Result<i64> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
 
-            // Nothing to reset → report the current head without a new snapshot.
-            let has_live: Option<i32> = sqlx::query_scalar(
-                "SELECT 1 FROM ducklake_sort_info
-                 WHERE table_id = $1 AND end_snapshot IS NULL LIMIT 1",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if has_live.is_none() {
-                let head: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
-                     WHERE catalog_id = $1",
-                )
-                .bind(self.catalog_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                return Ok(head);
-            }
-
             let snapshot_id = insert_metadata_snapshot(self.catalog_id, &mut tx).await?;
+            // Official bumps the schema version on every sort-order change, with
+            // no `ducklake_schema_versions` row (checked with the DuckDB CLI).
+            sqlx::query(
+                "UPDATE ducklake_snapshot SET schema_version = schema_version + 1
+                 WHERE snapshot_id = $1",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "UPDATE ducklake_sort_info SET end_snapshot = $1
                  WHERE table_id = $2 AND end_snapshot IS NULL",
@@ -5759,10 +6875,8 @@ impl MetadataWriter for PostgresMetadataWriter {
         // One file is the degenerate batch: same transaction, same checks, one
         // pass of the loop. Kept as a separate entry point because it is the
         // shape most callers want and predates the plural.
-        let entry = PromotedFile {
-            file: file.clone(),
-            delete: delete.cloned(),
-        };
+        let mut entry = PromotedFile::new(file.clone());
+        entry.delete = delete.cloned();
         self.register_existing_data_files(
             schema_name,
             table_name,
@@ -5784,516 +6898,39 @@ impl MetadataWriter for PostgresMetadataWriter {
         layout: Option<&PromoteLayout>,
         mode: WriteMode,
     ) -> Result<CommitIds> {
-        // This method bypasses begin_write_transaction, so it must do begin's
-        // input validation itself. `column_ids[i]` is inserted for `columns[i]`
-        // (finalize_snapshot zips them), so a length mismatch would silently drop
-        // the trailing columns.
-        if columns.is_empty() {
-            return Err(crate::DuckLakeError::InvalidConfig(
-                "register_existing_data_file requires at least one column".to_string(),
-            ));
-        }
-        let catalog_column_count = catalog_column_defs(columns)?.len();
-        if column_ids.len() != catalog_column_count {
-            return Err(crate::DuckLakeError::InvalidConfig(format!(
-                "register_existing_data_file: column_ids (len {}) must match catalog column nodes (len {})",
-                column_ids.len(),
-                catalog_column_count
-            )));
-        }
-        // An all-empty layout is the same as none, so the commit path below never
-        // has to distinguish "asked for nothing" from "asked for no layout".
-        let layout = match layout {
-            Some(layout) if !layout.is_empty() => Some(layout),
-            _ => None,
-        };
-        let mints_partition_spec = layout.is_some_and(|layout| !layout.partition_by.is_empty());
+        self.register_existing_data_files_tagged(
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            files,
+            layout,
+            mode,
+            None,
+        )
+    }
 
-        // One path may appear once in a batch. Official's plural entry point
-        // DEDUPLICATES instead, keeping the first and skipping the rest
-        // (`ducklake_add_data_files.cpp:241-246` at d8a1881, pinned by
-        // `test/sql/add_files/add_files_overlapping_globs.test`), because its entries
-        // are bare paths produced by glob expansion: overlapping globs are routine,
-        // and two entries for one path are byte-identical, so dropping one loses
-        // nothing.
-        //
-        // Here an entry is not a path but a `PromotedFile` carrying record count,
-        // sizes, row-id policy, partition values, ownership and its own delete file —
-        // none of it derived, all of it the caller's. Two entries for one path can
-        // disagree on every field, so "keep the first" is a silent choice between
-        // them. The case that decides it: two entries, same path, only the second
-        // carrying the delete file. Deduplicating drops that delete and the
-        // destination then reads rows the source had deleted — a wrong answer
-        // produced by the safer-looking option. Refusing loses nothing, since a
-        // caller passing an explicit list has no glob to overlap.
-        //
-        // The residual is narrower than the refusal: the argument above only bites
-        // when the entries DISAGREE. Two structurally identical entries have no
-        // delete file to lose and no field to choose between, so refusing those is
-        // stricter than official with nothing gained. Splitting the two cases is
-        // #328.
-        //
-        // Exact spellings only. Two ways of writing one object (relative vs absolute)
-        // are not resolvable here — that needs the table path the commit has not
-        // looked up yet — and official's normalization is likewise about glob and URL
-        // forms, not catalog path resolution.
-        let mut seen_paths = std::collections::HashSet::with_capacity(files.len());
-        // Indexed once for the batch: every stat of every file is checked against
-        // it, and a wide table's batch would otherwise scan the id list per stat.
-        let adopted_column_ids: std::collections::HashSet<i64> =
-            column_ids.iter().copied().collect();
-        for entry in files {
-            let (file, delete) = (&entry.file, entry.delete.as_ref());
-            if !seen_paths.insert(file.path.as_str()) {
-                return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "register_existing_data_files: {} appears more than once in the batch. Each \
-                     entry becomes its own ducklake_data_file row, so a repeat would double the \
-                     table's record count and hand one object two row-id ranges. Union the \
-                     entries for a path into one.",
-                    file.path
-                )));
-            }
-            // Both ways of getting ownership wrong are refused here, where the caller
-            // can still fix them.
-            //
-            // Naming THIS catalog as owner is a contradiction, and a silent leak: the
-            // row would be a reference nobody schedules, while the owner cleanup that
-            // would have reclaimed it is this very catalog, holding itself back for as
-            // long as its own row stands.
-            //
-            // A reference with a RELATIVE path is worse — it deletes rather than leaks.
-            // `all_reference_paths` hands cleanup the stored path verbatim, which the
-            // owner then compares against its own fully-resolved key; a relative
-            // spelling can never match, so the owner's cleanup is not deferred and
-            // reclaims the object while this row still names it. (The row does not even
-            // read back correctly here: a relative path resolves through THIS catalog's
-            // schema and table rows, not the owner's.)
-            for (kind, path, owner, is_relative) in [
-                Some((
-                    "file",
-                    file.path.as_str(),
-                    file.owner_catalog_id,
-                    file.path_is_relative,
-                )),
-                delete.map(|delete| {
-                    (
-                        "delete file",
-                        delete.path.as_str(),
-                        delete.owner_catalog_id,
-                        delete.path_is_relative,
-                    )
-                }),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                let Some(owner) = owner else {
-                    continue;
-                };
-                if owner == self.catalog_id {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "register_existing_data_file: {kind} {path} owner_catalog_id {owner} is \
-                         this catalog; a row that references its own catalog's file is never \
-                         reclaimed by anyone. Leave it unset for a file this catalog owns."
-                    )));
-                }
-                if is_relative {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "register_existing_data_file: {kind} {path} references catalog {owner} \
-                         but its path is relative, so it resolves through this catalog's layout \
-                         and never matches the object the owner's cleanup defers against. Mark \
-                         it absolute with `with_absolute_path()`."
-                    )));
-                }
-            }
-            // A partition_id alongside a layout that mints one can only name a
-            // generation this very commit is about to retire. Refuse rather than
-            // silently overwrite it: the caller is working from a stale spec.
-            if let Some(partition_id) = file.partition_id.filter(|_| mints_partition_spec) {
-                return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "register_existing_data_files: {} carries partition_id {partition_id} while \
-                     this batch establishes a new partition spec, whose generation does not exist \
-                     yet. Supply the values alone with DataFileInfo::with_partition_values.",
-                    file.path
-                )));
-            }
-            // A file's statistics are stored as given, under the ids adopted
-            // above, so each must name one of them. A stat for any other column
-            // is not merely dead weight: the commit merges every per-file row
-            // into the roll-up by `column_id`, so it would put a table-wide
-            // bound on a column the table does not have. And a column may be
-            // described once per file: a repeat would merge one file's values
-            // twice under rows that disagree. Both are a caller working from
-            // the wrong column set — refused here, where it can still fix them.
-            let mut seen_columns =
-                std::collections::HashSet::with_capacity(file.column_stats.len());
-            for stat in &file.column_stats {
-                if !adopted_column_ids.contains(&stat.column_id) {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "register_existing_data_files: {} carries statistics for column_id {}, \
-                         which is not among the adopted column_ids {column_ids:?}. A promoted \
-                         file's statistics are stored as given, so they must describe the \
-                         columns this registration creates.",
-                        file.path, stat.column_id
-                    )));
-                }
-                if !seen_columns.insert(stat.column_id) {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "register_existing_data_files: {} carries statistics for column_id {} \
-                         more than once. One row per column per file, or the table roll-up \
-                         counts this file twice.",
-                        file.path, stat.column_id
-                    )));
-                }
-            }
-        }
-        block_on(async {
-            let mut tx = self.pool.begin().await?;
-            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
-            let legacy = legacy_owner_columns(&mut tx).await?;
-
-            // No begin_write_transaction: derive the conflict base (catalog head)
-            // and a table-id hint (used only if the table doesn't exist yet) here.
-            let base_snapshot: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_catalog_snapshot_map
-                 WHERE catalog_id = $1",
-            )
-            .bind(self.catalog_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            let table_id_hint = reserve_ids("ducklake_table", "table_id", 1, &mut tx).await?[0];
-
-            // finalize inserts the columns with the adopted `column_ids`
-            // (OVERRIDING SYSTEM VALUE), so the file's field-ids match. `mode`
-            // applies to the batch as a whole: a Replace retires the prior
-            // generation exactly once, here, before any of `files` lands.
-            let (snapshot_id, schema_id, table_id) = finalize_snapshot(
-                self.catalog_id,
-                schema_name,
-                table_name,
-                table_id_hint,
-                columns,
-                column_ids,
-                mode,
-                base_snapshot,
-                &mut tx,
-            )
-            .await?;
-
-            // The layout goes on this same snapshot, between the columns and the
-            // fence. It has to: a partition spec names its keys by column NAME, and
-            // the only commit that creates those columns under the SOURCE's
-            // `column_ids` is this one. Establishing it here is what lets a
-            // partitioned promote be a single commit rather than a bootstrap
-            // registration, a SET, and a re-registration.
-            if let Some(layout) = layout {
-                if !layout.partition_by.is_empty() {
-                    // Setting a partition spec is DDL. Idempotent against the bump
-                    // finalize_snapshot already made when it created the table.
-                    record_schema_version_bump(self.catalog_id, table_id, snapshot_id, &mut tx)
-                        .await?;
-                    write_partition_generation(
-                        table_id,
-                        snapshot_id,
-                        &layout.partition_by,
-                        &mut tx,
-                    )
-                    .await?;
-                }
-                if !layout.sorted_by.is_empty() {
-                    // Sort order is not DDL (see `set_sort_spec`): no version bump.
-                    write_sort_generation(table_id, snapshot_id, &layout.sorted_by, &mut tx)
-                        .await?;
-                }
-            }
-
-            // Rowids: a fresh range by default, or the source's carried value
-            // when the caller supplied one. See `allocate_row_id_start`. Within a
-            // batch the allocator moves file by file, so two Assign files never
-            // draw the same range.
-            sqlx::query(
-                "INSERT INTO ducklake_table_stats (table_id, record_count, next_row_id, file_size_bytes)
-                 VALUES ($1, 0, 0, 0)
-                 ON CONFLICT (table_id) DO NOTHING",
-            )
-            .bind(table_id)
-            .execute(&mut *tx)
-            .await?;
-            let first_row_id: i64 = sqlx::query_scalar(
-                "SELECT next_row_id FROM ducklake_table_stats WHERE table_id = $1",
-            )
-            .bind(table_id)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            // Partition-spec fence + validation. A promoted file is registered
-            // as-is, so the caller is asserting it already holds rows of exactly one
-            // partition (official DuckLake's ducklake_add_data_files makes the same
-            // assumption, deriving the values from the file's Hive path). We check
-            // everything checkable without reading the data: the file agrees with the
-            // live generation, and its values fit that generation's keys.
-            //
-            // Read once for the batch — the catalog lock is held, so the live
-            // generation cannot move underneath the loop, including when the block
-            // above is what made it live.
-            let live_partition_id: Option<i64> = sqlx::query_scalar(
-                "SELECT partition_id FROM ducklake_partition_info
-                 WHERE table_id = $1 AND end_snapshot IS NULL",
-            )
-            .bind(table_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let mut transforms: Vec<String> = Vec::new();
-            let mut key_column_types: Vec<Option<arrow::datatypes::DataType>> = Vec::new();
-            if let Some(partition_id) = live_partition_id {
-                let key_rows = sqlx::query(
-                    "SELECT transform, column_id FROM ducklake_partition_column
-                     WHERE table_id = $1 AND partition_id = $2
-                     ORDER BY partition_key_index",
-                )
-                .bind(table_id)
-                .bind(partition_id)
-                .fetch_all(&mut *tx)
-                .await?;
-                for row in &key_rows {
-                    transforms.push(row.try_get::<String, _>(0)?);
-                    // Resolve each key's column_id to the Arrow type of the matching
-                    // promoted column, so an `identity` value can be cast-checked the
-                    // way official's MapHiveColumn does.
-                    let column_id: i64 = row.try_get(1)?;
-                    key_column_types.push(
-                        column_ids
-                            .iter()
-                            .position(|id| *id == column_id)
-                            .and_then(|index| columns.get(index))
-                            .and_then(|column| {
-                                crate::types::ducklake_to_arrow_type(column.ducklake_type()).ok()
-                            }),
-                    );
-                }
-            }
-
-            let mut next_row_id = first_row_id;
-            let mut batch_records: i64 = 0;
-            let mut batch_bytes: i64 = 0;
-            for entry in files {
-                // A minted generation is stamped on here, not by the caller: its id
-                // did not exist when the batch was built (the `partition_id.is_some()`
-                // combination was refused above).
-                let stamped;
-                let file = match live_partition_id.filter(|_| mints_partition_spec) {
-                    Some(partition_id) => {
-                        stamped = entry
-                            .file
-                            .clone()
-                            .with_partition(partition_id, entry.file.partition_values.clone());
-                        &stamped
-                    },
-                    None => &entry.file,
-                };
-
-                // Diagnose the promote-specific case before the shared fence: a caller
-                // that supplied no partition assignment for a partitioned table has not
-                // lost a race, so the fence's "concurrent SET PARTITIONED BY … retry"
-                // wording would send them chasing a problem that does not exist. Tell
-                // them what to actually do instead.
-                //
-                // Deliberately NOT exempting a 0-row file, unlike the shared fence.
-                // That exemption exists for the empty-Replace truncate marker a write
-                // session emits, which has no promote equivalent — a promoted file is
-                // one the caller actually produced. Official agrees: `AddFileToTable`
-                // compares the derived value count against the spec's key count with no
-                // row-count exception, so an empty file with no assignment is rejected
-                // there too.
-                if file.partition_id.is_none() && live_partition_id.is_some() {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "cannot promote {} into table {table_id}: the table is partitioned, so a \
-                         registered file must declare the single partition its rows belong to. \
-                         Attach it with DataFileInfo::with_partition (copy the values from the \
-                         source catalog, or derive them from the file's Hive path).",
-                        file.path
-                    )));
-                }
-                // The mirror of the stale-`partition_id` refusal above: values with no
-                // generation to hang them off. Nothing downstream catches this —
-                // `enforce_partition_fence` passes when both ids are None and
-                // `validate_promoted_partition_values` is gated on the file's id — so
-                // `insert_partition_metadata` would write
-                // `ducklake_file_partition_value` rows under a NULL `partition_id` in a
-                // table with no live spec. No reader can use that shape and no other
-                // write path produces it. Reached only on an unpartitioned table: a
-                // partitioned one is diagnosed above, and a batch that mints a spec has
-                // already stamped every file.
-                if file.partition_id.is_none() && !file.partition_values.is_empty() {
-                    return Err(crate::DuckLakeError::InvalidConfig(format!(
-                        "cannot promote {} into table {table_id}: it carries {} partition \
-                         value(s) but names no partition generation, and the table has no live \
-                         spec for them to belong to. Establish one in this commit \
-                         (PromoteLayout::partition_by), or drop the values.",
-                        file.path,
-                        file.partition_values.len()
-                    )));
-                }
-                crate::metadata_writer::enforce_partition_fence(table_id, live_partition_id, file)?;
-                if live_partition_id.is_some() && file.partition_id.is_some() {
-                    crate::metadata_writer::validate_promoted_partition_values(
-                        table_id,
-                        &transforms,
-                        &key_column_types,
-                        file,
-                    )?;
-                }
-
-                let row_ids = crate::metadata_writer::allocate_row_id_start(next_row_id, file);
-                next_row_id = next_row_id.saturating_add(row_ids.advance);
-                batch_records = batch_records.saturating_add(file.record_count);
-                batch_bytes = batch_bytes.saturating_add(file.file_size_bytes);
-
-                let data_file_id: i64 = sqlx::query_scalar(
-                    "INSERT INTO ducklake_data_file
-                         (table_id, path, path_is_relative, file_size_bytes,
-                          footer_size, record_count, row_id_start, begin_snapshot)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING data_file_id",
-                )
-                .bind(table_id)
-                .bind(&file.path)
-                .bind(file.path_is_relative)
-                .bind(file.file_size_bytes)
-                .bind(file.footer_size)
-                .bind(file.record_count)
-                .bind(row_ids.stored)
-                .bind(snapshot_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                // Ownership is the one thing registration decides that no other
-                // write path does: no reference row for a file this catalog owns
-                // (including one promoted from outside its own layout), one naming
-                // the source's catalog for a reference. Every reclaim path reads it.
-                if let Some(owner) = file.owner_catalog_id {
-                    record_file_reference(&mut tx, FileTable::Data, data_file_id, owner, legacy)
-                        .await?;
-                }
-                // Persist the caller-supplied partition assignment. Without this a
-                // promoted file lands with no partition_id and no
-                // ducklake_file_partition_value rows, i.e. unprunable and inconsistent
-                // with the table's spec.
-                insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                // And its per-column zone maps, under the id just assigned. A
-                // promoted file is registered as-is, so these are the source
-                // catalog's rows for the same bytes — which is why the caller
-                // copies them rather than re-reading the footer: `contains_nan`
-                // is not in a footer, and without it a float max is never
-                // trusted. Empty means no rows, and the roll-up below then
-                // reports the file's columns as unknown, exactly as the source did.
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
-                    .await?;
-
-                // An existing positional delete file travels with its data file: same
-                // commit, same snapshot, hanging off the id just assigned. The path is
-                // stored as given (a fork marks it absolute, pointing at the source's
-                // object), like the data file's.
-                if let Some(delete) = &entry.delete {
-                    let delete_file_id: i64 = sqlx::query_scalar(
-                        "INSERT INTO ducklake_delete_file
-                             (data_file_id, table_id, path, path_is_relative, file_size_bytes,
-                              footer_size, delete_count, begin_snapshot)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING delete_file_id",
-                    )
-                    .bind(data_file_id)
-                    .bind(table_id)
-                    .bind(&delete.path)
-                    .bind(delete.path_is_relative)
-                    .bind(delete.file_size_bytes)
-                    .bind(delete.footer_size)
-                    .bind(delete.delete_count)
-                    .bind(snapshot_id)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if let Some(owner) = delete.owner_catalog_id {
-                        record_file_reference(
-                            &mut tx,
-                            FileTable::Delete,
-                            delete_file_id,
-                            owner,
-                            legacy,
-                        )
-                        .await?;
-                    }
-                }
-            }
-
-            // Merge the batch's statistics into the table-wide roll-up, as every
-            // other register path does.
-            merge_file_table_column_stats(
-                &mut tx,
-                table_id,
-                &crate::metadata_writer::catalog_fields(columns, column_ids)?,
-                &crate::metadata_writer::file_column_stats(files.iter().map(|entry| &entry.file)),
-            )
-            .await?;
-
-            // A layout is DDL, but only worth its own entry when finalize did not
-            // already record one for this table on this snapshot: a table created
-            // here is `created_table`, and a column change is already
-            // `altered_table`. Appending a second entry would report one DDL as two.
-            if layout.is_some() {
-                let created = format!(
-                    "created_table:{}",
-                    crate::metadata_writer::quote_snapshot_table(schema_name, table_name)
-                );
-                let altered = format!("altered_table:{table_id}");
-                let recorded: Option<String> = sqlx::query_scalar(
-                    "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
-                )
-                .bind(snapshot_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
-                let recorded = recorded.unwrap_or_default();
-                if !snapshot_has_change(&recorded, &created)
-                    && !snapshot_has_change(&recorded, &altered)
-                {
-                    record_snapshot_changes(
-                        &mut tx,
-                        snapshot_id,
-                        &altered,
-                        &SnapshotCommitMetadata::default(),
-                    )
-                    .await?;
-                }
-            }
-
-            if !files.is_empty() {
-                sqlx::query(
-                    "UPDATE ducklake_table_stats
-                     SET next_row_id     = next_row_id + $1,
-                         record_count    = record_count + $2,
-                         file_size_bytes = file_size_bytes + $3
-                     WHERE table_id = $4",
-                )
-                .bind(next_row_id - first_row_id)
-                .bind(batch_records)
-                .bind(batch_bytes)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?;
-
-                record_snapshot_changes(
-                    &mut tx,
-                    snapshot_id,
-                    &format!("inserted_into_table:{table_id}"),
-                    &SnapshotCommitMetadata::default(),
-                )
-                .await?;
-            }
-            advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            self.commit(tx).await?;
-            Ok(CommitIds {
-                snapshot_id,
-                schema_id,
-                table_id,
-            })
-        })
+    fn register_existing_data_files_with_tags(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+        column_ids: &[i64],
+        files: &[PromotedFile],
+        layout: Option<&PromoteLayout>,
+        mode: WriteMode,
+        tags: &CarriedTags,
+    ) -> Result<CommitIds> {
+        self.register_existing_data_files_tagged(
+            schema_name,
+            table_name,
+            columns,
+            column_ids,
+            files,
+            layout,
+            mode,
+            Some(tags),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6308,7 +6945,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         base_snapshot: i64,
         delete: &DeleteFileInfo,
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             // Single atomic commit under the catalog lock: fence on
             // `base_snapshot`, compare-and-swap the currently-live delete file
             // for this data file, allocate the snapshot, retire the prior delete
@@ -6369,6 +7006,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Allocate the snapshot (commit-ordered IDENTITY). A delete is
             // non-DDL, so carry the per-catalog `schema_version` forward.
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -6493,7 +7131,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         expected_base_snapshot_id: Option<i64>,
     ) -> Result<CommitIds> {
         validate_delete_entries(mode, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // One atomic commit for a combined append + positional deletes (an
             // update/upsert). finalize_snapshot writes the snapshot + schema/columns
             // and returns the committed snapshot id; the new data file AND every
@@ -6757,7 +7395,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             ));
         }
         validate_delete_entries(mode, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // One atomic commit for a combined N-file append + positional deletes
             // (a keyed mutation whose new row versions span several partitions or
             // rolled files). finalize_snapshot writes the snapshot + schema/columns
@@ -6990,7 +7628,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         // A positional delete never retires the data files it targets, so it is
         // Append-semantics for validation (also enforces distinct data files).
         validate_delete_entries(WriteMode::Append, deletes)?;
-        block_on(async {
+        self.block_on(async {
             // Single atomic commit under the catalog lock for an N-file positional
             // DELETE with no append: fence + compare-and-swap + retire + insert per
             // entry, all stamped with one snapshot; advance_catalog_head LAST so
@@ -7008,6 +7646,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Allocate the snapshot (commit-ordered IDENTITY). A delete is
             // non-DDL, so carry the per-catalog schema_version forward.
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7134,7 +7773,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 "commit_inlined_deletes requires at least one row".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -7143,6 +7782,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 ..TableChanges::default()
             };
             check_table_conflicts(&mut tx, table_id, base_snapshot, ours).await?;
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7216,7 +7856,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             );
         }
         validate_delete_entries(WriteMode::Append, positional)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -7226,6 +7866,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 ..TableChanges::default()
             };
             check_table_conflicts(&mut tx, table_id, base_snapshot, ours).await?;
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7346,12 +7987,13 @@ impl MetadataWriter for PostgresMetadataWriter {
         tables: &[InlinedFlushTable],
     ) -> Result<i64> {
         validate_inlined_flush(tables)?;
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             for table in tables {
                 assert_table_not_in_other_catalog(self.catalog_id, table.table_id, &mut tx).await?;
             }
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7410,7 +8052,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 "commit_compaction requires at least one source file".to_string(),
             ));
         }
-        block_on(async {
+        self.block_on(async {
             // One atomic commit under the catalog lock. Mirrors
             // commit_positional_deletes' shape (allocate snapshot, carry
             // schema_version forward, fence + CAS), plus: schedule + retire the
@@ -7429,6 +8071,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .collect::<Vec<_>>();
             detect_new_inlined_deletes(table_id, base_snapshot, &source_files, &mut tx).await?;
 
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7670,7 +8313,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         _table_name: &str,
         base_snapshot: i64,
     ) -> Result<u64> {
-        block_on(async {
+        self.block_on(async {
             // Metadata-only truncate in one snapshot under the catalog lock: end
             // every live data file and its live delete file, and advance the head
             // LAST. `ducklake_table_stats` is left as official's `DELETE` leaves it.
@@ -7712,6 +8355,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             };
             check_table_conflicts(&mut tx, table_id, base_snapshot, ours).await?;
 
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -7828,7 +8472,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn retire_appends_since(&self, table_id: i64, base_snapshot: i64) -> Result<Option<i64>> {
-        block_on(async {
+        self.block_on(async {
             // Metadata-only rollback of a pure-append delta, in one snapshot under
             // the catalog lock: end every live data file added after base_snapshot,
             // recompute the visible totals from the survivors, advance the head LAST.
@@ -7952,6 +8596,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 return Ok(None);
             }
 
+            crate::metadata_writer_postgres::utc_snapshot_time(&mut tx).await?;
             let snapshot_id: i64 = sqlx::query(
                 "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
                  VALUES (NOW(), 0) RETURNING snapshot_id",
@@ -8035,7 +8680,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         columns: &[ColumnDef],
         column_ids: &[i64],
     ) -> Result<CommitIds> {
-        block_on(async {
+        self.block_on(async {
             // Fileless commit point (CREATE TABLE, zero-row Replace). Same atomic
             // model as register_data_file minus the data-file insert: write all
             // metadata via finalize_snapshot, then advance the head LAST.
@@ -8082,7 +8727,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         // zero (the new files written next will rebuild them). `next_row_id`
         // is deliberately NOT reset: rowids must stay monotonic across the
         // table's lifetime so historical snapshots still resolve uniquely.
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
             assert_table_in_catalog(self.catalog_id, table_id, &mut tx).await?;
@@ -8103,7 +8748,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn get_data_path(&self) -> Result<String> {
-        block_on(async {
+        self.block_on(async {
             let path: Option<String> =
                 sqlx::query_scalar("SELECT data_path FROM ducklake_catalog WHERE catalog_id = $1")
                     .bind(self.catalog_id)
@@ -8123,7 +8768,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         schema_name: &str,
         table_name: &str,
     ) -> Result<Option<Vec<(String, bool)>>> {
-        block_on(async {
+        self.block_on(async {
             let rows = sqlx::query(
                 "SELECT c.column_name, c.nulls_allowed
                  FROM ducklake_column c
@@ -8156,7 +8801,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn set_data_path(&self, path: &str) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             let mut tx = self.pool.begin().await?;
             lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
 
@@ -8195,7 +8840,7 @@ impl MetadataWriter for PostgresMetadataWriter {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        block_on(async {
+        self.block_on(async {
             execute_ddl_statements(&self.pool, SQL_CREATE_STANDARD_TABLES).await?;
             execute_ddl_statements(&self.pool, SQL_CREATE_MULTICATALOG_TABLES).await?;
             migrate_column_default_metadata(&self.pool).await?;
@@ -8211,6 +8856,9 @@ impl MetadataWriter for PostgresMetadataWriter {
             // Carry a v0.8.0 store's ownership column into the reference tables.
             // Idempotent.
             migrate_file_ownership(&self.pool).await?;
+            sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+                .execute(&self.pool)
+                .await?;
             Ok(())
         })
     }
@@ -8237,7 +8885,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         }
         let catalog_id = self.catalog_id;
         let lock_timeout_ms = self.lock_timeout_ms;
-        block_on(async {
+        self.block_on(async {
             // RESERVE ONLY: this transaction inserts NOTHING into ducklake_snapshot
             // / ducklake_schema / ducklake_table / ducklake_column /
             // ducklake_schema_versions / either map table. All of that is written

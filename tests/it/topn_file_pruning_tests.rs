@@ -596,7 +596,8 @@ async fn a_nan_unsafe_float_column_refuses_the_sort() {
     // `contains_nan = true`, and a bound that excludes NaN cannot be acted on.
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -606,7 +607,8 @@ async fn a_nan_unsafe_float_column_refuses_the_sort() {
 
     let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
         .append_table("main", "f", &[float_batch(vec![10.0, 11.0, 12.0])])
@@ -662,7 +664,8 @@ async fn a_nan_unsafe_float_column_refuses_the_sort() {
     std::fs::create_dir_all(&clean_data).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(&clean, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(clean_data.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -671,7 +674,8 @@ async fn a_nan_unsafe_float_column_refuses_the_sort() {
         .unwrap();
     let writer = SqliteMetadataWriter::new(&conn_str(&clean, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
         .append_table("main", "f", &[float_batch(vec![10.0, 11.0, 12.0])])
@@ -693,5 +697,111 @@ async fn a_nan_unsafe_float_column_refuses_the_sort() {
         clean_plan.contains("sort_order_for_reorder"),
         "without the barrier the ordering must reach the scan — otherwise the \
          refusal asserted above proves nothing\n{clean_plan}"
+    );
+}
+
+/// Append `rows` rows from `day` under the default inlining limit (10), so
+/// they are inlined beside the fixture's Parquet files.
+async fn append_inlined(temp_dir: &TempDir, day: i64, rows: i64, user: &str) {
+    let writer = SqliteMetadataWriter::new(&conn_str(temp_dir, true))
+        .await
+        .unwrap();
+    DuckLakeTableWriter::new(Arc::new(writer), object_store())
+        .unwrap()
+        .append_table("main", "events", &[batch(day, rows, user)])
+        .await
+        .unwrap();
+}
+
+async fn inlined_row_count(temp_dir: &TempDir) -> i64 {
+    let pool = sqlx::SqlitePool::connect(&conn_str(temp_dir, false))
+        .await
+        .unwrap();
+    let tables: Vec<String> =
+        sqlx::query_scalar("SELECT table_name FROM ducklake_inlined_data_tables")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut rows = 0;
+    for table in tables {
+        rows += sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM \"{table}\" WHERE end_snapshot IS NULL"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    }
+    rows
+}
+
+/// Inlined rows beside the Parquet files take part in a Top-N: the newest
+/// and the oldest rows here are inlined, and both directions return them.
+#[tokio::test(flavor = "multi_thread")]
+async fn topn_returns_inlined_rows_beside_parquet_files() {
+    let temp = TempDir::new().unwrap();
+    seed_four_files(&temp).await;
+    append_inlined(&temp, DAY_0 + 4 * ONE_DAY, 3, "e").await;
+    append_inlined(&temp, DAY_0 - ONE_DAY, 2, "z").await;
+    assert_eq!(inlined_row_count(&temp).await, 5);
+    let ctx = session(&temp).await;
+
+    assert_eq!(
+        timestamps(&ctx, "ORDER BY timestamp DESC LIMIT 4").await,
+        vec![
+            DAY_0 + 4 * ONE_DAY + 2 * ONE_SECOND,
+            DAY_0 + 4 * ONE_DAY + ONE_SECOND,
+            DAY_0 + 4 * ONE_DAY,
+            DAY_0 + 3 * ONE_DAY + 99 * ONE_SECOND,
+        ],
+    );
+    assert_eq!(
+        timestamps(&ctx, "ORDER BY timestamp ASC LIMIT 3").await,
+        vec![DAY_0 - ONE_DAY, DAY_0 - ONE_DAY + ONE_SECOND, DAY_0],
+    );
+}
+
+/// A Parquet row deleted by an inlined deletion stays out of a Top-N that
+/// also reads inlined rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn topn_skips_a_row_deleted_by_an_inlined_deletion() {
+    let temp = TempDir::new().unwrap();
+    seed_four_files(&temp).await;
+    append_inlined(&temp, DAY_0 + 4 * ONE_DAY, 1, "e").await;
+
+    let provider = SqliteMetadataProvider::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let writer = SqliteMetadataWriter::new(&conn_str(&temp, true))
+        .await
+        .unwrap();
+    let catalog = DuckLakeCatalog::with_writer(Arc::new(provider), Arc::new(writer)).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let newest_parquet = DAY_0 + 3 * ONE_DAY + 99 * ONE_SECOND;
+    ctx.sql(&format!(
+        "DELETE FROM ducklake.main.events WHERE timestamp = to_timestamp_micros({newest_parquet})"
+    ))
+    .await
+    .unwrap()
+    .collect()
+    .await
+    .unwrap();
+    let pool = sqlx::SqlitePool::connect(&conn_str(&temp, false))
+        .await
+        .unwrap();
+    let delete_files: i64 = sqlx::query_scalar("SELECT count(*) FROM ducklake_delete_file")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(delete_files, 0, "the deletion is inlined");
+
+    let ctx = session(&temp).await;
+    assert_eq!(
+        timestamps(&ctx, "ORDER BY timestamp DESC LIMIT 3").await,
+        vec![
+            DAY_0 + 4 * ONE_DAY,
+            DAY_0 + 3 * ONE_DAY + 98 * ONE_SECOND,
+            DAY_0 + 3 * ONE_DAY + 97 * ONE_SECOND,
+        ],
     );
 }

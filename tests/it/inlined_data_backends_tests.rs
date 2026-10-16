@@ -918,3 +918,424 @@ async fn inlined_rows_read_through_a_widened_column_type() {
         assert_eq!(rows, expected[index], "catalog {}", catalogs[index].0);
     }
 }
+
+/// The nested-schema history every [`nested_evolution`] check replays on a
+/// catalog `{c}`: inlined rows written under each shape of a struct, a list of
+/// structs, a map of structs and a struct nested in a struct, as fields are
+/// added (one with a default), renamed and dropped between the inserts.
+const NESTED_EVOLUTION: &[&str] = &[
+    "CREATE TABLE {c}.t(id INTEGER, s STRUCT(a INTEGER, b VARCHAR), ls STRUCT(x INTEGER)[], \
+     m MAP(VARCHAR, STRUCT(p INTEGER)), nn STRUCT(i STRUCT(q INTEGER)))",
+    "INSERT INTO {c}.t VALUES (1, {'a': 1, 'b': 'x'}, [{'x': 1}], MAP {'k': {'p': 1}}, \
+     {'i': {'q': 1}}), (2, NULL, [NULL, {'x': NULL}], MAP {'k': NULL}, {'i': NULL})",
+    "ALTER TABLE {c}.t ADD COLUMN s.c INTEGER DEFAULT 7",
+    "INSERT INTO {c}.t VALUES (3, {'a': 3, 'b': 'z', 'c': NULL}, [], MAP {}, NULL)",
+    "ALTER TABLE {c}.t ADD COLUMN ls.element.y INTEGER",
+    "ALTER TABLE {c}.t ADD COLUMN m.value.r INTEGER",
+    "ALTER TABLE {c}.t ADD COLUMN nn.i.w INTEGER",
+    "INSERT INTO {c}.t VALUES (4, {'a': 4, 'b': 'w', 'c': 4}, [{'x': 4, 'y': 4}], \
+     MAP {'k': {'p': 4, 'r': 4}}, {'i': {'q': 4, 'w': 4}})",
+    "ALTER TABLE {c}.t RENAME COLUMN s.b TO bb",
+    "INSERT INTO {c}.t VALUES (5, {'a': 5, 'bb': 'v', 'c': 5}, NULL, NULL, NULL)",
+    "ALTER TABLE {c}.t DROP COLUMN s.a",
+    "INSERT INTO {c}.t VALUES (6, {'bb': 'u', 'c': 6}, [{'x': 6, 'y': NULL}], \
+     MAP {'k': {'p': 6, 'r': 6}}, {'i': {'q': 6, 'w': NULL}})",
+];
+
+/// Every row of `sql`'s result, one comma-joined line of displayed cells.
+fn displayed_duckdb_rows(conn: &duckdb::Connection, sql: &str) -> Vec<String> {
+    let mut statement = conn.prepare(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+    let mut lines = Vec::new();
+    for batch in statement.query_arrow([]).unwrap() {
+        for row in 0..batch.num_rows() {
+            let cells = (0..batch.num_columns())
+                .map(|column| {
+                    let array = batch.column(column);
+                    if array.is_null(row) {
+                        "NULL".to_string()
+                    } else {
+                        duckdb::arrow::util::display::array_value_to_string(array, row).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            lines.push(cells.join(","));
+        }
+    }
+    lines
+}
+
+/// [`displayed_duckdb_rows`] for DataFusion batches.
+fn displayed_datafusion_rows(batches: &[RecordBatch]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let cells = (0..batch.num_columns())
+                .map(|column| {
+                    let array = batch.column(column);
+                    if array.is_null(row) {
+                        "NULL".to_string()
+                    } else {
+                        datafusion::arrow::util::display::array_value_to_string(array, row).unwrap()
+                    }
+                })
+                .collect::<Vec<_>>();
+            lines.push(cells.join(","));
+        }
+    }
+    lines
+}
+
+/// Replay [`NESTED_EVOLUTION`] on the attached catalog `catalog` and return,
+/// per snapshot from the table's creation on, what DuckDB reads there.
+fn nested_evolution(conn: &duckdb::Connection, catalog: &str) -> Vec<(i64, Vec<String>)> {
+    for statement in NESTED_EVOLUTION {
+        let sql = statement.replace("{c}", catalog);
+        conn.execute_batch(&sql)
+            .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+    }
+    let created: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT min(snapshot_id) FROM ducklake_snapshots('{catalog}') \
+                 WHERE snapshot_id > 0"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let last: i64 = conn
+        .query_row(
+            &format!("SELECT max(snapshot_id) FROM ducklake_snapshots('{catalog}')"),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (created..=last)
+        .map(|snapshot| {
+            (
+                snapshot,
+                displayed_duckdb_rows(
+                    conn,
+                    &format!("SELECT * FROM {catalog}.t AT (VERSION => {snapshot}) ORDER BY id"),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Require this crate to read every snapshot of `expected` as DuckDB did.
+async fn assert_nested_evolution_reads(
+    provider: Arc<dyn MetadataProvider>,
+    expected: &[(i64, Vec<String>)],
+    label: &str,
+    table: &str,
+) {
+    for (snapshot, rows) in expected {
+        let ctx = SessionContext::new();
+        ctx.register_catalog(
+            "lake",
+            Arc::new(DuckLakeCatalog::with_snapshot(Arc::clone(&provider), *snapshot).unwrap()),
+        );
+        let batches = ctx
+            .sql(&format!("SELECT * FROM lake.main.{table} ORDER BY id"))
+            .await
+            .unwrap_or_else(|e| panic!("{label} snapshot {snapshot}: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{label} snapshot {snapshot}: {e}"));
+        assert_eq!(
+            &displayed_datafusion_rows(&batches),
+            rows,
+            "{label} snapshot {snapshot}"
+        );
+    }
+}
+
+/// Inlined rows written before a struct (at any depth, and inside a list or a
+/// map) gained, renamed or lost a field read with the table's current shape, a
+/// field they predate taking its default, at every snapshot, as DuckDB reads
+/// them on DuckDB and SQLite catalogs.
+#[tokio::test(flavor = "multi_thread")]
+async fn inlined_nested_rows_read_across_struct_evolution() {
+    let temp = TempDir::new().unwrap();
+    common::ensure_ducklake_installed();
+    common::ensure_extension_installed("sqlite");
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("LOAD ducklake; LOAD sqlite;").unwrap();
+    let duck = temp.path().join("a.ducklake");
+    let lite = temp.path().join("b.db");
+    let mut expected = Vec::new();
+    for (name, uri) in [
+        ("duck", format!("ducklake:{}", escaped_path(&duck))),
+        ("lite", format!("ducklake:sqlite:{}", escaped_path(&lite))),
+    ] {
+        conn.execute_batch(&format!(
+            "ATTACH '{uri}' AS {name} (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 10)",
+            escaped_path(&temp.path().join("data").join(name))
+        ))
+        .unwrap();
+        expected.push(nested_evolution(&conn, name));
+    }
+    drop(conn);
+    // DuckDB reads the oldest row's added struct field as its default.
+    assert!(
+        expected[0].last().unwrap().1[0].contains("{bb: x, c: 7}"),
+        "{:?}",
+        expected[0].last()
+    );
+
+    assert_nested_evolution_reads(
+        Arc::new(DuckdbMetadataProvider::new(duck.to_string_lossy().to_string()).unwrap()),
+        &expected[0],
+        "duckdb",
+        "t",
+    )
+    .await;
+    #[cfg(feature = "metadata-sqlite")]
+    assert_nested_evolution_reads(
+        Arc::new(
+            datafusion_ducklake::SqliteMetadataProvider::new(&format!("sqlite:{}", lite.display()))
+                .await
+                .unwrap(),
+        ),
+        &expected[1],
+        "sqlite",
+        "t",
+    )
+    .await;
+    #[cfg(all(feature = "metadata-sqlite", feature = "write-sqlite"))]
+    nested_evolution_mutations_match(&temp, &lite).await;
+}
+
+/// A history like [`NESTED_EVOLUTION`] for a table `u` whose evolving struct is
+/// its last column, then the deletes and updates [`nested_evolution_mutations_match`]
+/// runs over its inlined rows of every shape.
+#[cfg(all(feature = "metadata-sqlite", feature = "write-sqlite"))]
+const NESTED_MUTATION_SETUP: &[&str] = &[
+    "CREATE TABLE {c}.u(id INTEGER, s STRUCT(a INTEGER, b VARCHAR, l STRUCT(x INTEGER)[]))",
+    "INSERT INTO {c}.u VALUES (1, {'a': 1, 'b': 'x', 'l': [{'x': 1}]}), (2, NULL)",
+    "ALTER TABLE {c}.u ADD COLUMN s.l.element.y INTEGER",
+    "ALTER TABLE {c}.u ADD COLUMN s.c INTEGER DEFAULT 7",
+    "INSERT INTO {c}.u VALUES (3, {'a': 3, 'b': 'z', 'l': [{'x': 3, 'y': NULL}], 'c': NULL})",
+    "ALTER TABLE {c}.u RENAME COLUMN s.b TO bb",
+    "INSERT INTO {c}.u VALUES (4, {'a': 4, 'bb': 'w', 'l': [], 'c': 4})",
+    "ALTER TABLE {c}.u DROP COLUMN s.a",
+];
+
+#[cfg(all(feature = "metadata-sqlite", feature = "write-sqlite"))]
+const NESTED_MUTATIONS: &[&str] =
+    &["DELETE FROM {c}.u WHERE id = 2", "UPDATE {c}.u SET id = id + 100 WHERE id IN (1, 3)"];
+
+/// Delete and update inlined rows of every struct shape, then flush them to
+/// Parquet, once by DuckDB on a copy of the SQLite catalog `lite` and once by
+/// this crate on `lite` itself: after each step this crate reads both tables of
+/// `lite` as DuckDB reads its copy.
+#[cfg(all(feature = "metadata-sqlite", feature = "write-sqlite"))]
+async fn nested_evolution_mutations_match(temp: &TempDir, lite: &Path) {
+    use datafusion_ducklake::{SqliteMetadataProvider, SqliteMetadataWriter, execute_ducklake_sql};
+
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("LOAD ducklake; LOAD sqlite;").unwrap();
+    conn.execute_batch(&format!(
+        "ATTACH 'ducklake:sqlite:{}' AS ours",
+        escaped_path(lite)
+    ))
+    .unwrap();
+    for statement in NESTED_MUTATION_SETUP {
+        conn.execute_batch(&statement.replace("{c}", "ours"))
+            .unwrap();
+    }
+    conn.execute_batch("DETACH ours").unwrap();
+    let copy = temp.path().join("c.db");
+    std::fs::copy(lite, &copy).unwrap();
+    conn.execute_batch(&format!(
+        "ATTACH 'ducklake:sqlite:{}' AS official",
+        escaped_path(&copy)
+    ))
+    .unwrap();
+    let official_head = || -> i64 {
+        conn.query_row(
+            "SELECT max(snapshot_id) FROM ducklake_snapshots('official')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let official_rows = |snapshot: i64| -> Vec<Vec<String>> {
+        ["t", "u"]
+            .iter()
+            .map(|table| {
+                displayed_duckdb_rows(
+                    &conn,
+                    &format!(
+                        "SELECT * FROM official.{table} AT (VERSION => {snapshot}) ORDER BY id"
+                    ),
+                )
+            })
+            .collect()
+    };
+    let mut expected = vec![official_rows(official_head())];
+    for statement in NESTED_MUTATIONS {
+        conn.execute_batch(&statement.replace("{c}", "official"))
+            .unwrap();
+        expected.push(official_rows(official_head()));
+    }
+    conn.execute_batch("CALL ducklake_flush_inlined_data('official', table_name => 'u')")
+        .unwrap();
+    expected.push(official_rows(official_head()));
+    drop(conn);
+
+    let url = format!("sqlite:{}", lite.display());
+    let provider: Arc<dyn MetadataProvider> =
+        Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
+    let writable = || async {
+        DuckLakeCatalog::with_writer(
+            Arc::clone(&provider),
+            Arc::new(SqliteMetadataWriter::new(&url).await.unwrap()),
+        )
+        .unwrap()
+    };
+    let ctx = SessionContext::new();
+    let handle = writable().await;
+    DuckLakeCatalog::register(&ctx, "lake", writable().await);
+    let mut snapshots = vec![provider.get_current_snapshot().unwrap()];
+    for statement in NESTED_MUTATIONS {
+        let sql = statement.replace("{c}", "lake.main");
+        execute_ducklake_sql(&ctx, &handle, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}`: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+        snapshots.push(provider.get_current_snapshot().unwrap());
+    }
+    let flushed = handle
+        .flush_inlined_data(&ctx.state(), Some("main"), Some("u"))
+        .await
+        .unwrap();
+    assert_eq!(flushed.len(), 1, "{flushed:?}");
+    snapshots.push(provider.get_current_snapshot().unwrap());
+
+    for (step, (snapshot, official)) in snapshots.iter().zip(&expected).enumerate() {
+        for (table, official) in ["t", "u"].iter().zip(official) {
+            assert_nested_evolution_reads(
+                Arc::clone(&provider),
+                &[(*snapshot, official.clone())],
+                &format!("sqlite {table} after step {step}"),
+                table,
+            )
+            .await;
+        }
+    }
+    let after_flush = &expected.last().unwrap()[1];
+    assert!(
+        after_flush
+            .iter()
+            .any(|row| row.starts_with("101,{bb: x, l: [{x: 1, y: }], c: 7}")),
+        "{after_flush:?}"
+    );
+}
+
+/// [`inlined_nested_rows_read_across_struct_evolution`] on a PostgreSQL catalog.
+#[cfg(feature = "metadata-postgres")]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_inlined_nested_rows_read_across_struct_evolution() {
+    use datafusion_ducklake::PostgresMetadataProvider;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let libpq =
+        format!("host=127.0.0.1 port={port} dbname=postgres user=postgres password=postgres");
+    let temp = TempDir::new().unwrap();
+    common::ensure_ducklake_installed();
+    common::ensure_extension_installed("postgres");
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch("LOAD postgres; LOAD ducklake;").unwrap();
+    conn.execute_batch(&format!(
+        "ATTACH 'ducklake:postgres:{libpq}' AS lake (DATA_PATH '{}', DATA_INLINING_ROW_LIMIT 10)",
+        escaped_path(&temp.path().join("data"))
+    ))
+    .unwrap();
+    let expected = nested_evolution(&conn, "lake");
+    drop(conn);
+    assert_nested_evolution_reads(
+        Arc::new(PostgresMetadataProvider::new(&url).await.unwrap()),
+        &expected,
+        "postgres",
+        "t",
+    )
+    .await;
+}
+
+/// Inlined struct rows on a MySQL catalog written before a field was added
+/// (with a default) and another renamed read in the current shape. Official
+/// DuckLake cannot inline a struct on MySQL, so the catalog is built directly
+/// in the layout it stores inlined text in, with the schema-version ledger
+/// rows each inlined table's registered version is looked up in.
+#[cfg(all(feature = "metadata-mysql", feature = "write-mysql"))]
+#[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_inlined_nested_rows_read_across_struct_evolution() {
+    use datafusion_ducklake::{MySqlMetadataProvider, MySqlMetadataWriter};
+    use sqlx::MySqlPool;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::mysql::Mysql;
+
+    let container = Mysql::default().start().await.unwrap();
+    let port = container.get_host_port_ipv4(3306).await.unwrap();
+    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    MySqlMetadataWriter::new_with_init(&url).await.unwrap();
+    let pool = MySqlPool::connect(&url).await.unwrap();
+    for statement in [
+        "INSERT INTO ducklake_snapshot(snapshot_id, schema_version) \
+         VALUES (1, 1), (2, 1), (3, 2), (4, 2)",
+        "INSERT INTO ducklake_metadata(`key`, `value`, scope) VALUES ('data_path', '/tmp', NULL)",
+        "INSERT INTO ducklake_schema(schema_id, schema_name, path, path_is_relative, begin_snapshot) \
+         VALUES (1, 'main', '', TRUE, 1)",
+        "INSERT INTO ducklake_table(table_id, schema_id, table_name, path, path_is_relative, \
+         begin_snapshot) VALUES (1, 1, 't', '', TRUE, 1)",
+        "INSERT INTO ducklake_column(column_id, begin_snapshot, end_snapshot, table_id, \
+         column_order, column_name, column_type, initial_default, nulls_allowed, parent_column) \
+         VALUES (1, 1, NULL, 1, 1, 'id', 'int32', NULL, TRUE, NULL), \
+                (2, 1, NULL, 1, 2, 's', 'struct', NULL, TRUE, NULL), \
+                (3, 1, NULL, 1, 3, 'a', 'int32', NULL, TRUE, 2), \
+                (4, 1, 3, 1, 4, 'b', 'varchar', NULL, TRUE, 2), \
+                (4, 3, NULL, 1, 4, 'bb', 'varchar', NULL, TRUE, 2), \
+                (5, 3, NULL, 1, 5, 'c', 'int32', '7', FALSE, 2)",
+        "CREATE TABLE IF NOT EXISTS ducklake_inlined_data_tables( \
+         table_id BIGINT, table_name VARCHAR(255), schema_version BIGINT)",
+        "CREATE TABLE ducklake_inlined_data_1_1(row_id BIGINT, begin_snapshot BIGINT, \
+         end_snapshot BIGINT, id BIGINT, s TEXT)",
+        "CREATE TABLE ducklake_inlined_data_1_2(row_id BIGINT, begin_snapshot BIGINT, \
+         end_snapshot BIGINT, id BIGINT, s TEXT)",
+        "INSERT INTO ducklake_inlined_data_tables VALUES \
+         (1, 'ducklake_inlined_data_1_1', 1), (1, 'ducklake_inlined_data_1_2', 2)",
+        "INSERT INTO ducklake_schema_versions(begin_snapshot, schema_version, table_id) \
+         VALUES (1, 1, 1), (3, 2, 1)",
+        "INSERT INTO ducklake_inlined_data_1_1 VALUES (0, 2, NULL, 1, '{''a'': 1, ''b'': ''x''}')",
+        "INSERT INTO ducklake_inlined_data_1_2 VALUES \
+         (1, 4, NULL, 2, '{''a'': 2, ''bb'': ''y'', ''c'': NULL}')",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("`{statement}`: {e}"));
+    }
+    assert_nested_evolution_reads(
+        Arc::new(MySqlMetadataProvider::new(&url).await.unwrap()),
+        &[
+            (2, vec!["1,{a: 1, b: x}".to_string()]),
+            (
+                4,
+                vec!["1,{a: 1, bb: x, c: 7}".to_string(), "2,{a: 2, bb: y, c: }".to_string()],
+            ),
+        ],
+        "mysql",
+        "t",
+    )
+    .await;
+}

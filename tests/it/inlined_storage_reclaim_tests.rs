@@ -1213,7 +1213,9 @@ mod duckdb_catalog {
         std::fs::create_dir_all(&data).unwrap();
         {
             let writer = Arc::new(
-                DuckdbMetadataWriter::new_with_init(path.to_string_lossy().into_owned()).unwrap(),
+                DuckdbMetadataWriter::new_with_init(path.to_string_lossy().into_owned())
+                    .unwrap()
+                    .with_data_inlining_row_limit(0),
             );
             writer.set_data_path(data.to_str().unwrap()).unwrap();
             let parquet =

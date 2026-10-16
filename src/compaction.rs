@@ -56,6 +56,7 @@ use datafusion::physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::reset_plan_states;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -71,7 +72,7 @@ use crate::metadata_writer::{
 };
 use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
-use crate::sort::{SortDirection, SortSpec};
+use crate::sort::SortSpec;
 use crate::table::{
     DuckLakeTable, MergeSourceFacts, RewrittenBatch, UpdateSourceScan, rewrite_output_schema,
     rewrite_scanned_batch,
@@ -112,8 +113,9 @@ impl Default for MergeOptions {
 #[derive(Debug, Clone)]
 pub struct RewriteOptions {
     /// Rewrite a data file only when the fraction of its rows masked by its live
-    /// delete file is at least this value. DuckDB's default is `0.95`. Must be in
-    /// `[0.0, 1.0]`.
+    /// delete file is not below this value. DuckDB's default is `0.95`. Must be
+    /// in `[0.0, 1.0]`, or NaN, which rewrites every file with deletions, as
+    /// official reads a stored `nan`.
     pub delete_threshold: f64,
     /// When set, rewrite only these currently-live data files, regardless of
     /// their delete fraction. This supports explicit physical maintenance such
@@ -139,6 +141,11 @@ pub struct CompactionResult {
     pub files_created: usize,
     /// Total rows written into the new files.
     pub rows_written: i64,
+    /// The snapshot of the flush of the table's inlined data the operation
+    /// ran first under an opt-in
+    /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy), or
+    /// `None` when it flushed nothing (always, under the default policy).
+    pub inlined_flush_snapshot: Option<i64>,
 }
 
 impl CompactionResult {
@@ -148,13 +155,17 @@ impl CompactionResult {
             files_processed: 0,
             files_created: 0,
             rows_written: 0,
+            inlined_flush_snapshot: None,
         }
     }
 
-    /// Whether the operation actually compacted anything (retired a source file).
-    /// A `false` result committed no snapshot.
+    /// Whether the operation committed anything: retired a source file, or,
+    /// under an opt-in
+    /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy),
+    /// flushed the table's inlined data first. A `false` result committed no
+    /// snapshot.
     pub fn did_work(&self) -> bool {
-        self.files_processed > 0
+        self.files_processed > 0 || self.inlined_flush_snapshot.is_some()
     }
 }
 
@@ -511,6 +522,30 @@ async fn first_nonempty(
     Ok(None)
 }
 
+/// [`first_nonempty`] of `sorted`, a compaction output sorted by the table's
+/// sort order, or — when it fails before emitting a row — of `unsorted`, the
+/// same rows in the order an unsorted compaction writes them.
+///
+/// A sort is blocking: it evaluates every key over every row before it emits
+/// one, so a key that fails to evaluate (a division by zero, a failing cast)
+/// fails it here. The order is a layout preference, so such a key writes the
+/// rows unsorted rather than fail the compaction, as an insert keeps their
+/// arrival order. `unsorted` re-executes the sources from a fresh plan state
+/// (`reset_plan_states`); an error that is not the key's (a source that
+/// cannot be read) fails that run too.
+async fn first_nonempty_sorted(
+    sorted: Result<SendableRecordBatchStream>,
+    unsorted: impl FnOnce() -> Result<SendableRecordBatchStream>,
+) -> Result<Option<SendableRecordBatchStream>> {
+    match sorted.map(first_nonempty) {
+        Ok(first) => match first.await {
+            Ok(first) => Ok(first),
+            Err(_) => first_nonempty(unsorted()?).await,
+        },
+        Err(_) => first_nonempty(unsorted()?).await,
+    }
+}
+
 /// A file's partition identity, normalized for grouping and comparison: the spec
 /// generation it was written under (`None` for an unpartitioned file) and its
 /// per-key values ordered by `partition_key_index`.
@@ -541,9 +576,17 @@ fn partition_value_pairs(values: &[Option<String>]) -> Vec<(i32, Option<String>)
 /// data columns, which are the LEADING columns of a rewrite batch. `None` means
 /// "write unsorted".
 ///
+/// The keys are those an insert sorts by ([`crate::sort::sort_exprs`]): a bare
+/// column by position (a float one as DuckDB orders it, `nan` last and `-0.0`
+/// equal to `0.0`), any other expression evaluated with DataFusion's
+/// semantics. No key of the `duckdb` dialect, or one DataFusion cannot plan,
+/// is `None`: the order is layout only, so the rows keep the order an unsorted
+/// compaction writes them in. A key naming a column the table lacks fails
+/// with official's binder error.
+///
 /// Resolved ONCE per operation, before any source file is read, so a
-/// specification this crate cannot honour fails the whole compaction rather
-/// than depending on which bin happened to contain rows.
+/// specification official refuses fails the whole compaction rather than
+/// depending on which bin happened to contain rows.
 pub(crate) fn compaction_ordering(
     data_schema: &Schema,
     sort_spec: Option<&SortSpec>,
@@ -551,42 +594,10 @@ pub(crate) fn compaction_ordering(
     let Some(sort_spec) = sort_spec else {
         return Ok(None);
     };
-    let keys = sort_spec.producible_columns().ok_or_else(|| {
-        DuckLakeError::InvalidConfig(format!(
-            "DuckLake sort order {} contains an unsupported expression; \
-             datafusion-ducklake can write only bare-column sort keys",
-            sort_spec.sort_id
-        ))
-    })?;
-    // No usable keys means "write unsorted", not an error. `producible_columns` filters
-    // out fields whose dialect is not `duckdb`, so a spec authored by another engine can
-    // legitimately leave nothing behind. Official DuckLake skips such fields and
-    // proceeds with whatever remains — an empty ORDER BY when that is all of them
-    // (`ducklake_compaction_functions.cpp`, `ducklake_insert.cpp`). Falling through to
-    // `LexOrdering::new` would instead fail a compaction that official completes; the
-    // SQL INSERT path already returns "no ordering" for this case.
-    if keys.is_empty() {
-        return Ok(None);
-    }
-
-    let mut expressions = Vec::with_capacity(keys.len());
-    for (name, direction, null_order) in keys {
-        let index = data_schema.index_of(&name).map_err(|_| {
-            DuckLakeError::InvalidConfig(format!(
-                "DuckLake sort key '{name}' is not present in the rewrite schema"
-            ))
-        })?;
-        expressions.push(PhysicalSortExpr::new(
-            Arc::new(Column::new(&name, index)),
-            SortOptions {
-                descending: direction == SortDirection::Desc,
-                nulls_first: null_order.nulls_first(),
-            },
-        ));
-    }
-    Ok(Some(LexOrdering::new(expressions).ok_or_else(|| {
-        DuckLakeError::Internal("sort order is empty".to_string())
-    })?))
+    Ok(LexOrdering::new(crate::sort::sort_exprs(
+        sort_spec,
+        data_schema,
+    )?))
 }
 
 /// Stream already-materialized rewrite output through the same path as a
@@ -885,7 +896,38 @@ impl DuckLakeTable {
     /// Returns no-op metrics (and commits no snapshot) when nothing qualifies.
     /// Errors if the table is read-only (open the catalog with a writer) or if a
     /// source file's rowid lineage cannot be reconstructed.
+    ///
+    /// Inlined rows and inlined deletions stay where they are, as official's
+    /// `ducklake_merge_adjacent_files` leaves them. A file with inlined
+    /// deletions is not merged (its deletions would be lost with it); a flush
+    /// ([`DuckLakeCatalog::flush_inlined_data`](crate::DuckLakeCatalog::flush_inlined_data)
+    /// or [`DuckLakeCatalog::checkpoint`](crate::DuckLakeCatalog::checkpoint))
+    /// turns them into a delete file, after which [`Self::rewrite_data_files`]
+    /// reclaims it. An opt-in
+    /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy) on the
+    /// table's write options, an addition of this crate, flushes the table
+    /// first when it is due; the merge then plans over the table at the flush
+    /// snapshot, which the result's `inlined_flush_snapshot` reports.
     pub async fn merge_adjacent_files(
+        &self,
+        state: &dyn Session,
+        opts: MergeOptions,
+    ) -> Result<CompactionResult> {
+        match self
+            .flush_inlined_if_due(state, "merge_adjacent_files")
+            .await?
+        {
+            Some((flushed, snapshot)) => {
+                let mut result = flushed.merge_adjacent_files_planned(state, opts).await?;
+                result.inlined_flush_snapshot = Some(snapshot);
+                Ok(result)
+            },
+            None => self.merge_adjacent_files_planned(state, opts).await,
+        }
+    }
+
+    /// [`Self::merge_adjacent_files`] after its flush step.
+    async fn merge_adjacent_files_planned(
         &self,
         state: &dyn Session,
         opts: MergeOptions,
@@ -1192,30 +1234,36 @@ impl DuckLakeTable {
             }
 
             let rowid_index = physical_schema.fields().len();
-            let merged = match (carried_row_id_start, ordering.as_ref()) {
-                (Some(start), None) => rowid_ordered_output(
-                    state.task_ctx(),
-                    UnionExec::try_new(leaves)?,
-                    rowid_index,
-                    start,
-                )?,
-                (Some(_), Some(ordering)) => without_column(
-                    sorted_rewrite_output(
-                        state.task_ctx(),
-                        UnionExec::try_new(leaves)?,
-                        Some(ordering),
-                    )?,
-                    rowid_index,
-                )?,
-                (None, _) => sorted_rewrite_output(
-                    state.task_ctx(),
-                    UnionExec::try_new(leaves)?,
-                    ordering.as_ref(),
-                )?,
+            // Fresh plan state each time: a scan executed once hands its
+            // files out from a shared queue, which a second execution of the
+            // same plan finds drained.
+            let unsorted = || -> Result<SendableRecordBatchStream> {
+                let input = reset_plan_states(UnionExec::try_new(leaves.clone())?)?;
+                match carried_row_id_start {
+                    Some(start) => {
+                        rowid_ordered_output(state.task_ctx(), input, rowid_index, start)
+                    },
+                    None => sorted_rewrite_output(state.task_ctx(), input, None),
+                }
             };
             // A bin whose sources hold no rows at all writes no file; its
             // sources are still retired by the commit below.
-            let Some(merged) = first_nonempty(merged).await? else {
+            let merged = match ordering.as_ref() {
+                None => first_nonempty(unsorted()?).await?,
+                Some(ordering) => {
+                    let sorted = UnionExec::try_new(leaves.clone())
+                        .map_err(DuckLakeError::from)
+                        .and_then(|input| {
+                            sorted_rewrite_output(state.task_ctx(), input, Some(ordering))
+                        })
+                        .and_then(|sorted| match carried_row_id_start {
+                            Some(_) => without_column(sorted, rowid_index),
+                            None => Ok(sorted),
+                        });
+                    first_nonempty_sorted(sorted, unsorted).await?
+                },
+            };
+            let Some(merged) = merged else {
                 continue;
             };
             // Every file in the bin shares one partition identity (that is the
@@ -1295,6 +1343,7 @@ impl DuckLakeTable {
             files_processed,
             files_created: outputs.len(),
             rows_written,
+            inlined_flush_snapshot: None,
         })
     }
 
@@ -1310,7 +1359,168 @@ impl DuckLakeTable {
     /// Returns no-op metrics (and commits no snapshot) when no file exceeds the
     /// threshold. Errors if the table is read-only or `delete_threshold` is
     /// outside `[0.0, 1.0]`.
+    ///
+    /// Inlined deletions of a file count towards its deleted fraction, and a
+    /// file whose rows they all delete is retired like any other. Inlined rows
+    /// stay inlined, as official's `ducklake_rewrite_data_files` leaves them,
+    /// unless an opt-in
+    /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy) flushes
+    /// them first, as for [`Self::merge_adjacent_files`].
     pub async fn rewrite_data_files(
+        &self,
+        state: &dyn Session,
+        opts: RewriteOptions,
+    ) -> Result<CompactionResult> {
+        match self
+            .flush_inlined_if_due(state, "rewrite_data_files")
+            .await?
+        {
+            Some((flushed, snapshot)) => {
+                let mut result = flushed.rewrite_data_files_planned(state, opts).await?;
+                result.inlined_flush_snapshot = Some(snapshot);
+                Ok(result)
+            },
+            None => self.rewrite_data_files_planned(state, opts).await,
+        }
+    }
+
+    /// Flush this table's inlined data when its opt-in
+    /// [`InlinedFlushPolicy`](crate::table_writer::InlinedFlushPolicy) says so,
+    /// returning the table reopened at the flush snapshot and the snapshot;
+    /// `None` when it flushed nothing (the default policy, read-only,
+    /// `auto_compact` off, an encrypted catalog, or no trigger fired).
+    async fn flush_inlined_if_due(
+        &self,
+        state: &dyn Session,
+        operation: &str,
+    ) -> Result<Option<(DuckLakeTable, i64)>> {
+        let Some(writer) = self.writer() else {
+            return Ok(None);
+        };
+        let Some(schema_name) = self.schema_name() else {
+            return Ok(None);
+        };
+        self.write_options().validate()?;
+        // The policy is opt-in: without one, nothing is read from the catalog.
+        let policy = self
+            .write_options()
+            .inlined_flush_policy
+            .unwrap_or_default();
+        if policy.min_inlined_rows.is_none() && policy.max_inlined_age.is_none() {
+            return Ok(None);
+        }
+        if !self.write_options().auto_compact.unwrap_or(true) || writer.catalog_encrypted()? {
+            return Ok(None);
+        }
+        let Some(backlog) = self.inlined_flush_backlog(state).await? else {
+            return Ok(None);
+        };
+        let pending = backlog.rows + backlog.file_deletes;
+        if pending == 0 {
+            return Ok(None);
+        }
+        let due = policy.min_inlined_rows.is_some_and(|min| pending >= min)
+            || match (policy.max_inlined_age, backlog.oldest_snapshot) {
+                (Some(age), Some(oldest)) => self
+                    .snapshot_age(oldest)?
+                    .is_some_and(|elapsed| elapsed >= age),
+                _ => false,
+            };
+        if !due {
+            return Ok(None);
+        }
+        tracing::debug!(
+            table = self.table_name(),
+            pending,
+            operation,
+            "flushing inlined data before compaction"
+        );
+        let catalog =
+            crate::DuckLakeCatalog::with_writer(Arc::clone(self.provider()), Arc::clone(writer))?;
+        let outcome = catalog
+            .flush_inlined_data_with(
+                crate::inlined_flush::FlushObjectStores::Session(Arc::clone(state.runtime_env())),
+                Some(schema_name),
+                Some(self.table_name()),
+                None,
+            )
+            .await?;
+        let Some(snapshot) = outcome.snapshot_id else {
+            return Ok(None);
+        };
+        Ok(Some((self.reopened_at_head()?, snapshot)))
+    }
+
+    /// What a flush of this table at the head would move: its inlined rows
+    /// (those live at the table's snapshot), the inlined deletions of Parquet
+    /// rows the flush moves (a retired data file's that cannot merge into its
+    /// delete file history stay inlined, and do not count), and the smallest
+    /// `begin_snapshot` among everything it moves, deleted inlined rows
+    /// included. `None` when the metadata provider does not read inlined data
+    /// for a flush (a third-party provider without the flush reads), which
+    /// leaves nothing to flush.
+    async fn inlined_flush_backlog(&self, state: &dyn Session) -> Result<Option<FlushBacklog>> {
+        let provider = self.provider();
+        let head = provider.get_current_snapshot()?;
+        let unsupported = |error: &DuckLakeError| matches!(error, DuckLakeError::Unsupported(_));
+        let oldest_row = match provider.oldest_inlined_row_snapshot(self.table_id(), head) {
+            Err(error) if unsupported(&error) => {
+                tracing::debug!(table = self.table_name(), %error, "not flushing inlined data");
+                return Ok(None);
+            },
+            result => result?,
+        };
+        let file_deletes = match provider.get_inlined_file_deletes_for_flush(self.table_id(), head)
+        {
+            Err(error) if unsupported(&error) => {
+                tracing::debug!(table = self.table_name(), %error, "not flushing inlined data");
+                return Ok(None);
+            },
+            result => result?,
+        };
+        let rows: u64 = self
+            .inlined_data_with_row_ids()?
+            .iter()
+            .map(|rows| rows.row_ids.len() as u64)
+            .sum();
+        let (file_deletes, oldest_delete) = if file_deletes.is_empty() {
+            (0, None)
+        } else {
+            let store = state
+                .runtime_env()
+                .object_store(self.object_store_url().as_ref())?;
+            crate::inlined_flush::flushed_file_deletes(self, store.as_ref(), file_deletes).await?
+        };
+        Ok(Some(FlushBacklog {
+            rows,
+            file_deletes,
+            oldest_snapshot: oldest_row.into_iter().chain(oldest_delete).min(),
+        }))
+    }
+
+    /// How long ago snapshot `snapshot` was committed. An expired snapshot
+    /// takes the time of the first surviving snapshot after it, the earliest
+    /// time known to follow it. `None` when no such snapshot has a time.
+    fn snapshot_age(&self, snapshot: i64) -> Result<Option<std::time::Duration>> {
+        let Some(timestamp) = self
+            .provider()
+            .list_snapshots()?
+            .into_iter()
+            .filter(|candidate| candidate.snapshot_id >= snapshot)
+            .min_by_key(|candidate| candidate.snapshot_id)
+            .and_then(|candidate| candidate.timestamp)
+            .and_then(|raw| crate::metadata_provider::parse_snapshot_timestamp(&raw))
+        else {
+            return Ok(None);
+        };
+        // A snapshot time ahead of this clock (the catalog server's clock
+        // runs ahead) is no age at all.
+        let now = chrono::Utc::now().naive_utc();
+        Ok(Some((now - timestamp).to_std().unwrap_or_default()))
+    }
+
+    /// [`Self::rewrite_data_files`] after its flush step.
+    async fn rewrite_data_files_planned(
         &self,
         state: &dyn Session,
         mut opts: RewriteOptions,
@@ -1325,7 +1535,10 @@ impl DuckLakeTable {
                 .rewrite_delete_threshold
                 .unwrap_or(opts.delete_threshold);
         }
-        if !(0.0..=1.0).contains(&opts.delete_threshold) {
+        // `threshold < 0 || threshold > 1`, which a NaN passes, as official's
+        // `ducklake_set_option` checks it.
+        #[allow(clippy::manual_range_contains)]
+        if opts.delete_threshold < 0.0 || opts.delete_threshold > 1.0 {
             return Err(DuckLakeError::InvalidConfig(format!(
                 "rewrite_data_files: delete_threshold must be in [0.0, 1.0], got {}",
                 opts.delete_threshold
@@ -1374,9 +1587,13 @@ impl DuckLakeTable {
                         .get(&tf.data_file_id)
                         .map_or(0, |positions| positions.len() as i64);
                     let delete_count = tf.delete_count.unwrap_or(0) + inlined_count;
+                    // Official keeps a file only when `delete_ratio <
+                    // threshold`, which a NaN threshold never is.
                     delete_count > 0
                         && record_count > 0
-                        && delete_count as f64 / record_count as f64 >= opts.delete_threshold
+                        && (delete_count as f64 / record_count as f64)
+                            .partial_cmp(&opts.delete_threshold)
+                            != Some(std::cmp::Ordering::Less)
                 },
             })
             .collect();
@@ -1407,20 +1624,36 @@ impl DuckLakeTable {
             let scan = self
                 .build_update_scan(state, tf, inlined_deletes.get(&tf.data_file_id))
                 .await?;
-            let sorted = sorted_rewrite_output(
-                state.task_ctx(),
-                Arc::new(CompactionSourceExec::new(
-                    Arc::new(scan),
-                    Arc::clone(&physical_schema),
-                    // A delete-rewrite emits no origin column, so nothing raises
-                    // this and nothing reads it.
+            let source: Arc<dyn ExecutionPlan> = Arc::new(CompactionSourceExec::new(
+                Arc::new(scan),
+                Arc::clone(&physical_schema),
+                // A delete-rewrite emits no origin column, so nothing raises
+                // this and nothing reads it.
+                None,
+                Arc::new(AtomicI64::new(i64::MIN)),
+                // A rewrite always embeds its rowids: deleted rows leave gaps.
+                false,
+            ));
+            // Fresh plan state, as for a merge: the sorted run drained the
+            // scan's shared file queue.
+            let unsorted = || {
+                sorted_rewrite_output(
+                    state.task_ctx(),
+                    reset_plan_states(Arc::clone(&source))?,
                     None,
-                    Arc::new(AtomicI64::new(i64::MIN)),
-                    // A rewrite always embeds its rowids: deleted rows leave gaps.
-                    false,
-                )),
-                ordering.as_ref(),
-            )?;
+                )
+            };
+            let sorted = match ordering.as_ref() {
+                None => first_nonempty(unsorted()?).await?,
+                Some(ordering) => {
+                    let sorted = sorted_rewrite_output(
+                        state.task_ctx(),
+                        Arc::clone(&source),
+                        Some(ordering),
+                    );
+                    first_nonempty_sorted(sorted, unsorted).await?
+                },
+            };
 
             files_processed += 1;
             sources.push(CompactionSourceFile {
@@ -1429,7 +1662,7 @@ impl DuckLakeTable {
             });
 
             // Every row deleted: the source is retired with no replacement.
-            let Some(sorted) = first_nonempty(sorted).await? else {
+            let Some(sorted) = sorted else {
                 continue;
             };
 
@@ -1498,6 +1731,7 @@ impl DuckLakeTable {
             files_processed,
             files_created: outputs.len(),
             rows_written,
+            inlined_flush_snapshot: None,
         })
     }
 }
@@ -1729,12 +1963,16 @@ fn rewrite_delete_threshold(table: &DuckLakeTable, schema_id: Option<i64>) -> Re
     let Some(value) = settings.get("rewrite_delete_threshold") else {
         return Ok(0.95);
     };
-    let threshold = value.trim().parse::<f64>().map_err(|_| {
+    // Read with DuckDB's `VARCHAR` cast, as official reads a stored `DOUBLE`
+    // (`nan` included).
+    let threshold = crate::duckdb_cast::varchar_to_double(value).ok_or_else(|| {
         DuckLakeError::InvalidConfig(format!(
             "rewrite_delete_threshold '{value}' is not a number"
         ))
     })?;
-    if !(0.0..=1.0).contains(&threshold) {
+    // `threshold < 0 || threshold > 1`, which a NaN passes.
+    #[allow(clippy::manual_range_contains)]
+    if threshold < 0.0 || threshold > 1.0 {
         return Err(DuckLakeError::InvalidConfig(
             "The delete_threshold option must be between 0 and 1".to_string(),
         ));
@@ -1742,35 +1980,50 @@ fn rewrite_delete_threshold(table: &DuckLakeTable, schema_id: Option<i64>) -> Re
     Ok(threshold)
 }
 
+/// What a flush of one table would move; see
+/// [`DuckLakeTable::inlined_flush_backlog`].
+struct FlushBacklog {
+    rows: u64,
+    file_deletes: u64,
+    oldest_snapshot: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sort::{DUCKDB_DIALECT, NullOrder, SortDirection, SortField};
 
-    #[test]
-    fn compaction_ordering_rejects_expression_sort_key() {
-        let data_schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let sort_spec = SortSpec {
+    fn key(expression: &str) -> SortSpec {
+        SortSpec {
             sort_id: 7,
             fields: vec![SortField {
                 sort_key_index: 0,
-                expression: "lower(id)".to_string(),
+                expression: expression.to_string(),
                 dialect: DUCKDB_DIALECT.to_string(),
                 direction: SortDirection::Asc,
                 null_order: NullOrder::NullsLast,
             }],
-        };
+        }
+    }
 
-        let result = compaction_ordering(&data_schema, Some(&sort_spec));
-        let err = match result {
-            Ok(_) => panic!("expression sort key must be rejected"),
-            Err(e) => e,
-        };
-
-        assert_eq!(
-            err.to_string(),
-            "Invalid configuration: DuckLake sort order 7 contains an unsupported expression; \
-             datafusion-ducklake can write only bare-column sort keys",
-        );
+    #[test]
+    fn compaction_orders_by_expression_sort_keys() {
+        let data_schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let ordering = compaction_ordering(&data_schema, Some(&key("-((id / 2))")))
+            .unwrap()
+            .expect("an expression key DataFusion plans orders the output");
+        assert_eq!(ordering.len(), 1);
+        // Keys DataFusion cannot plan (a function it lacks, DuckDB's `//`
+        // operator) keep the unsorted order.
+        for unplannable in ["main.list_value(id)", "-((id // 2))"] {
+            assert!(
+                compaction_ordering(&data_schema, Some(&key(unplannable)))
+                    .unwrap()
+                    .is_none(),
+                "{unplannable}"
+            );
+        }
+        // A key naming a missing column fails, as official's binder fails it.
+        assert!(compaction_ordering(&data_schema, Some(&key("(gone + 1)"))).is_err());
     }
 }

@@ -929,6 +929,8 @@ struct FileReadConfig {
     /// column's data would be lost (and its sources removed). `merge_adjacent_files`
     /// skips any group containing one.
     drops_current_columns: bool,
+    /// Number of rows the file's footer records.
+    row_count: i64,
 }
 
 /// What one file's parquet footer says: the field-id → physical-name map, the
@@ -974,6 +976,8 @@ pub(crate) struct ParquetFileLayout {
     pub(crate) drops_current_columns: bool,
     /// Number of row groups in the file.
     pub(crate) row_group_count: usize,
+    /// Number of rows the footer records.
+    pub(crate) row_count: i64,
 }
 
 /// The parquet reader's metadata size hint for a file whose catalog records
@@ -1222,6 +1226,7 @@ pub(crate) async fn read_parquet_file_layout(
         embedded_snapshot_parquet_name: facts.field_ids.get(&SNAPSHOT_ID_PARQUET_FIELD_ID).cloned(),
         drops_current_columns,
         row_group_count: facts.row_group_count,
+        row_count: facts.row_count,
     }))
 }
 
@@ -1670,6 +1675,12 @@ impl DuckLakeTable {
     /// true physical row positions and does not depend on a row's position
     /// matching `rowid - row_id_start`, so it is valid for rewritten files too.
     /// A rewritten file needs no special handling here.
+    ///
+    /// Sees only Parquet data and delete files, never inlined rows or inlined
+    /// deletions. On a table with data inlining enabled, use
+    /// `DuckLakeTable::keyed_mutation` (with the `write` feature), a scan, or
+    /// [`DuckLakeTable::locate_rowids`](crate::DuckLakeTable::locate_rowids)
+    /// instead.
     pub fn files_matching(
         &self,
         predicate: &Arc<dyn PhysicalExpr>,
@@ -2544,6 +2555,12 @@ impl DuckLakeTable {
     /// therefore irrelevant here: they may be non-contiguous, or ordered
     /// differently from the rows they sit on, without affecting which physical
     /// row a resolved position names.
+    ///
+    /// Sees only Parquet data and delete files, never inlined rows or inlined
+    /// deletions. On a table with data inlining enabled, use
+    /// `DuckLakeTable::keyed_mutation` (with the `write` feature), a scan, or
+    /// [`DuckLakeTable::locate_rowids`](crate::DuckLakeTable::locate_rowids)
+    /// instead.
     pub async fn resolve_positions(
         &self,
         state: &dyn Session,
@@ -2706,7 +2723,8 @@ impl DuckLakeTable {
             file.footer_size,
             file.encryption_key.as_deref(),
         )
-        .await?;
+        .await
+        .map_err(|e| e.context(format!("reading the row count of data file {resolved}")))?;
         Ok(facts.row_count)
     }
 
@@ -2836,6 +2854,15 @@ impl DuckLakeTable {
         Ok(positions)
     }
 
+    /// The number of rows `file`'s footer records, read once per table.
+    pub(crate) async fn file_row_count(
+        &self,
+        state: &dyn Session,
+        file: &DuckLakeFileData,
+    ) -> DataFusionResult<i64> {
+        Ok(self.build_file_read_config(state, file).await?.row_count)
+    }
+
     /// Whether `file` was rewritten — by an UPDATE or by compaction — rather
     /// than only ever inserted. A rewritten file embeds its rows' original row
     /// ids as a reserved parquet column (tagged with
@@ -2861,6 +2888,230 @@ impl DuckLakeTable {
     ) -> DataFusionResult<bool> {
         let cfg = self.build_file_read_config(state, file).await?;
         Ok(cfg.embedded_rowid_parquet_name.is_some())
+    }
+
+    /// Where `table_file`'s rows take their `rowid` from: an embedded
+    /// `_ducklake_internal_row_id` column, which official DuckLake's reader
+    /// prefers whatever the catalog records, else the catalog's
+    /// `row_id_start` plus the row's position. A file that embeds row ids may
+    /// still record a `row_id_start` (a flush or merge records its smallest
+    /// row id), so the catalog alone cannot tell; this reads the file's footer
+    /// once and memoizes the answer. `None` when the file has neither.
+    pub async fn file_row_id_layout(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+    ) -> DataFusionResult<Option<crate::rowid_lookup::RowIdLayout>> {
+        if self
+            .file_has_embedded_rowid(state, &table_file.file)
+            .await?
+        {
+            return Ok(Some(crate::rowid_lookup::RowIdLayout::Embedded));
+        }
+        Ok(table_file.row_id_start.map(|row_id_start| {
+            crate::rowid_lookup::RowIdLayout::Positional {
+                row_id_start,
+            }
+        }))
+    }
+
+    /// The positions of `table_file` deleted at this table's snapshot: its
+    /// live delete file's, as of the snapshot, and `inlined`, its deletions
+    /// in `ducklake_inlined_delete_<table_id>`.
+    pub(crate) async fn deleted_positions_at_snapshot(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        inlined: Option<&HashSet<i64>>,
+    ) -> DataFusionResult<HashSet<i64>> {
+        self.deleted_positions_for_file(state, table_file, inlined)
+            .await
+    }
+
+    /// Every row of `table_file` as `(position, embedded rowid, embedded
+    /// snapshot)`, reading only those columns, or `None` when the file embeds
+    /// no row ids. With `with_snapshot` (a partial file read at a snapshot
+    /// before its last), the snapshot is read too, a NULL one as `None`; a
+    /// file without the column fails, as official's reader does. Delete files
+    /// are not applied.
+    pub(crate) async fn embedded_row_ids(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        with_snapshot: bool,
+    ) -> DataFusionResult<Option<Vec<(i64, i64, Option<i64>)>>> {
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+        if file_cfg.embedded_rowid_parquet_name.is_none() {
+            return Ok(None);
+        }
+        if with_snapshot && file_cfg.embedded_snapshot_parquet_name.is_none() {
+            return Err(missing_snapshot_column(table_file, self.snapshot_id));
+        }
+        let snapshot_name = file_cfg
+            .embedded_snapshot_parquet_name
+            .clone()
+            .filter(|_| with_snapshot);
+        let read_schema = match &snapshot_name {
+            Some(name) => {
+                let mut fields: Vec<Arc<Field>> =
+                    file_cfg.read_schema.fields().iter().cloned().collect();
+                fields.push(Arc::new(Field::new(name, DataType::Int64, true)));
+                Arc::new(Schema::new(fields))
+            },
+            None => Arc::clone(&file_cfg.read_schema),
+        };
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            read_schema.clone(),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
+        let mut proj = vec![file_cfg.read_schema.fields().len() - 1];
+        if snapshot_name.is_some() {
+            proj.push(read_schema.fields().len() - 1);
+        }
+        proj.push(pos_table_idx);
+        let source = self.create_parquet_source(state, table_schema)?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            self.scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![
+                    self.partitioned_file(&table_file.file)?,
+                ]))
+                .with_projection_indices(Some(proj))?
+                .build(),
+        );
+        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
+        let int64 = |batch: &RecordBatch, index: usize| -> DataFusionResult<Int64Array> {
+            let column = arrow::compute::cast(batch.column(index), &DataType::Int64)?;
+            Ok(column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("cast to Int64")
+                .clone())
+        };
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let row_ids = int64(batch, 0)?;
+            let snapshots = snapshot_name
+                .is_some()
+                .then(|| int64(batch, 1))
+                .transpose()?;
+            let positions = int64(batch, batch.num_columns() - 1)?;
+            for row in 0..batch.num_rows() {
+                if row_ids.is_null(row) {
+                    continue;
+                }
+                let snapshot = snapshots
+                    .as_ref()
+                    .and_then(|snapshots| snapshots.is_valid(row).then(|| snapshots.value(row)));
+                rows.push((positions.value(row), row_ids.value(row), snapshot));
+            }
+        }
+        Ok(Some(rows))
+    }
+
+    /// The positions of `table_file` holding a row not visible at this
+    /// table's snapshot: for a partial file (one whose `partial_max` lies past
+    /// the snapshot, as a merge of files from several snapshots writes it),
+    /// the rows whose embedded `_ducklake_internal_snapshot_id` is past it or
+    /// NULL, which official's `<=` snapshot filter leaves out too. Empty for
+    /// any other file, whose rows all predate the snapshot.
+    pub(crate) async fn positions_inserted_later(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+    ) -> DataFusionResult<HashSet<i64>> {
+        if table_file
+            .partial_max
+            .is_none_or(|max| max <= self.snapshot_id)
+        {
+            return Ok(HashSet::new());
+        }
+        let file_cfg = self.build_file_read_config(state, &table_file.file).await?;
+        let Some(snapshot_name) = file_cfg.embedded_snapshot_parquet_name.clone() else {
+            return Err(missing_snapshot_column(table_file, self.snapshot_id));
+        };
+        let mut fields: Vec<Arc<Field>> = file_cfg.read_schema.fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(&snapshot_name, DataType::Int64, true)));
+        let read_schema = Arc::new(Schema::new(fields));
+        let (table_schema, pos_table_idx, _pos_name) = positional_table_schema_reserving(
+            read_schema.clone(),
+            self.physical_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str()),
+        );
+        let source = self.create_parquet_source(state, table_schema)?;
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(
+            self.scan_config_builder(Arc::new(source))
+                .with_file_group(FileGroup::new(vec![
+                    self.partitioned_file(&table_file.file)?,
+                ]))
+                .with_projection_indices(Some(vec![read_schema.fields().len() - 1, pos_table_idx]))?
+                .build(),
+        );
+        let batches = datafusion::physical_plan::collect(plan, state.task_ctx()).await?;
+        let mut later = HashSet::new();
+        for batch in &batches {
+            let snapshots = arrow::compute::cast(batch.column(0), &DataType::Int64)?;
+            let snapshots = snapshots
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("cast to Int64");
+            let positions = arrow::compute::cast(batch.column(1), &DataType::Int64)?;
+            let positions = positions
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("cast to Int64");
+            for row in 0..batch.num_rows() {
+                if snapshots.is_null(row) || snapshots.value(row) > self.snapshot_id {
+                    later.insert(positions.value(row));
+                }
+            }
+        }
+        Ok(later)
+    }
+
+    /// The rows of `table_file` at `positions`, as `[physical columns...,
+    /// rowid]`, each with its `rowid` as the table's scans read it. Rows its
+    /// delete files or `inlined` deletions remove, and rows inserted after
+    /// this table's snapshot, are left out.
+    #[cfg(feature = "write")]
+    pub(crate) async fn read_file_rows_at(
+        &self,
+        state: &dyn Session,
+        table_file: &DuckLakeTableFile,
+        positions: &HashSet<i64>,
+        inlined: Option<&HashSet<i64>>,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
+        let later = self.positions_inserted_later(state, table_file).await?;
+        let scan = self
+            .build_update_scan_with_snapshot(state, table_file, false, inlined, None)
+            .await?;
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&scan.scan), state.task_ctx()).await?;
+        let out_schema = rewrite_output_schema(&self.physical_schema);
+        let mut out = Vec::new();
+        for batch in &batches {
+            let Some(rewritten) =
+                rewrite_scanned_batch(&self.physical_schema, &out_schema, &scan, batch, None, &[])?
+            else {
+                continue;
+            };
+            let keep = BooleanArray::from(
+                rewritten
+                    .positions
+                    .iter()
+                    .map(|position| positions.contains(position) && !later.contains(position))
+                    .collect::<Vec<_>>(),
+            );
+            let kept = arrow::compute::filter_record_batch(&rewritten.batch, &keep)?;
+            if kept.num_rows() > 0 {
+                out.push(kept);
+            }
+        }
+        Ok(out)
     }
 
     /// Roll one scan group's per-file catalog statistics up into the group- and
@@ -3762,6 +4013,7 @@ impl DuckLakeTable {
             embedded_rowid_parquet_name: layout.embedded_rowid_parquet_name.clone(),
             embedded_snapshot_parquet_name: layout.embedded_snapshot_parquet_name.clone(),
             drops_current_columns: layout.drops_current_columns,
+            row_count: layout.row_count,
         });
 
         {
@@ -4476,6 +4728,27 @@ impl DuckLakeTable {
         self.physical_schema.clone()
     }
 
+    /// This table opened again at the catalog's head, with the same writer and
+    /// write options: after a maintenance step committed a snapshot this
+    /// handle cannot see.
+    #[cfg(feature = "write")]
+    pub(crate) fn reopened_at_head(&self) -> crate::Result<Self> {
+        let head = self.provider.get_current_snapshot()?;
+        let mut table = Self::new(
+            self.table_id,
+            self.table_name.clone(),
+            Arc::clone(&self.provider),
+            head,
+            Arc::clone(&self.object_store_url),
+            self.table_path.clone(),
+        )?
+        .with_row_lineage(self.row_lineage);
+        table.schema_name = self.schema_name.clone();
+        table.writer = self.writer.clone();
+        table.write_options = self.write_options.clone();
+        Ok(table)
+    }
+
     /// The metadata writer, when this table was opened writable
     /// (`DuckLakeCatalog::with_writer`). Used by the compaction ops.
     #[cfg(feature = "write")]
@@ -4975,6 +5248,18 @@ pub(crate) struct MergeSourceFacts {
     /// that do not read the field, catalogs predating it), and keying off it
     /// would re-stamp every row with one origin and drop the column.
     pub(crate) has_embedded_snapshot: bool,
+}
+
+/// The error reading the partial file `table_file` at `snapshot_id` (before
+/// its last snapshot) fails with when it carries no embedded
+/// `_ducklake_internal_snapshot_id` column, as official's reader fails
+/// ("Snapshot filter was specified but snapshot column was not present").
+fn missing_snapshot_column(table_file: &DuckLakeTableFile, snapshot_id: i64) -> DataFusionError {
+    DataFusionError::Execution(format!(
+        "partial file \"{}\" carries no embedded `_ducklake_internal_snapshot_id` column, so \
+         the rows it holds at snapshot {snapshot_id} cannot be told apart",
+        table_file.file.path
+    ))
 }
 
 /// Output schema of a rewritten source file: the table's physical columns (in
@@ -5479,7 +5764,7 @@ impl TableProvider for DuckLakeTable {
     #[cfg(feature = "write")]
     async fn insert_into(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         input: Arc<dyn ExecutionPlan>,
         insert_op: InsertOp,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -5537,22 +5822,63 @@ impl TableProvider for DuckLakeTable {
             },
         };
 
-        // Resolve the live sort spec (also at the head, for the same reason as the
-        // partition spec). When it is producible — every key is a bare column
-        // present in the write schema — wrap the input in a global SortExec so each
-        // written file's rows are ordered, tightening per-file min/max statistics
-        // for range pruning. Sorting is applied before the partition split, so each
-        // per-partition file remains a sorted subsequence. An unsupported expression
-        // or missing sort column is rejected before execution rather than silently
-        // producing files that violate the active sort contract.
-        let ordering = if self.write_options.sort_on_insert.unwrap_or(true) {
-            let live_sort = self
-                .provider
-                .get_sort_spec(self.table_id, head_snapshot)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            sort_ordering_for(&input.schema(), live_sort.as_ref())?
-        } else {
-            None
+        // Plan the sort as official's `PlanInsert` does, under the live sort
+        // spec (also at the head, for the same reason as the partition spec)
+        // and the stored `sort_on_insert`, read once here and handed to the
+        // writer, so the plan and the writer cannot each assume the other
+        // sorts. With the option on, the plan sorts every row, as official's
+        // sort below its inlining operator does, when every key is a bare
+        // column; an expression key (which DataFusion may fail to evaluate,
+        // leaving the rows in their order rather than failing the insert) is
+        // left to the writer. With it off, the writer sorts the rows it writes
+        // to Parquet while inlining is enabled. Official validates the keys'
+        // columns whenever it plans a sort, however many rows the statement
+        // holds, so a missing sort column fails here, before execution.
+        let mut planned_sort_on_insert = None;
+        let ordering = match self
+            .provider
+            .get_sort_spec(self.table_id, head_snapshot)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+        {
+            Some(spec) => {
+                let stored = writer
+                    .table_setting(schema_name, &self.table_name, "sort_on_insert")
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                let fallback = self.write_options.sort_on_insert.unwrap_or(true);
+                let sort_on_insert = crate::table_writer::resolve_sort_on_insert(stored, fallback);
+                planned_sort_on_insert = Some(sort_on_insert);
+                let inlining_enabled = !sort_on_insert && {
+                    let object_store = state
+                        .runtime_env()
+                        .object_store(self.object_store_url.as_ref())?;
+                    crate::table_writer::DuckLakeTableWriter::new(Arc::clone(writer), object_store)
+                        .and_then(|table_writer| {
+                            table_writer
+                                .with_options(&self.write_options)
+                                .inlining_enabled(
+                                    schema_name,
+                                    &self.table_name,
+                                    self.physical_schema.as_ref(),
+                                )
+                        })
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?
+                };
+                if sort_on_insert || inlining_enabled {
+                    crate::sort::validate_sort_columns(&spec, &input.schema())
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                }
+                let bare_columns = spec
+                    .fields
+                    .iter()
+                    .filter(|field| field.is_duckdb_dialect())
+                    .all(|field| field.column_candidate().is_some());
+                if sort_on_insert && bare_columns {
+                    sort_ordering_for(&input.schema(), Some(&spec))?
+                } else {
+                    None
+                }
+            },
+            None => None,
         };
         // Wrap the input in a SortExec now AND declare the same requirement on
         // DuckLakeInsertExec, so DataFusion's EnforceSorting keeps the ordering
@@ -5578,7 +5904,8 @@ impl TableProvider for DuckLakeTable {
                 self.write_options.clone(),
                 ordering,
             )
-            .with_planned_snapshot(self.snapshot_id),
+            .with_planned_snapshot(self.snapshot_id)
+            .with_planned_sort_on_insert(planned_sort_on_insert),
         ))
     }
 
@@ -5859,8 +6186,9 @@ pub(crate) fn is_object_store_not_found(err: &DataFusionError) -> bool {
 }
 
 /// The `LexOrdering` for a table's live sort spec against `schema`, or `None` when
-/// the table has no sort order. Unsupported expressions and missing sort columns
-/// fail the write before data is committed.
+/// the table has no sort order or no key of the `duckdb` dialect
+/// ([`crate::sort::sort_exprs`]). A missing sort column fails the write before
+/// data is committed.
 #[cfg(feature = "write")]
 fn sort_ordering_for(
     schema: &arrow::datatypes::Schema,
@@ -5869,37 +6197,9 @@ fn sort_ordering_for(
     let Some(sort_spec) = sort_spec else {
         return Ok(None);
     };
-    let keys = sort_spec.producible_columns().ok_or_else(|| {
-        DataFusionError::NotImplemented(format!(
-            "DuckLake sort order {} contains an unsupported expression; \
-             datafusion-ducklake can write only bare-column sort keys",
-            sort_spec.sort_id
-        ))
-    })?;
-    if keys.is_empty() {
-        return Ok(None);
-    }
-    let mut sort_exprs = Vec::with_capacity(keys.len());
-    for (name, direction, null_order) in &keys {
-        let index = schema.index_of(name).map_err(|_| {
-            DataFusionError::Plan(format!(
-                "DuckLake sort key '{name}' is not present in the write schema"
-            ))
-        })?;
-        let column = Arc::new(datafusion::physical_expr::expressions::Column::new(
-            name, index,
-        ));
-        sort_exprs.push(
-            datafusion::physical_expr_common::sort_expr::PhysicalSortExpr::new(
-                column,
-                arrow::compute::SortOptions {
-                    descending: matches!(direction, crate::sort::SortDirection::Desc),
-                    nulls_first: null_order.nulls_first(),
-                },
-            ),
-        );
-    }
-    Ok(datafusion::physical_expr::LexOrdering::new(sort_exprs))
+    let keys = crate::sort::sort_exprs(sort_spec, schema)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(datafusion::physical_expr::LexOrdering::new(keys))
 }
 
 /// Re-state a page's per-file statistics for a caller that reads a data file
@@ -6981,6 +7281,7 @@ mod tests {
             embedded_rowid_parquet_name: None,
             embedded_snapshot_parquet_name: None,
             drops_current_columns: false,
+            row_count: 0,
         };
         let id_index = table.physical_schema.index_of("id").unwrap();
 
@@ -8028,26 +8329,25 @@ mod tests {
     // compile the test target.
     #[cfg(feature = "write")]
     #[test]
-    fn sort_ordering_rejects_expression_sort_key() {
+    fn sort_ordering_plans_expression_sort_key() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
-        let sort_spec = crate::sort::SortSpec {
+        let spec = |expression: &str| crate::sort::SortSpec {
             sort_id: 9,
             fields: vec![crate::sort::SortField {
                 sort_key_index: 0,
-                expression: "lower(id)".to_string(),
+                expression: expression.to_string(),
                 dialect: crate::sort::DUCKDB_DIALECT.to_string(),
                 direction: crate::sort::SortDirection::Asc,
                 null_order: crate::sort::NullOrder::NullsLast,
             }],
         };
 
-        let err = sort_ordering_for(&schema, Some(&sort_spec)).unwrap_err();
-
-        assert_eq!(
-            err.to_string(),
-            "This feature is not implemented: DuckLake sort order 9 contains an unsupported \
-             expression; datafusion-ducklake can write only bare-column sort keys",
-        );
+        let ordering = sort_ordering_for(&schema, Some(&spec("id % 7")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordering.len(), 1);
+        let err = sort_ordering_for(&schema, Some(&spec("missing + 1"))).unwrap_err();
+        assert!(err.to_string().contains("missing"), "{err}");
     }
 
     // --- the DuckLake scan attaches the footer metadata cache ---

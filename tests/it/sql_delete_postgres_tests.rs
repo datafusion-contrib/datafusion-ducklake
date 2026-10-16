@@ -59,7 +59,8 @@ async fn writer_for(
 ) -> Arc<PostgresMetadataWriter> {
     let w = PostgresMetadataWriter::with_pool(pool.clone(), cat)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     w.set_data_path(data_path.to_str().unwrap()).unwrap();
     Arc::new(w)
 }

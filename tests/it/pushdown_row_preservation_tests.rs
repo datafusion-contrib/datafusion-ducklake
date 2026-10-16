@@ -113,14 +113,14 @@ use crate::common;
 /// across the whole query, which is what makes "the filter actually filtered"
 /// observable.
 #[derive(Debug, Clone)]
-struct PushdownToggle {
+pub(crate) struct PushdownToggle {
     inner: Arc<dyn MetadataProvider>,
     enabled: bool,
     listed: Arc<AtomicUsize>,
 }
 
 impl PushdownToggle {
-    fn new(inner: Arc<dyn MetadataProvider>, enabled: bool) -> Self {
+    pub(crate) fn new(inner: Arc<dyn MetadataProvider>, enabled: bool) -> Self {
         Self {
             inner,
             enabled,

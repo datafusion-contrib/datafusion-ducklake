@@ -141,7 +141,8 @@ async fn write_nested_table() -> (TempDir, std::path::PathBuf) {
         temp_dir.path().join("test.db").display()
     ))
     .await
-    .unwrap();
+    .unwrap()
+    .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     DuckLakeTableWriter::new(
@@ -426,7 +427,8 @@ async fn a_struct_column_keeps_its_predicate_pushdown() {
         temp_dir.path().join("test.db").display()
     ))
     .await
-    .unwrap();
+    .unwrap()
+    .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let s = StructArray::new(

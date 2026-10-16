@@ -9,26 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `with_data_inlining_row_limit` on every metadata writer: one inlining limit for every write
+  path, as official's `DATA_INLINING_ROW_LIMIT` option; stored settings outrank it.
+- `MetadataWriter::table_setting` and `DuckLakeTableWriter::table_sort_on_insert` read a
+  table's stored option, table over schema over catalog-wide.
+- `MetadataWriter::data_inlining_row_limit`, `table_data_inlining_row_limit` and
+  `set_schema_setting`, and `set_global_setting` on MySQL.
+- `DuckLakeTableWriter::table_data_inlining_row_limit` and `TableWriteSession::is_inlining`.
+- `DuckLakeTable::keyed_mutation` deletes, updates or upserts rows by key from staged Arrow
+  batches of the table's types (or lossless widenings), Parquet and inlined rows alike.
+- `DuckLakeTable::delete_positions` and `delete_rowids` record small deletions inlined, as a
+  SQL `DELETE` does.
+- `DuckLakeTable::locate_rowids`, `read_rows_by_rowid` and `file_row_id_layout` find rows by
+  `rowid`, inlined or in files embedding row ids; `DuckLakeTableFile::may_embed_row_ids`.
+- `change_detection` reports what snapshots did to a table: the change ledger, and the change
+  feed where the ledger records only a flush or a compaction.
+- `MetadataProvider::list_table_snapshot_changes`, `snapshot_ids_between`,
+  `snapshot_ids_are_consecutive`, `table_first_snapshot` and `oldest_inlined_row_snapshot`.
+- `MulticatalogManager::fork_table` forks a table into another catalog by reference, with its
+  inlined rows, inlined deletions, column metadata and tags; it returns a `TableFork`.
+- `InlinedFlushPolicy`, opt-in and not in official DuckLake: `merge_adjacent_files` and
+  `rewrite_data_files` flush a due table's inlined data first (`inlined_flush_snapshot`).
 - `MetadataProvider::scan_inlined_data_noting_absence` also reports the latest snapshot through
   which a table has no inlined rows. The PostgreSQL and multicatalog providers implement it.
-- `MulticatalogProvider::begin_read_session` takes one pooled connection for a query, and
-  `with_read_session` runs every catalog read of the provider on it.
-  `DuckLakeTable::with_metadata_provider` binds a cached table to it per query (#338).
-- `TableWriteSession::write_batch_async` writes a batch and then waits until every finished
-  file has started uploading, which bounds the finished files a rolling or partitioned
-  session holds on local disk to `upload_concurrency`.
+- `MulticatalogProvider::begin_read_session` and `with_read_session` run a query's catalog
+  reads on one pooled connection (#338).
+- `DuckLakeTable::with_metadata_provider` binds a cached table to a read session per query.
+- `TableWriteSession::write_batch_async` writes a batch, then waits until every finished file
+  is uploading, so a session holds at most `upload_concurrency` finished files on disk.
 - `TableWriteSession::abort` abandons a session without committing and removes every file it
   uploaded, waiting for the uploads in flight first.
-- `PostgresCommitGuard`, with the `write-postgres` feature: `with_commit_guard` on
-  `PostgresMetadataWriter` and `PostgresSingleCatalogMetadataWriter` runs a caller's check on
-  the connection of each metadata transaction the writer commits, after its last write and
-  right before `COMMIT`. A refusal rolls the transaction back and the writer returns
-  `DuckLakeError::CommitRefused`; a write removes the files it uploaded for it. Without a
-  guard nothing changes.
-- `PostgresMetadataWriter::drop_table` drops a table as
-  `MulticatalogManager::drop_table_in_catalog` does, through the writer's commit guard. It
-  returns `CatalogNotFound` for a missing catalog where `drop_table_in_catalog` returns
-  `false`, and waits for the catalog lock up to the writer's `with_lock_timeout`.
+- `PostgresCommitGuard` (`write-postgres`): `with_commit_guard` on both PostgreSQL writers runs
+  a caller's check right before each metadata `COMMIT`; a refusal rolls it back.
+- `PostgresMetadataWriter::drop_table` drops a table through the writer's commit guard and lock
+  timeout; a missing catalog is `CatalogNotFound`.
 - Change feeds and `rowid` scans read inlined rows and inlined deletions of Parquet rows,
   matching official DuckLake; inlined rows resolve columns by id across schema versions (#270).
 - SQL `UPDATE` updates inlined rows, and `UPDATE` and `DELETE` inline small deletions and new
@@ -54,69 +68,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
+  stored limit, else the writer's, else `10`. To keep writing Parquet, set
+  `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
+- **BREAKING**: `CompactionResult` gains `inlined_flush_snapshot`; add it to struct literals.
+- An insert whose sort key names a column the table lacks fails with official's binder error
+  whenever official's would, empty or inlined; so does `set_sort_spec`.
+- **BREAKING** (behaviour): a write dropping a column a sort key references is refused, as
+  official refuses `DROP COLUMN`, and so is any drop under a key this crate cannot parse.
+  Reset or change the sort order first.
+- **BREAKING** (behaviour): every write path reads the stored `sort_on_insert`, which outranks
+  a writer's or catalog's own option, as official has no session override of it. Store
+  `false` at table, schema or catalog scope to stop sorting.
+- **BREAKING**: `SortField::column` takes a bare column name and quotes it as DuckDB writes a
+  key (`"My Col"`). Pass names unquoted; a quoted one is quoted again.
+- **BREAKING**: the `set_*_setting` methods cast, store and refuse options as official's
+  `ducklake_set_option` does. Give sizes a unit (`512MB`) and `hive_file_pattern` an integer.
+- **BREAKING** (behaviour): a stored `sort_on_insert` or `hive_file_pattern` is on only for
+  exactly `true`, as official reads it. Run writer or multicatalog initialization once to
+  rewrite the `TRUE`-like values earlier releases stored to `true`.
+- **BREAKING** for `MetadataWriter` wrappers: forward the new inlining-limit methods,
+  `table_setting`, `set_schema_setting` and `register_existing_data_files_with_tags`.
+- **BREAKING**: `PromotedFile` gains `partial_max` and is `#[non_exhaustive]`; build it with
+  `PromotedFile::new`.
 - A `DuckLakeTable` whose PostgreSQL catalog holds no inlined rows for it reads its inlined
   data once per snapshot, not on every scan.
-- **BREAKING**: `DuckLakeError` gains `CommitRefused`, with the `write-postgres` feature; add
-  an arm to exhaustive matches. Its source is the error a `PostgresCommitGuard` refused a
-  commit with. Nothing was committed, so a caller may treat it like any other failure before
-  `COMMIT`; it is never `CommitOutcomeUnknown`.
-- **BREAKING** for `MetadataProvider` implementors and wrappers: implement or forward the new
-  methods (see Added); their defaults fail with `Unsupported` on inlined data instead of
-  reading or flushing it.
+- **BREAKING**: `DuckLakeError` gains `CommitRefused` (`write-postgres`), a commit guard's
+  refusal; nothing was committed. Add an arm to exhaustive matches.
+- **BREAKING** for `MetadataProvider` implementors and wrappers: the new methods' defaults fail
+  with `Unsupported` on inlined data. Implement or forward them (see Added).
 - **BREAKING** for `MetadataWriter` implementors and wrappers: implement or forward
-  `catalog_encrypted`, `head_snapshot`, `next_snapshot_id`, `reserved_inlining_column` and
-  `supports_inlined_row_mutations`.
+  `catalog_encrypted`, `head_snapshot`, `next_snapshot_id` and `reserved_inlining_column`.
 - **BREAKING** for `MetadataWriter` implementors and wrappers: implement or forward
-  `maintenance`, `commit_inlined_flush`, `drop_empty_superseded_inlined_tables` and
-  `table_types_support_inlining`.
+  `supports_inlined_row_mutations`, `maintenance` and `commit_inlined_flush`.
+- **BREAKING** for `MetadataWriter` implementors and wrappers: implement or forward
+  `drop_empty_superseded_inlined_tables` and `table_types_support_inlining`.
 - **BREAKING** for rollback to 0.9: this release's first inlined write to a SQLite table
   rewrites its inlined floats, 0.9's included, as text, which 0.9 cannot read.
 - **BREAKING** for rollback to 0.9: 0.9 fails to read a flushed file at a snapshot after one
   of its rows was deleted, before its last row.
 - **BREAKING**: `DeleteFileInfo` gains a private field; build it with `DeleteFileInfo::new`,
   and `with_deleted_positions` to commit it beside concurrent inlined deletions of other rows.
-- **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown`, with the `metadata-postgres` or
-  `metadata-mysql` feature; add an arm to exhaustive matches. A PostgreSQL or MySQL commit
-  that registers data files, or `commit_multi_table`, returns it in place of `Sqlx` when the
-  `COMMIT` statement itself fails, since the server may have applied it.
-- A rolling or partitioned session uploads each data file as soon as it is finished, instead
-  of all of them in `finish`, so upload buffers are held while later files are still being
-  encoded; `with_upload_concurrency` caps how many uploads run at once.
+- **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown` (`metadata-postgres`,
+  `metadata-mysql`): a failed `COMMIT` that may have applied. Add an arm to exhaustive matches.
+- A rolling or partitioned session uploads each data file once it is finished, not all at
+  `finish`; `with_upload_concurrency` caps how many uploads run at once.
 - `TableWriteSession::write_batch` can return an upload failure, and once it has, every later
   call fails too; drop or `abort` the session.
 - Dropping a session after its uploads started removes them in the background, on the tokio
   runtime the uploads started on.
-- A streaming session puts its files in the data path for the whole write, not only at
-  `finish`, so an orphan-file sweep's `older_than` cutoff must be earlier than the start of
-  the longest write that may still be running.
+- A streaming session's files sit in the data path for the whole write, so an orphan sweep's
+  `older_than` must precede the start of the longest write still running.
 - The `ducklake.upload_staged_files` span times only the uploads still running at `finish`.
-- **BREAKING** for `MetadataWriter` implementors: a write session or multi-table transaction
-  now removes the files it uploaded when a commit returns any error other than
-  `CommitOutcomeUnknown`. An implementation must return any other error only when nothing
-  was committed, and `CommitOutcomeUnknown` when its `COMMIT` failed with an unknown outcome.
+- **BREAKING** for `MetadataWriter` implementors: a failed commit's uploaded files are removed
+  unless it returns `CommitOutcomeUnknown`. Return any other error only if nothing committed.
 - `merge_adjacent_files` writes no rowid column when the merged files' rowid ranges are
-  adjacent, keeping the first file's `row_id_start`, as official DuckLake does. Each row's
-  rowid is then that start plus its position in the merged file. Without a sort order the
-  rows keep their rowids. A file with an embedded rowid column and a `row_id_start` (an
-  inlined-data flush) is adjacent by its range, and its rows are taken in file order.
-- **BREAKING** (behaviour): on a table with a sort order, an adjacent merge writes its rows
-  in sorted order, so their rowids follow the sorted position, at the head and at earlier
-  snapshots, as in official DuckLake. Before, every merge embedded rowids and kept them.
-  This contradicts the row lineage guarantee and is tracked upstream as
-  duckdb/ducklake#1602.
-- `merge_adjacent_files` takes merge candidates in official DuckLake's order within a schema
-  version and partition: `begin_snapshot`, then `row_id_start`, then `data_file_id`. An
-  earlier merge's output, whose id is newer than files appended before that merge ran, now
-  precedes them.
-- **BREAKING** for `MetadataWriter` implementors: `commit_compaction` must store an output's
-  `row_id_start` when it is `RowIdStart::Preserved`, and NULL otherwise. An implementation
-  that keeps storing NULL registers a merged file that has neither a range nor a rowid
-  column: reading its rowids, or updating it, fails.
+  adjacent, keeping the first file's `row_id_start`, as official DuckLake does.
+- **BREAKING** (behaviour): an adjacent merge of a sorted table writes its rows in sorted
+  order, so their rowids follow it, as official does (duckdb/ducklake#1602).
+- `merge_adjacent_files` takes merge candidates in official DuckLake's order: `begin_snapshot`,
+  then `row_id_start`, then `data_file_id`.
+- **BREAKING** for `MetadataWriter` implementors: `commit_compaction` must store a
+  `RowIdStart::Preserved` output's `row_id_start`, and NULL otherwise.
 - Large row-ID scans use less CPU when no scanned file has file-based or inlined
   deletes (#368).
 - **BREAKING**: SQL and direct `MetadataWriter` writes default `data_inlining_row_limit` to
-  `10`, as official; above `0` a table refuses `row_id` and other inlined system names (#270).
-  Set the option to `0` to opt out.
+  `10`, as official (#270). Set the option to `0` to opt out.
+- **BREAKING**: under a positive `data_inlining_row_limit`, the default, a write refuses a
+  column named like an inlined system column (`row_id`, `begin_snapshot`), as official (#270).
+  Store a limit of `0` for such a table, or its schema, before writing it.
 - **BREAKING**: a Parquet write to a catalog with `encrypted` set fails with `Unsupported`
   instead of writing unencrypted; inlined writes succeed. To write Parquet, set `encrypted` to
   `false`; no data migration is needed.
@@ -130,8 +150,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the data file, as official DuckLake does; one of the same rows still aborts it.
 - A `DELETE` or `UPDATE` recording inlined deletions commits beside a delete file the data file
   got since it read the table, as official DuckLake does; one of the same rows aborts it.
-- `DuckLakeTableWriter`'s limit (`0` unless set) and `with_write_options`' act as official's
-  `DATA_INLINING_ROW_LIMIT`: where none is stored, they gate inlined tables and reserved names.
 - **BREAKING**: appends, inlined inserts and `set_delete_file` fail on the concurrent changes
   official's conflict check refuses since an `Append`'s `base_snapshot`; concurrent appends
   still commit. Pass `WriteSetupResult::base_snapshot_id`.
@@ -171,23 +189,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Inserts order rows by `SET SORTED BY` as official does: inlined rows too, and with
+  `sort_on_insert` off, rows written to Parquet while inlining is enabled.
+- Expression sort keys order inserts, flushes and compaction, evaluated with DataFusion (layout
+  may differ from DuckDB's); a key that can't be evaluated keeps the arrival order, not failing.
+- `SET SORTED BY` and `RESET SORTED BY`, a `RESET` of an unsorted table too, bump
+  `schema_version` and record `altered_table`, as official does.
+- `UPDATE` and `update_by_keys` no longer sort the rows they rewrite, as official does not.
+- Sort keys bind to columns ignoring case, as DuckDB does: a `SET SORTED BY (ID)` over column
+  `id` orders writes, flushes and compaction; `SET SORTED BY` stores keys as typed.
+- `SET SORTED BY` quotes a key as DuckDB does (`"My Col"`, `"name"`), and keys DuckDB wrote as
+  `main.<function>(...)` order inserts.
+- Sort keys of a dialect other than exactly `duckdb` order nothing, as official skips them.
+- PostgreSQL snapshot listings read official's `TIMESTAMPTZ` snapshot times, time travel reads
+  any UTC offset, and PostgreSQL writers store snapshot times in UTC whatever the `TimeZone`.
+- Inlined rows written before a struct field was added, renamed or dropped (also in a list or
+  map) read in the current shape, an added field taking its default, on every backend.
+- `UPDATE`, `DELETE` and flushes of inlined rows accept a NULL in a struct field that official
+  DuckLake added with `nulls_allowed = false`, as official does.
+- Concurrent inlined inserts on SQLite wait for the write lock instead of failing with
+  "database is locked".
+- `UPDATE` and `DELETE` commit on a table with NOT NULL struct fields, or a struct field added
+  after a later column, instead of failing with "table schema changed after staging".
+- Data writes leave a table's `ducklake_column` rows as official DuckLake does, instead of
+  renumbering `column_order` or rewriting `nulls_allowed` in place.
+- Inlined data tables are read and flushed with their registered schema version's columns, as
+  official DuckLake does, not with those of their oldest row's snapshot.
+- PostgreSQL and multi-catalog file listings report each file's `partition_id` instead of NULL.
+- An inlined struct value that leaves out a field reads it as NULL, as DuckDB's cast does.
+- A column a write adds gets its column id as its `column_order`, as official numbers it.
 - Rows of a table with a `GEOMETRY` column, nested ones included, are written to Parquet and
   never inlined, and such a table gets no inlined data table, as in official DuckLake.
-- A write session whose commit fails with nothing committed removes the data and delete
-  files it uploaded, on every session path — rolling, partitioned, single-file, and
-  `finish_with_deletes` — as official DuckLake does; so does a multi-table transaction whose
-  commit fails with nothing committed. Before, a session removed nothing on a failed commit,
-  and a multi-table transaction removed its files only on a conflict or validation failure. A
-  `COMMIT` that fails on PostgreSQL or MySQL keeps them, since it may have applied; official
-  removes them there too. A multi-table transaction whose cleanup fails now returns the commit
-  error and logs the cleanup failure.
-- `DuckLakeTableWriter::write_table`, `append_table`, `write_rows` and the `write_partitioned`
-  forms remove the files they uploaded when the commit fails with nothing committed, as a
-  write session does; before, those files were left for the orphan sweep.
-- A `Replace`, and a write with `expected_base_snapshot_id`, fail with `Conflict` when a commit
-  since their base deleted rows of the table, as official DuckLake fails an insert. An
-  inlined-data flush still commits over a delete file, and now fails over an inlined deletion
-  of a Parquet row.
+- A write session or multi-table transaction whose commit fails with nothing committed removes
+  the files it uploaded; a failed PostgreSQL or MySQL `COMMIT` keeps them.
+- `DuckLakeTableWriter::write_table`, `append_table`, `write_rows` and `write_partitioned*`
+  remove the files they uploaded when the commit fails with nothing committed.
+- A `Replace`, or a write with `expected_base_snapshot_id`, fails with `Conflict` when a commit
+  since its base deleted rows of the table, as official DuckLake fails an insert.
 - A filter on a `FLOAT` column at a value printed with an exponent (`1e20`, `FLT_MAX`) no
   longer skips the data file holding the match on DuckDB catalogs (duckdb/ducklake#1604).
 - Inlined rows of a column `ALTER ... SET TYPE` widened since (DuckDB catalogs), and floats

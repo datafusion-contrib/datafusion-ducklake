@@ -72,8 +72,9 @@ pub(crate) struct RowLineageProbes {
     /// Resolves to whether the file stores that column.
     pub(crate) has_embedded: Option<String>,
     /// Resolves to the file's `_ducklake_internal_snapshot_id` column, found by
-    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`], or NULL when it stores none: each row's
-    /// origin snapshot in a file compaction merged.
+    /// [`SNAPSHOT_ID_PARQUET_FIELD_ID`]: each row's origin snapshot in a file
+    /// compaction merged. A file without it fails to open, as official's reader
+    /// fails a snapshot-filtered file without it.
     pub(crate) embedded_snapshot: Option<String>,
 }
 
@@ -386,8 +387,10 @@ impl FieldIdExprAdapter {
 
     /// A row-lineage probe column resolved in this file, or `None` when `name`
     /// is not one.
-    fn row_lineage_probe(&self, name: &str) -> Option<Arc<dyn PhysicalExpr>> {
-        let probes = self.row_lineage.as_ref()?;
+    fn row_lineage_probe(&self, name: &str) -> DataFusionResult<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(probes) = self.row_lineage.as_ref() else {
+            return Ok(None);
+        };
         let tagged = |field_id: i32| {
             self.physical_file_schema.fields().iter().position(|field| {
                 field
@@ -411,17 +414,25 @@ impl FieldIdExprAdapter {
             }
         };
         if probes.has_embedded.as_deref() == Some(name) {
-            return Some(Arc::new(Literal::new(ScalarValue::Boolean(Some(
+            return Ok(Some(Arc::new(Literal::new(ScalarValue::Boolean(Some(
                 tagged(ROW_ID_PARQUET_FIELD_ID).is_some(),
-            )))));
+            ))))));
         }
         if probes.embedded.as_deref() == Some(name) {
-            return Some(int64_or_null(tagged(ROW_ID_PARQUET_FIELD_ID)));
+            return Ok(Some(int64_or_null(tagged(ROW_ID_PARQUET_FIELD_ID))));
         }
         if probes.embedded_snapshot.as_deref() == Some(name) {
-            return Some(int64_or_null(tagged(SNAPSHOT_ID_PARQUET_FIELD_ID)));
+            let Some(index) = tagged(SNAPSHOT_ID_PARQUET_FIELD_ID) else {
+                return Err(DataFusionError::Execution(
+                    "a partial file read at a snapshot before its last carries no embedded \
+                     `_ducklake_internal_snapshot_id` column, so the rows it holds there \
+                     cannot be told apart"
+                        .to_string(),
+                ));
+            };
+            return Ok(Some(int64_or_null(Some(index))));
         }
-        None
+        Ok(None)
     }
 
     /// The file's type at `path` under `root`.
@@ -567,7 +578,7 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
                 let Some(column) = expr.downcast_ref::<Column>() else {
                     return Ok(Transformed::no(expr));
                 };
-                if let Some(resolved) = self.row_lineage_probe(column.name()) {
+                if let Some(resolved) = self.row_lineage_probe(column.name())? {
                     return Ok(Transformed::new(resolved, true, TreeNodeRecursion::Jump));
                 }
                 let Ok(index) = self.logical_file_schema.index_of(column.name()) else {

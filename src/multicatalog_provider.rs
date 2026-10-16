@@ -31,8 +31,8 @@ use crate::metadata_provider::{
 use crate::metadata_provider_postgres::{
     PostgresStatsDialect, StatsFilterSql, delete_file_begin_snapshot_on, fetch_data_file_page,
     first_inlined_snapshot_on, inlined_file_deletes_between_on, inlined_file_deletes_for_flush_on,
-    inlined_table_for_flush_on, read_inlined_rows_on, registered_inlined_tables_on,
-    scan_inlined_data_on, stats_filter_sql,
+    inlined_table_for_flush_on, inlined_version_snapshot_on, read_inlined_rows_on,
+    registered_inlined_tables_on, scan_inlined_data_on, stats_filter_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -123,6 +123,8 @@ struct SchemaCapabilities {
     delete_file_partial_max: bool,
     /// The `ducklake_schema_versions` table exists.
     schema_versions: bool,
+    /// `ducklake_schema_versions.table_id` exists.
+    schema_versions_table_id: bool,
     /// `ducklake_data_file.partition_id` exists.
     data_file_partition_id: bool,
     /// The `ducklake_view` table exists.
@@ -158,11 +160,26 @@ impl SchemaCapabilities {
         self.data_file_partial_max
             && self.delete_file_partial_max
             && self.schema_versions
+            && self.schema_versions_table_id
             && self.data_file_partition_id
             && self.views
             && self.file_column_stats
             && self.file_partition_values
             && self.inlined_data_tables
+    }
+
+    /// What the store's `ducklake_schema_versions` ledger records, looked up
+    /// among one catalog's snapshots, as each catalog numbers its own schema
+    /// versions.
+    fn ledger(&self) -> crate::metadata_provider::InlinedVersionLookup {
+        crate::metadata_provider::InlinedVersionLookup {
+            ledger: crate::metadata_provider_postgres::schema_version_ledger(
+                self.schema_versions,
+                self.schema_versions_table_id,
+            ),
+            catalog_scoped: true,
+            backslash_escapes: false,
+        }
     }
 }
 
@@ -486,11 +503,16 @@ impl MulticatalogProvider {
         shape: InlinedReadShape,
     ) -> Result<Vec<DuckLakeInlinedRows>> {
         block_on(async {
-            if !self.schema_capabilities().await?.inlined_data_tables {
+            let caps = self.schema_capabilities().await?;
+            if !caps.inlined_data_tables {
                 return Ok(Vec::new());
             }
+            let ledger = caps.ledger();
             self.on_connection(async |connection| {
-                read_inlined_rows_on(connection, table_id, columns, selection, filter, shape).await
+                read_inlined_rows_on(
+                    connection, ledger, table_id, columns, selection, filter, shape,
+                )
+                .await
             })
             .await
         })
@@ -600,13 +622,17 @@ impl MulticatalogProvider {
                to_regclass('ducklake_file_partition_value') IS NOT NULL,
                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
-               current_setting('server_version_num')::int >= 120000",
+               current_setting('server_version_num')::int >= 120000,
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_schema_versions'
+                         AND column_name = 'table_id')",
             ))
             .await?;
         let caps = SchemaCapabilities {
             data_file_partial_max: row.try_get(0)?,
             delete_file_partial_max: row.try_get(1)?,
             schema_versions: row.try_get(2)?,
+            schema_versions_table_id: row.try_get(10)?,
             data_file_partition_id: row.try_get(3)?,
             views: row.try_get(4)?,
             file_column_stats: row.try_get(5)?,
@@ -646,6 +672,11 @@ impl MulticatalogProvider {
             // memo did not give is current, and probing again would repeat it.
             let memoized = self.schema_capabilities.get().is_some();
             let caps = self.schema_capabilities().await?;
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id::bigint"
+            } else {
+                "NULL::bigint"
+            };
             let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max::bigint"
             } else {
@@ -703,7 +734,7 @@ impl MulticatalogProvider {
                         del.encryption_key AS delete_encryption_key,
                         del.delete_count, data.begin_snapshot::bigint,
                         {partial_max_expr} AS partial_max, {schema_version_expr} AS schema_version,
-                        NULL::bigint AS data_partition_id,
+                        {partition_id_expr} AS data_partition_id,
                         data.mapping_id::bigint
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
@@ -1109,6 +1140,80 @@ impl MetadataProvider for MulticatalogProvider {
                         schema_version: row.try_get(2)?,
                     })
                 })
+                .collect()
+        })
+    }
+
+    fn snapshot_ids_are_consecutive(&self) -> bool {
+        false
+    }
+
+    fn table_first_snapshot(&self, table_id: i64) -> Result<Option<i64>> {
+        block_on(async {
+            let row = self
+                .read_one(
+                    sqlx::query(
+                        "SELECT MIN(begin_snapshot) FROM ducklake_table WHERE table_id = $1",
+                    )
+                    .bind(table_id),
+                )
+                .await?;
+            Ok(row.try_get(0)?)
+        })
+    }
+
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        block_on(async {
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT snapshot.snapshot_id
+                 FROM ducklake_snapshot AS snapshot
+                 JOIN ducklake_catalog_snapshot_map AS catalog
+                   ON catalog.snapshot_id = snapshot.snapshot_id
+                 WHERE catalog.catalog_id = $1
+                   AND snapshot.snapshot_id >= $2 AND snapshot.snapshot_id <= $3
+                 ORDER BY snapshot.snapshot_id",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(from_snapshot)
+                    .bind(through_snapshot),
+                )
+                .await?;
+            rows.into_iter().map(|row| Ok(row.try_get(0)?)).collect()
+        })
+    }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        let pattern = crate::change_detection::table_change_like_pattern(table_id);
+        block_on(async {
+            let rows = self
+                .read_all(
+                    sqlx::query(
+                        "SELECT snapshot.snapshot_id, changes.changes_made
+                 FROM ducklake_snapshot AS snapshot
+                 JOIN ducklake_catalog_snapshot_map AS catalog
+                   ON catalog.snapshot_id = snapshot.snapshot_id
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 WHERE catalog.catalog_id = $1
+                   AND snapshot.snapshot_id > $2 AND snapshot.snapshot_id <= $3
+                   AND (changes.changes_made IS NULL OR changes.changes_made LIKE $4)
+                 ORDER BY snapshot.snapshot_id",
+                    )
+                    .bind(self.catalog_id)
+                    .bind(after_snapshot)
+                    .bind(through_snapshot)
+                    .bind(pattern),
+                )
+                .await?;
+            rows.into_iter()
+                .map(|row| Ok((row.try_get(0)?, row.try_get(1)?)))
                 .collect()
         })
     }
@@ -1903,14 +2008,17 @@ impl MetadataProvider for MulticatalogProvider {
         block_on(async {
             // No registry yet, so no inlined rows. Not an answer to keep: a
             // migration can add the registry, and a later commit inline rows.
-            if !self.schema_capabilities().await?.inlined_data_tables {
+            let caps = self.schema_capabilities().await?;
+            if !caps.inlined_data_tables {
                 return Ok((crate::inlined_filter::InlinedDataScan::default(), None));
             }
+            let ledger = caps.ledger();
             // The registry, then each inlined table's rows, all on one
             // connection.
             self.on_connection(async |connection| {
                 scan_inlined_data_on(
                     connection,
+                    ledger,
                     Some(self.catalog_id),
                     table_id,
                     snapshot_id,
@@ -1977,6 +2085,32 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        block_on(async {
+            if !self.schema_capabilities().await?.inlined_data_tables {
+                return Ok(None);
+            }
+            let ledger = self.schema_capabilities().await?.ledger();
+            self.on_connection(async |connection| {
+                let mut oldest: Option<i64> = None;
+                for table in registered_inlined_tables_on(connection, table_id).await? {
+                    let first = first_inlined_snapshot_on(connection, &table, snapshot_id).await?;
+                    // As the flush, which skips a table whose schema version
+                    // it cannot resolve.
+                    if first.is_some()
+                        && inlined_version_snapshot_on(connection, ledger, &table)
+                            .await?
+                            .is_some()
+                    {
+                        oldest = oldest.into_iter().chain(first).min();
+                    }
+                }
+                Ok(oldest)
+            })
+            .await
+        })
+    }
+
     fn get_inlined_data_for_flush(
         &self,
         table_id: i64,
@@ -1991,25 +2125,39 @@ impl MetadataProvider for MulticatalogProvider {
             })
             .await
         })?;
+        let ledger = block_on(self.schema_capabilities())?.ledger();
         let mut flushed = Vec::new();
         for table in tables {
-            let first = block_on(self.on_connection(async |connection| {
-                first_inlined_snapshot_on(connection, &table, snapshot_id).await
+            let version = block_on(self.on_connection(async |connection| {
+                if first_inlined_snapshot_on(connection, &table, snapshot_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                inlined_version_snapshot_on(connection, ledger, &table).await
             }))?;
-            let Some(first) = first else {
+            let Some(version) = version else {
                 continue;
             };
             // Read with the connection released: the structure read takes it again.
-            let columns = self.get_table_structure(table_id, first)?;
+            let columns = self.get_table_structure(table_id, version)?;
             let rows = block_on(self.on_connection(async |connection| {
-                inlined_table_for_flush_on(connection, table_id, &table, &columns, snapshot_id)
-                    .await
+                inlined_table_for_flush_on(
+                    connection,
+                    ledger,
+                    table_id,
+                    &table,
+                    &columns,
+                    snapshot_id,
+                )
+                .await
             }))?;
             if let Some(rows) = rows {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
-                    columns_snapshot: first,
+                    columns_snapshot: version,
                 });
             }
         }

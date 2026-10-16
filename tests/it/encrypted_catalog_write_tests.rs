@@ -57,7 +57,17 @@ async fn encrypted_lake(limit: usize) -> Lake {
     writer
         .set_global_setting("data_inlining_row_limit", &limit.to_string())
         .unwrap();
-    writer.set_global_setting("encrypted", "true").unwrap();
+    // `encrypted` is set when a catalog is created, never by `set_option`.
+    let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("DELETE FROM ducklake_metadata WHERE key = 'encrypted' AND scope IS NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO ducklake_metadata (key, value) VALUES ('encrypted', 'true')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
     let provider = Arc::new(SqliteMetadataProvider::new(&url).await.unwrap());
     Lake {
         _temp: temp,
@@ -140,8 +150,7 @@ async fn inserts_over_the_limit_are_refused() {
     let metadata: Arc<dyn MetadataWriter> = lake.writer.clone();
     let error = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new()))
         .unwrap()
-        .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
-        .append_table("main", "t", &[ids(100..102)])
+        .append_table("main", "t", &[ids(100..120)])
         .await
         .unwrap_err();
     assert!(matches!(error, DuckLakeError::Unsupported(_)), "{error}");
@@ -275,8 +284,7 @@ async fn refused_write_to_a_new_table_leaves_no_rows() {
         let metadata: Arc<dyn MetadataWriter> = lake.writer.clone();
         let error = DuckLakeTableWriter::new(metadata, Arc::new(LocalFileSystem::new()))
             .unwrap()
-            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
-            .append_table(schema, table, &[ids(0..3)])
+            .append_table(schema, table, &[ids(0..20)])
             .await
             .unwrap_err();
         refused(&error.to_string());

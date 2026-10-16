@@ -288,7 +288,8 @@ async fn rolling_session_with_deletes_commits_every_rolled_file() {
     let writer = {
         let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
             .await
-            .unwrap();
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
             .unwrap()
             .with_target_file_size(512 * 1024)
@@ -316,7 +317,8 @@ async fn rolling_session_with_deletes_commits_every_rolled_file() {
     let del_info = {
         let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
             .await
-            .unwrap();
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
             .unwrap()
             .write_delete_file("main", "events", &seed_path, &[0])
@@ -340,7 +342,8 @@ async fn rolling_session_with_deletes_commits_every_rolled_file() {
     let writer = {
         let w = SqliteMetadataWriter::new_with_init(&env.conn_str)
             .await
-            .unwrap();
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         DuckLakeTableWriter::new(Arc::new(w), object_store.clone())
             .unwrap()
             .with_target_file_size(8 * 1024)

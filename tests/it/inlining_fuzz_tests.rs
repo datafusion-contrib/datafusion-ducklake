@@ -3,11 +3,11 @@
 //!
 //! Each seed generates a table and a history of writes and maintenance (small
 //! and large inserts, updates, deletes, flushes, checkpoints, compaction,
-//! column changes, inlining limits, partitioning, expiry), with values at the
-//! edges of their types. The history runs twice: through official DuckLake
-//! (the pinned DuckDB) on a catalog of its own, the oracle, and through this
-//! crate on a catalog of the backend under test. After every step the harness
-//! compares:
+//! column changes, inlining limits, partitioning, sort orders and
+//! `sort_on_insert`, expiry), with values at the edges of their types. The
+//! history runs twice: through official DuckLake (the pinned DuckDB) on a
+//! catalog of its own, the oracle, and through this crate on a catalog of the
+//! backend under test. After every step the harness compares:
 //!
 //! - whether the step failed on each side, and how (the error's class);
 //! - the rows with their row ids at the current snapshot, and at earlier
@@ -60,8 +60,9 @@ use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use datafusion::prelude::SessionContext;
 use datafusion_ducklake::metadata_writer::ColumnDef;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeTable, MergeOptions, MetadataProvider, MetadataWriter, RewriteOptions,
-    WriteMode, execute_ducklake_sql, register_ducklake_functions,
+    DuckLakeCatalog, DuckLakeTable, MergeOptions, MetadataProvider, MetadataWriter, NullOrder,
+    RewriteOptions, SortDirection, SortField, WriteMode, execute_ducklake_sql,
+    register_ducklake_functions,
 };
 
 use crate::inlined_mutation_differential_tests::Metadata;
@@ -802,6 +803,15 @@ enum Step {
     Widen(String),
     Limit(usize),
     Partition(Option<(String, Transform)>),
+    /// `SET SORTED BY (<key> ASC|DESC, id)` (`true` for `DESC`; `id` alone
+    /// when the key is `id`), or `RESET SORTED BY`. `id` breaks ties, where
+    /// the two engines' sorts may order rows differently. The key is a column
+    /// or an expression over an integer column, written as DuckDB stores it
+    /// (`((v % 10) * 7)`, `-((v // 2))`), which this crate's `SET SORTED BY` does
+    /// not take and its writer records through `set_sort_spec`.
+    Sort(Option<(String, bool)>),
+    /// The table's `sort_on_insert` option.
+    SortOnInsert(bool),
     Expire,
 }
 
@@ -965,7 +975,69 @@ fn generate(seed: u64, kind: Kind) -> History {
             47..=56 if kind.mutations() => {
                 Step::Delete((!rng.chance(10)).then(|| gen_pred(&mut rng, next_id, &columns)))
             },
-            57..=63 => Step::Flush,
+            57..=60 => Step::Flush,
+            61..=63 if rng.chance(25) => Step::SortOnInsert(rng.chance(50)),
+            61..=63 => {
+                let candidates = std::iter::once("id".to_string())
+                    .chain(
+                        columns
+                            .iter()
+                            .filter(|c| {
+                                matches!(
+                                    c.ty,
+                                    Ty::Int
+                                        | Ty::BigInt
+                                        | Ty::SmallInt
+                                        | Ty::Varchar
+                                        | Ty::Bool
+                                        | Ty::Date
+                                )
+                            })
+                            .map(|c| c.name.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                let integers = std::iter::once("id".to_string())
+                    .chain(
+                        columns
+                            .iter()
+                            .filter(|c| matches!(c.ty, Ty::Int | Ty::BigInt | Ty::SmallInt))
+                            .map(|c| c.name.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                if rng.chance(15) {
+                    Step::Sort(None)
+                } else if kind == Kind::Sqlite && rng.chance(30) {
+                    // An expression key, on SQLite, whose catalog this harness
+                    // rewrites. This crate evaluates it with DataFusion and
+                    // official with DuckDB, so the row order inside files may
+                    // differ (`/` divides integers here, as `DOUBLE` there;
+                    // DataFusion cannot plan `//`, keeping the arrival order):
+                    // row ids stop comparing from such a key on (see
+                    // `compare_step`). The keys cannot overflow on DuckDB, so
+                    // official's write never fails where this crate's falls
+                    // back to the arrival order.
+                    let column = rng.pick(&integers).clone();
+                    let key = match rng.below(6) {
+                        0 => format!("(({column} % 10) * 7)"),
+                        1 => format!("-(({column} // 2))"),
+                        2 => format!("({column} // 3)"),
+                        3 => format!("abs(({column} // 2))"),
+                        4 => format!("({column} / 2)"),
+                        _ => format!("({column} % 4)"),
+                    };
+                    Step::Sort(Some((key, rng.chance(50))))
+                } else {
+                    let column = rng.pick(&candidates).clone();
+                    // A key spelled in another case than its column, which
+                    // DuckDB stores as typed and binds ignoring case.
+                    let column = if rng.chance(30) {
+                        column.to_ascii_uppercase()
+                    } else {
+                        column
+                    };
+                    Step::Sort(Some((column, rng.chance(50))))
+                }
+            },
             64..=66 if kind.maintenance() => Step::Checkpoint,
             67..=70 if kind.maintenance() => Step::Merge,
             71..=74 if kind.maintenance() => Step::Rewrite,
@@ -1080,6 +1152,26 @@ fn render_pred(pred: &Pred, literal: fn(Ty, &V) -> String) -> String {
         ),
         Pred::IsNull(column) => format!("{column} IS NULL"),
         Pred::Eq(column, ty, value) => format!("{column} = {}", literal(*ty, value)),
+    }
+}
+
+/// Whether a [`Step::Sort`] key is a bare column, not an expression.
+fn is_bare_key(key: &str) -> bool {
+    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The keys of [`Step::Sort`]: `column` (spelled as generated, perhaps in
+/// another case than the column), then `id` to break ties.
+fn sort_keys(column: &str, desc: bool) -> String {
+    let direction = if desc {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    if column.eq_ignore_ascii_case("id") {
+        format!("{column} {direction}")
+    } else {
+        format!("{column} {direction}, id")
     }
 }
 
@@ -1293,6 +1385,14 @@ impl Official {
                 "ALTER TABLE t SET PARTITIONED BY ({})",
                 transform_sql(column, *transform)
             )),
+            Step::Sort(None) => self.run("ALTER TABLE t RESET SORTED BY"),
+            Step::Sort(Some((column, desc))) => self.run(&format!(
+                "ALTER TABLE t SET SORTED BY ({})",
+                sort_keys(column, *desc)
+            )),
+            Step::SortOnInsert(on) => self.run(&format!(
+                "CALL lake.set_option('sort_on_insert', '{on}', table_name => 't')"
+            )),
             Step::Expire => self.run("CALL ducklake_expire_snapshots('lake', older_than => now())"),
         }
     }
@@ -1464,6 +1564,9 @@ impl Lake {
 
     async fn apply(&self, history: &History, step: usize) -> Result<(), String> {
         let columns = history.columns_at(step);
+        if let Some(outcome) = self.apply_through_row_apis(history, step).await {
+            return outcome;
+        }
         match &history.steps[step] {
             Step::Insert(rows) => {
                 let values = rows
@@ -1602,6 +1705,56 @@ impl Lake {
                 ))
                 .await
             },
+            Step::Sort(None) => self.sql("ALTER TABLE lake.main.t RESET SORTED BY").await,
+            Step::Sort(Some((key, desc))) if !is_bare_key(key) => {
+                // This crate records column keys alone: record `id`, then
+                // write the expression into the catalog as DuckDB stores it.
+                let (writer, _) = (self.open)().await;
+                let table_id = self.table_id().await.ok_or("no table")?;
+                let direction = if *desc {
+                    SortDirection::Desc
+                } else {
+                    SortDirection::Asc
+                };
+                let fields = [
+                    SortField::column(0, "id", direction, NullOrder::NullsLast),
+                    SortField::column(1, "id", SortDirection::Asc, NullOrder::NullsLast),
+                ];
+                writer
+                    .set_sort_spec(table_id, &fields)
+                    .map_err(|e| e.to_string())?;
+                let path = self.metadata.as_ref().ok_or("no SQLite catalog")?;
+                let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", path.display()))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sqlx::query(
+                    "UPDATE ducklake_sort_expression SET expression = ? \
+                     WHERE table_id = ? AND sort_key_index = 0 AND sort_id = \
+                     (SELECT MAX(sort_id) FROM ducklake_sort_expression WHERE table_id = ?)",
+                )
+                .bind(key)
+                .bind(table_id)
+                .bind(table_id)
+                .execute(&pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                pool.close().await;
+                Ok(())
+            },
+            Step::Sort(Some((column, desc))) => {
+                self.sql(&format!(
+                    "ALTER TABLE lake.main.t SET SORTED BY ({})",
+                    sort_keys(column, *desc)
+                ))
+                .await
+            },
+            Step::SortOnInsert(on) => {
+                let (writer, _) = (self.open)().await;
+                let table_id = self.table_id().await.ok_or("no table")?;
+                writer
+                    .set_table_setting(table_id, "sort_on_insert", &on.to_string())
+                    .map_err(|e| e.to_string())
+            },
             Step::Expire => {
                 let (writer, _) = (self.open)().await;
                 writer
@@ -1615,6 +1768,193 @@ impl Lake {
                     .map_err(|e| e.to_string())
             },
         }
+    }
+
+    /// Apply a step through the row-level APIs instead of SQL, for the steps
+    /// that have an equivalent: an insert into an unpartitioned table through a
+    /// streaming write session, a delete or update keyed on `id` through a
+    /// keyed mutation. Each is the same change as its SQL form, so official
+    /// stays the oracle. Half of them, by the parity of the step's first id
+    /// (stable under shrinking); `None` for the rest, which go through SQL.
+    async fn apply_through_row_apis(
+        &self,
+        history: &History,
+        step: usize,
+    ) -> Option<Result<(), String>> {
+        // A step routed here fails, rather than falling back to SQL, when its
+        // staged rows cannot be built.
+        macro_rules! staged {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(Err(format!("staging the row API's rows: {error}")));
+                    },
+                }
+            };
+        }
+        let routed = |id: i64| id.rem_euclid(2) == 0;
+        let columns = history.columns_at(step);
+        let partitioned = history.steps[..step].iter().fold(false, |on, s| match s {
+            Step::Partition(spec) => spec.is_some(),
+            _ => on,
+        });
+        // A session streams the rows it writes to Parquet in their order,
+        // where official's insert sorts them.
+        let sorted = history.steps[..step].iter().fold(false, |on, s| match s {
+            Step::Sort(spec) => spec.is_some(),
+            _ => on,
+        });
+        match &history.steps[step] {
+            Step::Insert(rows)
+                if !partitioned && !sorted && rows.first().is_some_and(|r| routed(r.0)) =>
+            {
+                let names = std::iter::once("id".to_string())
+                    .chain(columns.iter().map(|c| c.name.clone()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let values = rows
+                    .iter()
+                    .map(|(id, values)| {
+                        let mut cells = vec![format!("CAST({id} AS BIGINT)")];
+                        cells.extend(
+                            columns
+                                .iter()
+                                .zip(values)
+                                .map(|(c, v)| datafusion_literal(c.ty, v)),
+                        );
+                        format!("({})", cells.join(", "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ctx = SessionContext::new();
+                let batches = staged!(
+                    staged!(
+                        ctx.sql(&format!("SELECT * FROM (VALUES {values}) AS v({names})"))
+                            .await
+                    )
+                    .collect()
+                    .await
+                );
+                // DuckDB allows one open catalog at a time: take the schema
+                // and close this handle before the session opens its own.
+                let schema = {
+                    let (_, table) = self.table().await;
+                    datafusion::catalog::TableProvider::schema(&table)
+                };
+                let mut aligned = Vec::with_capacity(batches.len());
+                for batch in &batches {
+                    let mut columns = Vec::with_capacity(schema.fields().len());
+                    for (index, field) in schema.fields().iter().enumerate() {
+                        let column = batch.column(index);
+                        columns.push(if column.data_type() == field.data_type() {
+                            Arc::clone(column)
+                        } else {
+                            staged!(arrow::compute::cast(column, field.data_type()))
+                        });
+                    }
+                    aligned.push(staged!(arrow::record_batch::RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        columns
+                    )));
+                }
+                let (writer, _) = (self.open)().await;
+                let outcome = async {
+                    let table_writer = datafusion_ducklake::DuckLakeTableWriter::new(
+                        writer,
+                        Arc::new(object_store::local::LocalFileSystem::new()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let mut session = table_writer
+                        .begin_write("main", "t", &schema, WriteMode::Append)
+                        .map_err(|e| e.to_string())?;
+                    for batch in &aligned {
+                        session.write_batch(batch).map_err(|e| e.to_string())?;
+                    }
+                    session
+                        .finish()
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+                .await;
+                Some(outcome)
+            },
+            Step::Delete(Some(Pred::IdEq(id))) if routed(*id) => {
+                Some(self.keyed_delete(vec![*id]).await)
+            },
+            Step::Delete(Some(Pred::IdIn(ids))) if ids.first().is_some_and(|id| routed(*id)) => {
+                Some(self.keyed_delete(ids.clone()).await)
+            },
+            // A keyed update takes staged values of the column's own type
+            // only; SQL casts another.
+            Step::Update {
+                column,
+                ty,
+                value,
+                pred: pred @ (Pred::IdEq(_) | Pred::IdIn(_)),
+            } if columns.iter().any(|c| &c.name == column && c.ty == *ty)
+                && match pred {
+                    Pred::IdEq(id) => routed(*id),
+                    Pred::IdIn(ids) => ids.first().is_some_and(|id| routed(*id)),
+                    _ => false,
+                } =>
+            {
+                let projection = std::iter::once("id".to_string())
+                    .chain(columns.iter().map(|c| {
+                        if &c.name == column {
+                            format!("{} AS {}", datafusion_literal(*ty, value), c.name)
+                        } else {
+                            c.name.clone()
+                        }
+                    }))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let staged = {
+                    let (ctx, _, _, _) = self.session(None, false).await;
+                    staged!(
+                        staged!(
+                            ctx.sql(&format!(
+                                "SELECT {projection} FROM lake.main.t WHERE {}",
+                                render_pred(pred, datafusion_literal)
+                            ))
+                            .await
+                        )
+                        .collect()
+                        .await
+                    )
+                };
+                let (ctx, table) = self.table().await;
+                let outcome = table
+                    .keyed_mutation(&["id"])
+                    .update_by_keys(&ctx.state(), staged)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+                Some(outcome)
+            },
+            _ => None,
+        }
+    }
+
+    /// Delete the rows with `ids` through a keyed mutation.
+    async fn keyed_delete(&self, ids: Vec<i64>) -> Result<(), String> {
+        let keys = arrow::record_batch::RecordBatch::try_new(
+            Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+                "id",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::Int64Array::from(ids))],
+        )
+        .map_err(|e| e.to_string())?;
+        let (ctx, table) = self.table().await;
+        table
+            .keyed_mutation(&["id"])
+            .delete_by_keys(&ctx.state(), vec![keys])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// A copy of the crate's metadata database DuckDB can attach.
@@ -3012,7 +3352,17 @@ impl Run<'_> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let blind = self.blind || known::mysql_fallback(self.history, step, self.lake.kind);
+        // An expression sort key is evaluated with DataFusion here and with
+        // DuckDB on official, so the two may order rows differently inside
+        // files (an accepted, layout-only divergence): from the first such key
+        // on, row ids (which follow the physical order) no longer compare, and
+        // rows compare as sets of values.
+        let expression_sorted = self.history.steps[..=step]
+            .iter()
+            .any(|s| matches!(s, Step::Sort(Some((key, _))) if !is_bare_key(key)));
+        let blind = self.blind
+            || expression_sorted
+            || known::mysql_fallback(self.history, step, self.lake.kind);
         let signless = self.cells(index);
         let official = Official::rows(
             &self.official.connection,
@@ -3038,7 +3388,12 @@ impl Run<'_> {
                 )
             });
         self.ran("rows");
-        if blind {
+        if expression_sorted {
+            self.skip(
+                "row ids",
+                "expression sort key: DataFusion-evaluated row order",
+            );
+        } else if blind {
             self.skip("row ids", "MySQL fallback to Parquet");
         } else {
             self.ran("row ids");
@@ -3240,6 +3595,225 @@ impl Run<'_> {
         };
         for at in earlier {
             self.compare_reads_at(step, at).await?;
+        }
+        self.check_row_apis(step).await
+    }
+
+    /// The row-level APIs over this crate's table after a step, against its
+    /// own scan (which the rows comparison above holds to official's): the
+    /// change ledger reports a row change whenever the rows changed, and none
+    /// for a step that only moves rows (flush, merge, rewrite, checkpoint);
+    /// and rows read by `rowid` are the rows the scan reads.
+    async fn check_row_apis(&mut self, step: usize) -> Result<(), Mismatch> {
+        let index = step + 1;
+        if index - 1 < self.readable_from {
+            return Ok(());
+        }
+        let Some(table_id) = self.lake.table_id().await else {
+            return Ok(());
+        };
+        let list = std::iter::once("rowid".to_string())
+            .chain(std::iter::once("id".to_string()))
+            .chain(
+                self.history
+                    .columns_at(index - 1)
+                    .into_iter()
+                    .map(|c| c.name),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {list} FROM lake.main.t ORDER BY rowid");
+        // Each head's scan was compared with official's when its step ran, so
+        // one failing here failed in official too; nothing is left to check.
+        let (Ok(before), Ok(now)) = (
+            self.lake.rows(Some(self.heads.ours[index - 1]), &sql).await,
+            self.lake.rows(None, &sql).await,
+        ) else {
+            self.skip("row_apis", "the scan fails in official too");
+            return Ok(());
+        };
+        let now_ids = now.1.clone();
+        let (after, through) = (self.heads.ours[index - 1], self.heads.ours[index]);
+        let (ctx, _, _, provider) = self.lake.session(None, false).await;
+        let changes = datafusion_ducklake::change_detection::table_data_changes(
+            &ctx.state(),
+            &provider,
+            table_id,
+            after,
+            through,
+        )
+        .await
+        .map_err(|e| Mismatch {
+            kind: "change_ledger",
+            step,
+            detail: e.to_string(),
+        })?;
+        self.ran("change_ledger");
+        // Rows by content: a merge may renumber rows (#1605) without changing
+        // which rows the table holds.
+        let content = |rows: &[Vec<String>]| {
+            let mut content: Vec<Vec<String>> = rows.iter().map(|row| row[1..].to_vec()).collect();
+            content.sort();
+            content
+        };
+        let (before, now) = ((before.0, content(&before.1)), (now.0, content(&now.1)));
+        if before.1 != now.1 && !changes.rows_changed() {
+            return Err(Mismatch {
+                kind: "change_ledger",
+                step,
+                detail: format!("the rows changed but the ledger reports {changes:?}"),
+            });
+        }
+        // `rows_changed` is this crate's change feed over the window being
+        // non-empty, except where the ledger's tokens record an insert, a
+        // delete, a drop or an unknown change, which count without reading
+        // the feed (a flush of inlined deletions of Parquet rows records
+        // `deleted_from_table`, as official's does, and the feed lists
+        // nothing for it).
+        if after < through {
+            // The table exists at the window's end (its id was read above),
+            // so the feed must answer.
+            let feed_mismatch = |detail: String| Mismatch {
+                kind: "change_ledger",
+                step,
+                detail,
+            };
+            let batches = ctx
+                .sql(&format!(
+                    "SELECT count(*) FROM ducklake_table_changes('main.t', {}, {through})",
+                    after + 1
+                ))
+                .await
+                .map_err(|e| feed_mismatch(format!("the change feed failed to plan: {e}")))?
+                .collect()
+                .await
+                .map_err(|e| feed_mismatch(format!("the change feed failed: {e}")))?;
+            let feed = canon_crate::rows(&batches)
+                .1
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|cell| cell.parse::<i64>().ok())
+                .ok_or_else(|| feed_mismatch(format!("no feed count in {batches:?}")))?;
+            {
+                self.ran("change_feed");
+                if feed > 0 && !changes.rows_changed() {
+                    return Err(Mismatch {
+                        kind: "change_ledger",
+                        step,
+                        detail: format!("the change feed lists {feed} rows but {changes:?}"),
+                    });
+                }
+                let row_tokens = provider
+                    .list_table_snapshot_changes(table_id, after, through)
+                    .map_err(|e| Mismatch {
+                        kind: "change_ledger",
+                        step,
+                        detail: e.to_string(),
+                    })?
+                    .into_iter()
+                    .any(|(_, made)| {
+                        made.is_none_or(|made| {
+                            made.split(',').any(|token| {
+                                token.split_once(':').is_some_and(|(kind, id)| {
+                                    id.trim() == table_id.to_string()
+                                        && !matches!(
+                                            kind,
+                                            "inline_flush"
+                                                | "flushed_inlined"
+                                                | "merge_adjacent"
+                                                | "rewrite_delete"
+                                                | "compacted_table"
+                                                | "altered_table"
+                                        )
+                                })
+                            })
+                        })
+                    });
+                if feed == 0 && changes.rows_changed() && !row_tokens && !changes.history_incomplete
+                {
+                    return Err(Mismatch {
+                        kind: "change_ledger",
+                        step,
+                        detail: format!(
+                            "only a flush or compaction was recorded and the change feed is \
+                             empty, but {changes:?}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Release this session's catalog handles: a DuckDB catalog file is
+        // opened by one instance at a time.
+        drop((ctx, provider));
+
+        // Rows read by rowid: a sample of the live ones and an absent one.
+        let ids: Vec<i64> = now_ids
+            .iter()
+            .filter_map(|row| row.first().and_then(|cell| cell.parse().ok()))
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut wanted: Vec<i64> = (0..5).map(|_| ids[self.rng.below(ids.len())]).collect();
+        wanted.push(ids.iter().max().copied().unwrap_or(0) + 1_000_000);
+        wanted.sort_unstable();
+        wanted.dedup();
+        let full_list = std::iter::once("id".to_string())
+            .chain(self.history.columns_at(index).into_iter().map(|c| c.name))
+            .collect::<Vec<_>>();
+        let expected = self
+            .lake
+            .rows(
+                None,
+                &format!(
+                    "SELECT {}, rowid FROM lake.main.t WHERE rowid IN ({}) ORDER BY rowid",
+                    full_list.join(", "),
+                    wanted
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .await;
+        let (ctx, table) = self.lake.table().await;
+        let read = table.read_rows_by_rowid(&ctx.state(), &wanted).await;
+        self.ran("rowid_reads");
+        match (expected, read) {
+            (Ok(expected), Ok(batches)) => {
+                let mut got = canon_crate::rows(&batches).1;
+                let rowid = |row: &Vec<String>| {
+                    row.last()
+                        .and_then(|cell| cell.parse::<i64>().ok())
+                        .unwrap_or(i64::MIN)
+                };
+                got.sort_by_key(rowid);
+                if got != expected.1 {
+                    return Err(Mismatch {
+                        kind: "rowid_reads",
+                        step,
+                        detail: format!(
+                            "rows read by rowid {wanted:?}:\n  scan: {:?}\n  read: {got:?}",
+                            expected.1
+                        ),
+                    });
+                }
+            },
+            (_, Err(e)) => {
+                return Err(Mismatch {
+                    kind: "rowid_reads",
+                    step,
+                    detail: format!("read_rows_by_rowid failed: {e}"),
+                });
+            },
+            (Err(e), _) => {
+                return Err(Mismatch {
+                    kind: "rowid_reads",
+                    step,
+                    detail: format!("the scan by rowid failed where the full scan read: {e}"),
+                });
+            },
         }
         Ok(())
     }
@@ -4487,6 +5061,9 @@ fn step_kind(step: &Step) -> &'static str {
         Step::Widen(_) => "widen",
         Step::Limit(_) => "limit",
         Step::Partition(_) => "partition",
+        Step::Sort(Some((key, _))) if !is_bare_key(key) => "sort expression",
+        Step::Sort(_) => "sort",
+        Step::SortOnInsert(_) => "sort on insert",
         Step::Expire => "expire",
     }
 }
@@ -4586,6 +5163,9 @@ fn step_names(step: &Step, name: &str) -> bool {
         Step::Delete(Some(pred)) => pred_names(pred, name),
         Step::Widen(column) => column == name,
         Step::Partition(Some((column, _))) => column == name,
+        Step::Sort(Some((key, _))) => key
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| token.eq_ignore_ascii_case(name)),
         _ => false,
     }
 }
@@ -4754,6 +5334,12 @@ fn step_source(step: &Step) -> String {
             "Step::Partition({})",
             p.as_ref().map_or("None".into(), |(c, t)| format!(
                 "Some(({c:?}.into(), Transform::{t:?}))"
+            ))
+        ),
+        Step::Sort(s) => format!(
+            "Step::Sort({})",
+            s.as_ref().map_or("None".into(), |(c, desc)| format!(
+                "Some(({c:?}.into(), {desc}))"
             ))
         ),
         other => format!("Step::{other:?}"),
@@ -8144,6 +8730,27 @@ async fn regression_official_keeps_nan_float_row() {
                 (14, vec![V::S("b".into()), V::R(-1.5)]),
                 (15, vec![V::S("a".into()), V::R(-0.0)]),
             ]),
+        ],
+    };
+    check(&history, Kind::Sqlite).await;
+}
+
+/// Seed 338: a rewrite of a table sorted by an expression key completes, as
+/// official's does. DataFusion cannot plan DuckDB's `//`, so the rewrite
+/// writes its rows unsorted.
+#[tokio::test(flavor = "multi_thread")]
+async fn regression_rewrite_with_expression_sort_key() {
+    let history = History {
+        columns: vec![Col {
+            name: "c0".into(),
+            ty: Ty::Map,
+        }],
+        limit: None,
+        steps: vec![
+            Step::Sort(Some(("-((id // 2))".into(), false))),
+            Step::Insert((4..=14).map(|id| (id, vec![V::Null])).collect()),
+            Step::Delete(Some(Pred::IdEq(6))),
+            Step::Rewrite,
         ],
     };
     check(&history, Kind::Sqlite).await;

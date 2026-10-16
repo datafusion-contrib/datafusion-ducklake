@@ -68,7 +68,8 @@ async fn seed_table(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
     std::fs::create_dir_all(&data_path).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&conn_str(temp_dir, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
@@ -81,7 +82,8 @@ async fn seed_table(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
 async fn append_file(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
     let writer = SqliteMetadataWriter::new(&conn_str(temp_dir, true))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     DuckLakeTableWriter::new(Arc::new(writer), object_store())
         .unwrap()
         .append_table("main", "t", &[batch(ids, vals)])

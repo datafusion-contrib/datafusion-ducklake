@@ -115,7 +115,8 @@ async fn cumulative_delete_file_windows_per_row() {
     std::fs::create_dir_all(&data_path).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&db_url(&temp))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),

@@ -82,7 +82,8 @@ async fn make_writer(temp: &TempDir) -> SqliteMetadataWriter {
     std::fs::create_dir_all(&data_path).unwrap();
     let writer = SqliteMetadataWriter::new_with_init(&db_url(temp))
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
     writer
 }
@@ -107,7 +108,12 @@ async fn seed(temp: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
 
 /// Append one more data file to `main.t`.
 async fn append(temp: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
-    let writer = Arc::new(SqliteMetadataWriter::new(&db_url(temp)).await.unwrap());
+    let writer = Arc::new(
+        SqliteMetadataWriter::new(&db_url(temp))
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(0),
+    );
     DuckLakeTableWriter::new(writer, object_store())
         .unwrap()
         .append_table("main", "t", &[batch(ids, vals)])
@@ -367,6 +373,7 @@ async fn delete_after_merge_of_multi_origin_files() {
             files_processed: 3,
             files_created: 1,
             rows_written: 3,
+            inlined_flush_snapshot: None,
         },
     );
 
@@ -632,6 +639,7 @@ async fn keyed_mutation_after_rewrite_with_rowid_holes() {
             files_processed: 1,
             files_created: 1,
             rows_written: 5,
+            inlined_flush_snapshot: None,
         },
     );
     assert_eq!(
@@ -723,6 +731,7 @@ async fn delete_and_update_after_adjacent_merge() {
             files_processed: 3,
             files_created: 1,
             rows_written: 6,
+            inlined_flush_snapshot: None,
         },
     );
     let p = pool(&temp).await;
@@ -764,4 +773,105 @@ async fn delete_and_update_after_adjacent_merge() {
         read_id_rowid(&temp).await,
         vec![(1, 0), (2, 1), (4, 3), (5, 4), (6, 5)],
     );
+}
+
+/// A keyed mutation of a table read at a snapshot before a merged file's
+/// `partial_max` does not match the rows that file holds from later
+/// snapshots: they are not rows of the table there, as the scan leaves them
+/// out.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_delete_skips_rows_a_merged_file_holds_from_later_snapshots() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await;
+    let p = pool(&temp).await;
+    let first = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![2], vec![20]).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    assert!(
+        opt_i64(
+            &p,
+            "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await
+        .is_some_and(|max| max > first),
+        "the merge writes a partial file spanning both snapshots",
+    );
+
+    let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::new(provider), first).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let provider = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let writer: Arc<dyn MetadataWriter> =
+        Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+    let table = as_ducklake(&provider)
+        .clone()
+        .with_writer("main".to_string(), writer);
+    let keys = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![2]))],
+    )
+    .unwrap();
+    let result = table
+        .keyed_mutation(&["id"])
+        .delete_by_keys(&ctx.state(), vec![keys])
+        .await
+        .unwrap();
+    assert_eq!(result.rows_deleted, 0);
+    assert_eq!(result.snapshot_id, None);
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
+}
+
+/// A keyed mutation of a table opened without the catalog's write options
+/// follows the table's stored `data_inlining_row_limit`, which outranks the
+/// writer's: its deletion is inlined, not written as a delete file.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_delete_follows_the_stored_inlining_limit() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1, 2, 3], vec![10, 20, 30]).await;
+    let p = pool(&temp).await;
+    let table_id = scalar_i64(&p, "SELECT max(table_id) FROM ducklake_table").await;
+    // Its own limit is 0: only the stored setting inlines the deletion.
+    let writer = make_writer(&temp).await;
+    writer
+        .set_table_setting(table_id, "data_inlining_row_limit", "10")
+        .unwrap();
+    let writer: Arc<dyn MetadataWriter> = Arc::new(writer);
+
+    let (ctx, provider) = open_table(&temp).await;
+    let table = as_ducklake(&provider)
+        .clone()
+        .with_writer("main".to_string(), writer);
+    let keys = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![2]))],
+    )
+    .unwrap();
+    let result = table
+        .keyed_mutation(&["id"])
+        .delete_by_keys(&ctx.state(), vec![keys])
+        .await
+        .unwrap();
+    assert_eq!(result.rows_deleted, 1);
+    assert_eq!(
+        scalar_i64(&p, "SELECT count(*) FROM ducklake_delete_file").await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(
+            &p,
+            &format!("SELECT count(*) FROM ducklake_inlined_delete_{table_id}")
+        )
+        .await,
+        1
+    );
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (3, 30)]);
 }

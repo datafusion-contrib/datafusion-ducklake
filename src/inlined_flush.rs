@@ -66,7 +66,6 @@ use datafusion::physical_expr::{EquivalenceProperties, Partitioning, PhysicalExp
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
-use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
@@ -94,7 +93,7 @@ const DEFAULT_SCHEMA: &str = "main";
 
 /// Rows per batch the flush feeds its file writer; a file rolls over only at a
 /// batch boundary.
-const FLUSH_BATCH_ROWS: usize = 2048;
+pub(crate) const FLUSH_BATCH_ROWS: usize = 2048;
 
 /// One row of `ducklake_flush_inlined_data`'s result: a table whose inlined rows
 /// were written to Parquet.
@@ -498,7 +497,7 @@ async fn flush_table(
 }
 
 /// A current sort key, resolved against the table's live columns.
-enum FlushSortKey {
+pub(crate) enum FlushSortKey {
     /// A bare column, by its column id.
     Column {
         column_id: i64,
@@ -513,89 +512,104 @@ enum FlushSortKey {
     },
 }
 
-/// The planner sort-key expressions are evaluated with. Identifiers keep their
-/// case, so a key names its column exactly as the catalog does.
-fn sort_key_context() -> SessionContext {
-    let mut config = SessionConfig::new();
-    config.options_mut().sql_parser.enable_ident_normalization = false;
-    SessionContext::new_with_config(config)
+/// The table's live sort keys, or `None` when it is unsorted or when
+/// DataFusion cannot plan one of them (the rows are then ordered by row id
+/// alone: the order is layout only). Keys of a dialect other than exactly
+/// `duckdb` are skipped, as official does, and columns bind as DuckDB's binder
+/// binds them ([`crate::sort::bind_sort_column`]). A key naming no column of
+/// the table fails with official's binder error.
+fn current_sort_keys(table: &DuckLakeTable) -> Result<Option<Vec<FlushSortKey>>> {
+    sort_keys_of(table, table.live_sort_spec()?)
 }
 
-/// The table's live sort keys, or `None` when it is unsorted. Keys of a dialect
-/// other than `duckdb` are skipped, as official does.
-fn current_sort_keys(table: &DuckLakeTable) -> Result<Option<Vec<FlushSortKey>>> {
-    let Some(spec) = table.live_sort_spec()? else {
+/// [`current_sort_keys`] for `spec`, a sort order of `table`.
+pub(crate) fn sort_keys_of(
+    table: &DuckLakeTable,
+    spec: Option<crate::sort::SortSpec>,
+) -> Result<Option<Vec<FlushSortKey>>> {
+    let Some(spec) = spec else {
         return Ok(None);
     };
     let schema = table.physical_schema();
     let ids = table.top_level_column_ids();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
-    let context = sort_key_context();
+    let context = crate::sort::sort_key_context();
     let mut keys = Vec::with_capacity(spec.fields.len());
-    for field in spec
-        .fields
-        .iter()
-        .filter(|field| field.dialect.eq_ignore_ascii_case("duckdb"))
-    {
+    let mut missing = Vec::new();
+    let mut plannable = true;
+    for field in spec.fields.iter().filter(|field| field.is_duckdb_dialect()) {
         let options = SortOptions {
             descending: field.direction == SortDirection::Desc,
             nulls_first: field.null_order == NullOrder::NullsFirst,
         };
         if let Some(name) = field.column_candidate() {
-            let index = schema.index_of(&name).map_err(|_| {
-                DuckLakeError::InvalidConfig(format!(
-                    "DuckLake sort key '{name}' is not a column of the table"
-                ))
-            })?;
-            keys.push(FlushSortKey::Column {
-                column_id: ids[index],
-                options,
-            });
+            match crate::sort::bind_sort_column(names.iter().copied(), &name)? {
+                Some(index) => keys.push(FlushSortKey::Column {
+                    column_id: ids[index],
+                    options,
+                }),
+                None => crate::sort::note_missing(&mut missing, &name),
+            }
             continue;
         }
-        let expr = context
-            .parse_sql_expr(&field.expression, &df_schema)
-            .map_err(|error| {
-                DuckLakeError::Unsupported(format!(
-                    "DuckLake sort expression '{}' cannot be evaluated: {error}",
-                    field.expression
-                ))
-            })?;
+        let Some(expr) = crate::sort::plan_sort_expression(
+            &context,
+            &field.expression,
+            &names,
+            &df_schema,
+            &mut missing,
+        )?
+        else {
+            plannable = false;
+            continue;
+        };
+        // The column ids the expression reads, its columns bound exactly.
         let column_ids = expr
             .column_refs()
             .iter()
-            .map(|column| {
-                schema
-                    .index_of(column.name())
-                    .map(|index| ids[index])
-                    .map_err(|_| {
-                        DuckLakeError::InvalidConfig(format!(
-                            "DuckLake sort expression '{}' names '{}', which is not a column \
-                             of the table",
-                            field.expression,
-                            column.name()
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .filter_map(|column| names.iter().position(|name| *name == column.name()))
+            .map(|index| ids[index])
+            .collect();
         keys.push(FlushSortKey::Expression {
             expr,
             column_ids,
             options,
         });
     }
-    Ok(Some(keys))
+    if !missing.is_empty() {
+        return Err(crate::sort::missing_sort_columns(&missing));
+    }
+    Ok(plannable.then_some(keys))
 }
 
 /// The sort columns of `keys` over `data`, a batch of an inlined table's
-/// columns at its schema version (`version_ids`). A key that reads a column the
-/// version lacks fails the flush, as official's binder rejects the column.
+/// columns at its schema version (`version_ids`), or `None` when DataFusion
+/// cannot plan one of them over it or evaluating one fails over the rows (a
+/// division by zero, a failing cast): the rows then keep their row id order, as
+/// the order is layout only. A key that reads a column the version lacks fails
+/// the flush, as official's binder rejects the column.
 fn sort_columns(
     keys: &[FlushSortKey],
     data: &RecordBatch,
     version_ids: &[i64],
     table: &DuckLakeTable,
-) -> Result<Vec<SortColumn>> {
+) -> Result<Option<Vec<SortColumn>>> {
+    for key in keys {
+        let key_ids = match key {
+            FlushSortKey::Column {
+                column_id,
+                ..
+            } => std::slice::from_ref(column_id),
+            FlushSortKey::Expression {
+                column_ids,
+                ..
+            } => column_ids.as_slice(),
+        };
+        if !key_ids.iter().all(|id| version_ids.contains(id)) {
+            return Err(missing_sort_column(table, key_ids, version_ids));
+        }
+    }
     let mut columns = Vec::new();
     let mut renamed: Option<RecordBatch> = None;
     for key in keys {
@@ -607,27 +621,37 @@ fn sort_columns(
                 let index = version_ids
                     .iter()
                     .position(|id| id == column_id)
-                    .ok_or_else(|| missing_sort_column(table, &[*column_id], version_ids))?;
+                    .expect("checked above");
+                // A float column sorts as DuckDB sorts it: `nan` last, `-0.0`
+                // equal to `0.0`.
                 columns.push(SortColumn {
-                    values: Arc::clone(data.column(index)),
+                    values: crate::sort::duckdb_sort_values(data.column(index)),
                     options: Some(*options),
                 });
             },
             FlushSortKey::Expression {
                 expr,
-                column_ids,
                 options,
+                ..
             } => {
-                if !column_ids.iter().all(|id| version_ids.contains(id)) {
-                    return Err(missing_sort_column(table, column_ids, version_ids));
-                }
                 if renamed.is_none() {
                     renamed = Some(under_live_names(data, version_ids, table)?);
                 }
                 let batch = renamed.as_ref().expect("renamed above");
                 let df_schema = DFSchema::try_from(batch.schema().as_ref().clone())?;
-                let physical = sort_key_context().create_physical_expr(expr.clone(), &df_schema)?;
-                let values = physical.evaluate(batch)?.into_array(batch.num_rows())?;
+                // A key DataFusion cannot plan over this version's columns,
+                // or that fails over the rows, leaves the rows in row id order.
+                let Ok(physical) =
+                    crate::sort::sort_key_context().create_physical_expr(expr.clone(), &df_schema)
+                else {
+                    return Ok(None);
+                };
+                let Ok(values) = physical
+                    .evaluate(batch)
+                    .and_then(|value| value.into_array(batch.num_rows()))
+                else {
+                    return Ok(None);
+                };
                 columns.push(SortColumn {
                     values,
                     options: Some(*options),
@@ -635,7 +659,7 @@ fn sort_columns(
             },
         }
     }
-    Ok(columns)
+    Ok(Some(columns))
 }
 
 /// The error for a sort key reading columns (`key_ids`) an inlined table's
@@ -789,21 +813,14 @@ async fn write_inlined_table(
     columns.push(Arc::new(Int64Array::from(data.rows.end_snapshots.clone())));
     let full = RecordBatch::try_new(Arc::clone(&full_schema), columns)?;
 
-    // ORDER BY <sort keys>, row_id ASC NULLS LAST, begin_snapshot ASC NULLS LAST.
-    let mut ordering = match sort_keys {
-        Some(keys) => sort_columns(keys, batch, &top_level_ids, table)?,
-        None => Vec::new(),
-    };
-    for index in [data_width, data_width + 1] {
-        ordering.push(SortColumn {
-            values: Arc::clone(full.column(index)),
-            options: Some(SortOptions {
-                descending: false,
-                nulls_first: false,
-            }),
-        });
-    }
-    let order: UInt32Array = lexsort_to_indices(&ordering, None)?;
+    let order = flush_order(
+        table,
+        sort_keys,
+        batch,
+        &top_level_ids,
+        full.column(data_width),
+        full.column(data_width + 1),
+    )?;
     let sorted = RecordBatch::try_new(
         Arc::clone(&full_schema),
         full.columns()
@@ -954,6 +971,35 @@ async fn write_inlined_table(
     Ok(files)
 }
 
+/// The order official's flush writes inlined rows in: `ORDER BY <sort keys>,
+/// row_id ASC NULLS LAST, begin_snapshot ASC NULLS LAST`. `data` holds the
+/// rows' columns at their schema version (`version_ids`), `row_ids` and
+/// `snapshots` their row ids and insert snapshots. Without `sort_keys`, or
+/// when DataFusion cannot plan one, the rows keep their row id order.
+pub(crate) fn flush_order(
+    table: &DuckLakeTable,
+    sort_keys: Option<&[FlushSortKey]>,
+    data: &RecordBatch,
+    version_ids: &[i64],
+    row_ids: &ArrayRef,
+    snapshots: &ArrayRef,
+) -> Result<UInt32Array> {
+    let mut ordering = match sort_keys {
+        Some(keys) => sort_columns(keys, data, version_ids, table)?.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    for values in [row_ids, snapshots] {
+        ordering.push(SortColumn {
+            values: Arc::clone(values),
+            options: Some(SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        });
+    }
+    Ok(lexsort_to_indices(&ordering, None)?)
+}
+
 /// The partition one flushed file belongs to.
 struct FlushPartition {
     /// The spec generation in effect when the rows were inserted.
@@ -990,6 +1036,68 @@ async fn write_file_deletes(
     rows: Vec<DuckLakeInlinedFileDeleteForFlush>,
     written: &mut Vec<ObjectPath>,
 ) -> Result<Vec<InlinedFlushFileDelete>> {
+    let planned = plan_file_deletes(table, object_store, rows, true).await?;
+    let mut out = Vec::with_capacity(planned.len());
+    for file in planned {
+        let data_path = resolve_path(
+            table.table_path(),
+            &file.data_file.path,
+            file.data_file.path_is_relative,
+        )?;
+        let deletions: Vec<(i64, i64)> = file.deletions.into_iter().collect();
+        let delete = table_writer
+            .write_delete_file_with_snapshots(
+                schema_name,
+                table.table_name(),
+                &data_path,
+                &deletions,
+                written,
+            )
+            .await?;
+        out.push(InlinedFlushFileDelete {
+            data_file_id: file.data_file_id,
+            data_file_end: file.data_file_end,
+            expected_prev_delete_file: file.expected_prev,
+            delete: InlinedFlushDeleteFile {
+                delete,
+                begin_snapshot: file.begin_snapshot,
+                partial_max: file.partial_max,
+                end_snapshot: file.end_snapshot,
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// One data file's inlined deletions as a flush moves them.
+struct PlannedFileDeletes {
+    data_file_id: i64,
+    data_file: crate::metadata_provider::DuckLakeFileData,
+    data_file_end: Option<i64>,
+    /// The smallest `begin_snapshot` of the file's inlined deletions.
+    first_inlined: i64,
+    /// How many positions the file's inlined deletions name.
+    inlined: u64,
+    /// position -> snapshot that deleted it: the inlined deletions, merged
+    /// with the delete file they replace when planned with `merge`.
+    deletions: BTreeMap<i64, i64>,
+    expected_prev: Option<i64>,
+    begin_snapshot: i64,
+    partial_max: Option<i64>,
+    end_snapshot: Option<i64>,
+}
+
+/// Group inlined deletions by data file and plan each file's delete file
+/// (see [`write_file_deletes`]), leaving out the files whose deletions stay
+/// inlined: an encrypted file's, and a retired file's that cannot merge into
+/// its delete file history. Without `merge`, a live file's delete file is not
+/// read, and its plan carries only the inlined deletions.
+async fn plan_file_deletes(
+    table: &DuckLakeTable,
+    object_store: &dyn ObjectStore,
+    rows: Vec<DuckLakeInlinedFileDeleteForFlush>,
+    merge: bool,
+) -> Result<Vec<PlannedFileDeletes>> {
     let mut by_file: BTreeMap<i64, Vec<DuckLakeInlinedFileDeleteForFlush>> = BTreeMap::new();
     for row in rows {
         by_file.entry(row.data_file_id).or_default().push(row);
@@ -1018,74 +1126,79 @@ async fn write_file_deletes(
                 .and_modify(|snapshot| *snapshot = (*snapshot).min(row.begin_snapshot))
                 .or_insert(row.begin_snapshot);
         }
+        let first_inlined = deletions.values().copied().min().unwrap_or_default();
+        let inlined = deletions.len() as u64;
         let inlined_last = deletions.values().copied().max().unwrap_or_default();
+        let retired_with_deletes = first.data_file_end.is_some() && first.existing_delete.is_some();
         let expected_prev = match &first.existing_delete {
             Some((delete_file_id, file, begin_snapshot)) => {
-                let path = resolve_path(table.table_path(), &file.path, file.path_is_relative)?;
-                for (position, snapshot) in
-                    read_delete_file(object_store, &path, *begin_snapshot).await?
-                {
-                    deletions
-                        .entry(position)
-                        .and_modify(|current| *current = (*current).min(snapshot))
-                        .or_insert(snapshot);
+                if merge || retired_with_deletes {
+                    let path = resolve_path(table.table_path(), &file.path, file.path_is_relative)?;
+                    for (position, snapshot) in
+                        read_delete_file(object_store, &path, *begin_snapshot).await?
+                    {
+                        deletions
+                            .entry(position)
+                            .and_modify(|current| *current = (*current).min(snapshot))
+                            .or_insert(snapshot);
+                    }
                 }
                 Some(*delete_file_id)
             },
             None => None,
         };
-        let deletions: Vec<(i64, i64)> = deletions.into_iter().collect();
-        let begin_snapshot = deletions.iter().map(|(_, s)| *s).min().unwrap_or_default();
-        let partial_max = deletions.iter().map(|(_, s)| *s).max();
+        let begin_snapshot = deletions.values().copied().min().unwrap_or_default();
+        let partial_max = deletions.values().copied().max();
         // The merged file replaces a retired file's latest delete file only
         // where it alone covers the file's history.
-        let end_snapshot = match (first.data_file_end, &first.existing_delete) {
-            (Some(_), Some(_)) => {
-                let overlaps_earlier = first
-                    .earlier_delete_end
-                    .is_some_and(|end| end > begin_snapshot);
-                let outlives_end = first
-                    .existing_delete_end
-                    .is_some_and(|end| inlined_last >= end);
-                if overlaps_earlier || outlives_end {
-                    tracing::warn!(
-                        data_file_id,
-                        "leaving inlined deletions of a retired data file inlined: they cannot \
-                         merge into its delete file history"
-                    );
-                    continue;
-                }
-                first.existing_delete_end
-            },
-            _ => None,
+        let end_snapshot = if retired_with_deletes {
+            let overlaps_earlier = first
+                .earlier_delete_end
+                .is_some_and(|end| end > begin_snapshot);
+            let outlives_end = first
+                .existing_delete_end
+                .is_some_and(|end| inlined_last >= end);
+            if overlaps_earlier || outlives_end {
+                tracing::warn!(
+                    data_file_id,
+                    "leaving inlined deletions of a retired data file inlined: they cannot \
+                     merge into its delete file history"
+                );
+                continue;
+            }
+            first.existing_delete_end
+        } else {
+            None
         };
-        let data_path = resolve_path(
-            table.table_path(),
-            &first.data_file.path,
-            first.data_file.path_is_relative,
-        )?;
-        let delete = table_writer
-            .write_delete_file_with_snapshots(
-                schema_name,
-                table.table_name(),
-                &data_path,
-                &deletions,
-                written,
-            )
-            .await?;
-        out.push(InlinedFlushFileDelete {
+        out.push(PlannedFileDeletes {
             data_file_id,
+            data_file: first.data_file.clone(),
             data_file_end: first.data_file_end,
-            expected_prev_delete_file: expected_prev,
-            delete: InlinedFlushDeleteFile {
-                delete,
-                begin_snapshot,
-                partial_max,
-                end_snapshot,
-            },
+            first_inlined,
+            inlined,
+            deletions,
+            expected_prev,
+            begin_snapshot,
+            partial_max,
+            end_snapshot,
         });
     }
     Ok(out)
+}
+
+/// How many of the inlined deletions in `rows` a flush moves (see
+/// [`plan_file_deletes`]) and the smallest `begin_snapshot` among them; those
+/// that stay inlined do not count.
+pub(crate) async fn flushed_file_deletes(
+    table: &DuckLakeTable,
+    object_store: &dyn ObjectStore,
+    rows: Vec<DuckLakeInlinedFileDeleteForFlush>,
+) -> Result<(u64, Option<i64>)> {
+    let planned = plan_file_deletes(table, object_store, rows, false).await?;
+    Ok((
+        planned.iter().map(|file| file.inlined).sum(),
+        planned.iter().map(|file| file.first_inlined).min(),
+    ))
 }
 
 /// Read a delete file's positions with the snapshot that deleted each: its

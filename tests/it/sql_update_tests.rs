@@ -63,7 +63,7 @@ async fn make_writer(temp_dir: &TempDir) -> SqliteMetadataWriter {
 /// Seed a single data file `t(id, val)` from the given rows via the low-level
 /// writer (deterministic file layout: `row_id_start = 0`, positions `0..n`).
 async fn seed_table(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
-    let writer = Arc::new(make_writer(temp_dir).await);
+    let writer = Arc::new(make_writer(temp_dir).await.with_data_inlining_row_limit(0));
     let batch = RecordBatch::try_new(
         table_schema(),
         vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
@@ -80,7 +80,12 @@ async fn seed_table(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
 async fn append_file(temp_dir: &TempDir, ids: Vec<i32>, vals: Vec<i32>) {
     let db_path = temp_dir.path().join("test.db");
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
-    let writer = Arc::new(SqliteMetadataWriter::new(&conn_str).await.unwrap());
+    let writer = Arc::new(
+        SqliteMetadataWriter::new(&conn_str)
+            .await
+            .unwrap()
+            .with_data_inlining_row_limit(0),
+    );
     let batch = RecordBatch::try_new(
         table_schema(),
         vec![Arc::new(Int32Array::from(ids)), Arc::new(Int32Array::from(vals))],
@@ -284,12 +289,15 @@ async fn update_output_records_a_fresh_range_like_official() {
 
 // ---------------------------------------------------------------------------
 
+/// Official's `UPDATE` plans no sort (`DuckLakeCatalog::PlanUpdate`): on a
+/// table `SET SORTED BY (val)`, the rewritten rows keep the order they were
+/// read in. Guards against sorting them.
 #[tokio::test(flavor = "multi_thread")]
-async fn update_applies_sort_order() {
+async fn update_keeps_read_order_under_sort_order() {
     let temp_dir = TempDir::new().unwrap();
     seed_table(&temp_dir, vec![1, 1, 1], vec![30, 10, 20]).await;
     let writer = Arc::new(make_writer(&temp_dir).await);
-    // The new versions go to a sorted Parquet file rather than being inlined.
+    // The new versions go to a Parquet file rather than being inlined.
     writer
         .set_global_setting("data_inlining_row_limit", "0")
         .unwrap();
@@ -360,7 +368,7 @@ async fn update_applies_sort_order() {
     assert_eq!(files.len(), 1);
     assert_eq!(
         values.values().iter().copied().collect::<Vec<_>>(),
-        vec![11, 21, 31],
+        vec![31, 11, 21],
     );
 }
 
@@ -1340,7 +1348,8 @@ async fn partitioned_update_with_calendar_transform_moves_row() {
             temp_dir.path().join("test.db").display()
         ))
         .await
-        .unwrap(),
+        .unwrap()
+        .with_data_inlining_row_limit(0),
     );
     DuckLakeTableWriter::new(seed_writer, object_store())
         .unwrap()
@@ -1464,7 +1473,7 @@ async fn update_partitions_rewritten_rows_when_spec_was_set_after_data() {
     ]));
 
     // Seed ONE unpartitioned file spanning two regions.
-    let writer = Arc::new(make_writer(&temp_dir).await);
+    let writer = Arc::new(make_writer(&temp_dir).await.with_data_inlining_row_limit(0));
     let seed = RecordBatch::try_new(
         schema.clone(),
         vec![

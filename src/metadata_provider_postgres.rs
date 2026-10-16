@@ -19,9 +19,10 @@ use crate::metadata_provider::{
 use crate::metadata_provider::{
     DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData, DuckLakeInlinedRows,
     INLINED_SYSTEM_SELECT_WIDTH, InlinedColumnMapping, InlinedFileDeleteChange,
-    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, inlined_file_delete_change,
+    InlinedFileDeleteRow, InlinedReadShape, InlinedRowSelection, InlinedVersionColumn,
+    InlinedVersionLookup, SchemaVersionLedger, inlined_file_delete_change,
     inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql,
-    inlined_version_columns_sql,
+    inlined_version_columns_sql, inlined_version_snapshot_sql,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -41,8 +42,10 @@ use std::sync::{Arc, OnceLock};
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
 /// was written with. `None` when no row matches.
+#[allow(clippy::too_many_arguments)]
 async fn read_postgres_inlined_table(
     connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
     table_id: i64,
     table: &str,
     columns: &[DuckLakeTableColumn],
@@ -50,19 +53,21 @@ async fn read_postgres_inlined_table(
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
 ) -> Result<Option<DuckLakeInlinedRows>> {
-    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
         present,
         physical_types,
     } = inlined_table_layout(&mut *connection, table).await?;
-    let version_columns: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(
-        inlined_version_columns_sql(&quote_ident(table), &system, "$1"),
+    let version_columns: Vec<InlinedVersionColumn> = sqlx::query_as(AssertSqlSafe(
+        inlined_version_columns_sql(table, ledger, "$1"),
     ))
     .bind(table_id)
     .fetch_all(&mut *connection)
     .await?;
-    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present)?;
+    let decode_columns = mapping.decode_columns(columns);
+    let decode_schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(&decode_columns)?);
 
     let mut select_list = selection
         .system_select(&system)
@@ -182,11 +187,15 @@ async fn read_postgres_inlined_table(
         row_ids,
         snapshots,
         end_snapshots,
-        batch: parse_inlined_rows_with_present(
+        batch: mapping.adapt(
+            parse_inlined_rows_with_present(
+                decode_schema,
+                &decode_columns,
+                values,
+                Some(&mapping.present(columns)),
+            )?,
             schema,
             columns,
-            values,
-            Some(&mapping.present(columns)),
         )?,
     }))
 }
@@ -372,6 +381,8 @@ struct SchemaCapabilities {
     delete_file_partial_max: bool,
     /// The `ducklake_schema_versions` table exists.
     schema_versions: bool,
+    /// `ducklake_schema_versions.table_id` exists (DuckLake 0.4 on).
+    schema_versions_table_id: bool,
     /// `ducklake_data_file.partition_id` exists.
     data_file_partition_id: bool,
     /// The `ducklake_inlined_data_tables` registry exists.
@@ -400,9 +411,25 @@ impl SchemaCapabilities {
         self.data_file_partial_max
             && self.delete_file_partial_max
             && self.schema_versions
+            && self.schema_versions_table_id
             && self.data_file_partition_id
             && self.inlined_data_tables
             && self.views
+    }
+
+    /// What the catalog's `ducklake_schema_versions` ledger records.
+    fn ledger(&self) -> SchemaVersionLedger {
+        schema_version_ledger(self.schema_versions, self.schema_versions_table_id)
+    }
+}
+
+/// The ledger a catalog keeps, from whether `ducklake_schema_versions` and its
+/// `table_id` column exist.
+pub(crate) fn schema_version_ledger(exists: bool, per_table: bool) -> SchemaVersionLedger {
+    match (exists, per_table) {
+        (true, true) => SchemaVersionLedger::PerTable,
+        (true, false) => SchemaVersionLedger::Global,
+        (false, _) => SchemaVersionLedger::Absent,
     }
 }
 
@@ -471,6 +498,7 @@ pub(crate) async fn registered_inlined_tables_on(
 /// `ducklake_inlined_data_tables`.
 pub(crate) async fn scan_inlined_data_on(
     connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
     catalog_id: Option<i64>,
     table_id: i64,
     snapshot_id: i64,
@@ -511,6 +539,7 @@ pub(crate) async fn scan_inlined_data_on(
     for table in registry.iter().filter(|table| is_inlined_data_table(table)) {
         if let Some(rows) = read_postgres_inlined_table(
             connection,
+            ledger,
             table_id,
             table,
             columns,
@@ -546,6 +575,7 @@ pub(crate) async fn scan_inlined_data_on(
 /// `ducklake_inlined_data_tables`.
 pub(crate) async fn read_inlined_rows_on(
     connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
     table_id: i64,
     columns: &[DuckLakeTableColumn],
     selection: InlinedRowSelection,
@@ -555,7 +585,7 @@ pub(crate) async fn read_inlined_rows_on(
     let mut out = Vec::new();
     for table in registered_inlined_tables_on(connection, table_id).await? {
         if let Some(rows) = read_postgres_inlined_table(
-            connection, table_id, &table, columns, selection, filter, shape,
+            connection, ledger, table_id, &table, columns, selection, filter, shape,
         )
         .await?
         {
@@ -566,8 +596,7 @@ pub(crate) async fn read_inlined_rows_on(
 }
 
 /// The earliest begin snapshot at or below `snapshot_id` in the inlined-data
-/// table `table`, read on `connection`; `None` when it holds no such row. A
-/// flush reads the table under the columns of that snapshot.
+/// table `table`, read on `connection`; `None` when it holds no such row.
 pub(crate) async fn first_inlined_snapshot_on(
     connection: &mut PgConnection,
     table: &str,
@@ -585,10 +614,27 @@ pub(crate) async fn first_inlined_snapshot_on(
         .await?)
 }
 
+/// The snapshot whose columns the inlined data table `table` holds, read on
+/// `connection` ([`inlined_version_snapshot_sql`]). A flush reads the table
+/// under the columns of that snapshot.
+pub(crate) async fn inlined_version_snapshot_on(
+    connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
+    table: &str,
+) -> Result<Option<i64>> {
+    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT ({})::bigint",
+        inlined_version_snapshot_sql(table, ledger)
+    )))
+    .fetch_one(&mut *connection)
+    .await?)
+}
+
 /// The rows of `table`, an inlined-data table of `table_id`, written at or
 /// below `snapshot_id`, for a flush, read on `connection`.
 pub(crate) async fn inlined_table_for_flush_on(
     connection: &mut PgConnection,
+    ledger: InlinedVersionLookup,
     table_id: i64,
     table: &str,
     columns: &[DuckLakeTableColumn],
@@ -596,6 +642,7 @@ pub(crate) async fn inlined_table_for_flush_on(
 ) -> Result<Option<DuckLakeInlinedRows>> {
     read_postgres_inlined_table(
         connection,
+        ledger,
         table_id,
         table,
         columns,
@@ -1124,11 +1171,21 @@ impl PostgresMetadataProvider {
         filter: Option<&InlinedFilter>,
         shape: InlinedReadShape,
     ) -> Result<Vec<DuckLakeInlinedRows>> {
-        if !self.schema_capabilities().await?.inlined_data_tables {
+        let caps = self.schema_capabilities().await?;
+        if !caps.inlined_data_tables {
             return Ok(Vec::new());
         }
         let mut connection = self.pool.acquire().await?;
-        read_inlined_rows_on(&mut connection, table_id, columns, selection, filter, shape).await
+        read_inlined_rows_on(
+            &mut connection,
+            caps.ledger().into(),
+            table_id,
+            columns,
+            selection,
+            filter,
+            shape,
+        )
+        .await
     }
 
     /// Whether the catalog has the `ducklake_inlined_data_tables` registry, from
@@ -1158,7 +1215,7 @@ impl PostgresMetadataProvider {
         if let Some(caps) = self.schema_capabilities.get() {
             return Ok(*caps);
         }
-        let row: (bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        let row: (bool, bool, bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
             "SELECT
                EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name = 'ducklake_data_file' AND column_name = 'partial_max'),
@@ -1170,7 +1227,10 @@ impl PostgresMetadataProvider {
                to_regclass('ducklake_inlined_data_tables') IS NOT NULL,
                to_regclass('ducklake_view') IS NOT NULL,
                to_regprocedure('pg_input_is_valid(text,text)') IS NOT NULL,
-               current_setting('server_version_num')::int >= 120000",
+               current_setting('server_version_num')::int >= 120000,
+               EXISTS (SELECT 1 FROM information_schema.columns
+                       WHERE table_name = 'ducklake_schema_versions'
+                         AND column_name = 'table_id')",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1178,6 +1238,7 @@ impl PostgresMetadataProvider {
             data_file_partial_max: row.0,
             delete_file_partial_max: row.1,
             schema_versions: row.2,
+            schema_versions_table_id: row.8,
             data_file_partition_id: row.3,
             inlined_data_tables: row.4,
             views: row.5,
@@ -1212,6 +1273,11 @@ impl PostgresMetadataProvider {
         })?;
         block_on(async {
             let caps = self.schema_capabilities().await?;
+            let partition_id_expr = if caps.data_file_partition_id {
+                "data.partition_id::bigint"
+            } else {
+                "NULL::bigint"
+            };
             let partial_max_expr = if caps.data_file_partial_max {
                 "data.partial_max::bigint"
             } else {
@@ -1262,7 +1328,7 @@ impl PostgresMetadataProvider {
                         del.file_size_bytes, del.footer_size, del.encryption_key,
                         del.delete_count, data.begin_snapshot::bigint,
                         {partial_max_expr}, {schema_version_expr},
-                        NULL::bigint AS data_partition_id,
+                        {partition_id_expr} AS data_partition_id,
                         data.mapping_id::bigint
                  FROM ducklake_data_file AS data
                  LEFT JOIN ducklake_delete_file AS del
@@ -1527,7 +1593,14 @@ impl MetadataProvider for PostgresMetadataProvider {
             rows.into_iter()
                 .map(|row| {
                     let snapshot_id: i64 = row.try_get(0)?;
-                    let timestamp: Option<NaiveDateTime> = row.try_get(1)?;
+                    // This crate's layout stores a `TIMESTAMP` (UTC), official's a
+                    // `TIMESTAMPTZ`: either is printed as its UTC instant.
+                    let timestamp: Option<NaiveDateTime> = match row.try_get(1) {
+                        Ok(timestamp) => timestamp,
+                        Err(_) => row
+                            .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(1)?
+                            .map(|instant| instant.naive_utc()),
+                    };
                     let timestamp_str = timestamp
                         .map(|ts: NaiveDateTime| ts.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
 
@@ -1538,6 +1611,45 @@ impl MetadataProvider for PostgresMetadataProvider {
                     })
                 })
                 .collect()
+        })
+    }
+
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        block_on(async {
+            Ok(sqlx::query_scalar(
+                "SELECT snapshot_id FROM ducklake_snapshot
+                 WHERE snapshot_id >= $1 AND snapshot_id <= $2
+                 ORDER BY snapshot_id",
+            )
+            .bind(from_snapshot)
+            .bind(through_snapshot)
+            .fetch_all(&self.pool)
+            .await?)
+        })
+    }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        let pattern = crate::change_detection::table_change_like_pattern(table_id);
+        block_on(async {
+            Ok(sqlx::query_as(
+                "SELECT snapshot.snapshot_id, changes.changes_made
+                 FROM ducklake_snapshot AS snapshot
+                 LEFT JOIN ducklake_snapshot_changes AS changes
+                   ON changes.snapshot_id = snapshot.snapshot_id
+                 WHERE snapshot.snapshot_id > $1 AND snapshot.snapshot_id <= $2
+                   AND (changes.changes_made IS NULL OR changes.changes_made LIKE $3)
+                 ORDER BY snapshot.snapshot_id",
+            )
+            .bind(after_snapshot)
+            .bind(through_snapshot)
+            .bind(pattern)
+            .fetch_all(&self.pool)
+            .await?)
         })
     }
 
@@ -2251,12 +2363,14 @@ impl MetadataProvider for PostgresMetadataProvider {
         block_on(async {
             // No registry yet, so no inlined rows. Not an answer to keep: a
             // migration can add the registry, and a later commit inline rows.
-            if !self.schema_capabilities().await?.inlined_data_tables {
+            let caps = self.schema_capabilities().await?;
+            if !caps.inlined_data_tables {
                 return Ok((InlinedDataScan::default(), None));
             }
             let mut connection = self.pool.acquire().await?;
             scan_inlined_data_on(
                 &mut connection,
+                caps.ledger().into(),
                 None,
                 table_id,
                 snapshot_id,
@@ -2299,32 +2413,68 @@ impl MetadataProvider for PostgresMetadataProvider {
         ))
     }
 
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let ledger: InlinedVersionLookup = block_on(self.schema_capabilities())?.ledger().into();
+        block_on(async {
+            let mut connection = self.pool.acquire().await?;
+            let mut oldest: Option<i64> = None;
+            for table in &tables {
+                let first = first_inlined_snapshot_on(&mut connection, table, snapshot_id).await?;
+                // As the flush, which skips a table whose schema version it
+                // cannot resolve.
+                if first.is_some()
+                    && inlined_version_snapshot_on(&mut connection, ledger, table)
+                        .await?
+                        .is_some()
+                {
+                    oldest = oldest.into_iter().chain(first).min();
+                }
+            }
+            Ok(oldest)
+        })
+    }
+
     fn get_inlined_data_for_flush(
         &self,
         table_id: i64,
         snapshot_id: i64,
     ) -> Result<Vec<DuckLakeInlinedFlushData>> {
         let tables = block_on(self.registered_inlined_tables(table_id))?;
+        let ledger: InlinedVersionLookup = block_on(self.schema_capabilities())?.ledger().into();
         let mut flushed = Vec::new();
         for table in tables {
-            let first = block_on(async {
+            let version = block_on(async {
                 let mut connection = self.pool.acquire().await?;
-                first_inlined_snapshot_on(&mut connection, &table, snapshot_id).await
+                if first_inlined_snapshot_on(&mut connection, &table, snapshot_id)
+                    .await?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                inlined_version_snapshot_on(&mut connection, ledger, &table).await
             })?;
-            let Some(first) = first else {
+            let Some(version) = version else {
                 continue;
             };
-            let columns = self.get_table_structure(table_id, first)?;
+            let columns = self.get_table_structure(table_id, version)?;
             let rows = block_on(async {
                 let mut connection = self.pool.acquire().await?;
-                inlined_table_for_flush_on(&mut connection, table_id, &table, &columns, snapshot_id)
-                    .await
+                inlined_table_for_flush_on(
+                    &mut connection,
+                    ledger,
+                    table_id,
+                    &table,
+                    &columns,
+                    snapshot_id,
+                )
+                .await
             })?;
             if let Some(rows) = rows {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
-                    columns_snapshot: first,
+                    columns_snapshot: version,
                 });
             }
         }

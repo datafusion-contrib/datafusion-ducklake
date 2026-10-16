@@ -437,6 +437,14 @@ pub(crate) struct CrateSide {
 const LIMIT: usize = 5;
 
 async fn run_crate_sql(side: &CrateSide, statement: &str) {
+    if let Some(directive) = statement
+        .strip_prefix("/* api ")
+        .and_then(|rest| rest.split_once(" */"))
+        .map(|(directive, _)| directive)
+    {
+        run_crate_api(side, directive).await;
+        return;
+    }
     let ctx = SessionContext::new();
     let catalog =
         DuckLakeCatalog::with_writer(Arc::clone(&side.provider), Arc::clone(&side.writer)).unwrap();
@@ -449,6 +457,96 @@ async fn run_crate_sql(side: &CrateSide, statement: &str) {
         .collect()
         .await
         .unwrap_or_else(|e| panic!("crate `{statement}`: {e}"));
+}
+
+/// Run a statement's row-level API equivalent: `/* api <op> <query> */` before
+/// the SQL official runs. `<query>`, run by this crate against `lake`, gives the
+/// staged rows (or, for `delete_rowids`, the row ids); `<op>` is `delete`,
+/// `update` or `upsert` (keyed on `id`), `stream` (a streaming write session)
+/// or `delete_rowids`.
+async fn run_crate_api(side: &CrateSide, directive: &str) {
+    let (op, query) = directive.split_once(' ').unwrap();
+    let ctx = SessionContext::new();
+    let catalog =
+        DuckLakeCatalog::with_writer(Arc::clone(&side.provider), Arc::clone(&side.writer)).unwrap();
+    DuckLakeCatalog::register(&ctx, "w", catalog);
+    let reads = DuckLakeCatalog::with_writer(Arc::clone(&side.provider), Arc::clone(&side.writer))
+        .unwrap()
+        .with_row_lineage(true);
+    DuckLakeCatalog::register(&ctx, "lake", reads);
+    let staged = ctx
+        .sql(query)
+        .await
+        .unwrap_or_else(|e| panic!("crate api `{query}`: {e}"))
+        .collect()
+        .await
+        .unwrap_or_else(|e| panic!("crate api `{query}`: {e}"));
+    let provider = ctx
+        .catalog("w")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = (provider.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<datafusion_ducklake::DuckLakeTable>()
+        .unwrap()
+        .clone();
+    let state = ctx.state();
+    let keyed = table.keyed_mutation(&["id"]);
+    match op {
+        "delete" => {
+            keyed.delete_by_keys(&state, staged).await.unwrap();
+        },
+        "update" => {
+            keyed.update_by_keys(&state, staged).await.unwrap();
+        },
+        "upsert" => {
+            keyed.upsert_by_keys(&state, staged).await.unwrap();
+        },
+        "delete_rowids" => {
+            let ids = staged
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            table.delete_rowids(&state, &ids).await.unwrap();
+        },
+        "stream" => {
+            let schema = datafusion::catalog::TableProvider::schema(&table);
+            let mut session = DuckLakeTableWriter::new(
+                Arc::clone(&side.writer),
+                Arc::new(LocalFileSystem::new()),
+            )
+            .unwrap()
+            .begin_write("main", "t", &schema, datafusion_ducklake::WriteMode::Append)
+            .unwrap();
+            for batch in &staged {
+                let columns = schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        arrow::compute::cast(batch.column(index), field.data_type()).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                session
+                    .write_batch(&RecordBatch::try_new(Arc::clone(&schema), columns).unwrap())
+                    .unwrap();
+            }
+            session.finish().await.unwrap();
+        },
+        other => panic!("unknown api directive `{other}`"),
+    }
 }
 
 async fn crate_setup(side: &CrateSide, steps: &[CrateStep], limit: usize) {
@@ -925,8 +1023,10 @@ pub(crate) fn scenario_partitioned() -> Scenario {
         ]),
         crate_setup: vec![
             // `CREATE TABLE` needs the schema, and an empty append would
-            // write an empty data file official's `CREATE TABLE` does not.
-            CrateStep::AppendOther("seed", id_value([0], |_| "seed".to_string())),
+            // write an empty data file official's `CREATE TABLE` does not. The
+            // seed holds more rows than the limit, so it is Parquet and the
+            // flush has nothing of it to move.
+            CrateStep::AppendOther("seed", id_value(0..6, |_| "seed".to_string())),
             CrateStep::Sql(
                 "CREATE TABLE lake.main.t (id INTEGER, p INTEGER, v VARCHAR)".to_string(),
             ),
@@ -1044,6 +1144,86 @@ pub(crate) fn scenario_file_lifecycle(limit: usize) -> Scenario {
     }
 }
 
+/// The row-level APIs where official has an equivalent statement: a keyed
+/// delete, update and upsert (official's `DELETE`, `UPDATE`, and a `DELETE`
+/// with an `INSERT` in one transaction), a streaming write session (an
+/// `INSERT`) and a delete by row id, over inlined and Parquet rows, under and
+/// over the limit, around a flush.
+pub(crate) fn scenario_row_apis() -> Scenario {
+    let values = |ids: std::ops::RangeInclusive<i32>, prefix: &str| {
+        ids.map(|id| format!("({id}, '{prefix}{id}')"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let upsert = |ids: &[i32], prefix: &str| {
+        let list = ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = ids
+            .iter()
+            .map(|id| format!("({id}, '{prefix}{id}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "/* api upsert SELECT CAST(column1 AS INT) AS id, column2 AS v FROM (VALUES {rows}) */ \
+             BEGIN; DELETE FROM lake.main.t WHERE id IN ({list}); \
+             INSERT INTO lake.main.t VALUES {rows}; COMMIT;"
+        )
+    };
+    Scenario {
+        name: "row_apis",
+        official_setup: s(&[
+            "CALL lake.set_option('data_inlining_row_limit', 5)",
+            "CREATE TABLE lake.main.t (id INTEGER, v VARCHAR)",
+            "INSERT INTO lake.main.t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO lake.main.t SELECT i, 'x' || i FROM range(10, 30) r(i)",
+        ]),
+        crate_setup: vec![
+            CrateStep::Append(id_value([1, 2, 3], |id| {
+                ["a", "b", "c"][id as usize - 1].to_string()
+            })),
+            CrateStep::Append(id_value(10..30, |id| format!("x{id}"))),
+        ],
+        statements: vec![
+            "/* api delete SELECT id FROM lake.main.t WHERE id IN (2, 11, 12) */ \
+             DELETE FROM lake.main.t WHERE id IN (2, 11, 12)"
+                .to_string(),
+            "/* api update SELECT id, 'u' || CAST(id AS VARCHAR) AS v FROM lake.main.t \
+             WHERE id IN (1, 13) */ UPDATE lake.main.t SET v = 'u' || id WHERE id IN (1, 13)"
+                .to_string(),
+            "/* api update SELECT id, 'w' AS v FROM lake.main.t WHERE id >= 20 */ \
+             UPDATE lake.main.t SET v = 'w' WHERE id >= 20"
+                .to_string(),
+            upsert(&[3, 14, 40], "n"),
+            upsert(&[15, 16, 17, 18, 19, 50, 51, 52], "m"),
+            format!(
+                "/* api stream SELECT CAST(column1 AS INT) AS id, column2 AS v FROM (VALUES {}) */ \
+                 INSERT INTO lake.main.t VALUES {}",
+                values(60..=61, "s"),
+                values(60..=61, "s")
+            ),
+            format!(
+                "/* api stream SELECT CAST(column1 AS INT) AS id, column2 AS v FROM (VALUES {}) */ \
+                 INSERT INTO lake.main.t VALUES {}",
+                values(70..=79, "l"),
+                values(70..=79, "l")
+            ),
+            "CALL ducklake_flush_inlined_data('lake')".to_string(),
+            "/* api delete_rowids SELECT rowid FROM lake.main.t WHERE id IN (40, 60, 21) */ \
+             DELETE FROM lake.main.t WHERE id IN (40, 60, 21)"
+                .to_string(),
+            upsert(&[61, 22], "z"),
+            "/* api delete SELECT id FROM lake.main.t WHERE id >= 70 */ \
+             DELETE FROM lake.main.t WHERE id >= 70"
+                .to_string(),
+        ],
+        limit: LIMIT,
+        known_differences: vec![],
+    }
+}
+
 pub(crate) fn scenarios() -> Vec<Scenario> {
     vec![
         scenario_basic(),
@@ -1052,6 +1232,7 @@ pub(crate) fn scenarios() -> Vec<Scenario> {
         scenario_schema_evolution(),
         scenario_file_lifecycle(LIMIT),
         scenario_file_lifecycle(0),
+        scenario_row_apis(),
     ]
 }
 
@@ -1180,6 +1361,11 @@ mod sqlite {
     #[tokio::test(flavor = "multi_thread")]
     async fn file_lifecycle_zero_limit() {
         run(scenario_file_lifecycle(0)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_apis() {
+        run(scenario_row_apis()).await;
     }
 }
 
@@ -3302,6 +3488,11 @@ mod duckdb_backend {
     #[tokio::test(flavor = "multi_thread")]
     async fn file_lifecycle_zero_limit() {
         run(scenario_file_lifecycle(0)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn row_apis() {
+        run(scenario_row_apis()).await;
     }
 }
 

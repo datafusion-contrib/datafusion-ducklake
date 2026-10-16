@@ -426,7 +426,9 @@ fn parse_sort_keys(parser: &mut Parser) -> DataFusionResult<Vec<SortField>> {
                 "unsupported sort key '{expr}'; only bare column names are supported"
             )));
         };
-        let column = normalize_ident(&ident);
+        // Stored as typed, as official stores `SET SORTED BY (ID)`; a key
+        // binds to its column ignoring case ([`crate::sort::bind_sort_column`]).
+        let column = ident.value;
 
         let direction = if parser.parse_keyword(Keyword::ASC) {
             SortDirection::Asc

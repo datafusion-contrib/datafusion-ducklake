@@ -267,10 +267,13 @@ execute_ducklake_sql(
 ```
 
 The spec is recorded in the catalog (`ducklake_sort_info` / `ducklake_sort_expression`) and
-applied on insert, to `UPDATE` rewrites, and to compaction output; rows are sorted before the
-partition split, so each per-partition file stays a sorted subsequence. Bare-column keys are
-produced; other expressions are tolerated on read but never produced. `RESET SORTED BY`
-turns it off.
+applied on insert, inlined rows included (with the table's stored `sort_on_insert` option off,
+only to rows written to Parquet while inlining is enabled, as official DuckLake does), to the
+inlined-data flush whatever `sort_on_insert` says, and to compaction output; rows are sorted
+before the partition split, so each per-partition file stays a sorted subsequence. `UPDATE`
+rewrites are not sorted, as in official DuckLake. `SET SORTED BY` records bare-column keys; a
+key DuckDB recorded as another expression orders inserts, flushes and compaction (evaluated with
+DataFusion). `RESET SORTED BY` turns it off.
 
 ---
 

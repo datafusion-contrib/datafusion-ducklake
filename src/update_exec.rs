@@ -264,7 +264,6 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             let mut superseded_positions: Vec<(&UpdateSourceScan, Vec<i64>)> = Vec::new();
             let mut superseded_inlined: Vec<InlinedRowRef> = Vec::new();
             let mut total_updated: u64 = 0;
-            let physical_schema = table.physical_schema();
 
             for scan in &scans {
                 let batches =
@@ -314,173 +313,24 @@ impl ExecutionPlan for DuckLakeUpdateExec {
                 return Ok(RecordBatch::try_new(output_schema, vec![count])?);
             }
 
-            validate_not_null_batches(physical_schema.as_ref(), &updated_batches)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            // Each source file's superseded rows are deleted as official's
-            // `DuckLakeDelete::FlushDelete` deletes them.
-            let mut deletions = FileDeletions::default();
-            for (scan, positions) in superseded_positions {
-                let target = DeletionTarget {
-                    data_file_id: scan.data_file_id,
-                    data_file_path: &scan.source_path,
-                    record_count: scan.record_count,
-                    delete_file: scan
-                        .delete_file_id
-                        .map(|id| (id, &scan.existing_parquet_deletes)),
-                };
-                deletions
-                    .record(
-                        &table,
-                        &table_writer,
-                        &schema_name,
-                        &table_name,
-                        &target,
-                        positions,
-                        inline_limit,
-                        base_snapshot,
-                    )
-                    .await?;
-            }
-            let mut delete_entries: Vec<DeleteFileEntry> =
-                std::mem::take(&mut deletions.positional);
-            for (data_file_id, expected_prev_delete_file, source_path, positions) in pending_deletes
-            {
-                let delete_info = table_writer
-                    .write_delete_file(&schema_name, &table_name, &source_path, &positions)
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                delete_entries.push(DeleteFileEntry {
-                    data_file_id,
-                    expected_prev_delete_file,
-                    delete: delete_info,
-                });
-            }
-
-            // The new versions without their rowid column, in the table's types.
-            let new_versions = updated_batches
-                .iter()
-                .map(|batch| {
-                    let columns = batch.columns()[..batch.num_columns() - 1].to_vec();
-                    RecordBatch::try_new(Arc::clone(&physical_schema), columns)
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let inline_new_versions = total_updated <= inline_limit as u64
-                && table_writer
-                    .should_inline(
-                        &schema_name,
-                        &table_name,
-                        total_updated as usize,
-                        physical_schema.as_ref(),
-                        &new_versions,
-                    )
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            let staged = inline_capable
-                && (inline_new_versions
-                    || deletions.needs_staged_commit()
-                    || !superseded_inlined.is_empty());
-
-            // Append the rewritten rows (embedding their original rowids) AND
-            // apply every positional delete in ONE snapshot.
-            let sort_spec = table
-                .live_sort_spec()
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let ordering = crate::compaction::compaction_ordering(
-                physical_schema.as_ref(),
-                sort_spec.as_ref(),
-            )
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            if staged {
-                let (data, row_ids) = if inline_new_versions {
-                    let row_ids = updated_batches
-                        .iter()
-                        .flat_map(|batch| {
-                            let ids = batch
-                                .column(batch.num_columns() - 1)
-                                .as_any()
-                                .downcast_ref::<arrow::array::Int64Array>()
-                                .expect("rowid column is Int64")
-                                .clone();
-                            ids.values().to_vec()
-                        })
-                        .collect::<Vec<_>>();
-                    (StagedTableData::Inlined(new_versions), Some(row_ids))
-                } else {
-                    let files = write_rewritten_files(
-                        &table_writer,
-                        Arc::clone(&context),
-                        &schema_name,
-                        &table_name,
-                        physical_schema.as_ref(),
-                        base_snapshot,
-                        updated_batches,
-                        ordering.as_ref(),
-                    )
-                    .await?;
-                    (StagedTableData::Files(files), None)
-                };
-                let state = datafusion::execution::SessionStateBuilder::new()
-                    .with_config(context.session_config().clone())
-                    .with_runtime_env(context.runtime_env())
-                    .build();
-                let latest = crate::delete_exec::LatestDeleteFiles {
+            commit_row_versions(
+                &RowVersionCommit {
                     table: &table,
-                    state: &state,
-                };
-                let mut transaction = table_writer.transaction();
-                transaction.set_delete_file_positions(&latest);
-                transaction
-                    .stage_row_mutation(
-                        &schema_name,
-                        &table_name,
-                        table.table_id(),
-                        table.column_ids(),
-                        physical_schema.as_ref(),
-                        base_snapshot,
-                        data,
-                        row_ids,
-                        delete_entries,
-                        deletions.rewritten,
-                        superseded_inlined,
-                        deletions.inlined,
-                        deletions.dropped,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-                let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
-                return Ok(RecordBatch::try_new(output_schema, vec![count])?);
-            }
-
-            let mut updated_batches =
-                sorted_rewrite_batches(Arc::clone(&context), updated_batches, ordering.as_ref())
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let mut session = table_writer
-                .begin_write_with_embedded_rowid(
-                    &schema_name,
-                    &table_name,
-                    physical_schema.as_ref(),
-                    WriteMode::Append,
-                )
-                .map(|session| session.with_base_snapshot_id(base_snapshot))
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            while let Some(batch) = updated_batches.try_next().await? {
-                session
-                    .write_batch(&batch)
-                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            }
-            // The session removes the delete files with its own when the commit
-            // definitely registered nothing.
-            session
-                .finish_with_deletes(&delete_entries)
-                .await
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
+                    table_writer: &table_writer,
+                    context: Arc::clone(&context),
+                    schema_name: &schema_name,
+                    table_name: &table_name,
+                    base_snapshot,
+                    inline_capable,
+                    inline_limit,
+                },
+                updated_batches,
+                superseded_positions,
+                pending_deletes,
+                superseded_inlined,
+                total_updated,
+            )
+            .await?;
             let count: ArrayRef = Arc::new(UInt64Array::from(vec![total_updated]));
             Ok(RecordBatch::try_new(output_schema, vec![count])?)
         });
@@ -492,9 +342,216 @@ impl ExecutionPlan for DuckLakeUpdateExec {
     }
 }
 
+/// What [`commit_row_versions`] commits for: the target table as read, the
+/// writer the commit goes through, and the statement's inlining limit.
+pub(crate) struct RowVersionCommit<'a> {
+    pub(crate) table: &'a DuckLakeTable,
+    pub(crate) table_writer: &'a DuckLakeTableWriter,
+    pub(crate) context: Arc<TaskContext>,
+    pub(crate) schema_name: &'a str,
+    pub(crate) table_name: &'a str,
+    pub(crate) base_snapshot: i64,
+    /// Whether the writer stages row mutations
+    /// ([`MetadataWriter::supports_inlined_row_mutations`]).
+    pub(crate) inline_capable: bool,
+    /// The statement's scoped `data_inlining_row_limit` (`0` on a writer that
+    /// does not stage row mutations).
+    pub(crate) inline_limit: usize,
+}
+
+/// Commit an `UPDATE`'s new row versions and the deletion of the versions they
+/// supersede in one snapshot, as official's `UPDATE` does (see the module
+/// docs): `updated_batches` are `[physical columns..., rowid]`, each keeping
+/// its row's id; `superseded_positions` are each source file's superseded rows
+/// on a writer that stages row mutations, `pending_deletes` each source
+/// file's cumulative delete file `(data_file_id, live delete file, path,
+/// positions)` on any other, and `superseded_inlined` the inlined rows the new
+/// versions replace. Returns the committed snapshot.
+pub(crate) async fn commit_row_versions(
+    commit: &RowVersionCommit<'_>,
+    updated_batches: Vec<RecordBatch>,
+    superseded_positions: Vec<(&UpdateSourceScan, Vec<i64>)>,
+    pending_deletes: Vec<(i64, Option<i64>, String, Vec<i64>)>,
+    superseded_inlined: Vec<InlinedRowRef>,
+    total_updated: u64,
+) -> DataFusionResult<Option<i64>> {
+    let RowVersionCommit {
+        table,
+        table_writer,
+        context,
+        schema_name,
+        table_name,
+        base_snapshot,
+        inline_capable,
+        inline_limit,
+    } = commit;
+    let (table, table_writer, schema_name, table_name) =
+        (*table, *table_writer, *schema_name, *table_name);
+    let (base_snapshot, inline_capable, inline_limit) =
+        (*base_snapshot, *inline_capable, *inline_limit);
+    let context = Arc::clone(context);
+    let physical_schema = table.physical_schema();
+    validate_not_null_batches(physical_schema.as_ref(), &updated_batches)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    // Each source file's superseded rows are deleted as official's
+    // `DuckLakeDelete::FlushDelete` deletes them.
+    let mut deletions = FileDeletions::default();
+    for (scan, positions) in superseded_positions {
+        let target = DeletionTarget {
+            data_file_id: scan.data_file_id,
+            data_file_path: &scan.source_path,
+            record_count: scan.record_count,
+            delete_file: scan
+                .delete_file_id
+                .map(|id| (id, &scan.existing_parquet_deletes)),
+        };
+        deletions
+            .record(
+                table,
+                table_writer,
+                schema_name,
+                table_name,
+                &target,
+                positions,
+                inline_limit,
+                base_snapshot,
+            )
+            .await?;
+    }
+    let mut delete_entries: Vec<DeleteFileEntry> = std::mem::take(&mut deletions.positional);
+    for (data_file_id, expected_prev_delete_file, source_path, positions) in pending_deletes {
+        let delete_info = table_writer
+            .write_delete_file(schema_name, table_name, &source_path, &positions)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        delete_entries.push(DeleteFileEntry {
+            data_file_id,
+            expected_prev_delete_file,
+            delete: delete_info,
+        });
+    }
+
+    // The new versions without their rowid column, in the table's types.
+    let new_versions = updated_batches
+        .iter()
+        .map(|batch| {
+            let columns = batch.columns()[..batch.num_columns() - 1].to_vec();
+            RecordBatch::try_new(Arc::clone(&physical_schema), columns)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let inline_new_versions = total_updated <= inline_limit as u64
+        && table_writer
+            .should_inline(
+                schema_name,
+                table_name,
+                total_updated as usize,
+                physical_schema.as_ref(),
+                &new_versions,
+            )
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+    let staged = inline_capable
+        && (inline_new_versions
+            || deletions.needs_staged_commit()
+            || !superseded_inlined.is_empty());
+
+    // Append the rewritten rows (embedding their original rowids) AND
+    // apply every positional delete in ONE snapshot. The new versions keep
+    // the order they were read in: official's UPDATE plans no sort
+    // (`DuckLakeCatalog::PlanUpdate`), whatever `sort_on_insert` says.
+
+    if staged {
+        let (data, row_ids) = if inline_new_versions {
+            let row_ids = updated_batches
+                .iter()
+                .flat_map(|batch| {
+                    let ids = batch
+                        .column(batch.num_columns() - 1)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .expect("rowid column is Int64")
+                        .clone();
+                    ids.values().to_vec()
+                })
+                .collect::<Vec<_>>();
+            (StagedTableData::Inlined(new_versions), Some(row_ids))
+        } else {
+            let files = write_rewritten_files(
+                table_writer,
+                Arc::clone(&context),
+                schema_name,
+                table_name,
+                physical_schema.as_ref(),
+                base_snapshot,
+                updated_batches,
+            )
+            .await?;
+            (StagedTableData::Files(files), None)
+        };
+        let state = datafusion::execution::SessionStateBuilder::new()
+            .with_config(context.session_config().clone())
+            .with_runtime_env(context.runtime_env())
+            .build();
+        let latest = crate::delete_exec::LatestDeleteFiles {
+            table,
+            state: &state,
+        };
+        let mut transaction = table_writer.transaction();
+        transaction.set_delete_file_positions(&latest);
+        transaction
+            .stage_row_mutation(
+                schema_name,
+                table_name,
+                table.table_id(),
+                table.column_ids(),
+                physical_schema.as_ref(),
+                base_snapshot,
+                data,
+                row_ids,
+                delete_entries,
+                deletions.rewritten,
+                superseded_inlined,
+                deletions.inlined,
+                deletions.dropped,
+            )
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let committed = transaction
+            .commit()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        return Ok(committed.first().map(|result| result.snapshot_id));
+    }
+
+    let mut updated_batches = sorted_rewrite_batches(Arc::clone(&context), updated_batches, None)
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    let mut session = table_writer
+        .begin_write_with_embedded_rowid(
+            schema_name,
+            table_name,
+            physical_schema.as_ref(),
+            WriteMode::Append,
+        )
+        .map(|session| session.with_base_snapshot_id(base_snapshot))
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    while let Some(batch) = updated_batches.try_next().await? {
+        session
+            .write_batch(&batch)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    }
+    // The session removes the delete files with its own when the commit
+    // definitely registered nothing.
+    let committed = session
+        .finish_with_deletes(&delete_entries)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    Ok(Some(committed.snapshot_id))
+}
+
 /// Write the rewritten rows `[physical columns..., rowid]` to Parquet files
-/// that embed each row's row id, in the table's sort order and partition
-/// layout, without committing them.
+/// that embed each row's row id, in the table's partition layout and the
+/// order they arrive, without committing them.
 #[allow(clippy::too_many_arguments)]
 async fn write_rewritten_files(
     table_writer: &DuckLakeTableWriter,
@@ -504,9 +561,8 @@ async fn write_rewritten_files(
     physical_schema: &Schema,
     base_snapshot: i64,
     batches: Vec<RecordBatch>,
-    ordering: Option<&datafusion::physical_expr::LexOrdering>,
 ) -> DataFusionResult<Vec<DataFileInfo>> {
-    let mut batches = sorted_rewrite_batches(context, batches, ordering)
+    let mut batches = sorted_rewrite_batches(context, batches, None)
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
     let mut session = table_writer
         .begin_write_with_embedded_rowid(

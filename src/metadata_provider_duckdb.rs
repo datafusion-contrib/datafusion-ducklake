@@ -19,12 +19,12 @@ use crate::metadata_provider::{
     SQL_GET_TABLE_BY_NAME, SQL_GET_TABLE_COLUMN_STATS, SQL_GET_TABLE_STATS, SQL_GET_VIEW_BY_NAME,
     SQL_LIST_ALL_FILES, SQL_LIST_ALL_TABLES, SQL_LIST_ALL_VIEWS, SQL_LIST_COLUMN_TAGS,
     SQL_LIST_OBJECT_TAGS, SQL_LIST_SCHEMAS, SQL_LIST_SNAPSHOTS, SQL_LIST_TABLES, SQL_LIST_VIEWS,
-    SQL_TABLE_EXISTS, SchemaMetadata, SnapshotChangeMetadata, SnapshotMetadata, TableMetadata,
-    TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema, build_inlined_batch,
-    inlined_delete_table_name, inlined_file_delete_change, inlined_file_deletes_between_sql,
-    inlined_file_deletes_for_flush_sql, inlined_missing_scalar, inlined_version_columns_sql,
-    is_inlined_data_table, reconstruct_columns, reconstruct_columns_with_table,
-    resolve_metadata_settings,
+    SQL_TABLE_EXISTS, SchemaMetadata, SchemaVersionLedger, SnapshotChangeMetadata,
+    SnapshotMetadata, TableMetadata, TableWithSchema, TagTarget, ViewMetadata, ViewWithSchema,
+    build_inlined_batch, inlined_delete_table_name, inlined_file_delete_change,
+    inlined_file_deletes_between_sql, inlined_file_deletes_for_flush_sql, inlined_missing_scalar,
+    inlined_version_columns_sql, inlined_version_snapshot_sql, is_inlined_data_table,
+    reconstruct_columns, reconstruct_columns_with_table, resolve_metadata_settings,
 };
 use crate::partition::PartitionSpec;
 use crate::sort::SortSpec;
@@ -1042,15 +1042,34 @@ impl DuckdbMetadataProvider {
         shape: InlinedReadShape,
     ) -> crate::Result<Vec<DuckLakeInlinedRows>> {
         let conn = self.connection();
+        let ledger = self.schema_version_ledger(&conn)?;
         let mut out = Vec::new();
         for table in self.registered_inlined_tables(&conn, table_id)? {
             if let Some(rows) = read_duckdb_inlined_table(
-                &conn, table_id, &table, columns, selection, filter, shape,
+                &conn, table_id, &table, ledger, columns, selection, filter, shape,
             )? {
                 out.push(rows);
             }
         }
         Ok(out)
+    }
+
+    /// What the catalog's `ducklake_schema_versions` ledger records.
+    fn schema_version_ledger(&self, conn: &Connection) -> crate::Result<SchemaVersionLedger> {
+        if self.schema_capabilities(conn)?.schema_versions {
+            return Ok(SchemaVersionLedger::PerTable);
+        }
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM information_schema.tables
+             WHERE table_name = 'ducklake_schema_versions'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(if exists {
+            SchemaVersionLedger::Global
+        } else {
+            SchemaVersionLedger::Absent
+        })
     }
 
     /// Get a reference to the shared connection
@@ -1181,32 +1200,38 @@ impl DuckdbMetadataProvider {
 /// Read `selection` of the inlined-data table `table` of `table_id` under
 /// `columns`, each resolved by column id against the schema version the table
 /// was written with. `None` when no row matches.
+#[allow(clippy::too_many_arguments)]
 fn read_duckdb_inlined_table(
     conn: &Connection,
     table_id: i64,
     table: &str,
+    ledger: SchemaVersionLedger,
     columns: &[DuckLakeTableColumn],
     selection: InlinedRowSelection,
     filter: Option<&InlinedFilter>,
     shape: InlinedReadShape,
 ) -> crate::Result<Option<DuckLakeInlinedRows>> {
-    let schema: SchemaRef = Arc::new(shape.schema(columns)?);
+    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(columns)?);
     let InlinedTableLayout {
         system,
         present,
         physical_types,
     } = inlined_table_layout(conn, table)?;
-    let mut version = conn.prepare(&inlined_version_columns_sql(
-        &quote_ident(table),
-        &system,
-        "?",
-    ))?;
+    let mut version = conn.prepare(&inlined_version_columns_sql(table, ledger, "?"))?;
     let version_columns = version
         .query_map([table_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present);
+    let mapping = InlinedColumnMapping::resolve(columns, &version_columns, &present)?;
+    let target_schema = schema;
+    let decode_columns = mapping.decode_columns(columns);
+    let schema: SchemaRef = Arc::new(crate::types::build_arrow_schema(&decode_columns)?);
 
     let mut select_list = selection
         .system_select(&system)
@@ -1231,7 +1256,7 @@ fn read_duckdb_inlined_table(
         }
     }));
     let rendered = filter.and_then(|filter| {
-        let (filter, filter_schema) = mapping.physical_filter(columns, &schema, filter)?;
+        let (filter, filter_schema) = mapping.physical_filter(columns, &target_schema, filter)?;
         render_inlined_filter(
             &filter,
             InlinedSqlDialect::DuckDb,
@@ -1299,7 +1324,11 @@ fn read_duckdb_inlined_table(
         row_ids,
         snapshots,
         end_snapshots,
-        batch: build_inlined_batch(schema, columns, &rows)?,
+        batch: mapping.adapt(
+            build_inlined_batch(schema, &decode_columns, &rows)?,
+            target_schema,
+            columns,
+        )?,
     }))
 }
 
@@ -1378,6 +1407,51 @@ impl MetadataProvider for DuckdbMetadataProvider {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(snapshots)
+    }
+
+    fn snapshot_ids_between(
+        &self,
+        from_snapshot: i64,
+        through_snapshot: i64,
+    ) -> crate::Result<Vec<i64>> {
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT snapshot_id FROM ducklake_snapshot
+             WHERE snapshot_id >= ? AND snapshot_id <= ?
+             ORDER BY snapshot_id",
+        )?;
+        let ids = statement
+            .query_map(duckdb::params![from_snapshot, through_snapshot], |row| {
+                row.get(0)
+            })?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> crate::Result<Vec<(i64, Option<String>)>> {
+        let pattern = crate::change_detection::table_change_like_pattern(table_id);
+        let conn = self.connection();
+        let mut statement = conn.prepare(
+            "SELECT snapshot.snapshot_id, changes.changes_made
+             FROM ducklake_snapshot AS snapshot
+             LEFT JOIN ducklake_snapshot_changes AS changes
+               ON changes.snapshot_id = snapshot.snapshot_id
+             WHERE snapshot.snapshot_id > ? AND snapshot.snapshot_id <= ?
+               AND (changes.changes_made IS NULL OR changes.changes_made LIKE ?)
+             ORDER BY snapshot.snapshot_id",
+        )?;
+        let rows = statement
+            .query_map(
+                duckdb::params![after_snapshot, through_snapshot, pattern],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn list_snapshot_changes(&self) -> crate::Result<Vec<SnapshotChangeMetadata>> {
@@ -2207,6 +2281,42 @@ impl MetadataProvider for DuckdbMetadataProvider {
         )
     }
 
+    fn oldest_inlined_row_snapshot(
+        &self,
+        table_id: i64,
+        snapshot_id: i64,
+    ) -> crate::Result<Option<i64>> {
+        let conn = self.connection();
+        let ledger = self.schema_version_ledger(&conn)?;
+        let mut oldest: Option<i64> = None;
+        for table in self.registered_inlined_tables(&conn, table_id)? {
+            let system = inlined_table_layout(&conn, &table)?.system;
+            let first: Option<i64> = conn.query_row(
+                &format!(
+                    "SELECT MIN({begin}) FROM {} WHERE {begin} <= ?",
+                    quote_ident(&table),
+                    begin = system.begin_snapshot,
+                ),
+                [snapshot_id],
+                |row| row.get(0),
+            )?;
+            // As the flush, which skips a table whose schema version it
+            // cannot resolve.
+            if first.is_none() {
+                continue;
+            }
+            let version: Option<i64> = conn.query_row(
+                &format!("SELECT {}", inlined_version_snapshot_sql(&table, ledger)),
+                [],
+                |row| row.get(0),
+            )?;
+            if version.is_some() {
+                oldest = oldest.into_iter().chain(first).min();
+            }
+        }
+        Ok(oldest)
+    }
+
     fn get_inlined_data_for_flush(
         &self,
         table_id: i64,
@@ -2214,8 +2324,9 @@ impl MetadataProvider for DuckdbMetadataProvider {
     ) -> crate::Result<Vec<DuckLakeInlinedFlushData>> {
         // The connection is released while the table structure is read, which
         // locks it again.
-        let versions = {
+        let (versions, ledger) = {
             let conn = self.connection();
+            let ledger = self.schema_version_ledger(&conn)?;
             let mut versions = Vec::new();
             for table in self.registered_inlined_tables(&conn, table_id)? {
                 let system = inlined_table_layout(&conn, &table)?.system;
@@ -2228,20 +2339,29 @@ impl MetadataProvider for DuckdbMetadataProvider {
                     [snapshot_id],
                     |row| row.get(0),
                 )?;
-                if let Some(first) = first {
-                    versions.push((table, first));
+                if first.is_none() {
+                    continue;
+                }
+                let version: Option<i64> = conn.query_row(
+                    &format!("SELECT {}", inlined_version_snapshot_sql(&table, ledger)),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if let Some(version) = version {
+                    versions.push((table, version));
                 }
             }
-            versions
+            (versions, ledger)
         };
         let mut flushed = Vec::new();
-        for (table, first) in versions {
-            let columns = self.get_table_structure(table_id, first)?;
+        for (table, version) in versions {
+            let columns = self.get_table_structure(table_id, version)?;
             let conn = self.connection();
             if let Some(rows) = read_duckdb_inlined_table(
                 &conn,
                 table_id,
                 &table,
+                ledger,
                 &columns,
                 InlinedRowSelection::WrittenUpTo(snapshot_id),
                 None,
@@ -2250,7 +2370,7 @@ impl MetadataProvider for DuckdbMetadataProvider {
                 flushed.push(DuckLakeInlinedFlushData {
                     rows,
                     columns,
-                    columns_snapshot: first,
+                    columns_snapshot: version,
                 });
             }
         }

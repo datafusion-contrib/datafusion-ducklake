@@ -351,8 +351,12 @@ impl Harness {
         }
     }
 
+    /// A table writer that writes every row to Parquet; a scenario that needs
+    /// inlined rows sets its own limit.
     fn table_writer(&self) -> DuckLakeTableWriter {
-        DuckLakeTableWriter::new(self.writer(), Arc::new(LocalFileSystem::new())).unwrap()
+        DuckLakeTableWriter::new(self.writer(), Arc::new(LocalFileSystem::new()))
+            .unwrap()
+            .with_options(&DuckLakeWriteOptions::default().with_data_inlining_row_limit(0))
     }
 }
 

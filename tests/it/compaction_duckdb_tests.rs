@@ -20,7 +20,11 @@ use tempfile::TempDir;
 async fn duckdb_compaction_retains_origin_metadata_and_rows() {
     let temp = TempDir::new().unwrap();
     let database = temp.path().join("catalog.ducklake");
-    let writer = Arc::new(DuckdbMetadataWriter::new_with_init(database.to_str().unwrap()).unwrap());
+    let writer = Arc::new(
+        DuckdbMetadataWriter::new_with_init(database.to_str().unwrap())
+            .unwrap()
+            .with_data_inlining_row_limit(0),
+    );
     writer
         .set_data_path(temp.path().join("data").to_str().unwrap())
         .unwrap();

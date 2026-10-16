@@ -41,7 +41,8 @@ async fn crate_write_produces_duckdb_canonical_column_stats() {
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
     let writer = SqliteMetadataWriter::new_with_init(&conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     // id: 1..3 (no nulls); name: Alice/Bob/NULL; d: 2020-01-01/-05/-03 (day
@@ -322,7 +323,8 @@ async fn write_timestamptz_files() -> (TempDir, String, Vec<i64>, Vec<i64>) {
     let conn_str = format!("{db_url}?mode=rwc");
     let writer = SqliteMetadataWriter::new_with_init(&conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -540,7 +542,8 @@ async fn float_with_nan_records_bounds_without_nan() {
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
     let writer = SqliteMetadataWriter::new_with_init(&conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
@@ -604,7 +607,8 @@ async fn setup_float_table(
     let conn_str = format!("sqlite:{}?mode=rwc", db_path.display());
     let writer = SqliteMetadataWriter::new_with_init(&conn_str)
         .await
-        .unwrap();
+        .unwrap()
+        .with_data_inlining_row_limit(0);
     writer.set_data_path(data_path.to_str().unwrap()).unwrap();
 
     let schema = Arc::new(Schema::new(vec![

@@ -73,6 +73,7 @@
 //! worth knowing if you are counting them.
 
 pub mod catalog;
+pub mod change_detection;
 pub mod column_rename;
 pub mod delete_filter;
 pub mod encryption;
@@ -89,6 +90,7 @@ pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
 pub(crate) mod row_lineage;
+pub mod rowid_lookup;
 pub mod schema;
 mod snapshot_changes;
 mod snapshot_consistency;
@@ -117,6 +119,10 @@ pub mod compaction;
 #[cfg(feature = "write")]
 pub mod delete_exec;
 #[cfg(feature = "write")]
+pub(crate) mod duckdb_cast;
+#[cfg(feature = "write-postgres")]
+pub mod fork;
+#[cfg(feature = "write")]
 pub mod inlined_flush;
 #[cfg(any(
     feature = "write-sqlite",
@@ -127,6 +133,8 @@ pub mod inlined_flush;
 pub(crate) mod inlined_reclaim;
 #[cfg(feature = "write")]
 pub mod insert_exec;
+#[cfg(feature = "write")]
+pub mod keyed_mutation;
 #[cfg(feature = "write")]
 pub mod maintenance;
 #[cfg(feature = "write")]
@@ -170,6 +178,7 @@ pub use metadata_provider::{
     TagObjectType, TagTarget,
 };
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
+pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};
 pub use schema::DuckLakeSchema;
 pub use snapshot_consistency::register_snapshot_consistency;
 pub use sort::{NullOrder, SortDirection, SortField, SortSpec};
@@ -193,10 +202,14 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
+#[cfg(feature = "write-postgres")]
+pub use fork::TableFork;
 #[cfg(feature = "write")]
 pub use inlined_flush::FlushedInlinedTable;
 #[cfg(feature = "write")]
 pub use insert_exec::DuckLakeInsertExec;
+#[cfg(feature = "write")]
+pub use keyed_mutation::{KeyedMutation, KeyedMutationResult};
 #[cfg(feature = "write")]
 pub use metadata_writer::{
     ColumnDef, ColumnStat, CommitIds, CompactionOutputFile, CompactionSourceFile, DataFileInfo,
@@ -223,8 +236,8 @@ pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]
 pub use table_writer::{
-    DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, TableWriteOptions,
-    TableWriteSession,
+    DuckLakeTableWriter, DuckLakeWriteOptions, DuckLakeWriteTransaction, InlinedFlushPolicy,
+    TableWriteOptions, TableWriteSession,
 };
 #[cfg(feature = "write")]
 pub use update_exec::DuckLakeUpdateExec;

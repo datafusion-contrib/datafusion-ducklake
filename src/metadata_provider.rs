@@ -493,22 +493,76 @@ pub struct SnapshotChangeMetadata {
     pub commit_extra_info: Option<String>,
 }
 
+/// A snapshot time, or a time given to resolve a snapshot by, as a UTC
+/// instant: `YYYY-MM-DD`, or a date and a time (` ` or `T` between them, an
+/// optional fraction) followed by an optional UTC offset (`Z`, ` UTC`, or
+/// `±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS`), which is how the backends print a
+/// snapshot's `snapshot_time` (PostgreSQL's and DuckDB's `TIMESTAMPTZ` in the
+/// session's time zone, e.g. `2026-07-16 14:00:00.5+05:30`). A time without
+/// an offset is UTC.
 pub(crate) fn parse_snapshot_timestamp(raw: &str) -> Option<chrono::NaiveDateTime> {
-    let mut timestamp = raw.trim();
-    for suffix in ["Z", " UTC", "+00:00", "+00"] {
-        if let Some(stripped) = timestamp.strip_suffix(suffix) {
-            timestamp = stripped.trim();
-            break;
+    let raw = raw.trim();
+    let (local, offset_seconds) = split_utc_offset(raw)?;
+    let local = local.trim();
+    let parsed = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"]
+        .iter()
+        .find_map(|format| chrono::NaiveDateTime::parse_from_str(local, format).ok())
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(local, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })?;
+    parsed.checked_sub_signed(chrono::TimeDelta::seconds(offset_seconds))
+}
+
+/// `raw` split into its local date and time and its UTC offset in seconds
+/// (`0` when it has none); `None` for a malformed offset.
+fn split_utc_offset(raw: &str) -> Option<(&str, i64)> {
+    for suffix in ["Z", " UTC"] {
+        if let Some(local) = raw.strip_suffix(suffix) {
+            return Some((local, 0));
         }
     }
-    for format in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
-        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(timestamp, format) {
-            return Some(parsed);
-        }
+    // An offset's sign follows the time: past the date's `YYYY-MM-DD`.
+    let Some(sign_at) = raw
+        .char_indices()
+        .skip(10)
+        .find(|(_, c)| matches!(c, '+' | '-'))
+        .map(|(at, _)| at)
+    else {
+        return Some((raw, 0));
+    };
+    let (local, offset) = raw.split_at(sign_at);
+    let negative = offset.starts_with('-');
+    let digits = &offset[1..];
+    let parts: Vec<&str> = if digits.contains(':') {
+        digits.split(':').collect()
+    } else if digits.len() == 4 {
+        vec![&digits[..2], &digits[2..]]
+    } else {
+        vec![digits]
+    };
+    if parts.is_empty()
+        || parts.len() > 3
+        || parts
+            .iter()
+            .any(|part| part.len() != 2 || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
     }
-    chrono::NaiveDate::parse_from_str(timestamp, "%Y-%m-%d")
-        .ok()
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
+    let seconds = parts
+        .iter()
+        .zip([3600, 60, 1])
+        .map(|(part, unit)| part.parse::<i64>().unwrap_or(0) * unit)
+        .sum::<i64>();
+    Some((
+        local,
+        if negative {
+            -seconds
+        } else {
+            seconds
+        },
+    ))
 }
 
 pub(crate) fn resolve_snapshot_at_or_before(
@@ -779,10 +833,11 @@ pub struct DuckLakeInlinedFlushData {
     /// [`Self::columns`]. `snapshots` holds each row's `begin_snapshot` and
     /// `end_snapshots` the snapshot that deleted it, `None` while it is live.
     pub rows: DuckLakeInlinedRows,
-    /// The table's columns at the snapshot that inserted the table's first
-    /// row. Every row of one inlined table was written at that table's schema
-    /// version, so these are the columns its Parquet file is written with, the
-    /// way official DuckLake binds the table entry of the inlined table's schema
+    /// The table's columns at the snapshot its inlined table's registered
+    /// schema version began (`ducklake_inlined_data_tables.schema_version`
+    /// looked up in `ducklake_schema_versions`, else the table's creation).
+    /// These are the columns its Parquet file is written with, the way
+    /// official DuckLake binds the table entry of the inlined table's schema
     /// version (`GetBeginSnapshotForSchemaVersion`).
     pub columns: Vec<DuckLakeTableColumn>,
     /// The snapshot `columns` were read at.
@@ -1347,32 +1402,21 @@ impl InlinedRowSelection {
 /// data columns of an inlined-row query.
 pub(crate) const INLINED_SYSTEM_SELECT_WIDTH: usize = 3;
 
-/// What a backend's inlined-row read serves, which fixes its Arrow schema and
-/// row order.
+/// What a backend's inlined-row read serves, which fixes its row order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InlinedReadShape {
-    /// A table scan: read-compatible types, rows in row-id order.
+    /// A table scan: rows in row-id order.
     Scan,
-    /// Mutation planning: the catalog's exact types, rows in write order.
+    /// Mutation planning: rows in write order.
     Mutation,
-    /// A `rowid` scan or change feed: read-compatible types, rows by snapshot.
+    /// A `rowid` scan or change feed: rows by snapshot.
     Changes,
-    /// A flush: the catalog's exact types, rows by `(row_id, begin_snapshot)`
-    /// as official's flush scan orders them.
+    /// A flush: rows by `(row_id, begin_snapshot)` as official's flush scan
+    /// orders them.
     Flush,
 }
 
 impl InlinedReadShape {
-    pub(crate) fn schema(
-        &self,
-        columns: &[DuckLakeTableColumn],
-    ) -> Result<arrow::datatypes::Schema> {
-        match self {
-            Self::Scan | Self::Changes => crate::types::build_arrow_schema(columns),
-            Self::Mutation | Self::Flush => crate::types::build_strict_arrow_schema(columns),
-        }
-    }
-
     pub(crate) fn order_by(
         &self,
         system: &InlinedSystemColumns,
@@ -1461,27 +1505,158 @@ pub(crate) fn inlined_file_deletes_between_sql(
     )
 }
 
-/// SQL listing the top-level columns (`column_id`, `column_name`) of the schema
-/// version a physical inlined-data table was written with. Every row of the
-/// table was written under that version, so its oldest `begin_snapshot` names a
-/// snapshot that sees it. No rows means an empty table. One placeholder: the
-/// table id.
+/// What a catalog's `ducklake_schema_versions` ledger records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "metadata-duckdb", feature = "metadata-postgres")), allow(dead_code))]
+pub(crate) enum SchemaVersionLedger {
+    /// One row per table and schema version (`table_id`, DuckLake 0.4 on).
+    PerTable,
+    /// One row per catalog-wide schema version (before `table_id`).
+    Global,
+    /// No ledger table.
+    Absent,
+}
+
+/// How [`inlined_version_snapshot_sql`] finds the schema version an inlined
+/// data table was registered for: from the catalog's ledger, and, in a
+/// multi-catalog PostgreSQL store (`catalog_scoped`), among its own catalog's
+/// snapshots only, since each catalog numbers its schema versions itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InlinedVersionLookup {
+    pub(crate) ledger: SchemaVersionLedger,
+    pub(crate) catalog_scoped: bool,
+    /// Whether the catalog's SQL reads `\` in a quoted string as an escape
+    /// (MySQL), so a table name is written as a [`text_literal`] that means
+    /// the same in either mode.
+    pub(crate) backslash_escapes: bool,
+}
+
+impl From<SchemaVersionLedger> for InlinedVersionLookup {
+    fn from(ledger: SchemaVersionLedger) -> Self {
+        Self {
+            ledger,
+            catalog_scoped: false,
+            backslash_escapes: false,
+        }
+    }
+}
+
+/// `text` as an SQL string literal: quoted, its quotes doubled. Where the
+/// catalog's SQL reads `\` as an escape (`backslash_escapes`, MySQL unless
+/// `NO_BACKSLASH_ESCAPES` is set), text holding one is written as a
+/// hexadecimal `utf8mb4` literal instead, which means the same in either
+/// mode.
+pub(crate) fn text_literal(text: &str, backslash_escapes: bool) -> String {
+    if backslash_escapes && text.contains('\\') {
+        let hex: String = text.bytes().map(|byte| format!("{byte:02X}")).collect();
+        return format!("_utf8mb4 X'{hex}'");
+    }
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// SQL scalar expression for the snapshot at which the schema version the
+/// inlined data table `inlined_data_table` was registered for began, as
+/// official's `GetBeginSnapshotForSchemaVersion` finds it: the table's
+/// `ducklake_inlined_data_tables.schema_version` looked up in
+/// `ducklake_schema_versions`.
+///
+/// When the ledger has no row for it (a table never altered, a catalog
+/// upgraded from before `ducklake_schema_versions.table_id`, or one without
+/// the ledger), official falls back to the table's own `begin_snapshot`
+/// (`GetBeginSnapshotForTable`), but binds through its schema cache, keyed by
+/// schema version: a scan of a snapshot of that version reads the version's
+/// columns, and only an uncached older version reads the table's first
+/// columns, which its inlined table may not hold. This reads the version's
+/// columns always: the first snapshot of the table's life with that
+/// `schema_version`, else the table's `begin_snapshot`.
+pub(crate) fn inlined_version_snapshot_sql(
+    inlined_data_table: &str,
+    lookup: impl Into<InlinedVersionLookup>,
+) -> String {
+    let InlinedVersionLookup {
+        ledger,
+        catalog_scoped,
+        backslash_escapes,
+    } = lookup.into();
+    let name = text_literal(inlined_data_table, backslash_escapes);
+    // The snapshots a schema version of the table's catalog is looked up
+    // among, when other catalogs' snapshots share the store.
+    let catalog_snapshots = |column: &str| {
+        if catalog_scoped {
+            format!(
+                " AND {column} IN (\
+                   SELECT m.snapshot_id FROM ducklake_catalog_snapshot_map m \
+                   JOIN ducklake_catalog_schema_map cs ON cs.catalog_id = m.catalog_id \
+                   JOIN ducklake_table ct ON ct.schema_id = cs.schema_id \
+                   JOIN ducklake_inlined_data_tables cr ON cr.table_id = ct.table_id \
+                   WHERE cr.table_name = {name})"
+            )
+        } else {
+            String::new()
+        }
+    };
+    let table_begin = format!(
+        "(SELECT MIN(t.begin_snapshot) \
+          FROM ducklake_table t \
+          JOIN ducklake_inlined_data_tables r ON r.table_id = t.table_id \
+          WHERE r.table_name = {name})"
+    );
+    let version_begin = format!(
+        "(SELECT MIN(s.snapshot_id) \
+          FROM ducklake_snapshot s \
+          JOIN ducklake_inlined_data_tables r ON s.schema_version = r.schema_version \
+          WHERE r.table_name = {name} AND s.snapshot_id >= {table_begin}{scope})",
+        scope = catalog_snapshots("s.snapshot_id"),
+    );
+    let ledger_join = match ledger {
+        SchemaVersionLedger::PerTable => {
+            "sv.table_id = r.table_id AND sv.schema_version = r.schema_version".to_string()
+        },
+        SchemaVersionLedger::Global => format!(
+            "sv.schema_version = r.schema_version{}",
+            catalog_snapshots("sv.begin_snapshot")
+        ),
+        SchemaVersionLedger::Absent => {
+            return format!("COALESCE({version_begin}, {table_begin})");
+        },
+    };
+    format!(
+        "COALESCE(\
+           (SELECT MIN(sv.begin_snapshot) \
+            FROM ducklake_inlined_data_tables r \
+            JOIN ducklake_schema_versions sv ON {ledger_join} \
+            WHERE r.table_name = {name}), \
+           {version_begin}, \
+           {table_begin})"
+    )
+}
+
+/// SQL listing the columns (`column_id`, `column_name`, `column_type`,
+/// `parent_column`) of the schema version the physical inlined data table
+/// `inlined_data_table` was registered for, at the snapshot
+/// [`inlined_version_snapshot_sql`] finds, as official binds the table entry
+/// of that version. One placeholder: the table id.
 pub(crate) fn inlined_version_columns_sql(
     inlined_data_table: &str,
-    system: &InlinedSystemColumns,
+    ledger: impl Into<InlinedVersionLookup>,
     table_id: &str,
 ) -> String {
     format!(
-        "SELECT c.column_id, c.column_name \
+        "SELECT c.column_id, c.column_name, c.column_type, c.parent_column \
          FROM ducklake_column c \
-         CROSS JOIN (SELECT MIN({begin}) AS version_snapshot FROM {inlined_data_table}) v \
+         CROSS JOIN (SELECT {version} AS version_snapshot) v \
          WHERE c.table_id = {table_id} \
-           AND c.parent_column IS NULL \
            AND v.version_snapshot >= c.begin_snapshot \
-           AND (c.end_snapshot IS NULL OR v.version_snapshot < c.end_snapshot)",
-        begin = system.begin_snapshot,
+           AND (c.end_snapshot IS NULL OR v.version_snapshot < c.end_snapshot) \
+         ORDER BY c.column_order",
+        version = inlined_version_snapshot_sql(inlined_data_table, ledger),
     )
 }
+
+/// One row of [`inlined_version_columns_sql`]: `(column_id, column_name,
+/// column_type, parent_column)` of a column, nested ones included, as the
+/// schema version an inlined-data table was written with had it.
+pub(crate) type InlinedVersionColumn = (i64, String, String, Option<i64>);
 
 /// Where each requested column lives in one physical inlined-data table.
 ///
@@ -1490,9 +1665,19 @@ pub(crate) fn inlined_version_columns_sql(
 /// dropped and re-added under the same name is a different column there — it
 /// resolves by column id, never by name. A column the version did not have is
 /// absent and reads as its `initial_default`.
+///
+/// A nested column holds values of the shape it had in that version, so a
+/// struct field added, renamed or dropped since then (at any depth) differs
+/// from the current shape: such a column is decoded with its version's type
+/// ([`Self::decode_columns`]) and rebuilt in the current one by nested column
+/// id ([`Self::adapt`]), as official DuckLake reads each inlined table with its
+/// own schema version's types.
 #[derive(Debug, Clone)]
 pub(crate) struct InlinedColumnMapping {
     physical: Vec<Option<String>>,
+    /// Per requested column, the column as its table's schema version had it,
+    /// when it is nested and its shape differs from the current one.
+    version: Vec<Option<DuckLakeTableColumn>>,
 }
 
 impl InlinedColumnMapping {
@@ -1502,12 +1687,13 @@ impl InlinedColumnMapping {
     /// read — falls back to matching by name.
     pub(crate) fn resolve(
         columns: &[DuckLakeTableColumn],
-        version_columns: &[(i64, String)],
+        version_columns: &[InlinedVersionColumn],
         physical_names: &HashSet<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let by_id: HashMap<i64, &str> = version_columns
             .iter()
-            .map(|(id, name)| (*id, name.as_str()))
+            .filter(|(_, _, _, parent)| parent.is_none())
+            .map(|(id, name, _, _)| (*id, name.as_str()))
             .collect();
         let physical = columns
             .iter()
@@ -1520,10 +1706,112 @@ impl InlinedColumnMapping {
                 name.filter(|name| physical_names.contains(*name))
                     .map(str::to_string)
             })
+            .collect::<Vec<_>>();
+        let nested = |column: &DuckLakeTableColumn| {
+            column
+                .data_type()
+                .is_ok_and(|data_type| data_type.is_nested())
+        };
+        let mut version = vec![None; columns.len()];
+        if columns
+            .iter()
+            .zip(&physical)
+            .any(|(column, physical)| physical.is_some() && nested(column))
+        {
+            let shapes: HashMap<i64, DuckLakeTableColumn> = reconstruct_columns(
+                version_columns
+                    .iter()
+                    .map(|(id, name, column_type, parent)| {
+                        (
+                            DuckLakeTableColumn::new(*id, name.clone(), column_type.clone(), true),
+                            *parent,
+                        )
+                    })
+                    .collect(),
+            )?
+            .into_iter()
+            .map(|column| (column.column_id, column))
             .collect();
-        Self {
-            physical,
+            for (index, column) in columns.iter().enumerate() {
+                if physical[index].is_none()
+                    || !nested(column)
+                    || column.nested_column_ids.is_empty()
+                {
+                    continue;
+                }
+                let Some(shape) = shapes.get(&column.column_id).cloned() else {
+                    continue;
+                };
+                let (read, target) = (shape.data_type()?, column.data_type()?);
+                if read.is_nested()
+                    && !crate::nested_inline::same_nested_shape(
+                        &read,
+                        &shape.nested_column_ids,
+                        &target,
+                        &column.nested_column_ids,
+                    )
+                {
+                    version[index] = Some(shape);
+                }
+            }
         }
+        Ok(Self {
+            physical,
+            version,
+        })
+    }
+
+    /// `columns` as the inlined table holds them: each nested column whose
+    /// shape changed since takes its version's type, so the backend decodes
+    /// the stored values against the fields they were written with.
+    pub(crate) fn decode_columns(
+        &self,
+        columns: &[DuckLakeTableColumn],
+    ) -> Vec<DuckLakeTableColumn> {
+        columns
+            .iter()
+            .zip(&self.version)
+            .map(|(column, version)| {
+                let mut column = column.clone();
+                if let Some(version) = version {
+                    column.column_type = version.column_type.clone();
+                    column.data_type = version.data_type.clone();
+                    column.nested_column_ids = version.nested_column_ids.clone();
+                }
+                column
+            })
+            .collect()
+    }
+
+    /// `batch`, decoded under [`Self::decode_columns`], rebuilt as `schema`,
+    /// the current shape of `columns`.
+    pub(crate) fn adapt(
+        &self,
+        batch: RecordBatch,
+        schema: SchemaRef,
+        columns: &[DuckLakeTableColumn],
+    ) -> Result<RecordBatch> {
+        if self.version.iter().all(Option::is_none) {
+            return Ok(batch);
+        }
+        let read_schema = batch.schema();
+        let arrays = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(index, array)| match &self.version[index] {
+                None => Ok(Arc::clone(array)),
+                Some(version) => crate::nested_inline::adapt_nested_array(
+                    array,
+                    read_schema.field(index).data_type(),
+                    &version.nested_column_ids,
+                    schema.field(index).data_type(),
+                    &columns[index].nested_column_ids,
+                    &columns[index].nested_initial_defaults,
+                ),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(RecordBatch::try_new(schema, arrays)?)
     }
 
     /// The physical column holding `columns[index]`, if the table has it.
@@ -2255,6 +2543,76 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// `(snapshot_id, changes_made)` of the snapshots after `after_snapshot`,
+    /// through `through_snapshot`, whose `changes_made` may name table
+    /// `table_id` (a token ending in `:<table_id>`, or a longer id sharing that
+    /// prefix) or is not recorded, in snapshot order. Read by
+    /// [`crate::change_detection::table_data_changes`].
+    ///
+    /// Default: [`Self::list_snapshot_changes`], filtered here. The built-in
+    /// providers filter in the catalog query instead.
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        let needle = format!(":{table_id}");
+        Ok(self
+            .list_snapshot_changes()?
+            .into_iter()
+            .filter(|row| row.snapshot_id > after_snapshot && row.snapshot_id <= through_snapshot)
+            .filter(|row| {
+                row.changes_made
+                    .as_deref()
+                    .is_none_or(|changes| changes.contains(&needle))
+            })
+            .map(|row| (row.snapshot_id, row.changes_made))
+            .collect())
+    }
+
+    /// The ids of this catalog's snapshots from `from_snapshot` through
+    /// `through_snapshot`, ascending. Change detection reads them to find
+    /// snapshots expired from a window, whose ledger rows are gone.
+    ///
+    /// Default: [`Self::list_snapshots`], filtered here. The built-in
+    /// providers read only the range.
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .list_snapshots()?
+            .into_iter()
+            .map(|snapshot| snapshot.snapshot_id)
+            .filter(|id| *id >= from_snapshot && *id <= through_snapshot)
+            .collect())
+    }
+
+    /// Whether this catalog numbers its snapshots consecutively from `0`, as
+    /// official DuckLake and the single-catalog writers do, so a missing id
+    /// is an expired snapshot. A multi-catalog store shares one id sequence
+    /// among its catalogs and answers `false`.
+    ///
+    /// A provider that wraps another must forward this. The default `true` is
+    /// the conservative answer: a shared sequence read as consecutive shows
+    /// gaps that are not expirations, so change detection reports a change it
+    /// cannot rule out, never misses one.
+    fn snapshot_ids_are_consecutive(&self) -> bool {
+        true
+    }
+
+    /// The first snapshot of table `table_id`: the earliest `begin_snapshot`
+    /// of its `ducklake_table` rows, or `None` when it has none. Change
+    /// detection reads it on a catalog whose snapshot ids are not consecutive
+    /// ([`Self::snapshot_ids_are_consecutive`]), where a gap in the ids is
+    /// not an expiration: a table created at a snapshot since expired lost
+    /// the history before the first snapshot that survives it.
+    ///
+    /// Default: `None`. A provider answering `false` to
+    /// [`Self::snapshot_ids_are_consecutive`] implements it, and one that
+    /// wraps another forwards it.
+    fn table_first_snapshot(&self, _table_id: i64) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
     /// Find the first snapshot with live data files whose `commit_extra_info`
     /// equals or contains `needle`.
     ///
@@ -2313,6 +2671,12 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
     }
 
     /// Get table files for a specific snapshot
+    ///
+    /// Sees only Parquet data and delete files, never inlined rows or inlined
+    /// deletions. On a table with data inlining enabled, use
+    /// `DuckLakeTable::keyed_mutation` (with the `write` feature), a scan, or
+    /// [`DuckLakeTable::locate_rowids`](crate::DuckLakeTable::locate_rowids)
+    /// instead.
     fn get_table_files_for_select(
         &self,
         table_id: i64,
@@ -2592,6 +2956,21 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
             ));
         }
         Ok(Vec::new())
+    }
+
+    /// The smallest `begin_snapshot` among the rows of `table_id`'s
+    /// inlined-data tables with `begin_snapshot <= snapshot_id`, deleted ones
+    /// included: the oldest row a flush at `snapshot_id` moves. `None` when
+    /// there is none.
+    ///
+    /// The default reads [`Self::get_inlined_data_for_flush`] (and so refuses
+    /// as it does); the built-in providers ask the catalog for the minimum.
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .get_inlined_data_for_flush(table_id, snapshot_id)?
+            .into_iter()
+            .flat_map(|data| data.rows.snapshots)
+            .min())
     }
 
     /// Read the rows of `ducklake_inlined_delete_<table_id>` with
@@ -3154,6 +3533,30 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
+
+    /// A table name is one string literal in every dialect: quotes doubled,
+    /// and where `\` is an escape (MySQL) a name holding one written in hex.
+    #[test]
+    fn inlined_table_names_are_literals_in_every_dialect() {
+        let name = "ducklake_inlined_data_1_1'\\x";
+        let standard = inlined_version_snapshot_sql(name, SchemaVersionLedger::PerTable);
+        assert!(
+            standard.contains("'ducklake_inlined_data_1_1''\\x'"),
+            "{standard}"
+        );
+        let mysql = inlined_version_snapshot_sql(
+            name,
+            InlinedVersionLookup {
+                ledger: SchemaVersionLedger::PerTable,
+                catalog_scoped: false,
+                backslash_escapes: true,
+            },
+        );
+        let hex: String = name.bytes().map(|byte| format!("{byte:02X}")).collect();
+        assert!(mysql.contains(&format!("_utf8mb4 X'{hex}'")), "{mysql}");
+        assert!(!mysql.contains("'ducklake_inlined"), "{mysql}");
+        assert_eq!(text_literal("plain", true), "'plain'");
+    }
 
     #[cfg(any(
         feature = "metadata-postgres",

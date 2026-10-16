@@ -175,9 +175,9 @@ impl SnapshotFilterStream {
         let num_rows = batch.num_rows();
         let mut keep_indices: Vec<u32> = Vec::with_capacity(num_rows);
         for i in 0..num_rows {
-            // A NULL origin is treated as visible (defensive; the writer always
-            // populates it). Otherwise keep rows whose origin is <= read snapshot.
-            if snap.is_null(i) || snap.value(i) <= self.read_snapshot {
+            // Keep rows whose origin is <= the read snapshot. A NULL origin
+            // fails the comparison, as it fails official's `<=` filter.
+            if snap.is_valid(i) && snap.value(i) <= self.read_snapshot {
                 keep_indices.push(i as u32);
             }
         }

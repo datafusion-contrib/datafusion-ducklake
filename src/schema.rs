@@ -151,7 +151,11 @@ impl DuckLakeSchema {
     /// [`DuckLakeCatalog::with_write_options`](crate::DuckLakeCatalog::with_write_options)
     /// over them, except that a stored `data_inlining_row_limit` (table,
     /// schema or catalog-wide) outranks the options' one, as official's stored
-    /// settings outrank its `DATA_INLINING_ROW_LIMIT` attach option.
+    /// settings outrank its `DATA_INLINING_ROW_LIMIT` attach option (with
+    /// neither, the writer's own
+    /// [`MetadataWriter::data_inlining_row_limit`] applies, else `10`), and a
+    /// stored `sort_on_insert` outranks the options' one, as official has no
+    /// session override of it.
     #[cfg(feature = "write")]
     fn table_write_options(
         &self,
@@ -164,9 +168,20 @@ impl DuckLakeSchema {
         let stored =
             crate::table_writer::DuckLakeWriteOptions::from_metadata_settings_deferred(&settings);
         let stored_limit = stored.data_inlining_row_limit;
+        let stored_sort = stored.sort_on_insert;
         let mut options = stored.with_overrides(&self.write_options);
+        if settings.contains_key("sort_on_insert") {
+            options.sort_on_insert = stored_sort;
+        }
         if settings.contains_key("data_inlining_row_limit") {
             options.data_inlining_row_limit = stored_limit;
+        } else if self.write_options.data_inlining_row_limit.is_none()
+            && let Some(limit) = self
+                .writer
+                .as_ref()
+                .and_then(|writer| writer.data_inlining_row_limit())
+        {
+            options.data_inlining_row_limit = Some(limit);
         }
         Ok(options)
     }

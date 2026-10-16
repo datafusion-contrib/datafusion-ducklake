@@ -74,6 +74,7 @@ pub(crate) async fn drop_live_table(
     // strictly less than its own id, so concurrent writers (which
     // hold the same catalog FOR UPDATE lock we do) can't slip a
     // row in to invalidate the dense allocation.
+    crate::metadata_writer_postgres::utc_snapshot_time(tx).await?;
     let drop_snapshot: i64 = sqlx::query(
         "INSERT INTO ducklake_snapshot (snapshot_time, schema_version)
              VALUES (CURRENT_TIMESTAMP, 0) RETURNING snapshot_id",
@@ -196,6 +197,11 @@ pub async fn initialize_multicatalog_schema(pool: &PgPool) -> Result<()> {
     // Idempotent; MUST run here for the same reason as the migration above — this
     // is the bootstrap path callers actually use.
     crate::metadata_writer_postgres::migrate_file_ownership(pool).await?;
+    // Rewrite a `sort_on_insert` or `hive_file_pattern` an earlier release
+    // stored as a case variant of `true`. Idempotent.
+    sqlx::query(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -261,6 +267,11 @@ impl MulticatalogManager {
             pool,
             has_inlined_registry: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The manager's pool.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Build a catalog-scoped provider sharing this manager's pool.

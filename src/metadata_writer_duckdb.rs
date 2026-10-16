@@ -56,7 +56,6 @@ use crate::metadata_writer::{
     parse_inlined_index_columns, quote_snapshot_name, quote_snapshot_table, snapshot_has_change,
     staged_table_write_changes, table_storage_changes, top_level_column_ids,
     validate_delete_entries, validate_inlined_flush, validate_inlined_index_columns, validate_name,
-    validate_table_setting,
 };
 use crate::metadata_writer::{
     DroppedDataFile, InlinedFileDelete, InlinedFlushFileDelete, SQL_GLOBAL_INLINING_COLUMNS,
@@ -858,6 +857,28 @@ pub struct DuckdbMetadataWriter {
     conn: Arc<Mutex<Connection>>,
     catalog_path: String,
     commit_lock: Arc<Mutex<()>>,
+    data_inlining_row_limit: Option<usize>,
+}
+
+/// The writer's locked connection, with its `data_inlining_row_limit` in
+/// effect for the calls made through it.
+struct WriterConnection<'a> {
+    connection: MutexGuard<'a, Connection>,
+    _limit: crate::metadata_writer::WriterInliningLimitScope,
+}
+
+impl std::ops::Deref for WriterConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for WriterConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
 }
 
 impl DuckdbMetadataWriter {
@@ -978,6 +999,7 @@ impl DuckdbMetadataWriter {
             conn: Arc::new(Mutex::new(conn)),
             catalog_path,
             commit_lock: Arc::new(Mutex::new(())),
+            data_inlining_row_limit: None,
         })
     }
 
@@ -1004,8 +1026,28 @@ impl DuckdbMetadataWriter {
     /// Lock the shared connection. Panics only if a previous holder panicked
     /// mid-write (poisoned mutex), which cannot leave partial SQL committed
     /// because every mutating method wraps its work in a transaction.
-    fn connection(&self) -> MutexGuard<'_, Connection> {
-        self.conn.lock().expect("DuckDB connection mutex poisoned")
+    ///
+    /// The writer's `data_inlining_row_limit` is in effect while the guard
+    /// lives.
+    fn connection(&self) -> WriterConnection<'_> {
+        let connection = self.conn.lock().expect("DuckDB connection mutex poisoned");
+        WriterConnection {
+            connection,
+            _limit: crate::metadata_writer::WriterInliningLimitScope::enter(
+                self.data_inlining_row_limit,
+            ),
+        }
+    }
+
+    /// Set the `data_inlining_row_limit` this writer applies where the
+    /// catalog stores none at table, schema or catalog scope, as official's
+    /// `DATA_INLINING_ROW_LIMIT` attach option does; see
+    /// [`MetadataWriter::data_inlining_row_limit`]. `0` stores every write in
+    /// Parquet and creates no inlined data tables.
+    #[must_use]
+    pub fn with_data_inlining_row_limit(mut self, limit: usize) -> Self {
+        self.data_inlining_row_limit = Some(limit);
+        self
     }
 
     /// Expire snapshots and remove catalog rows no longer reachable from a
@@ -2275,6 +2317,18 @@ fn finalize_table_snapshot(
     // Reconcile the column generation SURGICALLY so each column keeps a stable
     // column_id (== parquet field_id): end only removed columns, insert only new
     // ones, and leave unchanged columns (and their ids) in place.
+    // Official refuses to drop a column its sort order references.
+    let dropped =
+        crate::metadata_writer::dropped_top_level_columns(&existing_catalog_columns, column_ids);
+    if !dropped.is_empty() {
+        let keys = tx
+            .prepare(crate::sort::LIVE_SORT_KEYS_SQL)?
+            .query_map(params![table_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        crate::sort::refuse_dropping_sort_columns(&keys, &dropped)?;
+    }
     let proposed_ids = column_ids.iter().copied().collect::<HashSet<_>>();
     let mut current_by_id: HashMap<i64, (i64, bool, String)> = HashMap::new();
     for (column_id, _name, ty, order, nullable, _parent_id) in &current {
@@ -2288,43 +2342,64 @@ fn finalize_table_snapshot(
         current_by_id.insert(*column_id, (*order, *nullable, ty.clone()));
     }
 
-    for (order, (column, column_id)) in proposed.iter().zip(column_ids).enumerate() {
+    let existing_orders = current.iter().map(|column| column.3).collect::<Vec<_>>();
+    let orders = crate::metadata_writer::proposed_column_orders(
+        &existing_catalog_columns,
+        &existing_orders,
+        &proposed,
+        column_ids,
+    );
+    for ((column, column_id), order) in proposed.iter().zip(column_ids).zip(orders) {
         let parent_id = column.parent_index.map(|index| column_ids[index]);
         match current_by_id.get(column_id) {
-            // Existing column kept: its id stays stable. Sync metadata only if it
-            // changed. A legacy list representation gets a snapshot-bounded row.
+            // A data write leaves a live column's row as it is, as official's
+            // does. A schema change that retypes it, changes its top-level
+            // nullability or moves it records a new row version, keeping the
+            // old one for time travel.
             Some((cur_order, cur_nullable, cur_type)) => {
-                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
-                if migrate_type {
-                    tx.execute(
-                        "UPDATE ducklake_column SET end_snapshot = ?
-                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
-                        params![snapshot_id, table_id, column_id],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO ducklake_column
-                             (column_id, table_id, column_name, column_type, column_order,
-                              nulls_allowed, parent_column, begin_snapshot)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        params![
-                            column_id,
-                            table_id,
-                            column.name.as_str(),
-                            column.ducklake_type.as_str(),
-                            order as i64,
-                            column.is_nullable,
-                            parent_id,
-                            snapshot_id
-                        ],
-                    )?;
-                } else if *cur_order != order as i64 || *cur_nullable != column.is_nullable {
-                    tx.execute(
-                        "UPDATE ducklake_column
-                         SET column_order = ?, nulls_allowed = ?
-                         WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
-                        params![order as i64, column.is_nullable, table_id, column_id],
-                    )?;
+                if !is_ddl {
+                    continue;
                 }
+                let migrate_type = catalog_column_type_requires_migration(cur_type, column);
+                let nullable = if column.parent_index.is_none() {
+                    column.is_nullable
+                } else {
+                    *cur_nullable
+                };
+                if !migrate_type && *cur_order == order && *cur_nullable == nullable {
+                    continue;
+                }
+                let column_type = if migrate_type {
+                    column.ducklake_type.as_str()
+                } else {
+                    cur_type.as_str()
+                };
+                tx.execute(
+                    "UPDATE ducklake_column SET end_snapshot = ?
+                     WHERE table_id = ? AND column_id = ? AND end_snapshot IS NULL",
+                    params![snapshot_id, table_id, column_id],
+                )?;
+                tx.execute(
+                    "INSERT INTO ducklake_column
+                         (column_id, table_id, column_name, column_type, column_order,
+                          nulls_allowed, parent_column, begin_snapshot, initial_default,
+                          default_value, default_value_type, default_value_dialect)
+                     SELECT column_id, table_id, column_name, ?, ?, ?, parent_column, ?,
+                            initial_default, default_value, default_value_type,
+                            default_value_dialect
+                     FROM ducklake_column
+                     WHERE table_id = ? AND column_id = ? AND end_snapshot = ?
+                     LIMIT 1",
+                    params![
+                        column_type,
+                        order,
+                        nullable,
+                        snapshot_id,
+                        table_id,
+                        column_id,
+                        snapshot_id
+                    ],
+                )?;
             },
             // Newly added column: insert it with its reserved id.
             None => {
@@ -2339,7 +2414,7 @@ fn finalize_table_snapshot(
                         table_id,
                         column.name.as_str(),
                         column.ducklake_type.as_str(),
-                        order as i64,
+                        order,
                         column.is_nullable,
                         parent_id,
                         snapshot_id,
@@ -2398,7 +2473,7 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
         })?;
     let proposed = catalog_column_defs(&write.columns)?;
     let mut statement = tx.prepare(
-        "SELECT column_id, column_type, nulls_allowed, parent_column
+        "SELECT column_id, column_name, column_type, nulls_allowed, parent_column
          FROM ducklake_column
          WHERE table_id = ? AND end_snapshot IS NULL
          ORDER BY column_order",
@@ -2406,10 +2481,13 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
     let current = statement
         .query_map(params![write.table_id], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<bool>>(2)?.unwrap_or(true),
-                row.get::<_, Option<i64>>(3)?,
+                ExistingCatalogColumn {
+                    column_id: row.get(0)?,
+                    name: row.get(1)?,
+                    ducklake_type: row.get(2)?,
+                    parent_column: row.get(4)?,
+                },
+                row.get::<_, Option<bool>>(3)?.unwrap_or(true),
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2417,37 +2495,17 @@ fn validate_staged_table(tx: &Transaction<'_>, write: &StagedTableWrite) -> Resu
     if current.is_empty() && proposed.len() == write.column_ids.len() {
         return Ok(schema_id);
     }
-    if current.len() != proposed.len() || proposed.len() != write.column_ids.len() {
+    let (existing, nullability): (Vec<_>, Vec<_>) = current.into_iter().unzip();
+    if !crate::metadata_writer::staged_columns_match(
+        &existing,
+        &nullability,
+        &proposed,
+        &write.column_ids,
+    ) {
         return Err(crate::DuckLakeError::Conflict(format!(
-            "multi-table write target {}.{} changed schema after staging: catalog has {} nodes, \
-             staged schema has {} nodes and {} field IDs",
-            write.schema_name,
-            write.table_name,
-            current.len(),
-            proposed.len(),
-            write.column_ids.len(),
+            "multi-table write target {}.{} changed schema after staging",
+            write.schema_name, write.table_name
         )));
-    }
-    for (index, ((column_id, column_type, nullable, parent_id), proposed)) in
-        current.iter().zip(&proposed).enumerate()
-    {
-        let proposed_parent = proposed.parent_index.map(|parent| write.column_ids[parent]);
-        if *column_id != write.column_ids[index]
-            || !catalog_column_type_equal(column_type, proposed)
-            || *nullable != proposed.is_nullable
-            || *parent_id != proposed_parent
-        {
-            return Err(crate::DuckLakeError::Conflict(format!(
-                "multi-table write target {}.{} changed schema after staging at node {index}: \
-                 catalog ({column_id}, {column_type}, nullable={nullable}, parent={parent_id:?}), \
-                 staged ({}, {}, nullable={}, parent={proposed_parent:?})",
-                write.schema_name,
-                write.table_name,
-                write.column_ids[index],
-                proposed.ducklake_type,
-                proposed.is_nullable,
-            )));
-        }
     }
     Ok(schema_id)
 }
@@ -3063,6 +3121,50 @@ impl DuckdbMetadataWriter {
     }
 }
 
+impl DuckdbMetadataWriter {
+    /// The `(scope, scope_id, value)` rows storing option `key`, with the
+    /// live ids of `schema_name` and its `table_name` when they exist.
+    #[allow(clippy::type_complexity)]
+    fn scoped_setting_rows(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        key: &str,
+    ) -> Result<(
+        Vec<(Option<String>, Option<i64>, String)>,
+        Option<i64>,
+        Option<i64>,
+    )> {
+        let conn = self.connection();
+        let schema_id: Option<i64> = conn
+            .query_row(
+                "SELECT schema_id FROM ducklake_schema
+                 WHERE schema_name = ? AND end_snapshot IS NULL",
+                params![schema_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let table_id: Option<i64> = match schema_id {
+            Some(schema_id) => conn
+                .query_row(
+                    "SELECT table_id FROM ducklake_table
+                     WHERE schema_id = ? AND table_name = ? AND end_snapshot IS NULL",
+                    params![schema_id, table_name],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+        let settings = conn
+            .prepare("SELECT scope, scope_id, value FROM ducklake_metadata WHERE key = ?")?
+            .query_map(params![key], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<(Option<String>, Option<i64>, String)>, _>>()?;
+        Ok((settings, schema_id, table_id))
+    }
+}
+
 impl MetadataWriter for DuckdbMetadataWriter {
     fn maintenance(&self) -> Option<&dyn crate::maintenance::CatalogMaintenance> {
         Some(self)
@@ -3146,6 +3248,11 @@ impl MetadataWriter for DuckdbMetadataWriter {
     }
 
     fn set_global_setting(&self, key: &str, value: &str) -> Result<()> {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let key = key.as_str();
+        let value = crate::metadata_writer::normalize_setting_value(key, value)?;
+        let value = value.as_str();
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         if enables_inlining(key, value) {
@@ -3168,8 +3275,72 @@ impl MetadataWriter for DuckdbMetadataWriter {
         Ok(())
     }
 
+    fn data_inlining_row_limit(&self) -> Option<usize> {
+        self.data_inlining_row_limit
+    }
+
+    fn table_data_inlining_row_limit(&self, schema_name: &str, table_name: &str) -> Result<usize> {
+        let (settings, schema_id, table_id) =
+            self.scoped_setting_rows(schema_name, table_name, "data_inlining_row_limit")?;
+        // With this writer's limit in effect, as every call of it has.
+        let _scope =
+            crate::metadata_writer::WriterInliningLimitScope::enter(self.data_inlining_row_limit);
+        crate::metadata_writer::effective_inlining_limit_of(&settings, schema_id, table_id)
+    }
+
+    fn table_setting(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let (settings, schema_id, table_id) =
+            self.scoped_setting_rows(schema_name, table_name, key)?;
+        Ok(crate::metadata_writer::scoped_setting_of(
+            &settings, schema_id, table_id,
+        ))
+    }
+
+    fn set_schema_setting(&self, schema_id: i64, key: &str, value: &str) -> Result<()> {
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+        let value = value.as_str();
+        let mut conn = self.connection();
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ducklake_schema WHERE schema_id = ? AND end_snapshot IS NULL)",
+            params![schema_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(crate::DuckLakeError::SchemaNotFound(schema_id.to_string()));
+        }
+        if enables_inlining(&key, value) {
+            let columns = tx
+                .prepare(crate::metadata_writer::SQL_SCHEMA_INLINING_COLUMNS)?
+                .query_map(params![schema_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<Vec<(String, String)>, _>>()?;
+            let system = crate::metadata_provider_duckdb::catalog_inlined_system_columns(&tx)?;
+            reject_reserved_inlining_columns(&columns, system)?;
+        }
+        tx.execute(
+            "DELETE FROM ducklake_metadata WHERE key = ? AND scope = 'schema' AND scope_id = ?",
+            params![key, schema_id],
+        )?;
+        tx.execute(
+            "INSERT INTO ducklake_metadata (key, value, scope, scope_id) VALUES (?, ?, 'schema', ?)",
+            params![key, value, schema_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn set_table_setting(&self, table_id: i64, key: &str, value: &str) -> Result<()> {
-        let key = validate_table_setting(key)?;
+        // Option names are case-insensitive; official stores them lowercased.
+        let key = key.to_ascii_lowercase();
+        let value = crate::metadata_writer::normalize_setting_value(&key, value)?;
+        let value = value.as_str();
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         let exists: bool = tx.query_row(
@@ -3495,9 +3666,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let last_column_id = reserve_ids(&tx, "next_column_id", n)?;
         let first_column_id = last_column_id - n + 1;
         let column_ids = (first_column_id..=last_column_id).collect::<Vec<_>>();
-        for (order, (column, column_id)) in
-            catalog_columns.iter().zip(column_ids.iter()).enumerate()
-        {
+        for (column, column_id) in catalog_columns.iter().zip(column_ids.iter()) {
             let parent_id = column.parent_index.map(|index| column_ids[index]);
             tx.execute(
                 "INSERT INTO ducklake_column
@@ -3510,7 +3679,8 @@ impl MetadataWriter for DuckdbMetadataWriter {
                     table_id,
                     column.name.as_str(),
                     column.ducklake_type.as_str(),
-                    order as i64,
+                    // Official numbers a column it creates by its id.
+                    *column_id,
                     column.is_nullable,
                     parent_id,
                     snapshot_id,
@@ -5178,33 +5348,22 @@ impl MetadataWriter for DuckdbMetadataWriter {
             row.get(0)
         })?;
         let (new_snapshot, _carried) = insert_snapshot(&tx)?;
+        // Official bumps the schema version on every sort-order change, with no
+        // `ducklake_schema_versions` row (checked with the DuckDB CLI).
+        bump_schema_version(&tx, new_snapshot)?;
 
         // Validate every sort key resolves to a live column (v1 supports bare column
         // keys only), so a bad SET fails here rather than silently producing
-        // unsorted writes later.
-        for field in fields {
-            let column = field.column_candidate().ok_or_else(|| {
-                crate::DuckLakeError::InvalidConfig(format!(
-                    "set_sort_spec: sort key '{}' is not a bare column; only column \
-                     sort keys are supported",
-                    field.expression
-                ))
-            })?;
-            let exists: Option<i64> = tx
-                .query_row(
-                    "SELECT column_id FROM ducklake_column
-                     WHERE table_id = ? AND column_name = ? AND end_snapshot IS NULL
-                       AND parent_column IS NULL",
-                    params![table_id, column.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if exists.is_none() {
-                return Err(crate::DuckLakeError::InvalidConfig(format!(
-                    "set_sort_spec: no live column '{column}' in table {table_id}"
-                )));
-            }
-        }
+        // unsorted writes later. A key binds to its column ignoring case, as
+        // DuckDB's binder binds it.
+        let names = tx
+            .prepare(
+                "SELECT column_name FROM ducklake_column
+                 WHERE table_id = ? AND end_snapshot IS NULL AND parent_column IS NULL",
+            )?
+            .query_map(params![table_id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        crate::sort::check_sort_key_columns(fields, &names)?;
 
         tx.execute(
             "UPDATE ducklake_sort_info SET end_snapshot = ?
@@ -5234,8 +5393,6 @@ impl MetadataWriter for DuckdbMetadataWriter {
                 ],
             )?;
         }
-
-        // A sort-order change does NOT bump schema_version.
         record_snapshot_changes(
             &tx,
             new_snapshot,
@@ -5250,22 +5407,12 @@ impl MetadataWriter for DuckdbMetadataWriter {
         let mut conn = self.connection();
         let tx = conn.transaction()?;
         let (new_snapshot, _carried) = insert_snapshot(&tx)?;
-        let ended = tx.execute(
+        bump_schema_version(&tx, new_snapshot)?;
+        tx.execute(
             "UPDATE ducklake_sort_info SET end_snapshot = ?
              WHERE table_id = ? AND end_snapshot IS NULL",
             params![new_snapshot, table_id],
         )?;
-        if ended == 0 {
-            // Nothing to reset: roll back the snapshot and report the head.
-            drop(tx);
-            let head: i64 = conn.query_row(
-                "SELECT COALESCE(MAX(snapshot_id), 0) FROM ducklake_snapshot",
-                [],
-                |row| row.get(0),
-            )?;
-            return Ok(head);
-        }
-        // A sort-order change does NOT bump schema_version.
         record_snapshot_changes(
             &tx,
             new_snapshot,
@@ -5461,6 +5608,7 @@ impl MetadataWriter for DuckdbMetadataWriter {
              UPDATE ducklake_schema SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';
              UPDATE ducklake_table SET path = path || '/' WHERE path <> '' AND path NOT LIKE '%/';",
         )?;
+        conn.execute_batch(crate::metadata_writer::SQL_CANONICALIZE_LEGACY_BOOLEAN_SETTINGS)?;
         Ok(())
     }
 

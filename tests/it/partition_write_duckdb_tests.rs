@@ -439,7 +439,9 @@ async fn duckdb_empty_delete_finish_commits_a_partitioned_append() {
     let table_id;
     let committed;
     {
-        let writer = DuckdbMetadataWriter::new_with_init(&db_str).unwrap();
+        let writer = DuckdbMetadataWriter::new_with_init(&db_str)
+            .unwrap()
+            .with_data_inlining_row_limit(0);
         writer.set_data_path(data.to_str().unwrap()).unwrap();
 
         let cols = vec![

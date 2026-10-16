@@ -120,7 +120,10 @@ fn invalid_change(token: &str) -> DataFusionError {
     DataFusionError::Execution(format!("Invalid DuckLake snapshot change: {token}"))
 }
 
-fn display_identifier(name: &str) -> String {
+/// `name` as DuckDB writes an identifier (`KeywordHelper::WriteOptionallyQuoted`):
+/// bare when it is a letter or `_` followed by letters, digits or `_`, and no
+/// keyword; else double-quoted, with `"` doubled.
+pub(crate) fn display_identifier(name: &str) -> String {
     if name.bytes().enumerate().all(|(index, byte)| {
         byte.is_ascii_alphabetic() || byte == b'_' || (index > 0 && byte.is_ascii_digit())
     }) && !DUCKDB_KEYWORDS

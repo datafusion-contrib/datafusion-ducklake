@@ -1525,7 +1525,7 @@ mod sqlite {
             .unwrap();
         backend
             .writer
-            .set_table_setting(created.table_id, "hive_file_pattern", "false")
+            .set_table_setting(created.table_id, "hive_file_pattern", "0")
             .unwrap();
         backend
             .writer

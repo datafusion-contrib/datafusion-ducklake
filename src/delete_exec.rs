@@ -10,9 +10,10 @@
 //!   physical row positions matching the predicate and record them as official
 //!   DuckLake's `DuckLakeDelete::FlushDelete` does: at most the scoped
 //!   `data_inlining_row_limit` go to
-//!   `ducklake_inlined_delete_<table_id>`; a file they empty is dropped; a file
-//!   with a live delete file gets a new one carrying each position's snapshot
-//!   in its place; any other gets a delete file of its new positions. Matching
+//!   `ducklake_inlined_delete_<table_id>`, even when they empty the file;
+//!   above it, a file they empty is dropped, a file with a live delete file
+//!   gets a new one carrying each position's snapshot in its place, and any
+//!   other gets a delete file of its new positions. Matching
 //!   inlined rows are ended. Everything commits in a SINGLE snapshot (atomic
 //!   multi-file delete). The read path is already delete-aware, so a subsequent
 //!   `SELECT` excludes the deleted rows automatically.
@@ -481,7 +482,7 @@ pub(crate) struct DeletionTarget<'a> {
 
 impl<'a> DeletionTarget<'a> {
     /// The target for `file`, whose live delete file deletes `existing`.
-    fn of_file(
+    pub(crate) fn of_file(
         file: &'a crate::metadata_provider::DuckLakeTableFile,
         existing: &'a HashMap<i64, Option<i64>>,
     ) -> Self {
@@ -511,6 +512,25 @@ pub(crate) struct FileDeletions {
 }
 
 impl FileDeletions {
+    /// Deletions whose rewritten delete files date the statement's deletions
+    /// to `commit_snapshot`, for callers that record files concurrently and
+    /// [`absorb`](Self::absorb) the results.
+    pub(crate) fn dated(commit_snapshot: i64) -> Self {
+        Self {
+            commit_snapshot: Some(commit_snapshot),
+            ..Self::default()
+        }
+    }
+
+    /// Add `other`'s deletions to these.
+    pub(crate) fn absorb(&mut self, other: FileDeletions) {
+        self.positional.extend(other.positional);
+        self.rewritten.extend(other.rewritten);
+        self.inlined.extend(other.inlined);
+        self.dropped.extend(other.dropped);
+        self.commit_snapshot = self.commit_snapshot.or(other.commit_snapshot);
+    }
+
     /// Whether the deletions need the staged commit: anything beyond new delete
     /// files for files that had none.
     pub(crate) fn needs_staged_commit(&self) -> bool {
