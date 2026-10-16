@@ -2020,6 +2020,7 @@ impl DuckLakeTable {
 
 /// Options for [`DuckLakeTable::verify_file_orders`].
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct VerifyOrderOptions {
     /// Only these data files; `None` = every live file without a record.
     pub data_file_ids: Option<Vec<i64>>,
@@ -2027,8 +2028,25 @@ pub struct VerifyOrderOptions {
     pub max_files: Option<usize>,
 }
 
+impl VerifyOrderOptions {
+    /// Check only these data files.
+    #[must_use]
+    pub fn with_data_file_ids(mut self, data_file_ids: Vec<i64>) -> Self {
+        self.data_file_ids = Some(data_file_ids);
+        self
+    }
+
+    /// Stop after reading `max_files` files.
+    #[must_use]
+    pub fn with_max_files(mut self, max_files: usize) -> Self {
+        self.max_files = Some(max_files);
+        self
+    }
+}
+
 /// What [`DuckLakeTable::verify_file_orders`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VerifyOrderResult {
     /// Files whose key columns were read and checked.
     pub files_verified: usize,
