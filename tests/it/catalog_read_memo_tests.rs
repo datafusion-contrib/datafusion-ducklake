@@ -1713,7 +1713,9 @@ mod postgres {
     #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_row_inlined_after_a_fill_is_read_at_the_new_head() -> anyhow::Result<()> {
-        let lake = backend().await?.lake(10, NO_INLINED_ROWS_YET).await?;
+        // The backend owns the container, so it must outlive the test.
+        let backend = backend().await?;
+        let lake = backend.lake(10, NO_INLINED_ROWS_YET).await?;
         row_inlined_after_a_fill_is_read_at_the_new_head(lake).await
     }
 }
