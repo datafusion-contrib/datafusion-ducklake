@@ -24,6 +24,11 @@
 //!   DuckDB's answers over it, the statistics rows, and the Hive directories
 //!   and partition values of the live files, against official's.
 //!
+//! After the last step (with the `restore` feature), this crate writes a few
+//! more steps of its own and restores its table to a random earlier step
+//! ([`Run::check_restore`]): `rowid, *` at the head must be the mark's, and
+//! on DuckDB official must read it so too.
+//!
 //! Official's `UPDATE` and `DELETE` run without filter pushdown, so its rows
 //! stay right where its statistics are known to be wrong.
 //!
