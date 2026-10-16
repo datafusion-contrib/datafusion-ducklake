@@ -110,6 +110,7 @@ AWS‑LC, install the intended process‑wide Rustls `CryptoProvider` before cre
 | `tls-rustls-aws-lc-rs`     | Use Rustls with AWS‑LC for SQLx PostgreSQL connections                            |           |
 | `tls-rustls-ring`          | Use Rustls with Ring for SQLx PostgreSQL connections                              |           |
 | `encryption`               | Parquet Modular Encryption (PME) reads                                            |           |
+| `ext-file-order`           | EXPERIMENTAL: record verified per-file sort order, see below; not under semver    |           |
 | `skip-tests-with-docker`   | CI-only: skip tests that require Docker                                           |           |
 
 For dynamic linking against a system `libduckdb`, disable defaults and re-enable just
@@ -1028,6 +1029,35 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   the flush reads (a third-party one keeping the trait's defaults) has nothing to flush. A merge leaves out
   a file with inlined deletions (merging it would lose them); `rewrite_data_files` counts them
   towards the deleted fraction and retires a file they empty.
+
+## Experimental: verified file order (`ext-file-order`)
+
+Off unless the `ext-file-order` feature is compiled in **and** a catalog opts in with
+`DuckLakeCatalog::with_ext_file_order(true)`. With either missing, no extra table is
+created, read or written, and plans are unchanged.
+
+DuckLake's `SET SORTED BY` is a write-time hint: no catalog row says which files follow
+it, so a reader cannot rely on it. This feature proves the order per file instead and
+records it in a table outside the spec, `ext_ducklake_file_order` (table id, file path,
+file size, sort key by field id):
+
+- The writer checks every row it writes, and records the file only if all of them were
+  in order. Files written by DuckDB or another client, uploads and files from before the
+  option was on are recorded by `DuckLakeTable::verify_file_orders`, which reads only the
+  key columns, in the catalog's types, and rewrites nothing.
+- A row applies to a file only when its table, path and size match. A file without one is
+  scanned as usual.
+- A scan declares the order only when an `ORDER BY` on the key asks for it and every file
+  it reads is recorded, has no deletes and no NULL key; anything else plans as before.
+
+**Divergence.** The sidecar is not part of the DuckLake spec. DuckDB's extension names the
+tables it reads and never enumerates the catalog, so it neither sees nor disturbs it;
+compaction and expiry by DuckDB leave orphaned rows that match no file, which
+`MetadataWriter::prune_file_orders` removes. Recording is supported on SQLite and
+multicatalog PostgreSQL; on other backends every file reads as unrecorded. Converging
+would need a per-file sort record in the spec itself.
+
+---
 
 ## Limitations
 

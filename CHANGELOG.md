@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- EXPERIMENTAL `ext-file-order` feature, off by default and not covered by semver: with
+  `DuckLakeCatalog::with_ext_file_order(true)` (or `DuckLakeWriteOptions::ext_file_order`), the
+  writer checks every row it writes against the table's sort key and records each file that
+  follows it in an `ext_ducklake_file_order` table beside the catalog; scans then serve
+  `ORDER BY <sort key> LIMIT n` from the recorded files in order, without a sort, and stop
+  early. `DuckLakeTable::verify_file_orders` records existing files without rewriting them, and
+  `MetadataWriter::prune_file_orders` drops rows of files that are gone. SQLite and multicatalog
+  PostgreSQL record; other backends read every file as unrecorded. Divergence: the sidecar is
+  not part of the DuckLake spec; DuckDB's extension ignores it (see `COMPATIBILITY.md`).
 - `with_data_inlining_row_limit` on every metadata writer: one inlining limit for every write
   path, as official's `DATA_INLINING_ROW_LIMIT` option; stored settings outrank it.
 - `MetadataWriter::table_setting` and `DuckLakeTableWriter::table_sort_on_insert` read a
