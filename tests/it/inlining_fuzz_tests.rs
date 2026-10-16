@@ -1809,55 +1809,8 @@ impl Lake {
             Step::Insert(rows)
                 if !partitioned && !sorted && rows.first().is_some_and(|r| routed(r.0)) =>
             {
-                let names = std::iter::once("id".to_string())
-                    .chain(columns.iter().map(|c| c.name.clone()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let values = rows
-                    .iter()
-                    .map(|(id, values)| {
-                        let mut cells = vec![format!("CAST({id} AS BIGINT)")];
-                        cells.extend(
-                            columns
-                                .iter()
-                                .zip(values)
-                                .map(|(c, v)| datafusion_literal(c.ty, v)),
-                        );
-                        format!("({})", cells.join(", "))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let ctx = SessionContext::new();
-                let batches = staged!(
-                    staged!(
-                        ctx.sql(&format!("SELECT * FROM (VALUES {values}) AS v({names})"))
-                            .await
-                    )
-                    .collect()
-                    .await
-                );
-                // DuckDB allows one open catalog at a time: take the schema
-                // and close this handle before the session opens its own.
-                let schema = {
-                    let (_, table) = self.table().await;
-                    datafusion::catalog::TableProvider::schema(&table)
-                };
-                let mut aligned = Vec::with_capacity(batches.len());
-                for batch in &batches {
-                    let mut columns = Vec::with_capacity(schema.fields().len());
-                    for (index, field) in schema.fields().iter().enumerate() {
-                        let column = batch.column(index);
-                        columns.push(if column.data_type() == field.data_type() {
-                            Arc::clone(column)
-                        } else {
-                            staged!(arrow::compute::cast(column, field.data_type()))
-                        });
-                    }
-                    aligned.push(staged!(arrow::record_batch::RecordBatch::try_new(
-                        Arc::clone(&schema),
-                        columns
-                    )));
-                }
+                let aligned = staged!(self.staged_rows(&columns, rows).await);
+                let schema = aligned.first()?.schema();
                 let (writer, _) = (self.open)().await;
                 let outcome = async {
                     let table_writer = datafusion_ducklake::DuckLakeTableWriter::new(
@@ -1935,6 +1888,64 @@ impl Lake {
             },
             _ => None,
         }
+    }
+
+    /// `rows` (an `id` and a value per column of `columns`) as batches of the
+    /// table's schema, as the row APIs take them.
+    async fn staged_rows(
+        &self,
+        columns: &[Col],
+        rows: &[(i64, Vec<V>)],
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+        let names = std::iter::once("id".to_string())
+            .chain(columns.iter().map(|c| c.name.clone()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = rows
+            .iter()
+            .map(|(id, values)| {
+                let mut cells = vec![format!("CAST({id} AS BIGINT)")];
+                cells.extend(
+                    columns
+                        .iter()
+                        .zip(values)
+                        .map(|(c, v)| datafusion_literal(c.ty, v)),
+                );
+                format!("({})", cells.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ctx = SessionContext::new();
+        let batches = ctx
+            .sql(&format!("SELECT * FROM (VALUES {values}) AS v({names})"))
+            .await
+            .map_err(|e| e.to_string())?
+            .collect()
+            .await
+            .map_err(|e| e.to_string())?;
+        // DuckDB allows one open catalog at a time: take the schema and close
+        // this handle before the caller opens its own.
+        let schema = {
+            let (_, table) = self.table().await;
+            datafusion::catalog::TableProvider::schema(&table)
+        };
+        let mut aligned = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let mut columns = Vec::with_capacity(schema.fields().len());
+            for (index, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(index);
+                columns.push(if column.data_type() == field.data_type() {
+                    Arc::clone(column)
+                } else {
+                    arrow::compute::cast(column, field.data_type()).map_err(|e| e.to_string())?
+                });
+            }
+            aligned.push(
+                arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), columns)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(aligned)
     }
 
     /// Delete the rows with `ids` through a keyed mutation.
@@ -2048,6 +2059,32 @@ fn normalize(
     }
     rows.sort();
     (names, rows)
+}
+
+/// A read's rows alone, sorted: the row order of a read, and the column
+/// names of one with no rows, are not compared.
+#[cfg(feature = "restore")]
+fn sorted_rows(rows: Rows) -> Rows {
+    rows.map(|(names, mut rows)| {
+        rows.sort();
+        (
+            if rows.is_empty() {
+                Vec::new()
+            } else {
+                names
+            },
+            rows,
+        )
+    })
+}
+
+/// [`describe`] of a read, or its error.
+#[cfg(feature = "restore")]
+fn describe_rows(rows: &Rows) -> String {
+    match rows {
+        Ok(rows) => describe(rows),
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 fn describe(rows: &(Vec<String>, Vec<Vec<String>>)) -> String {
@@ -4538,6 +4575,259 @@ impl Run<'_> {
 
     /// Note a rewrite at `step` (or a checkpoint's) that wrote the same rows
     /// into more files here than official ([`known::rewrite_grouping`]).
+    /// Restore this crate's table to a random earlier step's snapshot, after
+    /// more writes of its own (inserts, deletes, updates, keyed upserts, a
+    /// replace, maintenance): `rowid, *` at the head must then be the mark's
+    /// exactly, and earlier snapshots must still read what they read. A
+    /// window that changed the table's columns or partition spec is refused
+    /// with `Unsupported`, as is any restore on a backend that stages no row
+    /// mutation. On DuckDB, official reads the head as `AT (VERSION => mark)`.
+    #[cfg(feature = "restore")]
+    async fn check_restore(&mut self) -> Result<(), Mismatch> {
+        let steps = self.history.steps.len();
+        let head = *self.heads.ours.last().expect("the setup's head");
+        let marks: Vec<usize> = (self.readable_from..steps)
+            .filter(|at| self.heads.ours[*at] < head)
+            .collect();
+        if marks.is_empty() {
+            self.skip("restore", "no snapshot before the head to restore to");
+            return Ok(());
+        }
+        let at = marks[self.rng.below(marks.len())];
+        let mark = self.heads.ours[at];
+        let failed = |detail: String| Mismatch {
+            kind: "restore",
+            step: steps,
+            detail,
+        };
+        let list = |at: usize| {
+            std::iter::once("id".to_string())
+                .chain(self.history.columns_at(at).into_iter().map(|c| c.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let select = |at: usize| format!("SELECT rowid, {} FROM lake.main.t", list(at));
+
+        if !self.lake.kind.mutations() {
+            let (ctx, table) = self.lake.table().await;
+            return match table.restore_rows_to(&ctx.state(), mark).await {
+                Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) => {
+                    self.ran("restore refused");
+                    Ok(())
+                },
+                other => Err(failed(format!(
+                    "a restore on a writer that stages no row mutation: {other:?}"
+                ))),
+            };
+        }
+
+        // More writes past the history, this crate's only.
+        let extended = self.extend_for_restore();
+        for index in steps..extended.steps.len() {
+            if Box::pin(self.lake.apply(&extended, index)).await.is_ok() {
+                self.ran(&format!(
+                    "restore window: {}",
+                    step_kind(&extended.steps[index])
+                ));
+            }
+        }
+        let columns = self.history.columns_at(steps);
+        let rows = self.restore_rows(&columns, self.history.steps.len() as i64 + 1000);
+        if let Ok(staged) = self.lake.staged_rows(&columns, &rows).await {
+            let (ctx, table) = self.lake.table().await;
+            if table
+                .keyed_mutation(&["id"])
+                .upsert_by_keys(&ctx.state(), staged)
+                .await
+                .is_ok()
+            {
+                self.ran("restore window: upsert");
+            }
+        }
+        if self.rng.chance(30) {
+            let rows = self.restore_rows(&columns, self.history.steps.len() as i64 + 2000);
+            if let Ok(staged) = self.lake.staged_rows(&columns, &rows).await {
+                let (writer, _) = (self.lake.open)().await;
+                let replaced = async {
+                    datafusion_ducklake::DuckLakeTableWriter::new(
+                        writer,
+                        Arc::new(object_store::local::LocalFileSystem::new()),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .write_table("main", "t", &staged)
+                    .await
+                    .map_err(|e| e.to_string())
+                }
+                .await;
+                if replaced.is_ok() {
+                    self.ran("restore window: replace");
+                }
+            }
+        }
+
+        let expected = sorted_rows(self.lake.rows(Some(mark), &select(at)).await);
+        let current = self.lake.head().await;
+        let mut kept = vec![(mark, at)];
+        kept.push((self.heads.ours[steps], steps));
+        if at + 1 < steps {
+            let between = at + 1 + self.rng.below(steps - at - 1);
+            kept.push((self.heads.ours[between], between));
+        }
+        let mut history = Vec::with_capacity(kept.len() + 1);
+        for (snapshot, step) in &kept {
+            history.push(sorted_rows(
+                self.lake.rows(Some(*snapshot), &select(*step)).await,
+            ));
+        }
+        let before_restore = sorted_rows(self.lake.rows(Some(current), &select(steps)).await);
+
+        let changed = self.history.steps[at..].iter().any(|step| {
+            matches!(
+                step,
+                Step::AddColumn(..) | Step::Widen(_) | Step::Partition(_)
+            )
+        });
+        let (ctx, table) = self.lake.table().await;
+        let outcome = Box::pin(table.restore_rows_to(&ctx.state(), mark)).await;
+        drop((ctx, table));
+        match outcome {
+            Err(datafusion_ducklake::DuckLakeError::Unsupported(_)) if changed => {
+                self.ran("restore refused");
+                return Ok(());
+            },
+            Err(error) => {
+                return Err(failed(format!(
+                    "restore to step {at} (snapshot {mark}): {error}"
+                )));
+            },
+            Ok(result) => {
+                if self.history.steps[at..]
+                    .iter()
+                    .any(|step| matches!(step, Step::AddColumn(..) | Step::Widen(_)))
+                {
+                    return Err(failed(format!(
+                        "a restore across a column change committed: {result:?}"
+                    )));
+                }
+                self.ran("restore");
+            },
+        }
+        let restored = sorted_rows(self.lake.rows(None, &select(steps)).await);
+        if restored != expected {
+            return Err(failed(format!(
+                "rowid, * at the head after restoring to step {at} (snapshot {mark}):\n  \
+                 mark: {}\n  head: {}",
+                describe_rows(&expected),
+                describe_rows(&restored)
+            )));
+        }
+        for ((snapshot, step), before) in kept.iter().zip(&history) {
+            let after = sorted_rows(self.lake.rows(Some(*snapshot), &select(*step)).await);
+            if &after != before {
+                return Err(failed(format!(
+                    "snapshot {snapshot} reads differently after the restore:\n  before: \
+                     {}\n  after: {}",
+                    describe_rows(before),
+                    describe_rows(&after)
+                )));
+            }
+        }
+        let after = sorted_rows(self.lake.rows(Some(current), &select(steps)).await);
+        if after != before_restore {
+            return Err(failed(format!(
+                "the snapshot before the restore reads differently after it:\n  before: \
+                 {}\n  after: {}",
+                describe_rows(&before_restore),
+                describe_rows(&after)
+            )));
+        }
+
+        // Official reads this crate's restored head as the mark.
+        if self.lake.kind == Kind::Duckdb
+            && let Some(copy) = self.lake.duckdb_copy(&self.dir).await
+        {
+            let reader = duckdb_session();
+            reader
+                .execute_batch(&format!(
+                    "ATTACH '{}' AS lake (DATA_PATH '{}/', READ_ONLY); USE lake;",
+                    copy.ducklake_uri(),
+                    self.lake.data.display()
+                ))
+                .map_err(|e| failed(e.to_string()))?;
+            let cells = self.cells(steps);
+            let read = |sql: String| {
+                sorted_rows(Official::rows(&reader, &sql).map(|rows| normalize_cells(rows, &cells)))
+            };
+            let at_head = read(format!("SELECT rowid, {} FROM t", list(steps)));
+            let at_mark = read(format!(
+                "SELECT rowid, {} FROM t AT (VERSION => {mark})",
+                list(steps)
+            ));
+            if at_head != at_mark {
+                return Err(failed(format!(
+                    "official reads the restored head apart from AT (VERSION => {mark}):\n  \
+                     head: {}\n  mark: {}",
+                    describe_rows(&at_head),
+                    describe_rows(&at_mark)
+                )));
+            }
+            self.ran("restore: official reads the mark");
+        }
+        Ok(())
+    }
+
+    /// The history and a few more steps of this crate's only, to run before
+    /// a restore: inserts, deletes, updates and maintenance.
+    #[cfg(feature = "restore")]
+    fn extend_for_restore(&mut self) -> History {
+        let mut extended = self.history.clone();
+        let columns = self.history.columns_at(self.history.steps.len());
+        let base = self.history.steps.len() as i64 + 3000;
+        for index in 0..1 + self.rng.below(4) {
+            let step = match self.rng.below(7) {
+                0 | 1 => Step::Insert(self.restore_rows(&columns, base + 100 * index as i64)),
+                2 => Step::Delete(Some(Pred::IdLt(self.rng.below(40) as i64))),
+                3 => Step::Delete(Some(Pred::IdIn(
+                    (0..1 + self.rng.below(5))
+                        .map(|_| self.rng.below(60) as i64)
+                        .collect(),
+                ))),
+                4 if !columns.is_empty() => {
+                    let column = self.rng.pick(&columns).clone();
+                    Step::Update {
+                        value: gen_value(&mut self.rng, column.ty),
+                        column: column.name,
+                        ty: column.ty,
+                        pred: Pred::IdGt(self.rng.below(60) as i64),
+                    }
+                },
+                5 => Step::Flush,
+                _ => self.rng.pick(&[Step::Merge, Step::Rewrite]).clone(),
+            };
+            extended.steps.push(step);
+        }
+        extended
+    }
+
+    /// A few rows of `columns`: ids that exist and ids from `fresh` on.
+    #[cfg(feature = "restore")]
+    fn restore_rows(&mut self, columns: &[Col], fresh: i64) -> Vec<(i64, Vec<V>)> {
+        (0..1 + self.rng.below(12))
+            .map(|index| {
+                let id = if self.rng.chance(50) {
+                    self.rng.below(60) as i64
+                } else {
+                    fresh + index as i64
+                };
+                let values = columns
+                    .iter()
+                    .map(|column| gen_value(&mut self.rng, column.ty))
+                    .collect();
+                (id, values)
+            })
+            .collect()
+    }
+
     async fn note_rewrite_grouping(&mut self, step: usize) {
         let outputs = |metadata: &Metadata, heads: &[i64]| {
             let connection = duckdb_session();
@@ -4998,6 +5288,8 @@ async fn run_history_tallied(
         }
         run.compare_step(step).await?;
     }
+    #[cfg(feature = "restore")]
+    Box::pin(run.check_restore()).await?;
     Ok(std::mem::take(&mut *run.tally.lock().unwrap()))
 }
 
