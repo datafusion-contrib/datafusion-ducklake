@@ -48,7 +48,8 @@ The codebase follows a layered architecture with clear separation of concerns:
    - Bridges DuckLake concepts to DataFusion's catalog system
    - `DuckLakeCatalog`: Implements `CatalogProvider`, uses dynamic metadata lookup (queries on every call to `schema()` and `schema_names()`)
    - `DuckLakeSchema`: Implements `SchemaProvider`, uses dynamic metadata lookup (queries on every call to `table()` and `table_names()`)
-   - `DuckLakeTable`: Implements `TableProvider`, caches table structure and file lists at creation time
+   - `DuckLakeTable`: Implements `TableProvider`, caches table structure at creation time and reads the
+     file list at each scan
    - **No HashMaps**: Catalog and schema providers query metadata on-demand rather than caching
 
 3. **Write Layer** (feature-gated, `write` / `write-sqlite` / `write-postgres`)
@@ -61,6 +62,18 @@ The codebase follows a layered architecture with clear separation of concerns:
 
 4. **Additional capabilities**
    - `information_schema.rs`: SQL-queryable catalog metadata (snapshots, schemata, tables, columns, files)
+   - `catalog_read_memo.rs`: `CatalogReadMemo` (opt-in) keeps a table's scan-time catalog reads (listing,
+     inlined deletions, inlined rows) across queries. `memo.bind(provider)` reads the catalog head once per
+     query. It returns a `MemoizedMetadataProvider`, which serves those reads while the head stays the same
+     and forwards every other call. **This is not DuckLake behavior**: official lists a scan's files in
+     every transaction. The memo is correct only because every commit that changes a listing (insert,
+     delete, update, merge, rewrite, flush) moves the head. Expire, cleanup and the low-level
+     `MetadataWriter` calls after `create_snapshot` do not move it. `scan()` has
+     no memo code. Keep it that way, and put memo logic in the wrapper. Forward every new
+     `MetadataProvider` method in `MemoizedMetadataProvider` too. Otherwise the memo runs the trait
+     default without notice. A unit test checks this
+   - `delete_memo.rs`: `DuckLakeReadOptions` (opt-in) lets a table keep the delete positions its scans read.
+     A delete file never changes after it is written, so this memo needs no catalog check
    - `table_functions.rs`: `ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`; registered via `register_ducklake_functions()`
    - `row_id.rs`: DuckLake row lineage (`rowid` virtual column), opt-in via `DuckLakeCatalog::with_row_lineage(true)`
    - `encryption.rs`: Parquet Modular Encryption (PME) reads (feature `encryption`)
@@ -114,8 +127,8 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
   - `new()`: O(1) - just stores IDs and paths
 
 - **DuckLakeTable** (`table.rs`):
-  - Still caches table structure and file lists at creation time
-  - This is necessary for query planning and execution
+  - Caches table structure at creation time, which query planning needs
+  - Reads the file list at each scan, unless its provider is bound to a `CatalogReadMemo`
 
 **Benefits**:
 - O(1) memory usage regardless of catalog size
@@ -125,7 +138,8 @@ The catalog uses a **pure dynamic lookup** approach with no caching at the catal
 
 **Trade-offs**:
 - Small query overhead per metadata lookup (acceptable for typical catalog sizes)
-- Future optimization: Add optional caching layer via wrapper implementation
+- `CatalogReadMemo` (`catalog_read_memo.rs`) is an optional wrapper that keeps a table's scan-time
+  reads across queries. Catalog and schema lookups have no caching layer
 
 ### Data Flow
 
@@ -134,7 +148,7 @@ When querying a DuckLake table:
 2. User registers required object stores (S3, MinIO, etc.) with the `RuntimeEnv`
 3. SQL query references table as `catalog.schema.table`
 4. DataFusion resolves path: catalog -> schema -> table (queries metadata on-demand)
-5. `DuckLakeTable` queries metadata provider for table structure and data files (cached at table creation)
+5. `DuckLakeTable` reads table structure from the metadata provider at creation, and the data files at each scan
 6. Paths are resolved hierarchically using `path_resolver` utilities:
    - Global `data_path` from `ducklake_metadata` table
    - Schema path (relative to `data_path` or absolute)
@@ -273,7 +287,8 @@ runtime.register_object_store(&Url::parse("s3://ducklake-data/")?, s3);
 - One `data_inlining_row_limit` governs every write path: stored table > schema >
   catalog-wide setting > the writer's limit (`with_write_options` / `with_data_inlining_row_limit`)
   > `10`.
-- No optional metadata caching layer (all lookups are dynamic)
+- Catalog and schema lookups are dynamic. Only a table's scan-time reads can be kept, through the
+  opt-in `CatalogReadMemo` wrapper, which is not DuckLake behavior (see `COMPATIBILITY.md`)
 
 ### Testing
 The project includes comprehensive tests (`tests/it/`, ~50 integration modules plus unit
@@ -294,7 +309,7 @@ Representative groups:
 - **Writes**: `write_tests.rs`, `sql_write_tests.rs`, `concurrent_write_tests.rs`, `insert_partitioning_tests.rs`, `postgres_single_catalog_write_tests.rs`
 - **Backends**: `sqlite_metadata_provider_test.rs`, `postgres_metadata_provider_test.rs`, `mysql_metadata_provider_test.rs`, `hybrid_asyncdb.rs`
 - **Multicatalog**: `multicatalog_provider_tests.rs`, `multicatalog_postgres_tests.rs`, `multicatalog_hardening_tests.rs`
-- **Capabilities**: `information_schema_test.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
+- **Capabilities**: `information_schema_test.rs`, `catalog_read_memo_tests.rs`, `row_id_tests.rs`, `rowid_physical_position_tests.rs`, `renamed_columns_tests.rs`, `table_changes_tests.rs`, `encryption_tests.rs`, `maintenance_sqlite_tests.rs`
 - **Concurrency & object store**: `concurrent_tests.rs`, `object_store_integration_test.rs`
 - **SQL logic tests**: `sqllogictest_runner.rs` driving `tests/sqllogictests/`
 - **Test data generation**: helpers in `tests/it/common/mod.rs` — each test builds its own

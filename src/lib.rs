@@ -73,9 +73,11 @@
 //! worth knowing if you are counting them.
 
 pub mod catalog;
+mod catalog_read_memo;
 pub mod change_detection;
 pub mod column_rename;
 pub mod delete_filter;
+mod delete_memo;
 pub mod encryption;
 pub mod error;
 #[cfg(feature = "ext-file-order")]
@@ -177,6 +179,8 @@ pub type Result<T> = std::result::Result<T, DuckLakeError>;
 
 // Re-export main types for convenience
 pub use catalog::DuckLakeCatalog;
+pub use catalog_read_memo::{CatalogReadMemo, MemoizedMetadataProvider};
+pub use delete_memo::DuckLakeReadOptions;
 pub use error::{DuckLakeError, TypeChangeOperation, TypeChangeWriteMode};
 pub use metadata_provider::{
     ColumnTag, DuckLakeFileData, DuckLakeInlinedFileDeleteForFlush, DuckLakeInlinedFlushData,

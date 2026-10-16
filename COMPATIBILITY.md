@@ -242,6 +242,8 @@ projection occurs in DataFusion. Index declarations remain optional.
 | Table functions (`ducklake_snapshots()`, `ducklake_table_info()`, `ducklake_list_files()`, `ducklake_table_changes()`, `ducklake_table_deletions()`, `ducklake_table_insertions()`)                                                                                                                                              | ✅        |
 | Maintenance: expire snapshots, cleanup superseded files, orphan-file reclamation                                                                                                                                                                                                                                                 | ✅        |
 | Parquet Modular Encryption (PME) reads (feature `encryption`)                                                                                                                                                                                                                                                                    | ✅        |
+| Keep a table's catalog reads across queries (`CatalogReadMemo`, opt-in, not DuckLake behavior: see Limitations)                                                                                                                                                                                                                   | 🟧       |
+| Keep a table's delete positions across scans (`DuckLakeReadOptions`, opt-in)                                                                                                                                                                                                                                                     | ✅        |
 | Configurable writer output (compression, row-group sizing)                                                                                                                                                                                                                                                                       | ✅        |
 | Table partitioning — read + file pruning (all backends); `identity` + `year`/`month`/`day`/`hour` transforms (`bucket(N)` tolerated, not pruned)                                                                                                                                                                                 | ✅        |
 | Partitioned writes — split into per-partition files in one snapshot, on every writable backend, via `set_partition_spec`/`reset_partition_spec` or `execute_ducklake_sql` (`ALTER TABLE … SET/RESET PARTITIONED BY`). Honoured by SQL `INSERT`, the low-level write entry points, the streaming session, compaction, and promote | ✅        |
@@ -1060,6 +1062,24 @@ would need a per-file sort record in the spec itself.
 ---
 
 ## Limitations
+
+- **`CatalogReadMemo` is not DuckLake behavior.** Official DuckLake lists a scan's files again
+  in every transaction, at the snapshot that the transaction pinned. The opt-in memo keeps a
+  table's listing, inlined deletions and inlined rows across queries. It serves them only while
+  the catalog head (the newest snapshot id) is the one that its bind read at the start of the
+  query. This is correct only because every commit that changes a listing also moves the head:
+  an insert, a delete, an update, a merge of adjacent files, a rewrite of data files and a flush
+  of inlined data. Two cases do not move the head:
+  - The low-level `MetadataWriter` API changes the catalog at a snapshot that `create_snapshot`
+    made earlier, for example with `register_data_file` or `end_table_files`. A memo filled
+    between the two misses the change until the next commit.
+  - Expiring snapshots and cleanup commit no snapshot. Official refuses a read at an expired
+    snapshot with "No snapshot found". Without a memo, this crate returns no rows for it. With a
+    memo, a fill kept before the expire returns the old rows until cleanup deletes their files,
+    and then the read fails.
+
+  `DuckLakeTable::scan` has no memo code, and the memo lives in its own provider wrapper
+  (`src/catalog_read_memo.rs`).
 
 - **Catalog-side filter pushdown declines a few type/backend combinations.** A
   pushed-down filter narrows the file-listing query using per-column statistics,

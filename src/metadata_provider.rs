@@ -791,7 +791,7 @@ pub struct FileWithTable {
 ///
 /// Built-in providers retain the reconstructed nested Arrow type and descendant
 /// IDs so reads and rewrites preserve the recursive catalog representation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DuckLakeTableColumn {
     /// Unique identifier for this column in the catalog
     pub column_id: i64,

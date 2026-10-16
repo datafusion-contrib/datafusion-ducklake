@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MetadataWriter::prune_file_orders` drops rows of files that are gone. SQLite and multicatalog
   PostgreSQL record; other backends read every file as unrecorded. Divergence: the sidecar is
   not part of the DuckLake spec; DuckDB's extension ignores it (see `COMPATIBILITY.md`).
+- `CatalogReadMemo` keeps a table's scan-time catalog reads across queries, bound once per query.
+  It is opt-in and not DuckLake behavior, as `COMPATIBILITY.md` explains (#338).
+- `DuckLakeReadOptions` lets a table keep the delete-file positions its scans read (#338).
 - `with_data_inlining_row_limit` on every metadata writer: one inlining limit for every write
   path, as official's `DATA_INLINING_ROW_LIMIT` option; stored settings outrank it.
 - `MetadataWriter::table_setting` and `DuckLakeTableWriter::table_sort_on_insert` read a
