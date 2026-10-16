@@ -18,7 +18,9 @@
 //! Eligibility is structural, checked on the plan it is given: every
 //! file-backed scan under it must read exactly the verified files (a scan of
 //! any other file — unverified, with deletes, name-mapped — makes it decline),
-//! and every in-memory source is sorted. The final check against the
+//! every in-memory source is sorted, and nothing under it may carry a limit
+//! already (an inner `LIMIT` pushed into the scan bounds the rows; the
+//! ordered plan would turn it into a per-chain limit). The final check against the
 //! requested ordering makes a wrapper above (one that loses orderings) a
 //! decline, never a wrong answer.
 
@@ -106,6 +108,15 @@ impl OrderOnRequestExec {
         let mut replaced = 0usize;
         let mut eligible = true;
         let plan = Arc::clone(&self.input).transform_up(|node| {
+            // A limit already under this node (an inner `LIMIT` that
+            // `LimitPushdown` moved into the scan before `PushdownSort` asked)
+            // bounds the input's rows. The ordered plan would rebuild the scan
+            // as several chains, where that limit holds per chain, and
+            // `PushdownSort` then overwrites it with the outer fetch: decline.
+            if node.fetch().is_some() {
+                eligible = false;
+                return Ok(Transformed::no(node));
+            }
             let Some(scan) = node.downcast_ref::<DataSourceExec>() else {
                 return Ok(Transformed::no(node));
             };
