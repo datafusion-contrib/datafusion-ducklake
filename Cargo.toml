@@ -110,6 +110,10 @@ write-sqlite = ["write", "metadata-sqlite"]
 write-postgres = ["write", "metadata-postgres", "multicatalog-postgres"]
 write-duckdb = ["write", "metadata-duckdb"]
 write-mysql = ["write", "metadata-mysql"]
+# Restore a table's rows to an earlier snapshot (`DuckLakeTable::restore_rows_to`),
+# a library extension with no official equivalent. Backend-neutral: it runs on
+# any writer that stages row mutations, enabled by that writer's own feature.
+restore = ["write"]
 # Multicatalog read provider (independent of write support)
 multicatalog-postgres = ["metadata-postgres"]
 

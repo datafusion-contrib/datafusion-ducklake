@@ -155,6 +155,8 @@ pub mod metadata_writer_sqlite;
 pub mod multicatalog;
 #[cfg(feature = "multicatalog-postgres")]
 pub mod multicatalog_provider;
+#[cfg(feature = "restore")]
+pub mod restore;
 #[cfg(feature = "write")]
 pub mod sql;
 #[cfg(feature = "write")]
@@ -236,6 +238,8 @@ pub use metadata_writer_sqlite::SqliteMetadataWriter;
 pub use multicatalog::{FileOwners, MulticatalogManager, initialize_multicatalog_schema};
 #[cfg(feature = "multicatalog-postgres")]
 pub use multicatalog_provider::{MetadataReadSession, MulticatalogProvider};
+#[cfg(feature = "restore")]
+pub use restore::RestoreResult;
 #[cfg(feature = "write")]
 pub use sql::execute_ducklake_sql;
 #[cfg(feature = "write")]

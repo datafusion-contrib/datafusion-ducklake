@@ -1122,6 +1122,31 @@ impl DuckLakeTableWriter {
         arrow_schema: &Schema,
         mode: WriteMode,
     ) -> Result<TableWriteSession> {
+        self.begin_embedded_rowid_write(schema_name, table_name, arrow_schema, mode, false)
+    }
+
+    /// [`Self::begin_write_with_embedded_rowid`] rolling over to a new file
+    /// once one exceeds the target file size, as [`Self::begin_write`] does,
+    /// for a caller that commits the files with [`TableWriteSession::finish_files`].
+    #[cfg(feature = "restore")]
+    pub(crate) fn begin_rolling_write_with_embedded_rowid(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+    ) -> Result<TableWriteSession> {
+        self.begin_embedded_rowid_write(schema_name, table_name, arrow_schema, mode, true)
+    }
+
+    fn begin_embedded_rowid_write(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        arrow_schema: &Schema,
+        mode: WriteMode,
+        roll: bool,
+    ) -> Result<TableWriteSession> {
         let scoped_base = match self.metadata.catalog_id() {
             Some(id) => join_paths(&self.base_key_path, &format!("cat_{id}"))?,
             None => self.base_key_path.clone(),
@@ -1139,7 +1164,7 @@ impl DuckLakeTableWriter {
             true,
             mode,
             StreamPartitionMode::Split,
-            false,
+            roll,
             false,
         )
     }

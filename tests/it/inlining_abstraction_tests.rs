@@ -46,7 +46,7 @@ pub(crate) struct Lake {
     /// Whether the backend inlines rows (every backend but single-catalog
     /// PostgreSQL).
     pub(crate) inlines: bool,
-    _dir: tempfile::TempDir,
+    pub(crate) _dir: tempfile::TempDir,
 }
 
 type LakeFuture = Pin<Box<dyn Future<Output = Lake> + Send>>;

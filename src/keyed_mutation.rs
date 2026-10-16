@@ -1817,7 +1817,7 @@ impl PhysicalExpr for KeyMembership {
     }
 }
 
-fn from_df(error: DataFusionError) -> DuckLakeError {
+pub(crate) fn from_df(error: DataFusionError) -> DuckLakeError {
     match error {
         DataFusionError::External(inner) => match inner.downcast::<DuckLakeError>() {
             Ok(error) => *error,
