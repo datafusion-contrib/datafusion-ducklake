@@ -1179,3 +1179,80 @@ async fn sidecar_row_never_vouches_for_a_file_that_reuses_its_id() {
         assert!(sorts(&p) && !declares_ts_desc(&p), "{p}");
     }
 }
+
+/// An inner `LIMIT` that `LimitPushdown` (which runs before `PushdownSort`)
+/// already moved into the scan bounds the subquery. Replanning the scan for
+/// an outer sort must not replace it with the outer fetch, nor turn it into a
+/// per-chain limit: the subquery still yields 10 rows, whatever the outer
+/// `LIMIT`, layout or partition count.
+#[tokio::test(flavor = "multi_thread")]
+async fn inner_limit_survives_an_ordered_replan() {
+    const INNER: &str = "SELECT ts, id FROM ducklake.main.logs LIMIT 10";
+    let queries = [
+        format!("SELECT ts, id FROM ({INNER}) ORDER BY ts DESC LIMIT 15"),
+        format!("SELECT ts, id FROM ({INNER}) ORDER BY ts DESC LIMIT 5"),
+        format!("SELECT ts, id FROM ({INNER}) ORDER BY ts DESC"),
+    ];
+    let expected_rows = |sql: &str| {
+        if sql.ends_with("LIMIT 5") {
+            5
+        } else {
+            10
+        }
+    };
+
+    // Disjoint files (one chain), overlapping files (several chains), and
+    // the same with inlined rows in the union.
+    let disjoint = setup().await;
+    disjoint.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&disjoint, 3, 1_000).await;
+    let overlapping = setup().await;
+    overlapping.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    overlapping.append(&[batch(&desc(0..1_000))]).await;
+    overlapping.append(&[batch(&desc(500..1_500))]).await;
+    overlapping.append(&[batch(&desc(900..1_100))]).await;
+    let inlined = setup().await;
+    inlined.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&inlined, 3, 1_000).await;
+    inlined
+        .append_with(
+            &[batch(&[Some(50_000), Some(70_000), Some(60_000)])],
+            DuckLakeWriteOptions::default().with_data_inlining_row_limit(10),
+        )
+        .await;
+
+    for env in [&disjoint, &overlapping, &inlined] {
+        for partitions in [1, 4] {
+            for ext_file_order in [false, true] {
+                let ctx = env.ctx_with(partitions, ext_file_order).await;
+                for sql in &queries {
+                    let rows = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                    let n: usize = rows.iter().map(RecordBatch::num_rows).sum();
+                    assert_eq!(
+                        n,
+                        expected_rows(sql),
+                        "partitions={partitions} ext_file_order={ext_file_order}: {sql}\n{}",
+                        plan(&ctx, sql).await
+                    );
+                }
+            }
+        }
+    }
+
+    // One chain split into byte ranges across 8 partitions.
+    let split = setup().await;
+    split.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&split, 2, 20_000).await;
+    let ctx = split.ctx(8).await;
+    ctx.sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    for sql in &queries {
+        let rows = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let n: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(n, expected_rows(sql), "{sql}\n{}", plan(&ctx, sql).await);
+    }
+}
