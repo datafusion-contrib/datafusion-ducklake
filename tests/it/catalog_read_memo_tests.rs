@@ -1439,6 +1439,42 @@ async fn a_kept_fill_of_an_expired_snapshot_reads_until_cleanup() -> anyhow::Res
     Ok(())
 }
 
+/// Twenty rows in one Parquet file, and no inlined row yet. Attach with an
+/// inlining limit above one row, so that a later one-row insert is inlined.
+const NO_INLINED_ROWS_YET: &[&str] =
+    &["CREATE TABLE lake.t (id INT)", "INSERT INTO lake.t SELECT i FROM range(20) r(i)"];
+
+/// The provider's answer that a table has no inlined rows covers snapshots up
+/// to the head where it was read, and the memo keeps it across heads. A commit
+/// can then inline a row at a newer snapshot. A table at the new head must
+/// find the row, and the kept table, at the older snapshot, must not. The
+/// SQLite provider never gives that answer, so the PostgreSQL variant is the
+/// one that checks the boundary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_inlined_after_a_fill_is_read_at_the_new_head() -> anyhow::Result<()> {
+    row_inlined_after_a_fill_is_read_at_the_new_head(Lake::new(10, NO_INLINED_ROWS_YET)?).await
+}
+
+async fn row_inlined_after_a_fill_is_read_at_the_new_head(lake: Lake) -> anyhow::Result<()> {
+    let all = "SELECT id FROM t ORDER BY id";
+    let memoized = Caller::memoized(&lake).await?;
+    let before = memoized.query(all).await?;
+
+    lake.run(10, &["INSERT INTO lake.t VALUES (100)"])?;
+
+    assert_eq!(
+        memoized.query(all).await?,
+        before,
+        "the kept table's snapshot"
+    );
+    let ctx = SessionContext::new();
+    ctx.register_catalog("lake", Arc::new(DuckLakeCatalog::new(memoized.bind()?)?));
+    let at_head = query(&ctx, "SELECT id FROM lake.main.t ORDER BY id").await?;
+    assert!(at_head.contains("| 100 |"), "{at_head}");
+    assert_eq!(at_head, Caller::plain(&lake).await?.query(all).await?);
+    Ok(())
+}
+
 /// A catalog built over a bound provider for each query takes its tables'
 /// scans from the memo too, also behind a view. Its lookups read the catalog.
 #[tokio::test(flavor = "multi_thread")]
@@ -1672,5 +1708,12 @@ mod postgres {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_commit_during_the_fill_does_not_count_from_the_catalog() -> anyhow::Result<()> {
         commit_during_the_fill_does_not_count_from_the_catalog(&backend().await?).await
+    }
+
+    #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_inlined_after_a_fill_is_read_at_the_new_head() -> anyhow::Result<()> {
+        let lake = backend().await?.lake(10, NO_INLINED_ROWS_YET).await?;
+        row_inlined_after_a_fill_is_read_at_the_new_head(lake).await
     }
 }
