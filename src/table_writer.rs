@@ -1319,8 +1319,8 @@ impl DuckLakeTableWriter {
         // 5 GiB). `finish()` streams this file out via a multipart upload.
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props)
-            .with_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
+        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        writer.set_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
 
         // A partitioned target routes rows through a per-partition sink. The
         // single-file writer above is still created: with zero rows the sink
@@ -1364,19 +1364,18 @@ impl DuckLakeTableWriter {
         // A partitioned target already rolls inside its per-partition sink, so a
         // second roller would be redundant (and would double-write).
         let roller = if roll && partition_sink.is_none() {
-            Some(
-                RollingFileWriter::new(
-                    table_key.clone(),
-                    None,
-                    schema_with_ids.clone(),
-                    arrow_schema.fields().len(),
-                    self.build_writer_props(),
-                    self.target_file_size,
-                    // Keep `TableWriteSession::file_path` accurate for the first file.
-                    Some(catalog_path.clone()),
-                )
-                .with_file_order(file_order.clone()),
-            )
+            let mut roller = RollingFileWriter::new(
+                table_key.clone(),
+                None,
+                schema_with_ids.clone(),
+                arrow_schema.fields().len(),
+                self.build_writer_props(),
+                self.target_file_size,
+                // Keep `TableWriteSession::file_path` accurate for the first file.
+                Some(catalog_path.clone()),
+            );
+            roller.set_file_order(file_order.clone());
+            Some(roller)
         } else {
             None
         };
@@ -1927,8 +1926,8 @@ impl DuckLakeTableWriter {
                 usize::MAX
             },
             None,
-        )
-        .with_file_order(file_order);
+        );
+        roller.set_file_order(file_order);
         let mut files = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -2109,8 +2108,8 @@ impl DuckLakeTableWriter {
 
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props)
-            .with_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
+        let mut writer = RowGroupSampledWriter::new(staging, schema_with_ids.clone(), props);
+        writer.set_sort_check(file_order.as_ref().and_then(|o| o.check(&schema_with_ids)));
         let mut row_count: i64 = 0;
         let mut leaf_stats = crate::stats_collect::WrittenLeafStats::default();
         while let Some(batch) = batches.next().await {
@@ -2127,21 +2126,25 @@ impl DuckLakeTableWriter {
             writer.write(&batch_with_ids)?;
             row_count += batch.num_rows() as i64;
         }
-        let verified_order = writer.verified_order();
-        let staged = writer.into_inner()?;
+        // Scoped: a local borrowed before an await stays in the future across
+        // it, and the writer is large.
+        let (verified_order, staged) = {
+            let writer = writer;
+            (writer.verified_order(), writer.into_inner()?)
+        };
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
         let file_size = file.metadata()?.len() as i64;
         let footer_size = read_footer_size(&mut file)?;
+        if let (Some(file_order), Some(sort_key)) = (file_order, verified_order) {
+            file_order.record(&file_name, file_size, sort_key);
+        }
 
         let local = tokio::fs::File::open(temp.path()).await?;
         let mut reader = tokio::io::BufReader::new(local);
         let mut upload = ObjectBufWriter::new(Arc::clone(&self.object_store), object_path);
         stream_to_upload(&mut reader, &mut upload).await?;
-        if let (Some(file_order), Some(sort_key)) = (&file_order, verified_order) {
-            file_order.record(&file_name, file_size, sort_key);
-        }
 
         // Collect stats for catalog columns only. NaN presence and string
         // bounds were tracked while consuming the stream: the footer records
@@ -3288,8 +3291,8 @@ impl DuckLakeTableWriter {
             self.build_writer_props(),
             self.target_file_size,
             None,
-        )
-        .with_file_order(file_order);
+        );
+        roller.set_file_order(file_order);
         let mut files: Vec<DataFileInfo> = Vec::new();
         for batch in batches {
             if let Some(staged) = roller.write(batch)? {
@@ -4209,9 +4212,6 @@ struct StagedFile {
     object_path: ObjectPath,
     row_count: i64,
     leaf_stats: crate::stats_collect::WrittenLeafStats,
-    /// The request the file was checked for and the key its rows followed,
-    /// recorded once the file is uploaded.
-    verified_order: Option<(FileOrderRequest, String)>,
 }
 
 /// Writes batches into a sequence of parquet files, starting a new one whenever the
@@ -4274,9 +4274,8 @@ impl RollingFileWriter {
     }
 
     /// Check every file's rows for `file_order`, and record the ones that hold.
-    fn with_file_order(mut self, file_order: Option<FileOrderRequest>) -> Self {
+    fn set_file_order(&mut self, file_order: Option<FileOrderRequest>) {
         self.file_order = file_order;
-        self
     }
 
     /// Append `batch`, opening a file if none is in progress. Returns the finished
@@ -4344,13 +4343,13 @@ impl RollingFileWriter {
         let object_path = ObjectPath::from(object_path_str.trim_start_matches('/'));
         let temp = NamedTempFile::new()?;
         let staging = std::io::BufWriter::new(temp.reopen()?);
-        let writer =
-            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone())
-                .with_sort_check(
-                    self.file_order
-                        .as_ref()
-                        .and_then(|o| o.check(&self.schema_with_ids)),
-                );
+        let mut writer =
+            RowGroupSampledWriter::new(staging, self.schema_with_ids.clone(), self.props.clone());
+        writer.set_sort_check(
+            self.file_order
+                .as_ref()
+                .and_then(|o| o.check(&self.schema_with_ids)),
+        );
         Ok(OpenFile {
             writer,
             temp,
@@ -4367,20 +4366,27 @@ impl RollingFileWriter {
 /// descriptor. Synchronous, so a streaming write needs no await to roll a file.
 #[tracing::instrument(name = "ducklake.finalize_open_file", level = "info", skip_all)]
 fn finalize_open_file(file: OpenFile) -> Result<StagedFile> {
-    let verified_order = file.file_order.zip(file.writer.verified_order());
+    let verified_order = file.writer.verified_order();
     let staged = file.writer.into_inner()?;
     // `into_inner` flushes the buffered footer bytes to the OS file; dropping the
     // returned handle closes that descriptor.
-    staged
+    let handle = staged
         .into_inner()
         .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
+    if let (Some(file_order), Some(sort_key)) = (&file.file_order, verified_order) {
+        file_order.record(
+            &file.catalog_path,
+            handle.metadata()?.len() as i64,
+            sort_key,
+        );
+    }
+    drop(handle);
     Ok(StagedFile {
         temp: file.temp.into_temp_path(),
         catalog_path: file.catalog_path,
         object_path: file.object_path,
         row_count: file.row_count,
         leaf_stats: file.leaf_stats,
-        verified_order,
     })
 }
 
@@ -4408,9 +4414,6 @@ async fn upload_staged_file(
     let mut reader = tokio::io::BufReader::new(local);
     let mut upload = ObjectBufWriter::new(Arc::clone(object_store), staged.object_path.clone());
     stream_to_upload(&mut reader, &mut upload).await?;
-    if let Some((file_order, sort_key)) = &staged.verified_order {
-        file_order.record(&staged.catalog_path, file_size, sort_key.clone());
-    }
 
     let column_stats = crate::stats_collect::collect_own_written_column_stats(
         &staged.temp,
@@ -4463,7 +4466,7 @@ struct PartitionSink {
     /// Field-id-tagged schema every written batch carries.
     schema_with_ids: SchemaRef,
     props: WriterProperties,
-    /// See [`RollingFileWriter::with_file_order`].
+    /// See [`RollingFileWriter::set_file_order`].
     file_order: Option<FileOrderRequest>,
     target_file_size: usize,
     max_open: usize,
@@ -4517,23 +4520,21 @@ impl PartitionSink {
                 } else {
                     String::new()
                 };
-                self.open.push((
-                    values.to_vec(),
-                    RollingFileWriter::new(
-                        self.table_key.clone(),
-                        if rel.is_empty() {
-                            None
-                        } else {
-                            Some(rel)
-                        },
-                        self.schema_with_ids.clone(),
-                        self.schema_with_ids.fields().len(),
-                        self.props.clone(),
-                        self.target_file_size,
-                        None,
-                    )
-                    .with_file_order(self.file_order.clone()),
-                ));
+                let mut roller = RollingFileWriter::new(
+                    self.table_key.clone(),
+                    if rel.is_empty() {
+                        None
+                    } else {
+                        Some(rel)
+                    },
+                    self.schema_with_ids.clone(),
+                    self.schema_with_ids.fields().len(),
+                    self.props.clone(),
+                    self.target_file_size,
+                    None,
+                );
+                roller.set_file_order(self.file_order.clone());
+                self.open.push((values.to_vec(), roller));
                 self.open.len() - 1
             },
         };
@@ -5035,7 +5036,7 @@ pub struct TableWriteSession {
     /// Uploads the files the roller finishes, as it finishes them.
     rolled: StagedUploads,
     commit_metadata: SnapshotCommitMetadata,
-    /// See [`RollingFileWriter::with_file_order`]; for the single `writer`.
+    /// See [`RollingFileWriter::set_file_order`]; for the single `writer`.
     file_order: Option<FileOrderRequest>,
 }
 
@@ -5770,14 +5771,21 @@ impl TableWriteSession {
         // Finalise the parquet footer, then unwrap the `BufWriter` (its
         // `into_inner` flushes any buffered footer bytes to the OS file) so the
         // staging file on disk is the complete parquet.
-        let verified_order = writer.verified_order();
-        let staged = writer.into_inner()?;
+        // Scoped: a local borrowed before an await stays in the future across
+        // it, and the writer is large.
+        let (verified_order, staged) = {
+            let writer = writer;
+            (writer.verified_order(), writer.into_inner()?)
+        };
         let mut file = staged
             .into_inner()
             .map_err(|e| crate::error::DuckLakeError::Io(e.into_error()))?;
 
         let file_size = file.metadata()?.len() as i64;
         let footer_size = read_footer_size(&mut file)?;
+        if let (Some(file_order), Some(sort_key)) = (&self.file_order, verified_order) {
+            file_order.record(&self.catalog_path, file_size, sort_key);
+        }
 
         // Stream the staged file to object storage. `BufWriter` chunks the
         // payload and switches to a multipart upload for large files, so there
@@ -5794,9 +5802,6 @@ impl TableWriteSession {
                 tracing::warn!(error = %failure, "failed to remove a data file after a failed upload");
             }
             return Err(error.into());
-        }
-        if let (Some(file_order), Some(sort_key)) = (&self.file_order, verified_order) {
-            file_order.record(&self.catalog_path, file_size, sort_key);
         }
 
         // Harvest per-column statistics from the parquet footer we just wrote

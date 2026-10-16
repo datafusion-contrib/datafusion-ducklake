@@ -257,7 +257,8 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     writer: Option<ArrowWriter<W>>,
-    sort_check: Option<crate::file_ordering::SortCheck>,
+    /// Boxed: the writer lives in long-held futures, and is mostly `None`.
+    sort_check: Option<Box<crate::file_ordering::SortCheck>>,
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -274,12 +275,8 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
 
     /// Check every row written against `check` (see [`crate::file_ordering`]);
     /// [`Self::verified_order`] then reports whether all of them followed it.
-    pub(crate) fn with_sort_check(
-        mut self,
-        check: Option<crate::file_ordering::SortCheck>,
-    ) -> Self {
-        self.sort_check = check;
-        self
+    pub(crate) fn set_sort_check(&mut self, check: Option<crate::file_ordering::SortCheck>) {
+        self.sort_check = check.map(Box::new);
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while

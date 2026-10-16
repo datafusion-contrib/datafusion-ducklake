@@ -151,9 +151,17 @@ mod write {
 
     /// What a write asks of each file it writes under the `ext_file_order`
     /// option: check the rows against the table's sort key and, when they
-    /// follow it, record that in the sidecar once the file is uploaded.
+    /// follow it, record that in the sidecar as soon as the file is finished.
+    /// That can precede the upload: a row for a path whose upload then fails
+    /// matches no catalog file and is pruned like any other.
+    ///
+    /// One pointer wide: writers and sessions holding it live in long-held
+    /// futures.
     #[derive(Debug, Clone)]
-    pub(crate) struct FileOrderRequest {
+    pub(crate) struct FileOrderRequest(Arc<RequestInner>);
+
+    #[derive(Debug)]
+    struct RequestInner {
         metadata: Arc<dyn MetadataWriter>,
         table_id: i64,
         /// Top-level field indices of the written schema, with the key's
@@ -184,20 +192,20 @@ mod write {
                 })
                 .collect::<Option<Vec<_>>>()
                 .filter(|columns| !columns.is_empty())?;
-            Some(Self {
+            Some(Self(Arc::new(RequestInner {
                 metadata,
                 table_id,
                 columns,
-            })
+            })))
         }
 
         /// A fresh check for one file written with `schema`, which carries
         /// the request's columns at the same indices plus their field ids.
         pub(crate) fn check(&self, schema: &Schema) -> Option<SortCheck> {
-            SortCheck::new(schema, &self.columns)
+            SortCheck::new(schema, &self.0.columns)
         }
 
-        /// Record that the uploaded file at catalog `path` follows `sort_key`.
+        /// Record that the finished file at catalog `path` follows `sort_key`.
         /// Best effort: the data write never fails over its sidecar row, and a
         /// file without one reads as unordered, as it always did.
         pub(crate) fn record(&self, path: &str, file_size_bytes: i64, sort_key: String) {
@@ -206,9 +214,10 @@ mod write {
                 file_size_bytes,
                 sort_key,
             };
-            if let Err(error) = self
-                .metadata
-                .record_file_orders(self.table_id, BY_WRITE, &[order])
+            if let Err(error) =
+                self.0
+                    .metadata
+                    .record_file_orders(self.0.table_id, BY_WRITE, &[order])
             {
                 tracing::warn!(
                     %error,
