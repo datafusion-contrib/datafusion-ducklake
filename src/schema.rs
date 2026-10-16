@@ -448,11 +448,13 @@ impl SchemaProvider for DuckLakeSchema {
             .collect::<DataFusionResult<Vec<_>>>()?;
 
         // Official refuses a column named like an inlined data table's system
-        // column while inlining is enabled.
+        // column while inlining is enabled, before the table exists: the
+        // setup below creates it on some backends. With no stored, configured
+        // or writer limit, official's default applies.
         let inlining = self
             .table_write_options(None)?
             .data_inlining_row_limit
-            .unwrap_or(0);
+            .unwrap_or(crate::table_writer::DEFAULT_DATA_INLINING_ROW_LIMIT);
         if inlining > 0 {
             let names = columns
                 .iter()

@@ -71,9 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING**: `DuckLakeTableWriter` and its sessions inline as official does, under the
   stored limit, else the writer's, else `10`. To keep writing Parquet, set
   `with_data_inlining_row_limit(0)` and store no positive limit; no catalog migration needed.
+- **BREAKING** (behaviour): deletes and upserts built from `files_matching`,
+  `resolve_positions`, `write_delete_file` or `set_delete_file` miss rows writers now inline.
+  Use `DuckLakeTable::keyed_mutation`, `delete_positions` or `delete_rowids`, or a limit of `0`.
+- **BREAKING** (behaviour): on multi-catalog PostgreSQL, a `DuckLakeTableWriter` write creating
+  a table or changing its columns creates its inlined data table. Grant the role `CREATE`.
 - **BREAKING**: `CompactionResult` gains `inlined_flush_snapshot`; add it to struct literals.
-- An insert whose sort key names a column the table lacks fails with official's binder error
-  whenever official's would, empty or inlined; so does `set_sort_spec`.
+- **BREAKING** (behaviour): an insert whose sort key names a column the table lacks fails with
+  official's binder error, empty or inlined; so does `set_sort_spec`. Fix the sort order first.
 - **BREAKING** (behaviour): a write dropping a column a sort key references is refused, as
   official refuses `DROP COLUMN`, and so is any drop under a key this crate cannot parse.
   Reset or change the sort order first.
@@ -89,6 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewrite the `TRUE`-like values earlier releases stored to `true`.
 - **BREAKING** for `MetadataWriter` wrappers: forward the new inlining-limit methods,
   `table_setting`, `set_schema_setting` and `register_existing_data_files_with_tags`.
+  Call the inner writer on the calling thread, which carries a table writer's limit.
 - **BREAKING**: `PromotedFile` gains `partial_max` and is `#[non_exhaustive]`; build it with
   `PromotedFile::new`.
 - A `DuckLakeTable` whose PostgreSQL catalog holds no inlined rows for it reads its inlined
@@ -107,6 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewrites its inlined floats, 0.9's included, as text, which 0.9 cannot read.
 - **BREAKING** for rollback to 0.9: 0.9 fails to read a flushed file at a snapshot after one
   of its rows was deleted, before its last row.
+- **BREAKING** for rollback to 0.9: 0.9 refuses `UPDATE` and `rowid` scans on a table holding
+  inlined rows, which writers now produce by default. Flush inlined data before rolling back.
 - **BREAKING**: `DeleteFileInfo` gains a private field; build it with `DeleteFileInfo::new`,
   and `with_deleted_positions` to commit it beside concurrent inlined deletions of other rows.
 - **BREAKING**: `DuckLakeError` gains `CommitOutcomeUnknown` (`metadata-postgres`,
@@ -136,7 +144,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `10`, as official (#270). Set the option to `0` to opt out.
 - **BREAKING**: under a positive `data_inlining_row_limit`, the default, a write refuses a
   column named like an inlined system column (`row_id`, `begin_snapshot`), as official (#270).
-  Store a limit of `0` for such a table, or its schema, before writing it.
+  Write such a table with a writer limit of `0`, or store `0` at its schema or catalog scope.
 - **BREAKING**: a Parquet write to a catalog with `encrypted` set fails with `Unsupported`
   instead of writing unencrypted; inlined writes succeed. To write Parquet, set `encrypted` to
   `false`; no data migration is needed.
@@ -203,6 +211,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sort keys of a dialect other than exactly `duckdb` order nothing, as official skips them.
 - PostgreSQL snapshot listings read official's `TIMESTAMPTZ` snapshot times, time travel reads
   any UTC offset, and PostgreSQL writers store snapshot times in UTC whatever the `TimeZone`.
+- On a PostgreSQL server not in UTC, snapshot times earlier releases wrote are local times now
+  read as UTC, so time travel and `OlderThan` expiry over them shift by the server's offset.
 - Inlined rows written before a struct field was added, renamed or dropped (also in a list or
   map) read in the current shape, an added field taking its default, on every backend.
 - `UPDATE`, `DELETE` and flushes of inlined rows accept a NULL in a struct field that official

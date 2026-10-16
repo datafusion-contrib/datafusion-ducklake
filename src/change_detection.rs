@@ -135,7 +135,11 @@ pub struct TableDataChanges {
     /// expired snapshot. A multi-catalog PostgreSQL store shares one id
     /// sequence among its catalogs; there only an expired starting snapshot,
     /// or an expired first snapshot of the table in the window, is found, and
-    /// taken to mean the snapshots after it were expired too.
+    /// taken to mean the snapshots after it were expired too. That finds every
+    /// expiry by age (`ExpireCriteria::OlderThan`), which removes a catalog's
+    /// oldest snapshots, but not `ExpireCriteria::Versions` naming a snapshot
+    /// strictly inside the window: a missing id there is as likely another
+    /// catalog's snapshot or a rolled-back commit's, so it is not taken as one.
     pub history_incomplete: bool,
     /// The latest snapshot in the window that changed the table's rows (as
     /// [`Self::rows_changed`] counts them), if any.

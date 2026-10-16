@@ -223,7 +223,7 @@ fn resolve_snapshot_bound(
             None => {
                 return plan_err!(
                     "{arg_name} of {fn_name}() is not a valid timestamp: '{s}' \
-                     (expected 'YYYY-MM-DD[ HH:MM:SS[.ffffff]]', UTC)"
+                     (expected 'YYYY-MM-DD[ HH:MM:SS[.ffffff]][+HH[:MM]]', UTC without an offset)"
                 );
             },
         },

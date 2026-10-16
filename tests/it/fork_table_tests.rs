@@ -1645,6 +1645,389 @@ async fn fork_writes_inlined_rows_sorted_by(pool: sqlx::PgPool, key: &str, order
     assert_eq!(catalog_rows(&destination), flushed, "{key}");
 }
 
+// ---------------------------------------------------------------------------
+// Forks against the source's maintenance
+// ---------------------------------------------------------------------------
+
+type Hook = futures::future::BoxFuture<'static, ()>;
+
+/// A local store that runs `hook` once, before the first object the fork
+/// uploads, so the source's maintenance lands between the fork reading the
+/// source and committing.
+struct HookedStore {
+    inner: object_store::local::LocalFileSystem,
+    hook: tokio::sync::Mutex<Option<Hook>>,
+}
+
+impl std::fmt::Debug for HookedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HookedStore")
+    }
+}
+
+impl std::fmt::Display for HookedStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HookedStore")
+    }
+}
+
+impl HookedStore {
+    async fn run_hook(&self) {
+        let hook = self.hook.lock().await.take();
+        if let Some(hook) = hook {
+            hook.await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for HookedStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.run_hook().await;
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.run_hook().await;
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn catalog_name(
+    pool: &sqlx::PgPool,
+    writer: &Arc<dyn datafusion_ducklake::MetadataWriter>,
+) -> String {
+    sqlx::query_scalar("SELECT catalog_name FROM ducklake_catalog WHERE catalog_id = $1")
+        .bind(writer.catalog_id().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Replace `main.t` with `rows` in Parquet, ending its files.
+async fn replace(writer: &Arc<dyn datafusion_ducklake::MetadataWriter>, rows: RecordBatch) {
+    datafusion_ducklake::DuckLakeTableWriter::new(
+        Arc::clone(writer),
+        Arc::new(object_store::local::LocalFileSystem::new()),
+    )
+    .unwrap()
+    .with_options(
+        &datafusion_ducklake::DuckLakeWriteOptions::default().with_data_inlining_row_limit(0),
+    )
+    .write_table("main", "t", &[rows])
+    .await
+    .unwrap();
+}
+
+/// Expire every snapshot of `writer`'s catalog but its head, then clean up
+/// its scheduled files; the paths cleanup deleted.
+async fn expire_and_clean(
+    pool: &sqlx::PgPool,
+    writer: &Arc<dyn datafusion_ducklake::MetadataWriter>,
+) -> Vec<String> {
+    let manager = MulticatalogManager::new(pool.clone());
+    let name = catalog_name(pool, writer).await;
+    let snapshots: Vec<i64> = sqlx::query_scalar(
+        "SELECT snapshot_id FROM ducklake_catalog_snapshot_map WHERE catalog_id = $1",
+    )
+    .bind(writer.catalog_id().unwrap())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    manager
+        .expire_snapshots_in_catalog(
+            &name,
+            datafusion_ducklake::maintenance::ExpireCriteria::Versions(snapshots),
+        )
+        .await
+        .unwrap();
+    datafusion_ducklake::maintenance::cleanup_old_files_in_catalog(
+        &manager,
+        &name,
+        Arc::new(object_store::local::LocalFileSystem::new()),
+        datafusion_ducklake::maintenance::CleanupCriteria::All,
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+/// The Parquet files under `lake`'s data directory.
+fn parquet_files(lake: &Lake) -> Vec<std::path::PathBuf> {
+    walk(lake.data.clone())
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect()
+}
+
+/// The source ends a file the fork has read, expires the snapshots that
+/// could read it and cleans it up while the fork is writing its own files:
+/// the fork's commit refuses with a retryable `Conflict` instead of
+/// registering a reference to a deleted object, and removes the files it
+/// wrote. Guards against a fork committed after the reclaim, reading a file
+/// that no longer exists.
+async fn fork_conflicts_with_a_source_reclaim_mid_fork(pool: sqlx::PgPool) {
+    let manager = MulticatalogManager::new(pool.clone());
+    let make = multicatalog(pool.clone());
+    let source = make(Some(5)).await;
+    create(&source, "t").await;
+    source.append_parquet("t", &batch(1..=20, "a")).await;
+    source.append("t", &batch(100..=102, "i")).await;
+    let destination = make(None).await;
+    let (_, table) = read_handle(&source, source.head()).await;
+
+    let reclaimed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Hook = {
+        let pool = pool.clone();
+        let writer = Arc::clone(&source.writer);
+        let reclaimed = Arc::clone(&reclaimed);
+        Box::pin(async move {
+            replace(&writer, batch(50..=52, "r")).await;
+            let deleted = expire_and_clean(&pool, &writer).await;
+            reclaimed.lock().unwrap().extend(deleted);
+        })
+    };
+    let store = Arc::new(HookedStore {
+        inner: object_store::local::LocalFileSystem::new(),
+        hook: tokio::sync::Mutex::new(Some(hook)),
+    });
+    let ctx = SessionContext::new();
+    ctx.runtime_env().register_object_store(
+        datafusion::execution::object_store::ObjectStoreUrl::local_filesystem().as_ref(),
+        store,
+    );
+    let forked = manager
+        .fork_table(
+            &ctx.state(),
+            &table,
+            Arc::clone(&destination.writer),
+            "main",
+            "t",
+        )
+        .await;
+    assert!(
+        !reclaimed.lock().unwrap().is_empty(),
+        "the source reclaimed the file the fork read"
+    );
+    assert!(
+        matches!(forked, Err(DuckLakeError::Conflict(_))),
+        "{forked:?}"
+    );
+    assert!(
+        parquet_files(&destination).is_empty(),
+        "the refused fork removed its own files"
+    );
+
+    // A retry forks what the source holds now.
+    fork(&manager, &source, source.head(), &destination)
+        .await
+        .unwrap();
+    assert_eq!(destination.rows("t").await, source.rows("t").await);
+}
+
+/// A file a fork, and a fork of the fork, reference survives its owner
+/// ending, expiring and cleaning it up for as long as either reference
+/// stands, and is reclaimed once the last one goes. The fork of the fork
+/// names the root as owner, not the catalog it copied the row from.
+async fn cleanup_defers_files_forks_and_forks_of_forks_reference(pool: sqlx::PgPool) {
+    let manager = MulticatalogManager::new(pool.clone());
+    let make = multicatalog(pool.clone());
+    let root = make(Some(0)).await;
+    create(&root, "t").await;
+    root.append_parquet("t", &batch(1..=10, "a")).await;
+    let files = parquet_files(&root);
+    assert_eq!(files.len(), 1);
+    let file = files[0].clone();
+    let expected = root.rows("t").await;
+
+    let middle = make(None).await;
+    fork(&manager, &root, root.head(), &middle).await.unwrap();
+    let leaf = make(None).await;
+    fork(&manager, &middle, middle.head(), &leaf).await.unwrap();
+    let owners: Vec<i64> = sqlx::query_scalar(
+        "SELECT owner_catalog_id FROM ducklake_catalog_data_file_reference r
+         JOIN ducklake_data_file f ON f.data_file_id = r.data_file_id
+         JOIN ducklake_table t ON t.table_id = f.table_id
+         JOIN ducklake_catalog_schema_map m ON m.schema_id = t.schema_id
+         WHERE m.catalog_id = $1",
+    )
+    .bind(leaf.writer.catalog_id().unwrap())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owners, vec![root.writer.catalog_id().unwrap()]);
+
+    replace(&root.writer, batch(50..=52, "r")).await;
+    expire_and_clean(&pool, &root.writer).await;
+    assert!(file.exists(), "both references defer the reclaim");
+    assert_eq!(middle.rows("t").await, expected);
+    assert_eq!(leaf.rows("t").await, expected);
+
+    replace(&middle.writer, batch(60..=62, "m")).await;
+    expire_and_clean(&pool, &middle.writer).await;
+    expire_and_clean(&pool, &root.writer).await;
+    assert!(file.exists(), "the fork of the fork defers the reclaim");
+    assert_eq!(leaf.rows("t").await, expected);
+
+    replace(&leaf.writer, batch(70..=72, "l")).await;
+    expire_and_clean(&pool, &leaf.writer).await;
+    let deleted = expire_and_clean(&pool, &root.writer).await;
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert!(
+        !file.exists(),
+        "the owner reclaims it once no reference stands"
+    );
+}
+
+/// A fork that replaces its table with an empty source's records the rows it
+/// removed (`deleted_from_table`), as every Replace does, so change
+/// detection reports the snapshot the change feed shows the deletions at.
+/// Guards against a fileless Replace that recorded no row change.
+async fn fork_replace_from_an_empty_source_records_the_removal(pool: sqlx::PgPool) {
+    let manager = MulticatalogManager::new(pool.clone());
+    let make = multicatalog(pool.clone());
+    let source = make(Some(0)).await;
+    create(&source, "t").await;
+    source.append_parquet("t", &batch(1..=5, "a")).await;
+    let destination = make(None).await;
+    fork(&manager, &source, source.head(), &destination)
+        .await
+        .unwrap();
+    assert_eq!(destination.rows("t").await.len(), 5);
+
+    source.sql("DELETE FROM lake.main.t").await.unwrap();
+    assert!(source.rows("t").await.is_empty());
+    let forked = fork(&manager, &source, source.head(), &destination)
+        .await
+        .unwrap();
+    assert!(destination.rows("t").await.is_empty());
+    let table_id = destination.table_id("t");
+    let changes: String = sqlx::query_scalar(
+        "SELECT changes_made FROM ducklake_snapshot_changes WHERE snapshot_id = $1",
+    )
+    .bind(forked.commit.snapshot_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        changes
+            .split(',')
+            .any(|change| change == format!("deleted_from_table:{table_id}")),
+        "{changes}"
+    );
+    assert_eq!(
+        crate::inlining_abstraction_tests::last_rows_changed(
+            &destination.provider,
+            table_id,
+            destination.head()
+        )
+        .await,
+        Some(forked.commit.snapshot_id)
+    );
+}
+
+/// A partitioned source whose only live file is the 0-row file an empty
+/// Replace commits (with no partition values) forks: the file holds no row of
+/// the source, so the fork leaves it out and reads the source's (empty)
+/// content under its partition spec. Guards against refusing the fork as
+/// written under another partition spec.
+async fn fork_of_a_partitioned_source_emptied_by_a_replace(pool: sqlx::PgPool) {
+    let manager = MulticatalogManager::new(pool.clone());
+    let make = multicatalog(pool.clone());
+    let source = make(None).await;
+    create(&source, "t").await;
+    source
+        .writer
+        .set_partition_spec(
+            source.table_id("t"),
+            &[(
+                "v".to_string(),
+                datafusion_ducklake::PartitionTransform::Identity,
+            )],
+        )
+        .unwrap();
+    source.append_parquet("t", &batch(1..=20, "a")).await;
+    source
+        .table_writer()
+        .write_table("main", "t", &[batch(std::iter::empty(), "a")])
+        .await
+        .unwrap();
+    assert!(source.rows("t").await.is_empty());
+    let files = source
+        .provider
+        .get_table_files_for_select(source.table_id("t"), source.head())
+        .unwrap();
+    assert!(
+        files.iter().all(|file| file.max_row_count == Some(0)),
+        "{files:?}"
+    );
+
+    let destination = make(None).await;
+    let forked = fork(&manager, &source, source.head(), &destination)
+        .await
+        .unwrap();
+    assert_eq!(forked.files_referenced, 0);
+    assert!(destination.rows("t").await.is_empty());
+    assert!(
+        destination
+            .provider
+            .get_partition_spec(destination.table_id("t"), destination.head())
+            .unwrap()
+            .is_some(),
+        "the fork keeps the source's partition spec"
+    );
+}
+
 /// Every fork scenario on one PostgreSQL store, a fresh pair of catalogs
 /// each.
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
@@ -1666,5 +2049,9 @@ async fn fork_table_scenarios() {
     fork_with_row_id_gaps_keeps_row_ids_through_a_merge(pool.clone()).await;
     fork_of_updated_inlined_rows_keeps_row_ids_through_a_merge(pool.clone()).await;
     fork_writes_inlined_rows_as_a_flush_sorts_them(pool.clone()).await;
+    fork_conflicts_with_a_source_reclaim_mid_fork(pool.clone()).await;
+    cleanup_defers_files_forks_and_forks_of_forks_reference(pool.clone()).await;
+    fork_replace_from_an_empty_source_records_the_removal(pool.clone()).await;
+    fork_of_a_partitioned_source_emptied_by_a_replace(pool.clone()).await;
     fork_fuzz(pool).await;
 }

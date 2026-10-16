@@ -649,7 +649,7 @@ async fn crate_values(provider: &Arc<dyn MetadataProvider>, snapshots: &[i64]) -
 
 /// The change-feed windows compared after `previous`: every single snapshot,
 /// and their whole range.
-fn change_windows(previous: i64, head: i64) -> Vec<(i64, i64)> {
+pub(crate) fn change_windows(previous: i64, head: i64) -> Vec<(i64, i64)> {
     let mut windows = (previous + 1..=head).map(|s| (s, s)).collect::<Vec<_>>();
     if head > previous + 1 {
         windows.push((previous + 1, head));
@@ -687,7 +687,7 @@ fn relative_changes(lines: Vec<String>, setup_head: i64) -> Vec<String> {
 }
 
 /// Rows of arrow-rs batches as comma-separated cells, NULL as `NULL`.
-fn arrow_lines(batches: &[RecordBatch]) -> Vec<String> {
+pub(crate) fn arrow_lines(batches: &[RecordBatch]) -> Vec<String> {
     let mut lines = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {

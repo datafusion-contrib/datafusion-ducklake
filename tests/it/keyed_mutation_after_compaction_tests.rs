@@ -830,6 +830,56 @@ async fn keyed_delete_skips_rows_a_merged_file_holds_from_later_snapshots() {
     assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
 }
 
+/// [`keyed_delete_skips_rows_a_merged_file_holds_from_later_snapshots`] for
+/// `update_by_keys`: a row the merged file holds from a later snapshot is not
+/// a row of the table at the snapshot read, so no row is updated. Guards
+/// against an update that rewrote a row the table did not hold yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn keyed_update_skips_rows_a_merged_file_holds_from_later_snapshots() {
+    let temp = TempDir::new().unwrap();
+    seed(&temp, vec![1], vec![10]).await;
+    let p = pool(&temp).await;
+    let first = scalar_i64(&p, "SELECT max(snapshot_id) FROM ducklake_snapshot").await;
+    append(&temp, vec![2], vec![20]).await;
+    run_merge(&temp, MergeOptions::default()).await;
+    assert!(
+        opt_i64(
+            &p,
+            "SELECT partial_max FROM ducklake_data_file WHERE end_snapshot IS NULL"
+        )
+        .await
+        .is_some_and(|max| max > first),
+        "the merge writes a partial file spanning both snapshots",
+    );
+
+    let provider = SqliteMetadataProvider::new(&db_url(&temp)).await.unwrap();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::new(provider), first).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_catalog("ducklake", Arc::new(catalog));
+    let provider = ctx
+        .catalog("ducklake")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let writer: Arc<dyn MetadataWriter> =
+        Arc::new(SqliteMetadataWriter::new(&db_url(&temp)).await.unwrap());
+    let table = as_ducklake(&provider)
+        .clone()
+        .with_writer("main".to_string(), writer);
+    let result = table
+        .keyed_mutation(&["id"])
+        .update_by_keys(&ctx.state(), vec![batch(vec![2], vec![99])])
+        .await
+        .unwrap();
+    assert_eq!(result.rows_updated, 0);
+    assert_eq!(result.snapshot_id, None);
+    assert_eq!(read_rows(&temp).await, vec![(1, 10), (2, 20)]);
+}
+
 /// A keyed mutation of a table opened without the catalog's write options
 /// follows the table's stored `data_inlining_row_limit`, which outranks the
 /// writer's: its deletion is inlined, not written as a delete file.

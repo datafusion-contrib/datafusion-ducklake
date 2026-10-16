@@ -1391,9 +1391,24 @@ impl PostgresMetadataWriter {
                 }
             }
         }
+        // The catalogs whose rows the batch's references copy (a fork's
+        // source), locked with this one so their expire, compaction and
+        // drop wait for the commit.
+        let source_catalogs: std::collections::BTreeSet<i64> = files
+            .iter()
+            .filter_map(|entry| entry.source_rows.map(|rows| rows.catalog_id))
+            .filter(|catalog| *catalog != self.catalog_id)
+            .collect();
         self.block_on(async {
             let mut tx = self.pool.begin().await?;
-            lock_catalog(self.catalog_id, self.lock_timeout_ms, &mut tx).await?;
+            // Ascending ids, so two forks locking the same catalogs in opposite
+            // roles cannot deadlock.
+            let mut locked = source_catalogs.clone();
+            locked.insert(self.catalog_id);
+            for catalog in locked {
+                lock_catalog(catalog, self.lock_timeout_ms, &mut tx).await?;
+            }
+            refuse_removed_source_rows(files, &mut tx).await?;
             let legacy = legacy_owner_columns(&mut tx).await?;
             let existing_table = refuse_foreign_column_ids(
                 self.catalog_id,
@@ -1832,17 +1847,34 @@ impl PostgresMetadataWriter {
                 .bind(table_id)
                 .execute(&mut *tx)
                 .await?;
-
+            }
+            // A Replace that retired rows records their removal, as every other
+            // Replace does, also when it registers no file (a fork of an empty
+            // source), so the change ledger shows the rows it removed.
+            let (replaced_files, replaced_inlined) = if mode == WriteMode::Replace {
+                replaced_storage(&mut tx, table_id, snapshot_id).await?
+            } else {
+                (false, false)
+            };
+            let changes = table_storage_changes(
+                table_id,
+                (!files.is_empty()).then_some(false),
+                replaced_files,
+                replaced_inlined,
+            );
+            if !changes.is_empty() {
                 record_snapshot_changes(
                     &mut tx,
                     snapshot_id,
-                    &format!("inserted_into_table:{table_id}"),
+                    &changes,
                     &SnapshotCommitMetadata::default(),
                 )
                 .await?;
             }
             advance_catalog_head(self.catalog_id, snapshot_id, &mut tx).await?;
-            self.commit(tx).await?;
+            // A failed `COMMIT` may have applied: `CommitOutcomeUnknown`, so a
+            // caller keeps the files the registration may now name.
+            self.commit_networked(tx).await?;
             Ok(CommitIds {
                 snapshot_id,
                 schema_id,
@@ -2140,6 +2172,64 @@ pub(crate) fn validate_carried_tags(table_id: i64, tags: &CarriedTags) -> Result
             },
             key,
         )?;
+    }
+    Ok(())
+}
+
+/// Refuse with [`crate::DuckLakeError::Conflict`] a batch whose reference
+/// copies a source row that is gone: a data or delete file another catalog's
+/// expire, compaction or drop removed after the batch read it. Its object is
+/// then scheduled for (or past) deletion with no reference to hold it back, so
+/// registering it would name an object cleanup may already have reclaimed.
+/// The caller holds the source catalogs' locks, which every removal takes, so
+/// a row seen here stands until the reference committed with it holds the
+/// object back.
+async fn refuse_removed_source_rows(
+    files: &[PromotedFile],
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let rows = files
+        .iter()
+        .filter_map(|entry| entry.source_rows)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for (kind, table, column, ids) in [
+        (
+            "data file",
+            "ducklake_data_file",
+            "data_file_id",
+            rows.iter()
+                .map(|rows| rows.data_file_id)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "delete file",
+            "ducklake_delete_file",
+            "delete_file_id",
+            rows.iter()
+                .filter_map(|rows| rows.delete_file_id)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        if ids.is_empty() {
+            continue;
+        }
+        let present: std::collections::HashSet<i64> = sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT {column} FROM {table} WHERE {column} = ANY($1)"
+        )))
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .collect();
+        if let Some(missing) = ids.iter().find(|id| !present.contains(id)) {
+            return Err(crate::DuckLakeError::Conflict(format!(
+                "source {kind} {missing} was removed (expired, compacted or dropped) after it \
+                 was read; retry the fork"
+            )));
+        }
     }
     Ok(())
 }

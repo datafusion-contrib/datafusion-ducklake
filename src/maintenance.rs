@@ -46,6 +46,12 @@ use std::sync::Arc;
 pub enum ExpireCriteria {
     /// Expire exactly these snapshot ids (the most recent snapshot is always kept,
     /// even if listed here).
+    ///
+    /// On a multi-catalog PostgreSQL store, change detection does not find a
+    /// snapshot expired this way inside the window it reads unless it is the
+    /// table's first one there (see
+    /// [`TableDataChanges::history_incomplete`](crate::change_detection::TableDataChanges::history_incomplete));
+    /// expire by age when change detection runs over the catalog.
     Versions(Vec<i64>),
     /// Expire every snapshot older than this timestamp. The most recent snapshot
     /// is always kept regardless.

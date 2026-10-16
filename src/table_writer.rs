@@ -883,6 +883,49 @@ impl DuckLakeTableWriter {
         self
     }
 
+    /// Refuse a write that creates `table_name` or adds a top-level column to
+    /// it named like an inlined data table's system column while the table's
+    /// scoped inlining limit is above `0`, as official refuses `CREATE TABLE`
+    /// and `ADD COLUMN`. It runs before the setup, which on some backends
+    /// creates the table, and before anything is uploaded; the commit checks
+    /// again under its lock.
+    fn refuse_new_reserved_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        columns: &[ColumnDef],
+    ) -> Result<()> {
+        let names = columns
+            .iter()
+            .map(|column| column.name().to_string())
+            .collect::<Vec<_>>();
+        // Most writes name no reserved column: one lookup decides them.
+        if self.metadata.reserved_inlining_column(&names)?.is_none() {
+            return Ok(());
+        }
+        let existing = self
+            .metadata
+            .get_table_column_nullability(schema_name, table_name)?
+            .unwrap_or_default();
+        let new_columns = names
+            .into_iter()
+            .filter(|name| {
+                !existing
+                    .iter()
+                    .any(|(old, _)| old.eq_ignore_ascii_case(name))
+            })
+            .collect::<Vec<_>>();
+        let Some(column) = self.metadata.reserved_inlining_column(&new_columns)? else {
+            return Ok(());
+        };
+        if self.table_data_inlining_row_limit(schema_name, table_name)? == 0 {
+            return Ok(());
+        }
+        Err(crate::metadata_writer::reserved_inlining_column_error(
+            &column,
+        ))
+    }
+
     /// [`MetadataWriter::begin_write_transaction`], based at the planned
     /// snapshot when one was set and is earlier.
     fn begin_write_transaction(
@@ -892,6 +935,7 @@ impl DuckLakeTableWriter {
         columns: &[ColumnDef],
         mode: WriteMode,
     ) -> Result<WriteSetupResult> {
+        self.refuse_new_reserved_columns(schema_name, table_name, columns)?;
         let mut setup = self.with_inlining_limit(|| {
             self.metadata
                 .begin_write_transaction(schema_name, table_name, columns, mode)
@@ -2232,6 +2276,7 @@ impl DuckLakeTableWriter {
                 Some(spec) => sort_insert_rows(batches, arrow_schema, spec)?,
                 None => batches,
             };
+            let batches = crate::metadata_writer::materialize_null_columns(&batches, &columns)?;
             let committed = self.with_inlining_limit(|| {
                 self.metadata.register_inlined_data(
                     setup.table_id,
@@ -2472,13 +2517,14 @@ impl DuckLakeTableWriter {
             batches
         };
         if inline {
+            let batches = crate::metadata_writer::materialize_null_columns(batches, &columns)?;
             let committed = self.with_inlining_limit(|| {
                 self.metadata.register_inlined_data(
                     setup.table_id,
                     schema_name,
                     table_name,
                     setup.snapshot_id,
-                    batches,
+                    &batches,
                     mode,
                     setup.base_snapshot_id,
                     &columns,
@@ -2799,6 +2845,27 @@ impl DuckLakeTableWriter {
         error
     }
 
+    /// Remove, best effort, objects this writer uploaded for `schema_name.
+    /// table_name` that no transaction took over: `(path, path_is_relative)`
+    /// as the catalog would record them.
+    pub(crate) async fn remove_unstaged(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        files: Vec<(String, bool)>,
+    ) {
+        let paths = files
+            .iter()
+            .filter_map(|(path, relative)| {
+                self.staged_object_path(schema_name, table_name, path, *relative)
+                    .ok()
+            })
+            .collect();
+        for failure in remove_objects(&self.object_store, paths).await {
+            tracing::warn!(error = %failure, "failed to remove an unstaged file");
+        }
+    }
+
     pub(crate) fn staged_object_path(
         &self,
         schema_name: &str,
@@ -2837,12 +2904,6 @@ impl DuckLakeTableWriter {
     fn configured_inlining_limit(&self) -> Option<usize> {
         self.data_inlining_row_limit
             .or_else(|| self.metadata.data_inlining_row_limit())
-    }
-
-    /// [`Self::configured_inlining_limit`], else official's default.
-    pub(crate) fn data_inlining_row_limit(&self) -> usize {
-        self.configured_inlining_limit()
-            .unwrap_or(DEFAULT_DATA_INLINING_ROW_LIMIT)
     }
 
     /// The `data_inlining_row_limit` in effect for `schema_name.table_name`:
@@ -3639,8 +3700,8 @@ impl DuckLakeWriteTransaction<'_> {
             let writes = self
                 .writes
                 .iter()
-                .map(|prepared| prepared.write.clone())
-                .collect::<Vec<_>>();
+                .map(|prepared| prepared.write.clone().with_materialized_nulls())
+                .collect::<Result<Vec<_>>>()?;
             let committed = self.writer.with_inlining_limit(|| {
                 self.writer.metadata.commit_multi_table(
                     &writes,
@@ -5266,6 +5327,7 @@ impl TableWriteSession {
     /// Commit the session's rows inlined, in one snapshot, as
     /// [`MetadataWriter::register_inlined_data`] stores them.
     fn commit_inlined(self, batches: Vec<RecordBatch>) -> Result<WriteResult> {
+        let batches = crate::metadata_writer::materialize_null_columns(&batches, &self.columns)?;
         let committed = self.with_inlining_limit(|| {
             self.metadata.register_inlined_data(
                 self.table_id,
@@ -5315,7 +5377,8 @@ impl TableWriteSession {
             inlined_file_deletes: Vec::new(),
             dropped_files: Vec::new(),
             inlined_flush: false,
-        };
+        }
+        .with_materialized_nulls()?;
         let committed = self.with_inlining_limit(|| {
             self.metadata.commit_multi_table(
                 std::slice::from_ref(&write),
@@ -5701,7 +5764,9 @@ pub(crate) fn validate_not_null_batches(
         }
 
         for (field, array) in target_schema.fields().iter().zip(batch.columns()) {
-            if !field.is_nullable() && array.null_count() > 0 {
+            // `logical_null_count`: an Arrow `Null` array holds only NULLs but
+            // reports no physical null buffer.
+            if !field.is_nullable() && array.logical_null_count() > 0 {
                 return Err(crate::error::DuckLakeError::InvalidConfig(format!(
                     "NOT NULL constraint failed: {}",
                     field.name()

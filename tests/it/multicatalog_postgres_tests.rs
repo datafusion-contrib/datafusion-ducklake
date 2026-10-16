@@ -6346,10 +6346,17 @@ async fn register_existing_data_files_bumps_schema_version_for_a_late_layout() {
     .unwrap();
     assert_eq!(live, vec!["name=us/f1.parquet".to_string()]);
     // The table already existed, so the spec is a genuine alteration and must be
-    // reported as one — the mirror of the created-table case above.
+    // reported as one — the mirror of the created-table case above — and the
+    // Replace records the rows it retired, as every Replace does.
     assert_eq!(
         snapshot_changes(&pool, out.snapshot_id).await.as_deref(),
-        Some(format!("altered_table:{0},inserted_into_table:{0}", out.table_id).as_str()),
+        Some(
+            format!(
+                "altered_table:{0},inserted_into_table:{0},deleted_from_table:{0}",
+                out.table_id
+            )
+            .as_str()
+        ),
     );
 }
 

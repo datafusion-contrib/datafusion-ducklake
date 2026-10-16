@@ -71,7 +71,7 @@ use object_store::path::Path as ObjectPath;
 use crate::metadata_provider::DuckLakeTableFile;
 use crate::metadata_writer::{
     CarriedTags, CatalogNode, ColumnDef, ColumnStat, CommitIds, DataFileInfo, DeleteFileInfo,
-    MetadataWriter, PromoteLayout, PromotedFile, WriteMode,
+    MetadataWriter, PromoteLayout, PromotedFile, SourceFileRows, WriteMode,
 };
 use crate::multicatalog::MulticatalogManager;
 use crate::table::DuckLakeTable;
@@ -120,7 +120,11 @@ impl MulticatalogManager {
     /// another partition spec than its current one (the fork establishes one
     /// partition generation for every file), with an encrypted data or delete
     /// file (a fork cannot carry the key), or with a file read through a name
-    /// mapping (a fork does not carry the mapping).
+    /// mapping (a fork does not carry the mapping). Refused with
+    /// [`DuckLakeError::Conflict`], removing the files it wrote, when the
+    /// source's expire or compaction removed a file it read before the fork
+    /// committed (the commit locks the source's catalog to check); fork again.
+    /// A dropped source catalog is [`DuckLakeError::CatalogNotFound`].
     ///
     /// # Example
     ///
@@ -284,6 +288,11 @@ impl MulticatalogManager {
                 break;
             }
         }
+        // A file of no rows holds nothing the fork reads: the 0-row file a
+        // Replace with no rows commits to retire the prior generation (with no
+        // partition values on a partitioned table). Official writes no file for
+        // an empty insert, so the fork leaves it out.
+        metadata.retain(|entry| entry.file.max_row_count != Some(0));
         for entry in &metadata {
             let file = &entry.file;
             if file.file.encryption_key.is_some()
@@ -363,7 +372,8 @@ impl MulticatalogManager {
                 let masked_later = !at_head
                     && (file.delete_file.is_some()
                         || file.partial_max.is_some_and(|max| max > snapshot));
-                let delete = if inlined.is_some() || masked_later {
+                let referenced_delete = !(inlined.is_some() || masked_later);
+                let delete = if !referenced_delete {
                     let positions = deleted_at(source, state, file, inlined, snapshot).await?;
                     if positions.is_empty() {
                         None
@@ -416,7 +426,17 @@ impl MulticatalogManager {
                 // A partial file (flushed or merged) keeps its `partial_max`, so the
                 // fork dates its rows by their embedded snapshots, as the source
                 // does and as a merge of the fork's files would.
-                let promoted_file = PromotedFile::new(info).with_partial_max(file.partial_max);
+                let promoted_file = PromotedFile::new(info)
+                    .with_partial_max(file.partial_max)
+                    .with_source_rows(SourceFileRows {
+                        catalog_id: source_catalog,
+                        data_file_id: file.data_file_id,
+                        delete_file_id: if referenced_delete {
+                            file.delete_file_id
+                        } else {
+                            None
+                        },
+                    });
                 promoted.push(match delete {
                     Some(delete) => promoted_file.with_delete(delete),
                     None => promoted_file,
@@ -548,6 +568,11 @@ impl MulticatalogManager {
                         let count = usize::try_from(file.record_count).map_err(|_| {
                             DuckLakeError::Internal("forked file has a negative row count".into())
                         })?;
+                        if file_start + count > rows.num_rows() {
+                            return Err(DuckLakeError::Internal(
+                                "forked files hold more rows than were written".into(),
+                            ));
+                        }
                         let slice = rows.slice(file_start, count);
                         file_start += count;
                         let column = |index: usize| {
@@ -732,7 +757,15 @@ impl MulticatalogManager {
                 .get(index + 1)
                 .and_then(|next| column_ids.iter().position(|id| id == next))
                 .unwrap_or(column_ids.len());
-            let mut ids = column_ids[start..end].to_vec();
+            let mut ids = column_ids
+                .get(start..end)
+                .ok_or_else(|| {
+                    DuckLakeError::Internal(format!(
+                        "the field ids of column '{}' are out of order",
+                        field.name()
+                    ))
+                })?
+                .to_vec();
             let mut nodes = ids
                 .iter()
                 .map(|id| by_id.get(id).cloned())

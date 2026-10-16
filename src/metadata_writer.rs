@@ -2004,6 +2004,22 @@ pub struct PromotedFile {
     /// snapshot from its embedded column. `None` registers `NULL`. Only
     /// multi-catalog PostgreSQL registers it; the other writers refuse it.
     pub partial_max: Option<i64>,
+    /// The catalog rows this reference copies, which the commit re-checks
+    /// under their catalog's lock.
+    pub(crate) source_rows: Option<SourceFileRows>,
+}
+
+/// The rows of another catalog a promoted reference copies: a fork's source
+/// data file and the delete file it references with it. A multi-catalog
+/// PostgreSQL commit locks that catalog and refuses with
+/// [`DuckLakeError::Conflict`] when one of them is gone (expired, compacted
+/// or dropped since the fork read it), since its object may then be reclaimed
+/// before the reference that would keep it is committed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceFileRows {
+    pub(crate) catalog_id: i64,
+    pub(crate) data_file_id: i64,
+    pub(crate) delete_file_id: Option<i64>,
 }
 
 impl PromotedFile {
@@ -2013,7 +2029,15 @@ impl PromotedFile {
             file,
             delete: None,
             partial_max: None,
+            source_rows: None,
         }
+    }
+
+    /// Name the source catalog rows this reference copies
+    /// ([`SourceFileRows`]).
+    pub(crate) fn with_source_rows(mut self, rows: SourceFileRows) -> Self {
+        self.source_rows = Some(rows);
+        self
     }
 
     /// Attach the file's existing positional delete file.
@@ -2868,6 +2892,67 @@ pub struct StagedTableWrite {
     pub(crate) inlined_flush: bool,
 }
 
+/// `batches` with each top-level Arrow `Null` column (one with no type of its
+/// own, every value NULL) given its catalog column's type (`columns`, in
+/// order), so a backend stores NULLs of the column's type, as official stores a
+/// NULL in a typed column. Other columns are unchanged.
+pub(crate) fn materialize_null_columns(
+    batches: &[RecordBatch],
+    columns: &[ColumnDef],
+) -> Result<Vec<RecordBatch>> {
+    let Some(first) = batches.first() else {
+        return Ok(Vec::new());
+    };
+    let schema = first.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|field| field.data_type() == &DataType::Null)
+    {
+        return Ok(batches.to_vec());
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut targets = Vec::with_capacity(schema.fields().len());
+    for (index, field) in schema.fields().iter().enumerate() {
+        if field.data_type() != &DataType::Null {
+            fields.push(field.as_ref().clone());
+            targets.push(None);
+            continue;
+        }
+        let column = columns.get(index).ok_or_else(|| {
+            DuckLakeError::InvalidConfig(format!(
+                "column '{}' has no catalog column to take its type from",
+                field.name()
+            ))
+        })?;
+        let target = crate::types::ducklake_to_arrow_type(column.ducklake_type())?;
+        fields.push(
+            arrow::datatypes::Field::new(field.name(), target.clone(), true)
+                .with_metadata(field.metadata().clone()),
+        );
+        targets.push(Some(target));
+    }
+    let materialized = Arc::new(ArrowSchema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ));
+    batches
+        .iter()
+        .map(|batch| {
+            let columns = batch
+                .columns()
+                .iter()
+                .zip(&targets)
+                .map(|(column, target)| match target {
+                    Some(target) => arrow::array::new_null_array(target, batch.num_rows()),
+                    None => Arc::clone(column),
+                })
+                .collect();
+            Ok(RecordBatch::try_new(Arc::clone(&materialized), columns)?)
+        })
+        .collect()
+}
+
 impl StagedTableWrite {
     /// Returns the target table id reserved during write setup.
     #[must_use]
@@ -2903,6 +2988,15 @@ impl StagedTableWrite {
     #[must_use]
     pub fn columns(&self) -> &[ColumnDef] {
         &self.columns
+    }
+
+    /// This write with its inlined rows' Arrow `Null` columns given their
+    /// catalog types ([`materialize_null_columns`]).
+    pub(crate) fn with_materialized_nulls(mut self) -> Result<Self> {
+        if let StagedTableData::Inlined(batches) = &self.data {
+            self.data = StagedTableData::Inlined(materialize_null_columns(batches, &self.columns)?);
+        }
+        Ok(self)
     }
 
     /// Returns the catalog column ids paired with the staged columns.
@@ -3119,8 +3213,9 @@ pub(crate) async fn commit_networked<DB: sqlx::Database>(
 /// it calls (`register_data_file`, `register_data_files`, their
 /// `_with_commit_metadata`, `_with_deletes` and `_with_deletes_and_commit_metadata`
 /// forms, and `commit_multi_table`) must keep this contract, as must
-/// `commit_deletes` and `commit_inlined_flush`, whose callers remove the delete
-/// files and flushed files they wrote the same way: return
+/// `commit_deletes`, `commit_inlined_flush` and
+/// `register_existing_data_files_with_tags`, whose callers remove the delete
+/// files, flushed files and forked files they wrote the same way: return
 /// `DuckLakeError::CommitOutcomeUnknown` when the transaction's `COMMIT` itself
 /// fails and the catalog may have applied it, and any other error only when
 /// nothing was committed. In particular, an implementation must not return any
@@ -3698,7 +3793,9 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// inlined data tables (`row_id`, `begin_snapshot`, `end_snapshot` and
     /// DuckDB's internal names in a DuckLake 1.0 catalog; their `_ducklake_`
     /// forms in 1.1), which official refuses to create while inlining is
-    /// enabled. `None` for a backend that never inlines.
+    /// enabled. Writes call it before creating the table or uploading.
+    ///
+    /// Default: `None`, reserving no name.
     fn reserved_inlining_column(&self, _columns: &[String]) -> Result<Option<String>> {
         Ok(None)
     }

@@ -535,6 +535,11 @@ fn split_utc_offset(raw: &str) -> Option<(&str, i64)> {
     let (local, offset) = raw.split_at(sign_at);
     let negative = offset.starts_with('-');
     let digits = &offset[1..];
+    // Only ASCII digits make an offset; checking first keeps the slices
+    // below on character boundaries.
+    if !digits.is_ascii() {
+        return None;
+    }
     let parts: Vec<&str> = if digits.contains(':') {
         digits.split(':').collect()
     } else if digits.len() == 4 {

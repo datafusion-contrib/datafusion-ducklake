@@ -3113,6 +3113,36 @@ async fn delete_positions_bounded_by_the_footer_without_a_record_count() {
     assert_eq!(deleted.rows_deleted, 1);
 }
 
+/// `delete_positions` naming one data file twice is refused as such, and
+/// deletes nothing. Guards against a second entry reported as a file that is
+/// not live.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_positions_refuses_a_file_given_twice() {
+    let lake = sqlite()(Some(5)).await;
+    create(&lake, "t").await;
+    lake.append_parquet("t", &batch(1..=20, "a")).await;
+    let file = lake
+        .provider
+        .get_table_files_for_select(lake.table_id("t"), lake.head())
+        .unwrap()
+        .remove(0);
+    let (ctx, table) = lake.table("t").await;
+    let refused = table
+        .delete_positions(
+            &ctx.state(),
+            vec![(file.data_file_id, vec![1]), (file.data_file_id, vec![2])],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, datafusion_ducklake::DuckLakeError::InvalidConfig(message)
+            if message.contains("more than once")),
+        "{refused}"
+    );
+    assert_eq!(lake.inlined_deletes("t"), 0);
+    assert_eq!(lake.delete_files("t"), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Partial files read at an earlier snapshot
 // ---------------------------------------------------------------------------

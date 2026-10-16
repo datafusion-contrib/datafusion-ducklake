@@ -170,8 +170,8 @@ impl DuckLakeTable {
     /// live delete file gets a new one carrying every position with its
     /// snapshot, and any other file a delete file of its positions.
     /// Positions already deleted are skipped; a file not live at this table's
-    /// snapshot, or a position past its rows, is refused with
-    /// [`DuckLakeError::InvalidConfig`].
+    /// snapshot, a file given more than once, or a position past its rows, is
+    /// refused with [`DuckLakeError::InvalidConfig`].
     ///
     /// This is the inlining-aware form of writing a delete file
     /// ([`DuckLakeTableWriter::write_delete_file`]) and committing it with
@@ -236,7 +236,14 @@ impl DuckLakeTable {
             .collect();
         let inlined_deletes = self.inlined_deletes_by_file().map_err(from_df)?;
         let mut targets = Vec::with_capacity(positions.len());
+        let mut seen = std::collections::HashSet::with_capacity(positions.len());
         for (data_file_id, positions) in positions {
+            if !seen.insert(data_file_id) {
+                return Err(DuckLakeError::InvalidConfig(format!(
+                    "data file {data_file_id} appears more than once; pass each file's \
+                     positions in one entry"
+                )));
+            }
             let file = live.remove(&data_file_id).ok_or_else(|| {
                 DuckLakeError::InvalidConfig(format!(
                     "data file {data_file_id} is not a live file of '{}' at snapshot {}",
@@ -443,9 +450,19 @@ impl<'a> KeyedMutation<'a> {
                     let scan = table
                         .build_update_scan_filtered(state, &file, inlined, Some(&combined))
                         .await?;
-                    let batches =
+                    let mut batches =
                         datafusion::physical_plan::collect(Arc::clone(&scan.scan), task_ctx)
                             .await?;
+                    // A merged file read before its `partial_max` holds rows
+                    // of later snapshots, which are not rows of the table here,
+                    // as `match_rows` leaves them out.
+                    let later = table.positions_inserted_later(state, &file).await?;
+                    if !later.is_empty() {
+                        batches = batches
+                            .iter()
+                            .map(|batch| without_positions(batch, scan.pos_index, &later))
+                            .collect::<DataFusionResult<Vec<_>>>()?;
+                    }
                     let out =
                         table.apply_update_to_batches(&scan, &batches, Some(&combined), &[])?;
                     let mut versions = Vec::with_capacity(out.updated_batches.len());
@@ -696,38 +713,83 @@ impl<'a> KeyedMutation<'a> {
     ) -> crate::Result<Option<i64>> {
         let table = self.table;
         let base_snapshot = context.base_snapshot;
-        let commit_snapshot = context
-            .table_writer
-            .next_snapshot_id()?
-            .map_or(base_snapshot + 1, |next| next.max(base_snapshot + 1));
-        let pending: Vec<BoxFuture<'_, DataFusionResult<FileDeletions>>> = matched
-            .files
-            .iter()
-            .map(|found| -> BoxFuture<'_, DataFusionResult<FileDeletions>> {
-                Box::pin(async move {
-                    let mut deletions = FileDeletions::dated(commit_snapshot);
-                    deletions
-                        .record(
-                            table,
-                            &context.table_writer,
-                            &context.schema_name,
-                            &context.table_name,
-                            &DeletionTarget::of_file(&found.file, &found.existing),
-                            found.positions.clone(),
-                            context.inline_limit,
-                            base_snapshot,
-                        )
-                        .await?;
-                    Ok(deletions)
-                })
-            })
-            .collect();
+        // Until the transaction takes `data`'s files and the delete files
+        // written here over, a failure removes them.
+        let data_files = |data: &StagedTableData| match data {
+            StagedTableData::Files(files) => files
+                .iter()
+                .map(|file| (file.path.clone(), file.path_is_relative))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let commit_snapshot = match context.table_writer.next_snapshot_id() {
+            Ok(next) => next.map_or(base_snapshot + 1, |next| next.max(base_snapshot + 1)),
+            Err(error) => {
+                context
+                    .table_writer
+                    .remove_unstaged(&context.schema_name, &context.table_name, data_files(&data))
+                    .await;
+                return Err(error);
+            },
+        };
+        // Every file's outcome, so a failure still knows the delete files the
+        // others wrote.
+        let pending: Vec<BoxFuture<'_, DataFusionResult<DataFusionResult<FileDeletions>>>> =
+            matched
+                .files
+                .iter()
+                .map(
+                    |found| -> BoxFuture<'_, DataFusionResult<DataFusionResult<FileDeletions>>> {
+                        Box::pin(async move {
+                            let mut deletions = FileDeletions::dated(commit_snapshot);
+                            let recorded = deletions
+                                .record(
+                                    table,
+                                    &context.table_writer,
+                                    &context.schema_name,
+                                    &context.table_name,
+                                    &DeletionTarget::of_file(&found.file, &found.existing),
+                                    found.positions.clone(),
+                                    context.inline_limit,
+                                    base_snapshot,
+                                )
+                                .await;
+                            Ok(recorded.map(|()| deletions))
+                        })
+                    },
+                )
+                .collect();
         let recorded = bounded(pending, self.concurrency(state))
             .await
             .map_err(from_df)?;
         let mut deletions = FileDeletions::default();
+        let mut failure = None;
         for recorded in recorded {
-            deletions.absorb(recorded);
+            match recorded {
+                Ok(recorded) => deletions.absorb(recorded),
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        if let Some(error) = failure {
+            let mut written = data_files(&data);
+            written.extend(
+                deletions
+                    .positional
+                    .iter()
+                    .map(|entry| &entry.delete)
+                    .chain(
+                        deletions
+                            .rewritten
+                            .iter()
+                            .map(|rewritten| &rewritten.entry.delete.delete),
+                    )
+                    .map(|delete| (delete.path.clone(), delete.path_is_relative)),
+            );
+            context
+                .table_writer
+                .remove_unstaged(&context.schema_name, &context.table_name, written)
+                .await;
+            return Err(from_df(error));
         }
         let latest = LatestDeleteFiles {
             table,
@@ -1767,6 +1829,29 @@ fn from_df(error: DataFusionError) -> DuckLakeError {
 
 fn to_df(error: DuckLakeError) -> DataFusionError {
     DataFusionError::External(Box::new(error))
+}
+
+/// `batch` without the rows whose physical position (column `pos_index`) is
+/// one of `positions`.
+fn without_positions(
+    batch: &RecordBatch,
+    pos_index: usize,
+    positions: &std::collections::HashSet<i64>,
+) -> DataFusionResult<RecordBatch> {
+    let column = batch
+        .column(pos_index)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "physical-position column is not Int64".to_string(),
+            )
+        })?;
+    let keep: arrow::array::BooleanArray = column
+        .iter()
+        .map(|position| Some(position.is_none_or(|position| !positions.contains(&position))))
+        .collect();
+    Ok(arrow::compute::filter_record_batch(batch, &keep)?)
 }
 
 #[cfg(test)]

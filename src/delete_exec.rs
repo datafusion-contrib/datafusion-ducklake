@@ -280,11 +280,6 @@ async fn run_delete(
     // official DuckLake's `DuckLakeDelete::FlushDelete` does (see
     // [`FileDeletions::record`]); any other writes cumulative delete files.
     let capable = writer.supports_inlined_row_mutations();
-    let inline_limit = if capable {
-        table.write_options().data_inlining_row_limit.unwrap_or(0)
-    } else {
-        0
-    };
 
     // Delete-all (no WHERE) on a writer without staged row mutations:
     // metadata-only truncate — end every live data file in one snapshot. Skip
@@ -306,6 +301,16 @@ async fn run_delete(
     let table_writer = DuckLakeTableWriter::new(Arc::clone(&writer), object_store)
         .map(|writer| writer.with_options(table.write_options()))
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
+    // The table's scoped limit (stored table > schema > catalog-wide > the
+    // writer's > `10`), as official's `DuckLakeDelete` reads it: a table
+    // opened without the catalog's options carries no resolved limit.
+    let inline_limit = if capable {
+        table_writer
+            .table_data_inlining_row_limit(schema_name, table_name)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?
+    } else {
+        0
+    };
     let inlined_deletes = table.inlined_deletes_by_file()?;
 
     let predicate = match predicate {
@@ -805,7 +810,9 @@ async fn delete_all(
             continue;
         }
         total += live as u64;
-        if inlined.is_none() && (inline_limit == 0 || live > inline_limit as i64) {
+        // `live` is positive here; one that does not fit `usize` exceeds any limit.
+        let over_limit = usize::try_from(live).map_or(true, |live| live > inline_limit);
+        if inlined.is_none() && (inline_limit == 0 || over_limit) {
             // Every remaining row is deleted, so the file is dropped; its
             // positions need not be read.
             deletions.dropped.push(DroppedDataFile {

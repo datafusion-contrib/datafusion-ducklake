@@ -1435,8 +1435,12 @@ impl DuckLakeTable {
             operation,
             "flushing inlined data before compaction"
         );
+        // The flush writes with the options the compaction was asked to use
+        // (compression, row groups, rollover, Hive paths), over the table's
+        // stored ones as every write applies them.
         let catalog =
-            crate::DuckLakeCatalog::with_writer(Arc::clone(self.provider()), Arc::clone(writer))?;
+            crate::DuckLakeCatalog::with_writer(Arc::clone(self.provider()), Arc::clone(writer))?
+                .with_write_options(self.write_options().clone());
         let outcome = catalog
             .flush_inlined_data_with(
                 crate::inlined_flush::FlushObjectStores::Session(Arc::clone(state.runtime_env())),

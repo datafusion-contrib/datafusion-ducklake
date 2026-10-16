@@ -954,9 +954,255 @@ pub(crate) async fn stored_limit_outranks_writer_options(make: MakeLake) {
     assert_eq!(files, 1);
 }
 
+/// Run `statement` (over a table named `t`) against `main.t` opened outside
+/// the catalog's write options: read through a read-only catalog, then made
+/// writable with [`DuckLakeTable::with_writer`].
+async fn direct_sql(lake: &Lake, statement: &str) {
+    let ctx = SessionContext::new();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&lake.provider), lake.head()).unwrap();
+    ctx.register_catalog("ro", Arc::new(catalog));
+    let provider = ctx
+        .catalog("ro")
+        .unwrap()
+        .schema("main")
+        .unwrap()
+        .table("t")
+        .await
+        .unwrap()
+        .unwrap();
+    let table = (provider.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<DuckLakeTable>()
+        .expect("a DuckLakeTable")
+        .clone()
+        .with_writer("main".to_string(), Arc::clone(&lake.writer));
+    ctx.register_table("t", Arc::new(table)).unwrap();
+    ctx.sql(statement).await.unwrap().collect().await.unwrap();
+}
+
+/// SQL `DELETE` and `UPDATE` follow the table's scoped limit, whether the
+/// table comes from the writable catalog or is opened directly with a writer:
+/// with no stored setting and a writer without a limit, official's default of
+/// `10` inlines a one-row deletion and a one-row update (official records
+/// `inlined_delete` and `inlined_insert`, no delete file); a stored `0`
+/// inlines nothing. Guards against a DELETE that reads only the catalog's
+/// resolved options (and so writes delete files under the default) and an
+/// UPDATE that ignores the stored setting.
+pub(crate) async fn sql_mutations_follow_the_scoped_limit(make: MakeLake) {
+    for direct in [false, true] {
+        for stored_zero in [false, true] {
+            let case = format!("direct {direct}, stored 0 {stored_zero}");
+            let lake = make(None).await;
+            create(&lake, "t").await;
+            lake.append_parquet("t", &batch(1..=30, "a")).await;
+            if stored_zero {
+                lake.writer
+                    .set_table_setting(lake.table_id("t"), "data_inlining_row_limit", "0")
+                    .unwrap();
+            }
+            let run = async |statement: &str| {
+                if direct {
+                    direct_sql(&lake, &statement.replace("{t}", "t")).await;
+                } else {
+                    lake.sql(&statement.replace("{t}", "lake.main.t"))
+                        .await
+                        .unwrap();
+                }
+            };
+            run("DELETE FROM {t} WHERE id = 3").await;
+            if stored_zero {
+                assert_eq!(lake.inlined_deletes("t"), 0, "{case}");
+                assert_eq!(lake.delete_files("t"), 1, "{case}");
+            } else {
+                assert_eq!(lake.inlined_deletes("t"), 1, "{case}");
+                assert_eq!(lake.delete_files("t"), 0, "{case}");
+            }
+            run("UPDATE {t} SET v = 'u' WHERE id = 4").await;
+            if stored_zero {
+                assert_eq!(lake.inlined_rows("t"), 0, "{case}");
+                assert_eq!(lake.inlined_deletes("t"), 0, "{case}");
+            } else {
+                assert_eq!(lake.inlined_rows("t"), 1, "{case}");
+                assert_eq!(lake.inlined_deletes("t"), 2, "{case}");
+                assert_eq!(lake.delete_files("t"), 0, "{case}");
+            }
+            let rows = values(&lake.rows("t").await);
+            assert_eq!(rows.len(), 29, "{case}");
+            assert!(!rows.contains_key(&3), "{case}");
+            assert_eq!(rows[&4], vec!["u".to_string()], "{case}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // D2: streaming sessions and small deletes inline
 // ---------------------------------------------------------------------------
+
+/// A write whose batch has an Arrow `Null`-typed column (all NULL) stores it
+/// under the column's catalog type: inlined under the default limit, and read
+/// back as NULL, through a one-shot write and a streaming session alike.
+/// Guards against an inlined insert that binds such a column by its Arrow type
+/// instead of the inlined table's column type.
+pub(crate) async fn null_typed_columns_inline(make: MakeLake) {
+    let lake = make(None).await;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("x", DataType::Null, true),
+    ]));
+    let rows = |id: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![id])), Arc::new(arrow::array::NullArray::new(1))],
+        )
+        .unwrap()
+    };
+    let writer = lake.table_writer();
+    writer.append_table("main", "t", &[rows(1)]).await.unwrap();
+    let mut session = writer
+        .begin_write("main", "t", &schema, WriteMode::Append)
+        .unwrap();
+    session.write_batch(&rows(2)).unwrap();
+    session.finish().await.unwrap();
+    if lake.inlines {
+        assert_eq!(lake.inlined_rows("t"), 2);
+        assert_eq!(lake.data_files("t"), 0);
+    }
+    let ctx = SessionContext::new();
+    let catalog = DuckLakeCatalog::with_snapshot(Arc::clone(&lake.provider), lake.head()).unwrap();
+    ctx.register_catalog("lake", Arc::new(catalog));
+    let batches = ctx
+        .sql("SELECT id, x IS NULL FROM lake.main.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        lines(&batches, false),
+        vec!["1,true".to_string(), "2,true".to_string()]
+    );
+}
+
+/// An Arrow `Null`-typed batch column written to a NOT NULL column is refused,
+/// as official refuses a NULL there, by a one-shot write and a streaming
+/// session alike, and nothing is stored. Guards against a validator that
+/// counted only physical nulls, which a `Null` array does not have.
+pub(crate) async fn null_typed_column_refused_for_not_null(make: MakeLake) {
+    let lake = make(None).await;
+    let columns = [
+        datafusion_ducklake::metadata_writer::ColumnDef::from_arrow("id", &DataType::Int64, true)
+            .unwrap(),
+        datafusion_ducklake::metadata_writer::ColumnDef::from_arrow("x", &DataType::Utf8, false)
+            .unwrap(),
+    ];
+    let setup = lake
+        .writer
+        .begin_write_transaction("main", "t", &columns, WriteMode::Replace)
+        .unwrap();
+    lake.writer
+        .publish_snapshot(
+            setup.table_id,
+            "main",
+            "t",
+            setup.snapshot_id,
+            WriteMode::Replace,
+            setup.base_snapshot_id,
+            &columns,
+            &setup.field_ids,
+        )
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("x", DataType::Null, true),
+    ]));
+    let rows = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1])), Arc::new(arrow::array::NullArray::new(1))],
+    )
+    .unwrap();
+    let writer = lake.table_writer();
+    let error = writer
+        .append_table("main", "t", std::slice::from_ref(&rows))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("NOT NULL constraint failed: x"), "{error}");
+    let refused = match writer.begin_write("main", "t", &schema, WriteMode::Append) {
+        Ok(mut session) => match session.write_batch(&rows) {
+            Err(error) => Some(error),
+            Ok(()) => session.finish().await.err(),
+        },
+        Err(error) => Some(error),
+    };
+    let error = refused.expect("the session refuses the NULLs").to_string();
+    assert!(error.contains("NOT NULL constraint failed: x"), "{error}");
+    assert!(lake.rows("t").await.is_empty());
+}
+
+/// A streaming session on a partitioned table inlines a write of at most the
+/// limit's rows, as official's insert into a partitioned table does, and
+/// writes a larger one as one file per partition, recording each file's
+/// value. Guards against a partitioned session that never inlines, or one
+/// that inlines past the limit.
+pub(crate) async fn partitioned_session_inlines_small_writes(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create(&lake, "t").await;
+    lake.writer
+        .set_partition_spec(
+            lake.table_id("t"),
+            &[(
+                "v".to_string(),
+                datafusion_ducklake::PartitionTransform::Identity,
+            )],
+        )
+        .unwrap();
+    let rows = |ids: std::ops::RangeInclusive<i64>| {
+        let ids: Vec<i64> = ids.collect();
+        let values: Vec<&str> = ids
+            .iter()
+            .map(|id| {
+                if id % 2 == 0 {
+                    "a"
+                } else {
+                    "b"
+                }
+            })
+            .collect();
+        RecordBatch::try_new(
+            schema(),
+            vec![Arc::new(Int64Array::from(ids)), Arc::new(StringArray::from(values))],
+        )
+        .unwrap()
+    };
+    let writer = lake.table_writer();
+    let mut session = writer
+        .begin_write("main", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&rows(1..=3)).unwrap();
+    assert!(session.is_inlining());
+    let result = session.finish().await.unwrap();
+    assert_eq!((result.files_written, result.records_written), (0, 3));
+    assert_eq!(lake.inlined_rows("t"), 3);
+    assert_eq!(lake.data_files("t"), 0);
+
+    let mut session = writer
+        .begin_write("main", "t", &schema(), WriteMode::Append)
+        .unwrap();
+    session.write_batch(&rows(10..=16)).unwrap();
+    let result = session.finish().await.unwrap();
+    assert_eq!((result.files_written, result.records_written), (2, 7));
+    let files = lake
+        .provider
+        .get_table_files_for_select(lake.table_id("t"), lake.head())
+        .unwrap();
+    let mut counts: Vec<i64> = files
+        .iter()
+        .map(|file| file.max_row_count.unwrap_or(0))
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![3, 4], "one file per partition");
+    assert_eq!(lake.inlined_rows("t"), 3);
+    assert_eq!(values(&lake.rows("t").await).len(), 10);
+}
 
 /// A streaming session of at most the limit's rows commits them inlined, one
 /// past it writes every row to Parquet, and a single-file session inlines too.
@@ -1747,9 +1993,19 @@ async fn merge_under(
     lake: &Lake,
     policy: InlinedFlushPolicy,
 ) -> datafusion_ducklake::CompactionResult {
-    let catalog = lake
-        .catalog()
-        .with_write_options(DuckLakeWriteOptions::default().with_inlined_flush_policy(policy));
+    merge_with(
+        lake,
+        DuckLakeWriteOptions::default().with_inlined_flush_policy(policy),
+    )
+    .await
+}
+
+/// `merge_adjacent_files` on `main.t` of `lake` under `options`.
+async fn merge_with(
+    lake: &Lake,
+    options: DuckLakeWriteOptions,
+) -> datafusion_ducklake::CompactionResult {
+    let catalog = lake.catalog().with_write_options(options);
     let ctx = SessionContext::new();
     DuckLakeCatalog::register(&ctx, "lake", catalog);
     let provider = ctx
@@ -1769,6 +2025,192 @@ async fn merge_under(
         .merge_adjacent_files(&ctx.state(), MergeOptions::default())
         .await
         .unwrap()
+}
+
+/// The flush an [`InlinedFlushPolicy`] runs before a compaction writes with
+/// the compaction's write options, as its merged output does: here a row-group
+/// cap and a codec. Guards against a flush that took only the catalog's
+/// stored settings.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_flush_uses_the_callers_write_options() {
+    let lake = sqlite()(Some(10)).await;
+    create(&lake, "t").await;
+    lake.append("t", &batch(1..=6, "a")).await;
+    assert_eq!(lake.inlined_rows("t"), 6);
+    let mut options =
+        DuckLakeWriteOptions::default().with_inlined_flush_policy(InlinedFlushPolicy::always());
+    options.max_row_group_rows = Some(2);
+    options.compression = Some(parquet::basic::Compression::GZIP(Default::default()));
+    let merged = merge_with(&lake, options).await;
+    assert!(merged.inlined_flush_snapshot.is_some(), "{merged:?}");
+    assert_eq!(lake.inlined_rows("t"), 0);
+    let files: Vec<_> = walk_files(&lake.data)
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let reader =
+        parquet::file::reader::SerializedFileReader::new(std::fs::File::open(&files[0]).unwrap())
+            .unwrap();
+    let metadata = parquet::file::reader::FileReader::metadata(&reader);
+    assert_eq!(metadata.num_row_groups(), 3);
+    assert!(matches!(
+        metadata.row_group(0).column(0).compression(),
+        parquet::basic::Compression::GZIP(_)
+    ));
+    assert_eq!(values(&lake.rows("t").await).len(), 6);
+}
+
+/// Every file under `dir`.
+fn walk_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// A local store whose uploads fail once `allowed` have started.
+struct FailingStore {
+    inner: LocalFileSystem,
+    allowed: usize,
+    started: std::sync::atomic::AtomicUsize,
+}
+
+impl FailingStore {
+    fn admit(&self) -> object_store::Result<()> {
+        if self
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            < self.allowed
+        {
+            Ok(())
+        } else {
+            Err(object_store::Error::Generic {
+                store: "FailingStore",
+                source: "injected upload failure".into(),
+            })
+        }
+    }
+}
+
+impl std::fmt::Debug for FailingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingStore")
+    }
+}
+
+impl std::fmt::Display for FailingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FailingStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.admit()?;
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.admit()?;
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// An upsert whose delete file fails to upload, after its new rows' data
+/// file and another file's delete file were uploaded, removes both: nothing
+/// it wrote outlives the failure. Guards against orphans left by a failure
+/// before the transaction takes the files over.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_upsert_before_staging_removes_its_uploads() {
+    let lake = sqlite()(Some(0)).await;
+    create(&lake, "t").await;
+    lake.append_parquet("t", &batch(1..=10, "a")).await;
+    lake.append_parquet("t", &batch(11..=20, "b")).await;
+    let before = walk_files(&lake.data);
+    assert_eq!(before.len(), 2);
+    let (ctx, table) = lake.table("t").await;
+    ctx.runtime_env().register_object_store(
+        datafusion::execution::object_store::ObjectStoreUrl::local_filesystem().as_ref(),
+        Arc::new(FailingStore {
+            inner: LocalFileSystem::new(),
+            allowed: 2,
+            started: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let failed = table
+        .keyed_mutation(&["id"])
+        .with_concurrency(1)
+        .upsert_by_keys(&ctx.state(), vec![batch([1, 11, 100], "u")])
+        .await;
+    assert!(failed.is_err(), "{failed:?}");
+    let mut after = walk_files(&lake.data);
+    after.sort();
+    let mut before = before;
+    before.sort();
+    assert_eq!(after, before, "the failed upsert left no file behind");
+    assert_eq!(lake.data_files("t"), 2);
 }
 
 /// The age trigger of an [`InlinedFlushPolicy`] measures an inlined insert's
@@ -2232,26 +2674,32 @@ async fn legacy_true_settings_are_canonicalized_duckdb() {
 // ---------------------------------------------------------------------------
 
 /// The scenarios for a backend that inlines and stages row mutations.
+/// Each scenario is boxed: inlined into one future, they overflow a test
+/// thread's stack in a debug build.
 pub(crate) async fn all_scenarios(make: MakeLake) {
-    writer_limit_reaches_every_path(Arc::clone(&make)).await;
-    limit_precedence(Arc::clone(&make)).await;
-    sort_on_insert_precedence(Arc::clone(&make)).await;
-    settings_store_as_official(Arc::clone(&make)).await;
-    age_trigger_measures_utc_snapshot_times(Arc::clone(&make)).await;
-    sort_changes_bump_schema_version(Arc::clone(&make)).await;
-    reserved_names_under_scoped_limits(Arc::clone(&make)).await;
-    stored_limit_outranks_writer_options(Arc::clone(&make)).await;
-    sessions_inline_small_writes(Arc::clone(&make)).await;
-    session_with_deletes_inlines(Arc::clone(&make)).await;
-    small_deletes_inline(Arc::clone(&make)).await;
-    keyed_delete_reaches_inlined_rows(Arc::clone(&make)).await;
-    keyed_upsert_replaces_inlined_rows(Arc::clone(&make)).await;
-    keyed_update_keeps_row_ids(Arc::clone(&make)).await;
-    keyed_composite_and_partitioned(Arc::clone(&make)).await;
-    change_detection_sees_inlined_changes(Arc::clone(&make)).await;
-    rowid_lookup_everywhere(Arc::clone(&make)).await;
-    sort_key_columns_cannot_be_dropped(Arc::clone(&make)).await;
-    maintenance_flushes_inlined_data(make).await;
+    Box::pin(writer_limit_reaches_every_path(Arc::clone(&make))).await;
+    Box::pin(limit_precedence(Arc::clone(&make))).await;
+    Box::pin(sort_on_insert_precedence(Arc::clone(&make))).await;
+    Box::pin(settings_store_as_official(Arc::clone(&make))).await;
+    Box::pin(age_trigger_measures_utc_snapshot_times(Arc::clone(&make))).await;
+    Box::pin(sort_changes_bump_schema_version(Arc::clone(&make))).await;
+    Box::pin(reserved_names_under_scoped_limits(Arc::clone(&make))).await;
+    Box::pin(stored_limit_outranks_writer_options(Arc::clone(&make))).await;
+    Box::pin(sql_mutations_follow_the_scoped_limit(Arc::clone(&make))).await;
+    Box::pin(sessions_inline_small_writes(Arc::clone(&make))).await;
+    Box::pin(partitioned_session_inlines_small_writes(Arc::clone(&make))).await;
+    Box::pin(null_typed_columns_inline(Arc::clone(&make))).await;
+    Box::pin(null_typed_column_refused_for_not_null(Arc::clone(&make))).await;
+    Box::pin(session_with_deletes_inlines(Arc::clone(&make))).await;
+    Box::pin(small_deletes_inline(Arc::clone(&make))).await;
+    Box::pin(keyed_delete_reaches_inlined_rows(Arc::clone(&make))).await;
+    Box::pin(keyed_upsert_replaces_inlined_rows(Arc::clone(&make))).await;
+    Box::pin(keyed_update_keeps_row_ids(Arc::clone(&make))).await;
+    Box::pin(keyed_composite_and_partitioned(Arc::clone(&make))).await;
+    Box::pin(change_detection_sees_inlined_changes(Arc::clone(&make))).await;
+    Box::pin(rowid_lookup_everywhere(Arc::clone(&make))).await;
+    Box::pin(sort_key_columns_cannot_be_dropped(Arc::clone(&make))).await;
+    Box::pin(maintenance_flushes_inlined_data(make)).await;
 }
 
 macro_rules! per_backend {
@@ -2283,7 +2731,11 @@ per_backend!(
     sort_changes_bump_schema_version,
     reserved_names_under_scoped_limits,
     stored_limit_outranks_writer_options,
+    sql_mutations_follow_the_scoped_limit,
     sessions_inline_small_writes,
+    partitioned_session_inlines_small_writes,
+    null_typed_columns_inline,
+    null_typed_column_refused_for_not_null,
     session_with_deletes_inlines,
     small_deletes_inline,
     keyed_delete_reaches_inlined_rows,
@@ -2437,14 +2889,17 @@ async fn postgres_single_catalog_scenarios() {
     })
     .await;
     let make = postgres_single(port);
-    writer_limit_reaches_every_path(Arc::clone(&make)).await;
-    limit_precedence(Arc::clone(&make)).await;
-    sort_on_insert_precedence(Arc::clone(&make)).await;
-    settings_store_as_official(Arc::clone(&make)).await;
-    sort_changes_bump_schema_version(Arc::clone(&make)).await;
-    stored_limit_outranks_writer_options(Arc::clone(&make)).await;
-    sort_key_columns_cannot_be_dropped(Arc::clone(&make)).await;
-    change_detection_sees_inlined_changes(make).await;
+    Box::pin(writer_limit_reaches_every_path(Arc::clone(&make))).await;
+    Box::pin(limit_precedence(Arc::clone(&make))).await;
+    Box::pin(sort_on_insert_precedence(Arc::clone(&make))).await;
+    Box::pin(settings_store_as_official(Arc::clone(&make))).await;
+    Box::pin(sort_changes_bump_schema_version(Arc::clone(&make))).await;
+    Box::pin(stored_limit_outranks_writer_options(Arc::clone(&make))).await;
+    Box::pin(reserved_names_under_scoped_limits(Arc::clone(&make))).await;
+    Box::pin(null_typed_columns_inline(Arc::clone(&make))).await;
+    Box::pin(null_typed_column_refused_for_not_null(Arc::clone(&make))).await;
+    Box::pin(sort_key_columns_cannot_be_dropped(Arc::clone(&make))).await;
+    Box::pin(change_detection_sees_inlined_changes(make)).await;
 }
 
 /// A writer configured with `0` creates no inlined data table on any direct
@@ -2499,6 +2954,7 @@ async fn writer_limit_zero_creates_no_inlined_tables() {
 async fn official_reads_what_the_new_paths_wrote() {
     let lake = sqlite()(Some(5)).await;
     create(&lake, "t").await;
+    let created = lake.head();
     lake.append_parquet("t", &batch(1..=20, "a")).await;
     let writer = lake.table_writer();
     let mut session = writer
@@ -2528,11 +2984,67 @@ async fn official_reads_what_the_new_paths_wrote() {
     let db = lake._dir.path().join("lake.db");
     crate::inlined_mutation_differential_tests::make_sqlite_catalog_duckdb_readable(&db).await;
     let official = crate::inlined_mutation_differential_tests::duckdb_query(
-        &crate::inlined_mutation_differential_tests::Metadata::Sqlite(db),
+        &crate::inlined_mutation_differential_tests::Metadata::Sqlite(db.clone()),
         &lake.data,
         "SELECT rowid, id, v FROM lake.main.t ORDER BY rowid",
     );
     assert_eq!(official, ours);
+
+    // Official's snapshot listing reads every snapshot's `changes_made`, and
+    // its change feed reports what this crate's does over each snapshot and
+    // the whole history (the fork's multi-catalog layout is not one DuckDB
+    // attaches, so it is covered by this crate's feed alone).
+    use crate::inlined_mutation_differential_tests as differential;
+    let head = lake.head();
+    let connection = differential::duckdb_connection();
+    differential::attach_lake(
+        &connection,
+        &differential::Metadata::Sqlite(db.clone()),
+        &lake.data,
+        true,
+    );
+    let listed = differential::query_lines(
+        &connection,
+        "SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY snapshot_id",
+    );
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db.display()))
+        .await
+        .unwrap();
+    let stored: Vec<i64> =
+        sqlx::query_scalar("SELECT snapshot_id FROM ducklake_snapshot ORDER BY snapshot_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        listed,
+        stored.iter().map(i64::to_string).collect::<Vec<_>>()
+    );
+    let ctx = SessionContext::new();
+    datafusion_ducklake::register_ducklake_functions(&ctx, Arc::clone(&lake.provider));
+    for (from, through) in differential::change_windows(created, head) {
+        let official = differential::query_lines(
+            &connection,
+            &format!(
+                "SELECT * FROM ducklake_table_changes('lake', 'main', 't', {from}, {through}) \
+                 ORDER BY snapshot_id, rowid, change_type"
+            ),
+        );
+        let batches = ctx
+            .sql(&format!(
+                "SELECT * FROM ducklake_table_changes('main.t', {from}, {through}) \
+                 ORDER BY snapshot_id, rowid, change_type"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            official,
+            differential::arrow_lines(&batches),
+            "window {from}..={through}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2777,4 +3289,33 @@ async fn row_api_futures_can_be_spawned() {
     })
     .await
     .unwrap();
+}
+
+/// A time-travel bound with a non-ASCII offset (`+a€`, four bytes) is
+/// refused as an invalid timestamp, not a panic slicing inside a character.
+#[cfg(feature = "write-sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn non_ascii_snapshot_offset_is_an_error() {
+    let lake = sqlite()(Some(5)).await;
+    create(&lake, "t").await;
+    lake.append("t", &batch(1..=2, "a")).await;
+    let ctx = SessionContext::new();
+    datafusion_ducklake::register_ducklake_functions(&ctx, Arc::clone(&lake.provider));
+    // Spawned, so a panic is reported as a failed join, not a crash.
+    let outcome = tokio::spawn(query_owned(ctx.clone())).await;
+    let error = outcome
+        .expect("no panic")
+        .expect_err("an invalid timestamp")
+        .to_string();
+    assert!(error.contains("is not a valid timestamp"), "{error}");
+}
+
+async fn query_owned(ctx: SessionContext) -> datafusion::error::Result<Vec<RecordBatch>> {
+    ctx.sql(
+        "SELECT * FROM ducklake_table_changes('main.t', '2024-01-01 00:00:00+a€', \
+         '2030-01-01 00:00:00')",
+    )
+    .await?
+    .collect()
+    .await
 }

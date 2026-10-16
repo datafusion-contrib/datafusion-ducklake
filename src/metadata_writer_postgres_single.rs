@@ -1298,6 +1298,16 @@ impl MetadataWriter for PostgresSingleCatalogMetadataWriter {
         self.data_inlining_row_limit
     }
 
+    fn reserved_inlining_column(&self, columns: &[String]) -> Result<Option<String>> {
+        let system = self.block_on(
+            crate::metadata_provider_postgres::catalog_inlined_system_columns(&self.pool),
+        )?;
+        Ok(columns
+            .iter()
+            .find(|column| system.conflicts_with(column))
+            .cloned())
+    }
+
     fn table_data_inlining_row_limit(&self, schema_name: &str, table_name: &str) -> Result<usize> {
         self.block_on(
             crate::metadata_writer_postgres::postgres_inlining_limit_by_name(

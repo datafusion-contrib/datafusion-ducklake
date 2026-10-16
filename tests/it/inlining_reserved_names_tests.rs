@@ -508,3 +508,120 @@ async fn sql_create_table_keeps_the_default_limit() {
         .unwrap();
     assert_eq!(lake.data_files("t").await, 0);
 }
+
+/// Files under the catalog's data directory.
+fn data_objects(lake: &Lake) -> usize {
+    fn walk(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            walk(&path)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    walk(&lake._temp.path().join("data"))
+}
+
+/// A write refused for a reserved column name is refused before it creates
+/// the table or uploads anything, as official refuses at `CREATE TABLE`: no
+/// `ducklake_table` row (which a later commit's snapshot would reveal), no
+/// `information_schema` entry, no data object; a streaming session refuses at
+/// `begin_write`, not after its rows are streamed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_write_creates_and_uploads_nothing() {
+    use arrow::datatypes::SchemaRef;
+    use datafusion_ducklake::WriteMode;
+    let lake = lake().await;
+    let schema = |columns: &[&str]| -> SchemaRef {
+        Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ))
+    };
+    let writer: Arc<dyn MetadataWriter> = lake.writer.clone();
+    let table_writer = DuckLakeTableWriter::new(writer, Arc::new(LocalFileSystem::new())).unwrap();
+
+    // One-shot writes of a new table: append, and SQL CREATE TABLE.
+    let error = lake
+        .append_default("t", &["id", "row_id"])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    let error = lake
+        .sql("CREATE TABLE lake.main.c (id INT, end_snapshot INT)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(RESERVED), "{error}");
+    // Sessions refuse up front, for a new table and for a new column.
+    for (table, columns) in [("s", &["id", "begin_snapshot"][..]), ("e", &["id", "row_id"])] {
+        if table == "e" {
+            lake.append_default("e", &["id"]).await.unwrap();
+        }
+        for single_file in [false, true] {
+            let begun = if single_file {
+                table_writer.begin_write_single_file(
+                    "main",
+                    table,
+                    &schema(columns),
+                    WriteMode::Append,
+                )
+            } else {
+                table_writer.begin_write("main", table, &schema(columns), WriteMode::Append)
+            };
+            let Err(error) = begun else {
+                panic!("{table}: begin_write accepted a reserved column");
+            };
+            let error = error.to_string();
+            assert!(error.contains(RESERVED), "{table}: {error}");
+        }
+    }
+
+    // A later commit reveals no refused table, and `e` gained no column.
+    lake.append_default("e", &["id"]).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&lake.url).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar("SELECT table_name FROM ducklake_table")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tables, vec!["e".to_string()]);
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM ducklake_column WHERE end_snapshot IS NULL ORDER BY column_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, vec!["id".to_string()]);
+    let ctx = SessionContext::new();
+    let writer: Arc<dyn MetadataWriter> = lake.writer.clone();
+    DuckLakeCatalog::register(
+        &ctx,
+        "lake",
+        DuckLakeCatalog::with_writer(Arc::clone(&lake.provider), writer).unwrap(),
+    );
+    let listed = ctx
+        .sql("SELECT table_name FROM lake.information_schema.tables")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(listed, 1);
+    // `e`'s rows are inlined; nothing else was uploaded.
+    assert_eq!(data_objects(&lake), 0);
+}

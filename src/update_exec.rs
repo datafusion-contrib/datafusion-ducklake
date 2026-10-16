@@ -249,7 +249,9 @@ impl ExecutionPlan for DuckLakeUpdateExec {
             // versions are inlined when the whole statement writes at most the
             // limit.
             let inline_limit = if inline_capable {
-                table_writer.data_inlining_row_limit()
+                table_writer
+                    .table_data_inlining_row_limit(&schema_name, &table_name)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
             } else {
                 0
             };
