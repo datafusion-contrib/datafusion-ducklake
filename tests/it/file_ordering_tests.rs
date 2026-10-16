@@ -1256,3 +1256,88 @@ async fn inner_limit_survives_an_ordered_replan() {
         assert_eq!(n, expected_rows(sql), "{sql}\n{}", plan(&ctx, sql).await);
     }
 }
+
+/// The verify job checks a file's order as the reader will see it: in the
+/// catalog's column type. An upload storing a `TIMESTAMP` key as ISO text is
+/// read through a cast, and text with mixed UTC offsets sorts differently as
+/// text than as instants, so its text order proves nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_checks_order_in_the_catalog_type() {
+    use datafusion_ducklake::metadata_writer::DataFileInfo;
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+
+    // Descending as text; as instants the `-01:00` row is an hour later than
+    // the rows above it.
+    let ts = [
+        "1970-01-01T00:00:00.009+00:00",
+        "1970-01-01T00:00:00.008-01:00",
+        "1970-01-01T00:00:00.007+00:00",
+        "1970-01-01T00:00:00.006+00:00",
+    ];
+    let text = Arc::new(Schema::new(vec![
+        Field::new("ts", DataType::Utf8, true),
+        Field::new("level", DataType::Utf8, true),
+        Field::new("id", DataType::Int64, false),
+    ]));
+    let rows = RecordBatch::try_new(
+        Arc::clone(&text),
+        vec![
+            Arc::new(StringArray::from(ts.to_vec())),
+            Arc::new(StringArray::from(vec!["INFO"; ts.len()])),
+            Arc::new(Int64Array::from_iter_values(0..ts.len() as i64)),
+        ],
+    )
+    .unwrap();
+    let path = env
+        .data_path()
+        .join("main")
+        .join("logs")
+        .join("text.parquet");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut out =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), text, None)
+            .unwrap();
+    out.write(&rows).unwrap();
+    out.close().unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as i64;
+    let writer = env.writer().await;
+    let cols: Vec<ColumnDef> = schema()
+        .fields()
+        .iter()
+        .map(|f| ColumnDef::from_arrow(f.name(), f.data_type(), f.is_nullable()).unwrap())
+        .collect();
+    let setup = writer
+        .begin_write_transaction("main", "logs", &cols, WriteMode::Append)
+        .unwrap();
+    writer
+        .register_data_file(
+            setup.table_id,
+            "main",
+            "logs",
+            setup.snapshot_id,
+            &DataFileInfo::new("text.parquet", size, ts.len() as i64).with_column_stats(
+                datafusion_ducklake::stats_collect::collect_column_stats(
+                    &path,
+                    &setup.column_ids,
+                    ts.len() as i64,
+                    &[],
+                ),
+            ),
+            WriteMode::Append,
+            setup.base_snapshot_id,
+            &cols,
+            &setup.column_ids,
+        )
+        .unwrap();
+
+    let (ctx, table) = table_handle(&env).await;
+    table
+        .verify_file_orders(&ctx.state(), VerifyOrderOptions::default())
+        .await
+        .unwrap();
+    for partitions in [1, 4] {
+        assert_all_queries_correct(&env.ctx(partitions).await).await;
+    }
+    assert_eq!(env.orders().await.get("text.parquet"), Some(&None));
+}
