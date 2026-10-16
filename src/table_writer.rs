@@ -1303,7 +1303,15 @@ impl DuckLakeTableWriter {
             props_builder = props_builder.set_max_row_group_bytes(Some(bytes));
         }
         let props = props_builder.build();
-        let file_order = self.file_order_request(setup.table_id, &schema_with_ids)?;
+        // Only for a file name this writer mints: a row describes the object at
+        // its path, and a caller that picks the name (`begin_write_to_path`) may
+        // write other bytes there after a failed attempt. `verify_file_orders`
+        // can record such a file once it is committed.
+        let file_order = if path_is_relative {
+            self.file_order_request(setup.table_id, &schema_with_ids)?
+        } else {
+            None
+        };
         // Stream the parquet to a local staging file rather than an in-memory
         // buffer: a multi-GB table would otherwise be held whole in RAM and,
         // worse, uploaded as a single PUT (object stores cap a single PUT at
