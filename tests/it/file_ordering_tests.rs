@@ -1124,3 +1124,54 @@ async fn few_chains_are_split_across_partitions() {
     );
     assert_matches_reference(&ctx, filtered).await;
 }
+
+/// A sidecar row describes one file. A writer without the shared file-id
+/// counter (a release before it, or another client allocating SQLite row
+/// ids) hands a retired file's `data_file_id` to its next file; the row of
+/// the retired, sorted file must not then vouch for the new, unsorted one.
+#[tokio::test(flavor = "multi_thread")]
+async fn sidecar_row_never_vouches_for_a_file_that_reuses_its_id() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    env.append(&[batch(&desc(0..1_000))]).await;
+    // Ascending, so NOT in the spec's order: written with the option off.
+    let ascending: Vec<Option<i64>> = (1_000..2_000).map(Some).collect();
+    env.append_with(&[batch(&ascending)], DuckLakeWriteOptions::default())
+        .await;
+
+    // What expiry plus such a writer leave behind: the sorted file's rows are
+    // gone, and the unsorted file sits under the sorted file's id.
+    let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT data_file_id FROM ducklake_data_file ORDER BY data_file_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let [sorted_id, unsorted_id] = ids[..] else {
+        panic!("two data files expected: {ids:?}");
+    };
+    for table in ["ducklake_data_file", "ducklake_file_column_stats"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE data_file_id = ?"
+        )))
+        .bind(sorted_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET data_file_id = ? WHERE data_file_id = ?"
+        )))
+        .bind(sorted_id)
+        .bind(unsorted_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    for partitions in [1, 4] {
+        let ctx = env.ctx(partitions).await;
+        assert_all_queries_correct(&ctx).await;
+        let p = plan(&ctx, TOP_N).await;
+        assert!(sorts(&p) && !declares_ts_desc(&p), "{p}");
+    }
+}
