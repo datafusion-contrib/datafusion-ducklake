@@ -2097,40 +2097,6 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
-    fn verified_file_orders(
-        &self,
-        table_id: i64,
-        paths: &[&str],
-    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        block_on(async {
-            let rows = match sqlx::query(
-                "SELECT path, file_size_bytes, sort_key FROM ext_ducklake_file_order
-                 WHERE table_id = $1 AND path = ANY($2)",
-            )
-            .bind(table_id)
-            .bind(paths)
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => return Ok(Vec::new()),
-                Err(e) => return Err(e.into()),
-            };
-            rows.iter()
-                .map(|row| {
-                    Ok(crate::ext_file_order::FileOrder {
-                        path: row.try_get(0)?,
-                        file_size_bytes: row.try_get(1)?,
-                        sort_key: row.try_get(2)?,
-                    })
-                })
-                .collect()
-        })
-    }
-
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,
