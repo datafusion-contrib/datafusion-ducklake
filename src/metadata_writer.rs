@@ -2692,6 +2692,40 @@ pub(crate) fn inlined_flush_table_conflict(
     })
 }
 
+/// The `changes_made` kinds whose id is a table's (official's
+/// `ParseChangeType`): the ids of schemas, views and macros come from the
+/// same sequence as tables' in official, but not in every catalog this crate
+/// writes, so a kind naming one of them never names a table.
+const TABLE_CHANGE_KINDS: &[&str] = &[
+    "inserted_into_table",
+    "deleted_from_table",
+    "inlined_insert",
+    "inlined_delete",
+    "flushed_inlined",
+    "inline_flush",
+    "merge_adjacent",
+    "rewrite_delete",
+    "compacted_table",
+    "altered_table",
+    "dropped_table",
+];
+
+/// Whether any of `changes` names table `table_id` with a table kind.
+fn changes_name_table(changes: &[Option<String>], table_id: i64) -> bool {
+    changes
+        .iter()
+        .flatten()
+        .flat_map(|changes| snapshot_change_tokens(changes))
+        .any(|token| {
+            token.split_once(':').is_some_and(|(kind, id)| {
+                TABLE_CHANGE_KINDS
+                    .iter()
+                    .any(|table_kind| kind.eq_ignore_ascii_case(table_kind))
+                    && id.parse::<i64>().ok() == Some(table_id)
+            })
+        })
+}
+
 /// [`table_conflict`] for a staged write: an insert, a `DELETE` or an
 /// `UPDATE`. The insert of a `Replace` is not checked here: the Replace
 /// conflict detection checks its retirement of the prior generation. A
@@ -2703,15 +2737,7 @@ pub(crate) fn staged_conflict(
     changes: &[Option<String>],
 ) -> Option<DuckLakeError> {
     if write.exclusive {
-        let changed = changes
-            .iter()
-            .flatten()
-            .flat_map(|changes| snapshot_change_tokens(changes))
-            .any(|token| {
-                token
-                    .split_once(':')
-                    .is_some_and(|(_, id)| id.parse::<i64>().ok() == Some(write.table_id))
-            });
+        let changed = changes_name_table(changes, write.table_id);
         if changed {
             return Some(DuckLakeError::Conflict(format!(
                 "Transaction conflict - attempting to restore rows of table with index \
@@ -4897,6 +4923,35 @@ mod tests {
     /// Official's table-level conflict check: inserts before deletions, each
     /// against the other changes in official's order, across every snapshot
     /// since the base, worded as official words it.
+    #[test]
+    fn only_table_kinds_name_a_table() {
+        let changes = |list: &[&str]| -> Vec<Option<String>> {
+            list.iter().map(|c| Some((*c).to_string())).collect()
+        };
+        for kind in TABLE_CHANGE_KINDS {
+            assert!(
+                changes_name_table(&changes(&[&format!("{kind}:7")]), 7),
+                "{kind}"
+            );
+        }
+        assert!(changes_name_table(
+            &changes(&["created_schema:\"s\",altered_table:7"]),
+            7
+        ));
+        for other in [
+            "dropped_schema:7",
+            "dropped_view:7",
+            "altered_view:7",
+            "dropped_scalar_macro:7",
+            "dropped_table_macro:7",
+            "created_table:\"main\".\"t\"",
+            "inserted_into_table:8",
+        ] {
+            assert!(!changes_name_table(&changes(&[other]), 7), "{other}");
+        }
+        assert!(!changes_name_table(&[None], 7));
+    }
+
     #[test]
     fn table_conflicts_follow_official_order_and_wording() {
         let changes = |list: &[&str]| -> Vec<Option<String>> {
