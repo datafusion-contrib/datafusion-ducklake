@@ -457,9 +457,29 @@ fn commit_refusal<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a DuckLakeEr
 
 /// Every commit path of the multicatalog writer, refused: nothing is committed
 /// and the files written for it are removed.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// The body awaits every write path in turn, and unoptimized its poll frame
+/// alone is about 1.5 MiB, so it runs on a thread with room to spare rather
+/// than on the 2 MiB test thread, where a small change anywhere in the write
+/// path overflowed it.
+#[test]
 #[cfg_attr(all(feature = "skip-tests-with-docker", target_os = "macos"), ignore)]
-async fn multicatalog_refusal_commits_nothing_on_every_path() {
+fn multicatalog_refusal_commits_nothing_on_every_path() {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(multicatalog_refusal_commits_nothing_on_every_path_body())
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn multicatalog_refusal_commits_nothing_on_every_path_body() {
     let (pool, base, _c) = spin_up_postgres().await.unwrap();
 
     // Whole-table writes: the id reservation is approved, the registering commit
