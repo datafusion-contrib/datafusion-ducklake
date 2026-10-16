@@ -72,7 +72,7 @@ use crate::metadata_writer::{
 };
 use crate::partition::PartitionSpec;
 use crate::row_id::EMBEDDED_SNAPSHOT_ID_COLUMN_NAME;
-use crate::sort::{SortDirection, SortSpec};
+use crate::sort::SortSpec;
 use crate::table::{
     DuckLakeTable, MergeSourceFacts, RewrittenBatch, UpdateSourceScan, rewrite_output_schema,
     rewrite_scanned_batch,
@@ -1999,6 +1999,7 @@ impl DuckLakeTable {
     /// What a maintenance write of this table (merge, rewrite, inlined flush)
     /// asks of its outputs under the experimental `ext_file_order` option;
     /// `schema` holds the written data columns.
+    #[cfg(feature = "ext-file-order")]
     pub(crate) fn ext_file_order_request(
         &self,
         schema: &Schema,
@@ -2016,8 +2017,18 @@ impl DuckLakeTable {
             schema,
         ))
     }
+
+    /// Without the `ext-file-order` feature no output is checked.
+    #[cfg(not(feature = "ext-file-order"))]
+    pub(crate) fn ext_file_order_request(
+        &self,
+        _schema: &Schema,
+    ) -> Result<Option<crate::file_ordering::FileOrderRequest>> {
+        Ok(None)
+    }
 }
 
+#[cfg(feature = "ext-file-order")]
 /// Options for [`DuckLakeTable::verify_file_orders`].
 #[derive(Debug, Clone, Default)]
 pub struct VerifyOrderOptions {
@@ -2027,6 +2038,7 @@ pub struct VerifyOrderOptions {
     pub max_files: Option<usize>,
 }
 
+#[cfg(feature = "ext-file-order")]
 /// What [`DuckLakeTable::verify_file_orders`] did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifyOrderResult {
@@ -2046,6 +2058,7 @@ pub struct VerifyOrderResult {
     pub bytes_read: u64,
 }
 
+#[cfg(feature = "ext-file-order")]
 impl DuckLakeTable {
     /// EXPERIMENTAL (`ext_file_order`): record the verified sort order of live
     /// data files that have no record under the table's current sort key:
@@ -2105,7 +2118,7 @@ impl DuckLakeTable {
             key_ids.push((
                 column_ids[index],
                 SortOptions {
-                    descending: *direction == SortDirection::Desc,
+                    descending: *direction == crate::sort::SortDirection::Desc,
                     nulls_first: *nulls == crate::sort::NullOrder::NullsFirst,
                 },
             ));

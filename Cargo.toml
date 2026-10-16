@@ -113,6 +113,13 @@ write-mysql = ["write", "metadata-mysql"]
 # Multicatalog read provider (independent of write support)
 multicatalog-postgres = ["metadata-postgres"]
 
+# EXPERIMENTAL, not covered by semver: per-file sort order verified on write
+# and recorded in an `ext_ducklake_file_order` sidecar table, so a scan can
+# declare it for `ORDER BY ... LIMIT`. Each catalog still opts in at runtime
+# (`DuckLakeCatalog::with_ext_file_order`); without this feature none of it
+# is compiled.
+ext-file-order = []
+
 # Rowid verification examples need both the DuckDB extension (writes the
 # catalog + writes data) and the postgres provider (DataFusion-side reads).
 [[example]]

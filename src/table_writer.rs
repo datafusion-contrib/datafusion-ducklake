@@ -218,6 +218,7 @@ pub struct DuckLakeWriteOptions {
     /// `ext_ducklake_file_order` sidecar table (see
     /// [`crate::ext_file_order`]). `None` or `false`: nothing is checked or
     /// recorded.
+    #[cfg(feature = "ext-file-order")]
     pub ext_file_order: Option<bool>,
     deferred_error: Option<String>,
 }
@@ -281,6 +282,7 @@ impl DuckLakeWriteOptions {
                 Some(0.95),
             )?,
             inlined_flush_policy: None,
+            #[cfg(feature = "ext-file-order")]
             ext_file_order: None,
             deferred_error: None,
         })
@@ -367,6 +369,7 @@ impl DuckLakeWriteOptions {
         if overrides.inlined_flush_policy.is_some() {
             self.inlined_flush_policy = overrides.inlined_flush_policy;
         }
+        #[cfg(feature = "ext-file-order")]
         if overrides.ext_file_order.is_some() {
             self.ext_file_order = overrides.ext_file_order;
         }
@@ -717,6 +720,7 @@ pub struct DuckLakeTableWriter {
     flushing_inlined: bool,
     hive_file_pattern: bool,
     /// See [`DuckLakeWriteOptions::ext_file_order`].
+    #[cfg(feature = "ext-file-order")]
     ext_file_order: bool,
 }
 
@@ -763,6 +767,7 @@ impl DuckLakeTableWriter {
             sort_on_insert: true,
             flushing_inlined: false,
             hive_file_pattern: true,
+            #[cfg(feature = "ext-file-order")]
             ext_file_order: false,
         })
     }
@@ -871,6 +876,7 @@ impl DuckLakeTableWriter {
         if let Some(hive_file_pattern) = options.hive_file_pattern {
             self.hive_file_pattern = hive_file_pattern;
         }
+        #[cfg(feature = "ext-file-order")]
         if let Some(ext_file_order) = options.ext_file_order {
             self.ext_file_order = ext_file_order;
         }
@@ -884,6 +890,7 @@ impl DuckLakeTableWriter {
     /// cannot evaluate. Asked whether or not the writer sorts: the check only
     /// vouches for what it observes, so rows a caller sorted get a record and
     /// rows nobody sorted get none.
+    #[cfg(feature = "ext-file-order")]
     pub(crate) fn file_order_request(
         &self,
         table_id: i64,
@@ -899,6 +906,16 @@ impl DuckLakeTableWriter {
             spec.as_ref(),
             schema,
         ))
+    }
+
+    /// Without the `ext-file-order` feature no write is checked.
+    #[cfg(not(feature = "ext-file-order"))]
+    pub(crate) fn file_order_request(
+        &self,
+        _table_id: i64,
+        _schema: &Schema,
+    ) -> Result<Option<FileOrderRequest>> {
+        Ok(None)
     }
 
     /// Build the parquet [`WriterProperties`] shared by every write path from this

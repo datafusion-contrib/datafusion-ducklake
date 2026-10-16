@@ -3,7 +3,7 @@
 //! `MulticatalogProvider`, including a writer role without DDL rights.
 //! Docker-gated (testcontainers Postgres).
 
-#![cfg(feature = "write-postgres")]
+#![cfg(all(feature = "write-postgres", feature = "ext-file-order"))]
 
 use std::sync::Arc;
 

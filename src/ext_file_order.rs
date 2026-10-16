@@ -44,7 +44,7 @@ pub struct FileOrder {
     pub sort_key: String,
 }
 
-#[cfg(feature = "metadata-sqlite")]
+#[cfg(feature = "write-sqlite")]
 pub(crate) const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_file_order (
     table_id BIGINT NOT NULL,
     path VARCHAR NOT NULL,
@@ -55,7 +55,7 @@ pub(crate) const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_fil
     PRIMARY KEY (table_id, path)
 )";
 
-#[cfg(feature = "metadata-postgres")]
+#[cfg(feature = "write-postgres")]
 pub(crate) const POSTGRES_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_file_order (
     table_id BIGINT NOT NULL,
     path VARCHAR NOT NULL,
@@ -67,13 +67,15 @@ pub(crate) const POSTGRES_DDL: &str = "CREATE TABLE IF NOT EXISTS ext_ducklake_f
 )";
 
 /// Recorded by the writer, for a file it wrote.
+#[cfg(feature = "write")]
 pub(crate) const BY_WRITE: &str = "write";
 /// Recorded by `DuckLakeTable::verify_file_orders`, after reading the file.
+#[cfg(feature = "write")]
 pub(crate) const BY_VERIFY: &str = "verify";
 
 /// Whether `error` says the sidecar table does not exist (never created: the
 /// option was never turned on for this catalog), which reads as "no rows".
-#[cfg(any(feature = "metadata-sqlite", feature = "metadata-postgres"))]
+#[cfg(any(feature = "metadata-sqlite", feature = "multicatalog-postgres"))]
 pub(crate) fn is_missing_table(error: &sqlx::Error) -> bool {
     match error {
         sqlx::Error::Database(db) => {

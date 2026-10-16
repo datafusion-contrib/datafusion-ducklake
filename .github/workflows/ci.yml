@@ -258,7 +258,7 @@ jobs:
       # of failing. It stopped being a default feature, so it has to be listed.
       - name: Run tests (macOS; Linux is covered by test-full)
         if: steps.changes.outputs.code == 'true' && runner.os == 'macOS'
-        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite"
+        run: cargo test --features "skip-tests-with-docker duckdb-bundled write-sqlite ext-file-order"
 
       - name: Check documentation
         if: steps.changes.outputs.code == 'true'
@@ -403,7 +403,12 @@ jobs:
             write-sqlite \
             write-postgres \
             write-mysql \
-            metadata-duckdb,encryption
+            metadata-duckdb,encryption \
+            ext-file-order \
+            metadata-sqlite,ext-file-order \
+            multicatalog-postgres,ext-file-order \
+            write-sqlite,ext-file-order \
+            write-postgres,ext-file-order
           do
             echo "::group::cargo check --no-default-features --features '$features'"
             cargo check --no-default-features --features "$features"
@@ -444,7 +449,7 @@ jobs:
         run: |
           cargo "+$MSRV" check --locked --lib --no-default-features
           cargo "+$MSRV" check --locked --lib --no-default-features --features \
-            "metadata-duckdb metadata-postgres metadata-mysql metadata-sqlite encryption write-sqlite write-postgres write-duckdb write-mysql"
+            "metadata-duckdb metadata-postgres metadata-mysql metadata-sqlite encryption write-sqlite write-postgres write-duckdb write-mysql ext-file-order"
 
 
   test-full:
@@ -567,7 +572,7 @@ jobs:
 
       - name: Run single-catalog test suite
         if: steps.changes.outputs.code == 'true'
-        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite"
+        run: cargo test --features "duckdb-bundled encryption write-duckdb write-mysql write-postgres write-sqlite ext-file-order"
 
       - name: Save target directory (main only)
         if: |

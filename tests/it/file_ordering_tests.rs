@@ -8,7 +8,7 @@
 //! the table, so a declared ordering that is not true fails here as wrong rows,
 //! not just as a different plan.
 
-#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite"))]
+#![cfg(all(feature = "write-sqlite", feature = "metadata-sqlite", feature = "ext-file-order"))]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

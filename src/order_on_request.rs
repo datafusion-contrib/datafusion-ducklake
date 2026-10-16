@@ -396,11 +396,6 @@ impl MergedChainsExec {
             merge,
         }
     }
-
-    /// Bytes each chain may read ahead of the merge.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
 }
 
 impl DisplayAs for MergedChainsExec {

@@ -2746,6 +2746,7 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(statistics)
     }
 
+    #[cfg(feature = "ext-file-order")]
     /// EXPERIMENTAL (`ext_file_order`): the sidecar rows of `table_id` for
     /// `paths` (see [`crate::ext_file_order`]). A file without a row, or whose
     /// row does not match its size, is "unknown" and is scanned unordered, so

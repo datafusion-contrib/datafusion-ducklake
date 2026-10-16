@@ -78,8 +78,10 @@ pub mod column_rename;
 pub mod delete_filter;
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "ext-file-order")]
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
+#[cfg(any(feature = "ext-file-order", feature = "write"))]
 pub(crate) mod file_ordering;
 pub mod information_schema;
 pub mod inlined_filter;
@@ -88,7 +90,8 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
-pub mod order_on_request;
+#[cfg(feature = "ext-file-order")]
+mod order_on_request;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
@@ -180,7 +183,6 @@ pub use metadata_provider::{
     DuckLakeTableFile, DuckLakeTag, MetadataProvider, ObjectTag, SnapshotChangeMetadata,
     TagObjectType, TagTarget,
 };
-pub use order_on_request::{MergedChainsExec, OrderOnRequestExec};
 pub use partition::{PartitionSpec, PartitionSpecColumn, PartitionTransform};
 pub use rowid_lookup::{RowIdLayout, RowIdLocation, RowLocation};
 pub use schema::DuckLakeSchema;
@@ -203,10 +205,9 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
-pub use compaction::{
-    CheckpointResult, CompactionResult, MergeOptions, RewriteOptions, VerifyOrderOptions,
-    VerifyOrderResult,
-};
+pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
+#[cfg(all(feature = "write", feature = "ext-file-order"))]
+pub use compaction::{VerifyOrderOptions, VerifyOrderResult};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write-postgres")]

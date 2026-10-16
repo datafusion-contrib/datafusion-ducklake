@@ -3557,6 +3557,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    #[cfg(feature = "ext-file-order")]
     /// EXPERIMENTAL (`ext_file_order`): upsert sidecar rows for `table_id`'s
     /// files (see [`crate::ext_file_order`]), creating the sidecar table if it
     /// is missing. `verified_by` says what checked them. A row is a fact about
@@ -3574,6 +3575,7 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(0)
     }
 
+    #[cfg(feature = "ext-file-order")]
     /// EXPERIMENTAL (`ext_file_order`): drop sidecar rows whose path no data
     /// file of their table has any more (expired, or never committed).
     /// Optional; such rows are harmless. A row recorded for a write still in

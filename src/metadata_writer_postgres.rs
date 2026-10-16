@@ -6849,6 +6849,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    #[cfg(feature = "ext-file-order")]
     fn record_file_orders(
         &self,
         table_id: i64,
@@ -6906,6 +6907,7 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    #[cfg(feature = "ext-file-order")]
     fn prune_file_orders(&self) -> Result<u64> {
         self.block_on(async {
             // Any catalog row for the path keeps it: a retired file is still

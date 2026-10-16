@@ -1639,6 +1639,7 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    #[cfg(feature = "ext-file-order")]
     fn verified_file_orders(
         &self,
         table_id: i64,
