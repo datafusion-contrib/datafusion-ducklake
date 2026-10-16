@@ -1639,6 +1639,47 @@ impl MetadataProvider for SqliteMetadataProvider {
         })
     }
 
+    fn verified_file_orders(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        block_on(async {
+            let mut out = Vec::new();
+            // Bounded binds per statement (SQLite's limit is 32766).
+            for chunk in paths.chunks(900) {
+                let placeholders = vec!["?"; chunk.len()].join(",");
+                let sql = format!(
+                    "SELECT path, file_size_bytes, sort_key FROM ext_ducklake_file_order \
+                     WHERE table_id = ? AND path IN ({placeholders})"
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql)).bind(table_id);
+                for path in chunk {
+                    query = query.bind(*path);
+                }
+                match query.fetch_all(&self.pool).await {
+                    Ok(rows) => {
+                        for row in rows {
+                            out.push(crate::ext_file_order::FileOrder {
+                                path: row.try_get(0)?,
+                                file_size_bytes: row.try_get(1)?,
+                                sort_key: row.try_get(2)?,
+                            });
+                        }
+                    },
+                    Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                        return Ok(Vec::new());
+                    },
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

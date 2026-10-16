@@ -174,6 +174,27 @@ use datafusion_ducklake::DuckLakeReadOptions;
 let table = cached_table.with_read_options(DuckLakeReadOptions::memoized());
 ```
 
+### Serving `ORDER BY ... LIMIT` from sorted files (experimental)
+
+A table with a sort order (`SET SORTED BY`) still has a sort on every `ORDER BY <key> LIMIT n`,
+because DuckLake does not record which files follow the order. With these options on, the writer
+checks the rows of every file it writes and records the files that follow the key in an
+`ext_ducklake_file_order` table beside the catalog. Scans then read those files in order and stop
+early. Both are off by default:
+
+```rust,ignore
+use datafusion_ducklake::{DuckLakeReadOptions, DuckLakeWriteOptions};
+
+let catalog = DuckLakeCatalog::with_writer(provider, writer)?
+    .with_write_options(DuckLakeWriteOptions::default().with_ext_file_order(true))
+    .with_read_options(DuckLakeReadOptions::default().with_ext_file_order(true));
+// Files written before, or by another client: record them without rewriting.
+table.verify_file_orders(&state, VerifyOrderOptions::default()).await?;
+```
+
+The table is not part of the DuckLake spec. DuckDB's extension ignores it. See
+`COMPATIBILITY.md` for what is declared and when.
+
 ---
 
 ## Writing a catalog

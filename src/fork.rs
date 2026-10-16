@@ -556,6 +556,7 @@ impl MulticatalogManager {
                             // partition, rolling over only an unpartitioned one.
                             values.is_none(),
                             &mut paths,
+                            None,
                         )
                         .await;
                     written.extend(paths);

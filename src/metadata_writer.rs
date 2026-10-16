@@ -3557,6 +3557,31 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// EXPERIMENTAL (`ext_file_order`): upsert sidecar rows for `table_id`'s
+    /// files (see [`crate::ext_file_order`]), creating the sidecar table if it
+    /// is missing. `verified_by` says what checked them. A row is a fact about
+    /// the object at its path, so it needs no snapshot and may land before the
+    /// file's commit. It is a claim readers act on: record only orders checked
+    /// against every row of the file. Returns the rows written.
+    ///
+    /// Default: the backend keeps no sidecar; nothing is recorded.
+    fn record_file_orders(
+        &self,
+        _table_id: i64,
+        _verified_by: &str,
+        _orders: &[crate::ext_file_order::FileOrder],
+    ) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// EXPERIMENTAL (`ext_file_order`): drop sidecar rows whose path no data
+    /// file of their table has any more (expired, or never committed).
+    /// Optional; such rows are harmless. A row recorded for a write still in
+    /// flight can be dropped too, which leaves that file unknown, not wrong.
+    fn prune_file_orders(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Set the table's sort spec — the commit behind `ALTER TABLE … SET SORTED BY
     /// (…)`.
     ///

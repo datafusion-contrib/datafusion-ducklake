@@ -6849,6 +6849,82 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn record_file_orders(
+        &self,
+        table_id: i64,
+        verified_by: &str,
+        orders: &[crate::ext_file_order::FileOrder],
+    ) -> Result<u64> {
+        if orders.is_empty() {
+            return Ok(0);
+        }
+        let paths: Vec<&str> = orders.iter().map(|o| o.path.as_str()).collect();
+        let sizes: Vec<i64> = orders.iter().map(|o| o.file_size_bytes).collect();
+        let keys: Vec<&str> = orders.iter().map(|o| o.sort_key.as_str()).collect();
+        self.block_on(async {
+            // A later verification of the same object wins: same bytes, so
+            // only the key (a changed sort spec) can differ.
+            let upsert = || {
+                sqlx::query(
+                    "INSERT INTO ext_ducklake_file_order
+                         (table_id, path, file_size_bytes, sort_key, verified_by)
+                     SELECT $1, u.path, u.size, u.key, $5
+                     FROM UNNEST($2::text[], $3::bigint[], $4::text[]) AS u(path, size, key)
+                     ON CONFLICT (table_id, path) DO UPDATE SET
+                         file_size_bytes = EXCLUDED.file_size_bytes,
+                         sort_key = EXCLUDED.sort_key,
+                         verified_by = EXCLUDED.verified_by,
+                         verified_at = now()",
+                )
+                .bind(table_id)
+                .bind(&paths)
+                .bind(&sizes)
+                .bind(&keys)
+                .bind(verified_by)
+                .execute(&self.pool)
+            };
+            // The table is created only when missing: Postgres checks CREATE
+            // privilege before IF NOT EXISTS, so a role without DDL rights can
+            // still record once an administrator has created it.
+            match upsert().await {
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    match sqlx::query(crate::ext_file_order::POSTGRES_DDL)
+                        .execute(&self.pool)
+                        .await
+                    {
+                        // A concurrent first creation can lose the race on the
+                        // type name (23505) even with IF NOT EXISTS.
+                        Ok(_) => {},
+                        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => {
+                        },
+                        Err(e) => return Err(e.into()),
+                    }
+                    Ok(upsert().await?.rows_affected())
+                },
+                done => Ok(done?.rows_affected()),
+            }
+        })
+    }
+
+    fn prune_file_orders(&self) -> Result<u64> {
+        self.block_on(async {
+            // Any catalog row for the path keeps it: a retired file is still
+            // read by time travel until expiry removes its row.
+            match sqlx::query(
+                "DELETE FROM ext_ducklake_file_order o
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_data_file df
+                                   WHERE df.table_id = o.table_id AND df.path = o.path)",
+            )
+            .execute(&self.pool)
+            .await
+            {
+                Ok(done) => Ok(done.rows_affected()),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         self.block_on(async {
             let rows = sqlx::query(

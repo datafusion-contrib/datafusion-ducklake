@@ -2746,6 +2746,18 @@ pub trait MetadataProvider: Send + Sync + std::fmt::Debug {
         Ok(statistics)
     }
 
+    /// EXPERIMENTAL (`ext_file_order`): the sidecar rows of `table_id` for
+    /// `paths` (see [`crate::ext_file_order`]). A file without a row, or whose
+    /// row does not match its size, is "unknown" and is scanned unordered, so
+    /// the default (no rows) is always correct.
+    fn verified_file_orders(
+        &self,
+        _table_id: i64,
+        _paths: &[&str],
+    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
+        Ok(Vec::new())
+    }
+
     /// Load one keyset-paginated batch of visible files and their statistics.
     ///
     /// `after_data_file_id` is exclusive. Implementations must return records

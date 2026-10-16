@@ -4554,6 +4554,84 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
+    fn record_file_orders(
+        &self,
+        table_id: i64,
+        verified_by: &str,
+        orders: &[crate::ext_file_order::FileOrder],
+    ) -> Result<u64> {
+        if orders.is_empty() {
+            return Ok(0);
+        }
+        self.block_on(async {
+            async fn upsert(
+                pool: &sqlx::SqlitePool,
+                table_id: i64,
+                verified_by: &str,
+                orders: &[crate::ext_file_order::FileOrder],
+            ) -> std::result::Result<u64, sqlx::Error> {
+                let mut tx = pool.begin().await?;
+                let mut written = 0;
+                for order in orders {
+                    // A later verification of the same object wins: same
+                    // bytes, so only the key (a changed sort spec) can differ.
+                    written += sqlx::query(
+                        "INSERT INTO ext_ducklake_file_order
+                             (table_id, path, file_size_bytes, sort_key, verified_by)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT (table_id, path) DO UPDATE SET
+                             file_size_bytes = excluded.file_size_bytes,
+                             sort_key = excluded.sort_key,
+                             verified_by = excluded.verified_by,
+                             verified_at = CURRENT_TIMESTAMP",
+                    )
+                    .bind(table_id)
+                    .bind(&order.path)
+                    .bind(order.file_size_bytes)
+                    .bind(&order.sort_key)
+                    .bind(verified_by)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                }
+                tx.commit().await?;
+                Ok(written)
+            }
+            // The table is created on first use, so a catalog that never
+            // records anything never gets it.
+            match upsert(&self.pool, table_id, verified_by, orders).await {
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    sqlx::query(crate::ext_file_order::SQLITE_DDL)
+                        .execute(&self.pool)
+                        .await?;
+                    Ok(upsert(&self.pool, table_id, verified_by, orders).await?)
+                },
+                done => Ok(done?),
+            }
+        })
+    }
+
+    fn prune_file_orders(&self) -> Result<u64> {
+        self.block_on(async {
+            // Any catalog row for the path keeps it: a retired file is still
+            // read by time travel until expiry removes its row.
+            match sqlx::query(
+                "DELETE FROM ext_ducklake_file_order
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_data_file df
+                     WHERE df.table_id = ext_ducklake_file_order.table_id
+                       AND df.path = ext_ducklake_file_order.path)",
+            )
+            .execute(&self.pool)
+            .await
+            {
+                Ok(done) => Ok(done.rows_affected()),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         self.block_on(async {
             let rows = sqlx::query(

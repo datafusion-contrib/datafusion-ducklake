@@ -257,6 +257,8 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
     buffered_rows: usize,
     buffered_bytes: usize,
     writer: Option<ArrowWriter<W>>,
+    /// Boxed: the writer lives in long-held futures, and is mostly `None`.
+    sort_check: Option<Box<crate::file_ordering::SortCheck>>,
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
@@ -267,12 +269,22 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
             buffered_rows: 0,
             buffered_bytes: 0,
             writer: None,
+            sort_check: None,
         }
+    }
+
+    /// Check every row written against `check` (see [`crate::file_ordering`]);
+    /// [`Self::verified_order`] then reports whether all of them followed it.
+    pub(crate) fn set_sort_check(&mut self, check: Option<crate::file_ordering::SortCheck>) {
+        self.sort_check = check.map(Box::new);
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
     /// the first row group is incomplete, and opens the file once it is.
     pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if let Some(check) = &mut self.sort_check {
+            check.observe(batch)?;
+        }
         if let Some(writer) = &mut self.writer {
             writer.write(batch)?;
             return Ok(());
@@ -316,6 +328,15 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
         self.writer
             .as_ref()
             .map_or(0, ArrowWriter::in_progress_size)
+    }
+
+    /// The sort key every row written so far was verified to follow (see
+    /// [`crate::file_ordering`]), for the sidecar to record. Read before
+    /// [`Self::into_inner`].
+    pub(crate) fn verified_order(&self) -> Option<String> {
+        self.sort_check
+            .as_ref()
+            .and_then(|check| check.attestation())
     }
 
     /// Write the footer and return the sink.

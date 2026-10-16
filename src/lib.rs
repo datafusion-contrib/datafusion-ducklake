@@ -80,7 +80,9 @@ pub mod delete_filter;
 mod delete_memo;
 pub mod encryption;
 pub mod error;
+pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
+pub(crate) mod file_ordering;
 pub mod information_schema;
 pub mod inlined_filter;
 pub(crate) mod lazy_delete_filter;
@@ -88,6 +90,7 @@ pub mod metadata_provider;
 pub(crate) mod nan_pruning_barrier;
 mod nested_inline;
 pub(crate) mod open_time_filter_barrier;
+mod order_on_request;
 pub mod partition;
 pub mod path_resolver;
 pub mod row_id;
@@ -204,6 +207,8 @@ pub use metadata_provider_sqlite::SqliteMetadataProvider;
 // Re-export write types (feature-gated)
 #[cfg(feature = "write")]
 pub use compaction::{CheckpointResult, CompactionResult, MergeOptions, RewriteOptions};
+#[cfg(feature = "write")]
+pub use compaction::{VerifyOrderOptions, VerifyOrderResult};
 #[cfg(feature = "write")]
 pub use delete_exec::DuckLakeDeleteExec;
 #[cfg(feature = "write-postgres")]
