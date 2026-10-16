@@ -2601,23 +2601,7 @@ async fn insert_file_column_stats(
     table_id: i64,
     data_file_id: i64,
     column_stats: &[ColumnStat],
-    verified_order: Option<&str>,
 ) -> Result<()> {
-    // EXPERIMENTAL `ext_file_order`: the file's verified sort key, in the same
-    // transaction as the file. Only ever `Some` after the table was ensured.
-    if let Some(order) = verified_order {
-        sqlx::query(
-            "INSERT OR IGNORE INTO ext_ducklake_file_order
-                 (data_file_id, table_id, sort_key, verified_by)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(data_file_id)
-        .bind(table_id)
-        .bind(order)
-        .bind(crate::ext_file_order::BY_WRITE)
-        .execute(&mut **tx)
-        .await?;
-    }
     crate::metadata_writer::reject_duplicate_column_stats(column_stats)?;
     for stat in column_stats {
         sqlx::query(
@@ -3298,14 +3282,7 @@ async fn commit_files_at_snapshot(
         .execute(&mut **tx)
         .await?;
         let data_file_id = file_id;
-        insert_file_column_stats(
-            tx,
-            write.table_id,
-            data_file_id,
-            &file.column_stats,
-            file.verified_order.as_deref(),
-        )
-        .await?;
+        insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += row_ids.advance;
         total_advance += row_ids.advance;
@@ -4577,54 +4554,73 @@ impl MetadataWriter for SqliteMetadataWriter {
         })
     }
 
-    fn ensure_file_order_table(&self) -> Result<bool> {
-        self.block_on(async {
-            sqlx::query(crate::ext_file_order::SQLITE_DDL)
-                .execute(&self.pool)
-                .await?;
-            Ok(true)
-        })
-    }
-
-    fn record_file_orders(&self, table_id: i64, orders: &[(i64, String)]) -> Result<u64> {
+    fn record_file_orders(
+        &self,
+        table_id: i64,
+        verified_by: &str,
+        orders: &[crate::ext_file_order::FileOrder],
+    ) -> Result<u64> {
         if orders.is_empty() {
             return Ok(0);
         }
-        self.ensure_file_order_table()?;
         self.block_on(async {
-            let mut inserted = 0;
-            let mut tx = self.pool.begin().await?;
-            for (data_file_id, sort_key) in orders {
-                // Live files of this table only: a row for a file a concurrent
-                // compaction just retired would be harmless, but pointless.
-                inserted += sqlx::query(
-                    "INSERT OR IGNORE INTO ext_ducklake_file_order
-                         (data_file_id, table_id, sort_key, verified_by)
-                     SELECT ?, ?, ?, ?
-                     WHERE EXISTS (SELECT 1 FROM ducklake_data_file
-                                   WHERE data_file_id = ? AND table_id = ?
-                                     AND end_snapshot IS NULL)",
-                )
-                .bind(data_file_id)
-                .bind(table_id)
-                .bind(sort_key)
-                .bind(crate::ext_file_order::BY_VERIFY)
-                .bind(data_file_id)
-                .bind(table_id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+            async fn upsert(
+                pool: &sqlx::SqlitePool,
+                table_id: i64,
+                verified_by: &str,
+                orders: &[crate::ext_file_order::FileOrder],
+            ) -> std::result::Result<u64, sqlx::Error> {
+                let mut tx = pool.begin().await?;
+                let mut written = 0;
+                for order in orders {
+                    // A later verification of the same object wins: same
+                    // bytes, so only the key (a changed sort spec) can differ.
+                    written += sqlx::query(
+                        "INSERT INTO ext_ducklake_file_order
+                             (table_id, path, file_size_bytes, sort_key, verified_by)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON CONFLICT (table_id, path) DO UPDATE SET
+                             file_size_bytes = excluded.file_size_bytes,
+                             sort_key = excluded.sort_key,
+                             verified_by = excluded.verified_by,
+                             verified_at = CURRENT_TIMESTAMP",
+                    )
+                    .bind(table_id)
+                    .bind(&order.path)
+                    .bind(order.file_size_bytes)
+                    .bind(&order.sort_key)
+                    .bind(verified_by)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                }
+                tx.commit().await?;
+                Ok(written)
             }
-            tx.commit().await?;
-            Ok(inserted)
+            // The table is created on first use, so a catalog that never
+            // records anything never gets it.
+            match upsert(&self.pool, table_id, verified_by, orders).await {
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => {
+                    sqlx::query(crate::ext_file_order::SQLITE_DDL)
+                        .execute(&self.pool)
+                        .await?;
+                    Ok(upsert(&self.pool, table_id, verified_by, orders).await?)
+                },
+                done => Ok(done?),
+            }
         })
     }
 
     fn prune_file_orders(&self) -> Result<u64> {
         self.block_on(async {
+            // Any catalog row for the path keeps it: a retired file is still
+            // read by time travel until expiry removes its row.
             match sqlx::query(
                 "DELETE FROM ext_ducklake_file_order
-                 WHERE data_file_id NOT IN (SELECT data_file_id FROM ducklake_data_file)",
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM ducklake_data_file df
+                     WHERE df.table_id = ext_ducklake_file_order.table_id
+                       AND df.path = ext_ducklake_file_order.path)",
             )
             .execute(&self.pool)
             .await
@@ -4974,14 +4970,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Persist the file's per-column zone-map stats in the same tx.
             let data_file_id = file_id;
-            insert_file_column_stats(
-                &mut tx,
-                table_id,
-                data_file_id,
-                &file.column_stats,
-                file.verified_order.as_deref(),
-            )
-            .await?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             // Merge the file's statistics into the table-wide roll-up.
             merge_file_table_column_stats(
@@ -5158,14 +5147,8 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
                 let data_file_id = file_id;
-                insert_file_column_stats(
-                    &mut tx,
-                    table_id,
-                    data_file_id,
-                    &file.column_stats,
-                    file.verified_order.as_deref(),
-                )
-                .await?;
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                    .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 next_row_id += row_ids.advance;
                 total_advance += row_ids.advance;
@@ -5874,7 +5857,7 @@ impl MetadataWriter for SqliteMetadataWriter {
 
             // Persist the new file's per-column zone-map stats.
             let data_file_id = file_id;
-            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref()).await?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             // Merge the file's statistics into the table-wide roll-up.
             merge_file_table_column_stats(
@@ -6140,7 +6123,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 .execute(&mut *tx)
                 .await?;
                 let data_file_id = file_id;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref())
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 next_row_id += row_ids.advance;
@@ -6687,7 +6670,7 @@ impl MetadataWriter for SqliteMetadataWriter {
                 // (same tx). Mirrors how official DuckLake records stats for
                 // compaction outputs via the shared write path.
                 let data_file_id = file_id;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats, out.file.verified_order.as_deref())
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, &out.file).await?;
             }
@@ -6781,7 +6764,12 @@ impl MetadataWriter for SqliteMetadataWriter {
                     .execute(&mut *tx)
                     .await?;
                     let data_file_id = file_id;
-                    insert_file_column_stats(&mut tx, table.table_id, data_file_id, &out.file.column_stats, out.file.verified_order.as_deref())
+                    insert_file_column_stats(
+                        &mut tx,
+                        table.table_id,
+                        data_file_id,
+                        &out.file.column_stats,
+                    )
                     .await?;
                     insert_partition_metadata(&mut tx, table.table_id, data_file_id, &out.file)
                         .await?;

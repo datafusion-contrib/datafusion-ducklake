@@ -1292,7 +1292,7 @@ impl DuckLakeTable {
                     carried_row_id_start.is_none(),
                     partial,
                     subpath.as_deref(),
-                    self.ext_file_order_request(sort_spec.as_ref(), physical_schema.as_ref()),
+                    self.ext_file_order_request(physical_schema.as_ref())?,
                 )
                 .await?;
             if let Some(start) = carried_row_id_start {
@@ -1697,7 +1697,7 @@ impl DuckLakeTable {
                     true,
                     false,
                     subpath.as_deref(),
-                    self.ext_file_order_request(sort_spec.as_ref(), physical_schema.as_ref()),
+                    self.ext_file_order_request(physical_schema.as_ref())?,
                 )
                 .await?;
             rows_written += file.record_count;
@@ -1996,25 +1996,25 @@ struct FlushBacklog {
 }
 
 impl DuckLakeTable {
-    /// The sort check a compaction output requests: the live spec's keys, but
-    /// only with the experimental `ext_file_order` option on.
+    /// What a maintenance write of this table (merge, rewrite, inlined flush)
+    /// asks of its outputs under the experimental `ext_file_order` option;
+    /// `schema` holds the written data columns.
     pub(crate) fn ext_file_order_request(
         &self,
-        sort_spec: Option<&SortSpec>,
         schema: &Schema,
-    ) -> Option<Vec<parquet::file::metadata::SortingColumn>> {
+    ) -> Result<Option<crate::file_ordering::FileOrderRequest>> {
         if !self.write_options().ext_file_order.unwrap_or(false) {
-            return None;
+            return Ok(None);
         }
-        let columns = crate::table_writer::sort_check_columns(sort_spec, schema)?;
-        let ensured = self
-            .writer()
-            .map(|writer| writer.ensure_file_order_table())
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or(false);
-        ensured.then_some(columns)
+        let Some(writer) = self.writer() else {
+            return Ok(None);
+        };
+        Ok(crate::file_ordering::FileOrderRequest::new(
+            Arc::clone(writer),
+            self.table_id(),
+            self.live_sort_spec()?.as_ref(),
+            schema,
+        ))
     }
 }
 
@@ -2036,8 +2036,8 @@ pub struct VerifyOrderResult {
     pub files_recorded: u64,
     /// Of those, files whose rows are NOT in sort order (nothing recorded).
     pub files_unsorted: usize,
-    /// Files not read: already recorded, name-mapped, encrypted, or a footer
-    /// without the key columns.
+    /// Files not read: already recorded under the current key, name-mapped,
+    /// encrypted, or a footer without the key columns.
     pub files_skipped: usize,
     /// Compressed bytes of the key column chunks read.
     pub bytes_read: u64,
@@ -2045,21 +2045,21 @@ pub struct VerifyOrderResult {
 
 impl DuckLakeTable {
     /// EXPERIMENTAL (`ext_file_order`): record the verified sort order of live
-    /// data files that have no record yet — files written before the option
-    /// was on, by another DuckLake client, uploaded parquet registered as is,
-    /// or `ducklake_add_data_files` — WITHOUT rewriting them and without a new
-    /// snapshot.
+    /// data files that have no record under the table's current sort key:
+    /// files written before the option was on or under an older key, by
+    /// another DuckLake client, uploaded parquet registered as is, or
+    /// `ducklake_add_data_files`. The files are not rewritten and no snapshot
+    /// is taken.
     ///
     /// Per file: read only the sort-key columns (located by field id), in file
     /// order, through the same check the writer runs; if every row is in order,
-    /// insert `(data_file_id, sort_key)` into `ext_ducklake_file_order`. The
-    /// rows describe immutable files, so they need no snapshot and are true at
-    /// every snapshot that lists the file. Concurrent maintenance is harmless:
-    /// a file compacted away while being read gets no row (the insert is
-    /// conditioned on the file still being live), and a row that does land for
-    /// a file retired a moment later is never consulted (nothing lists the id)
-    /// and is dropped by `MetadataWriter::prune_file_orders`. Idempotent; two
-    /// concurrent passes insert each row once.
+    /// record the file's path, size and key in `ext_ducklake_file_order`. A row
+    /// describes the object at that path, so it needs no snapshot and is true
+    /// at every snapshot that lists the file. Concurrent maintenance is
+    /// harmless: a row for a file compacted away meanwhile matches no live
+    /// file and is dropped by `MetadataWriter::prune_file_orders`. Idempotent.
+    /// Rows are recorded once all candidates are read, so an error part way
+    /// (a file vacuumed after listing, say) records nothing for the pass.
     pub async fn verify_file_orders(
         &self,
         state: &dyn Session,
@@ -2126,10 +2126,28 @@ impl DuckLakeTable {
                     }),
             );
         }
-        let ids: Vec<i64> = candidates.iter().map(|tf| tf.data_file_id).collect();
-        let recorded = self.metadata_provider().verified_file_orders(&ids)?;
+        // Files already recorded under the current key are skipped; one
+        // recorded under an older key is checked again under this one.
+        let current_key = key_ids
+            .iter()
+            .map(|(id, options)| {
+                Some(crate::file_ordering::AttestedKey {
+                    field_id: i32::try_from(*id).ok()?,
+                    options: *options,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|keys| crate::file_ordering::encode(&keys));
+        let paths: Vec<&str> = candidates.iter().map(|tf| tf.file.path.as_str()).collect();
+        let recorded: HashSet<(String, i64)> = self
+            .metadata_provider()
+            .verified_file_orders(self.table_id(), &paths)?
+            .into_iter()
+            .filter(|order| current_key.as_ref() == Some(&order.sort_key))
+            .map(|order| (order.path, order.file_size_bytes))
+            .collect();
 
-        let mut orders: Vec<(i64, String)> = Vec::new();
+        let mut orders: Vec<crate::ext_file_order::FileOrder> = Vec::new();
         for tf in candidates {
             if opts
                 .max_files
@@ -2137,7 +2155,7 @@ impl DuckLakeTable {
             {
                 break;
             }
-            if recorded.contains_key(&tf.data_file_id)
+            if recorded.contains(&(tf.file.path.clone(), tf.file.file_size_bytes))
                 || tf.file.mapping_id.is_some()
                 || tf
                     .file
@@ -2242,11 +2260,19 @@ impl DuckLakeTable {
                 check.observe(&batch?)?;
             }
             match check.attestation() {
-                Some(order) => orders.push((tf.data_file_id, order)),
+                Some(sort_key) => orders.push(crate::ext_file_order::FileOrder {
+                    path: tf.file.path.clone(),
+                    file_size_bytes: tf.file.file_size_bytes,
+                    sort_key,
+                }),
                 None => result.files_unsorted += 1,
             }
         }
-        result.files_recorded = writer.record_file_orders(self.table_id(), &orders)?;
+        result.files_recorded = writer.record_file_orders(
+            self.table_id(),
+            crate::ext_file_order::BY_VERIFY,
+            &orders,
+        )?;
         Ok(result)
     }
 }

@@ -242,22 +242,6 @@ fn sliced_memory_size(batch: &RecordBatch) -> usize {
         .sum()
 }
 
-/// Ask every [`RowGroupSampledWriter`] built from `props` to verify, and attest
-/// when true, that its rows are ordered by `columns` (top-level field index,
-/// direction, null order). `None` or empty leaves `props` unchanged.
-pub(crate) fn request_sort_check(
-    props: WriterProperties,
-    columns: Option<Vec<parquet::file::metadata::SortingColumn>>,
-) -> WriterProperties {
-    match columns {
-        Some(columns) if !columns.is_empty() => props
-            .into_builder()
-            .set_sorting_columns(Some(columns))
-            .build(),
-        _ => props,
-    }
-}
-
 /// A parquet writer that buffers its file's first row group before opening, so
 /// the file's encoding can be chosen from it with [`props_for_row_group`].
 ///
@@ -277,28 +261,25 @@ pub(crate) struct RowGroupSampledWriter<W: Write + Send> {
 }
 
 impl<W: Write + Send> RowGroupSampledWriter<W> {
-    /// `base.sorting_columns()`, when set (see [`request_sort_check`]), is a
-    /// request to VERIFY that order, not a claim: it is stripped before the
-    /// parquet writer sees it, every row written is checked against it, and the
-    /// result is available from [`Self::verified_order`] only if all were in
-    /// order. Its `column_idx` is a top-level field index of `schema`.
     pub(crate) fn new(sink: W, schema: SchemaRef, base: WriterProperties) -> Self {
-        let sort_check = base
-            .sorting_columns()
-            .and_then(|requested| crate::file_ordering::SortCheck::new(&schema, requested));
-        let base = if base.sorting_columns().is_some() {
-            base.into_builder().set_sorting_columns(None).build()
-        } else {
-            base
-        };
         Self {
             pending: Some((sink, schema, base)),
             buffered: Vec::new(),
             buffered_rows: 0,
             buffered_bytes: 0,
             writer: None,
-            sort_check,
+            sort_check: None,
         }
+    }
+
+    /// Check every row written against `check` (see [`crate::file_ordering`]);
+    /// [`Self::verified_order`] then reports whether all of them followed it.
+    pub(crate) fn with_sort_check(
+        mut self,
+        check: Option<crate::file_ordering::SortCheck>,
+    ) -> Self {
+        self.sort_check = check;
+        self
     }
 
     /// Write `batch`, which must carry the file's parquet schema. Buffers it while
@@ -353,7 +334,7 @@ impl<W: Write + Send> RowGroupSampledWriter<W> {
     }
 
     /// The sort key every row written so far was verified to follow (see
-    /// [`crate::file_ordering`]), for the catalog commit to record. Read before
+    /// [`crate::file_ordering`]), for the sidecar to record. Read before
     /// [`Self::into_inner`].
     pub(crate) fn verified_order(&self) -> Option<String> {
         self.sort_check

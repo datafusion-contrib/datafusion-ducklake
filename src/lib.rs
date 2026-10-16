@@ -78,7 +78,6 @@ pub mod column_rename;
 pub mod delete_filter;
 pub mod encryption;
 pub mod error;
-#[cfg(any(feature = "metadata-sqlite", feature = "metadata-postgres"))]
 pub mod ext_file_order;
 pub(crate) mod field_id_adapter;
 pub(crate) mod file_ordering;

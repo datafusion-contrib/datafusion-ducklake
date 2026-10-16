@@ -3251,27 +3251,37 @@ impl DuckLakeTable {
     /// Each file's verified ordering over the table schema, from the
     /// `ext_ducklake_file_order` sidecar (one query for the whole page). Only
     /// files without a name mapping are considered: the recorded key names
-    /// columns by field id. A file the sidecar has no row for — or whose row
-    /// does not parse, or the lookup failing — is simply absent: it is scanned
-    /// exactly as before.
+    /// columns by field id. A row applies to a file only when its path and
+    /// size match the file's, so it never vouches for another file. A file
+    /// without a matching row (or whose row does not parse, or the lookup
+    /// failing) is simply absent: it is scanned exactly as before.
     fn attested_file_orderings(&self, files: &[&DuckLakeTableFile]) -> HashMap<i64, LexOrdering> {
-        let ids: Vec<i64> = files
+        let files: Vec<&DuckLakeTableFile> = files
             .iter()
+            .copied()
             .filter(|table_file| table_file.file.mapping_id.is_none())
-            .map(|table_file| table_file.data_file_id)
             .collect();
-        let recorded = match self.provider.verified_file_orders(&ids) {
+        let paths: Vec<&str> = files.iter().map(|tf| tf.file.path.as_str()).collect();
+        let recorded = match self.provider.verified_file_orders(self.table_id, &paths) {
             Ok(recorded) => recorded,
             Err(error) => {
                 tracing::debug!(%error, "ext_file_order lookup failed; scanning unordered");
                 return HashMap::new();
             },
         };
-        recorded
-            .into_iter()
-            .filter_map(|(id, key)| {
-                let keys = crate::file_ordering::decode(&key)?;
-                Some((id, self.ordering_for_attestation(&keys)?))
+        let recorded: HashMap<&str, &crate::ext_file_order::FileOrder> = recorded
+            .iter()
+            .map(|order| (order.path.as_str(), order))
+            .collect();
+        files
+            .iter()
+            .filter_map(|tf| {
+                let order = recorded.get(tf.file.path.as_str())?;
+                if order.file_size_bytes != tf.file.file_size_bytes {
+                    return None;
+                }
+                let keys = crate::file_ordering::decode(&order.sort_key)?;
+                Some((tf.data_file_id, self.ordering_for_attestation(&keys)?))
             })
             .collect()
     }

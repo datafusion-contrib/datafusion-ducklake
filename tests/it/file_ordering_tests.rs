@@ -22,6 +22,7 @@ use datafusion::prelude::*;
 use object_store::local::LocalFileSystem;
 use tempfile::TempDir;
 
+use datafusion_ducklake::ext_file_order::FileOrder;
 use datafusion_ducklake::{
     ColumnDef, DuckLakeCatalog, DuckLakeTable, DuckLakeTableWriter, DuckLakeWriteOptions,
     MergeOptions, MetadataWriter, NullOrder, SortDirection, SortField, SqliteMetadataProvider,
@@ -136,7 +137,9 @@ impl Env {
         .get(0);
         let sql = if has_sidecar {
             "SELECT df.path, o.sort_key FROM ducklake_data_file df
-             LEFT JOIN ext_ducklake_file_order o ON o.data_file_id = df.data_file_id
+             LEFT JOIN ext_ducklake_file_order o
+               ON o.table_id = df.table_id AND o.path = df.path
+              AND o.file_size_bytes = df.file_size_bytes
              WHERE df.end_snapshot IS NULL"
         } else {
             "SELECT path, NULL FROM ducklake_data_file WHERE end_snapshot IS NULL"
@@ -937,11 +940,15 @@ async fn verify_racing_compaction_and_prune() {
     }
     env.sort_by_ts_desc(NullOrder::NullsFirst).await;
     let provider = SqliteMetadataProvider::new(&env.url()).await.unwrap();
-    let before: Vec<i64> = provider
+    let before: Vec<FileOrder> = provider
         .get_table_files_for_select(env.table_id, provider.get_current_snapshot().unwrap())
         .unwrap()
         .iter()
-        .map(|f| f.data_file_id)
+        .map(|f| FileOrder {
+            path: f.file.path.clone(),
+            file_size_bytes: f.file.file_size_bytes,
+            sort_key: "1:desc:nulls_first".to_string(),
+        })
         .collect();
     assert_eq!(before.len(), 2);
 
@@ -957,37 +964,34 @@ async fn verify_racing_compaction_and_prune() {
     assert!(orders.values().all(Option::is_some));
 
     // The verify pass read the two files before the merge and records now.
-    let late: Vec<(i64, String)> = before
-        .iter()
-        .map(|id| (*id, "1:desc:nulls_first".to_string()))
-        .collect();
+    // The rows are true of those objects, but the merge removed the files
+    // from the catalog, so they match nothing.
+    let writer = env.writer().await;
     assert_eq!(
-        env.writer()
-            .await
-            .record_file_orders(env.table_id, &late)
+        writer
+            .record_file_orders(env.table_id, "verify", &before)
             .unwrap(),
-        0
+        2
     );
+    for partitions in [1, 4] {
+        assert_all_queries_correct(&env.ctx(partitions).await).await;
+    }
 
-    // A row for a vacuumed file: harmless to reads, and pruned.
+    // Rows for paths no file of the table has are pruned; the merge output's
+    // row stays.
+    assert_eq!(writer.prune_file_orders().unwrap(), 2);
+    assert_eq!(sidecar_rows(&env).await, 1);
+    assert_eq!(env.orders().await, orders);
+}
+
+async fn sidecar_rows(env: &Env) -> i64 {
     use sqlx::Row;
     let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
-    sqlx::query(
-        "INSERT INTO ext_ducklake_file_order (data_file_id, table_id, sort_key, verified_by)
-         VALUES (999999, ?, '1:desc:nulls_first', 'verify')",
-    )
-    .bind(env.table_id)
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_all_queries_correct(&env.ctx(4).await).await;
-    assert_eq!(env.writer().await.prune_file_orders().unwrap(), 1);
-    let left: i64 = sqlx::query("SELECT count(*) FROM ext_ducklake_file_order")
+    sqlx::query("SELECT count(*) FROM ext_ducklake_file_order")
         .fetch_one(&pool)
         .await
         .unwrap()
-        .get(0);
-    assert_eq!(left, 1);
+        .get(0)
 }
 
 /// Plan text with the wrapper line dropped and indentation removed, so a plan

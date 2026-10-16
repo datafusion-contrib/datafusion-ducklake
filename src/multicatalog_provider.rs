@@ -1727,30 +1727,39 @@ impl MetadataProvider for MulticatalogProvider {
         })
     }
 
-    fn verified_file_orders(&self, data_file_ids: &[i64]) -> Result<HashMap<i64, String>> {
-        if data_file_ids.is_empty() {
-            return Ok(HashMap::new());
+    fn verified_file_orders(
+        &self,
+        table_id: i64,
+        paths: &[&str],
+    ) -> Result<Vec<crate::ext_file_order::FileOrder>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
         }
         block_on(async {
             let rows = match self
                 .read_all(
                     sqlx::query(
-                        "SELECT data_file_id, sort_key FROM ext_ducklake_file_order
-                     WHERE data_file_id = ANY($1)",
+                        "SELECT path, file_size_bytes, sort_key FROM ext_ducklake_file_order
+                         WHERE table_id = $1 AND path = ANY($2)",
                     )
-                    .bind(data_file_ids),
+                    .bind(table_id)
+                    .bind(paths),
                 )
                 .await
             {
                 Ok(rows) => rows,
-                Err(e) if crate::ext_file_order::is_missing_table(&e) => return Ok(HashMap::new()),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => return Ok(Vec::new()),
                 Err(e) => return Err(e.into()),
             };
-            let mut out = HashMap::new();
-            for row in rows {
-                out.insert(row.try_get::<i64, _>(0)?, row.try_get::<String, _>(1)?);
-            }
-            Ok(out)
+            rows.iter()
+                .map(|row| {
+                    Ok(crate::ext_file_order::FileOrder {
+                        path: row.try_get(0)?,
+                        file_size_bytes: row.try_get(1)?,
+                        sort_key: row.try_get(2)?,
+                    })
+                })
+                .collect()
         })
     }
 
