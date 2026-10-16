@@ -988,9 +988,20 @@ async fn verify_racing_compaction_and_prune() {
     assert_eq!(env.orders().await, orders);
 }
 
+/// Rows in the sidecar; 0 when it was never created.
 async fn sidecar_rows(env: &Env) -> i64 {
     use sqlx::Row;
     let pool = sqlx::SqlitePool::connect(&env.url()).await.unwrap();
+    let exists: bool = sqlx::query(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE name = 'ext_ducklake_file_order'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get(0);
+    if !exists {
+        return 0;
+    }
     sqlx::query("SELECT count(*) FROM ext_ducklake_file_order")
         .fetch_one(&pool)
         .await
