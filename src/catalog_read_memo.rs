@@ -900,6 +900,34 @@ impl MetadataProvider for MemoizedMetadataProvider {
         self.inner
             .get_delete_files_added_between_snapshots(table_id, start_snapshot, end_snapshot)
     }
+
+    fn list_table_snapshot_changes(
+        &self,
+        table_id: i64,
+        after_snapshot: i64,
+        through_snapshot: i64,
+    ) -> Result<Vec<(i64, Option<String>)>> {
+        self.inner
+            .list_table_snapshot_changes(table_id, after_snapshot, through_snapshot)
+    }
+
+    fn snapshot_ids_between(&self, from_snapshot: i64, through_snapshot: i64) -> Result<Vec<i64>> {
+        self.inner
+            .snapshot_ids_between(from_snapshot, through_snapshot)
+    }
+
+    fn snapshot_ids_are_consecutive(&self) -> bool {
+        self.inner.snapshot_ids_are_consecutive()
+    }
+
+    fn table_first_snapshot(&self, table_id: i64) -> Result<Option<i64>> {
+        self.inner.table_first_snapshot(table_id)
+    }
+
+    fn oldest_inlined_row_snapshot(&self, table_id: i64, snapshot_id: i64) -> Result<Option<i64>> {
+        self.inner
+            .oldest_inlined_row_snapshot(table_id, snapshot_id)
+    }
 }
 
 #[cfg(test)]
