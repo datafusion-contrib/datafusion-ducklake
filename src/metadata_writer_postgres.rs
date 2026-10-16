@@ -1755,7 +1755,7 @@ impl PostgresMetadataWriter {
                 // is not in a footer, and without it a float max is never
                 // trusted. Empty means no rows, and the roll-up below then
                 // reports the file's columns as unknown, exactly as the source did.
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref())
                     .await?;
 
                 // An existing positional delete file travels with its data file: same
@@ -2716,7 +2716,24 @@ async fn insert_file_column_stats(
     table_id: i64,
     data_file_id: i64,
     column_stats: &[ColumnStat],
+    verified_order: Option<&str>,
 ) -> Result<()> {
+    // EXPERIMENTAL `ext_file_order`: the file's verified sort key, in the same
+    // transaction as the file. Only ever `Some` after the table was ensured.
+    if let Some(order) = verified_order {
+        sqlx::query(
+            "INSERT INTO ext_ducklake_file_order
+                 (data_file_id, table_id, sort_key, verified_by)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (data_file_id) DO NOTHING",
+        )
+        .bind(data_file_id)
+        .bind(table_id)
+        .bind(order)
+        .bind(crate::ext_file_order::BY_WRITE)
+        .execute(&mut **tx)
+        .await?;
+    }
     crate::metadata_writer::reject_duplicate_column_stats(column_stats)?;
     if column_stats.is_empty() {
         return Ok(());
@@ -3916,8 +3933,14 @@ pub(crate) async fn apply_inlined_flush_at_snapshot(
             .bind(out.partial_max)
             .fetch_one(&mut **tx)
             .await?;
-            insert_file_column_stats(tx, table.table_id, data_file_id, &out.file.column_stats)
-                .await?;
+            insert_file_column_stats(
+                tx,
+                table.table_id,
+                data_file_id,
+                &out.file.column_stats,
+                out.file.verified_order.as_deref(),
+            )
+            .await?;
             insert_partition_metadata(tx, table.table_id, data_file_id, &out.file).await?;
             if let Some(delete) = &out.delete {
                 insert_flush_delete_file(tx, table.table_id, data_file_id, delete).await?;
@@ -4066,7 +4089,14 @@ pub(crate) async fn commit_files_at_snapshot(
         .bind(snapshot_id)
         .fetch_one(&mut **tx)
         .await?;
-        insert_file_column_stats(tx, write.table_id, data_file_id, &file.column_stats).await?;
+        insert_file_column_stats(
+            tx,
+            write.table_id,
+            data_file_id,
+            &file.column_stats,
+            file.verified_order.as_deref(),
+        )
+        .await?;
         insert_partition_metadata(tx, write.table_id, data_file_id, file).await?;
         next_row_id += file.record_count;
         total_records += file.record_count;
@@ -6075,7 +6105,7 @@ impl MetadataWriter for PostgresMetadataWriter {
 
             // Persist the file's per-column zone maps + refresh the table roll-up,
             // in the same commit as the data-file row.
-            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref()).await?;
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
             merge_file_table_column_stats(
                 &mut tx,
@@ -6252,7 +6282,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .fetch_one(&mut *tx)
                 .await?;
                 let data_file_id: i64 = inserted.try_get(0)?;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref())
                     .await?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
                 next_row_id += row_ids.advance;
@@ -6849,6 +6879,66 @@ impl MetadataWriter for PostgresMetadataWriter {
         })
     }
 
+    fn ensure_file_order_table(&self) -> Result<bool> {
+        self.block_on(async {
+            // A concurrent first creation can lose the race on the type name
+            // (23505) even with IF NOT EXISTS; the table then exists.
+            match sqlx::query(crate::ext_file_order::POSTGRES_DDL)
+                .execute(&self.pool)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23505") => Ok(true),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    fn record_file_orders(&self, table_id: i64, orders: &[(i64, String)]) -> Result<u64> {
+        if orders.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_file_order_table()?;
+        let ids: Vec<i64> = orders.iter().map(|(id, _)| *id).collect();
+        let keys: Vec<String> = orders.iter().map(|(_, key)| key.clone()).collect();
+        self.block_on(async {
+            let done = sqlx::query(
+                "INSERT INTO ext_ducklake_file_order
+                     (data_file_id, table_id, sort_key, verified_by)
+                 SELECT u.id, $3, u.key, $4
+                 FROM UNNEST($1::bigint[], $2::text[]) AS u(id, key)
+                 JOIN ducklake_data_file df
+                   ON df.data_file_id = u.id AND df.table_id = $3
+                  AND df.end_snapshot IS NULL
+                 ON CONFLICT (data_file_id) DO NOTHING",
+            )
+            .bind(&ids)
+            .bind(&keys)
+            .bind(table_id)
+            .bind(crate::ext_file_order::BY_VERIFY)
+            .execute(&self.pool)
+            .await?;
+            Ok(done.rows_affected())
+        })
+    }
+
+    fn prune_file_orders(&self) -> Result<u64> {
+        self.block_on(async {
+            match sqlx::query(
+                "DELETE FROM ext_ducklake_file_order o
+                 WHERE NOT EXISTS (SELECT 1 FROM ducklake_data_file df
+                                   WHERE df.data_file_id = o.data_file_id)",
+            )
+            .execute(&self.pool)
+            .await
+            {
+                Ok(done) => Ok(done.rows_affected()),
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
     fn live_sort_spec(&self, table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         self.block_on(async {
             let rows = sqlx::query(
@@ -7327,7 +7417,7 @@ impl MetadataWriter for PostgresMetadataWriter {
             // because the `DataFileInfo` it validates DOES carry the assignment; only
             // the persistence was missing.
             insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats).await?;
+            insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref()).await?;
             merge_file_table_column_stats(
                 &mut tx,
                 table_id,
@@ -7590,7 +7680,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 .await?;
                 let data_file_id: i64 = inserted.try_get(0)?;
                 insert_partition_metadata(&mut tx, table_id, data_file_id, file).await?;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats)
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &file.column_stats, file.verified_order.as_deref())
                     .await?;
                 next_row_id += row_ids.advance;
                 total_advance += row_ids.advance;
@@ -8352,7 +8442,7 @@ impl MetadataWriter for PostgresMetadataWriter {
                 // Persist the compacted file's harvested zone maps (same tx),
                 // mirroring official DuckLake's stats-recording for outputs.
                 let data_file_id: i64 = inserted.try_get(0)?;
-                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats)
+                insert_file_column_stats(&mut tx, table_id, data_file_id, &out.file.column_stats, out.file.verified_order.as_deref())
                     .await?;
                 // Carry the output's partition assignment over from its sources.
                 // Every file in a compaction group shares one partition, so the

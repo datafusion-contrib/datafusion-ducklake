@@ -74,7 +74,8 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::parquet::CachedParquetFileReaderFactory;
 use datafusion::datasource::physical_plan::{
-    FileGroup, FileScanConfigBuilder, FileSource, ParquetFileReaderFactory, ParquetSource,
+    FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource, ParquetFileReaderFactory,
+    ParquetSource,
 };
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::table_schema::TableSchema;
@@ -83,6 +84,7 @@ use datafusion::execution::object_store::ObjectStoreUrl;
 #[cfg(feature = "write")]
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_datasource_parquet::metadata::DFParquetMetadata;
 use object_store::ObjectMeta;
@@ -111,7 +113,7 @@ pub const DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_646;
 /// 2`), NOT Iceberg's `2147483545`. See [`DELETE_FILE_PATH_FIELD_ID`].
 pub const DELETE_POS_FIELD_ID: i32 = 2_147_483_645;
 
-struct FileMetadataPages<'a> {
+pub(crate) struct FileMetadataPages<'a> {
     provider: &'a dyn MetadataProvider,
     table_id: i64,
     snapshot_id: i64,
@@ -1313,6 +1315,8 @@ pub struct DuckLakeTable {
     /// When true, `schema` includes a trailing `rowid` column and `scan()`
     /// resolves it per file via [`RowLineageExec`].
     row_lineage: bool,
+    /// See [`Self::with_ext_file_order`].
+    ext_file_order: bool,
     /// Column metadata from DuckLake (needed for field_id mapping)
     columns: Vec<DuckLakeTableColumn>,
     /// Literal defaults used by DataFusion when an INSERT omits a column
@@ -1488,6 +1492,7 @@ impl DuckLakeTable {
             schema,
             physical_schema,
             row_lineage: false,
+            ext_file_order: false,
             columns,
             column_defaults,
             fields,
@@ -1526,6 +1531,14 @@ impl DuckLakeTable {
     /// Enable / disable the row-lineage feature. When enabled, the table's
     /// public schema includes a trailing `rowid` BIGINT column synthesized
     /// from each row's catalog-recorded `row_id_start + position_in_file`.
+    /// EXPERIMENTAL, opt-in: declare a sort order for files the
+    /// `ext_ducklake_file_order` sidecar records as verified. Also on when the
+    /// table's write options enable `ext_file_order`.
+    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
+        self.ext_file_order = enabled;
+        self
+    }
+
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
         self.schema = if enabled {
@@ -1759,7 +1772,7 @@ impl DuckLakeTable {
     /// may ignore the filter entirely (the trait method defaults to doing so)
     /// and because the in-memory pass prunes on things the catalog cannot see —
     /// partition-derived bounds among them.
-    fn file_metadata_pages<'a>(
+    pub(crate) fn file_metadata_pages<'a>(
         &'a self,
         page_name: &'static str,
         filter: Option<&'a StatsFilter>,
@@ -3223,6 +3236,170 @@ impl DuckLakeTable {
                 (file_group, None)
             },
         }
+    }
+
+    /// Whether scans read the `ext_file_order` sidecar (see
+    /// [`Self::with_ext_file_order`]).
+    pub(crate) fn ext_file_order_enabled(&self) -> bool {
+        #[cfg(feature = "write")]
+        if self.write_options.ext_file_order == Some(true) {
+            return true;
+        }
+        self.ext_file_order
+    }
+
+    /// Each file's verified ordering over the table schema, from the
+    /// `ext_ducklake_file_order` sidecar (one query for the whole page). Only
+    /// files without a name mapping are considered: the recorded key names
+    /// columns by field id. A file the sidecar has no row for — or whose row
+    /// does not parse, or the lookup failing — is simply absent: it is scanned
+    /// exactly as before.
+    fn attested_file_orderings(&self, files: &[&DuckLakeTableFile]) -> HashMap<i64, LexOrdering> {
+        let ids: Vec<i64> = files
+            .iter()
+            .filter(|table_file| table_file.file.mapping_id.is_none())
+            .map(|table_file| table_file.data_file_id)
+            .collect();
+        let recorded = match self.provider.verified_file_orders(&ids) {
+            Ok(recorded) => recorded,
+            Err(error) => {
+                tracing::debug!(%error, "ext_file_order lookup failed; scanning unordered");
+                return HashMap::new();
+            },
+        };
+        recorded
+            .into_iter()
+            .filter_map(|(id, key)| {
+                let keys = crate::file_ordering::decode(&key)?;
+                Some((id, self.ordering_for_attestation(&keys)?))
+            })
+            .collect()
+    }
+
+    /// The longest prefix of `keys` this scan can declare: keys resolve by field
+    /// id to a CURRENT column (a dropped or re-added column ends the prefix), and
+    /// only fixed-width, totally ordered types qualify, since the cross-file
+    /// check compares catalog min/max, which for strings may be truncated and
+    /// for floats ignore NaN.
+    fn ordering_for_attestation(
+        &self,
+        keys: &[crate::file_ordering::AttestedKey],
+    ) -> Option<LexOrdering> {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        let mut exprs = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(index) = self
+                .columns
+                .iter()
+                .position(|column| column.column_id == i64::from(key.field_id))
+            else {
+                break;
+            };
+            let Some(field) = self.physical_schema.fields().get(index) else {
+                break;
+            };
+            if !matches!(
+                field.data_type(),
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Date32
+                    | DataType::Date64
+                    | DataType::Timestamp(_, _)
+                    | DataType::Decimal128(_, _)
+            ) {
+                break;
+            }
+            // The attested null order is dropped for SQL's default (NULLS LAST
+            // ascending, NULLS FIRST descending): the ordering is only declared
+            // for files whose key columns hold no NULL (`declarable_ordering`),
+            // where the two are one order. Without this, a DuckDB-style
+            // `SORTED BY (ts DESC NULLS LAST)` never satisfies `ORDER BY ts DESC`
+            // (DataFusion keeps one ordering per expression, not both).
+            exprs.push(PhysicalSortExpr::new(
+                Arc::new(PhysicalColumn::new(field.name(), index)),
+                arrow::compute::SortOptions {
+                    descending: key.options.descending,
+                    nulls_first: key.options.descending,
+                },
+            ));
+        }
+        LexOrdering::new(exprs)
+    }
+
+    /// The ordering to declare over `files`, and which files share it: the
+    /// ordering most of the attesting files carry, restricted to files whose
+    /// catalog statistics show no NULL in any key column. A NULL sits at one
+    /// end of its own file but outside the min/max the cross-file check
+    /// compares, so a file holding one could break the order between files.
+    fn declarable_ordering(
+        &self,
+        files: &[&DuckLakeTableFile],
+        attested: &HashMap<i64, LexOrdering>,
+        file_statistics: &HashMap<i64, Arc<Statistics>>,
+    ) -> Option<(LexOrdering, HashSet<i64>)> {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        let mut counts: Vec<(&LexOrdering, usize)> = Vec::new();
+        for file in files {
+            if let Some(ordering) = attested.get(&file.data_file_id) {
+                match counts.iter_mut().find(|(o, _)| *o == ordering) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((ordering, 1)),
+                }
+            }
+        }
+        let (ordering, _) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+        let key_columns: Vec<usize> = ordering
+            .iter()
+            .filter_map(|e| e.expr.downcast_ref::<PhysicalColumn>().map(|c| c.index()))
+            .collect();
+        let ids: HashSet<i64> = files
+            .iter()
+            .filter(|file| file.file.mapping_id.is_none())
+            .filter(|file| attested.get(&file.data_file_id) == Some(ordering))
+            .filter(|file| {
+                file_statistics
+                    .get(&file.data_file_id)
+                    .is_some_and(|stats| {
+                        key_columns.iter().all(|&i| {
+                            stats
+                                .column_statistics
+                                .get(i)
+                                .is_some_and(|c| c.null_count == Precision::Exact(0))
+                        })
+                    })
+            })
+            .map(|file| file.data_file_id)
+            .collect();
+        (!ids.is_empty()).then(|| (ordering.clone(), ids))
+    }
+
+    /// Split `files` into groups that are each a non-overlapping chain in
+    /// `ordering` (DataFusion's first-fit by min/max statistics), at most
+    /// `target_partitions` of them. `None` — declare nothing, scan as before —
+    /// when the statistics are missing or the files overlap too much to chain
+    /// into that many groups (live ingest before compaction).
+    fn ordered_file_groups(
+        &self,
+        state: &dyn Session,
+        files: &FileGroup,
+        ordering: LexOrdering,
+    ) -> Option<(Vec<FileGroup>, LexOrdering)> {
+        let target = state.config().target_partitions().max(1);
+        let groups = FileScanConfig::split_groups_by_statistics_with_target_partitions(
+            &self.physical_schema,
+            std::slice::from_ref(files),
+            &ordering,
+            target,
+        )
+        .inspect_err(|error| tracing::debug!(%error, "not declaring file ordering"))
+        .ok()?;
+        (groups.len() <= target).then_some((groups, ordering))
     }
 
     /// Build a single execution plan for all files without delete files
@@ -4701,6 +4878,7 @@ impl DuckLakeTable {
             schema: self.physical_schema.clone(),
             physical_schema: self.physical_schema.clone(),
             row_lineage: false,
+            ext_file_order: self.ext_file_order,
             columns: self.columns.clone(),
             column_defaults: self.column_defaults.clone(),
             fields: self.fields.clone(),
@@ -4853,6 +5031,11 @@ impl DuckLakeTable {
             ids.extend_from_slice(&column.nested_column_ids);
         }
         ids
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn metadata_provider(&self) -> &Arc<dyn MetadataProvider> {
+        &self.provider
     }
 
     #[cfg(feature = "write")]
@@ -5588,6 +5771,14 @@ impl TableProvider for DuckLakeTable {
                 Vec::new()
             },
         };
+        // EXPERIMENTAL, opt-in (`ext_file_order`): which files have a verified
+        // order comes from the sidecar, one catalog query per page of files.
+        let probe_file_orderings = !rowid_in_proj && self.ext_file_order_enabled();
+        // The ordered alternative's ingredients, gathered across pages and only
+        // used if a sort asks for them (see `crate::order_on_request`).
+        let mut recipe_files: Vec<PartitionedFile> = Vec::new();
+        let mut recipe_ordering: Option<LexOrdering> = None;
+        let mut recipe_ok = probe_file_orderings;
         for metadata in self.file_metadata_pages("planning", stats_filter.as_ref()) {
             let (table_files, file_statistics, summary_statistics) =
                 self.page_files_with_both_statistics(metadata?);
@@ -5657,6 +5848,32 @@ impl TableProvider for DuckLakeTable {
                 });
 
             if !files_without_deletes.is_empty() {
+                if recipe_ok {
+                    let attested = self.attested_file_orderings(&files_without_deletes);
+                    match self.declarable_ordering(
+                        &files_without_deletes,
+                        &attested,
+                        &file_statistics,
+                    ) {
+                        Some((ordering, ids))
+                            if recipe_ordering.as_ref().is_none_or(|o| *o == ordering) =>
+                        {
+                            for table_file in &files_without_deletes {
+                                if ids.contains(&table_file.data_file_id) {
+                                    recipe_files.push(self.partitioned_data_file(
+                                        table_file,
+                                        false,
+                                        &file_statistics,
+                                    )?);
+                                }
+                            }
+                            recipe_ordering = Some(ordering);
+                        },
+                        // Pages disagreeing on the ordering: declare nothing.
+                        Some(_) => recipe_ok = false,
+                        None => {},
+                    }
+                }
                 execs.push(self.build_exec_for_files_without_deletes(
                     state,
                     &files_without_deletes,
@@ -5757,8 +5974,39 @@ impl TableProvider for DuckLakeTable {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Combine execution plans
-        combine_execution_plans(execs)
+        // Combine execution plans. With verified files, the plan is still
+        // today's plan; the wrapper only offers an ordered alternative to a
+        // sort that asks for one (`try_pushdown_sort`).
+        let plan = combine_execution_plans(execs)?;
+        let recipe = recipe_ok
+            .then_some(recipe_ordering)
+            .flatten()
+            .filter(|_| !recipe_files.is_empty())
+            .and_then(|ordering| {
+                self.ordered_file_groups(state, &FileGroup::new(recipe_files), ordering)
+            });
+        Ok(match recipe {
+            Some((chains, ordering)) => Arc::new(crate::order_on_request::OrderOnRequestExec::new(
+                plan,
+                chains,
+                ordering,
+                state
+                    .config_options()
+                    .execution
+                    .sort_pushdown_buffer_capacity,
+                state
+                    .config_options()
+                    .optimizer
+                    .repartition_file_scans
+                    .then(|| {
+                        (
+                            state.config().target_partitions(),
+                            state.config_options().optimizer.repartition_file_min_size,
+                        )
+                    }),
+            )),
+            None => plan,
+        })
     }
 
     #[cfg(feature = "write")]

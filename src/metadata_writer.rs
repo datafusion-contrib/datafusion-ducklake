@@ -1569,6 +1569,11 @@ pub struct DataFileInfo {
     /// [`RowIdStart::Embedded`]/[`RowIdStart::Preserved`], whose real ids the row
     /// count does not reveal: pass the source table's `next_row_id`.
     pub row_id_floor: Option<i64>,
+    /// The sort key the writer verified every row of the file follows
+    /// (`crate::file_ordering` format), recorded in the experimental
+    /// `ext_ducklake_file_order` sidecar in the same transaction as the file,
+    /// by backends that support it. `None`: nothing is recorded (unknown).
+    pub verified_order: Option<String>,
 }
 
 impl DataFileInfo {
@@ -1597,7 +1602,14 @@ impl DataFileInfo {
             owner_catalog_id: None,
             row_id_start: RowIdStart::Assign,
             row_id_floor: None,
+            verified_order: None,
         }
+    }
+
+    /// Record `order` for the file (see [`Self::verified_order`]).
+    pub fn with_verified_order(mut self, order: Option<String>) -> Self {
+        self.verified_order = order;
+        self
     }
 
     /// Set the footer size for read optimization.
@@ -3553,6 +3565,28 @@ pub trait MetadataWriter: Send + Sync + std::fmt::Debug {
     /// commit-time fence for sort.
     ///
     /// Default: `None` (backends without sort support are never sorted).
+    /// EXPERIMENTAL (`ext_file_order`): create the sidecar table if missing.
+    /// Called before any write that may record a verified order, outside the
+    /// commit transaction, so the commit's own insert never races the DDL.
+    /// Default: unsupported backend, nothing recorded (`false`).
+    fn ensure_file_order_table(&self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// EXPERIMENTAL (`ext_file_order`): record `(data_file_id, sort_key)` rows
+    /// verified by reading the files, for live data files of `table_id` only;
+    /// idempotent. No snapshot: the rows describe immutable files, not the
+    /// table's contents. Returns the rows inserted. Default: nothing.
+    fn record_file_orders(&self, _table_id: i64, _orders: &[(i64, String)]) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// EXPERIMENTAL (`ext_file_order`): drop sidecar rows whose data file is
+    /// gone from the catalog (vacuumed). Optional; such rows are harmless.
+    fn prune_file_orders(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     fn live_sort_spec(&self, _table_id: i64) -> Result<Option<crate::sort::SortSpec>> {
         Ok(None)
     }

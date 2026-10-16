@@ -2097,6 +2097,31 @@ impl MetadataProvider for PostgresMetadataProvider {
         })
     }
 
+    fn verified_file_orders(&self, data_file_ids: &[i64]) -> Result<HashMap<i64, String>> {
+        if data_file_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        block_on(async {
+            let rows = match sqlx::query(
+                "SELECT data_file_id, sort_key FROM ext_ducklake_file_order
+                 WHERE data_file_id = ANY($1)",
+            )
+            .bind(data_file_ids)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(rows) => rows,
+                Err(e) if crate::ext_file_order::is_missing_table(&e) => return Ok(HashMap::new()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut out = HashMap::new();
+            for row in rows {
+                out.insert(row.try_get::<i64, _>(0)?, row.try_get::<String, _>(1)?);
+            }
+            Ok(out)
+        })
+    }
+
     fn get_table_file_metadata_page(
         &self,
         table_id: i64,

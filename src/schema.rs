@@ -66,6 +66,7 @@ pub struct DuckLakeSchema {
     schema_path: String,
     /// Propagated from the catalog: when true, tables expose a `rowid` column.
     row_lineage: bool,
+    ext_file_order: bool,
     /// Metadata writer for write operations (when write feature is enabled)
     #[cfg(feature = "write")]
     writer: Option<Arc<dyn MetadataWriter>>,
@@ -93,6 +94,7 @@ impl DuckLakeSchema {
             object_store_url,
             schema_path,
             row_lineage: false,
+            ext_file_order: false,
             #[cfg(feature = "write")]
             writer: None,
             #[cfg(feature = "write")]
@@ -116,6 +118,12 @@ impl DuckLakeSchema {
 
     /// Enable the row-lineage virtual `rowid` column for all tables in this
     /// schema. Set by the parent catalog (see `DuckLakeCatalog::with_row_lineage`).
+    /// See `DuckLakeCatalog::with_ext_file_order`.
+    pub fn with_ext_file_order(mut self, enabled: bool) -> Self {
+        self.ext_file_order = enabled;
+        self
+    }
+
     pub fn with_row_lineage(mut self, enabled: bool) -> Self {
         self.row_lineage = enabled;
         self
@@ -211,7 +219,8 @@ impl DuckLakeSchema {
             table_path,
         )
         .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?
-        .with_row_lineage(self.row_lineage);
+        .with_row_lineage(self.row_lineage)
+        .with_ext_file_order(self.ext_file_order);
 
         // Configure writer if this schema is writable
         #[cfg(feature = "write")]
