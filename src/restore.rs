@@ -52,11 +52,10 @@
 //! a writer that stages row mutations (SQLite, DuckDB, MySQL and multi-catalog
 //! PostgreSQL; single-catalog PostgreSQL refuses with
 //! [`DuckLakeError::Unsupported`], as it refuses `UPDATE` and `DELETE`). The
-//! commit is based on the table's snapshot: it runs the conflict checks of an
-//! `UPDATE`, and any change to the table's data files, delete files or inlined
-//! rows since that snapshot aborts it with [`DuckLakeError::Conflict`], so the
-//! rows it leaves are the mark's. A PostgreSQL commit guard approves it as it
-//! approves any other commit.
+//! commit is based on the table's snapshot, and any commit to the table since
+//! that snapshot (one the change ledger names it in) aborts it with
+//! [`DuckLakeError::Conflict`], so the rows it leaves are the mark's. A
+//! PostgreSQL commit guard approves it as it approves any other commit.
 //!
 //! # Cost
 //!
@@ -133,11 +132,31 @@ impl DuckLakeTable {
         // Each step's state lives on the heap, keeping this future small for
         // a caller that awaits it inside its own.
         let diff = Box::pin(context.diff(state)).await?;
+        // An expiry commits no snapshot, so the commit's checks cannot see
+        // one: the mark surviving the reads shows they all read it whole.
+        mark_survives(self, snapshot)?;
         if diff.rows_removed == 0 && diff.rows_restored == 0 {
             return Ok(RestoreResult::default());
         }
         Box::pin(context.commit(state, diff)).await
     }
+}
+
+/// Refuses a restore to `snapshot` when it is not in the catalog: it has
+/// expired, or was never one of its snapshots.
+fn mark_survives(head: &DuckLakeTable, snapshot: i64) -> crate::Result<()> {
+    if head
+        .provider()
+        .snapshot_ids_between(snapshot, snapshot)?
+        .is_empty()
+    {
+        return Err(DuckLakeError::InvalidSnapshot(format!(
+            "restore of '{}': snapshot {snapshot} is not in the catalog; it has expired or was \
+             never one of its snapshots, and the rows it read may be gone",
+            head.table_name()
+        )));
+    }
+    Ok(())
 }
 
 /// What a restore works with, resolved and checked once.
@@ -250,15 +269,7 @@ impl<'a> RestoreContext<'a> {
             )));
         }
         let provider = head.provider();
-        if provider
-            .snapshot_ids_between(snapshot, snapshot)?
-            .is_empty()
-        {
-            return Err(DuckLakeError::InvalidSnapshot(format!(
-                "restore of '{name}': snapshot {snapshot} is not in the catalog; it has expired \
-                 or was never one of its snapshots, and the rows it read may be gone"
-            )));
-        }
+        mark_survives(head, snapshot)?;
         if provider
             .get_table_structure(head.table_id(), snapshot)?
             .is_empty()
@@ -533,14 +544,7 @@ impl<'a> RestoreContext<'a> {
             table: head,
             state,
         };
-        // Any change to the table since its snapshot aborts the restore: the
-        // rows it would leave are the mark's only if the head it compared
-        // against is still the head. An `UPDATE`'s checks alone would admit a
-        // concurrent insert, or a second restore re-inserting the same rows.
-        let mut transaction = self.table_writer.transaction().with_options(
-            &crate::table_writer::TableWriteOptions::new()
-                .with_expected_base_snapshot_id(base_snapshot),
-        );
+        let mut transaction = self.table_writer.transaction();
         transaction.set_delete_file_positions(&latest);
         transaction
             .stage_row_mutation(
@@ -559,6 +563,12 @@ impl<'a> RestoreContext<'a> {
                 deletions.dropped,
             )
             .await?;
+        // Any commit to the table since its snapshot aborts the restore: the
+        // rows it leaves are the mark's only if the head it compared against
+        // is still the head. An `UPDATE`'s checks alone would admit a
+        // concurrent insert, a second restore re-inserting the same rows, or a
+        // rewrite whose new files begin before the snapshot.
+        transaction.make_last_write_exclusive();
         let snapshot_id = transaction
             .commit()
             .await?

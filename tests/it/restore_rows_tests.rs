@@ -23,8 +23,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::prelude::SessionContext;
 use datafusion_ducklake::maintenance::ExpireCriteria;
 use datafusion_ducklake::{
-    DuckLakeCatalog, DuckLakeError, DuckLakeTable, DuckLakeWriteOptions, InlinedFlushPolicy,
-    MergeOptions, RestoreResult, RewriteOptions,
+    CatalogReadMemo, DuckLakeCatalog, DuckLakeError, DuckLakeTable, DuckLakeWriteOptions,
+    InlinedFlushPolicy, MergeOptions, MetadataProvider, RestoreResult, RewriteOptions,
 };
 
 #[cfg(feature = "write-duckdb")]
@@ -844,6 +844,112 @@ pub(crate) async fn refusals(make: MakeLake) {
     let error = stale.restore_rows_to(&ctx.state(), mark).await.unwrap_err();
     assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
     assert_eq!(lake.head(), head);
+    // A concurrent `DELETE` that rewrites the delete file of a file the
+    // restore does not touch writes a delete file beginning before the
+    // restore's snapshot; it still conflicts.
+    create(&lake, "w").await;
+    lake.append_parquet("w", &batch(1..=20, "a")).await;
+    lake.sql("DELETE FROM lake.main.w WHERE id <= 6")
+        .await
+        .unwrap();
+    let mark = lake.head();
+    lake.append_parquet("w", &batch(50..=59, "b")).await;
+    let (ctx, stale) = lake.table("w").await;
+    lake.sql("DELETE FROM lake.main.w WHERE id BETWEEN 7 AND 12")
+        .await
+        .unwrap();
+    let head = lake.head();
+    let error = stale.restore_rows_to(&ctx.state(), mark).await.unwrap_err();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(lake.head(), head);
+}
+
+/// A table read through a [`CatalogReadMemo`]: a restore through a provider
+/// bound to it, with the memo filled at the head and at the mark, leaves the
+/// mark's rows, and the next bind serves them; a commit since the bound
+/// table was read aborts the restore.
+pub(crate) async fn restores_through_a_catalog_read_memo(make: MakeLake) {
+    let lake = make(Some(5)).await;
+    create(&lake, "t").await;
+    lake.append_parquet("t", &batch(1..=20, "a")).await;
+    let mark = lake.head();
+    for statement in [
+        "DELETE FROM lake.main.t WHERE id IN (3, 4)",
+        "UPDATE lake.main.t SET v = 'u' WHERE id = 7",
+    ] {
+        lake.sql(statement).await.unwrap();
+    }
+    lake.append_parquet("t", &batch(30..=39, "b")).await;
+    let expected = lake.rows_at("t", Some(mark)).await;
+    let memo = CatalogReadMemo::new(CatalogReadMemo::DEFAULT_MAX_BYTES);
+    let bound = |memo: &Arc<CatalogReadMemo>| -> Arc<dyn MetadataProvider> {
+        Arc::new(memo.bind(Arc::clone(&lake.provider)).unwrap())
+    };
+    let read = async |provider: Arc<dyn MetadataProvider>, snapshot: i64| {
+        let ctx = SessionContext::new();
+        let catalog = DuckLakeCatalog::with_snapshot(provider, snapshot)
+            .unwrap()
+            .with_row_lineage(true);
+        ctx.register_catalog("lake", Arc::new(catalog));
+        let batches = ctx
+            .sql("SELECT * FROM lake.main.t ORDER BY rowid")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        lines(&batches, true)
+    };
+    let open = async |provider: Arc<dyn MetadataProvider>| {
+        let ctx = SessionContext::new();
+        DuckLakeCatalog::register(
+            &ctx,
+            "lake",
+            DuckLakeCatalog::with_writer(provider, Arc::clone(&lake.writer)).unwrap(),
+        );
+        let table = ctx
+            .catalog("lake")
+            .unwrap()
+            .schema("main")
+            .unwrap()
+            .table("t")
+            .await
+            .unwrap()
+            .unwrap();
+        let table = (table.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<DuckLakeTable>()
+            .unwrap()
+            .clone();
+        (ctx, table)
+    };
+
+    // Fill the memo at the head and at the mark.
+    let provider = bound(&memo);
+    let head = lake.head();
+    let pre = read(Arc::clone(&provider), head).await;
+    assert_eq!(read(provider, mark).await, expected);
+
+    let (ctx, table) = open(bound(&memo)).await;
+    let result = Box::pin(table.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap();
+    assert!(result.snapshot_id.is_some(), "{result:?}");
+    assert_eq!(lake.rows("t").await, expected);
+    assert_eq!(read(bound(&memo), lake.head()).await, expected);
+    assert_eq!(read(bound(&memo), head).await, pre, "history kept");
+
+    // A commit after the bound table was read aborts its restore.
+    lake.sql("DELETE FROM lake.main.t WHERE id = 1")
+        .await
+        .unwrap();
+    let (ctx, table) = open(bound(&memo)).await;
+    lake.append("t", &batch([90], "x")).await;
+    let head = lake.head();
+    let error = Box::pin(table.restore_rows_to(&ctx.state(), mark))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, DuckLakeError::Conflict(_)), "{error}");
+    assert_eq!(lake.head(), head);
 }
 
 /// Nothing to undo commits nothing: no change to the table since the mark,
@@ -880,6 +986,7 @@ pub(crate) async fn all_scenarios(make: MakeLake) {
     Box::pin(restores_into_several_files(Arc::clone(&make))).await;
     Box::pin(restores_across_flush_and_compaction(Arc::clone(&make))).await;
     Box::pin(refusals(Arc::clone(&make))).await;
+    Box::pin(restores_through_a_catalog_read_memo(Arc::clone(&make))).await;
     Box::pin(nothing_to_undo(make)).await;
 }
 
@@ -915,6 +1022,7 @@ per_backend!(
     restores_into_several_files,
     restores_across_flush_and_compaction,
     refusals,
+    restores_through_a_catalog_read_memo,
     nothing_to_undo,
 );
 

@@ -2720,6 +2720,7 @@ impl DuckLakeTableWriter {
                     rewritten_deletes: Vec::new(),
                     dropped_files: Vec::new(),
                     inlined_flush: false,
+                    exclusive: false,
                 },
                 object_paths: Vec::new(),
                 files_written: 0,
@@ -2793,6 +2794,7 @@ impl DuckLakeTableWriter {
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written,
@@ -3242,6 +3244,15 @@ impl DuckLakeTableWriter {
 }
 
 impl<'a> DuckLakeWriteTransaction<'a> {
+    /// Make the last staged write conflict with any commit to its table since
+    /// the snapshot it was staged against, as a row restore needs.
+    #[cfg(feature = "restore")]
+    pub(crate) fn make_last_write_exclusive(&mut self) {
+        if let Some(prepared) = self.writes.last_mut() {
+            prepared.write.exclusive = true;
+        }
+    }
+
     /// Read concurrent delete files through `positions` when the commit's
     /// inlined deletions meet one, retrying the commit when it deletes none of
     /// their rows instead of aborting.
@@ -3517,6 +3528,7 @@ impl DuckLakeWriteTransaction<'_> {
                 rewritten_deletes: Vec::new(),
                 dropped_files: Vec::new(),
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written: 0,
@@ -3692,6 +3704,7 @@ impl DuckLakeWriteTransaction<'_> {
                 inlined_file_deletes,
                 dropped_files,
                 inlined_flush: false,
+                exclusive: false,
             },
             object_paths,
             files_written,
@@ -5402,6 +5415,7 @@ impl TableWriteSession {
             inlined_file_deletes: Vec::new(),
             dropped_files: Vec::new(),
             inlined_flush: false,
+            exclusive: false,
         }
         .with_materialized_nulls()?;
         let committed = self.with_inlining_limit(|| {

@@ -1019,17 +1019,17 @@ catalog or stored in Parquet; each handles both as official DuckLake's SQL does.
   library extension with no official equivalent): the table's rows become its rows at an
   earlier snapshot in one new snapshot, each restored row keeping its `rowid`, and no snapshot
   is rewritten. It commits what a SQL `UPDATE` commits, with its conflict checks, and also
-  aborts on any change to the table since it was read: rows live now but not then are deleted
+  aborts on any commit to the table since it was read: rows live now but not then are deleted
   as a `DELETE` deletes them (a data file added since, with more live rows than the scoped
-  `data_inlining_row_limit`, is ended whole), and rows live then but not now are inserted again
-  with their row ids, inlined within that limit, else in Parquet files embedding them, in the
-  table's partition layout. It runs on SQLite, DuckDB, MySQL and multi-catalog PostgreSQL;
-  single-catalog PostgreSQL refuses it (`Unsupported`), as it refuses `UPDATE` and `DELETE`.
-  It is refused when the snapshot is not before the table's (`InvalidConfig`), the table did
-  not exist then (`InvalidConfig`), the snapshot has expired (`InvalidSnapshot`), or the
-  table's columns or partition spec changed since (`Unsupported`). Official DuckLake reads the
-  result and its change feed as an `UPDATE`'s; its closest equivalent, inserting the rows read
-  `AT (VERSION => ...)`, gives them new row ids.
+  `data_inlining_row_limit` and none deleted inlined, is ended whole), and rows live then but
+  not now are inserted again with their row ids, inlined within that limit, else in Parquet
+  files embedding them, in the table's partition layout. It runs on SQLite, DuckDB, MySQL and
+  multi-catalog PostgreSQL; single-catalog PostgreSQL refuses it (`Unsupported`), as it refuses
+  `UPDATE` and `DELETE`. It is refused when the snapshot is not before the table's
+  (`InvalidConfig`), the table did not exist then (`InvalidConfig`), the snapshot has expired
+  (`InvalidSnapshot`), or the table's columns or partition spec changed since (`Unsupported`).
+  Official DuckLake reads the result and its change feed as an `UPDATE`'s; its closest
+  equivalent, inserting the rows read `AT (VERSION => ...)`, gives them new row ids.
 - **Maintenance flush** (`InlinedFlushPolicy`, carried by `DuckLakeWriteOptions`; an opt-in
   addition of this crate): by default `merge_adjacent_files` and `rewrite_data_files` flush
   nothing, as official's `ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`; its

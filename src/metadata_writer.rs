@@ -2702,6 +2702,24 @@ pub(crate) fn staged_conflict(
     write: &StagedTableWrite,
     changes: &[Option<String>],
 ) -> Option<DuckLakeError> {
+    if write.exclusive {
+        let changed = changes
+            .iter()
+            .flatten()
+            .flat_map(|changes| snapshot_change_tokens(changes))
+            .any(|token| {
+                token
+                    .split_once(':')
+                    .is_some_and(|(_, id)| id.parse::<i64>().ok() == Some(write.table_id))
+            });
+        if changed {
+            return Some(DuckLakeError::Conflict(format!(
+                "Transaction conflict - attempting to restore rows of table with index \
+                 \"{}\" - but another transaction has changed it",
+                write.table_id
+            )));
+        }
+    }
     if write.inlined_flush {
         let ours = TableChanges {
             deleted_inlined: !write.inlined_deletes.is_empty(),
@@ -2890,6 +2908,9 @@ pub struct StagedTableWrite {
     /// Set by the deprecated `DuckLakeTableWriter::flush_inlined_data`: the
     /// stage moves inlined rows into Parquet without changing logical rows.
     pub(crate) inlined_flush: bool,
+    /// Set by a row restore, which must leave exactly the rows it compared
+    /// against: any commit to the table since `base_snapshot_id` conflicts.
+    pub(crate) exclusive: bool,
 }
 
 /// `batches` with each top-level Arrow `Null` column (one with no type of its
