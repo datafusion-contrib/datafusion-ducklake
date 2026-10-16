@@ -1005,15 +1005,32 @@ fn without_wrapper(plan: &str) -> Vec<String> {
 
 /// A query that does not sort by the table's key plans exactly as with the
 /// option off: same file groups and byte-range splits, no buffer, no
-/// declared order. Only `ORDER BY ts DESC` gets the ordered plan.
+/// declared order. Only `ORDER BY ts DESC` gets the ordered plan. Small
+/// files are scanned whole; with `repartition_file_min_size` at 1 byte the
+/// same files are split into byte ranges across partitions.
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_without_a_key_sort_plan_as_today() {
     let env = setup().await;
     env.sort_by_ts_desc(NullOrder::NullsFirst).await;
     ingest_disjoint_sorted(&env, 4, 1_000).await;
-    for partitions in [1, 4, 8] {
-        let on = env.ctx_with(partitions, true).await;
-        let off = env.ctx_with(partitions, false).await;
+    let split_into_ranges = |ctx: SessionContext| async move {
+        ctx.sql("SET datafusion.optimizer.repartition_file_min_size = 1")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        ctx
+    };
+    for (partitions, split) in [(1, false), (4, false), (8, false), (4, true), (8, true)] {
+        let mut on = env.ctx_with(partitions, true).await;
+        let mut off = env.ctx_with(partitions, false).await;
+        if split {
+            on = split_into_ranges(on).await;
+            off = split_into_ranges(off).await;
+            let p = plan(&off, "SELECT * FROM ducklake.main.logs").await;
+            assert!(p.contains(".parquet:0.."), "byte-range split expected\n{p}");
+        }
         for sql in [
             "SELECT date_trunc('hour', ts) AS h, count(*) FROM ducklake.main.logs GROUP BY h",
             "SELECT level, count(*) FROM ducklake.main.logs WHERE ts > TIMESTAMP '1970-01-01 00:00:00.002' GROUP BY level",
@@ -1028,7 +1045,7 @@ async fn queries_without_a_key_sort_plan_as_today() {
             assert_eq!(
                 without_wrapper(&with),
                 without_wrapper(&without),
-                "partitions={partitions} {sql}\n--- on\n{with}\n--- off\n{without}"
+                "partitions={partitions} split={split} {sql}\n--- on\n{with}\n--- off\n{without}"
             );
             assert!(!with.contains("output_ordering"), "{with}");
             if deterministic {
@@ -1340,4 +1357,55 @@ async fn verify_checks_order_in_the_catalog_type() {
         assert_all_queries_correct(&env.ctx(partitions).await).await;
     }
     assert_eq!(env.orders().await.get("text.parquet"), Some(&None));
+}
+
+/// After `SET SORTED BY` changes the key, compaction sorts its output by the
+/// new key and records that; the files it replaced kept the old key. Each
+/// query is answered from what is recorded, never from the live spec alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn sort_spec_change_then_compaction() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    ingest_disjoint_sorted(&env, 2, 1_000).await;
+    assert!(
+        env.orders()
+            .await
+            .values()
+            .all(|o| o.as_deref() == Some("1:desc:nulls_first"))
+    );
+    // `id` is field 3; ascending by it is ascending by `ts` here.
+    env.writer()
+        .await
+        .set_sort_spec(
+            env.table_id,
+            &[SortField::column(0, "id", SortDirection::Asc, NullOrder::NullsLast)],
+        )
+        .unwrap();
+    // Before compaction: the old key's rows still describe the files.
+    for partitions in [1, 4] {
+        assert_all_queries_correct(&env.ctx(partitions).await).await;
+    }
+
+    let (ctx, table) = table_handle(&env).await;
+    table
+        .with_write_options(ext_options())
+        .merge_adjacent_files(&ctx.state(), MergeOptions::default())
+        .await
+        .unwrap();
+    let orders = env.orders().await;
+    assert_eq!(orders.len(), 1, "{orders:?}");
+    assert_eq!(
+        orders.values().next().unwrap().as_deref(),
+        Some("3:asc:nulls_last")
+    );
+    let by_id = "SELECT ts, level, id FROM ducklake.main.logs ORDER BY id ASC LIMIT 7";
+    for partitions in [1, 4] {
+        let ctx = env.ctx(partitions).await;
+        assert_all_queries_correct(&ctx).await;
+        assert_matches_reference(&ctx, by_id).await;
+        let p = plan(&ctx, by_id).await;
+        assert!(!sorts(&p), "{p}");
+        // The old key no longer describes any file: `ts DESC` sorts again.
+        assert!(sorts(&plan(&ctx, TOP_N).await));
+    }
 }
