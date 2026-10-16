@@ -1413,3 +1413,41 @@ async fn sort_spec_change_then_compaction() {
         assert!(sorts(&plan(&ctx, TOP_N).await));
     }
 }
+
+/// A row describes the object at a path. A file whose name the caller picks
+/// (`begin_write_to_path`) can be written again with other bytes after a
+/// failed attempt, so the writer records only files it names itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn caller_named_files_are_not_recorded() {
+    let env = setup().await;
+    env.sort_by_ts_desc(NullOrder::NullsFirst).await;
+    let writer = DuckLakeTableWriter::new(
+        Arc::new(env.writer().await),
+        Arc::new(LocalFileSystem::new()),
+    )
+    .unwrap()
+    .with_options(&ext_options());
+    let dir = env.data_path().join("main").join("logs");
+    let mut session = writer
+        .begin_write_to_path(
+            "main",
+            "logs",
+            schema().as_ref(),
+            dir.to_str().unwrap(),
+            "chosen.parquet".to_string(),
+            WriteMode::Append,
+        )
+        .unwrap();
+    session.write_batch(&batch(&desc(0..1_000))).unwrap();
+    session.finish().await.unwrap();
+    assert_eq!(sidecar_rows(&env).await, 0);
+
+    // Recorded by the verify job once committed, like any foreign file.
+    let (ctx, table) = table_handle(&env).await;
+    let verified = table
+        .verify_file_orders(&ctx.state(), VerifyOrderOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(verified.files_recorded, 1, "{verified:?}");
+    assert_all_queries_correct(&env.ctx(4).await).await;
+}
